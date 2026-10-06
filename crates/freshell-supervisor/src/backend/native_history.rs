@@ -6,6 +6,18 @@ const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REPAIR_RECEIPT_BYTES: usize = 64 * 1024;
 const OPENCODE_PROVIDER_HOME: &str = "/home/freshell/provider";
 
+struct ReadonlyNativeReader {
+    image_ref: String,
+    uid: u32,
+    gid: u32,
+    args: Vec<String>,
+    env: Vec<String>,
+    cwd: Option<String>,
+    extra_mounts: Vec<Value>,
+    tmpfs: &'static str,
+    tty: bool,
+}
+
 fn stopped_repair_provider_env(terminal: &TerminalLaunchSpec) -> Vec<String> {
     let mut env = terminal.env.clone();
     env.insert("HOME".into(), OPENCODE_PROVIDER_HOME.into());
@@ -30,6 +42,14 @@ fn decode_docker_stdout_frames(
     bytes: &[u8],
     max_output_bytes: usize,
 ) -> Result<Vec<u8>, BackendError> {
+    decode_docker_log_frames(bytes, max_output_bytes, false)
+}
+
+fn decode_docker_log_frames(
+    bytes: &[u8],
+    max_output_bytes: usize,
+    include_stderr: bool,
+) -> Result<Vec<u8>, BackendError> {
     let malformed = |message: &str| BackendError::Malformed(message.into());
     let mut output = Vec::new();
     let mut cursor = 0;
@@ -39,7 +59,7 @@ fn decode_docker_stdout_frames(
             .filter(|end| *end <= bytes.len())
             .ok_or_else(|| malformed("Docker repair helper log frame header is truncated"))?;
         let header = &bytes[cursor..header_end];
-        if header[0] != 1 || header[1..4] != [0, 0, 0] {
+        if !(header[0] == 1 || (include_stderr && header[0] == 2)) || header[1..4] != [0, 0, 0] {
             return Err(malformed(
                 "Docker repair helper emitted an unexpected log stream frame",
             ));
@@ -260,6 +280,139 @@ impl DockerEngineBackend {
         reader_binary: &Path,
         budget: Duration,
     ) -> Result<Value, BackendError> {
+        let agent = handle.fresh_agent().ok_or_else(|| {
+            BackendError::InvalidConfig("native history requires a fresh agent".into())
+        })?;
+        self.readonly_native_helper(
+            handle,
+            reader_binary,
+            ReadonlyNativeReader {
+                image_ref: handle.image_ref().into(),
+                uid: agent.run_as_uid,
+                gid: agent.run_as_gid,
+                args: vec![
+                    "native-history-only".into(),
+                    "--provider".into(),
+                    provider.into(),
+                    "--session-id".into(),
+                    native_id.into(),
+                    "--provider-home".into(),
+                    OPENCODE_PROVIDER_HOME.into(),
+                ],
+                env: vec![format!("HOME={OPENCODE_PROVIDER_HOME}")],
+                cwd: None,
+                extra_mounts: Vec::new(),
+                tmpfs: "rw,noexec,nosuid,nodev,size=16m",
+                tty: true,
+            },
+            budget,
+        )
+        .await
+    }
+
+    pub(super) async fn retained_store_helper(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        request: &freshell_runtime_protocol::RetainedStoreCompatibilityRequest,
+        reader_binary: &Path,
+    ) -> Result<freshell_runtime_protocol::RetainedStoreCompatibilityReceipt, BackendError> {
+        if request.provider_store_id != handle.provider_store_id()
+            || request.provider_home != OPENCODE_PROVIDER_HOME
+            || request.image_ref.len() != 71
+            || !request.image_ref.starts_with("sha256:")
+        {
+            return Err(BackendError::OwnershipMismatch(
+                "retained-store request does not bind the selected volume and current image".into(),
+            ));
+        }
+        let (uid, gid, workspace, cwd, mounts) = if let Some(terminal) = handle.terminal() {
+            if terminal.mode != "opencode" {
+                return Err(BackendError::InvalidConfig(
+                    "retained-store helper requires OpenCode".into(),
+                ));
+            }
+            (
+                terminal.run_as_uid,
+                terminal.run_as_gid,
+                terminal.workspace_path.as_str(),
+                terminal.cwd.as_str(),
+                docker::terminal_mounts(terminal),
+            )
+        } else if let Some(agent) = handle.fresh_agent() {
+            if agent.provider.as_str() != "opencode" {
+                return Err(BackendError::InvalidConfig(
+                    "retained-store helper requires OpenCode".into(),
+                ));
+            }
+            (
+                agent.run_as_uid,
+                agent.run_as_gid,
+                agent.workspace_path.as_str(),
+                agent.cwd.as_str(),
+                docker::fresh_agent_mounts(agent),
+            )
+        } else {
+            return Err(BackendError::InvalidConfig(
+                "retained-store helper requires an exact provider workload".into(),
+            ));
+        };
+        if (request.provider_uid, request.provider_gid) != (uid, gid)
+            || request.workspace_path != workspace
+            || request.cwd != cwd
+        {
+            return Err(BackendError::OwnershipMismatch(
+                "retained-store provider identity or workspace changed".into(),
+            ));
+        }
+        let mounts = mounts.map_err(BackendError::InvalidConfig)?;
+        let mut extra_mounts = vec![
+            json!({"Type":"bind","Source":mounts.workspace,"Target":mounts.workspace,"ReadOnly":true}),
+        ];
+        if let Some(git) = mounts.git_common_dir {
+            if !git.starts_with(&mounts.workspace) {
+                extra_mounts.push(json!({"Type":"bind","Source":git,"Target":git,"ReadOnly":true}));
+            }
+        }
+        let output=self.readonly_native_helper(handle,reader_binary,ReadonlyNativeReader {
+            image_ref:request.image_ref.clone(),uid,gid,
+            args:vec!["retained-opencode-store-worker".into(),serde_json::to_string(request).map_err(|error|BackendError::Malformed(error.to_string()))?],
+            env:vec![format!("HOME={OPENCODE_PROVIDER_HOME}"),format!("XDG_DATA_HOME={OPENCODE_PROVIDER_HOME}/.local/share"),format!("XDG_CONFIG_HOME={OPENCODE_PROVIDER_HOME}/.config"),format!("OPENCODE_DB={OPENCODE_PROVIDER_HOME}/.local/share/opencode/opencode.db")],
+            cwd:Some(cwd.into()),extra_mounts,tmpfs:"rw,noexec,nosuid,nodev,size=64m",tty:false,
+        },Duration::from_secs(30)).await?;
+        let receipt: freshell_runtime_protocol::RetainedStoreCompatibilityReceipt =
+            serde_json::from_value(output)
+                .map_err(|error| BackendError::Malformed(error.to_string()))?;
+        if &receipt.request != request
+            || receipt.provider_version
+                != freshell_agent_runtime::pinned_provider_version("opencode").unwrap_or_default()
+            || receipt.row_count == 0
+            || [
+                &receipt.source_schema_fingerprint,
+                &receipt.migration_journal_fingerprint,
+                &receipt.generation,
+            ]
+            .iter()
+            .any(|value| {
+                value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        {
+            return Err(BackendError::OwnershipMismatch(
+                "retained-store compatibility receipt does not match the selected request".into(),
+            ));
+        }
+        Ok(receipt)
+    }
+
+    async fn readonly_native_helper(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        reader_binary: &Path,
+        reader: ReadonlyNativeReader,
+        budget: Duration,
+    ) -> Result<Value, BackendError> {
         let name = format!("freshell-history-{}", uuid::Uuid::new_v4());
         let mut create_attempted = false;
         let operation = async {
@@ -285,21 +438,19 @@ impl DockerEngineBackend {
                     "native history volume changed".into(),
                 ));
             }
-            let agent = handle.fresh_agent().ok_or_else(|| {
-                BackendError::InvalidConfig("native history requires a fresh agent".into())
-            })?;
-            let binary = std::fs::canonicalize(reader_binary)
-                .map_err(|e| BackendError::Unavailable(e.to_string()))?;
+            let binary = canonical_regular_file(reader_binary)?;
+            let mut mounts = vec![
+                json!({"Type":"bind","Source":binary,"Target":"/runtime/freshell-session-host","ReadOnly":true}),
+                json!({"Type":"volume","Source":handle.provider_volume_name(),"Target":OPENCODE_PROVIDER_HOME,"ReadOnly":true}),
+            ];
+            mounts.extend(reader.extra_mounts);
             let body = json!({
-                "Image":handle.image_ref(), "User":format!("{}:{}",agent.run_as_uid,agent.run_as_gid), "Tty":true,
-                "Entrypoint":["/runtime/freshell-session-host"],
-                "Cmd":["native-history-only","--provider",provider,"--session-id",native_id,"--provider-home","/home/freshell/provider"],
-                "Env":["HOME=/home/freshell/provider"],
+                "Image":reader.image_ref, "User":format!("{}:{}",reader.uid,reader.gid), "Tty":reader.tty,
+                "WorkingDir":reader.cwd,
+                "Entrypoint":["/runtime/freshell-session-host"],"Cmd":reader.args,"Env":reader.env,
                 "HostConfig": {"NetworkMode":"none","ReadonlyRootfs":true,"CapDrop":["ALL"],
                     "SecurityOpt":["no-new-privileges"],"Memory":256*1024*1024,"MemorySwap":256*1024*1024,
-                    "NanoCpus":500_000_000,"PidsLimit":32,"Tmpfs":{"/tmp":"rw,noexec,nosuid,nodev,size=16m"},
-                    "Mounts":[{"Type":"bind","Source":binary,"Target":"/runtime/freshell-session-host","ReadOnly":true},
-                        {"Type":"volume","Source":handle.provider_volume_name(),"Target":"/home/freshell/provider","ReadOnly":true}]}
+                    "NanoCpus":500_000_000,"PidsLimit":32,"Tmpfs":{"/tmp":reader.tmpfs},"Mounts":mounts}
             });
             // The helper has no runtime labels, registry incarnation, execution grant or control mount.
             create_attempted = true;
@@ -347,11 +498,17 @@ impl DockerEngineBackend {
                         16 * 1024,
                     )
                     .await?;
-                let cause = std::str::from_utf8(&logs.body)
+                let error_output = if reader.tty {
+                    logs.body
+                } else {
+                    decode_docker_log_frames(&logs.body, 16 * 1024, true).unwrap_or_default()
+                };
+                let cause = std::str::from_utf8(&error_output)
                     .ok()
                     .into_iter()
                     .flat_map(str::lines)
                     .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .filter(|record| record["event"] == "session_host.fatal")
                     .find_map(|record| {
                         record
                             .get("error")
@@ -377,7 +534,12 @@ impl DockerEngineBackend {
                     "saved history exceeds snapshot read limit".into(),
                 ));
             }
-            serde_json::from_slice::<Value>(&logs.body)
+            let output = if reader.tty {
+                logs.body
+            } else {
+                decode_docker_stdout_frames(&logs.body, MAX_SNAPSHOT_BYTES)?
+            };
+            serde_json::from_slice::<Value>(&output)
                 .map_err(|e| BackendError::Malformed(e.to_string()))
         };
         let result = tokio::time::timeout(budget, operation)
@@ -472,6 +634,8 @@ mod tests {
     async fn history_helper_cleans_only_its_owned_container_on_success_error_and_timeout() {
         for mode in [
             "success",
+            "compatibility_success",
+            "compatibility_failure",
             "failed_exit",
             "bad_output",
             "timeout",
@@ -484,9 +648,11 @@ mod tests {
             let expected_daemon = daemon.clone();
             let binary = temp.path().join("reader");
             std::fs::write(&binary, "fixture binary").unwrap();
+            let workspace = temp.path().join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
             let agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
                 "sessionId":"presentation-alias","provider":"opencode","sessionType":"freshopencode",
-                "runtimeVariant":"opencode","providerStoreId":"store","cwd":"/workspace","workspacePath":"/workspace",
+                "runtimeVariant":"opencode","providerStoreId":"store","cwd":workspace,"workspacePath":workspace,
                 "runAsUid":65534,"runAsGid":0,"nativeSessionId":"ses_saved"
             })).unwrap();
             let handle = OwnedRuntimeHandle::from_registry(
@@ -552,7 +718,7 @@ mod tests {
                             }
                             (
                                 200,
-                                json!({"StatusCode": if mode == "failed_exit" {1} else {0}})
+                                json!({"StatusCode": if matches!(mode, "failed_exit" | "compatibility_failure") {1} else {0}})
                                     .to_string(),
                             )
                         } else if request.contains("/logs?") {
@@ -560,11 +726,27 @@ mod tests {
                                 200,
                                 if mode == "bad_output" {
                                     "invalid".into()
-                                } else if mode == "failed_exit" {
+                                } else if matches!(mode, "failed_exit" | "compatibility_failure") {
                                     json!({"event":"session_host.fatal","error":"saved native session not found"}).to_string()
                                 } else {
-                                    json!({"threadId":"ses_saved","provider":"opencode","turns":[]})
-                                        .to_string()
+                                    if mode.starts_with("compatibility_") {
+                                        let seen = seen.lock().unwrap();
+                                        let create: Value = serde_json::from_slice(
+                                            &seen
+                                                .iter()
+                                                .find(|(request, _)| request.contains("/create?"))
+                                                .unwrap()
+                                                .1,
+                                        )
+                                        .unwrap();
+                                        let request: Value = serde_json::from_str(
+                                            create["Cmd"][1].as_str().unwrap(),
+                                        )
+                                        .unwrap();
+                                        json!({"request":request,"providerVersion":"1.18.21","sourceSchemaFingerprint":"c".repeat(64),"migrationJournalFingerprint":"d".repeat(64),"generation":"e".repeat(64),"rowCount":3}).to_string()
+                                    } else {
+                                        json!({"threadId":"ses_saved","provider":"opencode","turns":[]}).to_string()
+                                    }
                                 },
                             )
                         } else if request.starts_with("DELETE ") {
@@ -575,26 +757,59 @@ mod tests {
                         } else {
                             panic!("unexpected request {request}")
                         };
-                        let response = format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
-                        let _ = stream.write_all(response.as_bytes()).await;
+                        let body =
+                            if mode.starts_with("compatibility_") && request.contains("/logs?") {
+                                let mut frame = docker_stdout_frame(body.as_bytes());
+                                if mode == "compatibility_failure" {
+                                    frame[0] = 2;
+                                }
+                                frame
+                            } else {
+                                body.into_bytes()
+                            };
+                        let header=format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(&body).await;
                     });
                 }
             });
-            let result = DockerEngineBackend::new(&socket)
-                .read_history_helper(
-                    &handle,
-                    "opencode",
-                    "ses_saved",
-                    &binary,
-                    if mode == "timeout" {
-                        Duration::from_millis(250)
-                    } else {
-                        Duration::from_secs(5)
-                    },
-                )
-                .await;
-            assert_eq!(result.is_ok(), mode == "success", "{mode}: {result:?}");
-            if mode == "failed_exit" {
+            let backend = DockerEngineBackend::new(&socket);
+            let result = if mode.starts_with("compatibility_") {
+                let request = freshell_runtime_protocol::RetainedStoreCompatibilityRequest {
+                    provider_store_id: handle.provider_store_id().into(),
+                    native_session_id: "ses_saved".into(),
+                    image_ref: format!("sha256:{}", "b".repeat(64)),
+                    provider_home: OPENCODE_PROVIDER_HOME.into(),
+                    workspace_path: workspace.to_string_lossy().into(),
+                    cwd: workspace.to_string_lossy().into(),
+                    provider_uid: 65534,
+                    provider_gid: 0,
+                };
+                backend
+                    .qualify_retained_opencode(&handle, &request, &binary)
+                    .await
+                    .map(|receipt| serde_json::to_value(receipt).unwrap())
+            } else {
+                backend
+                    .read_history_helper(
+                        &handle,
+                        "opencode",
+                        "ses_saved",
+                        &binary,
+                        if mode == "timeout" {
+                            Duration::from_millis(250)
+                        } else {
+                            Duration::from_secs(5)
+                        },
+                    )
+                    .await
+            };
+            assert_eq!(
+                result.is_ok(),
+                matches!(mode, "success" | "compatibility_success"),
+                "{mode}: {result:?}"
+            );
+            if matches!(mode, "failed_exit" | "compatibility_failure") {
                 assert!(result
                     .unwrap_err()
                     .to_string()
@@ -614,8 +829,21 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(create["User"], "65534:0");
+                assert_eq!(create["Tty"], !mode.starts_with("compatibility_"));
                 assert_eq!(create["HostConfig"]["NetworkMode"], "none");
-                assert_eq!(create["HostConfig"]["Mounts"].as_array().unwrap().len(), 2);
+                assert_eq!(
+                    create["HostConfig"]["Mounts"].as_array().unwrap().len(),
+                    if mode.starts_with("compatibility_") {
+                        3
+                    } else {
+                        2
+                    }
+                );
+                if mode.starts_with("compatibility_") {
+                    assert_eq!(create["Image"], format!("sha256:{}", "b".repeat(64)));
+                    assert_eq!(create["Cmd"][0], "retained-opencode-store-worker");
+                    assert_ne!(create["Image"], handle.image_ref());
+                }
                 assert!(create["HostConfig"]["Mounts"]
                     .as_array()
                     .unwrap()

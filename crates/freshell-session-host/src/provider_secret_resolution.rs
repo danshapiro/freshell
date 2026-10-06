@@ -4,6 +4,45 @@ use std::fs;
 use std::path::Path;
 
 const MAX_KEYS_BYTES: u64 = 128 * 1024;
+const MAX_VALUE_BYTES: usize = 16 * 1024;
+const ALLOWED_NAMES: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CURL_CA_BUNDLE",
+    "GLM_RUNPOD_API_KEY",
+    "GLM_RUNPOD_BASE_URL",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "VLLM_API_KEY",
+    "VLLM_BASE_URL",
+    "LUNAROUTE_API_KEY",
+    "LUNAROUTE_BASE_URL",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_USE_ENV_PROXY",
+    "NO_PROXY",
+    "ONECLI_GATEWAY",
+    "ONECLI_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENCODE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+];
+const CERTIFICATE_CHILD_NAMES: &[&str] = &[
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_FILE",
+];
+
 #[derive(Default)]
 pub struct ResolvedProviderSecrets {
     pub claude_settings_argument: Option<String>,
@@ -22,6 +61,11 @@ pub fn resolve_child_secrets(
         .map_err(|error| error.message)?;
     let mut resolved = ResolvedProviderSecrets::default();
     let mut configuration_bytes = 0u64;
+    let mut environment_grants = Vec::new();
+    let mut native_auth = false;
+    let mut oauth_auth = false;
+    let mut mounted_ca = false;
+    let mut seen = std::collections::BTreeSet::new();
     for (index, reference) in references.iter().enumerate() {
         if reference.profile.provider() != provider {
             return Err("OneCLI profile belongs to another provider".into());
@@ -72,18 +116,65 @@ pub fn resolve_child_secrets(
             return Err("OneCLI grant exceeds 128 KiB".into());
         }
         if let Some(relative) = reference.profile.provider_file_relative_path() {
-            if raw.is_empty() {
-                return Err("OneCLI provider-file grant is empty".into());
+            if raw.is_empty() || !seen.insert(relative) {
+                return Err("OneCLI provider-file grant is empty or duplicated".into());
+            }
+            if reference.profile.auth_relative_path().is_some() {
+                oauth_auth = validate_native_auth(provider, &raw)?;
+                native_auth = true;
+            } else {
+                mounted_ca = true;
             }
             resolved.provider_files.push((relative, raw));
         } else {
-            let text =
-                std::str::from_utf8(&raw).map_err(|_| "OneCLI environment grant is not UTF-8")?;
-            for (name, value) in resolve_profile(reference.profile, text)? {
-                if resolved.environment.insert(name, value).is_some() {
-                    return Err("OneCLI grants set the same child environment key".into());
-                }
+            environment_grants.push((reference.profile, raw));
+        }
+    }
+    for (profile, raw) in environment_grants {
+        let text =
+            std::str::from_utf8(&raw).map_err(|_| "OneCLI environment grant is not UTF-8")?;
+        for (name, value) in resolve_profile_with_native_auth(profile, text, native_auth)? {
+            if resolved.environment.insert(name, value).is_some() {
+                return Err("OneCLI grants set the same child environment key".into());
             }
+        }
+    }
+    if oauth_auth
+        && resolved.environment.keys().any(|name| {
+            matches!(
+                (provider, name.as_str()),
+                ("codex", "OPENAI_API_KEY")
+                    | ("claude", "ANTHROPIC_API_KEY")
+                    | ("opencode", "OPENAI_API_KEY")
+            )
+        })
+    {
+        return Err("OneCLI native OAuth conflicts with environment API-key auth mode".into());
+    }
+    if resolved.environment.contains_key("ANTHROPIC_API_KEY")
+        && resolved.environment.contains_key("CLAUDE_CODE_OAUTH_TOKEN")
+    {
+        return Err("OneCLI Claude environment auth modes conflict".into());
+    }
+    const NATIVE_CA: &str = "/home/freshell/provider/.config/onecli/gateway-ca.pem";
+    for name in CERTIFICATE_CHILD_NAMES {
+        if let Some(value) = resolved.environment.get(*name) {
+            if !mounted_ca || value != NATIVE_CA {
+                return Err("OneCLI native trust path has no exact typed CA mount".into());
+            }
+        }
+    }
+    if mounted_ca {
+        let names: &[&str] = match provider {
+            "claude" | "opencode" => &["NODE_EXTRA_CA_CERTS"],
+            "codex" => &["SSL_CERT_FILE"],
+            "amplifier" => &["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"],
+            _ => return Err("unsupported OneCLI CA provider".into()),
+        };
+        for name in names {
+            resolved
+                .environment
+                .insert((*name).into(), NATIVE_CA.into());
         }
     }
     Ok(resolved)
@@ -103,15 +194,432 @@ fn environment_profile(
         _ => Err("OneCLI auth-file grant cannot be parsed as an environment profile".into()),
     }
 }
+fn validate_native_auth(provider: &str, raw: &[u8]) -> Result<bool, String> {
+    let invalid = || "OneCLI typed native auth has an unsupported provider shape".to_owned();
+    if provider == "amplifier" {
+        let parsed = parse_keys_env(std::str::from_utf8(raw).map_err(|_| invalid())?)?;
+        if parsed.keys().any(|name| name.ends_with("_API_KEY")) {
+            return Ok(false);
+        }
+        return Err(invalid());
+    }
+    let native: serde_json::Value = serde_json::from_slice(raw).map_err(|_| invalid())?;
+    let string = |value: &serde_json::Value, name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    match provider {
+        "codex"
+            if native["auth_mode"] == "chatgpt"
+                && native["OPENAI_API_KEY"].is_null()
+                && ["access_token", "refresh_token", "id_token", "account_id"]
+                    .iter()
+                    .all(|name| string(&native["tokens"], name))
+                && string(&native, "last_refresh") =>
+        {
+            Ok(true)
+        }
+        "codex"
+            if string(&native, "OPENAI_API_KEY")
+                && matches!(native["auth_mode"].as_str(), Some("apikey" | "api_key")) =>
+        {
+            Ok(false)
+        }
+        "claude"
+            if string(&native["claudeAiOauth"], "accessToken")
+                && string(&native["claudeAiOauth"], "refreshToken") =>
+        {
+            Ok(true)
+        }
+        "opencode" => {
+            let Some(entries) = native.as_object().filter(|entries| !entries.is_empty()) else {
+                return Err(invalid());
+            };
+            let mut oauth = false;
+            for entry in entries.values() {
+                match entry["type"].as_str() {
+                    Some("oauth")
+                        if string(entry, "access")
+                            && string(entry, "refresh")
+                            && entry["expires"].as_i64().is_some_and(|expiry| expiry > 0) =>
+                    {
+                        oauth = true
+                    }
+                    Some("api") if string(entry, "key") => {}
+                    _ => return Err(invalid()),
+                }
+            }
+            Ok(oauth)
+        }
+        _ => Err(invalid()),
+    }
+}
+
+#[cfg(test)]
 fn resolve_profile(
     profile: ProviderSecretProfile,
     raw: &str,
 ) -> Result<BTreeMap<String, String>, String> {
-    freshell_platform::provider_environment_grants::resolve_environment_profile(
-        environment_profile(profile)?,
-        raw,
-    )
-    .map_err(|error| error.to_string())
+    resolve_profile_with_native_auth(profile, raw, false)
+}
+
+fn resolve_profile_with_native_auth(
+    profile: ProviderSecretProfile,
+    raw: &str,
+    native_auth: bool,
+) -> Result<BTreeMap<String, String>, String> {
+    let parsed = parse_keys_env(raw)?;
+    match profile {
+        ProviderSecretProfile::ClaudeOnecliEnvironment => {
+            resolve_provider_environment(
+                &parsed,
+                &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"],
+                false, native_auth,
+            )
+        }
+        ProviderSecretProfile::CodexOnecliEnvironment => {
+            resolve_provider_environment(&parsed, &["OPENAI_API_KEY", "OPENAI_BASE_URL"], false, native_auth)
+        }
+        ProviderSecretProfile::OpencodeOnecliEnvironment => {
+            resolve_provider_environment(
+                &parsed,
+                &[
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_BASE_URL",
+                    "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL",
+                    "GOOGLE_GENERATIVE_AI_API_KEY",
+                    "GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                    "OPENROUTER_API_KEY",
+                    "OPENCODE_API_KEY",
+                ],
+                true, native_auth,
+            )
+        }
+        ProviderSecretProfile::AmplifierOnecliEnvironment => {
+            resolve_provider_environment(
+                &parsed,
+                &[
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_BASE_URL",
+                    "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL",
+                    "VLLM_API_KEY", "VLLM_BASE_URL", "LUNAROUTE_API_KEY",
+                    "LUNAROUTE_BASE_URL",
+                    "GLM_RUNPOD_API_KEY",
+                    "GLM_RUNPOD_BASE_URL",
+                    "GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                    "OPENROUTER_API_KEY",
+                ],
+                false, native_auth,
+            )
+        }
+        ProviderSecretProfile::ClaudeConfigurationFile
+        | ProviderSecretProfile::CodexConfigurationFile
+        | ProviderSecretProfile::OpencodeConfigurationFile
+        | ProviderSecretProfile::AmplifierConfigurationFile
+        | ProviderSecretProfile::ClaudeOnecliAuthFile
+        | ProviderSecretProfile::CodexOnecliAuthFile
+        | ProviderSecretProfile::OpencodeOnecliAuthFile
+        | ProviderSecretProfile::ClaudeOnecliCaFile
+        | ProviderSecretProfile::CodexOnecliCaFile
+        | ProviderSecretProfile::AmplifierOnecliCaFile
+        | ProviderSecretProfile::OpencodeOnecliCaFile
+        | ProviderSecretProfile::AmplifierOnecliKeysFile => Err("OneCLI auth-file grant cannot be parsed as an environment profile".into()),
+        ProviderSecretProfile::AmplifierOnecliLunarouteGlm53 => {
+            // The approved proxy may replace a provider placeholder key, so
+            // only non-emptiness is required here. The credentialed gateway
+            // URL itself must never retain its operator placeholder.
+            let api_key = required(&parsed, "LUNAROUTE_API_KEY")?;
+            let upstream = required(&parsed, "LUNAROUTE_BASE_URL")?;
+            validate_https_upstream(upstream)?;
+            let gateway = required(&parsed, "ONECLI_GATEWAY")?;
+            if gateway != "1" && !gateway.eq_ignore_ascii_case("enabled") {
+                return Err(
+                    "Amplifier OneCLI profile requires ONECLI_GATEWAY to be enabled".into(),
+                );
+            }
+            let upper_proxy = parsed.get("HTTPS_PROXY").map(String::as_str);
+            let lower_proxy = parsed.get("https_proxy").map(String::as_str);
+            if matches!((upper_proxy, lower_proxy), (Some(upper), Some(lower)) if upper != lower) {
+                return Err("Amplifier OneCLI HTTPS_PROXY and https_proxy values conflict".into());
+            }
+            let proxy = upper_proxy.or(lower_proxy).ok_or_else(|| {
+                "Amplifier OneCLI profile requires a container-reachable HTTPS proxy".to_string()
+            })?;
+            reject_proxy_placeholder(proxy)?;
+            validate_container_proxy(proxy)?;
+
+            // ONECLI_URL is a host-local control endpoint in the approved
+            // setup. Do not forward it into the container: 127.0.0.1 there is
+            // the soul, not the host gateway. NO_PROXY is also deliberately
+            // omitted so the approved upstream cannot bypass the gateway.
+            // Provider-vllm needs only its upstream/API-key pair plus the
+            // canonical proxy and certificate transport.
+            let mut child = BTreeMap::new();
+            child.insert("VLLM_API_KEY".into(), api_key.to_string());
+            child.insert("VLLM_BASE_URL".into(), upstream.to_string());
+            child.insert("HTTPS_PROXY".into(), proxy.to_string());
+            child.insert("https_proxy".into(), proxy.to_string());
+            for name in CERTIFICATE_CHILD_NAMES {
+                if let Some(value) = parsed.get(*name) {
+                    child.insert((*name).to_string(), value.clone());
+                }
+            }
+            Ok(child)
+        }
+        ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow => Err(
+            "legacy Amplifier Anthropic/Haiku secret profile is no longer supported; recreate the managed runtime with the approved OneCLI/LunaRoute profile".into(),
+        ),
+    }
+}
+
+fn resolve_provider_environment(
+    parsed: &BTreeMap<String, String>,
+    provider_names: &[&str],
+    allow_opencode_proxy_settings: bool,
+    native_auth: bool,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut child = BTreeMap::new();
+    for (name, value) in parsed {
+        if provider_names.contains(&name.as_str())
+            || CERTIFICATE_CHILD_NAMES.contains(&name.as_str())
+        {
+            child.insert(name.clone(), value.clone());
+        } else if matches!(name.as_str(), "HTTPS_PROXY" | "https_proxy") {
+            reject_proxy_placeholder(value)?;
+            validate_container_proxy(value)?;
+            child.insert(name.clone(), value.clone());
+        } else if matches!(name.as_str(), "HTTP_PROXY" | "http_proxy") {
+            if allow_opencode_proxy_settings {
+                reject_proxy_placeholder(value)?;
+                validate_container_proxy(value)?;
+                child.insert(name.clone(), value.clone());
+            }
+        } else if name == "NODE_USE_ENV_PROXY" {
+            if allow_opencode_proxy_settings {
+                if value != "1" {
+                    return Err("NODE_USE_ENV_PROXY must be set to 1".into());
+                }
+                child.insert(name.clone(), value.clone());
+            }
+        } else if matches!(name.as_str(), "NO_PROXY" | "no_proxy") {
+            if allow_opencode_proxy_settings {
+                validate_loopback_no_proxy(value)?;
+                child.insert(name.clone(), value.clone());
+            }
+        } else if !matches!(name.as_str(), "ONECLI_URL" | "ONECLI_GATEWAY") {
+            return Err(format!("OneCLI environment profile does not allow {name}"));
+        }
+    }
+    if child.is_empty()
+        || (!native_auth
+            && !child
+                .keys()
+                .any(|name| provider_names.contains(&name.as_str())))
+    {
+        return Err("OneCLI environment profile has no provider values".into());
+    }
+    for (upper_name, lower_name, display_name) in [
+        ("HTTPS_PROXY", "https_proxy", "HTTPS_PROXY"),
+        ("HTTP_PROXY", "http_proxy", "HTTP_PROXY"),
+        ("NO_PROXY", "no_proxy", "NO_PROXY"),
+    ] {
+        if let (Some(upper), Some(lower)) = (child.get(upper_name), child.get(lower_name)) {
+            if upper != lower {
+                return Err(format!("OneCLI {display_name} values conflict"));
+            }
+        }
+    }
+    Ok(child)
+}
+
+fn validate_loopback_no_proxy(value: &str) -> Result<(), String> {
+    let entries = value
+        .split(',')
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if entries.is_empty()
+        || entries
+            .iter()
+            .any(|entry| !matches!(entry.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]"))
+    {
+        return Err("OneCLI NO_PROXY may bypass only loopback hosts".into());
+    }
+    Ok(())
+}
+
+fn validate_https_upstream(value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value)
+        .map_err(|_| "LUNAROUTE_BASE_URL must be a valid credential-free HTTPS URL".to_string())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("LUNAROUTE_BASE_URL must be a credential-free HTTPS URL".into());
+    }
+    Ok(())
+}
+
+fn validate_container_proxy(value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value)
+        .map_err(|_| "OneCLI proxy value must be a valid HTTP(S) URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("HTTPS_PROXY must be a valid HTTP(S) URL".into());
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host == "localhost" || host == "::1" || host.starts_with("127.") {
+        return Err(
+            "OneCLI proxy cannot use container loopback; use the approved proxy address reachable from the managed bridge"
+                .into(),
+        );
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("OneCLI proxy cannot contain query or fragment data".into());
+    }
+    Ok(())
+}
+
+fn parse_keys_env(raw: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut values = BTreeMap::new();
+    for (offset, original) in raw.lines().enumerate() {
+        let line_number = offset + 1;
+        let mut line = original.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("export ") {
+            line = rest.trim_start();
+        }
+        let (name, encoded) = line.split_once('=').ok_or_else(|| {
+            format!("OneCLI environment grant line {line_number} must be NAME=VALUE")
+        })?;
+        if !ALLOWED_NAMES.contains(&name) {
+            return Err(format!(
+                "OneCLI environment grant line {line_number} uses unsupported name {name:?}"
+            ));
+        }
+        if values.contains_key(name) {
+            return Err(format!(
+                "OneCLI environment grant line {line_number} duplicates {name}"
+            ));
+        }
+        let value = decode_value(encoded, &values, line_number)?;
+        if value.is_empty() || value.len() > MAX_VALUE_BYTES {
+            return Err(format!(
+                "OneCLI environment grant line {line_number} has an empty or oversized value"
+            ));
+        }
+        values.insert(name.to_string(), value);
+    }
+    Ok(values)
+}
+
+fn decode_value(
+    encoded: &str,
+    prior: &BTreeMap<String, String>,
+    line_number: usize,
+) -> Result<String, String> {
+    if !encoded.is_ascii()
+        || encoded.contains('`')
+        || encoded.contains("$(")
+        || encoded.contains('\0')
+    {
+        return Err(format!(
+            "OneCLI environment grant line {line_number} contains unsupported encoding or shell execution syntax"
+        ));
+    }
+    if encoded.starts_with('\'') {
+        if encoded.len() < 2 || !encoded.ends_with('\'') {
+            return Err(format!(
+                "OneCLI environment grant line {line_number} has malformed single quotes"
+            ));
+        }
+        return Ok(encoded[1..encoded.len() - 1].to_string());
+    }
+    let value = if encoded.starts_with('"') {
+        if encoded.len() < 2 || !encoded.ends_with('"') {
+            return Err(format!(
+                "OneCLI environment grant line {line_number} has malformed double quotes"
+            ));
+        }
+        &encoded[1..encoded.len() - 1]
+    } else {
+        if encoded.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "OneCLI environment grant line {line_number} must quote whitespace"
+            ));
+        }
+        encoded
+    };
+    expand_references(value, prior, line_number)
+}
+
+fn expand_references(
+    value: &str,
+    prior: &BTreeMap<String, String>,
+    line_number: usize,
+) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'$' {
+            out.push(bytes[index] as char);
+            index += 1;
+            continue;
+        }
+        let (name, next) = if bytes.get(index + 1) == Some(&b'{') {
+            let close = value[index + 2..].find('}').ok_or_else(|| {
+                format!("OneCLI environment grant line {line_number} has an unterminated reference")
+            })? + index
+                + 2;
+            (&value[index + 2..close], close + 1)
+        } else {
+            let start = index + 1;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            (&value[start..end], end)
+        };
+        if name.is_empty() || !ALLOWED_NAMES.contains(&name) {
+            return Err(format!(
+                "OneCLI environment grant line {line_number} has unsupported reference {name:?}"
+            ));
+        }
+        let resolved = prior.get(name).ok_or_else(|| {
+            format!("OneCLI environment grant line {line_number} references {name} before it is defined")
+        })?;
+        out.push_str(resolved);
+        index = next;
+    }
+    Ok(out)
+}
+
+fn reject_proxy_placeholder(value: &str) -> Result<(), String> {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("<agent_token>")
+        || lower.contains("placeholder")
+        || lower.contains("changeme")
+    {
+        return Err("Amplifier OneCLI HTTPS proxy still contains an operator placeholder".into());
+    }
+    Ok(())
+}
+
+fn required<'a>(values: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, String> {
+    values
+        .get(name)
+        .map(String::as_str)
+        .ok_or_else(|| format!("Amplifier OneCLI profile requires {name} in keys.env"))
 }
 
 #[cfg(test)]
@@ -133,6 +641,70 @@ mod tests {
         assert!(resolved.provider_files.is_empty());
         assert_eq!(resolved.configuration_files.len(), 1);
         assert_eq!(resolved.configuration_files[0].0, ".freshell/references/0");
+    }
+
+    #[test]
+    fn typed_codex_oauth_accepts_proxy_only_transport_without_changing_auth_mode() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("provider-0"),
+            "HTTPS_PROXY=http://agent:fixture@192.0.2.10:10255\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("provider-1"), r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"native-shaped-id","access_token":"fixture-access","refresh_token":"fixture-refresh","account_id":"fixture-account"},"last_refresh":"2026-10-06T00:00:00Z"}"#).unwrap();
+        let references = [
+            ProviderSecretProfile::CodexOnecliEnvironment,
+            ProviderSecretProfile::CodexOnecliAuthFile,
+        ]
+        .into_iter().enumerate().map(|(index, profile)| ProviderSecretReference {
+            source_path: root.path().join(format!("provider-{index}")).to_string_lossy().into_owned(),
+            profile,
+            provider_relative_path: None,
+        }).collect::<Vec<_>>();
+        let resolved = resolve_child_secrets("codex", &references, root.path())
+            .expect("typed native OAuth permits proxy-only transport");
+        assert!(!resolved.environment.contains_key("OPENAI_API_KEY"));
+        assert_eq!(resolved.provider_files[0].0, ".codex/auth.json");
+        let native: serde_json::Value =
+            serde_json::from_slice(&resolved.provider_files[0].1).unwrap();
+        assert_eq!(native["auth_mode"], "chatgpt");
+        fs::write(
+            root.path().join("provider-0"),
+            "OPENAI_API_KEY=conflicting-mode\nHTTPS_PROXY=http://192.0.2.10:10255\n",
+        )
+        .unwrap();
+        assert!(resolve_child_secrets("codex", &references, root.path()).is_err());
+    }
+
+    #[test]
+    fn proxy_only_transport_does_not_accept_malformed_native_auth_or_unmounted_ca() {
+        let root = tempfile::tempdir().unwrap();
+        let references = [
+            ProviderSecretProfile::CodexOnecliEnvironment,
+            ProviderSecretProfile::CodexOnecliAuthFile,
+        ]
+        .into_iter().enumerate().map(|(index, profile)| ProviderSecretReference {
+            source_path: root.path().join(format!("provider-{index}")).to_string_lossy().into_owned(),
+            profile,
+            provider_relative_path: None,
+        }).collect::<Vec<_>>();
+        fs::write(
+            root.path().join("provider-0"),
+            "HTTPS_PROXY=http://192.0.2.10:10255\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("provider-1"),
+            r#"{"auth_mode":"chatgpt","tokens":{}}"#,
+        )
+        .unwrap();
+        assert!(resolve_child_secrets("codex", &references, root.path()).is_err());
+        fs::write(
+            root.path().join("provider-0"),
+            "OPENAI_API_KEY=fixture\nSSL_CERT_FILE=/unmounted/gateway.pem\n",
+        )
+        .unwrap();
+        assert!(resolve_child_secrets("codex", &references[..1], root.path()).is_err());
     }
 
     #[test]
@@ -219,7 +791,13 @@ mod tests {
             profile: ProviderSecretProfile::OpencodeOnecliEnvironment,
         };
 
-        let resolved = resolve_child_secrets("opencode", &[reference], root.path()).unwrap();
+        fs::write(root.path().join("provider-1"), "fixture-ca").unwrap();
+        let ca = ProviderSecretReference {
+            source_path: root.path().join("provider-1").to_string_lossy().into_owned(),
+            profile: ProviderSecretProfile::OpencodeOnecliCaFile,
+            provider_relative_path: None,
+        };
+        let resolved = resolve_child_secrets("opencode", &[reference, ca], root.path()).unwrap();
 
         assert_eq!(
             resolved.environment.get("OPENAI_BASE_URL").unwrap(),
@@ -345,17 +923,40 @@ mod tests {
         for (provider, profile, expected) in cases {
             let root = tempfile::tempdir().unwrap();
             let mount = root.path().join("provider-0");
-            fs::write(&mount, "fake-OneCLI-auth-file").unwrap();
+            let auth = match provider {
+                "claude" => {
+                    r#"{"claudeAiOauth":{"accessToken":"fixture-access","refreshToken":"fixture-refresh"}}"#
+                }
+                "codex" => {
+                    r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"fixture-id","access_token":"fixture-access","refresh_token":"fixture-refresh","account_id":"fixture-account"},"last_refresh":"2026-10-06T00:00:00Z"}"#
+                }
+                "opencode" if profile.auth_relative_path().is_some() => {
+                    r#"{"openai":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh","expires":1790000000000}}"#
+                }
+                "amplifier" => "VLLM_API_KEY=fixture-key\n",
+                _ => "fixture-ca",
+            };
+            fs::write(&mount, auth).unwrap();
             let references = [ProviderSecretReference {
                 provider_relative_path: None,
                 source_path: mount.to_string_lossy().into_owned(),
                 profile,
             }];
             let resolved = resolve_child_secrets(provider, &references, root.path()).unwrap();
-            assert!(resolved.environment.is_empty());
+            if profile.auth_relative_path().is_some() {
+                assert!(resolved.environment.is_empty());
+            } else {
+                assert_eq!(
+                    resolved
+                        .environment
+                        .get("NODE_EXTRA_CA_CERTS")
+                        .map(String::as_str),
+                    Some("/home/freshell/provider/.config/onecli/gateway-ca.pem")
+                );
+            }
             assert_eq!(
                 resolved.provider_files,
-                vec![(expected, b"fake-OneCLI-auth-file".to_vec())]
+                vec![(expected, auth.as_bytes().to_vec())]
             );
             assert!(resolve_child_secrets("wrong-provider", &references, root.path()).is_err());
         }

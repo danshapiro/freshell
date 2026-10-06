@@ -1106,6 +1106,21 @@ describe('receipt-owned auth exchange HTTP routes', () => {
   })
 })
 
+function retainedStoreHelperBody() {
+  const body=historyHelperBody()
+  const image=`sha256:${'b'.repeat(64)}`
+  const request={providerStoreId:'exact-store',nativeSessionId:'ses_exact',imageRef:image,providerHome:'/home/freshell/provider',workspacePath:'/workspace',cwd:'/workspace',providerUid:65534,providerGid:0}
+  return {
+    ...body,Image:image,Tty:false,WorkingDir:'/workspace',
+    Cmd:['retained-opencode-store-worker',JSON.stringify(request)],
+    Env:['HOME=/home/freshell/provider','XDG_DATA_HOME=/home/freshell/provider/.local/share','XDG_CONFIG_HOME=/home/freshell/provider/.config','OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db'],
+    HostConfig:{...body.HostConfig,Tmpfs:{'/tmp':'rw,noexec,nosuid,nodev,size=64m'},Mounts:[
+      {...body.HostConfig.Mounts[0],Source:'/tmp/owned/other-approved-host'},body.HostConfig.Mounts[1],
+      {Type:'bind',Source:'/workspace',Target:'/workspace',ReadOnly:true},
+    ]},
+  }
+}
+
 type ForwardedRequest = { method: string; url: string; body: any }
 type BrokerHttpFixture = {
   directory: string
@@ -1745,8 +1760,10 @@ describe('fixed indexed publisher broker',()=>{
   });
 });
 
-async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gateways?:Set<string>, physicalStage = false,
+async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gatewaysOrOptions?:Set<string> | { allowTask2LegacyNegativeFixtures?: boolean }, physicalStage = false,
   allowedProviderInputRoots = new Set<string>()) {
+  const gateways = gatewaysOrOptions instanceof Set ? gatewaysOrOptions : undefined
+  const options = gatewaysOrOptions instanceof Set ? {} : (gatewaysOrOptions ?? {})
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-broker-history-'))
   const socket = path.join(dir, 'docker.sock')
   const proxy = path.join(dir, 'broker.sock')
@@ -1829,6 +1846,11 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       res.end()
       return
     }
+    if (req.method === 'GET' && req.url === `/v1.47/containers/${negativeLegacyId}/json`) {
+      res.statusCode = 200
+      res.end(JSON.stringify(negativeLegacyInspection()))
+      return
+    }
     res.statusCode = 200
     res.end(req.url?.includes('/wait?') ? '{"StatusCode":0}'
       : req.url?.includes('/logs?') ? '{"threadId":"native-owned"}' : JSON.stringify({ Name: providerVolume }))
@@ -1837,9 +1859,10 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     allowedHostGatewayAddresses:gateways,
     realSocketPath: socket,
     proxySocketPath: proxy,
+    allowTask2LegacyNegativeFixtures: options.allowTask2LegacyNegativeFixtures,
     runtimeRootPrefix: physicalStage ? path.join(dir, 'r') : '/tmp/owned/r',
     allowedHostBinaryPaths: new Set(physicalStage ? [path.join(dir, 'freshell-session-host')] : ['/tmp/owned/freshell-session-host', '/tmp/owned/other-approved-host']),
-    allowedImageRefs: new Set(['sha256:fixture-image', 'sha256:other-approved-image']),
+    allowedImageRefs: new Set(['sha256:fixture-image', 'sha256:other-approved-image', `sha256:${'b'.repeat(64)}`]),
     allowTerminalWorkloads: true,
     allowedWorkspaceRoots: new Set(['/workspace']),
     allowedProviderInputRoots,
@@ -1868,6 +1891,34 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
 }
 
 describe('receipt-owned read-only history HTTP routes', () => {
+  it('admits current-image exact retained-store reads with no writer or provider control authority', async () => {
+    await withHttpBroker(async ({request,forwarded,broker})=>{
+      expect((await request('POST','/v1.47/containers/create?name=owned-runtime',createBody([...ordinaryBinds,actorBind]))).status).toBe(201)
+      const invalid=[
+        (body:any)=>{body.HostConfig.Mounts[1].ReadOnly=false},
+        (body:any)=>{body.HostConfig.Mounts[1].Source='foreign-volume'},
+        (body:any)=>{body.HostConfig.Mounts.push({...body.HostConfig.Mounts[2]})},
+        (body:any)=>{body.HostConfig.CapAdd=['CHOWN']},
+        (body:any)=>{body.Tty=true},
+        (body:any)=>{body.Cmd[1]='{}'},
+        (body:any)=>{const decoded=JSON.parse(body.Cmd[1]);decoded.imageRef='sha256:fixture-image';body.Cmd[1]=JSON.stringify(decoded)},
+        (body:any)=>{body.WorkingDir='/foreign'},
+      ]
+      for(const mutate of invalid){
+        const body=retainedStoreHelperBody();mutate(body)
+        const before=forwarded.length
+        expect((await request('POST',`/v1.47/containers/create?name=${helperName}`,body)).status).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST',`/v1.47/containers/create?name=${helperName}`,retainedStoreHelperBody())).status).toBe(201)
+      expect(broker.receipts()).toHaveLength(1)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({ownerContainerId:ownedId,providerVolumeName:providerVolume})
+      expect((await request('POST',`/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST',`/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('POST',`/v1.47/containers/${helperId}/kill`)).status).toBe(403)
+      expect((await request('DELETE',`/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
   it('forwards the owned volume and exact helper lifecycle while refusing foreign sources and controls', async () => {
     await withHttpBroker(async ({ request, forwarded, broker }) => {
       expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))).status).toBe(201)
@@ -1963,4 +2014,83 @@ describe('receipt-owned read-only history HTTP routes', () => {
     })
   })
 
+})
+
+const negativeLegacyId = 'c'.repeat(64)
+function originalLegacyInspection() {
+  return { Id: ownedId, Image: 'sha256:fixture-image',
+    Config: { Labels: JSON.parse(createBody([...ordinaryBinds, actorBind]).toString()).Labels } }
+}
+function negativeLegacyInspection() {
+  const original = originalLegacyInspection()
+  return { ...original, Id: negativeLegacyId, State: { Status: 'created', Running: false, Pid: 0 },
+    Config: { Labels: { ...original.Config.Labels, 'com.freshell.task2-negative': 'foreign_binary' } } }
+}
+
+describe('finite Task2 legacy negative inspector admission', () => {
+  it('forwards only exact bound inspection without granting start, controls, discovery or writer receipts', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))).status).toBe(201)
+      const beforeUnbound = forwarded.length
+      expect((await request('GET', `/v1.47/containers/${negativeLegacyId}/json`)).status).toBe(403)
+      expect(forwarded).toHaveLength(beforeUnbound)
+      broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), originalLegacyInspection())
+      expect((await request('GET', `/v1.47/containers/${negativeLegacyId}/json`))).toMatchObject({
+        status: 200, body: JSON.stringify(negativeLegacyInspection()),
+      })
+      expect(forwarded.at(-1)).toMatchObject({ method: 'GET', url: `/v1.47/containers/${negativeLegacyId}/json` })
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({ severity: 'info', decision: 'forward', destructive: false,
+        containerId: negativeLegacyId, ownerContainerId: ownedId })
+      expect(broker.receipts()).toHaveLength(1)
+      expect([...broker.receiptIds()]).toEqual([ownedId])
+      for (const [method, url] of [
+        ...['start', 'stop', 'kill', 'unpause', 'update'].map(action => ['POST', `/v1.47/containers/${negativeLegacyId}/${action}`]),
+        ['DELETE', `/v1.47/containers/${negativeLegacyId}?force=1`],
+        ['GET', `/v1.47/containers/${negativeLegacyId}/logs?stdout=1`],
+        ['GET', `/v1.47/containers/${'f'.repeat(64)}/json`],
+        ['GET', '/v1.47/containers/json'],
+        ['POST', `/v1.47/containers/${negativeLegacyId}/create`],
+      ] as [string, string][]) {
+        const before = forwarded.length
+        expect((await request(method, url)).status).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      broker.forgetTask2LegacyNegativeInspection(negativeLegacyId)
+      const beforeRevoke = forwarded.length
+      expect((await request('GET', `/v1.47/containers/${negativeLegacyId}/json`)).status).toBe(403)
+      expect(forwarded).toHaveLength(beforeRevoke)
+    }, { allowTask2LegacyNegativeFixtures: true })
+  })
+
+  it('requires an opted-in finite rig, existing receipt owner, exact labels/image/full ID and never-started state', async () => {
+    await withHttpBroker(async ({ request, broker }) => {
+      await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))
+      expect(() => broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), originalLegacyInspection())).toThrow()
+    })
+    await withHttpBroker(async ({ request, broker }) => {
+      expect(() => broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), originalLegacyInspection())).toThrow()
+      await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))
+      const modifications = [
+        (body: any) => { body.Id = 'short-id' },
+        (body: any) => { body.Id = ownedId },
+        (body: any) => { body.Image = 'sha256:foreign' },
+        (body: any) => { body.State.Status = 'exited' },
+        (body: any) => { body.State.Running = true },
+        (body: any) => { body.State.Pid = 1234 },
+        ...['runtime-test-run-id', 'soul-id', 'incarnation-id', 'installation-id', 'task2-negative'].map(key =>
+          (body: any) => { body.Config.Labels[`com.freshell.${key}`] = 'foreign' }),
+      ]
+      for (const modify of modifications) {
+        const candidate = negativeLegacyInspection()
+        modify(candidate)
+        expect(() => broker.admitTask2LegacyNegativeInspection(candidate, originalLegacyInspection())).toThrow()
+      }
+      expect(() => broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), {
+        ...originalLegacyInspection(), Id: 'f'.repeat(64),
+      })).toThrow()
+      expect([...broker.receiptIds()]).toEqual([ownedId])
+      broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), originalLegacyInspection())
+      expect(() => broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), originalLegacyInspection())).toThrow()
+    }, { allowTask2LegacyNegativeFixtures: true })
+  })
 })

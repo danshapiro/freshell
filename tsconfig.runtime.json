@@ -26,6 +26,7 @@
     "scripts/testing/runtime-landing-campaign.ts",
     "test/unit/server/testing/runtime-soak-evidence.test.ts",
     "test/runtime/**/*.ts",
-    "shared/**/*.ts"
+    "shared/**/*.ts",
+    "scripts/testing/task002-config-legacy-fixtures.ts"
   ]
 }

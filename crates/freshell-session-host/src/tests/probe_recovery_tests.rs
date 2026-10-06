@@ -76,13 +76,14 @@ async fn startup_before_identity_retains_diagnostic() {
         "projectKey":"fixture", "workspacePath":state.state_dir
     })).unwrap();
     let pty = HostedPty::spawn(
-        &state.state_dir,
-        state.incarnation_id.clone(),
-        &terminal,
-        std::collections::BTreeMap::new(),
-        None,
-        None,
-    )
+            &state.state_dir,
+            state.incarnation_id.clone(),
+            &terminal,
+            std::collections::BTreeMap::new(),
+            None,
+            None,
+            None,
+        )
     .await
     .unwrap();
     *state.pty.lock().await = Some(pty);
@@ -193,6 +194,7 @@ async fn shell_without_native_paths_uses_terminal_end_policy() {
             state.incarnation_id.clone(),
             &terminal,
             std::collections::BTreeMap::new(),
+            None,
             None,
             None,
         )

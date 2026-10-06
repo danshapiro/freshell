@@ -1088,13 +1088,14 @@ mod output_epoch_tests {
         let incarnation = freshell_runtime_protocol::IncarnationId::new();
         (
             super::HostedPty::spawn(
-                root,
-                incarnation.clone(),
-                &launch,
-                Default::default(),
-                None,
-                None,
-            )
+            root,
+            incarnation.clone(),
+            &launch,
+            Default::default(),
+            None,
+            None,
+            None,
+        )
             .await
             .unwrap(),
             incarnation,
@@ -1958,6 +1959,7 @@ mod provider_exec_tests {
             IncarnationId::new(),
             &launch,
             environment,
+            None,
             None,
             None,
         )

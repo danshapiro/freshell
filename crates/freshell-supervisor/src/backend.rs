@@ -35,6 +35,8 @@ pub enum BackendError {
     Unavailable(String),
     #[error("runtime ownership proof no longer matches the backend object: {0}")]
     OwnershipMismatch(String),
+    #[error("owned runtime launch policy is incompatible: {0}")]
+    PolicyMismatch(String),
     #[error("docker request failed with HTTP {status}: {body}")]
     DockerHttp { status: u16, body: String },
     #[error("docker response was malformed: {0}")]
@@ -308,6 +310,16 @@ pub trait RuntimeBackend: Send + Sync {
             "stopped OpenCode repair helper is unavailable".into(),
         ))
     }
+    async fn qualify_retained_opencode(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+        _request: &freshell_runtime_protocol::RetainedStoreCompatibilityRequest,
+        _reader_binary: &Path,
+    ) -> Result<freshell_runtime_protocol::RetainedStoreCompatibilityReceipt, BackendError> {
+        Err(BackendError::Unavailable(
+            "current-image retained-store qualification is unavailable".into(),
+        ))
+    }
     async fn read_native_history(
         &self,
         _handle: &OwnedRuntimeHandle,
@@ -441,12 +453,7 @@ impl DockerEngineBackend {
             ));
         }
 
-        let expected_digest = immutable_digest_from_handle(handle)?;
-        if expected_digest != handle.immutable_config_digest() {
-            return Err(BackendError::OwnershipMismatch(
-                "registry immutable-config digest does not match its own fields".into(),
-            ));
-        }
+        verify_saved_immutable_digest(handle)?;
         verify_inspect_config(handle, &value)?;
         let mounts = match (handle.terminal(), handle.fresh_agent()) {
             (Some(terminal), None) => Some(docker::terminal_mounts_for_adoption(terminal)),
@@ -911,6 +918,15 @@ impl RuntimeBackend for DockerEngineBackend {
         .await
     }
 
+    async fn qualify_retained_opencode(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        request: &freshell_runtime_protocol::RetainedStoreCompatibilityRequest,
+        reader_binary: &Path,
+    ) -> Result<freshell_runtime_protocol::RetainedStoreCompatibilityReceipt, BackendError> {
+        self.retained_store_helper(handle, request, reader_binary)
+            .await
+    }
     async fn read_native_history(
         &self,
         handle: &OwnedRuntimeHandle,
@@ -1378,6 +1394,8 @@ struct ExpectedConfig {
     opencode_transfer_dir: Option<String>,
     fresh_agent: Option<ImmutableFreshAgentConfig>,
     provider_volume_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_policy: Option<freshell_runtime_protocol::RuntimeLaunchPolicy>,
 }
 
 /// The registry updates session identity and turn settings while a container
@@ -1435,6 +1453,7 @@ impl ExpectedConfig {
                 .map(|path| path.to_string_lossy().into_owned()),
             fresh_agent: spec.fresh_agent.as_ref().map(Into::into),
             provider_volume_name: spec.provider_volume_name.clone(),
+            launch_policy: Some(freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1),
         }
     }
 }
@@ -1456,7 +1475,70 @@ fn immutable_digest_from_handle(handle: &OwnedRuntimeHandle) -> Result<String, B
         .map(|path| path.to_string_lossy().into_owned()),
         fresh_agent: handle.fresh_agent().map(Into::into),
         provider_volume_name: handle.provider_volume_name().to_owned(),
+        launch_policy: handle.launch_policy(),
     })
+}
+
+#[derive(Serialize)]
+struct LegacyExpectedTerminalConfig<'a> {
+    image_ref: &'a str,
+    installation_id: &'a str,
+    soul_id: &'a str,
+    incarnation_id: &'a str,
+    host_binary_path: std::borrow::Cow<'a, str>,
+    runtime_dir: std::borrow::Cow<'a, str>,
+    limits: RuntimeLimits,
+    terminal: Option<&'a TerminalLaunchSpec>,
+    fresh_agent: Option<()>,
+    provider_volume_name: &'a str,
+}
+
+fn known_legacy_opencode_profile(
+    handle: &OwnedRuntimeHandle,
+    tmpfs: &BTreeMap<String, String>,
+) -> bool {
+    let mut legacy = runtime_tmpfs(Some("opencode"));
+    legacy.remove("/run/freshell-private");
+    known_legacy_opencode_identity(handle) && tmpfs == &legacy
+}
+fn known_legacy_opencode_identity(handle: &OwnedRuntimeHandle) -> bool {
+    handle.launch_policy().is_none()
+        && handle.fresh_agent().is_none()
+        && handle.terminal().is_some_and(|terminal| {
+            terminal.mode == "opencode"
+                && terminal.provider_launch_context.is_none()
+                && terminal.opencode_transfer.is_none()
+                && terminal.opencode_adoption.is_none()
+        })
+}
+fn verify_saved_immutable_digest(handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+    if immutable_digest_from_handle(handle)? == handle.immutable_config_digest() {
+        return Ok(());
+    }
+    if known_legacy_opencode_identity(handle) {
+        // Exact serializer/order from7dbc7ef6, terminal-only/no transfer;
+        // retain its saved bytes and never infer a newer profile over it.
+        let legacy = LegacyExpectedTerminalConfig {
+            image_ref: handle.image_ref(),
+            installation_id: handle.installation_id().as_str(),
+            soul_id: handle.soul_id().as_str(),
+            incarnation_id: handle.incarnation_id().as_str(),
+            host_binary_path: handle.host_binary_path().to_string_lossy(),
+            runtime_dir: handle.runtime_dir().to_string_lossy(),
+            limits: handle.requested_limits(),
+            terminal: handle.terminal(),
+            fresh_agent: None,
+            provider_volume_name: handle.provider_volume_name(),
+        };
+        let bytes = serde_json::to_vec(&legacy)
+            .map_err(|error| BackendError::Malformed(error.to_string()))?;
+        if format!("sha256:{:x}", Sha256::digest(bytes)) == handle.immutable_config_digest() {
+            return Ok(());
+        }
+    }
+    Err(BackendError::OwnershipMismatch(
+        "registry immutable-config digest does not match its own fields".into(),
+    ))
 }
 
 fn digest_expected(expected: &ExpectedConfig) -> Result<String, BackendError> {
@@ -1685,11 +1767,12 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
                 .collect::<std::collections::BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    if actual_tmpfs != expected_tmpfs {
-        return Err(BackendError::OwnershipMismatch(format!(
-            "runtime tmpfs topology changed: {actual_tmpfs:?}"
-        )));
-    }
+    let tmpfs_well_formed = host_config
+        .get("Tmpfs")
+        .and_then(Value::as_object)
+        .is_some_and(|object| object.len() == actual_tmpfs.len());
+    let exact_legacy = tmpfs_well_formed && known_legacy_opencode_profile(handle, &actual_tmpfs);
+    let policy_mismatch = !tmpfs_well_formed || (actual_tmpfs != expected_tmpfs && !exact_legacy);
 
     let mounts = value
         .get("Mounts")
@@ -1700,11 +1783,13 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             == Some(handle.host_binary_path().to_string_lossy().as_ref())
             && m.get("Destination").and_then(Value::as_str)
                 == Some("/runtime/freshell-session-host")
+            && m.get("RW").and_then(Value::as_bool) == Some(false)
     });
     let has_runtime = mounts.iter().any(|m| {
         m.get("Source").and_then(Value::as_str)
             == Some(handle.runtime_dir().to_string_lossy().as_ref())
             && m.get("Destination").and_then(Value::as_str) == Some("/run/freshell")
+            && m.get("RW").and_then(Value::as_bool) == Some(true)
     });
     if !has_binary || !has_runtime {
         return Err(BackendError::OwnershipMismatch(
@@ -1714,6 +1799,7 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
     let has_provider = mounts.iter().any(|mount| {
         mount.get("Name").and_then(Value::as_str) == Some(handle.provider_volume_name())
             && mount.get("Destination").and_then(Value::as_str) == Some("/home/freshell/provider")
+            && mount.get("RW").and_then(Value::as_bool) == Some(true)
     });
     if !has_provider {
         return Err(BackendError::OwnershipMismatch(
@@ -1775,6 +1861,61 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
         let expected = docker::fresh_agent_mounts_for_adoption(agent)
             .map_err(BackendError::OwnershipMismatch)?;
         verify_workload_mounts(mounts, &expected)?;
+    }
+    // Each declared destination occurs once. Required source/access checks
+    // above still determine ownership; this rejects extra/duplicate enclosures.
+    let mut destinations = std::collections::BTreeSet::from([
+        "/runtime/freshell-session-host".to_owned(),
+        "/run/freshell".to_owned(),
+        "/home/freshell/provider".to_owned(),
+    ]);
+    if expected_transfer_mount.is_some() {
+        destinations.insert(OpenCodeTransferMountPlan::DESTINATION.into());
+    }
+    if handle.fresh_agent().is_some() {
+        destinations.insert(HOST_ACTOR_STATE_MOUNT.into());
+    }
+    let workload = handle
+        .terminal()
+        .map(docker::terminal_mounts)
+        .or_else(|| handle.fresh_agent().map(docker::fresh_agent_mounts))
+        .transpose()
+        .map_err(BackendError::OwnershipMismatch)?;
+    if let Some(workload) = workload {
+        destinations.insert(workload.workspace.to_string_lossy().into_owned());
+        if let Some(git) = workload
+            .git_common_dir
+            .filter(|git| !git.starts_with(&workload.workspace))
+        {
+            destinations.insert(git.to_string_lossy().into_owned());
+        }
+        for (index, _) in workload.provider_secret_files.iter().enumerate() {
+            destinations.insert(format!("/run/freshell-secrets/provider-{index}"));
+        }
+        for (index, _) in workload.provider_bootstrap_files.iter().enumerate() {
+            destinations.insert(format!("/run/freshell-bootstrap/provider-{index}"));
+        }
+        if workload.provider_user_root.is_some() {
+            destinations.insert("/run/freshell-private/user-provider".into());
+        }
+        if workload.mcp_capability_file.is_some() {
+            destinations.insert("/run/freshell/mcp-capability.json".into());
+        }
+    }
+    let actual = mounts
+        .iter()
+        .filter_map(|mount| mount["Destination"].as_str())
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual != destinations || mounts.len() != actual.len() {
+        return Err(BackendError::OwnershipMismatch(
+            "runtime gained extra, duplicate, or missing mounts".into(),
+        ));
+    }
+    if policy_mismatch {
+        return Err(BackendError::PolicyMismatch(
+            "owned_launch_policy_mismatch".into(),
+        ));
     }
     Ok(())
 }
@@ -1994,6 +2135,165 @@ mod tests {
     use super::*;
     use freshell_runtime_protocol::{FreshProvider, LaunchNonce};
     use std::os::unix::fs::PermissionsExt;
+
+    fn retained_opencode_fixture() -> (tempfile::TempDir, OwnedRuntimeHandle, Value) {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_dir = root.path().join("runtime");
+        let workspace = root.path().join("workspace");
+        let binary = root.path().join("host");
+        std::fs::create_dir(&runtime_dir).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(&binary, "owned fixture").unwrap();
+        let terminal:TerminalLaunchSpec=serde_json::from_value(json!({"terminalId":"terminal-retained","streamId":"stream-retained","mode":"opencode","program":"opencode","args":[],"cwd":workspace,"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"project-retained","workspacePath":workspace,"resumeSessionId":"ses_retained"})).unwrap();
+        let handle = OwnedRuntimeHandle::from_registry(
+            InstallationId::new(),
+            SoulId::new(),
+            "retained-store".into(),
+            IncarnationId::new(),
+            LaunchNonce::new(),
+            DockerDaemonId::new(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            "sha256:retained-image".into(),
+            runtime_dir.clone(),
+            binary.clone(),
+            "saved-digest".into(),
+            RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 128 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 64,
+            },
+            None,
+            Some(terminal),
+            None,
+            "freshell-provider-retained".into(),
+        );
+        let mut tmpfs = runtime_tmpfs(Some("opencode"));
+        tmpfs.remove("/run/freshell-private");
+        let inspection = json!({"Id":handle.container_id(),"Image":handle.image_ref(),"Config":{"Labels":{"com.freshell.managed":"true","com.freshell.installation-id":handle.installation_id(),"com.freshell.soul-id":handle.soul_id(),"com.freshell.incarnation-id":handle.incarnation_id()},"Env":runtime_host_environment(handle.terminal(),None).unwrap()},"HostConfig":{"NetworkMode":"bridge","PidMode":"","Privileged":false,"CapAdd":["CHOWN","SETUID","SETGID"],"Tmpfs":tmpfs},"Mounts":[{"Source":binary,"Destination":"/runtime/freshell-session-host","RW":false},{"Source":runtime_dir,"Destination":"/run/freshell","RW":true},{"Name":handle.provider_volume_name(),"Destination":"/home/freshell/provider","RW":true},{"Source":workspace,"Destination":workspace,"RW":true}]});
+        (root, handle, inspection)
+    }
+
+    #[test]
+    fn historical_legacy_serializer_remains_owned_without_rewriting_saved_digest() {
+        let (_root, original, inspection) = retained_opencode_fixture();
+        // Exact production serializer field/order from immutable7dbc7ef6;
+        // the physical fixture also uses its independently compiled creator.
+        let encoded=format!("{{\"image_ref\":{},\"installation_id\":{},\"soul_id\":{},\"incarnation_id\":{},\"host_binary_path\":{},\"runtime_dir\":{},\"limits\":{},\"terminal\":{},\"fresh_agent\":null,\"provider_volume_name\":{}}}",serde_json::to_string(original.image_ref()).unwrap(),serde_json::to_string(&original.installation_id()).unwrap(),serde_json::to_string(&original.soul_id()).unwrap(),serde_json::to_string(&original.incarnation_id()).unwrap(),serde_json::to_string(&original.host_binary_path()).unwrap(),serde_json::to_string(&original.runtime_dir()).unwrap(),serde_json::to_string(&original.requested_limits()).unwrap(),serde_json::to_string(&original.terminal()).unwrap(),serde_json::to_string(original.provider_volume_name()).unwrap());
+        let saved = format!("sha256:{:x}", Sha256::digest(encoded));
+        let handle = OwnedRuntimeHandle::from_registry(
+            original.installation_id().clone(),
+            original.soul_id().clone(),
+            original.provider_store_id().into(),
+            original.incarnation_id().clone(),
+            original.launch_nonce().clone(),
+            original.daemon_id().clone(),
+            original.container_id().into(),
+            original.image_ref().into(),
+            original.runtime_dir().into(),
+            original.host_binary_path().into(),
+            saved.clone(),
+            original.requested_limits(),
+            None,
+            original.terminal().cloned(),
+            None,
+            original.provider_volume_name().into(),
+        );
+        assert!(
+            verify_saved_immutable_digest(&handle).is_ok(),
+            "the exact known historical serializer must qualify without hash mutation"
+        );
+        assert_eq!(handle.immutable_config_digest(), saved);
+        let modern = handle.clone().with_launch_policy(Some(
+            freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1,
+        ));
+        assert!(verify_saved_immutable_digest(&modern).is_err());
+        let mut unknown = inspection.clone();
+        unknown["HostConfig"]["Tmpfs"]["/foreign"] = json!("rw");
+        assert!(verify_saved_immutable_digest(&handle).is_ok(),"the exact saved legacy codec remains valid independently of current actual mount policy");
+        assert!(
+            matches!(
+                verify_inspect_config(&handle, &unknown),
+                Err(BackendError::PolicyMismatch(_))
+            ),
+            "an owned historical enclosure with altered policy remains precisely blocked"
+        );
+        assert_eq!(handle.immutable_config_digest(), saved);
+    }
+
+    #[test]
+    fn retained_legacy_opencode_requires_exact_known_profile_and_protected_mounts() {
+        let (_root, handle, inspection) = retained_opencode_fixture();
+        assert!(
+            verify_inspect_config(&handle, &inspection).is_ok(),
+            "exact known legacy mount profile remains owned across supervisor upgrades"
+        );
+        assert_eq!(handle.immutable_config_digest(), "saved-digest");
+        assert!(matches!(
+            verify_inspect_config(
+                &handle.clone().with_launch_policy(Some(
+                    freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1
+                )),
+                &inspection
+            ),
+            Err(BackendError::PolicyMismatch(_))
+        ));
+        for changed in [
+            {
+                let mut value = inspection.clone();
+                value["Mounts"][0]["RW"] = json!(true);
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Mounts"][1]["RW"] = json!(false);
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Mounts"][2]["RW"] = json!(false);
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["HostConfig"]["Tmpfs"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("/tmp");
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["HostConfig"]["Tmpfs"]["/extra"] = json!("rw");
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Mounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"Source":"/foreign","Destination":"/foreign","RW":true}));
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Mounts"][0]["Source"] = json!("/foreign/host");
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Config"]["Labels"]["com.freshell.soul-id"] = json!("foreign-soul");
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Image"] = json!("sha256:foreign");
+                value
+            },
+        ] {
+            assert!(verify_inspect_config(&handle, &changed).is_err());
+        }
+    }
 
     #[test]
     fn provider_private_parent_mount_adoption_checks_topology_and_actor_ownership() {
@@ -2406,6 +2706,7 @@ mod tests {
                 opencode_transfer_dir: None,
                 fresh_agent: Some((&agent).into()),
                 provider_volume_name: "freshell-provider-one".into(),
+                launch_policy: None,
             })
             .unwrap()
         };

@@ -7,6 +7,7 @@ mod provider_input_preparation;
 mod provider_secret_resolution;
 mod providers;
 mod pty;
+mod retained_store;
 
 use freshell_agent_runtime::prepare_terminal_for_resume;
 use freshell_runtime_protocol::{
@@ -92,6 +93,7 @@ trait GrantExecutionEffects: Sync {
         terminal: &TerminalLaunchSpec,
         child_env: std::collections::BTreeMap<String, String>,
         codex: Option<providers::PreparedCodexLaunch>,
+        claude_settings: Option<String>,
     ) -> Result<SpawnedTerminalPty, RuntimeError>;
 }
 
@@ -125,6 +127,7 @@ impl GrantExecutionEffects for SystemGrantExecutionEffects {
         terminal: &TerminalLaunchSpec,
         child_env: std::collections::BTreeMap<String, String>,
         codex: Option<providers::PreparedCodexLaunch>,
+        claude_settings: Option<String>,
     ) -> Result<SpawnedTerminalPty, RuntimeError> {
         let opencode_adoption_revalidator = opencode_adoption_revalidator(terminal);
         let hosted = HostedPty::spawn(
@@ -133,6 +136,7 @@ impl GrantExecutionEffects for SystemGrantExecutionEffects {
             terminal,
             child_env,
             codex,
+            claude_settings,
             opencode_adoption_revalidator,
         )
         .await
@@ -361,7 +365,10 @@ fn main() {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("{{\"event\":\"session_host.fatal\",\"error\":\"runtime: {error}\"}}");
+            eprintln!(
+                "{}",
+                serde_json::json!({"severity":"error","event":"session_host.fatal","error":format!("runtime: {error}")})
+            );
             std::process::exit(1);
         }
     };
@@ -369,7 +376,7 @@ fn main() {
         Ok(()) => 0,
         Err(error) => {
             eprintln!(
-                "{{\"event\":\"session_host.fatal\",\"error\":{}}}",
+                "{{\"severity\":\"error\",\"event\":\"session_host.fatal\",\"error\":{}}}",
                 serde_json::to_string(&error).unwrap_or_else(|_| "\"unknown\"".into())
             );
             1
@@ -424,6 +431,7 @@ async fn run() -> Result<(), String> {
                 Path::new("/run/freshell-input-exchange/reply.sock"),
             ).map_err(str::to_owned)
         }
+        Some("retained-opencode-store-worker") => retained_store::run(&args[2..]),
         Some("native-history-only") => {
             let snapshot = freshell_freshagent::native_history::read(
                 &required_arg(&args[2..], "--provider")?,
@@ -441,6 +449,10 @@ async fn run() -> Result<(), String> {
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
+        Some("publish-provider-files") => {
+            if args.len()!=4 { return Err("publish-provider-files requires stage and provider HOME".into()); }
+            publish_provider_files(Path::new(&args[2]),Path::new(&args[3]))
+        },
         Some("opencode-import-worker") => run_opencode_import_worker(&args[2..]),
         Some("opencode-reader-probe") => run_opencode_reader_probe(&args[2..]),
         Some("opencode-stopped-repair-worker") => {
@@ -633,6 +645,9 @@ async fn dispatch_with_effects(
                     &state.incarnation_id,
                 ),
                 capabilities: vec![
+                    "owned-provider-config-v1".into(),
+                    "provider-store-probe-v1".into(),
+                    "opencode-adoption-observation-v1".into(),
                     "grant-v1".into(),
                     "stop-v1".into(),
                     "security-probe-v1".into(),
@@ -1552,7 +1567,10 @@ async fn grant_execution(
                     terminal.run_as_gid,
                     &state.provider_config_paths,
                 )
-                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+                .map_err(|error| {
+                    append_event_with_secret(&state.state_dir, &state.secret, "host.provider_config_publication_blocked", serde_json::json!({"severity":"warn","soulId":soul_id,"incarnationId":state.incarnation_id,"controlEpoch":control_epoch,"executionGeneration":execution_generation,"provider":terminal.mode,"reason":"selected_dependency_unavailable"})).ok();
+                    RuntimeError::new(RuntimeErrorCode::HostUnreachable,format!("capability_pending: provider configuration publication failed: {error}"))
+                })?;
             }
             let prepared = providers::prepare_terminal(
                 terminal,
@@ -3213,7 +3231,9 @@ fn prepare_provider_state_for_fresh_launch_at(
     prepare_provider_state_before_bootstrap_with(
         terminal,
         |terminal| {
-            let mut created = providers::prepare_provider_state_before_bootstrap(terminal)?;
+            let mut created = providers::prepare_provider_state_before_bootstrap_at(
+                terminal, &paths.provider_home, &paths.private_mount.join("user-provider"),
+            )?;
             let bootstrap = if terminal.provider_bootstrap_files.is_empty()
                 && terminal
                     .provider_launch_context
@@ -3374,14 +3394,6 @@ fn prepare_provider_bootstrap_files(
     transfer_created_paths(provider, home, &created, run_as_uid, run_as_gid)
 }
 
-fn prepare_provider_bootstrap_files_at(
-    files: &[ProviderBootstrapFile], run_as_uid: u32, run_as_gid: u32,
-    home: &Path, bootstrap_root: &Path,
-) -> Result<(), String> {
-    let created = write_provider_bootstrap_files("opencode", files, home, bootstrap_root)?;
-    transfer_created_paths("opencode", home, &created, run_as_uid, run_as_gid)
-}
-
 fn rollback_created_provider_paths(paths: &[PathBuf]) {
     let mut paths = paths.iter().collect::<Vec<_>>();
     paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
@@ -3395,46 +3407,6 @@ fn rollback_created_provider_paths(paths: &[PathBuf]) {
         }
     }
 }
-struct BootstrapPublication {
-    provider: String,
-    home: PathBuf,
-    // Every newly published inode needs ownership handoff, including replacements.
-    owned_paths: std::collections::BTreeSet<PathBuf>,
-    // Only newly created pathnames grant removal authority on failure.
-    new_paths: Vec<PathBuf>,
-    replacements: Vec<(PathBuf, PathBuf)>,
-}
-impl BootstrapPublication {
-    fn reserve(&self, path: &Path) -> Result<(), String> {
-        let observed = self
-            .owned_paths
-            .len()
-            .checked_add(usize::from(!self.owned_paths.contains(path)))
-            .and_then(|entries| entries.checked_add(1)) // mounted HOME handoff
-            .ok_or("created path accounting overflow")?;
-        if observed > freshell_platform::provider_environment::CopyLimits::default().max_entries {
-            return Err(format!("created provider paths exceed shared entry bound: observed {observed}, permitted 100000"));
-        }
-        Ok(())
-    }
-}
-impl Drop for BootstrapPublication {
-    fn drop(&mut self) {
-        rollback_created_provider_paths(&self.new_paths);
-        for (destination, backup) in self.replacements.iter().rev() {
-            if let Err(error) = std::fs::rename(backup, destination) {
-                emit_environment_event(serde_json::json!({
-                    "severity": "error", "event": "provider.bootstrap.rollback.failed",
-                    "stage": "session_host", "provider": self.provider,
-                    "operation": "restore_replacement",
-                    "relative_path": destination.strip_prefix(&self.home).unwrap_or(Path::new("")),
-                    "error_kind": format!("{:?}", error.kind()), "os_error": error.raw_os_error()
-                }));
-            }
-        }
-    }
-}
-
 fn write_provider_bootstrap_files(
     provider: &str,
     files: &[ProviderBootstrapFile],
@@ -3522,97 +3494,42 @@ fn write_provider_bootstrap_files_with_publish(
         }
         destinations.push(destination);
     }
-    // Read and bound every input before changing any selected destination. Both
-    // staged files and replacement backups remain on the mounted HOME filesystem.
-    let stage = tempfile::Builder::new()
-        .prefix(".freshell-bootstrap-")
-        .tempdir_in(home)
-        .map_err(|error| error.to_string())?;
     let selections = files
         .iter()
         .enumerate()
-        .map(|(index, _)| {
+        .map(|(index, file)| {
             let source = source_root.join(format!("provider-{index}"));
-            if !std::fs::metadata(&source)
-                .map_err(|error| error.to_string())?
-                .is_file()
-            {
+            let metadata = std::fs::symlink_metadata(&source)
+                .map_err(|_| "provider bootstrap input is unavailable")?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
                 return Err("provider bootstrap input must be a regular file".to_owned());
             }
             Ok(CopySelection {
-                source: std::fs::canonicalize(source).map_err(|error| error.to_string())?,
-                destination_relative: format!("provider-{index}").into(),
+                source: std::fs::canonicalize(source)
+                    .map_err(|_| "provider bootstrap input is unavailable")?,
+                destination_relative: file.provider_relative_path.clone().into(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    copy_environment_with_events(
-        "bootstrap_inputs",
-        provider,
+    let publication = freshell_platform::provider_environment::stage_environment_with_publication(
         &selections,
-        &stage.path().join("inputs"),
+        home,
         &[],
+        Default::default(),
+        &mut publish,
     )
     .map_err(|error| error.to_string())?;
-    let mut created = BootstrapPublication {
-        provider: provider.into(),
-        home: home.into(),
-        owned_paths: std::collections::BTreeSet::new(),
-        new_paths: Vec::new(),
-        replacements: Vec::new(),
-    };
-    for (index, destination) in destinations.iter().enumerate() {
-        let relative = destination
-            .strip_prefix(home)
-            .map_err(|error| error.to_string())?;
-        let mut parent = home.to_path_buf();
-        for part in relative.parent().into_iter().flat_map(Path::components) {
-            parent.push(part.as_os_str());
-            match std::fs::symlink_metadata(&parent) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-                Ok(_) => {
-                    return Err("provider bootstrap parent must be a physical directory".into())
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    created.reserve(&parent)?;
-                    std::fs::create_dir(&parent).map_err(|error| error.to_string())?;
-                    created.owned_paths.insert(parent.clone());
-                    created.new_paths.push(parent.clone());
-                    set_mode(&parent, 0o700)?;
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        created.reserve(destination)?;
-        let replacement = match std::fs::symlink_metadata(destination) {
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
-            Ok(_) => return Err("provider bootstrap destination must be a regular file".into()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(error.to_string()),
-        };
-        let input = stage.path().join(format!("inputs/provider-{index}"));
-        set_mode(&input, 0o600)?;
-        // Sync each complete input before publishing it, as the prior writer did.
-        std::fs::File::open(&input)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| error.to_string())?;
-        if replacement {
-            let backup = stage.path().join(format!("backup-{index}"));
-            std::fs::rename(destination, &backup).map_err(|error| error.to_string())?;
-            created.replacements.push((destination.clone(), backup));
-        }
-        publish(&input, destination).map_err(|error| error.to_string())?;
-        created.owned_paths.insert(destination.clone());
-        if !replacement {
-            created.new_paths.push(destination.clone());
-        }
-    }
-    // Committing leaves only the exact new inode ownership ledger. Backups are
-    // attempt-owned and disappear with the stage; adopted parents are excluded.
-    created.new_paths.clear();
-    created.replacements.clear();
-    let mut paths = std::mem::take(&mut created.owned_paths);
-    paths.insert(home.to_owned());
-    Ok(paths.into_iter().collect())
+    let mut paths = publication
+        .created_paths()
+        .iter()
+        .map(|path| home.join(path))
+        .collect::<Vec<_>>();
+    publication.commit().map_err(|error| error.to_string())?;
+    paths.push(home.to_owned());
+    emit_environment_event(
+        serde_json::json!({"severity":"info","event":"provider.bootstrap.published","provider":provider,"entries":paths.len()}),
+    );
+    Ok(paths)
 }
 
 // Preparation produces at most start/completion (or failure) records per copy,
@@ -7259,34 +7176,11 @@ fn prepare_provider_files_at(
     if provider_files.is_empty() && configuration_files.is_empty() {
         return Ok(());
     }
-    if !provider_files.is_empty() || !indexed_configuration {
+    if !configuration_files.is_empty() && !indexed_configuration {
         std::fs::create_dir_all(auth_dir).map_err(|error| error.to_string())?;
         set_mode(auth_dir, 0o711)?;
     }
-    // Retain native auth until a matching typed grant has been written and
-    // owned. The final destination replacement occurs only for that grant.
-    for (index, (relative, contents)) in provider_files.iter().enumerate() {
-        use std::io::Write;
-        let destination = home.join(relative);
-        let mut target = tempfile::Builder::new()
-            .prefix(&format!("provider-{index}-"))
-            .tempfile_in(auth_dir)
-            .map_err(|error| error.to_string())?;
-        target
-            .write_all(contents)
-            .map_err(|error| error.to_string())?;
-        target
-            .as_file()
-            .sync_all()
-            .map_err(|error| error.to_string())?;
-        set_mode(target.path(), 0o600)?;
-        set_owner(target.path(), run_as_uid, run_as_gid)?;
-        publish_configuration_link(&destination, target.path(), run_as_uid, run_as_gid)
-            .map_err(str::to_owned)?;
-        // The accepted link now owns this target for this host lifetime. A
-        // failed publication instead drops the unselected temporary target.
-        target.keep().map_err(|error| error.error.to_string())?;
-    }
+    prepare_native_provider_files_at(provider_files, run_as_uid, run_as_gid, home, auth_dir)?;
     let mut aggregate = 0u64;
     for (index, (relative, source)) in configuration_files.iter().enumerate() {
         let destination = home.join(relative);
@@ -7464,6 +7358,135 @@ fn publish_configuration_link(
             .map_err(|_| "configuration-file failed link cleanup failed")?;
     }
     published.map_err(|_| "configuration-file link publication failed")
+}
+
+fn prepare_native_provider_files_at(
+    provider_files: &[(&str, Vec<u8>)],
+    run_as_uid: u32,
+    run_as_gid: u32,
+    home: &Path,
+    auth_dir: &Path,
+) -> Result<(), String> {
+    // No new publication grants authority over credentials already retained
+    // in the exact provider volume (including the Kilroy bootstrap exception).
+    if provider_files.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(auth_dir).map_err(|_| "provider secret stage is unavailable")?;
+    set_mode(auth_dir, 0o711)?;
+    let attempt = tempfile::Builder::new()
+        .prefix("provider-inputs-")
+        .tempdir_in(auth_dir)
+        .map_err(|_| "provider secret attempt cannot be staged")?;
+    let stage = attempt.path();
+    set_mode(stage, 0o711)?;
+    let mut relatives = Vec::with_capacity(provider_files.len());
+    for (index, (relative, contents)) in provider_files.iter().enumerate() {
+        if !matches!(
+            *relative,
+            ".claude/.credentials.json"
+                | ".codex/auth.json"
+                | ".local/share/opencode/auth.json"
+                | ".amplifier/keys.env"
+                | ".config/onecli/gateway-ca.pem"
+        ) {
+            return Err("unsupported provider secret publication path".into());
+        }
+        let target = stage.join(format!("provider-{index}"));
+        let temporary = stage.join(format!(".provider-{index}-{}", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|_| "provider secret input cannot be created")?;
+        file.write_all(contents)
+            .and_then(|()| file.sync_all())
+            .map_err(|_| "provider secret input cannot be synchronized")?;
+        std::fs::rename(&temporary, &target)
+            .map_err(|_| "provider secret input cannot be published")?;
+        set_mode(&target, 0o600)?;
+        set_owner(&target, run_as_uid, run_as_gid)?;
+        relatives.push(*relative);
+    }
+    let manifest = stage.join("provider-files.json");
+    let temporary = stage.join(format!(".provider-files-{}", std::process::id()));
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec(&relatives).map_err(|_| "encode provider publication metadata")?,
+    )
+    .map_err(|_| "write provider publication metadata")?;
+    set_mode(&temporary, 0o640)?;
+    std::fs::rename(&temporary, &manifest).map_err(|_| "publish provider publication metadata")?;
+    if run_as_uid == unsafe { libc::geteuid() } && run_as_gid == unsafe { libc::getegid() } {
+        return publish_provider_files(stage, home);
+    }
+    let executable =
+        std::env::current_exe().map_err(|_| "provider publication helper is unavailable")?;
+    run_provider_path_command(
+        run_as_uid,
+        run_as_gid,
+        executable
+            .to_str()
+            .ok_or("provider publication helper path is invalid")?,
+        &[
+            "publish-provider-files",
+            stage
+                .to_str()
+                .ok_or("provider secret stage path is invalid")?,
+            home.to_str().ok_or("provider HOME path is invalid")?,
+        ],
+    )
+}
+
+fn publish_provider_files(stage: &Path, home: &Path) -> Result<(), String> {
+    let manifest = std::fs::read(stage.join("provider-files.json"))
+        .map_err(|_| "provider publication metadata is unavailable")?;
+    if manifest.len() > 4096 {
+        return Err("provider publication metadata exceeds its bound".into());
+    }
+    let relatives: Vec<String> = serde_json::from_slice(&manifest)
+        .map_err(|_| "provider publication metadata is invalid")?;
+    if relatives.is_empty() || relatives.len() > 16 {
+        return Err("provider publication count is invalid".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let selections = relatives
+        .iter()
+        .enumerate()
+        .map(|(index, relative)| {
+            if !matches!(
+                relative.as_str(),
+                ".claude/.credentials.json"
+                    | ".codex/auth.json"
+                    | ".local/share/opencode/auth.json"
+                    | ".amplifier/keys.env"
+                    | ".config/onecli/gateway-ca.pem"
+            ) || !seen.insert(relative)
+            {
+                return Err("provider publication destination is invalid or duplicated".to_owned());
+            }
+            Ok(freshell_platform::provider_environment::CopySelection {
+                source: stage.join(format!("provider-{index}")),
+                destination_relative: relative.into(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    freshell_platform::provider_environment::copy_environment(
+        &selections,
+        home,
+        &[],
+        Default::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    emit_environment_event(
+        serde_json::json!({"severity":"info","event":"provider.secret_files.published","entries":relatives.len(),"provider_uid":unsafe{libc::geteuid()},"provider_gid":unsafe{libc::getegid()}}),
+    );
+    Ok(())
 }
 
 fn run_provider_path_command(
@@ -8281,6 +8304,188 @@ fn now_millis() -> i64 {
 mod tests {
     #[path = "probe_recovery_tests.rs"]
     mod probe_recovery;
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_failed_secret_source_attempt_cleans_only_its_inputs_and_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let inputs = root.path().join("inputs");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&inputs).unwrap();
+        std::fs::write(inputs.join("unrelated"), "preserve").unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        assert!(prepare_provider_files_at(
+            &home,
+            &inputs,
+            &[
+                (".codex/auth.json", b"first".to_vec()),
+                ("unsupported", vec![])
+            ],
+            &[],
+            uid,
+            gid,
+            false,
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read_dir(&inputs).unwrap().count(),
+            1,
+            "failed source staging must not leave private attempt files"
+        );
+        assert_eq!(
+            std::fs::read(inputs.join("unrelated")).unwrap(),
+            b"preserve"
+        );
+        prepare_provider_files_at(
+            &home,
+            &inputs,
+            &[(".codex/auth.json", b"retry".to_vec())],
+            &[],
+            uid,
+            gid,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(home.join(".codex/auth.json")).unwrap(),
+            b"retry"
+        );
+        assert_eq!(std::fs::read_dir(&inputs).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn provider_config_typed_codex_auth_and_ca_publish_as_private_owner_files() {
+        use freshell_runtime_protocol::{ProviderSecretProfile, ProviderSecretReference};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let mounts = root.path().join("mounts");
+        let home = root.path().join("home");
+        std::fs::create_dir(&mounts).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(
+            mounts.join("provider-0"),
+            "HTTPS_PROXY=http://192.0.2.10:10255\n",
+        )
+        .unwrap();
+        std::fs::write(mounts.join("provider-1"),r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"fixture-id","access_token":"fixture-access","refresh_token":"fixture-refresh","account_id":"fixture-account"},"last_refresh":"2026-10-06T00:00:00Z"}"#).unwrap();
+        std::fs::write(mounts.join("provider-2"), "fixture-ca").unwrap();
+        let refs = [
+            ProviderSecretProfile::CodexOnecliEnvironment,
+            ProviderSecretProfile::CodexOnecliAuthFile,
+            ProviderSecretProfile::CodexOnecliCaFile,
+        ]
+        .into_iter().enumerate().map(|(index, profile)| ProviderSecretReference {
+            source_path: mounts.join(format!("provider-{index}")).to_string_lossy().into_owned(),
+            profile,
+            provider_relative_path: None,
+        }).collect::<Vec<_>>();
+        let resolved =
+            provider_secret_resolution::resolve_child_secrets("codex", &refs, &mounts).unwrap();
+        assert_eq!(
+            resolved
+                .environment
+                .get("SSL_CERT_FILE")
+                .map(String::as_str),
+            Some("/home/freshell/provider/.config/onecli/gateway-ca.pem")
+        );
+        assert!(!resolved.environment.contains_key("OPENAI_API_KEY"));
+        prepare_provider_files_at(
+            &home,
+            &root.path().join("inputs"),
+            &resolved.provider_files,
+            &[],
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            false,
+        )
+        .unwrap();
+        for (relative, bytes) in &resolved.provider_files {
+            let file = home.join(relative);
+            let metadata = std::fs::symlink_metadata(&file).unwrap();
+            assert!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "provider native auth and CA must be regular owned files"
+            );
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.gid(), unsafe { libc::getegid() });
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::read(&file).unwrap(), *bytes);
+            std::fs::write(&file, bytes).expect("provider owns native refresh publication");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_bootstrap_failure_preserves_prior_inode_and_siblings() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let inputs = root.path().join("inputs");
+        std::fs::create_dir_all(home.join("selected")).unwrap();
+        std::fs::create_dir(&inputs).unwrap();
+        let prior = home.join("selected/first");
+        std::fs::write(&prior, "prior-config").unwrap();
+        std::fs::write(home.join("sibling"), "durable-sibling").unwrap();
+        let inode = std::fs::metadata(&prior).unwrap().ino();
+        let sibling = std::fs::metadata(home.join("sibling")).unwrap().ino();
+        std::fs::write(inputs.join("provider-0"), "replacement").unwrap();
+        let files = ["selected/first", "selected/second"].map(|relative| ProviderBootstrapFile {
+            source_path: String::new(),
+            provider_relative_path: relative.into(),
+        });
+        assert!(write_provider_bootstrap_files("codex", &files, &home, &inputs).is_err());
+        assert_eq!(std::fs::read(&prior).unwrap(), b"prior-config");
+        assert_eq!(std::fs::metadata(&prior).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::metadata(home.join("sibling")).unwrap().ino(),
+            sibling
+        );
+        assert_eq!(
+            std::fs::read(home.join("sibling")).unwrap(),
+            b"durable-sibling"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_failed_selected_refresh_preserves_original_projection() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let stage = root.path().join("stage");
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        std::fs::create_dir_all(stage.join("projection/skills")).unwrap();
+        std::fs::write(home.join("skills/old"), "prior-script").unwrap();
+        std::fs::write(home.join("skills/sibling"), "sibling").unwrap();
+        std::fs::write(
+            home.join(PROVIDER_PROJECTION_MANIFEST),
+            r#"["skills","skills/old"]"#,
+        )
+        .unwrap();
+        let prior = std::fs::metadata(home.join("skills/old")).unwrap().ino();
+        std::fs::write(stage.join("manifest.json"), r#"["skills"]"#).unwrap();
+        std::fs::write(
+            stage.join("projection").join(PROVIDER_PROJECTION_MANIFEST),
+            r#"["skills","skills/missing"]"#,
+        )
+        .unwrap();
+        symlink("absent", stage.join("projection/skills/missing")).unwrap();
+        assert!(apply_staged_provider_config(&stage, &home).is_err());
+        assert_eq!(
+            std::fs::read(home.join("skills/old")).unwrap(),
+            b"prior-script"
+        );
+        assert_eq!(
+            std::fs::metadata(home.join("skills/old")).unwrap().ino(),
+            prior
+        );
+        assert_eq!(
+            std::fs::read(home.join("skills/sibling")).unwrap(),
+            b"sibling"
+        );
+    }
+    use super::*;
 
     #[test]
     fn committed_journal_directory_sync_failure_is_not_treated_as_pre_publish() {
@@ -9024,7 +9229,7 @@ mod tests {
         prepare_provider_files_at(
             &home,
             &root.path().join("ca-only"),
-            &[(".freshell/opencode/ca.pem", b"synthetic-ca".to_vec())],
+            &[(".config/onecli/gateway-ca.pem", b"synthetic-ca".to_vec())],
             &[],
             uid,
             gid,
@@ -9044,7 +9249,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read(&auth).unwrap(), replacement);
-        assert!(std::fs::symlink_metadata(&auth)
+        assert!(!std::fs::symlink_metadata(&auth)
             .unwrap()
             .file_type()
             .is_symlink());
@@ -9616,7 +9821,7 @@ mod tests {
 
     #[test]
     fn provider_native_auth_failed_replacement_retains_prior_usable_destination() {
-        use std::{fs, os::unix::fs::PermissionsExt};
+        use std::{fs, os::unix::fs::{MetadataExt, PermissionsExt}};
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let auth_dir = root.path().join("auth");
@@ -9635,7 +9840,9 @@ mod tests {
             false,
         )
         .unwrap();
-        let prior_target = fs::read_link(&auth).unwrap();
+        let prior_metadata = fs::symlink_metadata(&auth).unwrap();
+        assert!(prior_metadata.is_file() && !prior_metadata.file_type().is_symlink());
+        let prior_stage_count = fs::read_dir(&auth_dir).unwrap().count();
         fs::set_permissions(auth.parent().unwrap(), fs::Permissions::from_mode(0o500)).unwrap();
         let failed = prepare_provider_files_at(
             &home,
@@ -9653,14 +9860,15 @@ mod tests {
             b"prior-typed-auth",
             "failed selected auth publication changed the old destination's contents"
         );
-        assert_eq!(fs::read_link(&auth).unwrap(), prior_target);
+        let after = fs::symlink_metadata(&auth).unwrap();
+        assert!(after.is_file() && !after.file_type().is_symlink());
+        assert_eq!(after.ino(), prior_metadata.ino());
         assert_eq!(
             fs::read_dir(&auth_dir).unwrap().count(),
-            1,
+            prior_stage_count,
             "failed auth publication must remove its new resources"
         );
     }
-    use super::*;
 
     #[cfg(unix)]
     #[test]
@@ -10559,7 +10767,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn provider_config_copy_keeps_selected_external_and_in_root_resources() {
+    fn provider_config_projects_selected_external_resources_without_escaping_home() {
         use freshell_runtime_protocol::{
             ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
         };
@@ -10572,7 +10780,7 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::create_dir_all(&destination).unwrap();
         std::fs::write(workspace.join("inside/opencode.json"), b"inside").unwrap();
-        std::fs::write(outside.join("opencode.json"), b"outside-secret").unwrap();
+        std::fs::write(outside.join("opencode.json"), b"selected-outside-resource").unwrap();
         symlink(&outside, workspace.join(".opencode")).unwrap();
         symlink(workspace.join("inside"), workspace.join("linked-inside")).unwrap();
         let context = ProviderLaunchContext {
@@ -10611,8 +10819,16 @@ mod tests {
         .unwrap();
         assert_eq!(
             std::fs::read(destination.join(".config/opencode/project/escaped.json")).unwrap(),
-            b"outside-secret"
+            b"selected-outside-resource"
         );
+        assert_eq!(
+            std::fs::read(outside.join("opencode.json")).unwrap(),
+            b"selected-outside-resource"
+        );
+        let projected =
+            std::fs::canonicalize(destination.join(".config/opencode/project/escaped.json"))
+                .unwrap();
+        assert!(projected.starts_with(&destination));
         assert_eq!(
             std::fs::read(destination.join(".config/opencode/project/allowed.json")).unwrap(),
             b"inside"
@@ -11048,6 +11264,8 @@ mod tests {
             std::fs::read(destination.join(".claude/plugins/provider-created.js")).unwrap(),
             b"durable"
         );
+        // The producer's next selected generation deliberately omits the
+        // removed optional file; this authorizes retiring its old projection.
         context
             .config
             .retain(|reference| reference.relative_path != "settings.json");
@@ -12005,6 +12223,7 @@ mod tests {
                 fresh_agent: None,
                 resume_spec: None,
             },
+            &SystemGrantExecutionEffects,
         )
         .await;
         assert!(result.is_err());
@@ -12076,8 +12295,8 @@ mod tests {
             let grant = GrantId::new();
             for attempt in 0..2 {
                 let error = grant_execution(
-                    &state,
-                    GrantExecutionRequest {
+            &state,
+            GrantExecutionRequest {
                         soul_id: SoulId::new(),
                         control_epoch: 1,
                         execution_generation: 1,
@@ -12088,7 +12307,8 @@ mod tests {
                         fresh_agent: fresh.clone(),
                         resume_spec: Some(resume.clone()),
                     },
-                )
+            &SystemGrantExecutionEffects,
+        )
                 .await
                 .unwrap_err();
                 assert_eq!(
@@ -12148,8 +12368,8 @@ mod tests {
             .enumerate()
             {
                 let error = grant_execution(
-                    &state,
-                    GrantExecutionRequest {
+            &state,
+            GrantExecutionRequest {
                         soul_id: SoulId::new(),
                         control_epoch: 1,
                         execution_generation: 1,
@@ -12160,7 +12380,8 @@ mod tests {
                         fresh_agent: None,
                         resume_spec: Some(resume.clone()),
                     },
-                )
+            &SystemGrantExecutionEffects,
+        )
                 .await
                 .unwrap_err();
                 assert_eq!(
@@ -12412,6 +12633,49 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--session", native_session_id]));
         assert!(!exact_launch.args.iter().any(|arg| arg == "--continue"));
+        let mut blocked_state = test_host_state();
+        Arc::get_mut(&mut blocked_state)
+            .unwrap()
+            .provider_config_paths = ProviderConfigPaths {
+            private_mount: workspace.path().join("private-mount"),
+            provider_home: provider_home.clone(),
+        };
+        let hidden_source = workspace.path().join("source-unavailable");
+        std::fs::rename(&source_config, &hidden_source).unwrap();
+        let denied = authenticated_host_envelope(
+            &blocked_state,
+            HostCommand::GrantExecution {
+                provider_path_inputs: Default::default(),
+                incarnation_id: blocked_state.incarnation_id.clone(),
+                soul_id: SoulId::new(),
+                host_boot_id: blocked_state.host_boot_id.clone(),
+                control_epoch: 1,
+                execution_generation: 1,
+                grant_id: GrantId::new(),
+                fixture: None,
+                terminal: Some(Box::new(terminal.clone())),
+                fresh_agent: None,
+                resume_spec: Some(Box::new(resume_spec.clone())),
+            },
+        );
+        let failure = dispatch(denied, &blocked_state)
+            .await
+            .expect_err("missing selected configuration must refuse execution");
+        assert_eq!(failure.code, RuntimeErrorCode::HostUnreachable);
+        assert!(
+            failure
+                .message
+                .starts_with("capability_pending: provider configuration publication failed:"),
+            "configuration refusal needs a recoverable preparation classification: {}",
+            failure.message
+        );
+        assert_eq!(blocked_state.persisted.lock().await.worker_launch_count, 0);
+        assert!(blocked_state.pty.lock().await.is_none());
+        assert_eq!(
+            std::fs::read(provider_home.join(".config/opencode/opencode.json")).unwrap(),
+            br#"{"model":"first"}"#
+        );
+        std::fs::rename(&hidden_source, &source_config).unwrap();
         let envelope = authenticated_host_envelope(
             &state,
             HostCommand::GrantExecution {
@@ -13107,6 +13371,7 @@ mod tests {
             terminal: &TerminalLaunchSpec,
             _child_env: std::collections::BTreeMap<String, String>,
             _codex: Option<providers::PreparedCodexLaunch>,
+            _claude_settings: Option<String>,
         ) -> Result<SpawnedTerminalPty, RuntimeError> {
             let call_order = self.events.lock().unwrap().clone();
             if !matches!(
@@ -13312,6 +13577,7 @@ mod tests {
                 control_epoch: 1,
                 execution_generation,
                 grant_id,
+                provider_path_inputs: Default::default(),
                 fixture: None,
                 terminal: Some(Box::new(terminal)),
                 fresh_agent: None,
@@ -13563,6 +13829,8 @@ mod tests {
         std::fs::create_dir(&runtime_dir).map_err(|error| error.to_string())?;
         let image_ref = descriptor.target_image_ref.clone();
         let backend_spec = freshell_supervisor::backend::CreateRuntimeSpec {
+                initial_input_reservation: None,
+                prior_provider_owner: None,
             installation_id: freshell_runtime_protocol::InstallationId::parse(
                 "synthetic-installation",
             )
@@ -13619,6 +13887,7 @@ mod tests {
                 control_epoch: 1,
                 execution_generation: 1,
                 grant_id,
+                provider_path_inputs: Default::default(),
                 fixture: None,
                 terminal: Some(Box::new(terminal)),
                 fresh_agent: None,
@@ -13797,6 +14066,7 @@ mod tests {
                 control_epoch: 2,
                 execution_generation: 2,
                 grant_id,
+                provider_path_inputs: Default::default(),
                 fixture: None,
                 terminal: Some(Box::new(terminal)),
                 fresh_agent: None,
@@ -14416,7 +14686,7 @@ mod tests {
             std::fs::create_dir_all(home.join("bootstrap")).unwrap();
             std::fs::create_dir(&inputs).unwrap();
             let first = home.join("bootstrap/first.json");
-            let last = home.join("bootstrap/last.json");
+            let last = home.join("bootstrap/zz-last.json");
             let sibling = home.join("bootstrap/sibling");
             for (path, bytes, mode) in [
                 (&first, "prior-first", 0o640),
@@ -14433,8 +14703,8 @@ mod tests {
             let before = [metadata(&first), metadata(&last), metadata(&sibling)];
             let files = [
                 "bootstrap/first.json",
-                "new-parent/second.json",
-                "bootstrap/last.json",
+                "bootstrap/middle-created/second.json",
+                "bootstrap/zz-last.json",
             ]
             .map(|relative| ProviderBootstrapFile {
                 source_path: "fixture".into(),
@@ -14462,7 +14732,8 @@ mod tests {
                             "first replacement was actually published before failure"
                         );
                         assert_eq!(
-                            std::fs::read(home.join("new-parent/second.json")).unwrap(),
+                            std::fs::read(home.join("bootstrap/middle-created/second.json"))
+                                .unwrap(),
                             b"new-1"
                         );
                         return Err(std::io::Error::other("synthetic late publication failure"));
@@ -14470,9 +14741,7 @@ mod tests {
                     std::fs::rename(source, destination)
                 },
             );
-            assert!(failure
-                .unwrap_err()
-                .contains("synthetic late publication failure"));
+            assert!(failure.unwrap_err().contains("publish_leaf"));
             assert_eq!(published, 3);
             assert_eq!(std::fs::read(&first).unwrap(), b"prior-first");
             assert_eq!(std::fs::read(&last).unwrap(), b"prior-last");
@@ -14481,7 +14750,7 @@ mod tests {
                 [metadata(&first), metadata(&last), metadata(&sibling)],
                 before
             );
-            assert!(!home.join("new-parent").exists());
+            assert!(!home.join("bootstrap/middle-created").exists());
             assert_eq!(
                 std::fs::read_dir(&home).unwrap().count(),
                 1,
@@ -14491,7 +14760,7 @@ mod tests {
                 write_provider_bootstrap_files("amplifier", &files, &home, &inputs).unwrap();
             assert!(owned.contains(&first));
             assert!(owned.contains(&last));
-            assert!(owned.contains(&home.join("new-parent")));
+            assert!(owned.contains(&home.join("bootstrap/middle-created")));
             assert!(!owned.contains(&home.join("bootstrap")));
             assert!(!owned.contains(&sibling));
             assert_eq!(std::fs::read(&first).unwrap(), b"new-0");
@@ -14536,6 +14805,79 @@ mod tests {
                 "physical lchown must leave the target inode untouched"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_absent_new_auth_preserves_verified_native_credential_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("provider");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        let auth = home.join(".codex/auth.json");
+        std::fs::write(&auth, b"existing-selected-onecli-auth").unwrap();
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let before = std::fs::metadata(&auth).unwrap();
+        prepare_provider_files_at(
+            &home,
+            &root.path().join("auth-stage"),
+            &[],
+            &[],
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            false,
+        )
+        .unwrap();
+        let after=std::fs::metadata(&auth).expect("empty new references cannot remove credentials already qualified in the exact provider volume");
+        assert_eq!(
+            (after.ino(), after.mode(), after.uid(), after.gid()),
+            (before.ino(), before.mode(), before.uid(), before.gid())
+        );
+        assert_eq!(
+            std::fs::read(&auth).unwrap(),
+            b"existing-selected-onecli-auth"
+        );
+    }
+
+    #[test]
+    fn provider_config_selected_amplifier_bundle_binds_new_seed_and_preserves_existing_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("provider");
+        let selected = root.path().join("selected");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(
+            selected.join("settings.yaml"),
+            "bundle:\n  active: selected-ordinary\n",
+        )
+        .unwrap();
+        let mut terminal:TerminalLaunchSpec=serde_json::from_value(serde_json::json!({"terminalId":"bundle-seed","streamId":"stream","mode":"amplifier","program":"amplifier","args":[],"cwd":root.path(),"runAsUid":unsafe{libc::geteuid()},"runAsGid":unsafe{libc::getegid()},"cols":80,"rows":24,"projectKey":"project","workspacePath":root.path(),"resumeSessionId":"exact-seed","providerLaunchContext":{"preparation":{"amplifier":{"bundle":"default","resume_args":[]}},"config":[{"root":"user_provider","relativePath":"settings.yaml","providerRelativePath":".amplifier/settings.yaml","format":"yaml"}]}})).unwrap();
+        let ledger =
+            providers::prepare_provider_state_before_bootstrap_at(&mut terminal, &home, &selected)
+                .unwrap();
+        let metadata = ledger
+            .iter()
+            .find(|path| path.file_name().is_some_and(|name| name == "metadata.json"))
+            .unwrap();
+        let bytes = std::fs::read(metadata).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["bundle"], "selected-ordinary",
+            "a new native seed must use the selected global settings before projection"
+        );
+        std::fs::write(selected.join("settings.yaml"), "bundle:\n  active: other\n").unwrap();
+        assert!(providers::prepare_provider_state_before_bootstrap_at(
+            &mut terminal,
+            &home,
+            &selected
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            std::fs::read(metadata).unwrap(),
+            bytes,
+            "an exact existing session retains its native metadata"
+        );
     }
 
     #[cfg(unix)]

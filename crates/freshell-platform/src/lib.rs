@@ -540,5 +540,3 @@ mod inject_tests {
         assert!(!probe.exists("/bin/zsh"));
     }
 }
-
-pub mod provider_environment;

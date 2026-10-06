@@ -59,11 +59,25 @@ describe('live Amplifier OneCLI qualification grants', () => {
     })).toEqual([onecliGrant])
   })
 
-  it('admits the OpenCode OneCLI gateway CA grant to the sandbox broker', () => {
+  it.each(['CLAUDE', 'CODEX', 'OPENCODE', 'AMPLIFIER'])('admits the typed %s gateway CA grant to the broker', provider => {
     const caGrant = privateGrant('gateway-ca.pem')
     expect(phase2BootstrapFiles({
-      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: caGrant,
+      [`FRESHELL_MANAGED_${provider}_ONECLI_CA_FILE`]: caGrant,
     })).toEqual([caGrant])
+  })
+
+  it.each(['CLAUDE', 'CODEX', 'OPENCODE', 'AMPLIFIER'])('refuses linked and public %s CA references before broker admission', provider => {
+    const grant=privateGrant('gateway-ca.pem')
+    const key=`FRESHELL_MANAGED_${provider}_ONECLI_CA_FILE`
+    const link=path.join(path.dirname(grant),'linked.pem');fs.symlinkSync(grant,link)
+    expect(()=>phase2BootstrapFiles({[key]:link})).toThrow(/regular file/)
+    fs.chmodSync(grant,0o644)
+    expect(()=>phase2BootstrapFiles({[key]:grant})).toThrow(/private/)
+  })
+
+  it('a CA file alone does not authorize Amplifier live qualification', () => {
+    const caGrant = privateGrant('gateway-ca.pem')
+    expect(() => requireAmplifierOnecliBootstrap({ FRESHELL_MANAGED_AMPLIFIER_ONECLI_CA_FILE: caGrant })).toThrow(/ONECLI_ENV_FILE.*ONECLI_AUTH_FILE/)
   })
 
   it('rejects a missing grant even when the old keys-file input is set', () => {

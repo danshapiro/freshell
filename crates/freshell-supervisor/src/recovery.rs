@@ -87,6 +87,70 @@ enum NativeIdentityWait {
 const NATIVE_IDENTITY_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const OPENCODE_ADOPTION_READINESS_TIMEOUT: Duration = Duration::from_secs(180);
 
+fn retained_runtime_probe(
+    exited: bool,
+    handle: ReattachHandle,
+    captured: RecoveryProbe,
+    native_store_required: bool,
+) -> RecoveryProbe {
+    if exited {
+        return captured;
+    }
+    if !native_store_required {
+        return RecoveryProbe::ReattachReady {
+            handle,
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+        };
+    }
+    match captured {
+        RecoveryProbe::ResumeReady { .. } | RecoveryProbe::PristineSeedReady { .. } => {
+            RecoveryProbe::ReattachReady {
+                handle,
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+            }
+        }
+        RecoveryProbe::DefinitivelyUnavailable { .. } => blocked(
+            RecoveryPath::Reattach,
+            RecoveryBlockReason::StoreUnreadable,
+            "running provider has no qualified current store",
+            Some(2000),
+        ),
+        other => other,
+    }
+}
+
+fn retained_host_features_known(host: &crate::service::AuthenticatedHost) -> bool {
+    ["owned-provider-config-v1", "provider-store-probe-v1"]
+        .iter()
+        .all(|required| {
+            host.capabilities
+                .iter()
+                .any(|capability| capability == required)
+        })
+}
+fn retained_status_observed(
+    context: &RecoveryContext,
+    host: &crate::service::AuthenticatedHost,
+    status: &crate::service::HostStatus,
+) -> bool {
+    if context.provider == "opencode" {
+        host.capabilities
+            .iter()
+            .any(|value| value == "opencode-adoption-observation-v1")
+            && matches!(&status.opencode_adoption,freshell_runtime_protocol::OpenCodeAdoptionStatus::Observed{observation} if Some(observation.root_session_id.as_str())==status.native_session_id.as_deref() && context.native_session_id.as_deref().is_none_or(|expected|expected==observation.root_session_id) && &observation.incarnation_id==context.prior_handle.incarnation_id() && observation.hydrated)
+    } else {
+        host.capabilities
+            .iter()
+            .any(|value| value == "native-identity-observation-v1")
+            && status.native_session_id.as_deref().is_some_and(|observed| {
+                context
+                    .native_session_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == observed)
+            })
+    }
+}
+
 fn native_identity_wait_timeout(opencode_adoption_required: bool) -> Duration {
     if opencode_adoption_required {
         OPENCODE_ADOPTION_READINESS_TIMEOUT
@@ -1513,7 +1577,39 @@ impl Supervisor {
                 }),
             );
         }
-        Ok((after_native_probe(&context, probe), context))
+        let probe = after_native_probe(&context, probe);
+        let (block_reason, repair) = match &probe {
+            RecoveryProbe::Blocked {
+                reason, retry_hint, ..
+            } => (Some(reason), retry_hint.repair.as_deref()),
+            _ => (None, None),
+        };
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery.preflight",
+            serde_json::json!({
+                "severity": if block_reason.is_some() {"warn"} else {"info"},
+                "soulId": context.soul_id,
+                "incarnationId": context.prior_handle.incarnation_id(),
+                "intentRevision": context.intent_revision,
+                "identityRevision": context.identity_revision,
+                "evidenceRevision": context.evidence_revision,
+                "controlEpoch": context.control_epoch,
+                "launchPolicy": context.prior_handle.launch_policy(),
+                "classification": match &probe {
+                    RecoveryProbe::Blocked { .. } => "blocked",
+                    RecoveryProbe::ReattachReady { .. } => "reattach_ready",
+                    RecoveryProbe::ResumeReady { .. } => "resume_ready",
+                    RecoveryProbe::PristineSeedReady { .. } => "pristine_seed_ready",
+                    RecoveryProbe::DefinitivelyUnavailable { .. } => "definitively_unavailable",
+                },
+                "blockReason": block_reason,
+                "repair": preflight_diagnostic_repair(repair),
+                "matcherReason": preflight_diagnostic_repair(repair),
+                "attemptReserved": false,
+            }),
+        );
+        Ok((probe, context))
     }
 
     async fn probe_recovery_context(
@@ -1539,6 +1635,14 @@ impl Supervisor {
                     None,
                 ));
             }
+            Err(BackendError::PolicyMismatch(message)) => {
+                return Ok(blocked(
+                    RecoveryPath::Reattach,
+                    RecoveryBlockReason::CapabilityPending,
+                    &message,
+                    None,
+                ));
+            }
             Err(error) => {
                 return Ok(blocked(
                     RecoveryPath::Reattach,
@@ -1558,6 +1662,17 @@ impl Supervisor {
                 .await
             {
                 Ok(host) => {
+                    if context.provider != "shell"
+                        && context.fixture.is_none()
+                        && !retained_host_features_known(&host)
+                    {
+                        return self
+                            .retained_store_compatibility_probe(
+                                context,
+                                "retained_host_capability_unknown",
+                            )
+                            .await;
+                    }
                     let status = match self
                         .host_status(
                             context.prior_handle.incarnation_id().clone(),
@@ -1567,7 +1682,21 @@ impl Supervisor {
                         .await
                     {
                         Ok(status) => status,
-                        Err(_) if context.resume_spec.is_some() => return offline_probe(context),
+                        Err(_)
+                            if context.fixture.is_none()
+                                && context.provider == "opencode"
+                                && context.native_session_id.is_some() =>
+                        {
+                            return self
+                                .retained_store_compatibility_probe(
+                                    context,
+                                    "retained_host_status_unreachable",
+                                )
+                                .await;
+                        }
+                        Err(_) if context.resume_spec.is_some() => {
+                            return offline_probe(context);
+                        }
                         Err(error) => {
                             return Ok(blocked(
                                 RecoveryPath::Reattach,
@@ -1577,7 +1706,14 @@ impl Supervisor {
                             ));
                         }
                     };
-                    if let Some(native_session_id) = status.native_session_id.as_ref() {
+                    let native_observation_qualified = context.fixture.is_some()
+                        || context.provider == "shell"
+                        || retained_status_observed(context, &host, &status);
+                    if let Some(native_session_id) = status
+                        .native_session_id
+                        .as_ref()
+                        .filter(|_| native_observation_qualified)
+                    {
                         self.registry
                             .record_native_session_fenced(
                                 context.soul_id.clone(),
@@ -1594,6 +1730,9 @@ impl Supervisor {
                         }
                     }
                     if !status.exited {
+                        if !native_observation_qualified && context.provider != "shell" && context.fixture.is_none() {
+                            return self.retained_store_compatibility_probe(context, "retained_native_observation_unqualified").await;
+                        }
                         if context.provider != "shell" && context.resume_spec.is_none() {
                             self.capture_live_resume_evidence(&context, &host, &status)
                                 .await;
@@ -1605,7 +1744,10 @@ impl Supervisor {
                     }
                     let candidate = match resume_catalog::exact_resume_candidate(
                         &*context,
-                        status.native_session_id.as_deref(),
+                        status
+                            .native_session_id
+                            .as_deref()
+                            .filter(|_| native_observation_qualified),
                     ) {
                         Ok(candidate) => candidate,
                         Err(probe) => return Ok(probe),
@@ -1656,7 +1798,18 @@ impl Supervisor {
 
                     return Ok(after_native_probe(context, captured));
                 }
-                Err(_) if context.resume_spec.is_some() => return offline_probe(context),
+                Err(_)
+                    if context.fixture.is_none()
+                        && context.provider == "opencode"
+                        && context.native_session_id.is_some() =>
+                {
+                    return self
+                        .retained_store_compatibility_probe(context, "retained_host_unreachable")
+                        .await;
+                }
+                Err(_) if context.resume_spec.is_some() => {
+                    return offline_probe(context);
+                }
                 Err(error) => {
                     return Ok(blocked(
                         RecoveryPath::Reattach,
@@ -1672,6 +1825,14 @@ impl Supervisor {
             inspection.state,
             BackendRuntimeState::Exited | BackendRuntimeState::Dead | BackendRuntimeState::Missing
         ) {
+            if context.fixture.is_none()
+                && context.provider == "opencode"
+                && context.native_session_id.is_some()
+            {
+                return self
+                    .retained_store_compatibility_probe(context, "retained_host_exited")
+                    .await;
+            }
             return offline_probe(context);
         }
 
@@ -1792,6 +1953,98 @@ impl Supervisor {
         }
         attempts.insert(key, now);
         true
+
+    }
+
+    async fn retained_store_compatibility_probe(
+        &self,
+        context: &RecoveryContext,
+        reason: &str,
+    ) -> Result<RecoveryProbe, RuntimeError> {
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery.retained_qualification_started",
+            serde_json::json!({
+                "severity": "info",
+                "soulId": context.soul_id,
+                "incarnationId": context.prior_handle.incarnation_id(),
+                "intentRevision": context.intent_revision,
+                "identityRevision": context.identity_revision,
+                "evidenceRevision": context.evidence_revision,
+                "controlEpoch": context.control_epoch,
+                "reason": reason,
+                "attemptReserved": false,
+            }),
+        );
+        let candidate = resume_catalog::exact_resume_candidate(context, None);
+        let result = match candidate {
+            Ok(Some(spec)) if context.provider == "opencode" && context.fixture.is_none() => {
+                let identity = context
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| (terminal.run_as_uid, terminal.run_as_gid))
+                    .or_else(|| {
+                        context
+                            .fresh_agent
+                            .as_ref()
+                            .map(|agent| (agent.run_as_uid, agent.run_as_gid))
+                    });
+                if let Some((uid, gid)) = identity {
+                    let request = freshell_runtime_protocol::RetainedStoreCompatibilityRequest {
+                        provider_store_id: context.provider_store_id.clone(),
+                        native_session_id: spec.provider_session.native_session_id.clone(),
+                        image_ref: self.config.image_ref.clone(),
+                        provider_home: spec.provider_home.clone(),
+                        workspace_path: spec.workspace_path.clone(),
+                        cwd: spec.cwd.clone(),
+                        provider_uid: uid,
+                        provider_gid: gid,
+                    };
+                    match self
+                        .backend
+                        .qualify_retained_opencode(
+                            &context.prior_handle,
+                            &request,
+                            &self.config.host_binary_path,
+                        )
+                        .await
+                    {
+                        Ok(receipt) => {
+                            crate::service::append_event(
+                                &self.config.lifecycle_log,
+                                "supervisor.recovery.retained_store_compatible",
+                                serde_json::json!({"severity":"info","soulId":context.soul_id,"incarnationId":context.prior_handle.incarnation_id(),"intentRevision":context.intent_revision,"evidenceRevision":context.evidence_revision,"controlEpoch":context.control_epoch,"launchPolicy":context.prior_handle.launch_policy(),"reason":reason,"receipt":receipt,"attemptReserved":false}),
+                            );
+                            RecoveryProbe::ResumeReady {
+                                resume_spec: Box::new(spec),
+                                evidence_revision: context.evidence_revision,
+                            }
+                        }
+                        Err(error) => blocked(
+                            RecoveryPath::NativeResume,
+                            RecoveryBlockReason::StoreUnreadable,
+                            &format!("current-image retained-store qualification failed: {error}"),
+                            Some(2000),
+                        ),
+                    }
+                } else {
+                    blocked(
+                        RecoveryPath::NativeResume,
+                        RecoveryBlockReason::CapabilityPending,
+                        "retained provider identity is unavailable",
+                        Some(2000),
+                    )
+                }
+            }
+            Err(probe) if context.native_session_id.is_some() => probe,
+            _ => blocked(
+                RecoveryPath::NativeResume,
+                RecoveryBlockReason::CapabilityPending,
+                reason,
+                Some(2000),
+            ),
+        };
+        Ok(result)
     }
 
     async fn probe_host_store(
@@ -3304,6 +3557,9 @@ impl Supervisor {
                             Some(2_000),
                         )
                     })?;
+                if context.provider!="shell" && context.fixture.is_none() && !retained_host_features_known(&host) {
+                    return Err(blocked(RecoveryPath::Reattach,RecoveryBlockReason::CapabilityPending,"retained_host_capability_unknown",Some(2000)));
+                }
                 let status = self
                     .host_status(
                         context.prior_handle.incarnation_id().clone(),
@@ -3320,7 +3576,17 @@ impl Supervisor {
                         )
                     })?;
                 if !status.exited {
-                    return Err(live_reattach_probe(context, &status));
+                    let handle=ReattachHandle{incarnation_id:context.prior_handle.incarnation_id().clone(),host_boot_id:status.host_boot_id.clone(),container_id:context.prior_handle.container_id().into()};
+                    if context.provider!="shell" && context.fixture.is_none() {
+                        let candidate=resume_catalog::exact_resume_candidate(context,None)?;
+                        let captured=self.probe_host_store(context,&host,candidate).await.map_err(|error|blocked(RecoveryPath::Reattach,RecoveryBlockReason::StoreUnreadable,&error.message,Some(2000)))?;
+                        let captured=after_native_probe(context,captured);
+                        if !retained_status_observed(context,&host,&status) && matches!(&captured,RecoveryProbe::ResumeReady{..}|RecoveryProbe::PristineSeedReady{..}) {
+                            return Err(blocked(RecoveryPath::Reattach,RecoveryBlockReason::CapabilityPending,"retained_native_observation_unqualified",Some(2000)));
+                        }
+                        return Err(retained_runtime_probe(false,handle,captured,true));
+                    }
+                    return Err(retained_runtime_probe(false,handle,RecoveryProbe::PristineSeedReady{seed:"fixture".into(),never_dispatched_proof:"fixture".into()},false));
                 }
                 Ok(RecoveryPathEvidence {
                     path: RecoveryPath::Reattach,
@@ -4007,6 +4273,34 @@ fn blocked(
     }
 }
 
+fn preflight_diagnostic_repair(repair: Option<&str>) -> Option<&'static str> {
+    let repair = repair?;
+    // A native transport error may carry arbitrary upstream data. Log only
+    // recognized static causes; the authenticated response retains its hint.
+    const SAFE_HINTS: &[&str] = &[
+        "runtime gained extra, duplicate, or missing mounts",
+        "runtime mount topology changed",
+        "owned_launch_policy_mismatch",
+        "repair the soul-local OpenCode database",
+    ];
+    if let Some(hint) = SAFE_HINTS.iter().find(|hint| **hint == repair) {
+        return Some(hint);
+    }
+    const SOURCE_CODES: &[&str] = &[
+        "source_io_unavailable",
+        "sqlite_source_unavailable",
+        "native_row_unreadable",
+        "unsupported_schema_or_migration",
+        "workspace_or_asset_unavailable",
+        "exact_graph_unavailable",
+        "source_qualification_pending",
+    ];
+    SOURCE_CODES
+        .iter()
+        .find(|code| repair.contains(&format!("retained OpenCode qualification blocked ({code})")))
+        .copied()
+}
+
 fn recovery_activation_failure_data(
     soul_id: &SoulId,
     prior_incarnation_id: &freshell_runtime_protocol::IncarnationId,
@@ -4025,6 +4319,7 @@ fn recovery_activation_failure_data(
         "blockReason": reason,
         "errorCode": error.code,
         "errorClass": "provider_activation_failed",
+        "severity": "warn",
     })
 }
 
@@ -4513,6 +4808,49 @@ pub(crate) mod tests {
             if owner.soul_id == candidates[0].soul_id));
     }
 
+    #[test]
+    fn retained_runtime_alive_never_bypasses_blocked_store_reader() {
+        let handle = ReattachHandle {
+            incarnation_id: IncarnationId::new(),
+            host_boot_id: freshell_runtime_protocol::HostBootId::new(),
+            container_id: "exact-retained-container".into(),
+        };
+        let probe = blocked(
+            RecoveryPath::NativeResume,
+            RecoveryBlockReason::StoreUnreadable,
+            "fixture config permission unavailable",
+            Some(2000),
+        );
+        assert!(matches!(
+            retained_runtime_probe(false, handle.clone(), probe, true),
+            RecoveryProbe::Blocked {
+                reason: RecoveryBlockReason::StoreUnreadable,
+                ..
+            }
+        ));
+        let unavailable = RecoveryProbe::DefinitivelyUnavailable {
+            path: RecoveryPath::NativeResume,
+            reason: "store inspection incomplete".into(),
+            evidence: vec![],
+            store_state: freshell_runtime_protocol::EvidenceStoreState::Missing,
+        };
+        assert!(matches!(
+            retained_runtime_probe(false, handle.clone(), unavailable, true),
+            RecoveryProbe::Blocked {
+                reason: RecoveryBlockReason::StoreUnreadable,
+                ..
+            }
+        ));
+        let pristine = RecoveryProbe::PristineSeedReady {
+            seed: "proven-seed".into(),
+            never_dispatched_proof: "durable-empty-journal".into(),
+        };
+        assert!(matches!(
+            retained_runtime_probe(false, handle, pristine, true),
+            RecoveryProbe::ReattachReady { .. }
+        ));
+    }
+
     struct ObservedRuntime(BackendRuntimeState);
 
     #[async_trait::async_trait]
@@ -4717,6 +5055,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn preflight_diagnostics_preserve_safe_causes_without_native_bodies_or_credentials() {
+        assert_eq!(
+            preflight_diagnostic_repair(Some(
+                "Bearer private-credential; synthetic native message"
+            )),
+            None
+        );
+        assert_eq!(
+            preflight_diagnostic_repair(Some("runtime mount topology changed")),
+            Some("runtime mount topology changed")
+        );
+        assert_eq!(
+            preflight_diagnostic_repair(Some("repair the soul-local OpenCode database")),
+            Some("repair the soul-local OpenCode database")
+        );
+        assert_eq!(preflight_diagnostic_repair(Some("private upstream response; retained OpenCode qualification blocked (sqlite_source_unavailable); preserve the store")), Some("sqlite_source_unavailable"));
+        assert_eq!(preflight_diagnostic_repair(None), None);
+    }
+
+    #[test]
     fn recovery_activation_diagnostic_links_generic_block_to_exact_failure() {
         let soul_id = SoulId::new();
         let prior = IncarnationId::new();
@@ -4745,6 +5103,7 @@ pub(crate) mod tests {
         assert_eq!(data["blockReason"], "PROVIDER_UNAVAILABLE");
         assert_eq!(data["errorCode"], "HOST_UNREACHABLE");
         assert_eq!(data["errorClass"], "provider_activation_failed");
+        assert_eq!(data["severity"], "warn");
         assert!(!data.to_string().contains("operation not permitted"));
     }
 
@@ -4911,15 +5270,22 @@ pub(crate) mod tests {
                 }),
                 config: Vec::new(),
             });
-        replace_terminal_mcp_reference(
-            &mut replacement,
-            freshell_runtime_protocol::McpCapabilityReference {
-                grant_id: "grant-new".into(),
-                endpoint: "http://host.docker.internal:4001".into(),
-                provider_relative_path: ".freshell/mcp-capability.json".into(),
-                host_gateway_address: None,
+        let mut current_context = replacement.provider_launch_context.clone().unwrap();
+        current_context.mcp_capability = Some(freshell_runtime_protocol::McpCapabilityReference {
+            grant_id: "grant-new".into(),
+            endpoint: "http://host.docker.internal:4001".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        });
+        install_prepared_provider_context(
+            Some(&mut replacement),
+            None,
+            freshell_runtime_protocol::PreparedProviderContext {
+                provider_launch_context: current_context,
+                provider_secret_references: vec![],
             },
-        );
+        )
+        .unwrap();
         let reference = replacement
             .provider_launch_context
             .as_ref()

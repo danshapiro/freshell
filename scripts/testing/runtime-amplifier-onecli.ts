@@ -1,15 +1,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-const GRANT_KEYS = [
-  'FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE',
-  'FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE',
-] as const
+type OnecliProvider = 'claude' | 'codex' | 'opencode' | 'amplifier'
 
-/** The same typed paths read by managed_provider_bootstrap.rs. Never read grant values. */
-export function configuredAmplifierOnecliGrantFiles(env: NodeJS.ProcessEnv = process.env): string[] {
+/** The exact typed paths read by managed_provider_bootstrap.rs; values stay private. */
+export function configuredProviderOnecliGrantFiles(provider: OnecliProvider, env: NodeJS.ProcessEnv = process.env): string[] {
+  const keys = ['ENV_FILE', 'AUTH_FILE', 'CA_FILE'].map(suffix => `FRESHELL_MANAGED_${provider.toUpperCase()}_ONECLI_${suffix}`)
   const files: string[] = []
-  for (const key of GRANT_KEYS) {
+  for (const key of keys) {
     const configured = env[key]
     if (configured === undefined) continue
     const source = configured.trim()
@@ -37,9 +35,13 @@ export function configuredAmplifierOnecliGrantFiles(env: NodeJS.ProcessEnv = pro
   return files
 }
 
+export function configuredAmplifierOnecliGrantFiles(env: NodeJS.ProcessEnv = process.env): string[] {
+  return configuredProviderOnecliGrantFiles('amplifier', env)
+}
+
 export function requireAmplifierOnecliBootstrap(env: NodeJS.ProcessEnv = process.env): string[] {
   const files = configuredAmplifierOnecliGrantFiles(env)
-  if (files.length === 0) {
+  if (!env.FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE && !env.FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE) {
     throw new Error(
       'Amplifier live qualification requires FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE or FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE',
     )

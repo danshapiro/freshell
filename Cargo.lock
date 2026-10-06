@@ -1433,7 +1433,6 @@ dependencies = [
  "base64 0.22.1",
  "freshell-platform",
  "hex",
- "freshell-platform",
  "hmac",
  "serde",
  "serde_json",

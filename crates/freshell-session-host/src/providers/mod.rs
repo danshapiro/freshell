@@ -32,8 +32,10 @@ pub struct PreparedTerminal {
     pub claude_settings: Option<String>,
 }
 
-pub fn prepare_provider_state_before_bootstrap(
+pub fn prepare_provider_state_before_bootstrap_at(
     terminal: &mut freshell_runtime_protocol::TerminalLaunchSpec,
+    provider_home: &std::path::Path,
+    selected_user_root: &std::path::Path,
 ) -> Result<Vec<std::path::PathBuf>, String> {
     if terminal.mode != "amplifier" {
         return Ok(Vec::new());
@@ -45,12 +47,27 @@ pub fn prepare_provider_state_before_bootstrap(
         .ok_or_else(|| {
             "managed Amplifier launch requires one exact launcher-assigned session id".to_string()
         })?;
-    let provider_home = std::path::Path::new("/home/freshell/provider/.amplifier");
-    let ensured = freshell_sessions::amplifier_stub::ensure_session(
-        provider_home,
+    let amplifier_home = provider_home.join(".amplifier");
+    let settings_home = if terminal
+        .provider_launch_context
+        .as_ref()
+        .is_some_and(|context| {
+            context.config.iter().any(|reference| {
+                reference.root == freshell_runtime_protocol::ProviderConfigRoot::UserProvider
+                    && reference.relative_path == "settings.yaml"
+                    && reference.provider_relative_path == ".amplifier/settings.yaml"
+            })
+        }) {
+        selected_user_root
+    } else {
+        &amplifier_home
+    };
+    let ensured = freshell_sessions::amplifier_stub::ensure_session_with_settings_home(
+        &amplifier_home,
         session_id,
         &terminal.cwd,
         &terminal.terminal_id,
+        settings_home,
     )
     .map_err(|error| format!("prepare Amplifier session stub: {error}"))?;
     if let Some(recorded_cwd) = ensured.working_dir_of_existing {
@@ -170,6 +187,8 @@ pub async fn prepare_terminal(
     prepare_terminal_with_provider_feature_runner(
         terminal,
         child_secret_env,
+        prepared_opencode_plan,
+        selected_claude_settings,
         prepare_provider_features_for_identity,
     )
     .await
@@ -178,6 +197,8 @@ pub async fn prepare_terminal(
 async fn prepare_terminal_with_provider_feature_runner<F>(
     mut terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     child_secret_env: &std::collections::BTreeMap<String, String>,
+    prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
+    selected_claude_settings: Option<&str>,
     prepare_features: F,
 ) -> Result<PreparedTerminal, String>
 where
@@ -187,7 +208,7 @@ where
     prepare_scoped_mcp_environment(terminal.provider_launch_context.as_ref(), &mut child_env)
         .await?;
     if terminal.mode == "amplifier" {
-        prepare_provider_features(&terminal, "amplifier-packages")?;
+        prepare_features(terminal.run_as_uid, terminal.run_as_gid, &["amplifier-packages"])?;
     }
     if terminal.mode == "claude"
         && terminal
@@ -443,13 +464,15 @@ pub async fn prepare_fresh_agent_child_environment(
     prepare_fresh_agent_child_environment_with_provider_feature_runner(
         launch,
         child_env,
+        prepared_opencode_plan,
         prepare_provider_features_for_identity,
-    )
+    ).await
 }
 
-fn prepare_fresh_agent_child_environment_with_provider_feature_runner<F>(
+async fn prepare_fresh_agent_child_environment_with_provider_feature_runner<F>(
     launch: &freshell_runtime_protocol::FreshAgentLaunchSpec,
     child_env: &mut std::collections::BTreeMap<String, String>,
+    prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
     prepare_features: F,
 ) -> Result<(), String>
 where
@@ -939,6 +962,8 @@ mod provider_secret_context_tests {
         let prepared = prepare_terminal_with_provider_feature_runner(
             terminal,
             &std::collections::BTreeMap::new(),
+            None,
+            None,
             |uid, gid, args| {
                 assert_eq!((uid, gid), (65534, 0));
                 assert_eq!(args, ["opencode-rebind", source]);
@@ -954,8 +979,8 @@ mod provider_secret_context_tests {
         );
     }
 
-    #[test]
-    fn managed_fresh_opencode_uses_worker_returned_tui_selector_path() {
+    #[tokio::test]
+    async fn managed_fresh_opencode_uses_worker_returned_tui_selector_path() {
         let workspace = tempfile::tempdir().unwrap();
         let source = "/home/freshell/provider/.config/opencode/user-tui.jsonc";
         let generated = "/home/freshell/provider/.freshell/opencode/tui-def456.json";
@@ -975,12 +1000,14 @@ mod provider_secret_context_tests {
         prepare_fresh_agent_child_environment_with_provider_feature_runner(
             &launch,
             &mut child_env,
+            None,
             |uid, gid, args| {
                 assert_eq!((uid, gid), (65534, 0));
                 assert_eq!(args, ["opencode-rebind", source]);
                 Ok(Some(generated.into()))
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(

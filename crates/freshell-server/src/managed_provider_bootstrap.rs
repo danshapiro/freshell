@@ -50,7 +50,7 @@ pub(crate) fn provider_launch_context_from_home(
     provider_launch_context_from_home_at(provider, workspace, workspace, home, mcp_capability)
 }
 
-fn provider_launch_context_from_home_at(
+pub(crate) fn provider_launch_context_from_home_at(
     provider: &str,
     workspace: &Path,
     project_dir: &Path,
@@ -78,7 +78,6 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
     xdg_config_home: Option<&Path>,
     mcp_capability: Option<McpCapabilityReference>,
 ) -> Result<Option<ProviderLaunchContext>, String> {
-    let mcp_enabled = mcp_capability.is_some();
     let (root, entries, preparation) = match provider {
         "claude" => (
             ".claude",
@@ -93,27 +92,15 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
                 "agents",
             ][..],
             ProviderPreparation::Claude {
-                mcp_args: if mcp_enabled {
-                    vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()]
-                } else {
-                    Vec::new()
-                },
+                mcp_args: Vec::new(),
             },
         ),
         "codex" => (
             ".codex",
             &["config.toml", "AGENTS.md", "skills", "rules"][..],
             ProviderPreparation::Codex {
-                tui_args: if mcp_enabled {
-                    managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?
-                } else {
-                    Vec::new()
-                },
-                sidecar_args: if mcp_enabled {
-                    managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?
-                } else {
-                    Vec::new()
-                },
+                tui_args: Vec::new(),
+                sidecar_args: Vec::new(),
             },
         ),
         "opencode" => (
@@ -291,12 +278,39 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
                 .into(),
         );
     }
-    Ok(Some(ProviderLaunchContext {
+    let context = ProviderLaunchContext {
         prepared_inputs: None,
         preparation,
-        mcp_capability,
+        mcp_capability: None,
         config,
+    };
+    Ok(Some(match mcp_capability {
+        Some(reference) => with_managed_mcp_reference(context, reference)?,
+        None => context,
     }))
+}
+
+pub(crate) fn with_managed_mcp_reference(
+    mut context: ProviderLaunchContext,
+    reference: McpCapabilityReference,
+) -> Result<ProviderLaunchContext, String> {
+    match &mut context.preparation {
+        ProviderPreparation::Claude { mcp_args } => {
+            *mcp_args = vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()]
+        }
+        ProviderPreparation::Codex {
+            tui_args,
+            sidecar_args,
+        } => {
+            let args =
+                managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?;
+            *tui_args = args.clone();
+            *sidecar_args = args;
+        }
+        ProviderPreparation::Opencode { .. } | ProviderPreparation::Amplifier { .. } => {}
+    }
+    context.mcp_capability = Some(reference);
+    Ok(context)
 }
 
 struct ManagedImageMcpRuntime;
@@ -366,13 +380,13 @@ pub fn named_provider_onecli_references(
             "CLAUDE",
             ProviderSecretProfile::ClaudeOnecliEnvironment,
             ProviderSecretProfile::ClaudeOnecliAuthFile,
-            None,
+            Some(ProviderSecretProfile::ClaudeOnecliCaFile),
         ),
         "codex" => (
             "CODEX",
             ProviderSecretProfile::CodexOnecliEnvironment,
             ProviderSecretProfile::CodexOnecliAuthFile,
-            None,
+            Some(ProviderSecretProfile::CodexOnecliCaFile),
         ),
         "opencode" => (
             "OPENCODE",
@@ -384,7 +398,7 @@ pub fn named_provider_onecli_references(
             "AMPLIFIER",
             ProviderSecretProfile::AmplifierOnecliEnvironment,
             ProviderSecretProfile::AmplifierOnecliKeysFile,
-            None,
+            Some(ProviderSecretProfile::AmplifierOnecliCaFile),
         ),
         _ => return Ok(Vec::new()),
     };
@@ -424,6 +438,41 @@ pub fn named_provider_onecli_references(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn named_provider_ca_references_resolve_exact_private_files_for_native_transports() {
+        let _lock = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let root = tempfile::tempdir().unwrap();
+        let ca = root.path().join("gateway-ca.pem");
+        fs::write(&ca, "fixture-ca").unwrap();
+        fs::set_permissions(&ca, fs::Permissions::from_mode(0o600)).unwrap();
+        let names = [
+            "FRESHELL_MANAGED_CLAUDE_ONECLI_CA_FILE",
+            "FRESHELL_MANAGED_CODEX_ONECLI_CA_FILE",
+            "FRESHELL_MANAGED_AMPLIFIER_ONECLI_CA_FILE",
+        ];
+        let _restore = RestoreOnecliEnv(names.map(|name| (name, std::env::var_os(name))).into());
+        for (name, provider) in names.into_iter().zip(["claude", "codex", "amplifier"]) {
+            std::env::set_var(name, &ca);
+            let references = named_provider_onecli_references(provider).unwrap();
+            let matching = references
+                .iter()
+                .filter(|reference| reference.source_path == ca.to_string_lossy())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching.len(),
+                1,
+                "{provider} needs a narrowly typed CA mount"
+            );
+            assert_eq!(
+                matching[0].profile.provider_file_relative_path(),
+                Some(".config/onecli/gateway-ca.pem")
+            );
+            fs::set_permissions(&ca, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(named_provider_onecli_references(provider).is_err());
+            fs::set_permissions(&ca, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
 
     struct RestoreOnecliEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
 

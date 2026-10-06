@@ -7,7 +7,7 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 
-import { configuredAmplifierOnecliGrantFiles } from './runtime-amplifier-onecli.js'
+import { configuredProviderOnecliGrantFiles } from './runtime-amplifier-onecli.js'
 import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
 
 export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
@@ -87,13 +87,9 @@ export function phase2BootstrapFiles(
   ]) {
     addRegularFile(env[key]?.trim())
   }
-  for (const provider of ['CLAUDE', 'CODEX', 'OPENCODE']) {
-    for (const suffix of ['ENV_FILE', 'AUTH_FILE']) {
-      addRegularFile(env[`FRESHELL_MANAGED_${provider}_ONECLI_${suffix}`]?.trim())
-    }
+  for (const provider of ['claude', 'codex', 'opencode', 'amplifier'] as const) {
+    for (const grant of configuredProviderOnecliGrantFiles(provider, env)) files.add(grant)
   }
-  addRegularFile(env.FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE?.trim())
-  for (const grant of configuredAmplifierOnecliGrantFiles(env)) files.add(grant)
   return [...files]
 }
 
@@ -133,7 +129,22 @@ export class RuntimeGateBlockedError extends Error {
   }
 }
 
+type Task2FixtureArtifact = { path: string; sha256: string }
+type Task2FixtureArtifacts = {
+  candidateSha: string
+  imageDigest: string
+  currentSupervisor: Task2FixtureArtifact
+  currentHost: Task2FixtureArtifact
+  currentServer: Task2FixtureArtifact
+  legacySupervisor: Task2FixtureArtifact
+  legacyHost: Task2FixtureArtifact
+  legacyCreatorCommit: '7dbc7ef6b0b87e47ec8386e19115f5e440399898'
+}
+
+
 export class RuntimeHarness {
+  private task2FiniteFixtures = false
+  task2ServerBinary = ""
   readonly repoRoot: string
   readonly phase: 1 | 2 | 3 | 4 | 5
   readonly runId: string
@@ -258,6 +269,53 @@ export class RuntimeHarness {
     writePrivateJson(path.join(this.evidenceDir, 'capabilities.json'), this.collectCapabilities())
     writePrivateJson(path.join(this.evidenceDir, 'build.json'), this.collectBuildInfo())
     this.recordLifecycle('gate.prepare.completed', { imageRef: this.imageRef, brokerSocket: proxySocketPath })
+  }
+
+  async prepareTask2FixtureArtifacts(input: Task2FixtureArtifacts): Promise<void> {
+    if (input.candidateSha !== this.candidateSha || !/^sha256:[a-f0-9]{64}$/.test(input.imageDigest)
+      || input.legacyCreatorCommit !== '7dbc7ef6b0b87e47ec8386e19115f5e440399898'
+      || !dockerIsRootless()) throw new Error('exact current/legacy artifacts and rootless Docker required')
+    if (docker(['image', 'inspect', input.imageDigest, '--format', '{{.Id}}']).trim() !== input.imageDigest)
+      throw new Error('immutable fixture image mismatch')
+    const artifacts = [input.currentSupervisor, input.currentHost, input.legacySupervisor, input.legacyHost, input.currentServer]
+    // Inputs must be prebuilt immutable private copies. Refuse symlinks and hash
+    // before copying; hash each copy afterward to catch changed inputs.
+    for (const artifact of artifacts) {
+      const stat = fs.lstatSync(artifact.path)
+      if (!path.isAbsolute(artifact.path) || fs.realpathSync(artifact.path) !== artifact.path
+        || !stat.isFile() || (stat.mode & 0o222) !== 0 || !/^[a-f0-9]{64}$/.test(artifact.sha256)
+        || createHash('sha256').update(fs.readFileSync(artifact.path)).digest('hex') !== artifact.sha256)
+        throw new Error('immutable exact fixture binary required')
+    }
+    if (fs.existsSync(this.testRoot) || fs.existsSync(this.buildDir)) throw new Error('fixture run already exists')
+    fs.mkdirSync(this.testRoot, { recursive: true, mode: 0o700 })
+    fs.mkdirSync(this.buildDir, { recursive: true, mode: 0o700 })
+    for (const directory of [this.evidenceDir, this.incidentsDir, this.browserDir]) ensurePrivateDirectory(directory)
+    const names = ['freshell-supervisor-test', 'freshell-session-host-test', 'task002-legacy-supervisor', 'task002-prefixed-session-host', 'task002-server']
+    for (const [index, artifact] of artifacts.entries()) {
+      const destination = path.join(this.buildDir, names[index]!)
+      fs.copyFileSync(artifact.path, destination, fs.constants.COPYFILE_EXCL)
+      fs.chmodSync(destination, index === 1 || index === 3 ? 0o550 : 0o500)
+      if (createHash('sha256').update(fs.readFileSync(destination)).digest('hex') !== artifact.sha256)
+        throw new Error('fixture copy changed')
+    }
+    this.imageRef = input.imageDigest
+    this.task2ServerBinary = path.join(this.buildDir, names[4]!)
+    this.testSupervisorBinary = this.releaseSupervisorBinary = path.join(this.buildDir, names[0]!)
+    this.testHostBinary = this.releaseHostBinary = path.join(this.buildDir, names[1]!)
+    this.task2FiniteFixtures = true
+    this.broker = new RestrictedDockerBroker({
+      realSocketPath: dockerSocketPath(), proxySocketPath: path.join(this.testRoot, 'broker/docker.sock'),
+      runtimeRootPrefix: path.join(this.testRoot, 'r'),
+      allowedHostBinaryPaths: new Set([this.testHostBinary, path.join(this.buildDir, names[3]!)]),
+      allowedImageRefs: new Set([this.imageRef]), allowTerminalWorkloads: true,
+      allowedWorkspaceRoots: new Set([this.testRoot]), allowedProviderUserRoots: new Set(),
+      allowTask2LegacyNegativeFixtures: true,
+      allowedBootstrapFiles: new Set(), testRunId: this.runId, logPath: path.join(this.evidenceDir, 'broker.jsonl'),
+    })
+    await this.broker.start()
+    this.brokerStarted = true
+    this.writeArtifact('task002-artifacts.json', input)
   }
 
   /** Finite offline transfer qualification; no ambient homes/grants or broker. */
@@ -539,6 +597,8 @@ export class RuntimeHarness {
     binaryPath?: string
     /** Operator home the supervisor mounts read-only into terminal/fresh-agent souls. */
     operatorHome?: string
+    /** Exact artifact-owned historical session host for legacy enclosure proof. */
+    hostBinaryPath?: string
   }): Promise<SupervisorInstance> {
     const scenarioId = sanitizeName(options.scenarioId)
     const scenarioRoot = this.scenarioPath(scenarioId)
@@ -570,10 +630,12 @@ export class RuntimeHarness {
     const supervisorBinary = options.binaryPath
       ? this.validateRunBuildBinary(options.binaryPath, 'supervisor')
       : defaultSupervisorBinary
-    const hostBinary = binaryKind === 'test' ? this.testHostBinary : this.releaseHostBinary
+    const hostBinary = options.hostBinaryPath
+      ? this.validateRunBuildBinary(options.hostBinaryPath, 'host')
+      : binaryKind === 'test' ? this.testHostBinary : this.releaseHostBinary
     const name = `freshell-p${this.phase}-supervisor-${this.runId.slice(0, 8)}-${scenarioId}-${randomUUID().slice(0, 8)}`
     const args = [
-      'run', '-d', '--name', name,
+      'run', '-d', '--name', name, '--label', `com.freshell.runtime-test-run-id=${this.runId}`,
       // The supervisor is trusted control-plane test code. Rootful Docker
       // preserves the host runner uid on bind mounts, so uid-0 with CapDrop=ALL
       // cannot traverse this harness's 0700 testRoot or read its 0600 secret.
@@ -1130,6 +1192,116 @@ export class RuntimeHarness {
     throw new Error(`container remained running: ${containerId}`)
   }
 
+  // Finite Task2 fault injection only. These enclosures are CREATED, never
+  // started, and cannot become broker replacement or provider-writer receipts.
+  createTask2LegacyNegativeContainerExact(
+    originalId: string,
+    fault: 'extra_mount' | 'missing_tmpfs' | 'missing_binary' | 'foreign_binary',
+  ): string {
+    const receipt = this.broker.receipts().find(row => row.containerId === originalId)
+    if (!this.task2FiniteFixtures || !dockerIsRootless() || !receipt
+      || !['extra_mount', 'missing_tmpfs', 'missing_binary', 'foreign_binary'].includes(fault)
+      || !/^[a-f0-9]{64}$/.test(originalId)) throw new Error('owned finite legacy fixture required')
+    const original = this.inspectContainer(originalId)
+    const config = original.Config, host = original.HostConfig
+    const labels = config.Labels
+    const expectedLabels = { project: 'freshell', 'com.freshell.managed': 'true',
+      'com.freshell.runtime-test-run-id': this.runId, 'com.freshell.soul-id': receipt.soulId,
+      'com.freshell.incarnation-id': receipt.incarnationId }
+    this.writeArtifact('task2-legacy-physical-shape.json', { idMatches: original.Id === originalId, imageReceiptMatches: original.Image === receipt.imageRef, imageAllowed: original.Image === this.imageRef, running: original.State.Running, labelsMatch: Object.entries(expectedLabels).every(([key, value]) => labels[key] === value), installationPresent: !!labels['com.freshell.installation-id'], readonlyRoot: host.ReadonlyRootfs, privileged: host.Privileged, pidMode: host.PidMode, networkMode: host.NetworkMode, restartPolicy: host.RestartPolicy, capDrop: host.CapDrop, capAdd: host.CapAdd, securityOpt: host.SecurityOpt, tmpfs: Object.keys(host.Tmpfs), receiptSourcesPresent: !!receipt.hostBinaryPath && !!receipt.workspacePath && !!receipt.providerVolumeName, commandPrefix: config.Cmd?.[0], entrypoint: config.Entrypoint })
+    if (original.Id !== originalId || original.Image !== receipt.imageRef || original.Image !== this.imageRef
+      || original.State.Running !== true || !labels['com.freshell.installation-id']
+      || Object.entries(expectedLabels).some(([key, value]) => labels[key] !== value)
+      || host.ReadonlyRootfs !== true || host.Privileged || host.PidMode
+      || host.NetworkMode !== 'bridge' || !['no', 'unless-stopped'].includes(host.RestartPolicy.Name) || host.RestartPolicy.MaximumRetryCount !== 0
+      || JSON.stringify(host.CapDrop) !== JSON.stringify(['ALL'])
+      || JSON.stringify([...host.CapAdd].map((cap: string) => cap.replace(/^CAP_/, '')).sort())
+        !== JSON.stringify(['CHOWN', 'SETGID', 'SETUID'])
+      || JSON.stringify(host.SecurityOpt.map((option: string) => option.replace(/:true$/, ''))) !== JSON.stringify(['no-new-privileges'])
+      || JSON.stringify(Object.keys(host.Tmpfs).sort()) !== JSON.stringify(['/run/opencode-tmp', '/tmp'])
+      || !receipt.hostBinaryPath || !receipt.workspacePath || !receipt.providerVolumeName
+      || !Array.isArray(config.Cmd) || config.Cmd[0] !== '/runtime/freshell-session-host'
+      || (config.Entrypoint?.length ?? 0) > 1) throw new Error('exact owned legacy enclosure differs')
+    const expectedBinds = [
+      `${receipt.hostBinaryPath}:/runtime/freshell-session-host:ro`, `${receipt.runtimeDir}:/run/freshell:rw`,
+      `${receipt.providerVolumeName}:/home/freshell/provider:rw`, `${receipt.workspacePath}:${receipt.workspacePath}:rw`,
+    ]
+    if (JSON.stringify([...host.Binds].sort()) !== JSON.stringify(expectedBinds.sort()))
+      throw new Error('legacy fixture gained configuration, secret, or foreign mounts')
+    for (const source of [receipt.runtimeDir, receipt.workspacePath]) {
+      if (!source.startsWith(`${this.testRoot}${path.sep}`) || fs.realpathSync(source) !== source)
+        throw new Error('fixture source is outside the owned scratch root')
+    }
+    if (receipt.hostBinaryPath !== path.join(this.buildDir, 'task002-prefixed-session-host'))
+      throw new Error('actual old creator binary mount required')
+    const binds: string[] = [...host.Binds]
+    const tmpfs: Record<string, string> = { ...host.Tmpfs }
+    const binaryIndex = binds.indexOf(`${receipt.hostBinaryPath}:/runtime/freshell-session-host:ro`)
+    if (fault === 'extra_mount') binds.push(`${receipt.workspacePath}:/run/task002-extra:ro`)
+    if (fault === 'missing_tmpfs') delete tmpfs['/run/opencode-tmp']
+    if (fault === 'missing_binary') binds.splice(binaryIndex, 1)
+    if (fault === 'foreign_binary') {
+      if (this.testHostBinary !== path.join(this.buildDir, 'freshell-session-host-test')
+        || fs.realpathSync(this.testHostBinary) !== this.testHostBinary)
+        throw new Error('owned current fixture binary required')
+      binds[binaryIndex] = `${this.testHostBinary}:/runtime/freshell-session-host:ro`
+    }
+    const args = ['create', '--name', `task002-negative-${this.runId}-${fault}`, '--read-only',
+      '--network', host.NetworkMode, '--restart', host.RestartPolicy.Name, '--cap-drop', 'ALL',
+      '--cpus', String(host.NanoCpus / 1_000_000_000), '--memory', String(host.Memory),
+      '--memory-swap', String(host.MemorySwap), '--pids-limit', String(host.PidsLimit)]
+    for (const cap of host.CapAdd) args.push('--cap-add', cap)
+    for (const option of host.SecurityOpt) args.push('--security-opt', option)
+    for (const entry of host.ExtraHosts ?? []) args.push('--add-host', entry)
+    for (const [key, value] of Object.entries(labels)) args.push('--label', `${key}=${value}`)
+    args.push('--label', `com.freshell.task2-negative=${fault}`)
+    for (const entry of config.Env ?? []) args.push('--env', entry)
+    for (const bind of binds) args.push('--volume', bind)
+    for (const [destination, options] of Object.entries(tmpfs)) args.push('--tmpfs', `${destination}:${options}`)
+    if (config.User) args.push('--user', config.User)
+    if (config.WorkingDir) args.push('--workdir', config.WorkingDir)
+    args.push('--entrypoint', config.Entrypoint?.[0] ?? '', original.Image, ...config.Cmd)
+    const id = docker(args).trim()
+    if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('negative create did not return an exact full ID')
+    this.trackedContainers.add(id) // before inspect/admission so failure still cleans this exact ID
+    try {
+      const bad = this.inspectContainer(id)
+      const preservedHostFields = ['NetworkMode', 'PidMode', 'Privileged', 'ReadonlyRootfs', 'NanoCpus',
+        'Memory', 'MemorySwap', 'PidsLimit', 'CapDrop', 'CapAdd', 'SecurityOpt', 'ExtraHosts', 'RestartPolicy']
+      const preservedHostMismatch = preservedHostFields.filter(key => {
+        const normalized = (value: unknown) => ['CapAdd', 'CapDrop'].includes(key) && Array.isArray(value)
+          ? value.map((cap: string) => cap.replace(/^CAP_/, '')).sort() : value
+        return JSON.stringify(normalized(bad.HostConfig[key])) !== JSON.stringify(normalized(host[key]))
+      })
+      if (bad.State.Running || bad.State.Status !== 'created' || bad.State.Pid !== 0
+        || bad.Id !== id || bad.Image !== original.Image || bad.HostConfig.ReadonlyRootfs !== true
+        || preservedHostMismatch.length !== 0
+        || JSON.stringify([...bad.HostConfig.Binds].sort()) !== JSON.stringify([...binds].sort())
+        || JSON.stringify(bad.HostConfig.Tmpfs) !== JSON.stringify(tmpfs)
+        || JSON.stringify(bad.Config.Env) !== JSON.stringify(config.Env)
+        || JSON.stringify(bad.Config.Cmd) !== JSON.stringify(config.Cmd))
+        throw new Error(`never-started negative fixture shape differs (host fields: ${preservedHostMismatch.join(',')}; binds: ${JSON.stringify([...bad.HostConfig.Binds].sort()) === JSON.stringify([...binds].sort())}; tmpfs: ${JSON.stringify(bad.HostConfig.Tmpfs) === JSON.stringify(tmpfs)}; env: ${JSON.stringify(bad.Config.Env) === JSON.stringify(config.Env)}; command: ${JSON.stringify(bad.Config.Cmd) === JSON.stringify(config.Cmd)})`)
+      this.broker.admitTask2LegacyNegativeInspection(bad, original)
+      this.recordLifecycle('task2.legacy_negative.created', { severity: 'info', fault, containerId: id, ownerContainerId: originalId })
+      return id
+    } catch (error) {
+      this.removeTask2LegacyNegativeContainerExact(id)
+      throw error
+    }
+  }
+
+  removeTask2LegacyNegativeContainerExact(containerId: string): void {
+    if (!this.task2FiniteFixtures || !this.trackedContainers.has(containerId) || !/^[a-f0-9]{64}$/.test(containerId))
+      throw new Error('tracked finite negative enclosure required')
+    const inspected = this.inspectContainer(containerId)
+    if (inspected.Id !== containerId || inspected.State.Running || inspected.State.Status !== 'created'
+      || inspected.Config.Labels['com.freshell.runtime-test-run-id'] !== this.runId
+      || !['extra_mount', 'missing_tmpfs', 'missing_binary', 'foreign_binary'].includes(inspected.Config.Labels['com.freshell.task2-negative']))
+      throw new Error('negative cleanup ownership or never-started state differs')
+    this.broker.forgetTask2LegacyNegativeInspection(containerId)
+    docker(['rm', containerId]) // no force; no start/stop/kill authority
+    this.trackedContainers.delete(containerId)
+  }
   inspectContainer(containerId: string): any {
     const output = docker(['inspect', containerId])
     return JSON.parse(output)[0]
@@ -1168,7 +1340,7 @@ export class RuntimeHarness {
     fs.mkdirSync(scenarioRoot, { recursive: true })
     const name = `freshell-foreign-${this.runId.slice(0, 8)}-${randomUUID().slice(0, 8)}`
     const id = docker([
-      'run', '-d', '--name', name, '--network', 'none',
+      'run', '-d', '--name', name, '--label', `com.freshell.runtime-test-run-id=${this.runId}`, '--network', 'none',
       '--label', 'com.freshell.managed=true',
       '--label', `com.freshell.installation-id=${options.installationId ?? `installation-${randomUUID()}`}`,
       '--label', `com.freshell.soul-id=soul-${randomUUID()}`,
@@ -1236,6 +1408,7 @@ export class RuntimeHarness {
     if (this.fixtureInputs) {
       return this.fixtureInputs.bootstrapFiles.map(selected => validateOwnedFixturePath(selected, 'file', 'bootstrap fixture input'))
     }
+    if (this.task2FiniteFixtures) return []
     return phase2BootstrapFiles()
   }
 
@@ -1243,6 +1416,7 @@ export class RuntimeHarness {
     if (this.fixtureInputs) {
       return this.fixtureInputs.workspaceRoots.map(selected => validateOwnedFixturePath(selected, 'directory', 'workspace fixture root'))
     }
+    if (this.task2FiniteFixtures) return [this.testRoot]
     const roots = new Set<string>([this.repoRoot, this.testRoot])
     try {
       const common = git(this.repoRoot, ['rev-parse', '--git-common-dir']).trim()
@@ -1258,6 +1432,7 @@ export class RuntimeHarness {
   }
 
   private phase2ProviderUserRoots(): string[] {
+    if (this.task2FiniteFixtures) return []
     const home = this.providerFixtureHome ?? os.homedir()
     const validateFixtureDirectory = (selected: string) => validateOwnedFixturePath(selected, 'directory', 'provider fixture root')
     if (this.providerFixtureHome !== undefined) validateFixtureDirectory(home)

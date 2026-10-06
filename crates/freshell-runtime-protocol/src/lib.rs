@@ -989,6 +989,38 @@ pub struct RepairAudit {
     pub mutation_performed: bool,
 }
 
+/// Immutable enclosure policy captured at creation; absent values identify
+/// historical rows, never permission to ignore current protected ownership facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeLaunchPolicy {
+    ProviderVolumeV1,
+}
+
+/// Read-only current-image qualification; never certifies a running provider identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedStoreCompatibilityRequest {
+    pub provider_store_id: String,
+    pub native_session_id: String,
+    pub image_ref: String,
+    pub provider_home: String,
+    pub workspace_path: String,
+    pub cwd: String,
+    pub provider_uid: u32,
+    pub provider_gid: u32,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedStoreCompatibilityReceipt {
+    pub request: RetainedStoreCompatibilityRequest,
+    pub provider_version: String,
+    pub source_schema_fingerprint: String,
+    pub migration_journal_fingerprint: String,
+    pub generation: String,
+    pub row_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchState {
@@ -1253,13 +1285,16 @@ pub enum ProviderSecretProfile {
     AmplifierConfigurationFile,
     ClaudeOnecliEnvironment,
     ClaudeOnecliAuthFile,
+    ClaudeOnecliCaFile,
     CodexOnecliEnvironment,
     CodexOnecliAuthFile,
+    CodexOnecliCaFile,
     OpencodeOnecliEnvironment,
     OpencodeOnecliAuthFile,
     OpencodeOnecliCaFile,
     AmplifierOnecliEnvironment,
     AmplifierOnecliKeysFile,
+    AmplifierOnecliCaFile,
     /// The approved OneCLI deployment: Amplifier's VLLM module talks to the
     /// LunaRoute-compatible upstream through the credentialed HTTPS proxy
     /// referenced by the user's private keys.env.
@@ -1276,9 +1311,11 @@ impl ProviderSecretProfile {
         match self {
             Self::ClaudeOnecliEnvironment
             | Self::ClaudeOnecliAuthFile
+            | Self::ClaudeOnecliCaFile
             | Self::ClaudeConfigurationFile => "claude",
             Self::CodexOnecliEnvironment
             | Self::CodexOnecliAuthFile
+            | Self::CodexOnecliCaFile
             | Self::CodexConfigurationFile => "codex",
             Self::OpencodeOnecliEnvironment
             | Self::OpencodeOnecliAuthFile
@@ -1287,6 +1324,7 @@ impl ProviderSecretProfile {
             Self::AmplifierOnecliEnvironment
             | Self::AmplifierConfigurationFile
             | Self::AmplifierOnecliKeysFile
+            | Self::AmplifierOnecliCaFile
             | Self::AmplifierOnecliLunarouteGlm53
             | Self::LegacyAmplifierOnecliAnthropicHaikuLow => "amplifier",
         }
@@ -1316,7 +1354,10 @@ impl ProviderSecretProfile {
     /// such as the gateway CA certificate.
     pub fn provider_file_relative_path(self) -> Option<&'static str> {
         self.auth_relative_path().or(match self {
-            Self::OpencodeOnecliCaFile => Some(".config/onecli/gateway-ca.pem"),
+            Self::OpencodeOnecliCaFile
+            | Self::ClaudeOnecliCaFile
+            | Self::CodexOnecliCaFile
+            | Self::AmplifierOnecliCaFile => Some(".config/onecli/gateway-ca.pem"),
             _ => None,
         })
     }
@@ -1343,6 +1384,14 @@ pub struct ProviderLaunchContext {
     pub mcp_capability: Option<McpCapabilityReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config: Vec<ProviderConfigReference>,
+}
+
+/// Exact current producer inputs for an already owned soul's replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderReplacementPreparation {
+    pub context: ProviderLaunchContext,
+    pub secret_references: Vec<ProviderSecretReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2065,6 +2114,7 @@ mod provider_launch_context_tests {
                 vec![
                     ProviderSecretProfile::ClaudeOnecliEnvironment,
                     ProviderSecretProfile::ClaudeOnecliAuthFile,
+                    ProviderSecretProfile::ClaudeOnecliCaFile,
                 ],
             ),
             (
@@ -2072,6 +2122,7 @@ mod provider_launch_context_tests {
                 vec![
                     ProviderSecretProfile::CodexOnecliEnvironment,
                     ProviderSecretProfile::CodexOnecliAuthFile,
+                    ProviderSecretProfile::CodexOnecliCaFile,
                 ],
             ),
             (
@@ -2087,6 +2138,7 @@ mod provider_launch_context_tests {
                 vec![
                     ProviderSecretProfile::AmplifierOnecliEnvironment,
                     ProviderSecretProfile::AmplifierOnecliKeysFile,
+                    ProviderSecretProfile::AmplifierOnecliCaFile,
                 ],
             ),
         ] {
