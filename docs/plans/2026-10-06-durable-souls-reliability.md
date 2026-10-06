@@ -293,8 +293,8 @@ Run: `git commit -m "fix(runtime): refresh provider config with owned filesystem
 ### Task 3: Prevent unsupported absence and loss certification
 
 **Files:**
-- Modify: `crates/freshell-supervisor/src/recovery.rs:1928`, `resume_catalog.rs`, `backend/native_history.rs`, `loss_report.rs`, `loss_report_tests.rs`, `crates/freshell-session-host/src/main.rs`.
-- Test: existing recovery/loss/native-history test modules.
+- Modify: `crates/freshell-supervisor/src/recovery.rs:1928`, `resume_catalog.rs`, `backend/native_history.rs`, `loss_report.rs`, `loss_report_tests.rs`, `crates/freshell-session-host/src/main.rs`, `crates/freshell-agent-runtime/src/lib.rs` (the actual online provider-store readers).
+- Test: existing recovery/loss/native-history test modules and inline agent-runtime provider-store behavior tests.
 
 **Interfaces:**
 - Consumes: `RecoveryContext`, `RecoveryProbe`, `EvidenceStoreState`, existing qualified exact-source census and verified `ResumeSpec`.
@@ -334,7 +334,7 @@ Expected: PASS for source census, true loss, pristine seed, materialization fenc
 
 - [ ] **Step 7: Commit the task**
 
-Run: `git add crates/freshell-supervisor/src/recovery.rs crates/freshell-supervisor/src/resume_catalog.rs crates/freshell-supervisor/src/backend/native_history.rs crates/freshell-supervisor/src/loss_report.rs crates/freshell-supervisor/src/loss_report_tests.rs crates/freshell-session-host/src/main.rs`
+Run: `git add crates/freshell-supervisor/src/recovery.rs crates/freshell-supervisor/src/resume_catalog.rs crates/freshell-supervisor/src/backend/native_history.rs crates/freshell-supervisor/src/loss_report.rs crates/freshell-supervisor/src/loss_report_tests.rs crates/freshell-session-host/src/main.rs crates/freshell-agent-runtime/src/lib.rs`
 
 Run: `git commit -m "fix(supervisor): require inspected evidence before native loss"`
 
