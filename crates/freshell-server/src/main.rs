@@ -44,6 +44,8 @@ mod managed_ports;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_provider_bootstrap;
 #[cfg(feature = "managed-runtime-v1")]
+mod managed_provider_references;
+#[cfg(feature = "managed-runtime-v1")]
 mod managed_runtime;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_runtime_api;

@@ -460,3 +460,249 @@ mod tests {
         assert_eq!(config["permission"]["bash"], "allow");
     }
 }
+
+/// Input provenance for one token in the pinned document-level substitution.
+/// Expanded paths are transient; never serialize or log this callback input.
+pub struct FileToken<'a> {
+    pub path: &'a str,
+    pub original_span: std::ops::Range<usize>,
+    pub variables: Vec<&'a str>,
+    pub direct_expression: bool,
+    pub ordinal: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformError {
+    SourceLimit,
+    ExpansionLimit,
+    EventLimit,
+    VariableLimit,
+}
+
+struct SubstitutionSegment<'a> {
+    expanded: std::ops::Range<usize>,
+    original: std::ops::Range<usize>,
+    variable: Option<&'a str>,
+}
+
+const MAX_CONFIG_VIEW_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONFIG_EVENTS: usize = 8192;
+
+fn bounded_append(out: &mut String, piece: &str) -> Result<(), TransformError> {
+    if out
+        .len()
+        .checked_add(piece.len())
+        .is_none_or(|n| n > MAX_CONFIG_VIEW_BYTES)
+    {
+        return Err(TransformError::ExpansionLimit);
+    }
+    out.push_str(piece);
+    Ok(())
+}
+
+fn outer_file_end(raw: &str, start: usize) -> Option<usize> {
+    if !raw[start..].starts_with("{file:") {
+        return None;
+    }
+    let mut cursor = start + 6;
+    while cursor < raw.len() {
+        if raw[cursor..].starts_with("{env:") {
+            let close = raw[cursor + 5..].find('}')? + cursor + 5;
+            cursor = close + 1;
+        } else if raw.as_bytes()[cursor] == b'}' {
+            return Some(cursor + 1);
+        } else {
+            cursor += raw[cursor..].chars().next()?.len_utf8();
+        }
+    }
+    None
+}
+
+/// OpenCode 1.18.21 performs exactly one raw env pass, then snapshots file
+/// matches from the resulting document. Keep raw escapes and full line-prefix
+/// context; parsed JSON strings do not reproduce its substitution behavior.
+/// Output may contain private child values and is process-only.
+pub fn transform_file_tokens<E>(
+    raw: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+    mut file: impl FnMut(FileToken<'_>) -> Result<String, E>,
+) -> Result<String, TokenTransformError<E>> {
+    use TokenTransformError::{Bound, Selection};
+    if raw.len() > MAX_CONFIG_VIEW_BYTES {
+        return Err(Bound(TransformError::SourceLimit));
+    }
+    let mut expanded = String::new();
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = raw[cursor..].find("{env:") {
+        let start = cursor + relative;
+        let Some(close_relative) = raw[start + 5..].find('}') else {
+            break;
+        };
+        let close = start + 5 + close_relative;
+        let name = &raw[start + 5..close];
+        if name.is_empty() {
+            cursor = close + 1;
+            continue;
+        }
+        if name.len() > 128 || name.chars().any(char::is_control) {
+            return Err(Bound(TransformError::VariableLimit));
+        }
+        if segments.len() + 2 > MAX_CONFIG_EVENTS {
+            return Err(Bound(TransformError::EventLimit));
+        }
+        let literal_start = segments
+            .last()
+            .map_or(0, |segment: &SubstitutionSegment<'_>| segment.original.end);
+        let begin = expanded.len();
+        bounded_append(&mut expanded, &raw[literal_start..start]).map_err(Bound)?;
+        segments.push(SubstitutionSegment {
+            expanded: begin..expanded.len(),
+            original: literal_start..start,
+            variable: None,
+        });
+        let begin = expanded.len();
+        if let Some(value) = env(name) {
+            bounded_append(&mut expanded, &value).map_err(Bound)?;
+        }
+        segments.push(SubstitutionSegment {
+            expanded: begin..expanded.len(),
+            original: start..close + 1,
+            variable: Some(name),
+        });
+        cursor = close + 1;
+    }
+    let literal_start = segments
+        .last()
+        .map_or(0, |segment: &SubstitutionSegment<'_>| segment.original.end);
+    let begin = expanded.len();
+    bounded_append(&mut expanded, &raw[literal_start..]).map_err(Bound)?;
+    segments.push(SubstitutionSegment {
+        expanded: begin..expanded.len(),
+        original: literal_start..raw.len(),
+        variable: None,
+    });
+    let mut out = String::new();
+    let mut cursor = 0;
+    let mut scan = 0;
+    let mut ordinal = 0;
+    while let Some(relative) = expanded[scan..].find("{file:") {
+        let start = scan + relative;
+        let Some(close_relative) = expanded[start + 6..].find('}') else {
+            break;
+        };
+        let end = start + 6 + close_relative + 1;
+        scan = end;
+        if end == start + 7 {
+            continue;
+        }
+        let line_start = expanded[..start].rfind('\n').map_or(0, |n| n + 1);
+        if expanded[line_start..start].trim_start().starts_with("//") {
+            continue;
+        }
+        if ordinal >= MAX_CONFIG_EVENTS {
+            return Err(Bound(TransformError::EventLimit));
+        }
+        let mut original_start = usize::MAX;
+        let mut original_end = 0;
+        let mut variables = Vec::new();
+        for segment in &segments {
+            if segment.expanded.start >= end || segment.expanded.end <= start {
+                continue;
+            }
+            let (a, b) = if let Some(variable) = segment.variable {
+                if !variables.contains(&variable) {
+                    variables.push(variable);
+                }
+                (segment.original.start, segment.original.end)
+            } else {
+                (
+                    segment.original.start + start.saturating_sub(segment.expanded.start),
+                    segment.original.start
+                        + (end.min(segment.expanded.end) - segment.expanded.start),
+                )
+            };
+            original_start = original_start.min(a);
+            original_end = original_end.max(b);
+        }
+        let direct_expression = outer_file_end(raw, original_start) == Some(original_end);
+        let replacement = file(FileToken {
+            path: &expanded[start + 6..end - 1],
+            original_span: original_start..original_end,
+            variables,
+            direct_expression,
+            ordinal,
+        })
+        .map_err(Selection)?;
+        bounded_append(&mut out, &expanded[cursor..start]).map_err(Bound)?;
+        bounded_append(&mut out, &replacement).map_err(Bound)?;
+        cursor = end;
+        ordinal += 1;
+    }
+    bounded_append(&mut out, &expanded[cursor..]).map_err(Bound)?;
+    Ok(out)
+}
+
+#[derive(Debug)]
+pub enum TokenTransformError<E> {
+    Bound(TransformError),
+    Selection(E),
+}
+
+#[cfg(test)]
+mod substitution_tests {
+    use super::*;
+    #[test]
+    fn one_pass_preserves_introduced_env_tokens_and_snapshots_file_tokens() {
+        let raw = r#"{"x":"{env:INSERT}"}"#;
+        let out = transform_file_tokens(
+            raw,
+            &|name| (name == "INSERT").then(|| "prefix{file:rules}suffix{env:UNEXPANDED}".into()),
+            |token| {
+                assert!(!token.direct_expression);
+                assert_eq!(token.path, "rules");
+                assert_eq!(token.variables, vec!["INSERT"]);
+                Ok::<_, ()>("{file:replacement}".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            r#"{"x":"prefix{file:replacement}suffix{env:UNEXPANDED}"}"#
+        );
+    }
+    #[test]
+    fn full_line_comment_prefix_is_preserved_and_empty_variable_matches_native() {
+        let raw = "  // {file:missing}\n{\"x\":\"{file:{env:MISSING}}\"}";
+        let out = transform_file_tokens::<()>(raw, &|_| None, |_| {
+            panic!("comment/empty file cannot select a source")
+        })
+        .unwrap();
+        assert_eq!(out, "  // {file:missing}\n{\"x\":\"{file:}\"}");
+    }
+    #[test]
+    fn nested_file_span_preserves_unrelated_env_tokens_in_controller_template() {
+        let raw = r#"{"x":"{file:{env:PATH}}","y":"{env:OTHER}"}"#;
+        let mut span = None;
+        transform_file_tokens(
+            raw,
+            &|name| {
+                Some(
+                    if name == "PATH" {
+                        "/approved"
+                    } else {
+                        "private-child"
+                    }
+                    .into(),
+                )
+            },
+            |token| {
+                assert!(token.direct_expression);
+                span = Some(token.original_span);
+                Ok::<_, ()>("runtime".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(&raw[span.unwrap()], "{file:{env:PATH}}");
+    }
+}
