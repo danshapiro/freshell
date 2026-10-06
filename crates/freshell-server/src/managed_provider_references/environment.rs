@@ -168,6 +168,20 @@ impl SourceEnvironment {
                 }
             }
         }
+        let generated_count = plan
+            .iter()
+            .map(|source| source.references.recipes.len())
+            .try_fold(0usize, usize::checked_add)
+            .ok_or("selected/generated source name count overflow")?;
+        if selected
+            .len()
+            .checked_add(generated_count)
+            .is_none_or(|count| count > 128)
+        {
+            return Err(
+                "selected and generated source inputs exceed shared 128-name profile".into(),
+            );
+        }
         let mut result = ProviderPathInputs::default();
         for name in selected {
             if matches!(
@@ -266,6 +280,64 @@ mod tests {
             .unexpanded_source()
             .contains("PRIVATE_PREFIX"));
     }
+    #[test]
+    fn managed_provider_source_environment_combines_selected_and_generated_name_budget() {
+        use super::super::sources::{LoadedSourceOccurrence, SourceOccurrence};
+        let owned = tempfile::tempdir().unwrap();
+        let rules = owned.path().join("rules");
+        std::fs::write(&rules, "synthetic-budget-rule-nonce").unwrap();
+        let names = (0..127)
+            .map(|index| format!("ROOT_{index}"))
+            .chain(std::iter::once("INSERT".into()))
+            .collect::<Vec<_>>();
+        let input = format!("{{file:{}}}", rules.display());
+        let original = |name: &str| {
+            if name == "INSERT" {
+                Some(input.clone())
+            } else if name.starts_with("ROOT_") {
+                Some(rules.to_str().unwrap().into())
+            } else {
+                None
+            }
+        };
+        let mut environment = SourceEnvironment::read(names, &[], &original).unwrap();
+        environment.set_native_auth(BTreeMap::new()).unwrap();
+        for selected_names in [127, 128] {
+            let mut fields = (0..selected_names - 1)
+                .map(|index| format!("{{file:{{env:ROOT_{index}}}}}"))
+                .collect::<Vec<_>>();
+            fields.push("{env:INSERT}".into());
+            let raw = serde_json::json!({"instructions": fields}).to_string();
+            let config = owned.path().join("opencode.json");
+            let plan = environment
+                .plan_sources(
+                    vec![LoadedSourceOccurrence {
+                        source: SourceOccurrence {
+                            logical_path: config.clone(),
+                            canonical_source: config,
+                            lane: SourceLane::Main,
+                        },
+                        view: std::sync::Arc::new(raw),
+                    }],
+                    owned.path(),
+                    owned.path(),
+                )
+                .unwrap();
+            assert_eq!(plan[0].references.recipes.len(), 1);
+            let frozen = environment.frozen_inputs(&plan);
+            if selected_names == 127 {
+                assert_eq!(
+                    frozen.unwrap().iter().count(),
+                    127,
+                    "the shared profile must allow exactly 128 selected plus generated names"
+                );
+            } else {
+                assert!(frozen.is_err(),
+                    "128 selected names plus a generated name must fail before capability publication");
+            }
+        }
+    }
+
     #[test]
     fn managed_provider_source_environment_maps_known_runtime_ca_to_its_typed_source() {
         use super::super::sources::{LoadedSourceOccurrence, SourceOccurrence};
