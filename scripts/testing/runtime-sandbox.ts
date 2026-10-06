@@ -680,7 +680,11 @@ export class RuntimeHarness {
         args.push('-v', `${credentialFile}:${credentialFile}:ro`)
       }
     }
-    if (options.crashPoint) args.push('-e', `FRESHELL_RUNTIME_CRASH_POINT=${options.crashPoint}`)
+    if (options.crashPoint) {
+      // Namespace PID1 ignores default SIGABRT; libc abort can then trap with
+      // SIGSEGV. Let Docker's init reap the actual aborted supervisor child.
+      args.push('--init', '-e', `FRESHELL_RUNTIME_CRASH_POINT=${options.crashPoint}`)
+    }
     if (options.dbFailpoint) args.push('-e', `FRESHELL_RUNTIME_DB_FAILPOINT=${options.dbFailpoint}`)
     for (const [key, value] of Object.entries(options.env ?? {})) args.push('-e', `${key}=${value}`)
     args.push(
