@@ -538,6 +538,14 @@ fn mode(path: &Path, permissions: u32, relative: &Path) -> Result<(), CopyError>
     Ok(())
 }
 struct TemporaryProjection(PathBuf);
+impl TemporaryProjection {
+    fn create(path: PathBuf) -> Result<Self, CopyError> {
+        fs::create_dir(&path).map_err(|cause| io_error(Path::new(""), "create_stage", cause))?;
+        let temporary = Self(path);
+        mode(&temporary.0, 0o700, Path::new(""))?;
+        Ok(temporary)
+    }
+}
 impl Drop for TemporaryProjection {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -642,18 +650,35 @@ fn copy_environment_with_account_home(
             }
         }
     }
-    let parent = destination_root
-        .parent()
-        .ok_or_else(|| error(Path::new(""), "stage", "destination has no parent"))?;
-    fs::create_dir_all(parent)
-        .map_err(|cause| io_error(Path::new(""), "create_stage_parent", cause))?;
-    let temporary = TemporaryProjection(parent.join(format!(
+    // A mounted destination's parent may be read-only or on another filesystem.
+    // Keep its inode stable and stage inside the writable destination instead.
+    let existing_root = match fs::symlink_metadata(destination_root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+        Ok(_) => {
+            return Err(error(
+                Path::new(""),
+                "publish",
+                "destination root must be a physical directory",
+            ))
+        }
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => false,
+        Err(cause) => return Err(io_error(Path::new(""), "inspect_destination", cause)),
+    };
+    let parent = if existing_root {
+        destination_root
+    } else {
+        let parent = destination_root
+            .parent()
+            .ok_or_else(|| error(Path::new(""), "stage", "destination has no parent"))?;
+        fs::create_dir_all(parent)
+            .map_err(|cause| io_error(Path::new(""), "create_stage_parent", cause))?;
+        parent
+    };
+    let temporary = TemporaryProjection::create(parent.join(format!(
         ".freshell-copy-{}-{}",
         std::process::id(),
         NEXT_PROJECTION.fetch_add(1, Ordering::Relaxed)
-    )));
-    fs::create_dir(&temporary.0).map_err(|cause| io_error(Path::new(""), "create_stage", cause))?;
-    mode(&temporary.0, 0o700, Path::new(""))?;
+    )))?;
     let mut actual_bytes = 0u64;
     for (relative, node) in &plan.nodes {
         let destination = temporary.0.join(relative);
@@ -727,7 +752,7 @@ fn copy_environment_with_account_home(
             }
         }
     }
-    if !destination_root.exists() {
+    if !existing_root {
         fs::rename(&temporary.0, destination_root)
             .map_err(|cause| io_error(Path::new(""), "publish", cause))?;
     } else {
@@ -799,10 +824,7 @@ fn copy_environment_with_account_home(
                         "existing destination type conflicts with selected resource",
                     ))
                 }
-                Ok(_) => {
-                    fs::remove_file(&destination)
-                        .map_err(|cause| io_error(relative, "replace_leaf", cause))?;
-                }
+                Ok(_) => {}
                 Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {}
                 Err(cause) => return Err(io_error(relative, "inspect_destination", cause)),
             }
@@ -838,6 +860,76 @@ mod tests {
             source: source.to_owned(),
             destination_relative: destination.into(),
         }
+    }
+
+    #[test]
+    fn failed_stage_creation_never_removes_a_preexisting_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("existing-provider-sibling");
+        fs::create_dir(&existing).unwrap();
+        fs::write(existing.join("sentinel"), "provider-owned-nonce").unwrap();
+        assert!(TemporaryProjection::create(existing.clone()).is_err());
+        assert_eq!(
+            fs::read(existing.join("sentinel")).expect("failed create grants no cleanup authority"),
+            b"provider-owned-nonce"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_destination_keeps_root_and_siblings_when_staging_or_validation_fails() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("home");
+        fs::create_dir_all(source.join("z-conflict")).unwrap();
+        fs::create_dir_all(home.join("selected")).unwrap();
+        fs::write(source.join("a-first"), "new-nonce").unwrap();
+        fs::write(source.join("z-conflict/child"), "child-nonce").unwrap();
+        fs::write(home.join("selected/a-first"), "prior-nonce").unwrap();
+        fs::write(home.join("selected/z-conflict"), "existing-type").unwrap();
+        fs::write(home.join("sibling"), "sibling-nonce").unwrap();
+        let identity = |path: &Path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                metadata.ino(),
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mode(),
+            )
+        };
+        let before_home = identity(&home);
+        let before_sibling = identity(&home.join("sibling"));
+        let before_leaf = identity(&home.join("selected/a-first"));
+        let selected = [selection(&source, "selected")];
+        assert!(copy_environment(&selected, &home, &[], CopyLimits::default()).is_err());
+        assert_eq!(
+            fs::read(home.join("selected/a-first")).unwrap(),
+            b"prior-nonce"
+        );
+        assert_eq!(identity(&home.join("selected/a-first")), before_leaf);
+        assert_eq!(identity(&home), before_home);
+        assert_eq!(identity(&home.join("sibling")), before_sibling);
+        assert_eq!(
+            fs::read_dir(&home).unwrap().count(),
+            2,
+            "attempt stage must be removed"
+        );
+
+        fs::remove_file(home.join("selected/z-conflict")).unwrap();
+        copy_environment(&selected, &home, &[], CopyLimits::default()).unwrap();
+        assert_eq!(
+            fs::read(home.join("selected/a-first")).unwrap(),
+            b"new-nonce"
+        );
+        assert_eq!(
+            fs::read(home.join("selected/z-conflict/child")).unwrap(),
+            b"child-nonce"
+        );
+        assert_eq!(identity(&home), before_home);
+        assert_eq!(identity(&home.join("sibling")), before_sibling);
+        assert_eq!(fs::read(home.join("sibling")).unwrap(), b"sibling-nonce");
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 2);
     }
 
     #[cfg(unix)]

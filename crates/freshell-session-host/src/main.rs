@@ -1215,15 +1215,20 @@ fn rollback_created_provider_paths(paths: &[PathBuf]) {
         }
     }
 }
-struct BootstrapCreatedPaths {
-    paths: std::collections::BTreeSet<PathBuf>,
+struct BootstrapPublication {
+    // Every newly published inode needs ownership handoff, including replacements.
+    owned_paths: std::collections::BTreeSet<PathBuf>,
+    // Only newly created pathnames grant removal authority on failure.
+    new_paths: Vec<PathBuf>,
+    replacements: Vec<(PathBuf, PathBuf)>,
 }
-impl BootstrapCreatedPaths {
+impl BootstrapPublication {
     fn reserve(&self, path: &Path) -> Result<(), String> {
         let observed = self
-            .paths
+            .owned_paths
             .len()
-            .checked_add(if self.paths.contains(path) { 1 } else { 2 })
+            .checked_add(usize::from(!self.owned_paths.contains(path)))
+            .and_then(|entries| entries.checked_add(1)) // mounted HOME handoff
             .ok_or("created path accounting overflow")?;
         if observed > freshell_platform::provider_environment::CopyLimits::default().max_entries {
             return Err(format!("created provider paths exceed shared entry bound: observed {observed}, permitted 100000"));
@@ -1231,9 +1236,14 @@ impl BootstrapCreatedPaths {
         Ok(())
     }
 }
-impl Drop for BootstrapCreatedPaths {
+impl Drop for BootstrapPublication {
     fn drop(&mut self) {
-        rollback_created_provider_paths(&self.paths.iter().cloned().collect::<Vec<_>>());
+        rollback_created_provider_paths(&self.new_paths);
+        for (destination, backup) in self.replacements.iter().rev() {
+            if let Err(error) = std::fs::rename(backup, destination) {
+                tracing::error!(event = "provider.bootstrap.rollback.failed", stage = "session_host", operation = "restore_replacement", path = %destination.display(), %error);
+            }
+        }
     }
 }
 
@@ -1242,15 +1252,25 @@ fn write_provider_bootstrap_files(
     home: &Path,
     source_root: &Path,
 ) -> Result<Vec<PathBuf>, String> {
+    write_provider_bootstrap_files_with_publish(files, home, source_root, |source, destination| {
+        std::fs::rename(source, destination)
+    })
+}
+
+fn write_provider_bootstrap_files_with_publish(
+    files: &[ProviderBootstrapFile],
+    home: &Path,
+    source_root: &Path,
+    mut publish: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Vec<PathBuf>, String> {
+    use freshell_platform::provider_environment::{copy_environment, CopyLimits, CopySelection};
     if !std::fs::symlink_metadata(home)
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
     {
         return Err("managed provider HOME volume is not mounted as a physical directory".into());
     }
-    let mut created = BootstrapCreatedPaths {
-        paths: std::collections::BTreeSet::new(),
-    };
-    for (index, file) in files.iter().enumerate() {
+    let mut destinations = Vec::with_capacity(files.len());
+    for file in files {
         let relative = Path::new(&file.provider_relative_path);
         if relative.as_os_str().is_empty()
             || relative
@@ -1267,51 +1287,110 @@ fn write_provider_bootstrap_files(
                 Ok(_) => {
                     return Err("provider bootstrap parent must be a physical directory".into())
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        let destination = home.join(relative);
+        match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err("provider bootstrap destination must be a regular file".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if destinations.iter().any(|other: &PathBuf| {
+            destination.starts_with(other) || other.starts_with(&destination)
+        }) {
+            return Err("provider bootstrap destinations overlap".into());
+        }
+        destinations.push(destination);
+    }
+    // Read and bound every input before changing any selected destination. Both
+    // staged files and replacement backups remain on the mounted HOME filesystem.
+    let stage = tempfile::Builder::new()
+        .prefix(".freshell-bootstrap-")
+        .tempdir_in(home)
+        .map_err(|error| error.to_string())?;
+    let selections = files
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let source = source_root.join(format!("provider-{index}"));
+            if !std::fs::metadata(&source)
+                .map_err(|error| error.to_string())?
+                .is_file()
+            {
+                return Err("provider bootstrap input must be a regular file".to_owned());
+            }
+            Ok(CopySelection {
+                source: std::fs::canonicalize(source).map_err(|error| error.to_string())?,
+                destination_relative: format!("provider-{index}").into(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    copy_environment(
+        &selections,
+        &stage.path().join("inputs"),
+        &[],
+        CopyLimits::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut created = BootstrapPublication {
+        owned_paths: std::collections::BTreeSet::new(),
+        new_paths: Vec::new(),
+        replacements: Vec::new(),
+    };
+    for (index, destination) in destinations.iter().enumerate() {
+        let relative = destination
+            .strip_prefix(home)
+            .map_err(|error| error.to_string())?;
+        let mut parent = home.to_path_buf();
+        for part in relative.parent().into_iter().flat_map(Path::components) {
+            parent.push(part.as_os_str());
+            match std::fs::symlink_metadata(&parent) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return Err("provider bootstrap parent must be a physical directory".into())
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     created.reserve(&parent)?;
                     std::fs::create_dir(&parent).map_err(|error| error.to_string())?;
-                    created.paths.insert(parent.clone());
+                    created.owned_paths.insert(parent.clone());
+                    created.new_paths.push(parent.clone());
                     set_mode(&parent, 0o700)?;
                 }
                 Err(error) => return Err(error.to_string()),
             }
         }
-        let destination = home.join(relative);
-        created.reserve(&destination)?;
-        if std::fs::symlink_metadata(&destination)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err("provider bootstrap destination cannot be a symbolic link".into());
+        created.reserve(destination)?;
+        let replacement = match std::fs::symlink_metadata(destination) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
+            Ok(_) => return Err("provider bootstrap destination must be a regular file".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.to_string()),
+        };
+        let input = stage.path().join(format!("inputs/provider-{index}"));
+        set_mode(&input, 0o600)?;
+        // Sync each complete input before publishing it, as the prior writer did.
+        std::fs::File::open(&input)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        if replacement {
+            let backup = stage.path().join(format!("backup-{index}"));
+            std::fs::rename(destination, &backup).map_err(|error| error.to_string())?;
+            created.replacements.push((destination.clone(), backup));
         }
-        let source = source_root.join(format!("provider-{index}"));
-        let bytes = std::fs::read(source).map_err(|error| error.to_string())?;
-        let temporary = destination.with_extension(format!("freshell-tmp-{}", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+        publish(&input, destination).map_err(|error| error.to_string())?;
+        created.owned_paths.insert(destination.clone());
+        if !replacement {
+            created.new_paths.push(destination.clone());
         }
-        use std::io::Write;
-        let result = (|| {
-            let mut output = options
-                .open(&temporary)
-                .map_err(|error| error.to_string())?;
-            output
-                .write_all(&bytes)
-                .map_err(|error| error.to_string())?;
-            output.sync_all().map_err(|error| error.to_string())?;
-            std::fs::rename(&temporary, &destination).map_err(|error| error.to_string())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        result?;
-        created.paths.insert(destination);
     }
-    // The exact mounted HOME is controller-created and is handed off last.
-    let mut paths = std::mem::take(&mut created.paths);
+    // Committing leaves only the exact new inode ownership ledger. Backups are
+    // attempt-owned and disappear with the stage; adopted parents are excluded.
+    created.new_paths.clear();
+    created.replacements.clear();
+    let mut paths = std::mem::take(&mut created.owned_paths);
     paths.insert(home.to_owned());
     Ok(paths.into_iter().collect())
 }
@@ -1636,6 +1715,23 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     }
     paths.sort();
     paths.dedup();
+    paths.sort_by_key(|path| path.components().count());
+    let selections = paths
+        .iter()
+        .map(
+            |path| freshell_platform::provider_environment::CopySelection {
+                source: projection.join(path),
+                destination_relative: path.clone(),
+            },
+        )
+        .collect::<Vec<_>>();
+    freshell_platform::provider_environment::copy_environment(
+        &selections,
+        provider_home,
+        &[],
+        Default::default(),
+    )
+    .map_err(|error| error.to_string())?;
     let mut stale = previous.difference(&current).collect::<Vec<_>>();
     stale.sort_by_key(|path| std::cmp::Reverse(Path::new(path).components().count()));
     for relative in stale {
@@ -1652,24 +1748,6 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
             }
         }
     }
-    paths.sort_by_key(|path| path.components().count());
-    let selections = paths
-        .iter()
-        .filter(|path| std::fs::symlink_metadata(projection.join(path)).is_ok())
-        .map(
-            |path| freshell_platform::provider_environment::CopySelection {
-                source: projection.join(path),
-                destination_relative: path.clone(),
-            },
-        )
-        .collect::<Vec<_>>();
-    freshell_platform::provider_environment::copy_environment(
-        &selections,
-        provider_home,
-        &[],
-        Default::default(),
-    )
-    .map_err(|error| error.to_string())?;
     write_projection_manifest(provider_home, &current)?;
     Ok(())
 }
@@ -2708,6 +2786,61 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_failed_staged_resource_preserves_previous_projection_and_retry() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let stage = root.path().join("stage");
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        std::fs::create_dir_all(stage.join("projection/skills")).unwrap();
+        std::fs::write(home.join("skills/old"), "prior-nonce").unwrap();
+        std::fs::write(home.join("skills/sibling"), "sibling-nonce").unwrap();
+        std::fs::write(
+            home.join(PROVIDER_PROJECTION_MANIFEST),
+            r#"["skills","skills/old"]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            stage.join("projection").join(PROVIDER_PROJECTION_MANIFEST),
+            r#"["skills","skills/new"]"#,
+        )
+        .unwrap();
+        std::fs::write(stage.join("manifest.json"), r#"["skills"]"#).unwrap();
+        symlink("missing", stage.join("projection/skills/new")).unwrap();
+        let before = std::fs::metadata(&home).unwrap().ino();
+        assert!(apply_staged_provider_config(&stage, &home).is_err());
+        assert_eq!(
+            std::fs::read(home.join("skills/old"))
+                .expect("prior projection must survive failed staging"),
+            b"prior-nonce"
+        );
+        assert_eq!(
+            read_projection_manifest(&home).unwrap(),
+            ["skills".to_owned(), "skills/old".to_owned()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            std::fs::read(home.join("skills/sibling")).unwrap(),
+            b"sibling-nonce"
+        );
+        std::fs::remove_file(stage.join("projection/skills/new")).unwrap();
+        std::fs::write(stage.join("projection/skills/new"), "new-nonce").unwrap();
+        apply_staged_provider_config(&stage, &home).unwrap();
+        assert_eq!(std::fs::metadata(&home).unwrap().ino(), before);
+        assert!(!home.join("skills/old").exists());
+        assert_eq!(
+            std::fs::read(home.join("skills/new")).unwrap(),
+            b"new-nonce"
+        );
+        assert_eq!(
+            std::fs::read(home.join("skills/sibling")).unwrap(),
+            b"sibling-nonce"
+        );
+    }
+
     #[test]
     fn provider_config_exact_resume_refreshes_changes_and_removes_stale_projection() {
         use freshell_runtime_protocol::{
@@ -3651,6 +3784,154 @@ mod tests {
             assert!(write_provider_bootstrap_files(&files, &home, &inputs).is_err());
             assert!(!home.join("bootstrap").exists());
             assert_eq!(std::fs::read(home.join("sibling")).unwrap(), b"sentinel");
+        }
+
+        #[test]
+        fn bootstrap_later_input_failure_preserves_existing_leaf_and_allows_retry() {
+            use std::os::unix::fs::MetadataExt;
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("provider");
+            let inputs = root.path().join("inputs");
+            std::fs::create_dir_all(home.join("bootstrap")).unwrap();
+            std::fs::create_dir(&inputs).unwrap();
+            let first = home.join("bootstrap/first.json");
+            let sibling = home.join("bootstrap/sibling");
+            std::fs::write(&first, "prior-config").unwrap();
+            std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o640)).unwrap();
+            std::fs::write(&sibling, "provider-sibling").unwrap();
+            let before = std::fs::metadata(&first).unwrap();
+            let sibling_before = std::fs::metadata(&sibling).unwrap();
+            std::fs::write(inputs.join("provider-0"), "new-config").unwrap();
+            let files = [
+                ProviderBootstrapFile {
+                    source_path: "fixture".into(),
+                    provider_relative_path: "bootstrap/first.json".into(),
+                },
+                ProviderBootstrapFile {
+                    source_path: "fixture".into(),
+                    provider_relative_path: "bootstrap/second.json".into(),
+                },
+            ];
+            assert!(write_provider_bootstrap_files(&files, &home, &inputs).is_err());
+            assert_eq!(
+                std::fs::read(&first).expect("prior config must survive failed bootstrap"),
+                b"prior-config"
+            );
+            let after = std::fs::metadata(&first).unwrap();
+            assert_eq!(
+                (after.ino(), after.uid(), after.gid(), after.mode()),
+                (before.ino(), before.uid(), before.gid(), before.mode())
+            );
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"provider-sibling");
+            assert_eq!(
+                std::fs::metadata(&sibling).unwrap().ino(),
+                sibling_before.ino()
+            );
+            assert!(!home.join("bootstrap/second.json").exists());
+            std::fs::write(inputs.join("provider-1"), "second-config").unwrap();
+            let owned = write_provider_bootstrap_files(&files, &home, &inputs).unwrap();
+            assert!(
+                owned.contains(&first),
+                "replacement inode needs exact ownership handoff"
+            );
+            assert!(!owned.contains(&sibling));
+            assert!(!owned.contains(&home.join("bootstrap")));
+            assert_eq!(std::fs::read(&first).unwrap(), b"new-config");
+            assert_eq!(
+                std::fs::read(home.join("bootstrap/second.json")).unwrap(),
+                b"second-config"
+            );
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"provider-sibling");
+        }
+
+        #[test]
+        fn bootstrap_late_publication_failure_restores_replacements_and_removes_only_new_paths() {
+            use std::os::unix::fs::MetadataExt;
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("provider");
+            let inputs = root.path().join("inputs");
+            std::fs::create_dir_all(home.join("bootstrap")).unwrap();
+            std::fs::create_dir(&inputs).unwrap();
+            let first = home.join("bootstrap/first.json");
+            let last = home.join("bootstrap/last.json");
+            let sibling = home.join("bootstrap/sibling");
+            for (path, bytes, mode) in [
+                (&first, "prior-first", 0o640),
+                (&last, "prior-last", 0o700),
+                (&sibling, "provider-sibling", 0o600),
+            ] {
+                std::fs::write(path, bytes).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            let metadata = |path: &Path| {
+                let value = std::fs::metadata(path).unwrap();
+                (value.ino(), value.uid(), value.gid(), value.mode())
+            };
+            let before = [metadata(&first), metadata(&last), metadata(&sibling)];
+            let files = [
+                "bootstrap/first.json",
+                "new-parent/second.json",
+                "bootstrap/last.json",
+            ]
+            .map(|relative| ProviderBootstrapFile {
+                source_path: "fixture".into(),
+                provider_relative_path: relative.into(),
+            });
+            for index in 0..files.len() {
+                std::fs::write(
+                    inputs.join(format!("provider-{index}")),
+                    format!("new-{index}"),
+                )
+                .unwrap();
+            }
+            let mut published = 0;
+            let failure = write_provider_bootstrap_files_with_publish(
+                &files,
+                &home,
+                &inputs,
+                |source, destination| {
+                    published += 1;
+                    if published == 3 {
+                        assert_eq!(
+                            std::fs::read(&first).unwrap(),
+                            b"new-0",
+                            "first replacement was actually published before failure"
+                        );
+                        assert_eq!(
+                            std::fs::read(home.join("new-parent/second.json")).unwrap(),
+                            b"new-1"
+                        );
+                        return Err(std::io::Error::other("synthetic late publication failure"));
+                    }
+                    std::fs::rename(source, destination)
+                },
+            );
+            assert!(failure
+                .unwrap_err()
+                .contains("synthetic late publication failure"));
+            assert_eq!(published, 3);
+            assert_eq!(std::fs::read(&first).unwrap(), b"prior-first");
+            assert_eq!(std::fs::read(&last).unwrap(), b"prior-last");
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"provider-sibling");
+            assert_eq!(
+                [metadata(&first), metadata(&last), metadata(&sibling)],
+                before
+            );
+            assert!(!home.join("new-parent").exists());
+            assert_eq!(
+                std::fs::read_dir(&home).unwrap().count(),
+                1,
+                "attempt staging/backup paths must be cleaned"
+            );
+            let owned = write_provider_bootstrap_files(&files, &home, &inputs).unwrap();
+            assert!(owned.contains(&first));
+            assert!(owned.contains(&last));
+            assert!(owned.contains(&home.join("new-parent")));
+            assert!(!owned.contains(&home.join("bootstrap")));
+            assert!(!owned.contains(&sibling));
+            assert_eq!(std::fs::read(&first).unwrap(), b"new-0");
+            assert_eq!(std::fs::read(&last).unwrap(), b"new-2");
+            assert_eq!(metadata(&sibling), before[2]);
         }
 
         #[test]
