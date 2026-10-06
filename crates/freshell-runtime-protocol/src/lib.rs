@@ -1541,6 +1541,13 @@ mod provider_launch_context_tests {
         .unwrap();
         fresh.provider_secret_references = references;
         assert!(fresh.validate().is_ok());
+        // A valid filesystem path can exceed the legacy credential reference
+        // limit. Configuration references use the preparation frame budget.
+        let deep_source = format!("/private/{}/selected", "directory/".repeat(205));
+        terminal.provider_secret_references[0].source_path = deep_source.clone();
+        fresh.provider_secret_references[0].source_path = deep_source;
+        assert!(terminal.validate().is_ok());
+        assert!(fresh.validate().is_ok());
     }
     #[test]
     fn configuration_file_grants_reject_cross_provider_duplicate_and_unsafe_destinations() {
@@ -2258,7 +2265,12 @@ pub fn validate_provider_secrets(
     for reference in references {
         if reference.profile.provider() != provider
             || !std::path::Path::new(&reference.source_path).is_absolute()
-            || reference.source_path.len() > 1024
+            || reference.source_path.len()
+                > if reference.profile.is_configuration_file() {
+                    MAX_CONTROL_FRAME_BYTES
+                } else {
+                    1024
+                }
             || reference.source_path.chars().any(char::is_control)
             || matches!(
                 reference.profile,
