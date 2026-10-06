@@ -9,6 +9,9 @@ from pathlib import Path
 import subprocess
 import tempfile
 import uuid
+import socket
+import struct
+import time
 
 
 def docker(*args, check=True):
@@ -17,10 +20,218 @@ def docker(*args, check=True):
     )
 
 
+def indexed_inputs_probe(image, binary, binary_sha256, receipt_directory):
+    """Closed synthetic publisher/file-subpath fixture; permissions run in Docker."""
+    expected_image = "sha256:967627e41734aa903e824e4be22849c7f22ce0e69487ce61bb72004c4817f89c"
+    if image != expected_image:
+        raise RuntimeError("indexed input fixture requires the pinned already-present runtime image")
+    run_id = "freshell-indexed-probe-" + uuid.uuid4().hex
+    label_key = "com.freshell.indexed-input-probe"
+    labels = {label_key: run_id}
+    volume = run_id + "-volume"
+    containers = []
+    payload = b"synthetic-indexed-source\n"
+    expected_digest = hashlib.sha256(payload).hexdigest()
+    receipt = {"image": image, "binarySha256": binary_sha256, "rootless": True, "runId": run_id}
+
+    def remove_owned(name):
+        result = docker("container", "inspect", name, check=False)
+        if result.returncode != 0:
+            return
+        value = json.loads(result.stdout)[0]
+        if value["Config"].get("Labels", {}).get(label_key) != run_id:
+            raise RuntimeError("indexed fixture cleanup ownership changed")
+        docker("rm", "--force", value["Id"])
+
+    with tempfile.TemporaryDirectory(prefix=run_id) as temporary:
+        exchange = Path(temporary)
+        # This fresh directory contains only IPC/receipts. Setup and every
+        # chmod/chown/denial fixture executes inside the owned namespace.
+        stream = None
+        listener = None
+        volume_attempted = False
+        try:
+            setup = run_id + "-setup"
+            containers.append(setup)
+            docker("create", "--name", setup, "--label", f"{label_key}={run_id}",
+                   "--network", "none", "--read-only", "--cap-drop", "ALL",
+                   "--security-opt", "no-new-privileges:true", "--pids-limit", "32", "--memory", "64m",
+                   "--mount", f"type=bind,src={exchange},dst=/fixture-exchange",
+                   "--entrypoint", "/bin/sh", image, "-ceu", "chmod 710 /fixture-exchange")
+            setup_result = docker("start", "--attach", setup, check=False)
+            if setup_result.returncode != 0:
+                raise RuntimeError("indexed fixture namespace setup failed")
+            remove_owned(setup)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.settimeout(20)
+            socket_path = exchange / "reply.sock"
+            listener.bind(str(socket_path))
+            listener.listen(1)
+            mode_setup = run_id + "-socket-mode"
+            containers.append(mode_setup)
+            docker("create", "--name", mode_setup, "--label", f"{label_key}={run_id}",
+                   "--network", "none", "--read-only", "--cap-drop", "ALL",
+                   "--security-opt", "no-new-privileges:true", "--pids-limit", "32", "--memory", "64m",
+                   "--mount", f"type=bind,src={exchange},dst=/fixture-exchange",
+                   "--entrypoint", "/bin/sh", image, "-ceu", "chmod 660 /fixture-exchange/reply.sock")
+            if docker("start", "--attach", mode_setup, check=False).returncode != 0:
+                raise RuntimeError("indexed fixture socket setup failed")
+            remove_owned(mode_setup)
+            volume_attempted = True
+            docker("volume", "create", "--label", f"{label_key}={run_id}", "--driver", "local",
+                   "--opt", "type=tmpfs", "--opt", "device=tmpfs", "--opt",
+                   "o=size=64m,mode=0700,uid=65534,gid=0,nr_inodes=1024,nosuid,nodev,noexec", volume)
+            publisher = run_id + "-publisher"
+            containers.append(publisher)
+            docker("create", "--name", publisher, "--label", f"{label_key}={run_id}",
+                   "--user", "65534:0", "--network", "none", "--read-only", "--cap-drop", "ALL",
+                   "--security-opt", "no-new-privileges:true", "--log-driver", "none",
+                   "--pids-limit", "32", "--memory", "128m", "--cpus", ".5",
+                   "--mount", f"type=bind,src={binary},dst=/runtime/freshell-session-host,readonly",
+                   "--mount", f"type=volume,src={volume},dst=/run/freshell-input-files,volume-nocopy",
+                   "--mount", f"type=bind,src={exchange},dst=/run/freshell-input-exchange,readonly",
+                   "--entrypoint", "/runtime/freshell-session-host", image, "publish-provider-inputs")
+            docker("start", publisher)
+            stream, _ = listener.accept()
+            stream.settimeout(20)
+
+            def receive_exact(length):
+                result = bytearray()
+                while len(result) < length:
+                    chunk = stream.recv(length - len(result))
+                    if not chunk:
+                        raise RuntimeError("indexed publisher private acknowledgement incomplete")
+                    result.extend(chunk)
+                return bytes(result)
+
+            def send(request, expected):
+                frame = json.dumps(request, separators=(",", ":")).encode()
+                if len(frame) >= 1024 * 1024:
+                    raise RuntimeError("indexed fixture private frame exceeds profile")
+                stream.sendall(struct.pack(">I", len(frame)) + frame)
+                length = struct.unpack(">I", receive_exact(4))[0]
+                if length >= 1024 * 1024 or json.loads(receive_exact(length)) != expected:
+                    raise RuntimeError("indexed publisher acknowledgement phase changed")
+
+            send({"operation": "begin", "source_ids": [0]}, "begun")
+            send({"operation": "open", "source_id": 0}, "opened")
+            send({"operation": "chunk", "bytes": list(payload)}, "written")
+            send({"operation": "finish"}, "finished")
+            send({"operation": "seal"}, "populated")
+            consumer = run_id + "-consumer"
+            containers.append(consumer)
+            probe = r'''
+const fs=require('fs'), crypto=require('crypto');
+const file='/fixture/selected';
+const stat=fs.lstatSync(file);
+let writable=true;try{fs.writeFileSync(file,'forbidden-write')}catch{writable=false}
+const status=fs.readFileSync('/proc/self/status','utf8');
+console.log(JSON.stringify({regular:stat.isFile(),symlink:stat.isSymbolicLink(),uid:process.getuid(),gid:process.getgid(),fileUid:stat.uid,fileGid:stat.gid,mode:stat.mode&511,writable,sha256:crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'),capEff:status.match(/^CapEff:\s*(\w+)/m)?.[1],uidMap:fs.readFileSync('/proc/self/uid_map','utf8').trim(),gidMap:fs.readFileSync('/proc/self/gid_map','utf8').trim()}));
+setInterval(()=>{},1000);
+'''
+            docker("create", "--name", consumer, "--label", f"{label_key}={run_id}",
+                   "--user", "65534:0", "--network", "none", "--read-only", "--cap-drop", "ALL",
+                   "--security-opt", "no-new-privileges:true", "--pids-limit", "32", "--memory", "128m",
+                   "--mount", f"type=volume,src={volume},dst=/fixture/selected,volume-subpath=files/source-0,volume-nocopy,readonly",
+                   "--entrypoint", "/usr/local/bin/node", image, "-e", probe)
+            inspected = json.loads(docker("inspect", consumer).stdout)[0]
+            mount = inspected["HostConfig"]["Mounts"][0]
+            assert mount["Type"] == "volume" and mount["Source"] == volume and mount["ReadOnly"]
+            assert mount["VolumeOptions"]["NoCopy"] and mount["VolumeOptions"]["Subpath"] == "files/source-0"
+            docker("start", consumer)
+            active = json.loads(docker("inspect", consumer).stdout)[0]
+            flattened = active["Mounts"]
+            volume_metadata = json.loads(docker("volume", "inspect", volume).stdout)[0]
+            assert len(flattened) == 1
+            assert flattened[0]["Type"] == "volume" and flattened[0]["Name"] == volume
+            assert flattened[0]["Destination"] == "/fixture/selected" and not flattened[0]["RW"]
+            assert flattened[0]["Source"] == volume_metadata["Mountpoint"]
+            deadline = time.monotonic() + 20
+            observed = None
+            while time.monotonic() < deadline:
+                output = docker("logs", consumer).stdout.strip()
+                if output:
+                    observed = json.loads(output.splitlines()[0])
+                    break
+                time.sleep(.1)
+            if observed is None:
+                raise RuntimeError("indexed consumer produced no bounded receipt")
+            assert observed["regular"] and not observed["symlink"] and not observed["writable"]
+            assert observed["uid"] == 65534 and observed["gid"] == 0
+            assert observed["fileUid"] == 65534 and observed["fileGid"] == 0 and observed["mode"] == 0o600
+            assert observed["capEff"] == "0000000000000000" and observed["sha256"] == expected_digest
+            assert observed["uidMap"] and observed["gidMap"]
+            assert json.loads(docker("inspect", publisher).stdout)[0]["State"]["Running"]
+            send({"operation": "release"}, "released")
+            remove_owned(publisher)
+            assert json.loads(docker("inspect", consumer).stdout)[0]["State"]["Running"]
+            post_release = docker("exec", "--user", "65534:0", consumer, "/usr/local/bin/node", "-e",
+                                  "process.stdout.write(require('crypto').createHash('sha256').update(require('fs').readFileSync('/fixture/selected')).digest('hex'))").stdout
+            assert post_release == expected_digest
+            receipt.update({"consumer": observed, "subpath": mount["VolumeOptions"]["Subpath"], "flattenedMountAgreement": True, "publisherConsumerOverlap": True})
+            remove_owned(consumer)
+            stream.close()
+            stream = None
+            # After the last active mount goes away, the local tmpfs is empty.
+            # Repopulate the same exact owned volume before any cold consumer.
+            cold_publisher = run_id + "-cold-publisher"
+            containers.append(cold_publisher)
+            docker("create", "--name", cold_publisher, "--label", f"{label_key}={run_id}",
+                   "--user", "65534:0", "--network", "none", "--read-only", "--cap-drop", "ALL",
+                   "--security-opt", "no-new-privileges:true", "--log-driver", "none",
+                   "--pids-limit", "32", "--memory", "128m", "--cpus", ".5",
+                   "--mount", f"type=bind,src={binary},dst=/runtime/freshell-session-host,readonly",
+                   "--mount", f"type=volume,src={volume},dst=/run/freshell-input-files,volume-nocopy",
+                   "--mount", f"type=bind,src={exchange},dst=/run/freshell-input-exchange,readonly",
+                   "--entrypoint", "/runtime/freshell-session-host", image, "publish-provider-inputs")
+            docker("start", cold_publisher)
+            stream, _ = listener.accept()
+            stream.settimeout(20)
+            cold_payload = b"synthetic-cold-repopulation\n"
+            send({"operation": "begin", "source_ids": [0]}, "begun")
+            send({"operation": "open", "source_id": 0}, "opened")
+            send({"operation": "chunk", "bytes": list(cold_payload)}, "written")
+            send({"operation": "finish"}, "finished")
+            send({"operation": "seal"}, "populated")
+            cold_consumer = run_id + "-cold-consumer"
+            containers.append(cold_consumer)
+            docker("create", "--name", cold_consumer, "--label", f"{label_key}={run_id}",
+                   "--user", "65534:0", "--network", "none", "--read-only", "--cap-drop", "ALL",
+                   "--security-opt", "no-new-privileges:true", "--pids-limit", "32", "--memory", "128m",
+                   "--mount", f"type=volume,src={volume},dst=/fixture/selected,volume-subpath=files/source-0,volume-nocopy,readonly",
+                   "--entrypoint", "/usr/local/bin/node", image, "-e",
+                   "process.stdout.write(require('crypto').createHash('sha256').update(require('fs').readFileSync('/fixture/selected')).digest('hex'))")
+            cold = docker("start", "--attach", cold_consumer, check=False)
+            assert cold.returncode == 0 and cold.stdout == hashlib.sha256(cold_payload).hexdigest()
+            send({"operation": "release"}, "released")
+            receipt["postReleaseRead"] = True
+            receipt["coldLastUnmountRepopulated"] = True
+        finally:
+            if stream is not None:
+                stream.close()
+            if listener is not None:
+                listener.close()
+            for container in reversed(containers):
+                remove_owned(container)
+            volume_state = docker("volume", "inspect", volume, check=False)
+            if volume_attempted and volume_state.returncode == 0:
+                metadata = json.loads(volume_state.stdout)[0]
+                if metadata.get("Labels", {}).get(label_key) != run_id:
+                    raise RuntimeError("indexed fixture volume cleanup ownership changed")
+                docker("volume", "rm", volume)
+            receipt["ownedCleanup"] = all(docker("container", "inspect", name, check=False).returncode != 0 for name in containers)
+            receipt["ownedCleanup"] &= docker("volume", "inspect", volume, check=False).returncode != 0
+        output = receipt_directory / "task002-indexed-provider-inputs.json"
+        output.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+        print(json.dumps(receipt, sort_keys=True), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
     parser.add_argument("--binary", required=True, type=Path)
+    parser.add_argument("--indexed-inputs", action="store_true")
+    parser.add_argument("--receipt-dir", type=Path)
     args = parser.parse_args()
     security = json.loads(docker("info", "--format", "{{json .SecurityOptions}}").stdout)
     if "name=rootless" not in security:
@@ -29,6 +240,11 @@ def main():
     binary = args.binary.resolve(strict=True)
     with binary.open("rb") as reader:
         binary_sha256 = hashlib.file_digest(reader, "sha256").hexdigest()
+    if args.indexed_inputs:
+        if not args.receipt_dir or not args.receipt_dir.is_dir():
+            raise RuntimeError("indexed fixture requires an existing receipt directory")
+        indexed_inputs_probe(image, binary, binary_sha256, args.receipt_dir)
+        return
     owned_name = "freshell-config-probe-" + uuid.uuid4().hex
     label = "com.freshell.provider-config-probe=" + owned_name
     with tempfile.TemporaryDirectory(prefix=owned_name) as temporary:
