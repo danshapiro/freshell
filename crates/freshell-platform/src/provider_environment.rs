@@ -33,6 +33,7 @@ pub struct CopyReport {
     pub entries: usize,
     pub bytes: u64,
     pub projected_paths: Vec<PathBuf>,
+    pub created_paths: Vec<PathBuf>,
 }
 #[derive(Debug)]
 pub struct CopyError {
@@ -664,6 +665,191 @@ impl Drop for TemporaryProjection {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+/// Removal authority covers only inodes created by this attempt. Replaced
+/// provider inodes remain on the same filesystem until publication commits.
+struct Publication {
+    backup: TemporaryProjection,
+    created: Vec<PathBuf>,
+    replaced: Vec<(PathBuf, PathBuf)>,
+    committed: bool,
+}
+impl Drop for Publication {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for path in self.created.iter().rev() {
+            if let Ok(stat) = fs::symlink_metadata(path) {
+                let result = if stat.is_dir() {
+                    fs::remove_dir(path)
+                } else {
+                    fs::remove_file(path)
+                };
+                if let Err(cause) = result {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"severity":"error","event":"provider.environment.rollback.failed","operation":"remove_created","error_kind":format!("{:?}",cause.kind()),"os_error":cause.raw_os_error()})
+                    );
+                }
+            }
+        }
+        let mut failed = false;
+        for (destination, backup) in self.replaced.iter().rev() {
+            if let Err(cause) = fs::rename(backup, destination) {
+                failed = true;
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"severity":"error","event":"provider.environment.rollback.failed","operation":"restore_replacement","error_kind":format!("{:?}",cause.kind()),"os_error":cause.raw_os_error()})
+                );
+            }
+        }
+        if failed {
+            // Never erase the last original inode after a rollback failure.
+            self.backup.0 = PathBuf::new();
+        }
+    }
+}
+/// A bounded HOME publication retains prior inodes until all associated
+/// projection operations succeed. Dropping an unfinished attempt restores them.
+pub struct EnvironmentPublication {
+    report: CopyReport,
+    root: PathBuf,
+    rollback: Option<Publication>,
+    unfinished_new_root: bool,
+    _stage: TemporaryProjection,
+}
+impl Drop for EnvironmentPublication {
+    fn drop(&mut self) {
+        if !self.unfinished_new_root {
+            return;
+        }
+        for relative in self.report.projected_paths.iter().rev() {
+            let path = self.root.join(relative);
+            if let Ok(metadata) = fs::symlink_metadata(&path) {
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    let _ = fs::remove_dir(&path);
+                } else {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        // A concurrently added sibling keeps the new directory intact.
+        let _ = fs::remove_dir(&self.root);
+    }
+}
+impl EnvironmentPublication {
+    pub fn remove_obsolete(&mut self, relative: &Path) -> Result<(), CopyError> {
+        if !valid_relative(relative) {
+            return Err(error(
+                relative,
+                "remove_obsolete",
+                "projection path is unsafe",
+            ));
+        }
+        let path = self.root.join(relative);
+        for parent in relative
+            .parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            let stat = match fs::symlink_metadata(self.root.join(parent)) {
+                Ok(stat) => stat,
+                Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(cause) => return Err(io_error(relative, "inspect_obsolete", cause)),
+            };
+            if !stat.is_dir() || stat.file_type().is_symlink() {
+                return Err(error(
+                    relative,
+                    "inspect_obsolete",
+                    "projection parent must be a physical directory",
+                ));
+            }
+        }
+        let stat = match fs::symlink_metadata(&path) {
+            Ok(stat) => stat,
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(cause) => return Err(io_error(relative, "inspect_obsolete", cause)),
+        };
+        if stat.is_dir()
+            && fs::read_dir(&path)
+                .map_err(|cause| io_error(relative, "inspect_obsolete", cause))?
+                .next()
+                .is_some()
+        {
+            return Ok(());
+        }
+        let publication = self.rollback.as_mut().ok_or_else(|| {
+            error(
+                relative,
+                "remove_obsolete",
+                "new root has no previous projection",
+            )
+        })?;
+        let backup = publication
+            .backup
+            .0
+            .join(publication.replaced.len().to_string());
+        fs::rename(&path, &backup).map_err(|cause| io_error(relative, "retain_obsolete", cause))?;
+        publication.replaced.push((path, backup));
+        Ok(())
+    }
+    pub fn created_paths(&self) -> &[PathBuf] {
+        &self.report.created_paths
+    }
+    pub fn commit(mut self) -> Result<CopyReport, CopyError> {
+        File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|cause| io_error(Path::new(""), "sync_publication", cause))?;
+        if let Some(publication) = self.rollback.as_mut() {
+            publication.committed = true;
+        }
+        self.unfinished_new_root = false;
+        Ok(std::mem::replace(
+            &mut self.report,
+            CopyReport {
+                entries: 0,
+                bytes: 0,
+                projected_paths: Vec::new(),
+                created_paths: Vec::new(),
+            },
+        ))
+    }
+}
+
+pub fn stage_environment_with_publication(
+    selections: &[CopySelection],
+    destination_root: &Path,
+    excluded_canonical_sources: &[PathBuf],
+    limits: CopyLimits,
+    publish: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<EnvironmentPublication, CopyError> {
+    let account_home = std::env::var_os("HOME").and_then(|home| fs::canonicalize(home).ok());
+    stage_environment_with_publisher(
+        selections,
+        destination_root,
+        excluded_canonical_sources,
+        limits,
+        account_home,
+        publish,
+    )
+}
+pub fn stage_environment(
+    selections: &[CopySelection],
+    destination_root: &Path,
+    excluded_canonical_sources: &[PathBuf],
+    limits: CopyLimits,
+) -> Result<EnvironmentPublication, CopyError> {
+    let account_home = std::env::var_os("HOME").and_then(|home| fs::canonicalize(home).ok());
+    stage_environment_with_publisher(
+        selections,
+        destination_root,
+        excluded_canonical_sources,
+        limits,
+        account_home,
+        |source, destination| fs::rename(source, destination),
+    )
+}
 static NEXT_PROJECTION: AtomicU64 = AtomicU64::new(0);
 
 /// Plans the complete physical graph first; rejected selections cannot publish
@@ -837,12 +1023,38 @@ struct CopyProjectionOptions<'a> {
 }
 
 fn copy_environment_projection(
+    selections: &[CopySelection], destination_root: &Path,
+    excluded_canonical_sources: &[PathBuf], limits: CopyLimits,
+    options: CopyProjectionOptions<'_>,
+) -> Result<CopyReport, CopyError> {
+    stage_environment_projection(selections, destination_root, excluded_canonical_sources, limits, options, |source,destination| fs::rename(source,destination))?.commit()
+}
+
+fn stage_environment_with_publisher(
+    selections: &[CopySelection], destination_root: &Path,
+    excluded_canonical_sources: &[PathBuf], limits: CopyLimits,
+    account_home: Option<PathBuf>, publish: impl FnMut(&Path,&Path) -> std::io::Result<()>,
+) -> Result<EnvironmentPublication, CopyError> {
+    stage_environment_projection(selections,destination_root,excluded_canonical_sources,limits,CopyProjectionOptions { account_home, ..Default::default() },publish)
+}
+
+#[cfg(test)]
+fn copy_environment_with_publisher(
+    selections: &[CopySelection], destination_root: &Path,
+    excluded_canonical_sources: &[PathBuf], limits: CopyLimits,
+    account_home: Option<PathBuf>, publish: impl FnMut(&Path,&Path) -> std::io::Result<()>,
+) -> Result<CopyReport, CopyError> {
+    stage_environment_with_publisher(selections,destination_root,excluded_canonical_sources,limits,account_home,publish)?.commit()
+}
+
+fn stage_environment_projection(
     selections: &[CopySelection],
     destination_root: &Path,
     excluded_canonical_sources: &[PathBuf],
     limits: CopyLimits,
     options: CopyProjectionOptions<'_>,
-) -> Result<CopyReport, CopyError> {
+    mut publish: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<EnvironmentPublication, CopyError> {
     let CopyProjectionOptions {
         account_home,
         mounted_roots,
@@ -1096,6 +1308,7 @@ fn copy_environment_projection(
                     ));
                 }
                 mode(&destination, private_file_mode(*source_mode), relative)?;
+                output.sync_all().map_err(|cause| io_error(relative, "sync_file", cause))?;
             }
             Node::Link(target) => {
                 let mounted = mounted_roots.iter().find(|root| relative.starts_with(root));
@@ -1127,6 +1340,7 @@ fn copy_environment_projection(
             }
         }
     }
+    let mut rollback = None;
     if !existing_root {
         fs::rename(&temporary.0, destination_root)
             .map_err(|cause| io_error(Path::new(""), "publish", cause))?;
@@ -1185,30 +1399,31 @@ fn copy_environment_projection(
                 _ => {}
             }
         }
+        let mut publication = Publication {
+            backup: TemporaryProjection::create(destination_root.join(format!(
+                ".freshell-copy-backups-{}-{}",
+                std::process::id(),
+                NEXT_PROJECTION.fetch_add(1, Ordering::Relaxed)
+            )))?,
+            created: Vec::new(),
+            replaced: Vec::new(),
+            committed: false,
+        };
         for (relative, node) in &plan.nodes {
             let destination = destination_root.join(relative);
-            match fs::symlink_metadata(&destination) {
-                Ok(metadata)
-                    if matches!(node, Node::Directory(_))
-                        && metadata.is_dir()
-                        && !metadata.file_type().is_symlink() => {}
-                Ok(metadata) if metadata.is_dir() || (matches!(node, Node::Directory(_))) => {
-                    return Err(error(
-                        relative,
-                        "publish",
-                        "existing destination type conflicts with selected resource",
-                    ))
-                }
-                Ok(_) => {}
-                Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {}
+            let existing = match fs::symlink_metadata(&destination) {
+                Ok(metadata) => Some(metadata),
+                Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => None,
                 Err(cause) => return Err(io_error(relative, "inspect_destination", cause)),
-            }
+            };
             if matches!(node, Node::Directory(_)) {
-                if !destination.exists() {
+                if existing.is_none() {
                     fs::create_dir(&destination)
                         .map_err(|cause| io_error(relative, "publish_directory", cause))?;
+                    publication.created.push(destination.clone());
+                    mode(&destination, 0o700, relative)?;
                 }
-                mode(&destination, 0o700, relative)?;
+                // An existing parent grants no chmod/chown/removal authority.
             } else if mounted_roots.contains(relative) && matches!(node, Node::File(..)) {
                 if preserve_existing_mounted_files.contains(relative)
                     && preserve_existing_mounted_file(&destination, relative, limits)?
@@ -1230,16 +1445,58 @@ fn copy_environment_projection(
                     limits,
                 )?;
             } else {
-                fs::rename(temporary.0.join(relative), destination)
+                if existing.is_some() {
+                    let backup = publication
+                        .backup
+                        .0
+                        .join(publication.replaced.len().to_string());
+                    fs::rename(&destination, &backup)
+                        .map_err(|cause| io_error(relative, "retain_replacement", cause))?;
+                    publication.replaced.push((destination.clone(), backup));
+                }
+                publish(&temporary.0.join(relative), &destination)
                     .map_err(|cause| io_error(relative, "publish_leaf", cause))?;
+                if existing.is_none() {
+                    publication.created.push(destination);
+                }
             }
         }
+        File::open(destination_root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|cause| io_error(Path::new(""), "sync_publication", cause))?;
+        rollback = Some(publication);
     }
     let entries = plan.nodes.len();
-    Ok(CopyReport {
-        entries,
-        bytes: actual_bytes,
-        projected_paths: plan.nodes.into_keys().collect(),
+    let created_paths = if let Some(publication) = &rollback {
+        publication
+            .created
+            .iter()
+            .chain(
+                publication
+                    .replaced
+                    .iter()
+                    .map(|(destination, _)| destination),
+            )
+            .filter_map(|path| {
+                path.strip_prefix(destination_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .collect()
+    } else {
+        plan.nodes.keys().cloned().collect()
+    };
+    Ok(EnvironmentPublication {
+        report: CopyReport {
+            entries,
+            bytes: actual_bytes,
+            projected_paths: plan.nodes.into_keys().collect(),
+            created_paths,
+        },
+        root: destination_root.to_owned(),
+        unfinished_new_root: rollback.is_none(),
+        rollback,
+        _stage: temporary,
     })
 }
 
@@ -1579,6 +1836,114 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::{fs, path::Path, process::Command};
+
+    #[cfg(unix)]
+    #[test]
+    fn unfinished_new_home_publication_removes_only_its_created_paths() {
+        let source = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("config.json"), b"new").unwrap();
+        let sibling = parent.path().join("sibling");
+        fs::write(&sibling, b"keep").unwrap();
+        let home = parent.path().join("provider");
+        let selection = CopySelection {
+            source: source.path().join("config.json"),
+            destination_relative: PathBuf::from("config.json"),
+        };
+        let publication =
+            stage_environment(&[selection.clone()], &home, &[], Default::default()).unwrap();
+        assert_eq!(fs::read(home.join("config.json")).unwrap(), b"new");
+        drop(publication);
+        assert!(
+            !home.exists(),
+            "unfinished initial publication must roll back its new HOME"
+        );
+        assert_eq!(fs::read(&sibling).unwrap(), b"keep");
+        stage_environment(&[selection], &home, &[], Default::default())
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(fs::read(home.join("config.json")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn publication_failure_after_first_replacement_restores_original_inodes() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("home");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&home).unwrap();
+        for name in ["a-first", "z-last"] {
+            fs::write(source.join(name), format!("new-{name}")).unwrap();
+            fs::write(home.join(name), format!("prior-{name}")).unwrap();
+        }
+        fs::write(home.join("sibling"), "sibling-nonce").unwrap();
+        fs::create_dir(source.join("b-new")).unwrap();
+        fs::write(source.join("b-new/child"), "new-child").unwrap();
+        let identity = |path: &Path| {
+            let stat = fs::metadata(path).unwrap();
+            (stat.ino(), stat.uid(), stat.gid(), stat.mode())
+        };
+        let before = ["a-first", "z-last", "sibling"].map(|name| {
+            (
+                name,
+                identity(&home.join(name)),
+                fs::read(home.join(name)).unwrap(),
+            )
+        });
+        let home_identity = identity(&home);
+        let mut executed = 0;
+        let error = copy_environment_with_publisher(
+            &[
+                selection(&source.join("a-first"), "a-first"),
+                selection(&source.join("b-new"), "b-new"),
+                selection(&source.join("z-last"), "z-last"),
+            ],
+            &home,
+            &[],
+            Default::default(),
+            None,
+            |from, to| {
+                assert!(
+                    from.starts_with(&home),
+                    "staging must be inside writable HOME"
+                );
+                executed += 1;
+                if executed == 3 {
+                    assert_eq!(fs::read(home.join("a-first")).unwrap(), b"new-a-first");
+                    assert_eq!(fs::read(home.join("b-new/child")).unwrap(), b"new-child");
+                    return Err(std::io::Error::other(
+                        "fixture failure after first replacement",
+                    ));
+                }
+                fs::rename(from, to)
+            },
+        );
+        // Use direct selected leaves, so both calls actually replace old inodes.
+        assert!(error.is_err());
+        assert_eq!(executed, 3);
+        assert_eq!(identity(&home), home_identity);
+        for (name, stat, bytes) in before {
+            assert_eq!(identity(&home.join(name)), stat);
+            assert_eq!(fs::read(home.join(name)).unwrap(), bytes);
+        }
+        assert!(!home.join("b-new").exists(), "created paths must roll back");
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 3);
+        copy_environment(
+            &[
+                selection(&source.join("a-first"), "a-first"),
+                selection(&source.join("z-last"), "z-last"),
+            ],
+            &home,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(home.join("a-first")).unwrap(), b"new-a-first");
+        assert_eq!(fs::read(home.join("z-last")).unwrap(), b"new-z-last");
+        assert_eq!(fs::read(home.join("sibling")).unwrap(), b"sibling-nonce");
+    }
 
     fn selection(source: &Path, destination: &str) -> CopySelection {
         CopySelection {
