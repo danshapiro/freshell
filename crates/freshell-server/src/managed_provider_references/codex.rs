@@ -161,6 +161,23 @@ impl Selection<'_> {
                     }
                 }
             }
+            if kind != LayerKind::Role {
+                let declared = role_paths.iter().cloned().collect();
+                let remaining_events = 8192usize
+                    .checked_sub(self.inputs.len())
+                    .and_then(|value| value.checked_sub(role_paths.len()))
+                    .ok_or("Codex selected role event budget exceeded")?;
+                let remaining_metadata = (8 * 1024 * 1024usize)
+                    .checked_sub(self.metadata_bytes)
+                    .and_then(|value| value.checked_sub(role_path_bytes))
+                    .ok_or("Codex selected role metadata budget exceeded")?;
+                role_paths.extend(discover_role_files(
+                    &parent.join("agents"),
+                    &declared,
+                    remaining_events,
+                    remaining_metadata,
+                )?);
+            }
             // Retain only finite edge metadata across recursion. Native TOML
             // documents and raw source views leave scope before loading roles.
             drop(value);
@@ -186,6 +203,70 @@ impl Selection<'_> {
         }
         Ok(())
     }
+}
+
+fn discover_role_files(
+    root: &Path,
+    declared: &std::collections::BTreeSet<PathBuf>,
+    max_files: usize,
+    max_path_bytes: usize,
+) -> Result<Vec<PathBuf>, &'static str> {
+    let limits = freshell_platform::provider_environment::CopyLimits::default();
+    let mut directories = vec![(root.to_owned(), 0usize)];
+    let mut files = Vec::new();
+    let mut entries = 0usize;
+    let mut metadata_bytes = 0usize;
+    let mut selected_bytes = 0usize;
+    while let Some((directory, depth)) = directories.pop() {
+        if depth > limits.max_depth {
+            return Err("Codex agent discovery depth exceeded");
+        }
+        let children = match std::fs::read_dir(&directory) {
+            Ok(children) => children,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && depth == 0 => continue,
+            Err(_) => return Err("Codex selected agent directory is unreadable or changed"),
+        };
+        for child in children {
+            entries = entries
+                .checked_add(1)
+                .ok_or("Codex agent discovery entry count overflow")?;
+            if entries > limits.max_entries {
+                return Err("Codex agent discovery entry limit exceeded");
+            }
+            let child = child.map_err(|_| "Codex selected agent directory entry unreadable")?;
+            let path = child.path();
+            metadata_bytes = metadata_bytes
+                .checked_add(path.as_os_str().len())
+                .ok_or("Codex agent discovery metadata overflow")?;
+            if metadata_bytes > 64 * 1024 * 1024 {
+                return Err("Codex agent discovery metadata budget exceeded");
+            }
+            let kind = child
+                .file_type()
+                .map_err(|_| "Codex selected agent entry metadata unavailable")?;
+            if kind.is_dir() {
+                directories.push((path, depth + 1));
+            } else if kind.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "toml")
+                && !declared.contains(&path)
+            {
+                if files.len() >= max_files {
+                    return Err("Codex selected role event budget exceeded");
+                }
+                selected_bytes = selected_bytes
+                    .checked_add(path.as_os_str().len())
+                    .ok_or("Codex selected role metadata overflow")?;
+                if selected_bytes > max_path_bytes {
+                    return Err("Codex selected role metadata budget exceeded");
+                }
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 fn string_field<'a>(value: &'a toml::Value, field: &str) -> Result<Option<&'a str>, &'static str> {
@@ -243,6 +324,83 @@ mod tests {
             kind: LayerKind::User,
         }
     }
+    #[test]
+    fn managed_provider_codex_discovered_roles_keep_nested_instruction_origins() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join(".codex");
+        let nested = root.join("agents/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("config.toml"), "model='synthetic-model'").unwrap();
+        std::fs::write(root.join("agents/z.toml"),"name='z'\ndescription='synthetic role'\ndeveloper_instructions='synthetic developer'\nmodel_instructions_file='./z.md'\n").unwrap();
+        std::fs::write(nested.join("a.toml"),"name='a'\ndescription='synthetic role'\ndeveloper_instructions='synthetic developer'\nmodel_instructions_file='./a.md'\n").unwrap();
+        std::fs::write(root.join("agents/z.md"), b"Z_INSTRUCTIONS").unwrap();
+        std::fs::write(nested.join("a.md"), b"A_NESTED_INSTRUCTIONS").unwrap();
+        std::fs::write(nested.join("not-a-role.json"), b"not a TOML role").unwrap();
+        let selected = select_inputs(
+            &[layer(root.join("config.toml"), true)],
+            fixture.path(),
+            None,
+        )
+        .unwrap();
+        let instructions = selected
+            .iter()
+            .filter(|input| input.kind == InputKind::Instructions)
+            .map(|input| digest(&input.canonical_source))
+            .collect::<Vec<_>>();
+        assert_eq!(instructions,vec![digest(&nested.join("a.md")),digest(&root.join("agents/z.md"))],
+            "native recursive role discovery must retain each role's declaring parent in sorted file order");
+        assert_eq!(
+            select_inputs(
+                &[layer(root.join("config.toml"), false)],
+                fixture.path(),
+                None
+            )
+            .unwrap()
+            .len(),
+            1,
+            "disabled project configuration must not activate its discovered role inputs"
+        );
+    }
+
+    #[test]
+    fn managed_provider_codex_discovered_roles_exclude_declared_files_and_bound_metadata() {
+        let fixture = tempfile::tempdir().unwrap();
+        let agents = fixture.path().join("agents");
+        std::fs::create_dir(&agents).unwrap();
+        let role = agents.join("declared.toml");
+        std::fs::write(&role, "model_instructions_file='./instructions.md'").unwrap();
+        std::fs::write(
+            agents.join("instructions.md"),
+            b"SYNTHETIC_ROLE_INSTRUCTIONS",
+        )
+        .unwrap();
+        let config = fixture.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[agents.worker]\nconfig_file='./agents/declared.toml'\n",
+        )
+        .unwrap();
+        let selected = select_inputs(&[layer(config, true)], fixture.path(), None).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|input| input.kind == InputKind::Instructions)
+                .count(),
+            1,
+            "explicit role must not be selected again through discovery"
+        );
+        assert!(discover_role_files(&agents, &std::collections::BTreeSet::new(), 0, 1024).is_err());
+        assert!(discover_role_files(&agents, &std::collections::BTreeSet::new(), 1, 0).is_err());
+        assert!(discover_role_files(
+            &fixture.path().join("absent"),
+            &std::collections::BTreeSet::new(),
+            0,
+            0
+        )
+        .unwrap()
+        .is_empty());
+    }
+
     #[test]
     fn managed_provider_codex_typed_inputs_keep_each_logical_role_and_profile_origin() {
         let fixture = tempfile::tempdir().unwrap();
