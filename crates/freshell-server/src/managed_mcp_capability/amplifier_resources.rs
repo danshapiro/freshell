@@ -160,35 +160,64 @@ fn select_local_bundle(
         .to_str()
         .ok_or("Amplifier projected bundle path is not UTF-8")?;
     let runtime_uri = format!("file://{runtime}");
-    if metadata.is_dir() {
+    let document_path = if metadata.is_dir() {
         result.selections.push(CopySelection {
-            source: root,
+            source: root.clone(),
             destination_relative: relative.clone(),
         });
+        let mut entry = None;
+        for name in ["bundle.md", "bundle.yaml"] {
+            let candidate = root.join(name);
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(_) => {
+                    entry = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err("Amplifier directory bundle entry metadata unavailable".into())
+                }
+            }
+        }
+        entry.ok_or("Amplifier selected directory has no native bundle entry")?
     } else {
+        canonical.clone()
+    };
+    let document = std::fs::canonicalize(&document_path)
+        .map_err(|_| "Amplifier directory bundle entry unavailable, dangling or cyclic")?;
+    if excluded.iter().any(|path| document.starts_with(path)) {
+        return Err("Amplifier selected bundle entry aliases credentials or native state; use the approved private grant source".into());
+    }
+    let document_relative = relative.join(
+        document_path
+            .file_name()
+            .ok_or("Amplifier bundle filename unavailable")?,
+    );
+    let root = document
+        .parent()
+        .ok_or("Amplifier bundle parent unavailable")?;
+    {
         // A standalone bundle document does not select its entire parent
         // directory. Preserve only its finite resources and native package
         // closure; selecting a document in HOME must not copy HOME wholesale.
-        if !canonical
+        if !document
             .extension()
             .is_some_and(|extension| extension == "yaml" || extension == "yml" || extension == "md")
         {
             return Err("Amplifier local bundle source has an unsupported native format".into());
         }
-        result.selections.push(CopySelection {
-            source: canonical.clone(),
-            destination_relative: relative.join(
-                canonical
-                    .file_name()
-                    .ok_or("Amplifier bundle filename unavailable")?,
-            ),
-        });
+        if metadata.is_file() {
+            result.selections.push(CopySelection {
+                source: document.clone(),
+                destination_relative: document_relative.clone(),
+            });
+        }
         let mut bundle_raw = String::new();
         let remaining = (64 * 1024 * 1024usize)
             .checked_sub(state.view_bytes)
             .ok_or("Amplifier retained source view size overflow")?;
         let limit = remaining.min(16 * 1024 * 1024);
-        std::fs::File::open(&canonical)
+        std::fs::File::open(&document)
             .map_err(|_| "Amplifier selected bundle unreadable")?
             .take(limit as u64 + 1)
             .read_to_string(&mut bundle_raw)
@@ -200,7 +229,7 @@ fn select_local_bundle(
             .view_bytes
             .checked_add(bundle_raw.len())
             .ok_or("Amplifier retained source view size overflow")?;
-        let yaml = if canonical
+        let yaml = if document
             .extension()
             .is_some_and(|extension| extension == "md")
         {
@@ -350,14 +379,9 @@ fn select_local_bundle(
                     }
                     template.replace_range(start..end, &replacement);
                 }
-                result.rewritten_resources.push((
-                    relative.join(
-                        canonical
-                            .file_name()
-                            .ok_or("Amplifier bundle filename unavailable")?,
-                    ),
-                    template,
-                ));
+                result
+                    .rewritten_resources
+                    .push((document_relative, template));
             }
         }
     }

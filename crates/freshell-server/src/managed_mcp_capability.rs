@@ -1610,6 +1610,8 @@ mod tests {
         };
         use sha2::{Digest, Sha256};
         for case in [
+            "directory-markdown-precedence",
+            "directory-bundle-includes",
             "bundle-includes",
             "bundle-object-includes",
             "bundle-relative-includes",
@@ -1655,15 +1657,19 @@ mod tests {
                 } else {
                     "./context.txt".into()
                 };
-            let bundle_name = if case.starts_with("markdown-") {
-                "bundle.md"
-            } else {
-                "bundle.yaml"
-            };
+            let bundle_name =
+                if case.starts_with("markdown-") || case == "directory-markdown-precedence" {
+                    "bundle.md"
+                } else {
+                    "bundle.yaml"
+                };
             let included = root.path().join("included-bundle");
             let header = if matches!(
                 case,
-                "bundle-includes" | "bundle-object-includes" | "bundle-relative-includes"
+                "directory-bundle-includes"
+                    | "bundle-includes"
+                    | "bundle-object-includes"
+                    | "bundle-relative-includes"
             ) {
                 std::fs::create_dir(&included).unwrap();
                 std::fs::write(included.join("context.txt"), payload).unwrap();
@@ -1690,13 +1696,24 @@ mod tests {
                     serde_json::to_string(&context_reference).unwrap()
                 )
             };
-            let document = if case.starts_with("markdown-") {
-                format!("---\n{header}---\n# Native retained instructions\nplain body source\n")
-            } else {
-                header
-            };
+            let document =
+                if case.starts_with("markdown-") || case == "directory-markdown-precedence" {
+                    format!("---\n{header}---\n# Native retained instructions\nplain body source\n")
+                } else {
+                    header
+                };
             std::fs::write(bundle.join(bundle_name), document).unwrap();
-            let selected = if case == "directory-source" {
+            if case == "directory-markdown-precedence" {
+                std::fs::write(
+                    bundle.join("bundle.yaml"),
+                    "bundle: {name: wrong-native-entry}\ncontext: {probe: ./must-not-select}\n",
+                )
+                .unwrap();
+            }
+            let selected = if matches!(
+                case,
+                "directory-source" | "directory-bundle-includes" | "directory-markdown-precedence"
+            ) {
                 bundle.clone()
             } else {
                 bundle.join(bundle_name)
@@ -1745,7 +1762,10 @@ mod tests {
             std::fs::remove_dir_all(&bundle).unwrap();
             if matches!(
                 case,
-                "bundle-includes" | "bundle-object-includes" | "bundle-relative-includes"
+                "directory-bundle-includes"
+                    | "bundle-includes"
+                    | "bundle-object-includes"
+                    | "bundle-relative-includes"
             ) {
                 std::fs::remove_dir_all(&included).unwrap();
             }
