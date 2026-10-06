@@ -38,10 +38,25 @@ pub struct FileReferenceSelection {
     pub source_ordinal: usize,
 }
 
+pub struct ApprovedFileOccurrence {
+    pub ordinal: usize,
+    pub approved_alias: PathBuf,
+    pub runtime_destination: String,
+}
+pub struct GeneratedFileRecipe {
+    pub generated_name: String,
+    pub unexpanded_source: String,
+    pub declaring_config: PathBuf,
+    pub cwd: PathBuf,
+    pub original_home: PathBuf,
+    pub occurrences: Vec<ApprovedFileOccurrence>,
+}
+
 pub struct ResolvedFileReferencePlan {
     pub template: String,
     pub selections: Vec<FileReferenceSelection>,
     pub referenced_variables: Vec<String>,
+    pub recipes: Vec<GeneratedFileRecipe>,
 }
 
 pub fn resolve_file_references(
@@ -49,9 +64,15 @@ pub fn resolve_file_references(
     origin: FileSourceOrigin<'_>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedFileReferencePlan, ReferenceError> {
-    use freshell_platform::opencode_config::{transform_file_tokens, TokenTransformError};
+    use freshell_platform::opencode_config::{
+        file_reference_path, transform_file_tokens, TokenTransformError,
+    };
     let mut selections: Vec<FileReferenceSelection> = Vec::new();
     let mut rewritten = Vec::new();
+    let mut occurrences = Vec::new();
+    let mut generated = false;
+    let mut planned_bytes = 0u64;
+    let mut aliases = std::collections::BTreeSet::new();
     let mut variables = std::collections::BTreeSet::new();
     let fail = |ordinal, variables: Vec<String>, cause| ReferenceError {
         operation: "resolve",
@@ -68,27 +89,20 @@ pub fn resolve_file_references(
             .map(|name| name.to_string())
             .collect();
         variables.extend(names.iter().cloned());
-        if !token.direct_expression {
+        if variables.len() > 128 {
             return Err(fail(
                 token.ordinal,
                 names,
-                "generated document recipe required",
+                "referenced variable count exceeds 128",
             ));
         }
-        let path = if let Some(relative) = token.path.strip_prefix("~/") {
-            origin.original_home.join(relative)
-        } else {
-            let path = Path::new(token.path);
-            if path.is_absolute() {
-                path.into()
-            } else {
-                origin
-                    .declaring_config
-                    .parent()
-                    .unwrap_or(origin.cwd)
-                    .join(path)
-            }
-        };
+        generated |= !token.direct_expression;
+        let path = file_reference_path(
+            token.path,
+            origin.declaring_config,
+            origin.cwd,
+            origin.original_home,
+        );
         let canonical = std::fs::canonicalize(&path).map_err(|_| {
             fail(
                 token.ordinal,
@@ -128,21 +142,14 @@ pub fn resolve_file_references(
                         "configuration reference count exceeds 128",
                     ));
                 }
-                let bytes = selections
-                    .iter()
-                    .try_fold(metadata.len(), |bytes, selection| {
-                        std::fs::metadata(&selection.canonical_source)
-                            .ok()
-                            .and_then(|m| bytes.checked_add(m.len()))
-                    })
-                    .ok_or_else(|| {
-                        fail(
-                            token.ordinal,
-                            names.clone(),
-                            "configuration reference accounting failed",
-                        )
-                    })?;
-                if bytes > 32 * 1024 * 1024 {
+                planned_bytes = planned_bytes.checked_add(metadata.len()).ok_or_else(|| {
+                    fail(
+                        token.ordinal,
+                        names.clone(),
+                        "configuration reference size overflow",
+                    )
+                })?;
+                if planned_bytes > 32 * 1024 * 1024 {
                     return Err(fail(
                         token.ordinal,
                         names,
@@ -160,6 +167,18 @@ pub fn resolve_file_references(
                 });
                 destination
             };
+        if aliases.insert(path.clone()) && aliases.len() > 256 {
+            return Err(fail(
+                token.ordinal,
+                names,
+                "configuration alias count exceeds 256",
+            ));
+        }
+        occurrences.push(ApprovedFileOccurrence {
+            ordinal: token.ordinal,
+            approved_alias: path,
+            runtime_destination: destination.clone(),
+        });
         let replacement = format!("{{file:{destination}}}");
         rewritten.push((token.original_span, replacement.clone()));
         Ok(replacement)
@@ -172,20 +191,87 @@ pub fn resolve_file_references(
             "configuration source, expansion or event profile limit exceeded",
         ),
     })?;
-    drop(transformed); // Expanded env text is transient and never retained in the plan.
-    let mut template = String::new();
-    let mut cursor = 0;
-    for (span, replacement) in rewritten {
-        template.push_str(&raw[cursor..span.start]);
-        template.push_str(&replacement);
-        cursor = span.end;
-    }
-    template.push_str(&raw[cursor..]);
+    drop(transformed);
+    let (template, recipes) = if generated {
+        let generated_name = "FRESHELL_CONFIG_REFERENCE_0".to_string();
+        (
+            format!("{{env:{generated_name}}}"),
+            vec![GeneratedFileRecipe {
+                generated_name,
+                unexpanded_source: raw.into(),
+                declaring_config: origin.declaring_config.into(),
+                cwd: origin.cwd.into(),
+                original_home: origin.original_home.into(),
+                occurrences,
+            }],
+        )
+    } else {
+        let mut template = String::new();
+        let mut cursor = 0;
+        for (span, replacement) in rewritten {
+            template.push_str(&raw[cursor..span.start]);
+            template.push_str(&replacement);
+            cursor = span.end;
+        }
+        template.push_str(&raw[cursor..]);
+        (template, Vec::new())
+    };
     Ok(ResolvedFileReferencePlan {
         template,
         selections,
         referenced_variables: variables.into_iter().collect(),
+        recipes,
     })
+}
+
+pub fn evaluate_generated_recipe(
+    recipe: &GeneratedFileRecipe,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, ReferenceError> {
+    use freshell_platform::opencode_config::{
+        file_reference_path, transform_file_tokens, TokenTransformError,
+    };
+    let fail = || ReferenceError {
+        operation: "prepare",
+        field: "OpenCode generated configuration",
+        source_ordinal: 0,
+        declaring_source: recipe.declaring_config.clone(),
+        variables: Vec::new(),
+        cause: "configuration reference selection changed; reprepare before dispatch",
+    };
+    let mut observed = 0;
+    let text = transform_file_tokens(&recipe.unexpanded_source, env, |token| {
+        let path = file_reference_path(
+            token.path,
+            &recipe.declaring_config,
+            &recipe.cwd,
+            &recipe.original_home,
+        );
+        let occurrence = recipe
+            .occurrences
+            .get(token.ordinal)
+            .filter(|approved| approved.ordinal == token.ordinal && approved.approved_alias == path)
+            .ok_or_else(fail)?;
+        observed += 1;
+        Ok(format!("{{file:{}}}", occurrence.runtime_destination))
+    })
+    .map_err(|error| match error {
+        TokenTransformError::Selection(error) => error,
+        TokenTransformError::Bound(_) => ReferenceError {
+            cause: "configuration recipe profile limit exceeded",
+            ..fail()
+        },
+    })?;
+    if observed != recipe.occurrences.len() {
+        return Err(fail());
+    }
+    if text.len() > 64 * 1024 {
+        return Err(ReferenceError {
+            cause: "generated configuration exceeds 64 KiB child value limit",
+            ..fail()
+        });
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -220,6 +306,13 @@ process.stdout.write(JSON.stringify(receipts));
         format!("{:x}", Sha256::digest(value.as_bytes()))
     }
     fn consume(plan: &ResolvedFileReferencePlan, runtime: &Path) -> Vec<String> {
+        consume_with_env(plan, runtime, &|_| None)
+    }
+    fn consume_with_env(
+        plan: &ResolvedFileReferencePlan,
+        runtime: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Vec<String> {
         std::fs::create_dir_all(runtime.join(".freshell/references")).unwrap();
         for selection in &plan.selections {
             let relative = selection
@@ -230,12 +323,19 @@ process.stdout.write(JSON.stringify(receipts));
         }
         let source = runtime.join("source.json");
         std::fs::write(&source, &plan.template).unwrap();
+        let mut child = std::collections::BTreeMap::new();
+        for recipe in &plan.recipes {
+            child.insert(
+                recipe.generated_name.clone(),
+                evaluate_generated_recipe(recipe, env).unwrap(),
+            );
+        }
         let result = std::process::Command::new("node")
             .arg("-e")
             .arg(CONSUMER)
             .arg(&source)
             .arg(runtime)
-            .arg("{}")
+            .arg(serde_json::to_string(&child).unwrap())
             .output()
             .unwrap();
         assert!(
@@ -373,5 +473,113 @@ process.stdout.write(JSON.stringify(receipts));
             assert_eq!(err.variables, vec!["PATH_INPUT"]);
             assert!(!format!("{err:?} {err}").contains(target));
         }
+    }
+    #[test]
+    fn managed_provider_references_env_introduced_file_tokens_and_private_prefix_use_child_recipe()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("reference");
+        std::fs::write(&target, "  payload-nonce  ").unwrap();
+        let source = temp.path().join("opencode.json");
+        let raw = r#"{"instructions":"{env:OPENAI_API_KEY}"}"#;
+        let lookup = |name: &str| {
+            (name == "OPENAI_API_KEY").then(|| {
+                format!(
+                    "sentinel-private-prefix{{file:{}}}sentinel-private-suffix",
+                    target.display()
+                )
+            })
+        };
+        let plan = resolve_file_references(
+            raw,
+            FileSourceOrigin {
+                declaring_config: &source,
+                cwd: temp.path(),
+                original_home: temp.path(),
+            },
+            &lookup,
+        )
+        .unwrap();
+        assert!(!plan.template.contains("sentinel-private"));
+        assert_eq!(plan.recipes.len(), 1);
+        assert!(!plan.recipes[0]
+            .unexpanded_source
+            .contains("sentinel-private"));
+        assert_eq!(
+            consume_with_env(&plan, &temp.path().join("runtime"), &lookup),
+            vec![digest(
+                "sentinel-private-prefixpayload-noncesentinel-private-suffix"
+            )]
+        );
+    }
+
+    #[test]
+    fn managed_provider_references_changed_grant_selection_blocks_before_child_and_keeps_prior_projection(
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::write(&a, "prior-usable-nonce").unwrap();
+        std::fs::write(&b, "unapproved-new-nonce").unwrap();
+        let source = temp.path().join("opencode.json");
+        let initial = |_: &str| Some(format!("prefix{{file:{}}}", a.display()));
+        let plan = resolve_file_references(
+            r#"{"x":"{env:OPENAI_API_KEY}"}"#,
+            FileSourceOrigin {
+                declaring_config: &source,
+                cwd: temp.path(),
+                original_home: temp.path(),
+            },
+            &initial,
+        )
+        .unwrap();
+        let previous = temp.path().join("runtime");
+        assert_eq!(
+            consume_with_env(&plan, &previous, &initial),
+            vec![digest("prefixprior-usable-nonce")]
+        );
+        let changed = |_: &str| Some(format!("sentinel-private-changed{{file:{}}}", b.display()));
+        let err = evaluate_generated_recipe(&plan.recipes[0], &changed)
+            .err()
+            .unwrap();
+        assert!(err.cause.contains("selection changed"));
+        assert!(!format!("{err:?} {err}").contains("sentinel-private"));
+        assert_eq!(
+            std::fs::read_to_string(previous.join(".freshell/references/0")).unwrap(),
+            "prior-usable-nonce"
+        );
+        let same_selection = |_: &str| Some(format!("different-prefix{{file:{}}}", a.display()));
+        assert!(evaluate_generated_recipe(&plan.recipes[0], &same_selection)
+            .unwrap()
+            .contains("different-prefix"));
+    }
+    #[test]
+    fn managed_provider_references_whole_document_native_wrapper_handles_outside_lexeme_expansion()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("reference");
+        std::fs::write(&target, "document-consumption-nonce").unwrap();
+        let source = temp.path().join("opencode.json");
+        let lookup = |_: &str| {
+            Some(
+                serde_json::json!({"instructions":format!("{{file:{}}}",target.display())})
+                    .to_string(),
+            )
+        };
+        let plan = resolve_file_references(
+            "{env:OPENAI_API_KEY}",
+            FileSourceOrigin {
+                declaring_config: &source,
+                cwd: temp.path(),
+                original_home: temp.path(),
+            },
+            &lookup,
+        )
+        .unwrap();
+        assert_eq!(
+            consume_with_env(&plan, &temp.path().join("runtime"), &lookup),
+            vec![digest("document-consumption-nonce")]
+        );
+        assert_eq!(plan.recipes[0].unexpanded_source, "{env:OPENAI_API_KEY}");
     }
 }

@@ -706,3 +706,20 @@ mod substitution_tests {
         assert_eq!(&raw[span.unwrap()], "{file:{env:PATH}}");
     }
 }
+
+/// Resolve native path syntax without touching the original controller tree.
+/// Hosts compare this candidate only to already approved source aliases.
+pub fn file_reference_path(
+    path: &str,
+    declaring_config: &Path,
+    cwd: &Path,
+    home: &Path,
+) -> PathBuf {
+    if let Some(relative) = path.strip_prefix("~/") {
+        home.join(relative)
+    } else if Path::new(path).is_absolute() {
+        path.into()
+    } else {
+        declaring_config.parent().unwrap_or(cwd).join(path)
+    }
+}
