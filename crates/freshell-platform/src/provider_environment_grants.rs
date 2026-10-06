@@ -94,6 +94,19 @@ pub fn read_environment_grant(
     path: &Path,
     profile: EnvironmentProfile,
 ) -> Result<BTreeMap<String, String>, GrantError> {
+    let raw = read_private_grant(path, profile)?;
+    resolve_environment_profile(profile, &raw)
+}
+
+pub fn read_opencode_auth_environment(
+    path: &Path,
+    needed: &[String],
+) -> Result<BTreeMap<String, String>, GrantError> {
+    let raw = read_private_grant(path, EnvironmentProfile::Opencode)?;
+    resolve_opencode_auth_environment(&raw, needed)
+}
+
+fn read_private_grant(path: &Path, profile: EnvironmentProfile) -> Result<String, GrantError> {
     let fail = |reason: &str| error(profile, GrantOperation::Read, reason.into());
     let canonical = std::fs::canonicalize(path).map_err(|_| fail("grant is unavailable"))?;
     let metadata = std::fs::symlink_metadata(path).map_err(|_| fail("grant is unavailable"))?;
@@ -108,8 +121,7 @@ pub fn read_environment_grant(
         }
     }
     let file = std::fs::File::open(path).map_err(|_| fail("grant is unavailable"))?;
-    let raw = read_bounded(file, profile)?;
-    resolve_environment_profile(profile, &raw)
+    read_bounded(file, profile)
 }
 
 const MAX_KEYS_BYTES: u64 = 128 * 1024;
@@ -496,6 +508,102 @@ fn required<'a>(values: &'a BTreeMap<String, String>, name: &str) -> Result<&'a 
         .ok_or_else(|| format!("Amplifier OneCLI profile requires {name} in keys.env"))
 }
 
+/// Read only the explicitly needed well-known auth environment. Returned
+/// values are transient; callers must not serialize, cache or log the map.
+pub fn resolve_opencode_auth_environment(
+    raw: &str,
+    needed: &[String],
+) -> Result<BTreeMap<String, String>, GrantError> {
+    use serde::de::{Deserializer, MapAccess, Visitor};
+    let fail = |reason: &str| {
+        error(
+            EnvironmentProfile::Opencode,
+            GrantOperation::Decode,
+            reason.into(),
+        )
+    };
+    if raw.len() > MAX_KEYS_BYTES as usize {
+        return Err(fail("auth grant exceeds 128 KiB"));
+    }
+    if needed.len() > 128
+        || needed.iter().any(|name| {
+            name.is_empty()
+                || name.len() > 128
+                || name.contains('=')
+                || name.chars().any(char::is_control)
+        })
+    {
+        return Err(fail(
+            "auth lookup variable selection is outside the bounded profile",
+        ));
+    }
+    struct OrderedAuth;
+    impl<'de> Visitor<'de> for OrderedAuth {
+        type Value = Vec<(String, serde_json::Value)>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a provider auth object")
+        }
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            let mut entries: Self::Value = Vec::new();
+            while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                // JSON.parse preserves a duplicate property's first insertion
+                // position while replacing its value with the final entry.
+                if let Some(index) = entries.iter().position(|(existing, _)| existing == &key) {
+                    entries[index].1 = value;
+                } else {
+                    entries.push((key, value));
+                }
+            }
+            Ok(entries)
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_str(raw);
+    let mut entries = decoder
+        .deserialize_map(OrderedAuth)
+        .map_err(|_| fail("auth grant is not a valid JSON object"))?;
+    decoder
+        .end()
+        .map_err(|_| fail("auth grant has trailing data"))?;
+    let array_index = |name: &str| {
+        name.parse::<u32>()
+            .ok()
+            .filter(|index| *index != u32::MAX && index.to_string() == name)
+    };
+    // Object.values visits integer-index keys first in ascending numeric order.
+    entries.sort_by(|(a, _), (b, _)| match (array_index(a), array_index(b)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    let mut selected = BTreeMap::new();
+    for (ordinal, (_, value)) in entries.into_iter().enumerate() {
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("wellknown") {
+            continue;
+        }
+        let Some(key) = value.get("key").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !needed.iter().any(|name| name == key) {
+            continue;
+        }
+        let token = value
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                let mut err = fail("selected well-known auth token must be a string");
+                err.field = Some("auth.wellknown.token");
+                err.source_ordinal = Some(ordinal);
+                err
+            })?;
+        if token.len() > 64 * 1024 {
+            return Err(fail("selected auth lookup value exceeds 64 KiB"));
+        }
+        selected.insert(key.to_string(), token.to_string());
+    }
+    Ok(selected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +649,44 @@ mod tests {
         )
         .unwrap_err();
         assert!(!format!("{err:?} {err}").contains("sentinel-private"));
+    }
+    #[test]
+    fn selected_native_auth_lookup_keeps_js_duplicate_key_order_and_excludes_unrequested_values() {
+        let raw = r#"{"first":{"type":"wellknown","key":"CA_PATH","token":"first-path"},"second":{"type":"wellknown","key":"CA_PATH","token":"second-path"},"first":{"type":"wellknown","key":"CA_PATH","token":"last-first-path"},"unrequested":{"type":"wellknown","key":"PRIVATE_UNUSED","token":"sentinel-private-unused"}}"#;
+        let env = resolve_opencode_auth_environment(raw, &["CA_PATH".into()]).unwrap();
+        assert_eq!(env.get("CA_PATH").map(String::as_str), Some("second-path"));
+        assert_eq!(env.len(), 1);
+        let numeric=resolve_opencode_auth_environment(r#"{"2":{"type":"wellknown","key":"CA_PATH","token":"two"},"1":{"type":"wellknown","key":"CA_PATH","token":"one"}}"#,&["CA_PATH".into()]).unwrap();
+        assert_eq!(numeric.get("CA_PATH").map(String::as_str), Some("two"));
+    }
+
+    #[test]
+    fn auth_reader_is_private_bounded_and_does_not_echo_malformed_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.json");
+        let raw = r#"{"source":{"type":"wellknown","key":"CA_PATH","token":"synthetic-path"}}"#;
+        std::fs::write(&path, raw).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let env = read_opencode_auth_environment(&path, &["CA_PATH".into()]).unwrap();
+        assert_eq!(
+            env.get("CA_PATH").map(String::as_str),
+            Some("synthetic-path")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        for malformed in [
+            r#"{"source":{"type":"wellknown","key":"CA_PATH","token":["sentinel-private"]}}"#,
+            r#"{"source":{"type":"wellknown","key":"CA_PATH","token":"sentinel-private"}"#,
+        ] {
+            let err =
+                resolve_opencode_auth_environment(malformed, &["CA_PATH".into()]).unwrap_err();
+            assert!(!format!("{err:?} {err}").contains("sentinel-private"));
+        }
+        std::fs::write(&path, vec![b' '; 128 * 1024 + 1]).unwrap();
+        assert!(read_opencode_auth_environment(&path, &["CA_PATH".into()]).is_err());
+        assert!(resolve_opencode_auth_environment(raw, &["x".repeat(129)]).is_err());
     }
 }

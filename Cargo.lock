@@ -1383,6 +1383,7 @@ name = "freshell-platform"
 version = "0.1.0"
 dependencies = [
  "percent-encoding",
+ "serde",
  "serde_json",
  "tempfile",
  "url",
