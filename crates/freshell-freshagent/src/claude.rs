@@ -9535,6 +9535,8 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
     let run_as = std::env::var("FRESHELL_PROVIDER_RUN_AS_UID")
         .ok()
         .zip(std::env::var("FRESHELL_PROVIDER_RUN_AS_GID").ok());
+    #[cfg(target_os = "linux")]
+    let run_as_wrapped = run_as.is_some();
     let mut cmd = if let Some((uid, gid)) = run_as {
         let mut command = tokio::process::Command::new("/usr/bin/setpriv");
         command.args([
@@ -9570,6 +9572,17 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
         .stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
+    #[cfg(target_os = "linux")]
+    if freshell_platform::managed_child_secrets::snapshot().is_some() {
+        let wrapper_targets = [node.as_str()];
+        let additional = if run_as_wrapped {
+            &wrapper_targets[..]
+        } else {
+            &[]
+        };
+        freshell_platform::provider_exec::check_command(cmd.as_std(), true, &additional)
+            .map_err(|error| error.to_string())?;
+    }
     let mut child = cmd.spawn().map_err(|e| {
         format!(
             "claude sidecar spawn failed ({node} {}): {e}",
@@ -9583,6 +9596,53 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
         drain_reader(err);
     }
     Ok((child, stdin, stdout, ownership_id))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod provider_exec_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn provider_exec_profile_checks_actual_managed_claude_sidecar_spawn() {
+        const CASE: &str = "FRESHELL_EXEC_PROFILE_FIXTURE_CHILD";
+        if let Ok(case) = std::env::var(CASE) {
+            let owned = tempfile::tempdir().unwrap();
+            let script = owned.path().join("synthetic-sidecar.mjs");
+            std::fs::write(&script, "setInterval(()=>{},1000)\n").unwrap();
+            std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+            let count = if case == "large" { 17 } else { 1 };
+            freshell_platform::managed_child_secrets::install(
+                (0..count)
+                    .map(|i| (format!("FRESHELL_EXEC_FIXTURE_{i}"), "x".repeat(64 * 1024)))
+                    .collect(),
+            )
+            .unwrap();
+            let mut result = spawn_sidecar().await;
+            if let Ok((child, _, _, _)) = &mut result {
+                let pid = child.id().unwrap();
+                child.kill().await.unwrap();
+                child.wait().await.unwrap();
+                eprintln!("synthetic owned sidecar pid {pid} stopped in fixture namespace");
+            }
+            if case == "large" {
+                assert!(matches!(result,Err(ref cause) if cause.contains("provider exec profile")),"managed fresh sidecar must reject oversized actual inherited+selected environment before spawn");
+            } else {
+                assert!(result.is_ok(),"valid finite selected environment must still launch the actual sidecar command");
+            }
+            return;
+        }
+        for case in ["large", "small"] {
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).env_clear()
+                .env("PATH","/usr/local/bin:/usr/bin:/bin").env(CASE,case)
+                .args(["--exact","claude::provider_exec_tests::provider_exec_profile_checks_actual_managed_claude_sidecar_spawn","--nocapture"])
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "actual sidecar fixture case {case} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }
 
 /// Read the sidecar's stdout until the `created` (→ the nanoid placeholder) or

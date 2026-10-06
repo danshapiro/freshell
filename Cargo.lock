@@ -1382,6 +1382,7 @@ dependencies = [
 name = "freshell-platform"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "percent-encoding",
  "serde",
  "serde_json",

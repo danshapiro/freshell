@@ -110,15 +110,29 @@ impl HostedPty {
         provider_env.insert("GIT_CONFIG_COUNT".into(), "1".into());
         provider_env.insert("GIT_CONFIG_KEY_0".into(), "safe.directory".into());
         provider_env.insert("GIT_CONFIG_VALUE_0".into(), launch.workspace_path.clone());
-        let mut pty = match PtyTerminal::spawn_with_sink(
-            &spec,
-            &provider_env,
-            &launch.terminal_id,
-            &launch.stream_id,
-            None,
-            Some(sink),
-            Some(on_exit),
-        ) {
+        let spawn = (|| {
+            #[cfg(target_os = "linux")]
+            freshell_platform::provider_exec::check_final_exec(
+                &spec.program,
+                &spec.args,
+                &provider_env,
+                &[&launch.program],
+                freshell_platform::provider_exec::process_profile()
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            PtyTerminal::spawn_with_sink(
+                &spec,
+                &provider_env,
+                &launch.terminal_id,
+                &launch.stream_id,
+                None,
+                Some(sink),
+                Some(on_exit),
+            )
+            .map_err(|error| error.to_string())
+        })();
+        let mut pty = match spawn {
             Ok(pty) => pty,
             Err(error) => {
                 if let Some(prepared) = prepared_codex {
@@ -704,5 +718,42 @@ mod codex_identity_tests {
         assert!(validate_codex_candidate(Some("thread-a"), None, "thread-b", false).is_err());
         assert!(validate_codex_candidate(None, None, "thread-a", true).is_err());
         assert!(validate_codex_candidate(None, Some("thread-a"), "thread-b", false).is_err());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod provider_exec_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn provider_exec_profile_rejects_combined_final_environment_before_pty_dispatch() {
+        let owned = tempfile::tempdir().unwrap();
+        let launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"exec-profile","streamId":"exec-profile-stream","mode":"codex",
+            "program":"/usr/bin/true","cwd":owned.path(),"workspacePath":owned.path(),
+            "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"exec-profile",
+            "env":{"PATH":"/usr/bin:/bin"}
+        }))
+        .unwrap();
+        let environment = (0..17)
+            .map(|i| (format!("FRESHELL_EXEC_FIXTURE_{i}"), "x".repeat(64 * 1024)))
+            .collect();
+        let mut result = HostedPty::spawn(
+            owned.path(),
+            IncarnationId::new(),
+            &launch,
+            environment,
+            None,
+        )
+        .await;
+        // This regression owns and stops only the unexpectedly dispatched
+        // synthetic PTY, inside the required lifecycle sandbox.
+        if let Ok(pty) = &mut result {
+            pty.stop().await;
+        }
+        assert!(
+            matches!(result,Err(ref cause) if cause.contains("provider exec profile")),
+            "oversized final argv+env must fail with a classified pre-dispatch profile error"
+        );
     }
 }
