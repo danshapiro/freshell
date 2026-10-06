@@ -1610,6 +1610,9 @@ mod tests {
         };
         use sha2::{Digest, Sha256};
         for case in [
+            "bundle-includes",
+            "bundle-object-includes",
+            "bundle-relative-includes",
             "context-include",
             "context-include-leading-slash",
             "markdown-bundle",
@@ -1657,7 +1660,29 @@ mod tests {
             } else {
                 "bundle.yaml"
             };
-            let header = if case.starts_with("context-include") {
+            let included = root.path().join("included-bundle");
+            let header = if matches!(
+                case,
+                "bundle-includes" | "bundle-object-includes" | "bundle-relative-includes"
+            ) {
+                std::fs::create_dir(&included).unwrap();
+                std::fs::write(included.join("context.txt"), payload).unwrap();
+                std::fs::write(included.join("bundle.yaml"),"bundle:\n  name: included-probe\n  version: 1.0.0\ncontext:\n  probe: ./context.txt\n").unwrap();
+                let source = if case == "bundle-relative-includes" {
+                    "./included-bundle/bundle.yaml".to_owned()
+                } else {
+                    format!("file://{}", included.join("bundle.yaml").display())
+                };
+                format!(
+                    "bundle:\n  name: source-probe\n  version: 1.0.0\nincludes:\n  - {}{}\n",
+                    if case == "bundle-object-includes" {
+                        "bundle: "
+                    } else {
+                        ""
+                    },
+                    serde_json::to_string(&source).unwrap()
+                )
+            } else if case.starts_with("context-include") {
                 format!("bundle:\n  name: source-probe\n  version: 1.0.0\ncontext:\n  include: [{}context.txt]\n",if case=="context-include-leading-slash" {"/"}else{""})
             } else {
                 format!(
@@ -1697,7 +1722,10 @@ mod tests {
                 "amplifier",
                 &home,
                 &references,
-                OpencodeEphemeralInput::default(),
+                OpencodeEphemeralInput {
+                    cwd: Some(root.path()),
+                    ..Default::default()
+                },
                 None,
             )
             .unwrap();
@@ -1715,6 +1743,12 @@ mod tests {
             "selecting a standalone document in HOME must not transport unrelated home files");
             }
             std::fs::remove_dir_all(&bundle).unwrap();
+            if matches!(
+                case,
+                "bundle-includes" | "bundle-object-includes" | "bundle-relative-includes"
+            ) {
+                std::fs::remove_dir_all(&included).unwrap();
+            }
             if case == "parent-context" {
                 std::fs::remove_file(context).unwrap();
             }

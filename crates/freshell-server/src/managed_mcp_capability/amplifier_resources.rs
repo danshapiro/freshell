@@ -55,8 +55,51 @@ pub(super) fn prepare(
     let Some(source) = active.data.as_str() else {
         return Err("Amplifier bundle.active source has an unsupported type".into());
     };
-    let Some(local) = source.strip_prefix("file://") else {
+    if !source.starts_with("file://") {
         return Ok(result);
+    }
+    let mut state = BundleSelection {
+        view_bytes: raw.len(),
+        ..Default::default()
+    };
+    if let Some(runtime) = select_local_bundle(source, cwd, excluded, &mut result, &mut state)? {
+        let replacement = serde_json::to_string(&runtime)
+            .map_err(|_| "Amplifier projected source could not be encoded")?;
+        result.rewritten_settings = Some(rewrite_bundle_active(
+            &raw,
+            document,
+            bundle,
+            active,
+            &replacement,
+        )?);
+    }
+    Ok(result)
+}
+
+#[derive(Default)]
+struct BundleSelection {
+    next_id: usize,
+    active: std::collections::BTreeSet<PathBuf>,
+    view_bytes: usize,
+    metadata_bytes: usize,
+    completed: BTreeMap<PathBuf, String>,
+}
+fn select_local_bundle(
+    source: &str,
+    cwd: &Path,
+    excluded: &[PathBuf],
+    result: &mut ResourcePreparation,
+    state: &mut BundleSelection,
+) -> Result<Option<String>, String> {
+    let local = if let Some(local) = source.strip_prefix("file://") {
+        local
+    } else if source.starts_with("./")
+        || source.starts_with("../")
+        || Path::new(source).is_absolute()
+    {
+        source
+    } else {
+        return Ok(None);
     };
     if local.is_empty() || local.chars().any(char::is_control) {
         return Err("Amplifier local source has an invalid path".into());
@@ -71,6 +114,9 @@ pub(super) fn prepare(
         .map_err(|_| "Amplifier selected local bundle is missing, inaccessible or cyclic")?;
     if excluded.iter().any(|path| canonical.starts_with(path)) {
         return Err("Amplifier selected bundle aliases credentials or native state; use the approved private grant source".into());
+    }
+    if let Some(runtime) = state.completed.get(&canonical) {
+        return Ok(Some(runtime.clone()));
     }
     let metadata = std::fs::metadata(&canonical)
         .map_err(|_| "Amplifier selected local bundle metadata unavailable")?;
@@ -90,20 +136,34 @@ pub(super) fn prepare(
     } else {
         return Err("Amplifier selected local bundle has an unsupported filesystem type".into());
     };
-    let relative = Path::new(".freshell/resources/amplifier-local-0");
+    if state.active.contains(&canonical) {
+        return Err("Amplifier local include cycle detected".into());
+    }
+    if state.active.len() >= 64 || state.next_id >= 8192 {
+        return Err("Amplifier local include depth or event budget exceeded".into());
+    }
+    state.metadata_bytes = state
+        .metadata_bytes
+        .checked_add(canonical.as_os_str().len())
+        .ok_or("Amplifier selected source metadata overflow")?;
+    if state.metadata_bytes > 8 * 1024 * 1024 {
+        return Err("Amplifier selected source metadata budget exceeded".into());
+    }
+    state.active.insert(canonical.clone());
+    let id = state.next_id;
+    state.next_id += 1;
+    let relative = PathBuf::from(format!(".freshell/resources/amplifier-local-{id}"));
     let runtime = Path::new("/home/freshell/provider")
-        .join(relative)
+        .join(&relative)
         .join(leaf);
     let runtime = runtime
         .to_str()
         .ok_or("Amplifier projected bundle path is not UTF-8")?;
-    let replacement = serde_json::to_string(&format!("file://{runtime}"))
-        .map_err(|_| "Amplifier projected source could not be encoded")?;
-    let template = rewrite_bundle_active(&raw, document, bundle, active, &replacement)?;
+    let runtime_uri = format!("file://{runtime}");
     if metadata.is_dir() {
         result.selections.push(CopySelection {
             source: root,
-            destination_relative: relative.into(),
+            destination_relative: relative.clone(),
         });
     } else {
         // A standalone bundle document does not select its entire parent
@@ -124,14 +184,22 @@ pub(super) fn prepare(
             ),
         });
         let mut bundle_raw = String::new();
+        let remaining = (64 * 1024 * 1024usize)
+            .checked_sub(state.view_bytes)
+            .ok_or("Amplifier retained source view size overflow")?;
+        let limit = remaining.min(16 * 1024 * 1024);
         std::fs::File::open(&canonical)
             .map_err(|_| "Amplifier selected bundle unreadable")?
-            .take(16 * 1024 * 1024 + 1)
+            .take(limit as u64 + 1)
             .read_to_string(&mut bundle_raw)
             .map_err(|_| "Amplifier selected bundle is unreadable or not UTF-8")?;
-        if bundle_raw.len() > 16 * 1024 * 1024 {
-            return Err("Amplifier selected bundle source exceeds 16 MiB".into());
+        if bundle_raw.len() > limit {
+            return Err("Amplifier selected bundle exceeds the shared source-view profile".into());
         }
+        state.view_bytes = state
+            .view_bytes
+            .checked_add(bundle_raw.len())
+            .ok_or("Amplifier retained source view size overflow")?;
         let yaml = if canonical
             .extension()
             .is_some_and(|extension| extension == "md")
@@ -148,6 +216,38 @@ pub(super) fn prepare(
                 return Err("Amplifier selected bundle requires one YAML document".into());
             }
             let mut bundle_replacements = Vec::new();
+            if let Some(includes) = bundle_documents[0].data.as_mapping_get("includes") {
+                for item in includes
+                    .data
+                    .as_sequence()
+                    .ok_or("Amplifier includes must be a sequence")?
+                {
+                    let node = if item.data.as_str().is_some() {
+                        item
+                    } else {
+                        item.data
+                            .as_mapping_get("bundle")
+                            .ok_or("Amplifier include requires its bundle source")?
+                    };
+                    let source = node
+                        .data
+                        .as_str()
+                        .ok_or("Amplifier include bundle source must be a string")?;
+                    if let Some(projected) =
+                        select_local_bundle(source, cwd, excluded, result, state)?
+                    {
+                        let replacement = serde_json::to_string(&projected)
+                            .map_err(|_| "Amplifier include source could not be encoded")?;
+                        let start = header_offset
+                            .checked_add(source_offset(yaml, node.span.start)?)
+                            .ok_or("Amplifier include source offset overflow")?;
+                        let end = header_offset
+                            .checked_add(source_offset(yaml, node.span.end)?)
+                            .ok_or("Amplifier include source offset overflow")?;
+                        bundle_replacements.push((start, end, replacement));
+                    }
+                }
+            }
             if let Some(context) = bundle_documents[0]
                 .data
                 .as_mapping_get("context")
@@ -261,8 +361,9 @@ pub(super) fn prepare(
             }
         }
     }
-    result.rewritten_settings = Some(template);
-    Ok(result)
+    state.active.remove(&canonical);
+    state.completed.insert(canonical, runtime_uri.clone());
+    Ok(Some(runtime_uri))
 }
 
 fn markdown_frontmatter(raw: &str) -> Option<(&str, usize)> {
@@ -493,6 +594,48 @@ fn bound_yaml_expansion(raw: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_provider_amplifier_local_graph_rejects_cycles_and_reuses_completed_diamonds() {
+        let fixture = tempfile::tempdir().unwrap();
+        let settings = fixture.path().join(".amplifier/settings.yaml");
+        std::fs::create_dir(settings.parent().unwrap()).unwrap();
+        let a = fixture.path().join("a.yaml");
+        let b = fixture.path().join("b.yaml");
+        let c = fixture.path().join("c.yaml");
+        let d = fixture.path().join("d.yaml");
+        std::fs::write(
+            &settings,
+            format!("bundle:\n  active: 'file://{}'\n", a.display()),
+        )
+        .unwrap();
+        std::fs::write(&a, format!("includes: ['file://{}']\n", b.display())).unwrap();
+        std::fs::write(&b, format!("includes: ['file://{}']\n", a.display())).unwrap();
+        assert_eq!(
+            prepare(fixture.path(), fixture.path(), &[]).err().unwrap(),
+            "Amplifier local include cycle detected"
+        );
+        std::fs::write(
+            &a,
+            format!(
+                "includes: ['file://{}','file://{}']\n",
+                b.display(),
+                c.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(&b, format!("includes: ['file://{}']\n", d.display())).unwrap();
+        std::fs::write(&c, format!("includes: ['file://{}']\n", d.display())).unwrap();
+        std::fs::write(&d, "bundle: {name: shared}\n").unwrap();
+        let prepared = prepare(fixture.path(), fixture.path(), &[]).unwrap();
+        assert_eq!(prepared.selections.iter().filter(|selection|selection.source==d).count(),1,
+            "a completed local include shared by two branches retains one approved input generation");
+        std::fs::remove_file(d).unwrap();
+        assert!(
+            prepare(fixture.path(), fixture.path(), &[]).is_err(),
+            "missing declared include must not be silently skipped"
+        );
+    }
     #[test]
     fn managed_provider_amplifier_resource_errors_preserve_private_input() {
         let fixture = tempfile::tempdir().unwrap();

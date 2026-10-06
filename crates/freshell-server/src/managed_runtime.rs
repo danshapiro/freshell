@@ -209,7 +209,11 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     source_plan: None,
                 }
             } else {
-                Default::default()
+                crate::managed_mcp_capability::OpencodeEphemeralInput {
+                    cwd: Some(&cwd),
+                    workspace: Some(&workspace),
+                    ..Default::default()
+                }
             };
             let mcp_capability = matches!(
                 request.mode.as_str(),
