@@ -18,6 +18,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub mod fresh_agent_ops;
 pub use fresh_agent_ops::*;
+pub mod provider_inputs;
+pub use provider_inputs::*;
 
 #[cfg(test)]
 #[path = "fresh_agent_ops_tests.rs"]
@@ -1002,6 +1004,8 @@ pub struct ProviderSecretReference {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderLaunchContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_inputs: Option<PreparedProviderInputs>,
     pub preparation: ProviderPreparation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_capability: Option<McpCapabilityReference>,
@@ -1074,6 +1078,9 @@ pub struct ProviderConfigReference {
 
 impl ProviderLaunchContext {
     pub fn validate(&self, provider: &str) -> Result<(), RuntimeError> {
+        if let Some(inputs) = &self.prepared_inputs {
+            inputs.validate(self.mcp_capability.as_ref())?;
+        }
         let invalid = || {
             RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -1321,6 +1328,7 @@ mod provider_launch_context_tests {
             host_gateway_address: None,
         };
         let mut context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Opencode {
                 project_config: Vec::new(),
                 tui_config: Some(reference),
@@ -1359,6 +1367,7 @@ mod provider_launch_context_tests {
     #[test]
     fn typed_provider_context_round_trips_without_secret_material() {
         let context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Claude {
                 mcp_args: vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()],
             },
@@ -1436,6 +1445,7 @@ mod provider_launch_context_tests {
         assert!(serde_json::from_value::<ProviderLaunchContext>(nested).is_err());
 
         let context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Claude { mcp_args: vec![] },
             mcp_capability: None,
             config: vec![ProviderConfigReference {
@@ -1475,6 +1485,7 @@ mod provider_launch_context_tests {
         }))
         .unwrap();
         launch.provider_launch_context = Some(ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Claude {
                 mcp_args: vec!["--api-key".into(), "fixture-secret-bytes".into()],
             },

@@ -1,6 +1,7 @@
 pub mod docker;
 mod native_auth;
 mod native_history;
+mod prepared_inputs;
 
 use crate::registry::OwnedRuntimeHandle;
 use async_trait::async_trait;
@@ -263,6 +264,45 @@ impl DockerEngineBackend {
             ));
         }
         verify_inspect_config(handle, &value)?;
+        let mounts = match (handle.terminal(), handle.fresh_agent()) {
+            (Some(terminal), None) => Some(docker::terminal_mounts(terminal)),
+            (None, Some(agent)) => Some(docker::fresh_agent_mounts(agent)),
+            _ => None,
+        }
+        .transpose()
+        .map_err(BackendError::OwnershipMismatch)?;
+        if let Some(mounts) = mounts {
+            let mut volumes = BTreeMap::new();
+            let mut names = std::collections::BTreeSet::new();
+            if !mounts.resource_mounts.is_empty() {
+                names.insert(handle.provider_volume_name().to_owned());
+            }
+            if let Some(files) = &mounts.indexed_files {
+                names.insert(files.volume_name.clone());
+            }
+            for name in names {
+                let inspected = self
+                    .request_bounded(
+                        "GET",
+                        &format!("{DOCKER_API}/volumes/{name}"),
+                        None,
+                        1024 * 1024,
+                    )
+                    .await?;
+                if inspected.status != 200 {
+                    return Err(BackendError::OwnershipMismatch(
+                        "prepared owned volume is unavailable".into(),
+                    ));
+                }
+                let inspected = serde_json::from_slice(&inspected.body).map_err(|_| {
+                    BackendError::OwnershipMismatch(
+                        "prepared owned volume inspection invalid".into(),
+                    )
+                })?;
+                volumes.insert(name, inspected);
+            }
+            prepared_inputs::verify(&value, &mounts, handle.provider_volume_name(), &volumes)?;
+        }
         Ok(Some(value))
     }
 
@@ -662,7 +702,7 @@ impl RuntimeBackend for DockerEngineBackend {
         } else {
             Vec::new()
         };
-        let body = docker_create_body(
+        let mut body = docker_create_body(
             spec,
             binds,
             host_env,
@@ -671,6 +711,36 @@ impl RuntimeBackend for DockerEngineBackend {
             requested_limits,
             memory_swap,
         );
+        if let Some(mounts) = &terminal_mounts {
+            let context = spec
+                .terminal
+                .as_ref()
+                .and_then(|spec| spec.provider_launch_context.as_ref())
+                .or_else(|| {
+                    spec.fresh_agent
+                        .as_ref()
+                        .and_then(|spec| spec.provider_launch_context.as_ref())
+                });
+            if let Some(inputs) = context.and_then(|context| context.prepared_inputs.as_ref()) {
+                if inputs.indexed_files.as_ref().is_some_and(|files| {
+                    files.volume_name
+                        != freshell_runtime_protocol::indexed_provider_volume_name(
+                            &spec.soul_id,
+                            &inputs.generation_id,
+                        )
+                }) {
+                    return Err(BackendError::InvalidConfig(
+                        "indexed provider volume belongs to another soul/preparation".into(),
+                    ));
+                }
+            }
+            body["HostConfig"]["Mounts"] = serde_json::to_value(
+                prepared_inputs::mount_descriptors(mounts, &spec.provider_volume_name)?,
+            )
+            .map_err(|_| {
+                BackendError::InvalidConfig("prepared mount metadata cannot be encoded".into())
+            })?;
+        }
         // The name is diagnostic only and is deliberately unique per create attempt.
         // A crash after Docker create but before the container-id commit can leave a
         // stopped, unregistered object. Retrying the PREPARED transaction must be able
@@ -1855,5 +1925,78 @@ mod tests {
 
         running.provider_store_id = "store-two".into();
         assert_ne!(digest(running), original);
+    }
+
+    #[test]
+    fn provider_prepared_metadata_changes_both_route_immutable_digests() {
+        use freshell_runtime_protocol::{
+            PreparedProviderInputs, ProviderInputManifestReference, ProviderLaunchContext,
+            ProviderPreparation,
+        };
+        let inputs = PreparedProviderInputs {
+            generation_id: "grant-digest".into(),
+            manifest: ProviderInputManifestReference {
+                relative_path: ".freshell/input-manifest.json".into(),
+                sha256: "a".repeat(64),
+                source_count: 0,
+                alias_count: 0,
+                recipe_count: 0,
+            },
+            config_binds: vec![],
+            resource_mounts: vec![],
+            indexed_files: None,
+        };
+        let context = ProviderLaunchContext {
+            prepared_inputs: Some(inputs),
+            preparation: ProviderPreparation::Codex {
+                tui_args: vec![],
+                sidecar_args: vec![],
+            },
+            mcp_capability: None,
+            config: vec![],
+        };
+        let terminal:TerminalLaunchSpec=serde_json::from_value(json!({
+            "terminalId":"terminal-digest","streamId":"stream-digest","mode":"codex","program":"codex",
+            "cwd":"/workspace","workspacePath":"/workspace","runAsUid":65534,"runAsGid":0,
+            "cols":80,"rows":24,"projectKey":"project-digest","providerLaunchContext":context,
+        })).unwrap();
+        let fresh:FreshAgentLaunchSpec=serde_json::from_value(json!({
+            "sessionId":"session-digest","provider":"codex","sessionType":"freshcodex","runtimeVariant":"codex-app-server",
+            "providerStoreId":"store-digest","cwd":"/workspace","workspacePath":"/workspace","runAsUid":65534,"runAsGid":0,
+            "providerLaunchContext":context,
+        })).unwrap();
+        for fresh_route in [false, true] {
+            let mut expected = ExpectedConfig {
+                image_ref: "sha256:image".into(),
+                installation_id: "installation-digest".into(),
+                soul_id: "soul-digest".into(),
+                incarnation_id: "incarnation-digest".into(),
+                host_binary_path: "/runtime/host".into(),
+                runtime_dir: "/runtime/incarnation".into(),
+                limits: RuntimeLimits {
+                    cpu_milli: 500,
+                    memory_bytes: 128 * 1024 * 1024,
+                    swap_bytes: 0,
+                    pids_max: 64,
+                },
+                terminal: (!fresh_route).then_some(terminal.clone()),
+                fresh_agent: fresh_route.then(|| (&fresh).into()),
+                provider_volume_name: "owned-provider".into(),
+            };
+            let before = digest_expected(&expected).unwrap();
+            let context = if let Some(terminal) = expected.terminal.as_mut() {
+                terminal.provider_launch_context.as_mut().unwrap()
+            } else {
+                expected
+                    .fresh_agent
+                    .as_mut()
+                    .unwrap()
+                    .provider_launch_context
+                    .as_mut()
+                    .unwrap()
+            };
+            context.prepared_inputs.as_mut().unwrap().manifest.sha256 = "b".repeat(64);
+            assert_ne!(digest_expected(&expected).unwrap(),before,"prepared metadata must participate in the immutable proof for route fresh={fresh_route}");
+        }
     }
 }

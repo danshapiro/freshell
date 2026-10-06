@@ -3064,6 +3064,7 @@ mod tests {
                     freshell_runtime_protocol::ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
             }],
             provider_launch_context: Some(freshell_runtime_protocol::ProviderLaunchContext {
+                prepared_inputs: None,
                 preparation: freshell_runtime_protocol::ProviderPreparation::Amplifier {
                     bundle: "default".into(),
                     resume_args: Vec::new(),
@@ -3172,6 +3173,7 @@ mod tests {
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
             provider_launch_context: Some(freshell_runtime_protocol::ProviderLaunchContext {
+                prepared_inputs: None,
                 preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
                     project_config: Vec::new(),
                     tui_config: None,

@@ -39,6 +39,16 @@ pub struct TerminalMounts {
     pub provider_secret_files: Vec<PathBuf>,
     pub provider_user_root: Option<PathBuf>,
     pub mcp_capability_file: Option<PathBuf>,
+    pub input_manifest: Option<PathBuf>,
+    pub config_binds: Vec<ResolvedProviderConfigBind>,
+    pub resource_mounts: Vec<freshell_runtime_protocol::ProviderResourceMount>,
+    pub indexed_files: Option<freshell_runtime_protocol::IndexedProviderFiles>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProviderConfigBind {
+    pub source: PathBuf,
+    pub reference: freshell_runtime_protocol::ProviderConfigBind,
 }
 
 pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, String> {
@@ -74,6 +84,9 @@ fn workload_mounts(
     context: Option<&ProviderLaunchContext>,
     provider: &str,
 ) -> Result<TerminalMounts, String> {
+    if let Some(context) = context {
+        context.validate(provider).map_err(|error| error.message)?;
+    }
     freshell_runtime_protocol::validate_provider_secrets(provider, secret_references)
         .map_err(|error| error.message)?;
     let workspace = canonical_dir(Path::new(workspace_path), "workspace")?;
@@ -190,6 +203,11 @@ fn workload_mounts(
             Ok(canonical)
         })
         .transpose()?;
+    let prepared = prepared_input_mounts(
+        &workspace,
+        provider_user_root.as_deref(),
+        context.and_then(|context| context.prepared_inputs.as_ref()),
+    )?;
     Ok(TerminalMounts {
         workspace,
         git_common_dir,
@@ -197,7 +215,282 @@ fn workload_mounts(
         provider_secret_files,
         provider_user_root,
         mcp_capability_file,
+        input_manifest: prepared.input_manifest,
+        config_binds: prepared.config_binds,
+        resource_mounts: prepared.resource_mounts,
+        indexed_files: prepared.indexed_files,
     })
+}
+
+#[derive(Default)]
+struct PreparedInputMounts {
+    input_manifest: Option<PathBuf>,
+    config_binds: Vec<ResolvedProviderConfigBind>,
+    resource_mounts: Vec<freshell_runtime_protocol::ProviderResourceMount>,
+    indexed_files: Option<freshell_runtime_protocol::IndexedProviderFiles>,
+}
+
+fn prepared_input_mounts(
+    workspace: &Path,
+    root: Option<&Path>,
+    inputs: Option<&freshell_runtime_protocol::PreparedProviderInputs>,
+) -> Result<PreparedInputMounts, String> {
+    let mut prepared = PreparedInputMounts::default();
+    if let Some(inputs) = inputs {
+        let root = root.ok_or("prepared provider stage is unavailable")?;
+        let manifest = canonical_stage_file(root, &inputs.manifest.relative_path)?;
+        verify_input_manifest_digest(&manifest, &inputs.manifest.sha256)?;
+        for reference in &inputs.config_binds {
+            let source = canonical_stage_file(root, &reference.source_relative_path)?;
+            verify_template_limit(&source)?;
+            verify_workspace_destination(
+                &workspace,
+                &reference.logical_destination,
+                &reference.effective_destination,
+                false,
+            )?;
+            prepared.config_binds.push(ResolvedProviderConfigBind {
+                source,
+                reference: reference.clone(),
+            });
+        }
+        for reference in &inputs.resource_mounts {
+            let source = root.join(&reference.stage_relative_path);
+            let canonical = std::fs::canonicalize(&source)
+                .map_err(|_| "selected prepared resource is unavailable")?;
+            let metadata = std::fs::symlink_metadata(&source)
+                .map_err(|_| "selected prepared resource metadata failed")?;
+            let directory =
+                reference.kind == freshell_runtime_protocol::ProviderResourceKind::Directory;
+            if canonical != source
+                || metadata.file_type().is_symlink()
+                || if directory {
+                    !metadata.is_dir()
+                } else {
+                    !metadata.is_file()
+                }
+            {
+                return Err("prepared resource is not a physical staged unit".into());
+            }
+            verify_workspace_destination(
+                &workspace,
+                &reference.logical_destination,
+                &reference.effective_destination,
+                directory,
+            )?;
+            prepared.resource_mounts.push(reference.clone());
+        }
+        if let Some(files) = &inputs.indexed_files {
+            for alias in &files.aliases {
+                verify_workspace_destination(
+                    &workspace,
+                    &alias.logical_destination,
+                    &alias.effective_destination,
+                    false,
+                )?;
+            }
+            prepared.indexed_files = Some(files.clone());
+        }
+        prepared.input_manifest = Some(manifest);
+    }
+    Ok(prepared)
+}
+
+fn canonical_stage_file(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let path = root.join(relative);
+    let canonical =
+        std::fs::canonicalize(&path).map_err(|_| "prepared input file is unavailable")?;
+    let metadata =
+        std::fs::symlink_metadata(&path).map_err(|_| "prepared input file metadata failed")?;
+    if canonical != path || !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("prepared input file must be physical and stage-owned".into());
+    }
+    Ok(canonical)
+}
+fn verify_template_limit(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut reader = std::fs::File::open(path)
+        .map_err(|_| "prepared config template is unavailable")?
+        .take(16 * 1024 * 1024 + 1);
+    let mut bytes = 0u64;
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .map_err(|_| "prepared config template read failed")?;
+        if count == 0 {
+            return Ok(());
+        }
+        bytes += count as u64;
+        if bytes > 16 * 1024 * 1024 {
+            return Err("prepared config template exceeds source-view limit".into());
+        }
+    }
+}
+fn verify_input_manifest_digest(path: &Path, expected: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut reader = std::fs::File::open(path)
+        .map_err(|_| "prepared input manifest is unavailable")?
+        .take(64 * 1024 * 1024 + 1);
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .map_err(|_| "prepared input manifest read failed")?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        if bytes > 64 * 1024 * 1024 {
+            return Err("prepared input manifest exceeds stored metadata limit".into());
+        }
+        hash.update(&chunk[..count]);
+    }
+    if format!("{:x}", hash.finalize()) != expected.to_ascii_lowercase() {
+        return Err("prepared input manifest changed; reprepare before mount construction".into());
+    }
+    Ok(())
+}
+fn verify_workspace_destination(
+    workspace: &Path,
+    logical: &str,
+    effective: &str,
+    directory: bool,
+) -> Result<(), String> {
+    let logical = Path::new(logical);
+    if !logical.starts_with(workspace) {
+        return Ok(());
+    }
+    // These mountpoints and parents must already exist. This operation never
+    // creates, chmods or edits the original workspace or its links.
+    let canonical = std::fs::canonicalize(logical)
+        .map_err(|_| "selected workspace input mountpoint is unavailable")?;
+    let metadata = std::fs::metadata(logical)
+        .map_err(|_| "selected workspace input mountpoint metadata failed")?;
+    if canonical != Path::new(effective)
+        || if directory {
+            !metadata.is_dir()
+        } else {
+            !metadata.is_file()
+        }
+    {
+        return Err("selected workspace input topology changed; reprepare before launch".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod prepared_stage_tests {
+    use super::*;
+    use freshell_runtime_protocol::{
+        PreparedProviderInputs, ProviderConfigBind, ProviderInputManifestReference,
+    };
+    use sha2::{Digest, Sha256};
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PreparedProviderInputs) {
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join("stage");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(stage.join(".freshell/templates")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let manifest = b"{\"sources\":[]}";
+        std::fs::write(stage.join(".freshell/input-manifest.json"), manifest).unwrap();
+        std::fs::write(
+            stage.join(".freshell/templates/source-0"),
+            b"{\"model\":\"transported\"}",
+        )
+        .unwrap();
+        let target = workspace.join("opencode.json");
+        std::fs::write(&target, b"{\"model\":\"original\"}").unwrap();
+        let inputs = PreparedProviderInputs {
+            generation_id: "grant-prepared-stage".into(),
+            manifest: ProviderInputManifestReference {
+                relative_path: ".freshell/input-manifest.json".into(),
+                sha256: format!("{:x}", Sha256::digest(manifest)),
+                source_count: 0,
+                alias_count: 0,
+                recipe_count: 0,
+            },
+            config_binds: vec![ProviderConfigBind {
+                source_relative_path: ".freshell/templates/source-0".into(),
+                logical_destination: target.to_string_lossy().into_owned(),
+                effective_destination: target.to_string_lossy().into_owned(),
+            }],
+            resource_mounts: vec![],
+            indexed_files: None,
+        };
+        (root, stage, workspace, inputs)
+    }
+
+    #[test]
+    fn provider_prepared_stage_bounds_actual_config_template() {
+        let (_owned, stage, workspace, inputs) = fixture();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(stage.join(".freshell/templates/source-0"))
+            .unwrap()
+            .set_len(16 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(
+            prepared_input_mounts(&workspace, Some(&stage), Some(&inputs)).is_err(),
+            "oversized selected template must be rejected before mount construction"
+        );
+    }
+
+    #[test]
+    fn provider_prepared_stage_consumes_template_and_preserves_workspace_topology() {
+        let (_owned, stage, workspace, mut inputs) = fixture();
+        let original = workspace.join("opencode.json");
+        let logical = workspace.join("linked.json");
+        std::os::unix::fs::symlink("opencode.json", &logical).unwrap();
+        inputs.config_binds[0].logical_destination = logical.to_string_lossy().into_owned();
+        let mounts = prepared_input_mounts(&workspace, Some(&stage), Some(&inputs)).unwrap();
+        assert_eq!(
+            std::fs::read(&mounts.config_binds[0].source).unwrap(),
+            b"{\"model\":\"transported\"}"
+        );
+        assert_eq!(
+            std::fs::read(&original).unwrap(),
+            b"{\"model\":\"original\"}"
+        );
+        assert_eq!(
+            std::fs::read_link(&logical).unwrap(),
+            Path::new("opencode.json")
+        );
+        inputs.config_binds[0].logical_destination = workspace
+            .join("missing/selected.json")
+            .to_string_lossy()
+            .into_owned();
+        assert!(prepared_input_mounts(&workspace, Some(&stage), Some(&inputs)).is_err());
+        assert!(!workspace.join("missing").exists());
+    }
+
+    #[test]
+    fn provider_prepared_stage_rejects_changed_manifest_and_escaped_template() {
+        let (_owned, stage, workspace, inputs) = fixture();
+        std::fs::write(
+            stage.join(".freshell/input-manifest.json"),
+            b"{\"sources\":[1]}",
+        )
+        .unwrap();
+        assert!(prepared_input_mounts(&workspace, Some(&stage), Some(&inputs)).is_err());
+        std::fs::write(
+            stage.join(".freshell/input-manifest.json"),
+            b"{\"sources\":[]}",
+        )
+        .unwrap();
+        let template = stage.join(".freshell/templates/source-0");
+        std::fs::remove_file(&template).unwrap();
+        std::os::unix::fs::symlink(workspace.join("opencode.json"), &template).unwrap();
+        assert!(prepared_input_mounts(&workspace, Some(&stage), Some(&inputs)).is_err());
+        assert_eq!(
+            std::fs::read(workspace.join("opencode.json")).unwrap(),
+            b"{\"model\":\"original\"}"
+        );
+    }
 }
 
 fn capability_directory() -> Result<PathBuf, String> {
@@ -337,6 +630,7 @@ mod provider_secret_tests {
     fn nested_opencode_user_config_requires_the_approved_root_mount() {
         use freshell_runtime_protocol::{ProviderConfigReference, ProviderPreparation};
         let context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Opencode {
                 project_config: vec![ProviderConfigReference {
                     root: ProviderConfigRoot::UserProvider,

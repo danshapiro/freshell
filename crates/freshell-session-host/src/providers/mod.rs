@@ -582,6 +582,7 @@ mod provider_secret_context_tests {
             }))
             .unwrap();
         terminal.provider_launch_context = Some(ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Claude {
                 mcp_args: vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()],
             },

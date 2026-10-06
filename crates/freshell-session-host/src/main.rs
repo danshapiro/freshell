@@ -2882,6 +2882,7 @@ mod tests {
         std::fs::write(source.join("plugins/ordinary.js"), b"export default {};").unwrap();
         std::fs::write(source.join("plugins/auth.json"), b"test-secret-value").unwrap();
         let context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Claude {
                 mcp_args: Vec::new(),
             },
@@ -2965,6 +2966,7 @@ mod tests {
         symlink(&outside, workspace.join(".opencode")).unwrap();
         symlink(workspace.join("inside"), workspace.join("linked-inside")).unwrap();
         let context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Opencode {
                 project_config: vec![
                     ProviderConfigReference {
@@ -3075,6 +3077,7 @@ mod tests {
         std::fs::write(source.join("settings.json"), b"first").unwrap();
         std::fs::write(source.join("plugins/old.js"), b"old").unwrap();
         let mut context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Claude {
                 mcp_args: Vec::new(),
             },
@@ -3219,6 +3222,7 @@ mod tests {
         )
         .unwrap();
         let context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Codex {
                 tui_args: vec![],
                 sidecar_args: vec![],
@@ -3857,6 +3861,7 @@ mod tests {
         std::fs::create_dir(&provider_home).unwrap();
         std::fs::write(&source_config, br#"{"model":"first"}"#).unwrap();
         let context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Opencode {
                 project_config: vec![ProviderConfigReference {
                     root: ProviderConfigRoot::Workspace,
@@ -4489,6 +4494,7 @@ mod tests {
         .unwrap();
         let mut terminal:TerminalLaunchSpec=serde_json::from_value(serde_json::json!({"terminalId":"first-amplifier","streamId":"stream","mode":"amplifier","program":"amplifier","args":[],"cwd":root.path(),"runAsUid":unsafe{libc::geteuid()},"runAsGid":unsafe{libc::getegid()},"cols":80,"rows":24,"projectKey":"project","workspacePath":root.path(),"resumeSessionId":"session"})).unwrap();
         terminal.provider_launch_context = Some(ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Amplifier {
                 bundle: "default".into(),
                 resume_args: Vec::new(),

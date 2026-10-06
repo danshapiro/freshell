@@ -292,6 +292,7 @@ fn provider_launch_context_from_home_at_with_xdg(
         );
     }
     Ok(Some(ProviderLaunchContext {
+        prepared_inputs: None,
         preparation,
         mcp_capability,
         config,

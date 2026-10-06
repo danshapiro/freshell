@@ -2410,6 +2410,7 @@ mod tests {
         let mut replacement = replacement;
         replacement.provider_launch_context =
             Some(freshell_runtime_protocol::ProviderLaunchContext {
+                prepared_inputs: None,
                 preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
                     project_config: Vec::new(),
                     tui_config: None,
@@ -2451,6 +2452,7 @@ mod tests {
         std::fs::create_dir_all(&user_root).unwrap();
         std::fs::write(user_root.join("old.jsonc"), "{}").unwrap();
         let mut context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Opencode {
                 project_config: vec![],
                 tui_config: None,

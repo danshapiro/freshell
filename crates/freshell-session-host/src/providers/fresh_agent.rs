@@ -2079,6 +2079,7 @@ mod tests {
                 session_id: format!("native-{}", provider.as_str()),
             }),
             provider_launch_context: Some(ProviderLaunchContext {
+                prepared_inputs: None,
                 preparation,
                 mcp_capability: None,
                 config: vec![freshell_runtime_protocol::ProviderConfigReference {
@@ -2677,6 +2678,7 @@ mod tests {
                     provider: provider.as_str().into(), session_id: "exact-native".into(),
                 }),
                 provider_launch_context: Some(ProviderLaunchContext {
+            prepared_inputs: None,
                     preparation,
                     mcp_capability: None,
                     config: vec![freshell_runtime_protocol::ProviderConfigReference {
