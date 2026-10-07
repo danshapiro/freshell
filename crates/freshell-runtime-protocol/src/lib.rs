@@ -2252,6 +2252,7 @@ pub fn durable_managed_terminal_args(
     };
     let mut out = Vec::with_capacity(args.len());
     let mut index = 0;
+    let mut selected_settings = None;
     while index < args.len() {
         match args[index].as_str() {
             flag if flag == "--setting-sources" || flag.starts_with("--setting-sources=") => {
@@ -2287,20 +2288,23 @@ pub fn durable_managed_terminal_args(
                     index += 2;
                     value.as_str()
                 };
-                out.push("--settings".into());
-                out.push(
-                    if freshell_platform::cli_launch::is_owned_claude_settings(value) {
-                        claude_settings.ok_or_else(invalid)?.into()
-                    } else {
-                        freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT.into()
-                    },
-                );
+                selected_settings = Some(value);
             }
             _ => {
                 out.push(args[index].clone());
                 index += 1;
             }
         }
+    }
+    if let Some(value) = selected_settings {
+        out.push("--settings".into());
+        out.push(
+            if freshell_platform::cli_launch::is_owned_claude_settings(value) {
+                claude_settings.ok_or_else(invalid)?.into()
+            } else {
+                freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT.into()
+            },
+        );
     }
     validate_managed_terminal_args(mode, &out)?;
     Ok(out)
@@ -3494,6 +3498,64 @@ mod tests {
         assert_eq!(
             durable_managed_terminal_args("claude", args.clone(), None).unwrap(),
             args
+        );
+    }
+
+    #[test]
+    fn managed_claude_duplicate_settings_uses_only_last_native_selection() {
+        use freshell_platform::claude_inputs::{
+            selected_settings_argument, MANAGED_SETTINGS_ARGUMENT,
+        };
+        use freshell_platform::cli_launch::{claude_settings_json, ProviderTarget};
+        let shipped = claude_settings_json(ProviderTarget::Unix);
+        for ignored in [
+            "missing-ignored-settings.json",
+            "{\"env\":{\"PRIVATE_IGNORED\":\"sentinel\"}}",
+        ] {
+            for last in [format!("--settings={shipped}"), "--settings".into()] {
+                let mut args = vec![
+                    "--settings".into(),
+                    ignored.into(),
+                    "--init-only".into(),
+                    last,
+                ];
+                if args.last().unwrap() == "--settings" {
+                    args.push(shipped.clone());
+                }
+                let retained =
+                    durable_managed_terminal_args("claude", args, Some(&shipped)).unwrap();
+                validate_managed_terminal_args("claude", &retained).unwrap();
+                assert_eq!(
+                    selected_settings_argument(&retained),
+                    Some(shipped.as_str())
+                );
+                assert!(!retained.iter().any(|arg| arg == MANAGED_SETTINGS_ARGUMENT),
+                    "an ignored earlier selection must not demand private selected settings at spawn");
+                assert!(!serde_json::to_string(&retained)
+                    .unwrap()
+                    .contains("PRIVATE_IGNORED"));
+            }
+        }
+        let retained = durable_managed_terminal_args(
+            "claude",
+            vec![
+                "--settings".into(),
+                shipped.clone(),
+                "--settings=selected-last.json".into(),
+            ],
+            Some(&shipped),
+        )
+        .unwrap();
+        assert_eq!(
+            selected_settings_argument(&retained),
+            Some(MANAGED_SETTINGS_ARGUMENT)
+        );
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|arg| arg.as_str() == "--settings")
+                .count(),
+            1
         );
     }
 

@@ -886,7 +886,10 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
     let flag_argument = match settings_form.as_str() {
         "file" => "../source-home/selected-config/selected-settings.json".into(),
         "inline" => String::from_utf8(flag_bytes.clone()).unwrap(),
-        _ => panic!("closed fixture settings form must be file or inline"),
+        "owned-last" => freshell_platform::cli_launch::claude_settings_json(
+            freshell_platform::cli_launch::ProviderTarget::Unix,
+        ),
+        _ => panic!("closed fixture settings form must be file, inline or owned-last"),
     };
     let instructions_consumer = r#"const fs=require('node:fs'),crypto=require('node:crypto'),path=require('node:path');
 let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
@@ -1033,6 +1036,11 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
                     "--init-only".into(),
                     "--setting-sources".into(),
                     "user".into(),
+                    // Native chooses the last selector. Neither an unavailable
+                    // earlier file nor its private inline document is selected.
+                    "--settings".into(),
+                    "missing-ignored-settings.json".into(),
+                    "--settings={\"env\":{\"CLAUDE_SELECTED_NONCE\":\"ignored-settings-sentinel\"}}".into(),
                     "--settings".into(),
                     flag_argument,
                     "--plugin-dir".into(),
@@ -1189,12 +1197,19 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         observed.expect("native Claude selected plugin must execute its startup hook"),
         expected
     );
-    assert_eq!(
-        consumed(&flag_receipt)
-            .await
-            .expect("native must execute the explicitly selected flag settings hook"),
-        json!({"flag":true,"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")})
-    );
+    if settings_form == "owned-last" {
+        assert!(
+            !flag_receipt.exists(),
+            "ignored user settings hooks must not execute"
+        );
+    } else {
+        assert_eq!(
+            consumed(&flag_receipt)
+                .await
+                .expect("native must execute the explicitly selected last flag settings hook"),
+            json!({"flag":true,"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")})
+        );
+    }
     assert_eq!(std::fs::read(&flag_settings).unwrap(), flag_bytes);
     assert_eq!(std::fs::read_link(&flag_alias).unwrap(), flag_settings);
     let native_import = consumed(&instructions_receipt).await;

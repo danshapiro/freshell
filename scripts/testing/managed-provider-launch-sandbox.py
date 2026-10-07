@@ -34,7 +34,7 @@ def main():
     parser.add_argument("--receipt-dir",type=Path,required=True)
     parser.add_argument("--provider",choices=["opencode","codex","claude","amplifier"],default="opencode")
     parser.add_argument("--claude-flavor",choices=["freshclaude","kilroy"],default="freshclaude")
-    parser.add_argument("--claude-settings-form",choices=["file","inline"],default="file")
+    parser.add_argument("--claude-settings-form",choices=["file","inline","owned-last"],default="file")
     args=parser.parse_args()
     if args.provider!="claude" and args.claude_flavor!="freshclaude":
         parser.error("the finite Claude flavor requires --provider claude")
