@@ -400,6 +400,25 @@ function fixture() {
 }
 
 describe('exact owned runtime facts', () => {
+  it.each(['launchState', 'incarnationId', 'containerId', 'hostBootId', 'nativeSessionId'] as const)(
+    'identifies the changed %s before reading owner facts', async field => {
+    const { adapter, read, row } = fixture()
+    row[field] = 'replacement-value'
+    await expect(owner.readExactRuntimeHostFacts(adapter, handle)).rejects.toMatchObject({
+      runtimeHandleMismatches: [field],
+    })
+    expect(read).not.toHaveBeenCalled()
+  })
+  it('keeps absent and duplicate current inventory unknown and unread', async () => {
+    const { adapter, read, row } = fixture()
+    for (const rows of [[], [row, row]]) {
+      adapter.inventory.mockResolvedValue(rows)
+      await expect(owner.readExactRuntimeHostFacts(adapter, handle)).rejects.toMatchObject({
+        runtimeHandleMismatches: ['inventoryMembership'],
+      })
+    }
+    expect(read).not.toHaveBeenCalled()
+  })
   it('keeps owner control responsive while cgroup facts are read for the exact native host', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-cgroup-child-'))
     const command = path.join(root, 'docker')

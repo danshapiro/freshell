@@ -14,7 +14,7 @@ import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
-import { ManagedRuntimeOwner, RuntimeHarness, type SupervisorInstance, type Phase3BrowserObservation } from '../../../../scripts/testing/runtime-sandbox.js'
+import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type SupervisorInstance, type Phase3BrowserObservation } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 
 beforeEach(() => execute.mockReset())
@@ -760,6 +760,22 @@ describe('closed external owner control', () => {
     expect(log).toHaveBeenCalledWith('external.owner_operation_refused', expect.objectContaining({ reason: 'pending_decision_mismatch' }))
     expect(log.mock.calls[0][1]).not.toHaveProperty('runtimeCode')
     expect(JSON.stringify(log.mock.calls)).not.toContain('private-decision')
+  })
+  it('records which exact address field changed while preserving the original current-handle refusal', async () => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-soul',
+      incarnationId: 'owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'owned-boot', nativeSessionId: 'owned-root' }
+    vi.spyOn(owned, 'allowFixtureDecision').mockImplementation(async () => assertExactRuntimeHandle({
+      runId: context.runId, candidateSha: context.candidateSha, receipts: () => [handle],
+      inventory: async () => [{ ...handle, nativeSessionId: 'private-replacement-root', launchState: 'running' }],
+    }, handle))
+    const log = vi.spyOn(owned.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    await expect(control({ ...request, action: 'fixture-decision-allow', handle, challengeId: 'pending-owned' })).rejects.toThrow(/current/)
+    expect(log).toHaveBeenCalledWith('external.owner_operation_refused', expect.objectContaining({
+      reason: 'current_address_mismatch', mismatchedFields: ['nativeSessionId'],
+    }))
+    expect(JSON.stringify(log.mock.calls)).not.toContain('private-replacement-root')
   })
   it('returns only registered synthetic source IDs, digests and actual counts across the finite transport', async () => {
     const { owned, context, request } = fixture()

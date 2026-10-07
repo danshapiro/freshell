@@ -716,6 +716,10 @@ export interface RuntimeOwnerFactsAdapter {
   readHostFacts(handle: ExactRuntimeHandle): Promise<unknown>
 }
 
+export const RuntimeHandleMismatchFieldsSchema = z.array(z.enum([
+  'inventoryMembership', 'launchState', 'incarnationId', 'containerId', 'hostBootId', 'nativeSessionId',
+])).min(1)
+
 export async function assertExactRuntimeHandle(
   owner: Omit<RuntimeOwnerFactsAdapter, 'readHostFacts'>, handle: ExactRuntimeHandle,
 ): Promise<void> {
@@ -730,10 +734,18 @@ export async function assertExactRuntimeHandle(
   }
   const rows = (await owner.inventory()).filter((row) => row.soulId === handle.soulId)
   const row = rows[0]
-  if (rows.length !== 1 || row.launchState !== 'running'
-    || row.incarnationId !== handle.incarnationId || row.containerId !== handle.containerId
-    || row.hostBootId !== handle.hostBootId || row.nativeSessionId !== handle.nativeSessionId) {
-    throw new Error('runtime handle is not the current exact owned incarnation and root')
+  const mismatches: z.infer<typeof RuntimeHandleMismatchFieldsSchema> = []
+  if (rows.length !== 1) mismatches.push('inventoryMembership')
+  else {
+    if (row.launchState !== 'running') mismatches.push('launchState')
+    for (const field of ['incarnationId', 'containerId', 'hostBootId', 'nativeSessionId'] as const) {
+      if (row[field] !== handle[field]) mismatches.push(field)
+    }
+  }
+  if (mismatches.length) {
+    throw Object.assign(new Error('runtime handle is not the current exact owned incarnation and root'), {
+      runtimeHandleMismatches: mismatches,
+    })
   }
 }
 

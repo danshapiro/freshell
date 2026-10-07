@@ -18,7 +18,7 @@ import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, R
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema,
-  FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -1151,13 +1151,16 @@ export function createExternalRuntimeControl(
   const queue = new RuntimeOwnerOperationQueue(descriptor.runId, descriptor.candidateSha, 'browser-managed-runtime', async request => {
     try { return await execute(request) } catch (error) {
       const runtime = z.object({ runtimeError: z.object({ code: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/) }) }).safeParse(error)
+      const address = z.object({ runtimeHandleMismatches: RuntimeHandleMismatchFieldsSchema }).safeParse(error)
       owner.runtime.recordLifecycle('external.owner_operation_refused', {
         severity: 'warn', runId: descriptor.runId, candidateSha: descriptor.candidateSha,
         operationId: request.operationId, action: request.action,
         reason: runtime.success ? 'runtime_rejection'
-          : error instanceof Error && error.message === 'exact actually pending fixture decision required'
-            ? 'pending_decision_mismatch' : 'owner_operation_refused',
+          : address.success ? 'current_address_mismatch'
+            : error instanceof Error && error.message === 'exact actually pending fixture decision required'
+              ? 'pending_decision_mismatch' : 'owner_operation_refused',
         ...(runtime.success ? { runtimeCode: runtime.data.runtimeError.code } : {}),
+        ...(address.success ? { mismatchedFields: address.data.runtimeHandleMismatches } : {}),
         ...(request.handle ? { soulId: request.handle.soulId, incarnationId: request.handle.incarnationId } : {}),
       })
       throw error
