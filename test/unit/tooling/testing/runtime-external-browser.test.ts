@@ -1288,6 +1288,88 @@ describe('closed Cloud metadata handoff', () => {
   })
 })
 
+describe('actual Cloud launcher browser image binding', () => {
+  async function launch(external: boolean, digest: string, observedImage?: string, executionImage?: string) {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-cloud-image-'))
+    try {
+      const scripts = path.join(directory, 'scripts')
+      const bin = path.join(directory, 'bin')
+      const calls = path.join(directory, 'calls.jsonl')
+      await fsp.mkdir(path.join(scripts, 'lib'), { recursive: true })
+      await fsp.mkdir(bin)
+      await fsp.copyFile('scripts/e2e-cloud.sh', path.join(scripts, 'e2e-cloud.sh'))
+      await fsp.copyFile('scripts/lib/gcp-identity.sh', path.join(scripts, 'lib/gcp-identity.sh'))
+      const command = `#!${process.execPath}\nconst fs=require('node:fs');const path=require('node:path');const args=process.argv.slice(2);const name=path.basename(process.argv[1]);
+fs.appendFileSync(process.env.TEST_CALLS,JSON.stringify({name,args})+'\\n');
+if(name==='git'){if(args.includes('status'))process.exit(0);console.log(args.includes('--short=12')?'aaaaaaaaaaaa':'${'a'.repeat(40)}');process.exit(0)}
+if(name==='pnpm'){if(args.some(x=>x.includes('externalCloudMetadata'))&&process.env.TEST_EXTERNAL==='1')console.log('FRESHELL_RUNTIME_EXTERNAL_RUN_ID: "${descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID}"');process.exit(0)}
+if(args[0]==='info')process.exit(0);
+if(args[0]==='auth'){console.log('fixture-token');process.exit(0)}
+if(args[0]==='artifacts'){console.log(process.env.TEST_DIGEST);process.exit(0)}
+if(args.includes('create')){const image=args.find(x=>x.startsWith('--image=')).slice(8);fs.writeFileSync(process.env.TEST_CALLS+'.image',image);process.exit(0)}
+if(args.includes('describe')){const job=args.find(x=>x.startsWith('freshell-e2e-'));const observed=args.includes('executions')?process.env.TEST_EXECUTION_IMAGE:process.env.TEST_OBSERVED_IMAGE;const containers=[{image:observed||fs.readFileSync(process.env.TEST_CALLS+'.image','utf8')}];console.log(JSON.stringify({metadata:{name:job,labels:{'freshell-managed-run':'${descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID}','freshell-managed-candidate':'${'a'.repeat(40)}'}},spec:{template:{spec:args.includes('executions')?{containers}:{template:{spec:{containers}}}}}}));process.exit(0)}
+if(args.includes('execute')){const job=args.find(x=>x.startsWith('freshell-e2e-'));console.log('Execution ['+job+'-fixture] has failed.');process.exit(73)}
+process.exit(0);\n`
+      for (const name of ['git', 'gcloud', 'pnpm']) await fsp.writeFile(path.join(bin, name), command, { mode: 0o700 })
+      const child = spawnSync('bash', [path.join(scripts, 'e2e-cloud.sh'), 'run', '--cloud'], {
+        env: { ...process.env, ...descriptor, PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+          FRESHELL_GCP_ACCOUNT: 'owned-fixture@example.test', TEST_CALLS: calls,
+          TEST_EXTERNAL: external ? '1' : '0', TEST_DIGEST: digest, TEST_OBSERVED_IMAGE: observedImage,
+          TEST_EXECUTION_IMAGE: executionImage },
+        encoding: 'utf8', timeout: 20_000,
+      })
+      const operations = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { name: string; args: string[] })
+      const events = child.stdout.split('\n').flatMap(line => { try { return [JSON.parse(line) as Record<string, unknown>] } catch { return [] } })
+      return { child, operations, events }
+    } finally { await fsp.rm(directory, { recursive: true, force: true }) }
+  }
+
+  it('pins the resolved digest before create and records the actual owned job image before execution', async () => {
+    const digest = `sha256:${'b'.repeat(64)}`
+    const image = `us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e@${digest}`
+    const result = await launch(true, digest)
+    const create = result.operations.find(row => row.name === 'gcloud' && row.args.includes('create'))
+    expect(create?.args).toContain(`--image=${image}`)
+    expect(result.events.find(row => row.event === 'managed_external_job_created')).toMatchObject({ image, imageDigest: digest })
+    expect(result.events.find(row => row.event === 'managed_external_job_execution')).toMatchObject({ image, imageDigest: digest })
+    expect(result.operations.some(row => row.args.includes('execute'))).toBe(true)
+    expect(result.child.status).toBe(1)
+  })
+
+  it.each(['', 'latest', `sha256:${'b'.repeat(63)}`])('refuses unavailable or malformed digest %j before job creation', async (digest) => {
+    const result = await launch(true, digest)
+    expect(result.child.status).toBe(1)
+    expect(result.operations.some(row => row.args.includes('create'))).toBe(false)
+    expect(result.operations.some(row => row.args.includes('execute'))).toBe(false)
+  })
+
+  it('refuses a changed job image before execution and still runs owned cleanup', async () => {
+    const result = await launch(true, `sha256:${'b'.repeat(64)}`, 'foreign.example/image:latest')
+    expect(result.child.status).toBe(1)
+    expect(result.operations.some(row => row.args.includes('execute'))).toBe(false)
+    expect(result.events.some(row => row.event === 'managed_external_job_created')).toBe(false)
+    expect(result.events.find(row => row.event === 'managed_external_job_cleanup')).toMatchObject({ ok: true })
+  })
+
+  it('refuses a changed execution image without certifying that execution', async () => {
+    const result = await launch(true, `sha256:${'b'.repeat(64)}`, undefined, 'foreign.example/image:latest')
+    expect(result.child.status).toBe(1)
+    expect(result.operations.some(row => row.args.includes('execute'))).toBe(true)
+    expect(result.events.some(row => row.event === 'managed_external_job_execution')).toBe(false)
+    expect(result.events.find(row => row.event === 'managed_external_job_cleanup')).toMatchObject({ ok: true })
+  })
+
+  it('preserves ordinary Cloud tag selection without external image observations', async () => {
+    const result = await launch(false, `sha256:${'b'.repeat(64)}`)
+    const create = result.operations.find(row => row.name === 'gcloud' && row.args.includes('create'))
+    expect(create?.args).toContain('--image=us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e:aaaaaaaaaaaa')
+    expect(result.operations.some(row => row.args.includes('--format=value(image_summary.digest)'))).toBe(false)
+    expect(result.operations.some(row => row.args.includes('describe') && row.args.includes('jobs'))).toBe(false)
+    expect(result.events).toEqual([])
+    expect(result.child.status).toBe(1)
+  })
+})
+
 describe('exact Cloud job cleanup authority', () => {
   const context = { jobName: 'freshell-e2e-owned-case', runId: descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID,
     candidateSha: descriptor.FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA }

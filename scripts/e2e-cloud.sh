@@ -583,6 +583,17 @@ cmd_run() {
     fi
   fi
 
+  local managed_browser_digest=""
+  if $managed_external; then
+    managed_browser_digest=$(gcloud artifacts docker images describe "$IMAGE_REMOTE" \
+      $(account_flag) --project="$GCP_PROJECT" --format='value(image_summary.digest)')
+    if [[ ! "$managed_browser_digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+      echo "[e2e-cloud] ERROR: exact managed browser image digest is unavailable." >&2
+      exit 1
+    fi
+    IMAGE_REMOTE="${IMAGE_REMOTE%:*}@${managed_browser_digest}"
+  fi
+
   echo "[e2e-cloud] Running on Cloud Run Jobs..."
   echo "[e2e-cloud]   Image:   $IMAGE_REMOTE"
   echo "[e2e-cloud]   Shards:  $shards"
@@ -718,9 +729,21 @@ cmd_run() {
     --memory=4Gi \
     --cpu=4 "${owned_job_labels[@]}"
   if $managed_external; then
+    local managed_job_image
+    if ! managed_job_image=$(gcloud run jobs describe $(gcloud_flags) "$RUN_JOB_NAME" --format=json | \
+      jq -er --arg jobName "$RUN_JOB_NAME" --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" \
+        --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" --arg image "$IMAGE_REMOTE" '
+        select(.metadata.name == $jobName
+          and .metadata.labels["freshell-managed-run"] == $runId
+          and .metadata.labels["freshell-managed-candidate"] == $candidateSha)
+        | .spec.template.spec.template.spec.containers
+        | select(length == 1 and .[0].image == $image) | .[0].image'); then
+      echo "[e2e-cloud] ERROR: exact owned job image observation is unavailable or changed." >&2
+      exit 1
+    fi
     jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
-      --arg jobName "$RUN_JOB_NAME" --arg image "$IMAGE_REMOTE" \
-      '{severity:"info", event:"managed_external_job_created", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, image:$image}'
+      --arg jobName "$RUN_JOB_NAME" --arg image "$managed_job_image" --arg imageDigest "$managed_browser_digest" \
+      '{severity:"info", event:"managed_external_job_created", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, image:$image, imageDigest:$imageDigest}'
   fi
 
   # Execute this run's job and wait for completion, capturing the exit
@@ -754,6 +777,25 @@ cmd_run() {
       --limit=1 || true)
   fi
 
+  if $managed_external && [ -n "$execution_id" ]; then
+    if [[ "$execution_id" != "$RUN_JOB_NAME"-* ]]; then
+      echo "[e2e-cloud] ERROR: observed execution differs from the exact owned job." >&2
+      exit 1
+    fi
+    local managed_execution_image
+    if ! managed_execution_image=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" --format=json | \
+      jq -er --arg executionName "$execution_id" --arg image "$IMAGE_REMOTE" '
+        select(.metadata.name == $executionName) | .spec.template.spec.containers
+        | select(length == 1 and .[0].image == $image) | .[0].image'); then
+      echo "[e2e-cloud] ERROR: exact owned execution image observation is unavailable or changed." >&2
+      exit 1
+    fi
+    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+      --arg jobName "$RUN_JOB_NAME" --arg executionName "$execution_id" --arg image "$managed_execution_image" \
+      --arg imageDigest "$managed_browser_digest" \
+      '{severity:"info", event:"managed_external_job_execution", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, executionName:$executionName, image:$image, imageDigest:$imageDigest}'
+  fi
+
   if [ "$execute_exit" -ne 0 ]; then
     echo "[e2e-cloud] Cloud Run Job execution failed (exit code $execute_exit)."
     if [ -n "$execution_id" ]; then
@@ -762,10 +804,9 @@ cmd_run() {
     fi
     exit 1
   fi
-  if $managed_external; then
-    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
-      --arg jobName "$RUN_JOB_NAME" --arg executionName "$execution_id" \
-      '{severity:"info", event:"managed_external_job_execution", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, executionName:$executionName}'
+  if $managed_external && [ -z "$execution_id" ]; then
+    echo "[e2e-cloud] ERROR: exact managed execution identity is unavailable." >&2
+    exit 1
   fi
 
   # Fetch logs (requires beta track for logs read).
