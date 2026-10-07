@@ -69,8 +69,9 @@
 // RESPONSE channel IS in scope (permission-channel.mjs, a faithful port of
 // server/sdk-bridge.ts): canUseTool parks a pending request, surfaces
 // sdk.permission.request / sdk.question.request, and waits for the Rust side's
-// permission.respond / question.respond (unknown respond ids are stderr-log-only
-// no-ops). The auto-allow shortcut remains ONLY for bypassPermissions sessions
+// permission.respond / question.respond (unknown respond ids return a typed
+// rejection). Managed dispatch acknowledgements follow the actual native stdin
+// control write; they do not certify a tool effect. The auto-allow shortcut remains ONLY for bypassPermissions sessions
 // (AskUserQuestion still routes to the question path first, per legacy ordering).
 
 import { createInterface } from 'node:readline'
@@ -78,8 +79,10 @@ import { randomBytes } from 'node:crypto'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
-import { managedSdkSpawn } from './exec-profile.mjs'
+import { checkSdkExec, managedSdkSpawn } from './exec-profile.mjs'
 import { hostedMcpServers } from './hosted-mcp.mjs'
+import { createNativeSessionChannel } from './native-session-channel.mjs'
+import { spawnObservedNative } from './native-process.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -263,6 +266,12 @@ function handleSdkMessage(sessionId, msg) {
     }
     case 'system': {
       if (msg.subtype === 'init') {
+        if (st.nativeChannel && !st.nativeReady) return
+        if (st.nativeReady && st.cliSessionId !== msg.session_id) {
+          emit({ type: 'sdk.error', sessionId, message: 'native root changed after startup' })
+          st.abort.abort()
+          return
+        }
         st.cliSessionId = msg.session_id
         st.settings.cwd ??= msg.cwd
         st.commandsInitSeen = true
@@ -311,6 +320,12 @@ function handleSdkMessage(sessionId, msg) {
       emit({ type: 'sdk.assistant', sessionId, content: blocks, model: msg.message?.model })
       break
     }
+    case 'user': {
+      const content = Array.isArray(msg.message?.content) ? msg.message.content.filter((block) => block.type === 'tool_result') : []
+      if (content.length) emit({ type: 'sdk.tool.result', sessionId, nativeSessionId: msg.session_id,
+        uuid: msg.uuid, parentToolUseId: msg.parent_tool_use_id, content })
+      break
+    }
     case 'result': {
       // The awaited turn's terminal frame arrived: drop one pending send
       // (clamped at 0 — an unsolicited result must not underflow the counter).
@@ -323,7 +338,9 @@ function handleSdkMessage(sessionId, msg) {
             cache_read_input_tokens: msg.usage.cache_read_input_tokens,
           }
         : undefined
-      emit({ type: 'sdk.result', sessionId, result: msg.subtype, durationMs: msg.duration_ms, costUsd: msg.total_cost_usd, usage })
+      emit({ type: 'sdk.result', sessionId, result: msg.subtype, durationMs: msg.duration_ms, costUsd: msg.total_cost_usd, usage,
+        nativeSessionId: msg.session_id, uuid: msg.uuid, isError: msg.is_error, stopReason: msg.stop_reason,
+        permissionDenials: msg.permission_denials, deferredToolUse: msg.deferred_tool_use })
       const failure = resultErrorMessage(msg)
       if (failure) emit({ type: 'sdk.error', sessionId, message: failure, turnFailure: true })
       // Unified attention edge: any turn end rings unless this result is the
@@ -379,11 +396,13 @@ async function consumeStream(sessionId, sdkQuery) {
     if (st?.abort.signal.aborted) emit({ type: 'sdk.exit', sessionId })
     else emit({ type: 'sdk.status', sessionId, status: 'idle' })
     sessions.delete(sessionId)
+    st?.abort.abort()
+    await st?.nativeChannel?.cleanup()
   }
 }
 
 // ── request handlers ─────────────────────────────────────────────────────────
-function handleCreate(req) {
+async function handleCreate(req) {
   const requestId = req.requestId
   let sessionId
   try {
@@ -422,6 +441,11 @@ function handleCreate(req) {
     const sdkStderr = process.env.FRESHELL_HOSTED_FRESH_AGENT === 'claude'
       ? data => process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-sidecar', event: 'provider.stderr', bytes: Buffer.byteLength(String(data)) })}\n`)
       : data => logerr(`sdk stderr: ${String(data).trimEnd()}`)
+    const launch = process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH
+      ? JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) : undefined
+    if (launch) state.nativeChannel = await createNativeSessionChannel({ launch, signal: abort.signal })
+
+    const sdkSpawn = managedSdkSpawn(sdkStderr)
     const sdkQuery = query({
       prompt: iterable,
       options: {
@@ -450,13 +474,29 @@ function handleCreate(req) {
         // sidecar, so checkpoint identity must remain unbound.
         extraArgs: { 'replay-user-messages': null },
         abortController: abort,
-        env: createClaudeSdkCleanEnv(process.env),
+        env: { ...createClaudeSdkCleanEnv(process.env), ...state.nativeChannel?.env },
+        settings: state.nativeChannel?.settings,
+        spawnClaudeCodeProcess: state.nativeChannel ? (options) => {
+          if (sdkSpawn) checkSdkExec(options)
+          return spawnObservedNative(options, {
+          onStderr: sdkStderr,
+          onControlWrite: (frame, error) => {
+            const binding = state.nativeRequests?.get(frame.response.request_id)
+            if (!binding) return
+            state.nativeRequests.delete(frame.response.request_id)
+            emit({ type: `sdk.${binding.kind}.dispatch`, sessionId, requestId: binding.requestId,
+              nativeRequestId: frame.response.request_id, ok: !error && frame.response.subtype === 'success',
+              acceptanceAmbiguous: !!error, message: error?.message ?? frame.response.error })
+          },
+          })
+        } : sdkSpawn,
         settingSources: ['user', 'project', 'local'],
-        spawnClaudeCodeProcess: managedSdkSpawn(sdkStderr),
         stderr: sdkStderr,
         canUseTool: async (toolName, input, options) => {
           const s = sessions.get(sessionId)
-          if (!s) return { behavior: 'allow', updatedInput: input }
+          if (!s || (s.nativeChannel && !s.nativeReady)) {
+            return { behavior: 'deny', message: 'Current native session is not ready' }
+          }
           // AskUserQuestion routes first (even under bypassPermissions), then the
           // bypass fast-path, else park-and-surface a pending request — legacy
           // ordering, sdk-bridge.ts:203-214.
@@ -479,6 +519,20 @@ function handleCreate(req) {
     // Return the placeholder before the native system/init identity arrives.
     emit({ type: 'created', requestId, sessionId })
     consumeStream(sessionId, sdkQuery).catch((err) => logerr(`consume error: ${err?.message}`))
+    if (state.nativeChannel) {
+      state.nativeChannel.waitReady(sdkQuery).then((observation) => {
+        if (sessions.get(sessionId) !== state || abort.signal.aborted) return
+        state.nativeReady = true
+        state.cliSessionId = observation.nativeSessionId
+        emit({ type: 'sdk.session.init', sessionId, cliSessionId: observation.nativeSessionId,
+          cwd: observation.native.cwd, model: req.model, nativeIdentityEvidence: {
+            launch, digest: observation.evidenceDigest, source: observation.native.source,
+          } })
+      }).catch((error) => {
+        emit({ type: 'sdk.error', sessionId, message: `native startup: ${error.message}` })
+        abort.abort()
+      })
+    }
   } catch (err) {
     if (sessionId) sessions.delete(sessionId)
     emit({ type: 'create.failed', requestId, message: err?.message || String(err) })
@@ -491,6 +545,10 @@ function handleSend(req) {
   // open (consumeStream deleted it), NO terminal edge or EOF follows; the Rust
   // busy tracker must fold this specific failure as provider-session death.
   if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found', sessionNotFound: true }); return }
+  if (st.nativeChannel && !st.nativeReady) {
+    emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'native startup is not observed' })
+    return
+  }
   // ep4-r3: /compact is the only dispatch rollback ever absorbs; mark it so
   // the quiesce handler can drain never-handed compacts from the input queue
   // and so a same-tick handoff arms the BUSY-forcing handed flag.
@@ -652,28 +710,30 @@ rl.on('line', (line) => {
     case 'rollback.quiesce': handleRollbackQuiesce(req); break
     case 'permission.respond': {
       const st = sessions.get(req.sessionId)
-      if (!st) break
+      if (!st) { emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'current session unavailable' }); break }
       // Missing decision: NEVER resolve — `undefined` is not a PermissionResult,
-      // and a synthesized default would fabricate the user's choice. Log-only
-      // no-op; the entry stays parked for a later valid respond (mirrors the
+      // and a synthesized default would fabricate the user's choice. Reject
+      // while the entry stays parked for a later valid respond (mirrors the
       // coerced-answers asymmetry one arm below).
       if (req.decision == null) {
         logerr(`permission.respond: missing decision for request ${req.requestId} (session ${req.sessionId})`)
+        emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'missing decision' })
         break
       }
-      // Unknown requestId: lose-safely (Rust validates its pending set first) —
-      // stderr log only, no frame.
+      // Unknown requestId: reject without resolving any callback.
       if (!respondPermission(st, String(req.requestId), req.decision)) {
         logerr(`permission.respond: no pending request ${req.requestId} for session ${req.sessionId}`)
+        emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'current callback unavailable' })
       }
       break
     }
     case 'question.respond': {
       const st = sessions.get(req.sessionId)
-      if (!st) break
+      if (!st) { emit({ type: 'sdk.question.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'current session unavailable' }); break }
       const answers = req.answers && typeof req.answers === 'object' ? req.answers : {}
       if (!respondQuestion(st, String(req.requestId), answers)) {
         logerr(`question.respond: no pending request ${req.requestId} for session ${req.sessionId}`)
+        emit({ type: 'sdk.question.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'current callback unavailable' })
       }
       break
     }

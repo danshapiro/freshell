@@ -34,6 +34,7 @@ function probe(frame) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 export function query({ prompt, options }) {
+  let closed = false
   const outQueue = []
   let outResolve = null
   const pushOut = (v) => {
@@ -104,6 +105,13 @@ export function query({ prompt, options }) {
         }, 500)
       } else if (text === '__one_result__') {
         pushOut({ type: 'result', subtype: 'success', session_id: 'other-turn' })
+      } else if (text === '__end_and_late_permission__') {
+        pushOut({ type: 'result', subtype: 'success' })
+        closed = true
+        setTimeout(async () => {
+          const decision = await options.canUseTool('Bash', { command: 'owned-late-call' }, {})
+          probe({ type: 'probe.late-permission', decision })
+        }, 30)
       }
     }
   })()
@@ -113,6 +121,7 @@ export function query({ prompt, options }) {
       if (outQueue.length > 0) {
         yield outQueue.shift()
       } else {
+        if (closed) return
         await new Promise((resolve) => {
           outResolve = resolve
         })
