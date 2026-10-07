@@ -1,4 +1,26 @@
 use super::*;
+
+#[test]
+fn kilroy_actor_accepts_its_typed_claude_native_context() {
+    let mut profile = profile(FreshProvider::Kilroy, "owned-kilroy", None);
+    profile.provider_launch_context = Some(freshell_runtime_protocol::ProviderLaunchContext {
+        preparation: freshell_runtime_protocol::ProviderPreparation::Claude {
+            mcp_args: Vec::new(),
+        },
+        config: Vec::new(),
+        mcp_capability: None,
+    });
+    assert!(profile.validate().is_ok());
+    profile
+        .provider_launch_context
+        .as_mut()
+        .unwrap()
+        .preparation = freshell_runtime_protocol::ProviderPreparation::Codex {
+        tui_args: Vec::new(),
+        sidecar_args: Vec::new(),
+    };
+    assert!(profile.validate().is_err());
+}
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct SnapshotTransport {
