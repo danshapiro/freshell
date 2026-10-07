@@ -1543,6 +1543,13 @@ fn stage_provider_root(
             )?;
         }
         if let Some(resources) = &ordinary_resources {
+            if provider == "claude" {
+                claude_stage::stage_settings(
+                    &temporary,
+                    resources,
+                    opencode_input.claude_manifest,
+                )?;
+            }
             let capability = McpCapabilityReference {
                 grant_id: grant_id.into(),
                 endpoint: "http://host.docker.internal:1".into(),
@@ -3308,6 +3315,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             cwd: cwd.clone(),
             workspace: cwd.clone(),
             config_root: Some(selected.clone()),
+            settings_file: None,
             setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec![],
         };
@@ -3361,6 +3369,93 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
             "default-decoy"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_explicit_settings_consumer_retains_user_hooks_and_resources() {
+        use freshell_platform::claude_inputs::ClaudeInputManifest;
+        use freshell_runtime_protocol::{
+            PreparedProviderInputs, ProviderLaunchContext, ProviderPreparation,
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let commands = cwd.join(".claude/commands");
+        let declaring = cwd.join("selected-origin");
+        let capabilities = owned.path().join("capabilities");
+        for directory in [&home, &commands, &declaring, &capabilities] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(commands.join("resource"), "transported-resource").unwrap();
+        std::fs::write(commands.join("probe.mjs"), "import {readFileSync} from 'node:fs';process.stdout.write(readFileSync(new URL('./resource',import.meta.url)))").unwrap();
+        let selected = declaring.join("settings.json");
+        let raw = r#"{"env":{"SELECTED_NONCE":"selected-explicit"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node probe.mjs"}]}]}}"#;
+        std::fs::write(&selected, raw).unwrap();
+        let alias = cwd.join("selected.json");
+        std::os::unix::fs::symlink(&selected, &alias).unwrap();
+        let manifest = ClaudeInputManifest {
+            version: 1,
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            workspace: cwd.clone(),
+            config_root: None,
+            settings_file: Some(std::fs::canonicalize(&alias).unwrap()),
+            setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
+            plugin_dirs: vec![],
+        };
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+            mcp_capability: None,
+            config: vec![],
+            prepared_inputs: None,
+        };
+        let stage = stage_provider_root(
+            &capabilities,
+            "grant-claude-explicit-settings",
+            "claude",
+            &home,
+            &[],
+            OpencodeEphemeralInput {
+                launch_context: Some(&context),
+                claude_manifest: Some(&manifest),
+                cwd: Some(&cwd),
+                workspace: Some(&cwd),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let inputs: PreparedProviderInputs = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/prepared-inputs.json")).unwrap(),
+        )
+        .unwrap();
+        let settings = inputs
+            .config_binds
+            .iter()
+            .find(|bind| Path::new(&bind.logical_destination) == selected)
+            .expect(
+                "the explicitly selected settings file must retain its native declaring origin",
+            );
+        let resources = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| Path::new(&mount.logical_destination) == commands)
+            .unwrap();
+        let output = std::process::Command::new("node")
+            .arg("--input-type=module").arg("-e")
+            .arg("import {readFileSync} from 'node:fs';import {execSync} from 'node:child_process';const s=JSON.parse(readFileSync(process.argv[1]));const r=execSync(s.hooks.SessionStart[0].hooks[0].command,{cwd:process.argv[2]});process.stdout.write([s.env.SELECTED_NONCE,r.toString(),s.hooks.SessionStart.length,s.hooks.Stop.length].join(':'))")
+            .arg(stage.join(&settings.source_relative_path))
+            .arg(stage.join(&resources.stage_relative_path))
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"selected-explicit:transported-resource:2:1");
+        assert_eq!(std::fs::read(&selected).unwrap(), raw.as_bytes());
+        assert_eq!(std::fs::read_link(&alias).unwrap(), selected);
     }
 
     #[cfg(unix)]
@@ -4622,6 +4717,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             cwd: workspace.clone(),
             workspace: workspace.clone(),
             config_root: Some(selected.clone()),
+            settings_file: None,
             setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec![],
         };

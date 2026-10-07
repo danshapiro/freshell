@@ -8,6 +8,7 @@ pub(crate) struct ClaudePreparation<'a> {
     pub soul: &'a SoulId,
     pub creation_seed: &'a str,
     pub reservation_provider: &'a str,
+    pub selected_settings: Option<&'a str>,
     pub home: &'a Path,
     pub cwd: &'a Path,
     pub workspace: &'a Path,
@@ -58,6 +59,7 @@ pub(crate) async fn prepare_managed(
             request.cwd,
             request.original,
         )?),
+        settings_file: selected_settings_file(request.cwd, request.selected_settings)?,
         setting_sources: request
             .args
             .windows(2)
@@ -106,6 +108,31 @@ pub(crate) async fn prepare_managed(
             ..Default::default()
         },
     )
+}
+
+fn selected_settings_file(
+    cwd: &Path,
+    selected: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(value) =
+        selected.filter(|value| !freshell_platform::cli_launch::is_owned_claude_settings(value))
+    else {
+        return Ok(None);
+    };
+    if value.trim_start().starts_with('{') {
+        return Err("Claude inline --settings requires private prepared source transport".into());
+    }
+    let path = Path::new(value);
+    let logical = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    std::fs::canonicalize(&logical).map(Some).map_err(|error| {
+        tracing::warn!(event="provider.inputs.preparation.blocked",provider="claude",stage="controller",operation="select_explicit_settings",path=%logical.display(),cause=%error,
+            "Selected Claude settings source is unavailable");
+        format!("Claude --settings {} is unavailable: {error}", logical.display())
+    })
 }
 
 fn selected_config_root(

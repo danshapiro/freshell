@@ -16,6 +16,7 @@ pub(super) fn prepare(
         cwd: cwd.into(),
         workspace: workspace.into(),
         config_root: None,
+        settings_file: None,
         setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
         plugin_dirs: vec![],
     });
@@ -23,6 +24,9 @@ pub(super) fn prepare(
     let mut configurations = Vec::new();
     let mut resources = Vec::new();
     let mut memory = Vec::new();
+    if let Some(selected) = &manifest.settings_file {
+        configurations.push((selected.clone(), canonical(selected)?));
+    }
     let mut bases: Vec<PathBuf> = manifest
         .cwd
         .ancestors()
@@ -127,6 +131,83 @@ pub(super) fn prepare(
         |path| manifest.runtime_path(path),
     )
 }
+
+// Only append Freshell's two shipped hook groups. Native settings merging,
+// source precedence and all other configured values remain the provider's job.
+pub(super) fn stage_settings(
+    root: &Path,
+    preparation: &Preparation,
+    manifest: Option<&ClaudeInputManifest>,
+) -> Result<(), String> {
+    use std::io::Read;
+    let Some(manifest) = manifest else {
+        return Ok(());
+    };
+    let Some(selected) = &manifest.settings_file else {
+        return Ok(());
+    };
+    let destination = manifest.runtime_path(selected);
+    let bind = preparation
+        .binds
+        .iter()
+        .find(|bind| Path::new(&bind.logical_destination) == destination)
+        .ok_or("Claude explicit settings source has no accepted config bind")?;
+    let path = root.join(&bind.source_relative_path);
+    let result = (|| {
+        const LIMIT: usize = 2 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&path)
+            .map_err(|_| "read selected settings")?
+            .take(LIMIT as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "read selected settings")?;
+        if bytes.len() > LIMIT {
+            return Err("selected settings exceeds native 2 MiB limit");
+        }
+        let mut settings: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| "selected settings is not valid JSON")?;
+        let object = settings
+            .as_object_mut()
+            .ok_or("selected settings must be a JSON object")?;
+        let hooks = object
+            .entry("hooks")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or("selected hooks must be an object")?;
+        let shipped: serde_json::Value =
+            serde_json::from_str(&freshell_platform::cli_launch::claude_settings_json(
+                freshell_platform::cli_launch::ProviderTarget::Unix,
+            ))
+            .map_err(|_| "shipped settings recipe invalid")?;
+        for (event, groups) in shipped["hooks"]
+            .as_object()
+            .ok_or("shipped hooks invalid")?
+        {
+            let selected = hooks
+                .entry(event)
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+                .ok_or("selected hook groups must be arrays")?;
+            for group in groups.as_array().ok_or("shipped hook groups invalid")? {
+                if !selected.contains(group) {
+                    selected.push(group.clone());
+                }
+            }
+        }
+        let bytes = freshell_runtime_protocol::bounded_json_bytes(&settings, LIMIT)
+            .map_err(|_| "combined settings exceeds native 2 MiB limit")?;
+        // The copier made this private, physical file in a not-yet-published
+        // attempt. Writing it retains its executable bits and failed attempts
+        // are removed by the existing stage transaction.
+        std::fs::write(&path, bytes).map_err(|_| "write selected settings")?;
+        Ok(())
+    })();
+    result.map_err(|reason| {
+        tracing::warn!(event="provider.inputs.preparation.blocked",provider="claude",stage="controller",operation="stage_explicit_settings",path=%selected.display(),reason,
+            "Selected Claude settings could not be prepared");
+        format!("Claude --settings {}: {reason}", selected.display())
+    })
+}
 fn canonical(path: &Path) -> Result<PathBuf, String> {
     std::fs::canonicalize(path).map_err(|error| {
         format!(
@@ -178,6 +259,7 @@ mod tests {
             cwd: cwd.clone(),
             workspace: cwd.clone(),
             config_root: Some(user.clone()),
+            settings_file: None,
             setting_sources: vec![ClaudeSettingSource::Project],
             plugin_dirs: vec![],
         };

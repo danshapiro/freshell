@@ -525,6 +525,7 @@ impl HostedFreshAgentProxy {
             let context = crate::managed_provider_references::claude::prepare_managed(
                 crate::managed_provider_references::claude::ClaudePreparation {
                     reservation_provider: provider.as_str(),
+                    selected_settings: None,
                     client: &self.client,
                     soul: &soul,
                     creation_seed: &message.request_id,

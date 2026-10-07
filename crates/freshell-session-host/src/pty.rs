@@ -48,6 +48,7 @@ impl HostedPty {
         launch: &TerminalLaunchSpec,
         child_secret_env: BTreeMap<String, String>,
         prepared_codex: Option<PreparedCodexLaunch>,
+        claude_settings: Option<String>,
     ) -> Result<Self, String> {
         launch.validate().map_err(|e| e.message)?;
         let launch_floor_ms = epoch_ms().saturating_sub(500);
@@ -92,7 +93,11 @@ impl HostedPty {
         });
         let mut provider_args = crate::provider_identity_args(launch.run_as_uid, launch.run_as_gid);
         provider_args.push(launch.program.clone());
-        provider_args.extend(launch.args.clone());
+        for argument in &launch.args {
+            provider_args.push(if launch.mode == "claude" && argument == freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT {
+                claude_settings.as_ref().ok_or("selected Claude settings origin is unavailable; retain inputs and reprepare before dispatch")?.clone()
+            } else { argument.clone() });
+        }
         let spec = SpawnSpec {
             program: "/usr/bin/setpriv".to_string(),
             args: provider_args,
@@ -743,6 +748,7 @@ mod provider_exec_tests {
             IncarnationId::new(),
             &launch,
             environment,
+            None,
             None,
         )
         .await;

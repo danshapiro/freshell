@@ -2,6 +2,27 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Durable argv names this owned selection; its source and declaring origin
+/// are recorded in the private accepted manifest, never as raw settings JSON.
+pub const MANAGED_SETTINGS_ARGUMENT: &str = ".freshell/claude-selected-settings";
+
+pub fn selected_settings_argument(args: &[String]) -> Option<&str> {
+    let mut selected = None;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--settings" {
+            selected = args.get(index + 1).map(String::as_str);
+            index += 2;
+        } else {
+            if let Some(value) = args[index].strip_prefix("--settings=") {
+                selected = Some(value);
+            }
+            index += 1;
+        }
+    }
+    selected
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaudeInputManifest {
@@ -11,6 +32,8 @@ pub struct ClaudeInputManifest {
     pub workspace: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_file: Option<PathBuf>,
     #[serde(default = "default_setting_sources")]
     pub setting_sources: Vec<ClaudeSettingSource>,
     pub plugin_dirs: Vec<PathBuf>,
@@ -81,6 +104,7 @@ impl ClaudeInputManifest {
         for path in [&self.original_home, &self.cwd, &self.workspace]
             .into_iter()
             .chain(self.config_root.iter())
+            .chain(self.settings_file.iter())
             .chain(&self.plugin_dirs)
         {
             if !path.is_absolute()

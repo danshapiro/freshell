@@ -2163,7 +2163,7 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
         }
         let value = args.get(index + 1).ok_or_else(invalid)?;
         let allowed = match (mode, flag) {
-            ("claude", "--settings") => freshell_platform::cli_launch::is_owned_claude_settings(value),
+            ("claude", "--settings") => value == freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT || freshell_platform::cli_launch::is_owned_claude_settings(value),
             ("claude", "--mcp-config") => matches!(
                 value.as_str(),
                 ".claude/freshell-mcp.json" | "/home/freshell/provider/.claude/freshell-mcp.json"
@@ -2206,8 +2206,9 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
 }
 
 /// Convert the web process's ordinary launch argv into its durable recipe.
-/// Claude's web-owned MCP file is omitted and its settings are regenerated
-/// from the shipped non-secret recipe before validation.
+/// Claude's web-owned MCP file is omitted. Its shipped settings recipe is
+/// regenerated; selected user settings use an owned marker resolved only from
+/// accepted private inputs at final child argv construction.
 pub fn durable_managed_terminal_args(
     mode: &str,
     args: Vec<String>,
@@ -2277,11 +2278,23 @@ pub fn durable_managed_terminal_args(
                 args.get(index + 1).ok_or_else(invalid)?;
                 index += 2;
             }
-            "--settings" => {
-                args.get(index + 1).ok_or_else(invalid)?;
+            flag if flag == "--settings" || flag.starts_with("--settings=") => {
+                let value = if let Some(value) = flag.strip_prefix("--settings=") {
+                    index += 1;
+                    value
+                } else {
+                    let value = args.get(index + 1).ok_or_else(invalid)?;
+                    index += 2;
+                    value.as_str()
+                };
                 out.push("--settings".into());
-                out.push(claude_settings.ok_or_else(invalid)?.into());
-                index += 2;
+                out.push(
+                    if freshell_platform::cli_launch::is_owned_claude_settings(value) {
+                        claude_settings.ok_or_else(invalid)?.into()
+                    } else {
+                        freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT.into()
+                    },
+                );
             }
             _ => {
                 out.push(args[index].clone());

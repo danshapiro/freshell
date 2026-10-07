@@ -70,6 +70,22 @@ pub fn prepare(
                 serde_json::from_slice(&metadata)
                     .map_err(|_| "prepared Claude discovery metadata invalid")?;
             manifest.validate().map_err(str::to_string)?;
+            if let Some(selected) = &manifest.settings_file {
+                let destination = manifest.runtime_path(selected);
+                if !inputs
+                    .config_binds
+                    .iter()
+                    .any(|bind| Path::new(&bind.logical_destination) == destination)
+                {
+                    return Err("selected Claude settings has no accepted config bind".into());
+                }
+                secrets.claude_settings_path = Some(
+                    destination
+                        .to_str()
+                        .ok_or("selected Claude settings destination is not UTF-8")?
+                        .into(),
+                );
+            }
             return Ok(BTreeMap::new());
         }
         if provider == "amplifier" {
@@ -308,6 +324,7 @@ mod tests {
             cwd: "/absent-original-workspace".into(),
             workspace: "/absent-original-workspace".into(),
             config_root: None,
+            settings_file: None,
             setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec!["/absent-original-plugin".into()],
         };

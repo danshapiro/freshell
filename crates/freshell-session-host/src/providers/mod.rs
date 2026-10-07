@@ -29,6 +29,7 @@ pub struct PreparedTerminal {
     pub terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     pub codex: Option<codex::PreparedCodexLaunch>,
     pub child_env: std::collections::BTreeMap<String, String>,
+    pub claude_settings: Option<String>,
 }
 
 pub fn prepare_provider_state_before_bootstrap(
@@ -164,6 +165,7 @@ pub async fn prepare_terminal(
     mut terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     child_secret_env: &std::collections::BTreeMap<String, String>,
     prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
+    selected_claude_settings: Option<&str>,
 ) -> Result<PreparedTerminal, String> {
     let mut child_env = child_secret_env.clone();
     prepare_scoped_mcp_environment(terminal.provider_launch_context.as_ref(), &mut child_env)
@@ -265,6 +267,8 @@ pub async fn prepare_terminal(
             child_env.insert("OPENCODE_CONFIG_CONTENT".into(), config);
         }
     }
+    // Keep the persisted/validated launch recipe separate from the final
+    // child-only settings argument, just as credential environment is separate.
     apply_terminal_context(&mut terminal)?;
     if terminal.mode == "codex" {
         let mut sidecar_env = terminal.env.clone();
@@ -277,12 +281,14 @@ pub async fn prepare_terminal(
             terminal,
             codex: Some(prepared),
             child_env,
+            claude_settings: None,
         });
     }
     Ok(PreparedTerminal {
         terminal,
         codex: None,
         child_env,
+        claude_settings: selected_claude_settings.map(str::to_owned),
     })
 }
 
@@ -728,7 +734,9 @@ mod provider_secret_context_tests {
             "OPENCODE_CONFIG_CONTENT".into(),
             "{\"model\":\"sentinel-private-inline\"}".into(),
         )]);
-        let prepared = prepare_terminal(terminal, &secrets, None).await.unwrap();
+        let prepared = prepare_terminal(terminal, &secrets, None, None)
+            .await
+            .unwrap();
         let metadata = serde_json::to_string(&prepared.terminal).unwrap();
         assert!(
             !metadata.contains("sentinel-private-inline"),

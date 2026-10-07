@@ -178,6 +178,12 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             let mut provider_secret_references = {
                 crate::managed_provider_bootstrap::named_provider_onecli_references(&request.mode)?
             };
+            let selected_claude_settings = (request.mode == "claude")
+                .then(|| {
+                    freshell_platform::claude_inputs::selected_settings_argument(&request.spec.args)
+                        .map(str::to_owned)
+                })
+                .flatten();
             let args = managed_provider_args(&request.mode, request.spec.args)?;
             let request_id = stable_request_id(create_key)?;
             let opencode_input = crate::managed_mcp_capability::OpencodeEphemeralInput {
@@ -268,6 +274,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 let context = crate::managed_provider_references::claude::prepare_managed(
                     crate::managed_provider_references::claude::ClaudePreparation {
                         reservation_provider: "claude",
+                        selected_settings: selected_claude_settings.as_deref(),
                         client: &self.client,
                         soul: &soul_id,
                         creation_seed: create_key,
@@ -1207,7 +1214,9 @@ mod tests {
     fn managed_claude_strips_web_bound_mcp_tempfile_only() {
         let args = vec![
             "--settings".into(),
-            "{}".into(),
+            freshell_platform::cli_launch::claude_settings_json(
+                freshell_platform::cli_launch::ProviderTarget::Unix,
+            ),
             "--mcp-config".into(),
             "/tmp/freshell-mcp/t1.json".into(),
             "--session-id".into(),

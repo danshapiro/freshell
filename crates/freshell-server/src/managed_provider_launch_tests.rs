@@ -851,12 +851,22 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
  const input=JSON.parse(raw),root=path.resolve(__dirname,'..');
  const endpoint=process.env.FRESHELL_URL,token=process.env.FRESHELL_TOKEN;
  const authenticated=await new Promise(resolve=>{if(!endpoint||!token)return resolve(false);const req=http.request(new URL('/api/mcp',endpoint),{method:'POST',headers:{'x-auth-token':token}},res=>{res.resume();resolve(res.statusCode===200)});req.on('error',()=>resolve(false));req.end('{}')});
- const record={hook:input.hook_event_name==='SessionStart',physicalHome:process.env.HOME,settings:process.env.CLAUDE_SELECTED_NONCE==='closed-selected-settings',authenticated,scopedAlias:process.env.FRESHELL==='1',onecli:hash(process.env.ANTHROPIC_API_KEY||'')===process.argv[3],
+ const record={hook:input.hook_event_name==='SessionStart',physicalHome:process.env.HOME,settings:['closed-selected-settings','closed-explicit-settings'].includes(process.env.CLAUDE_SELECTED_NONCE),authenticated,scopedAlias:process.env.FRESHELL==='1',onecli:hash(process.env.ANTHROPIC_API_KEY||'')===process.argv[3],
  memory:hash(fs.readFileSync(path.join(process.env.HOME,'.claude/CLAUDE.md'))),skill:hash(fs.readFileSync(path.join(root,'skills/probe/SKILL.md'))),resource:hash(require('node:child_process').execFileSync(path.join(__dirname,'run'))),dependency:hash(require('probe-dependency'))};
  fs.writeFileSync(process.argv[2],JSON.stringify(record));
 });
 "#;
     std::fs::write(plugin.join("scripts/consume.cjs"), consumer).unwrap();
+    let flag_receipt = workspace.join("claude-flag-receipt.json");
+    std::fs::write(plugin.join("scripts/flag.cjs"), "const fs=require('node:fs'),crypto=require('node:crypto');const hash=v=>crypto.createHash('sha256').update(v).digest('hex');let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{const input=JSON.parse(raw);fs.writeFileSync(process.argv[2],JSON.stringify({flag:input.hook_event_name==='SessionStart'&&process.env.CLAUDE_SELECTED_NONCE==='closed-explicit-settings',resource:hash(require('node:child_process').execFileSync(__dirname+'/run')),dependency:hash(require('probe-dependency'))}))})").unwrap();
+    let flag_origin = selected_config.join("explicit-origin");
+    std::fs::create_dir(&flag_origin).unwrap();
+    let flag_settings = flag_origin.join("settings.json");
+    let flag_value = json!({"env":{"CLAUDE_SELECTED_NONCE":"closed-explicit-settings"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":format!("node {} {}",serde_json::to_string(plugin.join("scripts/flag.cjs").to_str().unwrap()).unwrap(),serde_json::to_string(flag_receipt.to_str().unwrap()).unwrap()),"timeout":10}]}]}});
+    let flag_bytes = serde_json::to_vec(&flag_value).unwrap();
+    std::fs::write(&flag_settings, &flag_bytes).unwrap();
+    let flag_alias = selected_config.join("selected-settings.json");
+    std::os::unix::fs::symlink(&flag_settings, &flag_alias).unwrap();
     let instructions_consumer = r#"const fs=require('node:fs'),crypto=require('node:crypto'),path=require('node:path');
 let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
  const input=JSON.parse(raw),name=path.basename(input.file_path||''),event=input.hook_event_name==='InstructionsLoaded';
@@ -1002,6 +1012,8 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
                     "--init-only".into(),
                     "--setting-sources".into(),
                     "user".into(),
+                    "--settings".into(),
+                    "../source-home/selected-config/selected-settings.json".into(),
                     "--plugin-dir".into(),
                     plugin.to_str().unwrap().into(),
                 ],
@@ -1156,6 +1168,14 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         observed.expect("native Claude selected plugin must execute its startup hook"),
         expected
     );
+    assert_eq!(
+        consumed(&flag_receipt)
+            .await
+            .expect("native must execute the explicitly selected flag settings hook"),
+        json!({"flag":true,"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")})
+    );
+    assert_eq!(std::fs::read(&flag_settings).unwrap(), flag_bytes);
+    assert_eq!(std::fs::read_link(&flag_alias).unwrap(), flag_settings);
     let native_import = consumed(&instructions_receipt).await;
     if native_import.is_none() {
         println!(
