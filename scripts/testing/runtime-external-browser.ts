@@ -198,7 +198,7 @@ export function validateManagedWebProvenance(observed: unknown, candidateSha: st
 }
 
 export type OwnedWebDiagnosticRecord = {
-  pid: number; bootAttemptCount: number; ignoredLineCount: number
+  pid: number; homeReference: string; bootAttemptCount: number; ignoredLineCount: number
   logReadState: 'missing' | 'read'; logFiles: { name: string; bytes: number; sha256: string }[]
   facts: { severity: string; event: string; fields: Record<string, string | number | boolean> }[]
 }
@@ -340,7 +340,9 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
       await this.process.stop(signal)
       this.lastOutput = this.process.output()
       const log = await this.readOwnedRustLogs()
+      if (!this.homeDir) throw new Error('owned web HOME reference is unavailable')
       await this.diagnostics?.({ pid: this.process.identity.pid, bootAttemptCount: this.bootCount,
+        homeReference: this.homeDir,
         logReadState: log.files.length ? 'read' : 'missing', logFiles: log.files,
         ...ownedWebDiagnosticFacts(this.lastOutput, { text: log.text, pid: this.process.identity.pid }) })
     }

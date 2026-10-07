@@ -486,7 +486,7 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       const info = await server.start()
       await server.stop()
       const record = diagnostics.mock.calls[0][0]
-      expect(record).toMatchObject({ pid: info.pid, logReadState: 'read',
+      expect(record).toMatchObject({ pid: info.pid, homeReference: info.homeDir, logReadState: 'read',
         facts: [{ severity: 'warn', event: 'fresh_agent.hosted_snapshot_unavailable', fields: { code: 'CAPABILITY_PENDING', soul_id: 'owned-file-soul' } }] })
       expect(JSON.stringify(record)).not.toContain('FOREIGN_PID')
       expect(JSON.stringify(record)).not.toContain('file-body-must-not-persist')
