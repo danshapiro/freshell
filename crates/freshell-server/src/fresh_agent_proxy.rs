@@ -365,13 +365,41 @@ impl HostedFreshAgentProxy {
         self: &Arc<Self>,
         message: freshell_protocol::FreshAgentCreate,
     ) -> Result<(), ()> {
-        let provider = fresh_provider(&message.provider, message.session_type).ok_or(())?;
+        let provider =
+            fresh_provider(&message.provider, message.session_type).ok_or_else(|| {
+                tracing::warn!(
+                    event = "fresh_agent.create.preparation_failed",
+                    reason = "unsupported_provider",
+                    request_id = message.request_id.as_str(),
+                    session_type = session_type_wire(message.session_type).as_str()
+                );
+            })?;
         let public_provider = fresh_provider_wire(&provider);
         if let Some(session_ref) = message.session_ref.as_ref() {
             if session_ref.provider != public_provider {
+                tracing::warn!(
+                    event = "fresh_agent.create.preparation_failed",
+                    reason = "resume_provider_mismatch",
+                    request_id = message.request_id.as_str(),
+                    provider = provider.as_str(),
+                    session_type = session_type_wire(message.session_type).as_str()
+                );
                 return Err(());
             }
-            let inventory = self.client.inventory().await.map_err(|_| ())?;
+            let inventory = self.client.inventory().await.map_err(|error| {
+                let runtime_code = error
+                    .runtime_code()
+                    .and_then(|code| serde_json::to_value(code).ok())
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                tracing::warn!(
+                    event = "fresh_agent.create.resume_inventory_failed",
+                    reason = create_client_error_reason(&error),
+                    runtime_code = runtime_code.as_deref().unwrap_or("none"),
+                    request_id = message.request_id.as_str(),
+                    provider = provider.as_str(),
+                    session_type = session_type_wire(message.session_type).as_str()
+                );
+            })?;
             let view = inventory
                 .into_iter()
                 .rev()
@@ -430,9 +458,25 @@ impl HostedFreshAgentProxy {
                 return Ok(());
             }
         }
-        let cwd = canonical_cwd(message.cwd.as_deref()).map_err(|_| ())?;
+        let cwd = canonical_cwd(message.cwd.as_deref()).map_err(|_| {
+            tracing::warn!(
+                event = "fresh_agent.create.preparation_failed",
+                reason = "cwd_unavailable",
+                request_id = message.request_id.as_str(),
+                provider = provider.as_str(),
+                session_type = session_type_wire(message.session_type).as_str()
+            );
+        })?;
         let workspace = workspace_root(&cwd);
-        let soul = stable_soul_id(provider.as_str(), &message.request_id).map_err(|_| ())?;
+        let soul = stable_soul_id(provider.as_str(), &message.request_id).map_err(|_| {
+            tracing::warn!(
+                event = "fresh_agent.create.preparation_failed",
+                reason = "invalid_soul_id",
+                request_id = message.request_id.as_str(),
+                provider = provider.as_str(),
+                session_type = session_type_wire(message.session_type).as_str()
+            );
+        })?;
         let public_session_id = presentation_id_for_create(
             &provider,
             &message.request_id,
@@ -446,11 +490,20 @@ impl HostedFreshAgentProxy {
             .as_ref()
             .map(|value| value.session_id.clone());
         let session_type = session_type_wire(message.session_type);
-        let request_id = stable_request_id(&message.request_id).map_err(|_| ())?;
-        let provider_bootstrap_files = provider_bootstrap_files(&provider).map_err(|_| ())?;
+        let request_id = stable_request_id(&message.request_id).map_err(|_| {
+            tracing::warn!(event="fresh_agent.create.preparation_failed", reason="invalid_request_id",
+                request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
+        })?;
+        let provider_bootstrap_files = provider_bootstrap_files(&provider).map_err(|_| {
+            tracing::warn!(event="fresh_agent.create.preparation_failed", reason="bootstrap_reference_unavailable",
+                request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
+        })?;
         let provider_secret_references =
             crate::managed_provider_bootstrap::named_provider_onecli_references(provider.as_str())
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    tracing::warn!(event="fresh_agent.create.preparation_failed", reason="onecli_reference_unavailable",
+                        request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
+                })?;
         let mcp_capability = crate::managed_mcp_capability::issue_mcp_capability(
             &soul,
             provider.as_str(),
@@ -460,8 +513,9 @@ impl HostedFreshAgentProxy {
                 ..Default::default()
             },
         )
-        .map_err(|error| {
-            tracing::warn!(%error, "fresh_agent.create.capability_failed");
+        .map_err(|_| {
+            tracing::warn!(event="fresh_agent.create.capability_failed", reason="capability_unavailable",
+                request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
         })?;
         let mut provider_launch_context =
             crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
@@ -470,8 +524,9 @@ impl HostedFreshAgentProxy {
                 &cwd,
                 Some(mcp_capability.clone()),
             )
-            .map_err(|error| {
-                tracing::warn!(event="fresh_agent.create.provider_environment_failed", %error);
+            .map_err(|_| {
+                tracing::warn!(event="fresh_agent.create.provider_environment_failed", reason="provider_environment_unavailable",
+                    request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
             })?;
         // Fresh agents use the direct provider transports, which currently do
         // not inject Freshell's terminal MCP server. Retain ordinary provider
@@ -572,7 +627,11 @@ impl HostedFreshAgentProxy {
             .map_err(|error| {
                 let _ =
                     crate::managed_mcp_capability::revoke_mcp_capability(&mcp_capability.grant_id);
-                tracing::warn!(?error, "fresh_agent.create.launch_failed");
+                let runtime_code = error.runtime_code().and_then(|code| serde_json::to_value(code).ok())
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                tracing::warn!(event="fresh_agent.create.launch_failed", reason=create_client_error_reason(&error),
+                    runtime_code=runtime_code.as_deref().unwrap_or("none"), request_id=message.request_id.as_str(),
+                    provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
             })?;
         let naming_projection = match message.naming_handle.as_deref() {
             Some(handle) if !handle.trim().is_empty() => {
@@ -1107,6 +1166,16 @@ fn operation_error_code(error: &freshell_runtime_client::ClientError) -> &'stati
         Some(RuntimeErrorCode::CommandAmbiguous) => "COMMAND_AMBIGUOUS",
         Some(RuntimeErrorCode::RequestIdConflict) => "REQUEST_ID_CONFLICT",
         _ => "MANAGED_FRESH_AGENT_ERROR",
+    }
+}
+
+fn create_client_error_reason(error: &freshell_runtime_client::ClientError) -> &'static str {
+    use freshell_runtime_client::ClientError;
+    match error {
+        ClientError::Io(_) => "supervisor_io",
+        ClientError::Protocol(_) => "supervisor_protocol",
+        ClientError::Runtime(_, _) => "runtime_rejection",
+        ClientError::UnexpectedResult => "unexpected_supervisor_result",
     }
 }
 
