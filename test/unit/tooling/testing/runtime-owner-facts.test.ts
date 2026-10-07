@@ -19,6 +19,27 @@ const handle = {
 }
 
 describe('owner-side synthetic OpenCode source preparation', () => {
+  it('binds the existing authenticated adoption result to the registered source and current native address', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    try {
+      const source = await rig.prepareSyntheticOpenCodeSource()
+      const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha, nativeSessionId: source.rootId }
+      const view = { ...current, terminalId: 'owned-source-terminal', launchState: 'running', intentRevision: 1 }
+      vi.spyOn(rig, 'inventory').mockResolvedValue([view])
+      const observation = { terminalId: view.terminalId, rootSessionId: source.rootId, tailMessageId: source.lastMessageId,
+        evidenceGeneration: 'a'.repeat(64), incarnationId: view.incarnationId, launchNonce: 'owned-launch',
+        hydrated: true, messagesRead: 'success' as const }
+      const read = vi.spyOn(rig, 'ownedOpenCodeAdoptionStatus').mockResolvedValue({ state: 'observed', data: { observation } })
+      await expect(rig.syntheticOpenCodeAdoptionStatus(current)).resolves.toEqual({ state: 'observed', data: { observation } })
+      expect(read).toHaveBeenCalledWith(view)
+      read.mockResolvedValue({ state: 'observed', data: { observation: { ...observation, rootSessionId: 'foreign-root' } } })
+      await expect(rig.syntheticOpenCodeAdoptionStatus(current)).rejects.toThrow(/source|root/)
+    } finally { vi.unstubAllEnvs(); await rig.stop() }
+  })
+
   it.each(['history', 'excluded'] as const)('reads actual SQLite %s facts only for the registered source root', async mode => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
     const lifecycle = vi.spyOn(rig.runtime, 'recordLifecycle')
@@ -214,6 +235,28 @@ function fixture() {
 }
 
 describe('exact owned runtime facts', () => {
+  it('keeps owner control responsive while the fixed supervisor adoption probe runs', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-adoption-child-'))
+    const command = path.join(root, 'docker')
+    await fsp.writeFile(command, `#!${process.execPath}\nsetTimeout(()=>process.stdout.write(JSON.stringify({state:'awaiting_observation'})),150)\n`, { mode: 0o700 })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') })
+    rig.supervisor = { scenarioId: 'owned-adoption', containerId: 'd'.repeat(64), controlSocket: path.join(root, 'control.sock'),
+      controlSecret: 'synthetic-secret', controlSecretFile: path.join(root, 'secret'), runtimeRoot: root,
+      volumeName: 'owned-adoption-volume', binaryKind: 'test' }
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(root, 'unused.sock'), proxySocketPath: path.join(root, 'unused-proxy.sock'),
+      runtimeRootPrefix: root, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId, logPath: path.join(root, 'broker.jsonl') })
+    vi.spyOn(rig.runtime.broker, 'receiptIds').mockReturnValue(new Set([rig.supervisor.containerId]))
+    vi.stubEnv('PATH', `${root}${path.delimiter}${process.env.PATH}`)
+    let settled = false
+    const response = new Promise<boolean>(resolve => setTimeout(() => resolve(!settled), 20))
+    try {
+      const probe = rig.ownedOpenCodeAdoptionStatus({ ...handle, terminalId: 'owned-terminal', launchState: 'running', intentRevision: 1 })
+        .then(result => { settled = true; return result })
+      try { expect(await response).toBe(true) } finally {
+        await expect(probe).resolves.toEqual({ state: 'awaiting_observation' })
+      }
+    } finally { vi.unstubAllEnvs(); await fsp.rm(root, { recursive: true, force: true }) }
+  })
   it('keeps owner control responsive while an actual owned probe child is running', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-probe-child-'))
     const command = path.join(root, 'docker')

@@ -17,7 +17,7 @@ import path from 'node:path'
 import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
-  SyntheticOpenCodeHistoryFactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -26,7 +26,7 @@ import type { RuntimeWriterClaimFacts, ManagedMigrationFacts, ManagedStopResult 
 import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
-import type { ExactRuntimeHandle, ManagedRuntimeView, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
+import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
@@ -693,6 +693,11 @@ export class ExternalManagedRuntimeRig {
   async syntheticOpenCodeExcludedSentinels(handle: ExactRuntimeHandle): Promise<string[]> {
     return this.rpc('synthetic-source-exclusions', z.array(z.enum(EXCLUDED_SOURCE_SENTINELS)), { handle })
   }
+  async syntheticOpenCodeAdoptionStatus(handle: ExactRuntimeHandle): Promise<ManagedOpenCodeAdoptionStatus> {
+    return this.rpc('synthetic-source-adoption', ManagedOpenCodeAdoptionStatusSchema.refine(status => status.state !== 'observed'
+      || (status.data.observation.rootSessionId === handle.nativeSessionId
+        && status.data.observation.incarnationId === handle.incarnationId), 'source adoption differs from the exact address'), { handle })
+  }
   async inventorySnapshot(): Promise<ManagedRuntimeInventorySnapshot> {
     return this.rpc('inventory-snapshot', ManagedRuntimeInventorySnapshotSchema)
   }
@@ -944,6 +949,7 @@ export function createExternalRuntimeControl(
       case 'synthetic-source-facts': result = await owner.syntheticOpenCodeSourceFacts(); break
       case 'synthetic-source-history': result = await owner.syntheticOpenCodeHistoryFacts(handle()); break
       case 'synthetic-source-exclusions': result = await owner.syntheticOpenCodeExcludedSentinels(handle()); break
+      case 'synthetic-source-adoption': result = await owner.syntheticOpenCodeAdoptionStatus(handle()); break
       case 'inventory-snapshot': result = await owner.inventorySnapshot(); break
       case 'control-epoch': result = await owner.controlEpoch(); break
       case 'managed-opt-in':

@@ -615,6 +615,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'synthetic-history-challenge',
     'synthetic-source-facts',
     'synthetic-source-history', 'synthetic-source-exclusions',
+    'synthetic-source-adoption',
     'retained-start', 'retained-status', 'retained-observed', 'retained-finish',
   ]),
   handle: z.object({
@@ -2558,6 +2559,15 @@ export type ManagedOpenCodeAdoptionStatus =
       messagesRead: 'success' | 'empty_confirmed' | 'failed'
     } } }
 
+export const ManagedOpenCodeAdoptionStatusSchema: z.ZodType<ManagedOpenCodeAdoptionStatus> = z.discriminatedUnion('state', [
+  z.object({ state: z.enum(['not_required', 'awaiting_observation']) }).strict(),
+  z.object({ state: z.literal('observed'), data: z.object({ observation: z.object({
+    terminalId: z.string().min(1), rootSessionId: z.string().min(1), tailMessageId: z.string().nullable(),
+    evidenceGeneration: z.string().min(1), incarnationId: z.string().min(1), launchNonce: z.string().min(1),
+    hydrated: z.boolean(), messagesRead: z.enum(['success', 'empty_confirmed', 'failed']),
+  }).strict() }).strict() }).strict(),
+])
+
 /**
  * Owned managed-runtime browser rig: restricted Docker broker + supervisor +
  * a feature-enabled Rust web server. Web restart methods touch only the web
@@ -2678,6 +2688,20 @@ export class ManagedRuntimeOwner {
     const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', PROVIDER_SENTINEL_SCAN,
       '/home/freshell/provider/.local/share/opencode/opencode.db', JSON.stringify(EXCLUDED_SOURCE_SENTINELS)])
     return z.array(z.enum(EXCLUDED_SOURCE_SENTINELS)).parse(JSON.parse(raw))
+  }
+
+  async syntheticOpenCodeAdoptionStatus(handle: ExactRuntimeHandle): Promise<ManagedOpenCodeAdoptionStatus> {
+    await this.assertSyntheticOpenCodeSourceHandle(handle)
+    const view = (await this.inventory()).find(row => row.soulId === handle.soulId)
+    if (!view || view.incarnationId !== handle.incarnationId || view.containerId !== handle.containerId
+      || view.hostBootId !== handle.hostBootId || view.nativeSessionId !== handle.nativeSessionId) {
+      throw new Error('registered source adoption address changed before its probe')
+    }
+    const status = ManagedOpenCodeAdoptionStatusSchema.parse(await this.ownedOpenCodeAdoptionStatus(view))
+    if (status.state === 'observed' && status.data.observation.rootSessionId !== handle.nativeSessionId) {
+      throw new Error('registered source adoption observation belongs to another root')
+    }
+    return status
   }
 
   async start(): Promise<RuntimeWebInfo> {
@@ -3161,6 +3185,10 @@ export class ManagedRuntimeOwner {
   }
 
   async ownedProviderExec(containerId: string, args: string[]): Promise<string> {
+    return this.ownedDockerProbe(containerId, args, true)
+  }
+
+  private async ownedDockerProbe(containerId: string, args: string[], providerUser: boolean): Promise<string> {
     if (!this.runtime.broker.receiptIds().has(containerId)
       && !this.runtime.transferOwnedIds().containers.includes(containerId)) throw new Error('exact owned provider probe container required')
     const probeId = randomUUID()
@@ -3174,7 +3202,7 @@ export class ManagedRuntimeOwner {
     this.providerProbes.set(probeId, record)
     try {
       this.runtime.recordLifecycle('external.provider_probe_started', { severity: 'info', probeId, containerId })
-      record.child = execFile('docker', ['exec', '--user', '65534:0', containerId,
+      record.child = execFile('docker', ['exec', ...(providerUser ? ['--user', '65534:0'] : []), containerId,
         'env', 'HOME=/home/freshell/provider', ...args], {
         cwd: this.repoRoot, encoding: 'utf8', timeout: 120_000, maxBuffer: 32 * 1024 * 1024,
       }, (error, stdout, stderr) => {
@@ -3201,13 +3229,13 @@ export class ManagedRuntimeOwner {
     if (!view.containerId || !view.terminalId || !view.hostBootId) {
       throw new Error('managed OpenCode adoption probe requires an exact container, host boot, and terminal')
     }
-    const status = JSON.parse(this.ownedContainerExec(this.supervisor.containerId, [
+    const status = JSON.parse(await this.ownedDockerProbe(this.supervisor.containerId, [
       'node', '--no-warnings',
       path.join(this.repoRoot, 'test/e2e-browser/fixtures/managed-opencode-host-status.cjs'),
       this.runtime.runtimeDir(this.supervisor, view.incarnationId),
       view.incarnationId,
       view.hostBootId,
-    ])) as ManagedOpenCodeAdoptionStatus
+    ], false)) as ManagedOpenCodeAdoptionStatus
     if (status.state === 'observed'
       && (status.data?.observation?.incarnationId !== view.incarnationId
         || status.data.observation.terminalId !== view.terminalId)) {

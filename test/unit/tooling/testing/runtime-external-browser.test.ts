@@ -647,6 +647,23 @@ describe('closed external owner control', () => {
     readHistory.mockResolvedValue({ ...history, messages: { 'owned-message': 'truncated-digest' } })
     await expect(rig.syntheticOpenCodeHistoryFacts(address)).rejects.toThrow(/invalid/)
   })
+  it('transports authenticated source adoption metadata and rejects another root', async () => {
+    const { owned, context } = fixture()
+    const address = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-source-soul',
+      incarnationId: 'owned-source-incarnation', containerId: 'c'.repeat(64), hostBootId: 'owned-source-boot', nativeSessionId: 'owned-source-root' }
+    const observation = { terminalId: 'owned-source-terminal', rootSessionId: address.nativeSessionId,
+      tailMessageId: 'owned-tail', evidenceGeneration: 'a'.repeat(64), incarnationId: address.incarnationId,
+      launchNonce: 'owned-launch', hydrated: true, messagesRead: 'success' as const }
+    const read = vi.spyOn(owned, 'syntheticOpenCodeAdoptionStatus').mockResolvedValue({ state: 'observed', data: { observation } })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.syntheticOpenCodeAdoptionStatus(address)).resolves.toEqual({ state: 'observed', data: { observation } })
+    expect(read).toHaveBeenCalledWith(address)
+    read.mockResolvedValue({ state: 'observed', data: { observation: { ...observation, rootSessionId: 'foreign-root' } } })
+    await expect(rig.syntheticOpenCodeAdoptionStatus(address)).rejects.toThrow(/invalid/)
+  })
   it('routes exact inventory observations and binds the reply to run, candidate and operation', async () => {
     const { owned, context, inventory, request } = fixture()
     const control = runner.createExternalRuntimeControl(owned, context)

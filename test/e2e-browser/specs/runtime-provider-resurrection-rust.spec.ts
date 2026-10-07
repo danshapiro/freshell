@@ -384,7 +384,7 @@ test.describe('managed OpenCode source-to-soul resume', () => {
       // Wait for the session host to accept the TUI's exact-session/current-tail
       // observation. A live runtime alone can still reject input at this gate.
       const adoption = await waitForValue('provider-observed managed pane', async () => {
-        const status = (await rig.ownedOpenCodeAdoptionStatus(before))
+        const status = (await rig.syntheticOpenCodeAdoptionStatus(rig.exactRuntimeHandle(before)))
         return status.state === 'observed' ? status.data.observation : null
       }, 180_000)
       expect(adoption).toMatchObject({
@@ -437,7 +437,7 @@ test.describe('managed OpenCode source-to-soul resume', () => {
       const reopenedAdoption = await waitForValue('replacement provider-observed managed pane', async () => {
         // The probe authenticates this exact host boot against the reopened
         // inventory row before reading its input gate.
-        const status = (await rig.ownedOpenCodeAdoptionStatus(reopened))
+        const status = (await rig.syntheticOpenCodeAdoptionStatus(rig.exactRuntimeHandle(reopened)))
         return status.state === 'observed' ? status.data.observation : null
       }, 180_000)
       expect(reopenedAdoption).toMatchObject({
