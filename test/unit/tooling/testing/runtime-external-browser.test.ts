@@ -961,6 +961,22 @@ describe('closed external owner control', () => {
       path: '/arbitrary' })).rejects.toThrow(/operation/)
     expect(reset).toHaveBeenCalledOnce()
   })
+  it('returns fixed fresh-agent launch facts over a pre-native enclosure and refuses native commands', async () => {
+    const { owned, context, request } = fixture()
+    const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'fresh-soul',
+      incarnationId: 'fresh-incarnation', containerId: 'b'.repeat(64), hostBootId: 'fresh-boot' }
+    const facts = vi.spyOn(owned, 'freshAgentLaunchFacts').mockResolvedValue({ provider: 'claude', version: '2.1.263', workerPid: 42 })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.freshAgentLaunchFacts(enclosure)).resolves.toEqual({ provider: 'claude', version: '2.1.263', workerPid: 42 })
+    expect(facts).toHaveBeenCalledExactlyOnceWith(enclosure)
+    await expect(control({ ...request, action: 'fresh-agent-launch-facts' })).rejects.toThrow(/enclosure/)
+    await expect(control({ ...request, operationId: 'forged-launch', action: 'fresh-agent-launch-facts', enclosure,
+      command: ['claude', 'arbitrary'] })).rejects.toThrow(/operation/)
+    expect(facts).toHaveBeenCalledOnce()
+  })
   it('publishes only the fixed Phase3 browser observation and returns an opaque artifact reference', async () => {
     const { owned, context, request } = fixture()
     const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',

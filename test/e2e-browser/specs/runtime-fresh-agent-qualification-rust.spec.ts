@@ -123,9 +123,10 @@ async function qualify(
   const sessionId = created.sessionId as string
   const initial = await waitFor('managed fresh-agent view', () => rig.runningViewForFreshSession(sessionId))
   if (!initial.containerId) throw new Error('managed fresh-agent view has no enclosure')
-  expect((await rig.ownedProviderExec(initial.containerId, definition.versionCommand))).toContain(definition.version)
-  const initialProcesses = rig.ownedContainerProcessTable(initial.containerId)
-  expect(initialProcesses).toMatch(definition.processPattern)
+  const initialLaunch = await rig.freshAgentLaunchFacts(rig.runtimeEnclosureHandle(initial))
+  expect(initialLaunch.version).toBe(definition.version)
+  expect(initialLaunch.provider).toBe(definition.provider)
+  expect(initialLaunch.workerPid).toBeGreaterThan(1)
 
   const first = await sendNoToolTurn(page, paneId, sessionId, 'Remember the next ordinary word in this conversation: cedar. Use no tools. Reply only acknowledged.')
   const second = await sendNoToolTurn(page, paneId, sessionId, 'Use no tools or files. Reply with the ordinary word I asked you to remember.')

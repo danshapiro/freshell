@@ -601,6 +601,10 @@ export const SyntheticOpenCodeHistoryFactsSchema = z.object({
 }).strict()
 export type SyntheticOpenCodeHistoryFacts = z.infer<typeof SyntheticOpenCodeHistoryFactsSchema>
 
+export const FreshAgentLaunchFactsSchema = z.object({ provider: z.enum(['claude', 'codex', 'opencode']),
+  version: z.string().regex(/^\d+\.\d+\.\d+$/), workerPid: z.number().int().min(2) }).strict()
+export type FreshAgentLaunchFacts = z.infer<typeof FreshAgentLaunchFactsSchema>
+
 export const Phase3BrowserObservationSchema = z.object({
   browserInteraction: z.boolean(), provider: z.literal('opencode'), providerVersion: z.string().regex(/^\d+\.\d+\.\d+$/),
   model: z.string().min(1).max(200), paneId: z.string().min(1).max(200), terminalId: z.string().min(1).max(200),
@@ -620,7 +624,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt',
-    'managed-opt-in', 'opencode-version', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
     'native-challenge-register',
@@ -3049,7 +3053,7 @@ export class ManagedRuntimeOwner {
     return createRuntimeEnclosureHandle(this.runtime, view)
   }
 
-  private async assertCurrentOpenCodeEnclosure(handle: RuntimeEnclosureHandle): Promise<void> {
+  private async currentRuntimeEnclosure(handle: RuntimeEnclosureHandle): Promise<ManagedRuntimeView> {
     const rows = (await this.inventory()).filter(view => view.soulId === handle.soulId)
     const row = rows[0]
     if (handle.runId !== this.runtime.runId || handle.candidateSha !== this.runtime.candidateSha || rows.length !== 1
@@ -3059,7 +3063,32 @@ export class ManagedRuntimeOwner {
         && receipt.incarnationId === handle.incarnationId && receipt.containerId === handle.containerId)) {
       throw new Error('address is not the exact current owned enclosure')
     }
-    if (row?.provider !== 'opencode') throw new Error('exact OpenCode runtime required')
+    return row
+  }
+
+  private async assertCurrentOpenCodeEnclosure(handle: RuntimeEnclosureHandle): Promise<void> {
+    if ((await this.currentRuntimeEnclosure(handle)).provider !== 'opencode') throw new Error('exact OpenCode runtime required')
+  }
+
+  async freshAgentLaunchFacts(handle: RuntimeEnclosureHandle): Promise<FreshAgentLaunchFacts> {
+    const row = await this.currentRuntimeEnclosure(handle)
+    const mode = row.freshAgentSessionType
+    if (this.runtime.phase !== 5 || !mode || !this.freshAgentModes.includes(mode) || this.fixtureFreshAgentModes.includes(mode)) {
+      throw new Error('registered production fresh-agent mode required')
+    }
+    const provider = mode === 'freshclaude' || mode === 'kilroy' ? 'claude'
+      : mode === 'freshcodex' ? 'codex' : mode === 'freshopencode' ? 'opencode' : null
+    if (!provider || row.provider !== provider) throw new Error('fresh-agent provider registration differs')
+    const raw = await this.ownedProviderExec(handle.containerId, [provider, '--version'])
+    const version = raw.match(/\b\d+\.\d+\.\d+\b/)?.[0]
+    if (!version) throw new Error('provider version reply is invalid')
+    const pattern = provider === 'claude' ? /(?:^|\s)claude(?:$|\s)/m
+      : provider === 'codex' ? /codex.*app-server|app-server.*codex/m : /opencode.*serve/m
+    const processes = await this.ownedProviderExec(handle.containerId, ['ps', '-eo', 'pid,args'])
+    const process = processes.split('\n').find(line => pattern.test(line))
+    const workerPid = Number(process?.trim().match(/^(\d+)/)?.[1])
+    if (!Number.isSafeInteger(workerPid) || workerPid <= 1) throw new Error('actual provider child PID was not found')
+    return { provider, version, workerPid }
   }
 
   async resetPhase3ApprovalEffect(handle: RuntimeEnclosureHandle): Promise<void> {
