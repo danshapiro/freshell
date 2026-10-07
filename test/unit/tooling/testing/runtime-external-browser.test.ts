@@ -716,6 +716,40 @@ describe('closed external owner control', () => {
       expectedControlEpoch: 4, expectedIntentRevision: 7 })).rejects.toThrow(/current/)
     expect(admin).toHaveBeenCalledOnce()
   })
+  it('returns the fixed OpenCode version and kills only the current host-recorded provider PID', async () => {
+    const { owned, context, request, inventory } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'probe-owned-soul',
+      incarnationId: 'probe-owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'probe-owned-boot', nativeSessionId: 'probe-owned-native' }
+    const row = { ...handle, provider: 'opencode', launchState: 'running', intentRevision: 1 }
+    inventory.mockResolvedValue([row])
+    owned.runtime.broker = { receipts: () => [{ ...handle }] } as unknown as typeof owned.runtime.broker
+    const version = vi.spyOn(owned, 'ownedProviderExec').mockResolvedValue('1.18.21\n')
+    const facts = { workerPid: 23, workerLaunchCount: 1, unsafeBrokerAttempts: 0,
+      limits: { cpuMax: '200000 100000', memoryMax: '4294967296', swapMax: '0', pidsMax: '512' } }
+    const host = vi.spyOn(owned, 'chaosHostFacts').mockResolvedValue(facts)
+    const kill = vi.spyOn(owned.runtime, 'killOwnedRuntimePidExact').mockImplementation(() => {})
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.openCodeVersionFacts(handle)).resolves.toEqual({ provider: 'opencode', version: '1.18.21' })
+    expect(version).toHaveBeenCalledExactlyOnceWith(handle.containerId, ['opencode', '--version'])
+    inventory.mockResolvedValue([{ ...row, nativeSessionId: undefined }])
+    const enclosure = rig.runtimeEnclosureHandle({ ...row, nativeSessionId: undefined })
+    await expect(rig.openCodeVersionFacts(enclosure)).resolves.toEqual({ provider: 'opencode', version: '1.18.21' })
+    await expect(control({ ...request, action: 'opencode-version', enclosure: { ...enclosure, hostBootId: 'foreign-boot' } })).rejects.toThrow(/current/)
+    inventory.mockResolvedValue([row])
+    await rig.crashProviderWorker(handle)
+    expect(kill).toHaveBeenCalledExactlyOnceWith(handle.containerId, 23)
+    host.mockResolvedValue({ ...facts, workerPid: 1 })
+    await expect(control({ ...request, operationId: 'invalid-provider-pid', action: 'crash-provider-worker', handle })).rejects.toThrow(/provider.*PID/)
+    inventory.mockResolvedValue([{ ...row, provider: 'codex' }])
+    await expect(control({ ...request, operationId: 'wrong-provider', action: 'opencode-version', enclosure })).rejects.toThrow(/OpenCode/)
+    inventory.mockResolvedValue([{ ...row, incarnationId: 'replacement-incarnation' }])
+    await expect(control({ ...request, operationId: 'stale-worker', action: 'crash-provider-worker', handle })).rejects.toThrow(/current/)
+    expect(version).toHaveBeenCalledTimes(2)
+    expect(kill).toHaveBeenCalledOnce()
+  })
   it('refuses arbitrary commands, foreign metadata and absent current handles before owner work', async () => {
     const { owned, context, inventory, request } = fixture()
     const control = runner.createExternalRuntimeControl(owned, context)

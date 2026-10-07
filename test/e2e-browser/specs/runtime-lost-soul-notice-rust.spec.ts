@@ -233,7 +233,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       )
       const before = await waitForRunningView(rig, terminalId, 90_000)
       if (!before.containerId) throw new Error('OpenCode managed view lacks container identity')
-      expect(rig.ownedContainerExec(before.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
+      expect((await rig.openCodeVersionFacts(rig.runtimeEnclosureHandle(before))).version).toBe(P2_OPENCODE_VERSION)
 
       const diagnostic = 'phase5-diagnostic-retained-no-credential'
       await executeInPane(
@@ -251,9 +251,8 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       }, 120_000)
       expect(providerSessionId).toMatch(/^ses_/)
 
-      const runtimeDir = rig.runtime.runtimeDir(rig.supervisor, before.incarnationId)
-      const hostState = JSON.parse(fs.readFileSync(path.join(runtimeDir, 'host-state.json'), 'utf8'))
-      const workerPid = Number(hostState.workerPid)
+      const workerHandle = rig.exactRuntimeHandle({ ...before, nativeSessionId: providerSessionId })
+      const workerPid = (await rig.chaosHostFacts(workerHandle)).workerPid
       expect(workerPid).toBeGreaterThan(1)
 
       const credentialPath = '/home/freshell/provider/.local/share/opencode/auth.json'
@@ -282,7 +281,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
         observation.observer.observe(document.body, { childList: true, subtree: true })
         ;(window as any).__FRESHELL_PHASE5_NOTICE_OBSERVATION__ = observation
       })
-      rig.runtime.killOwnedRuntimePidExact(before.containerId, workerPid)
+      await rig.crashProviderWorker(workerHandle)
       rig.ownedContainerExec(before.containerId, [
         'node', '-e', String.raw`
 const fs = require('node:fs');

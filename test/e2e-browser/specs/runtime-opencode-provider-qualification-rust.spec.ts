@@ -516,7 +516,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       if (!first.view.containerId || !first.view.hostBootId) {
         throw new Error('first OpenCode view lacks exact runtime identity')
       }
-      expect(rig.ownedContainerExec(first.view.containerId, ['opencode', '--version']).trim())
+      expect((await rig.openCodeVersionFacts(rig.runtimeEnclosureHandle(first.view))).version)
         .toBe(P2_OPENCODE_VERSION)
       const processArgs = rig.ownedContainerProcessTable(first.view.containerId)
       expect(processArgs).toContain(P2_OPENCODE_MODEL)
@@ -591,13 +591,10 @@ test.describe.serial('OpenCode provider qualification', () => {
       // Provider-process loss: kill only the exact host-recorded worker PID,
       // then require another exact native resume and usable follow-up.
       const beforeProviderCrashStreamId = await paneStreamId(harness, tabId, first.paneId)
-      const hostStatePath = path.join(
-        rig.runtime.runtimeDir(rig.supervisor, afterHostCrash.incarnationId),
-        'host-state.json',
-      )
-      const workerPid = Number(JSON.parse(fs.readFileSync(hostStatePath, 'utf8')).workerPid)
+      const workerHandle = rig.exactRuntimeHandle(afterHostCrash)
+      const workerPid = (await rig.chaosHostFacts(workerHandle)).workerPid
       expect(workerPid).toBeGreaterThan(1)
-      rig.runtime.killOwnedRuntimePidExact(afterHostCrash.containerId, workerPid)
+      await rig.crashProviderWorker(workerHandle)
       const afterProviderCrash = await waitForRunningView(
         rig,
         first.terminalId,

@@ -237,7 +237,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
         90_000,
       )
       if (!before.containerId || !before.hostBootId) throw new Error('managed OpenCode view lacks container/host identity')
-      expect(rig.ownedContainerExec(before.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
+      expect((await rig.openCodeVersionFacts(rig.runtimeEnclosureHandle(before))).version).toBe(P2_OPENCODE_VERSION)
       await rig.ownedProviderExec(before.containerId, ['sh', '-lc', 'rm -f "$HOME/p3-tool-effect-count"'])
 
       // Phrase this as the ordinary file-edit task it is. The earlier

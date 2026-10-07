@@ -365,7 +365,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       }
       const view = await waitForRunningView(rig, terminalId, 90_000)
       if (!view?.containerId || !view.hostBootId) throw new Error('real OpenCode managed view missing ownership identity')
-      expect(rig.ownedContainerExec(view.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
+      expect((await rig.openCodeVersionFacts(rig.runtimeEnclosureHandle(view))).version).toBe(P2_OPENCODE_VERSION)
       const authProbe = (await rig.ownedProviderExec(view.containerId, [
         'node', '--no-warnings', '-e',
         "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||openai.type!=='oauth'||openai.access!=='onecli-managed'||openai.refresh!=='onecli-managed'||openai.expires<Date.now()+3600000)process.exit(2);fs.accessSync('/home/freshell/provider/.config/onecli/gateway-ca.pem',fs.constants.R_OK);process.stdout.write('onecli managed OpenAI stub and CA present')",
@@ -452,9 +452,8 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       await expect.poll(async () => {
         return (await rig.ownedProviderExec(view.containerId!, ['sh', '-lc', 'cat /home/freshell/provider/p2-opencode-followup 2>/dev/null || true'])).trim()
       }, { timeout: 90_000 }).toBe('P2_OPENCODE_FOLLOWUP_DONE')
-      const runtimeDir = rig.runtime.runtimeDir(rig.supervisor, view.incarnationId)
-      const hostState = JSON.parse(fs.readFileSync(path.join(runtimeDir, 'host-state.json'), 'utf8'))
-      expect(hostState.workerLaunchCount).toBe(1)
+      const hostFacts = await rig.chaosHostFacts(rig.exactRuntimeHandle({ ...view, nativeSessionId: sessionId }))
+      expect(hostFacts.workerLaunchCount).toBe(1)
       expect((await content())?.sessionRef?.sessionId).toBe(sessionId)
 
       const receipt = {
@@ -475,7 +474,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         hostBootId: view.hostBootId,
         toolCompletionCount: 1,
         followupSucceeded: true,
-        providerLaunchCount: hostState.workerLaunchCount,
+        providerLaunchCount: hostFacts.workerLaunchCount,
         candidateSha: rig.runtime.candidateSha,
         runtimeImage: rig.runtime.imageRef,
       }

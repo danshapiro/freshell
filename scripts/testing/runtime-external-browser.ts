@@ -17,6 +17,7 @@ import path from 'node:path'
 import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
   ManagedMigrationFactsSchema, ManagedStopResultSchema } from './runtime-sandbox.js'
+import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
 import { ManagedRuntimeInventorySnapshotSchema, type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
@@ -634,7 +635,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'challengeId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -723,6 +724,16 @@ export class ExternalManagedRuntimeRig {
       limits: z.object({ cpuMax: z.string().regex(/^(?:max|\d+) \d+$/), memoryMax: z.string().regex(/^(?:max|\d+)$/),
         swapMax: z.string().regex(/^(?:max|\d+)$/), pidsMax: z.string().regex(/^(?:max|\d+)$/) }).strict(),
       unsafeBrokerAttempts: z.number().int().nonnegative() }).strict(), { handle })
+  }
+  runtimeEnclosureHandle(view: Pick<ManagedRuntimeView, 'soulId' | 'incarnationId' | 'containerId' | 'hostBootId'>): RuntimeEnclosureHandle {
+    return createRuntimeEnclosureHandle(this.descriptor, view)
+  }
+  async openCodeVersionFacts(handle: RuntimeEnclosureHandle): Promise<{ provider: 'opencode'; version: string }> {
+    return this.rpc('opencode-version', z.object({ provider: z.literal('opencode'),
+      version: z.string().regex(/^\d+\.\d+\.\d+$/) }).strict(), { enclosure: this.runtimeEnclosureHandle(handle) })
+  }
+  async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {
+    await this.rpc('crash-provider-worker', CompletedOwnerOperationSchema, { handle })
   }
   async crashRuntimeHost(handle: ExactRuntimeHandle): Promise<void> {
     await this.rpc('crash-host', CompletedOwnerOperationSchema, { handle })
@@ -950,6 +961,11 @@ export function createExternalRuntimeControl(
         catch { result = { ok: false, errors: ['retained fixture cleanup failed'] } }
         break
       case 'host-facts': result = await owner.chaosHostFacts(handle()); break
+      case 'opencode-version':
+        if (!request.enclosure) throw new Error('exact current runtime enclosure address required')
+        result = await owner.openCodeVersionFacts(request.enclosure)
+        break
+      case 'crash-provider-worker': await owner.crashProviderWorker(handle()); result = { completed: true }; break
       case 'fixture-state': result = await owner.fixtureNativeState(handle()); break
       case 'fixture-worker': result = await owner.fixtureWorkerFacts(handle()); break
       case 'provider-volume': result = await owner.providerVolumeFacts(handle()); break

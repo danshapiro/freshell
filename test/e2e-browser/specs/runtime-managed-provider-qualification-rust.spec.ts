@@ -322,14 +322,6 @@ async function waitForReplacement(
   }, 300_000)
 }
 
-function workerPid(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): number {
-  const statePath = path.join(
-    rig.runtime.runtimeDir(rig.supervisor, view.incarnationId),
-    'host-state.json',
-  )
-  return Number(JSON.parse(fs.readFileSync(statePath, 'utf8')).workerPid)
-}
-
 async function qualifyProvider(
   page: Page,
   harness: TestHarness,
@@ -384,9 +376,10 @@ async function qualifyProvider(
   )
 
   if (!afterHostLoss.containerId) throw new Error('host-loss replacement has no owned container')
-  const pid = workerPid(rig, afterHostLoss)
+  const workerHandle = rig.exactRuntimeHandle(afterHostLoss)
+  const pid = (await rig.chaosHostFacts(workerHandle)).workerPid
   expect(pid).toBeGreaterThan(1)
-  rig.runtime.killOwnedRuntimePidExact(afterHostLoss.containerId, pid)
+  await rig.crashProviderWorker(workerHandle)
   const afterProviderLoss = await waitForReplacement(rig, created.terminalId, afterHostLoss.incarnationId)
   expect(afterProviderLoss.soulId).toBe(created.view.soulId)
   expect(afterProviderLoss.nativeSessionId).toBe(nativeSessionId)

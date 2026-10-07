@@ -108,6 +108,16 @@ export type ExactRuntimeHandle = {
   nativeSessionId: string
 }
 
+/** Installed binary facts can precede the first native session; they never qualify a root. */
+export type RuntimeEnclosureHandle = Omit<ExactRuntimeHandle, 'nativeSessionId'>
+
+export function createRuntimeEnclosureHandle(owner: { runId: string; candidateSha: string },
+  view: Pick<ManagedRuntimeView, 'soulId' | 'incarnationId' | 'containerId' | 'hostBootId'>): RuntimeEnclosureHandle {
+  if (!view.containerId || !/^[a-f0-9]{64}$/.test(view.containerId) || !view.hostBootId) throw new Error('exact runtime enclosure address required')
+  return { runId: owner.runId, candidateSha: owner.candidateSha, soulId: view.soulId,
+    incarnationId: view.incarnationId, containerId: view.containerId, hostBootId: view.hostBootId }
+}
+
 export type FixtureNativeState = {
   nativeSessionId: string
   pendingDecisionId: string | null
@@ -306,7 +316,8 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt',
-    'managed-opt-in', 'crash-host', 'crash-provider', 'hold-host', 'release-host',
+    'managed-opt-in', 'opencode-version', 'crash-provider-worker',
+    'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
     'native-challenge-register',
     'synthetic-history-challenge',
@@ -317,6 +328,9 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     soulId: z.string().min(1), incarnationId: z.string().min(1), containerId: z.string().regex(/^[a-f0-9]{64}$/),
     hostBootId: z.string().min(1), nativeSessionId: z.string().min(1),
   }).strict().optional(),
+  enclosure: z.object({ runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
+    soulId: z.string().min(1), incarnationId: z.string().min(1), containerId: z.string().regex(/^[a-f0-9]{64}$/),
+    hostBootId: z.string().min(1) }).strict().optional(),
   challengeId: z.string().min(1).optional(),
   expectedControlEpoch: z.number().int().nonnegative().optional(),
   expectedIntentRevision: z.number().int().nonnegative().optional(),
@@ -354,7 +368,8 @@ export class RuntimeOwnerOperationQueue {
     if (!parsed.success) throw new Error('invalid closed owner operation')
     const request = parsed.data
     if (request.runId !== this.runId || request.candidateSha !== this.candidateSha || request.scenarioId !== this.scenarioId
-      || (request.handle && (request.handle.runId !== this.runId || request.handle.candidateSha !== this.candidateSha))) {
+      || (request.handle && (request.handle.runId !== this.runId || request.handle.candidateSha !== this.candidateSha))
+      || (request.enclosure && (request.enclosure.runId !== this.runId || request.enclosure.candidateSha !== this.candidateSha))) {
       throw new Error('owner operation does not belong to this owned run, candidate and scenario')
     }
     const fingerprint = createHash('sha256').update(JSON.stringify(request)).digest('hex')
@@ -2607,6 +2622,34 @@ export class ManagedRuntimeOwner {
   async crashRuntimeHost(handle: ExactRuntimeHandle): Promise<void> {
     await this.assertCurrentHandle(handle)
     this.runtime.killOwnedRuntimeExact(handle.containerId)
+  }
+
+  runtimeEnclosureHandle(view: Pick<ManagedRuntimeView, 'soulId' | 'incarnationId' | 'containerId' | 'hostBootId'>): RuntimeEnclosureHandle {
+    return createRuntimeEnclosureHandle(this.runtime, view)
+  }
+
+  async openCodeVersionFacts(handle: RuntimeEnclosureHandle): Promise<{ provider: 'opencode'; version: string }> {
+    const rows = (await this.inventory()).filter(view => view.soulId === handle.soulId)
+    const row = rows[0]
+    if (handle.runId !== this.runtime.runId || handle.candidateSha !== this.runtime.candidateSha || rows.length !== 1
+      || row.launchState !== 'running' || row.incarnationId !== handle.incarnationId
+      || row.containerId !== handle.containerId || row.hostBootId !== handle.hostBootId
+      || !this.runtime.broker.receipts().some(receipt => receipt.soulId === handle.soulId
+        && receipt.incarnationId === handle.incarnationId && receipt.containerId === handle.containerId)) {
+      throw new Error('version address is not the exact current owned enclosure')
+    }
+    if (row?.provider !== 'opencode') throw new Error('exact OpenCode runtime required')
+    const version = (await this.ownedProviderExec(handle.containerId, ['opencode', '--version'])).trim()
+    if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('OpenCode version reply is invalid')
+    return { provider: 'opencode', version }
+  }
+
+  async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {
+    await this.assertCurrentHandle(handle)
+    const facts = await this.chaosHostFacts(handle)
+    if (!Number.isSafeInteger(facts.workerPid) || facts.workerPid <= 1) throw new Error('exact host-recorded provider child PID required')
+    this.runtime.recordLifecycle('external.provider_worker_crash', { severity: 'info', ...handle, workerPid: facts.workerPid })
+    this.runtime.killOwnedRuntimePidExact(handle.containerId, facts.workerPid)
   }
 
   async registerNativeChallenge(handle: ExactRuntimeHandle, kind: NativeChallengeKind): Promise<{ challengeId: string }> {

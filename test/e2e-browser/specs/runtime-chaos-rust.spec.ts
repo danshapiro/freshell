@@ -244,7 +244,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       )
       const initial = await runningView(rig, terminalId)
       if (!initial.containerId || !initial.hostBootId) throw new Error('managed OpenCode lacks runtime identity')
-      expect(rig.ownedContainerExec(initial.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
+      expect((await rig.openCodeVersionFacts(rig.runtimeEnclosureHandle(initial))).version).toBe(P2_OPENCODE_VERSION)
 
       await executeInPane(page, paneId, 'Reply with exactly P5_CHAOS_READY and use no tools.')
       await waitForPaneOutput(page, harness, tabId, paneId, 'P5_CHAOS_READY', 180_000)
