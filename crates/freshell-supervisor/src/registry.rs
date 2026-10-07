@@ -49,6 +49,16 @@ type NativeImportObservationRow = (
     u64,
 );
 type RecoveryRevisionFenceRow = (u64, u64, u64, u64, u64, Option<String>, String);
+type LiveNativeObservationRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    u64,
+    String,
+);
 type StoppedRepairStartStateRow = (
     String,
     String,
@@ -1105,6 +1115,7 @@ impl Registry {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             validate_recovery_write_fence(&tx, &soul, &fence)?;
             if incarnation_id != fence.active_incarnation_id { return Err(RegistryError::NativeIdentityConflict); }
+            validate_live_native_observation(&tx, &soul, &incarnation_id)?;
             let now = now_millis();
             let changed = tx.execute(
                 "UPDATE incarnations SET launch_state='running',updated_at=?1 WHERE incarnation_id=?2 AND launch_state='starting' AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running')",
@@ -4423,7 +4434,7 @@ fn validate_live_native_observation(
     incarnation: &IncarnationId,
 ) -> Result<(), RegistryError> {
     let (provider,root,fresh,fixture,launch,observation,generation,nonce):
-        (String,Option<String>,Option<String>,Option<String>,Option<String>,Option<String>,u64,String)=conn.query_row(
+        LiveNativeObservationRow=conn.query_row(
         "SELECT s.provider,s.native_session_id,i.fresh_agent_spec,i.fixture_kind,i.native_identity_launch,i.native_identity_observation,i.execution_generation,i.launch_nonce FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id WHERE s.soul_id=?1 AND i.incarnation_id=?2",
         params![soul.as_str(),incarnation.as_str()],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))?;
     let deterministic_fresh = fresh
@@ -7249,6 +7260,71 @@ pub(crate) mod tests {
                 .unwrap()
                 .recovery_state,
             RecoveryState::Recovering
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_running_publication_requires_the_current_native_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let prepared = materialize_test_runtime(&registry, soul.clone()).await;
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute("UPDATE souls SET provider='claude',recovery_state='recovering',native_session_id='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' WHERE soul_id=?1",[soul.as_str()]).unwrap();
+        conn.execute("UPDATE incarnations SET fixture_kind=NULL,launch_state='starting' WHERE incarnation_id=?1",[prepared.incarnation_id.as_str()]).unwrap();
+        let generation = conn
+            .query_row(
+                "SELECT execution_generation FROM incarnations WHERE incarnation_id=?1",
+                [prepared.incarnation_id.as_str()],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+        drop(conn);
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let missing = registry
+            .mark_running_observed(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                context.write_fence(),
+            )
+            .await;
+        assert!(
+            matches!(missing, Err(RegistryError::RecoveryBlocked { .. })),
+            "initial RUNNING must not release LIVE without current native evidence: {missing:?}"
+        );
+        assert_eq!(
+            registry.inventory().await.unwrap()[0].launch_state,
+            LaunchState::Starting
+        );
+        let launch = registry
+            .bind_native_identity_launch(freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+                evidence_revision: context.evidence_revision,
+                execution_generation: generation,
+                requested_native_session_id: context.native_session_id.clone(),
+            })
+            .await
+            .unwrap();
+        let observed = freshell_runtime_protocol::NativeIdentityObservation {
+            native_session_id: context.native_session_id.clone().unwrap(),
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: launch.launch_nonce.clone(),
+            evidence_revision: launch.evidence_revision,
+            source: freshell_runtime_protocol::NativeIdentitySource::ClaudeNativeEvent,
+            evidence_digest: "a".repeat(64),
+        };
+        registry
+            .record_native_identity_observation(soul.clone(), observed, context.write_fence())
+            .await
+            .unwrap();
+        registry
+            .mark_running_observed(soul.clone(), prepared.incarnation_id, context.write_fence())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.inventory().await.unwrap()[0].launch_state,
+            LaunchState::Running
         );
     }
 

@@ -1185,12 +1185,99 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "enable_long_lived_runtime", error)
             })?;
-        let accepted = self
+        let mut accepted = self
             .send_grant(&handle, &workload, &authenticated, &grant)
             .await
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "deliver_execution_grant", error)
             })?;
+        let native_context = self
+            .registry
+            .recovery_context(workload.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let requires_native_observation = workload.fixture.is_none()
+            && matches!(
+                native_context.provider.as_str(),
+                "claude" | "kilroy" | "codex" | "opencode" | "amplifier"
+            )
+            && !workload.fresh_agent.as_ref().is_some_and(|agent| {
+                crate::registry::deterministic_fresh_agent_fixture(&native_context.provider, agent)
+            });
+        if requires_native_observation {
+            let adoption_required = workload
+                .resume_spec
+                .as_ref()
+                .is_some_and(|spec| spec.opencode_adoption_baseline.is_some());
+            let wait = self
+                .wait_for_native_identity(
+                    &workload.soul_id,
+                    handle.incarnation_id(),
+                    prepared.intent_revision,
+                    crate::recovery::native_identity_wait_timeout(adoption_required),
+                    false,
+                )
+                .await;
+            let observed = match wait {
+                crate::recovery::NativeIdentityWait::Observed {
+                    native_session_id, ..
+                } => native_session_id,
+                crate::recovery::NativeIdentityWait::StopIntent { .. }
+                | crate::recovery::NativeIdentityWait::IntentChanged { .. } => {
+                    return Err(self.activation_failure(
+                        &prepared,
+                        state,
+                        "verify_native_startup",
+                        RuntimeError::new(
+                            RuntimeErrorCode::StaleIntentRevision,
+                            "durable intent changed during native startup",
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(self.activation_failure(
+                        &prepared,
+                        state,
+                        "verify_native_startup",
+                        RuntimeError::new(
+                            RuntimeErrorCode::RecoveryBlocked,
+                            "current native provider startup observation is unavailable",
+                        ),
+                    ))
+                }
+            };
+            // Recheck the still-live current child before publication. This
+            // path retains the original write fence; waiting does not publish
+            // a root or adopt a newer revision on this activation's behalf.
+            let current = self
+                .registry
+                .recovery_context(workload.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            let status = self
+                .host_status(
+                    handle.incarnation_id().clone(),
+                    handle.runtime_dir(),
+                    &authenticated,
+                )
+                .await?;
+            let observation = crate::recovery::current_native_observation(&current, &status)
+                .filter(|observation| !status.exited && observation.native_session_id == observed)
+                .cloned()
+                .ok_or_else(|| {
+                    self.activation_failure(
+                        &prepared,
+                        state,
+                        "verify_native_startup",
+                        RuntimeError::new(
+                            RuntimeErrorCode::RecoveryBlocked,
+                            "current native provider changed during startup",
+                        ),
+                    )
+                })?;
+            accepted.native_session_id = Some(observed);
+            accepted.native_identity_observation = Some(observation);
+        }
         if let (Some(terminal), Some(receipt)) = (
             workload.terminal.as_ref(),
             accepted.opencode_transfer_receipt.as_ref(),
@@ -1236,18 +1323,6 @@ impl Supervisor {
                     self.activation_failure(&prepared, state, "record_native_identity", error)
                 })?;
         }
-        fence = self
-            .registry
-            .mark_running_observed(
-                workload.soul_id.clone(),
-                handle.incarnation_id().clone(),
-                fence,
-            )
-            .await
-            .map_err(map_registry)
-            .map_err(|error| {
-                self.activation_failure(&prepared, state, "commit_running_state", error)
-            })?;
         if let Some(observation) =
             accepted
                 .native_identity_observation
@@ -1269,6 +1344,18 @@ impl Supervisor {
                     self.activation_failure(&prepared, state, "record_native_observation", error)
                 })?;
         }
+        fence = self
+            .registry
+            .mark_running_observed(
+                workload.soul_id.clone(),
+                handle.incarnation_id().clone(),
+                fence,
+            )
+            .await
+            .map_err(map_registry)
+            .map_err(|error| {
+                self.activation_failure(&prepared, state, "commit_running_state", error)
+            })?;
         if let Err(error) = self.cleanup_opencode_transfer_staging().await {
             append_event(
                 &self.config.lifecycle_log,
