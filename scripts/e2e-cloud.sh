@@ -376,6 +376,7 @@ cmd_push() {
 # Subcommand: run
 # ---------------------------------------------------------------------------
 cmd_run() {
+  cd "$ROOT"
   local local_mode=false
   local cloud_mode=false
   local force_build=false
@@ -503,6 +504,23 @@ cmd_run() {
     fi
   fi
 
+  # Validate the closed owned target before any identity, build or job action.
+  # JSON-quoted YAML values retain exact selections without exporting owner
+  # paths, OneCLI files, Docker access or local receipt destinations.
+  local managed_external_yaml managed_external=false
+  managed_external_yaml=$(cd "$ROOT" && pnpm exec tsx -e 'import { externalCloudMetadata } from "./scripts/testing/runtime-external-browser.ts"; for (const [key,value] of Object.entries(externalCloudMetadata(process.env))) process.stdout.write(key+": "+JSON.stringify(value)+"\n")')
+  if [ -n "$managed_external_yaml" ]; then
+    managed_external=true
+    if $local_mode || [ "$shards" != "1" ]; then
+      echo "[e2e-cloud] ERROR: the owned external target requires configured Cloud and exactly one task." >&2
+      exit 1
+    fi
+    if [ "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" != "$(git -C "$ROOT" rev-parse HEAD)" ] || [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+      echo "[e2e-cloud] ERROR: the owned external target requires this exact clean candidate." >&2
+      exit 1
+    fi
+  fi
+
   if $local_mode; then
     echo "[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; backend=local; source: ${backend_source})"
     cd "$ROOT"
@@ -590,6 +608,9 @@ cmd_run() {
   else
     echo 'PLAYWRIGHT_ARGS: ""' > "$RUN_ENV_FILE"
   fi
+  if $managed_external; then
+    printf '%s\n' "$managed_external_yaml" >> "$RUN_ENV_FILE"
+  fi
 
   # Cloud-lane WS-ready tolerance (kata j90s). Under gVisor the e2e Node
   # TestServer occasionally suffers a ~40-60s zero-CPU wedge of in-flight
@@ -636,13 +657,34 @@ cmd_run() {
     exit 1
   fi
   echo "[e2e-cloud]   Job:     $RUN_JOB_NAME"
+  RUN_MANAGED_EXTERNAL=$managed_external
   cleanup_run_job() {
+    local initial_status=$? cleanup_ok=true
     if [ -n "${RUN_JOB_NAME:-}" ]; then
-      gcloud run jobs delete $(gcloud_flags) "$RUN_JOB_NAME" --quiet >/dev/null 2>&1 || true
+      if ${RUN_MANAGED_EXTERNAL:-false}; then
+        # Reuse the owner cleanup operation: observe identity, cancel any
+        # unfinished owned execution, delete the exact job and verify absence.
+        if ! jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+          --arg jobName "$RUN_JOB_NAME" --arg project "$GCP_PROJECT" --arg region "$GCP_REGION" --arg account "$GCP_ACCOUNT" \
+          '{runId:$runId,candidateSha:$candidateSha,jobName:$jobName,project:$project,region:$region,account:$account}' | \
+          pnpm exec tsx -e 'import fs from "node:fs"; import { cleanupOwnedExternalCloudJob } from "./scripts/testing/runtime-external-browser.ts"; cleanupOwnedExternalCloudJob(JSON.parse(fs.readFileSync(0,"utf8")))' >/dev/null 2>&1; then
+          cleanup_ok=false
+        fi
+        jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+          --arg jobName "$RUN_JOB_NAME" --argjson ok "$cleanup_ok" \
+          '{severity: (if $ok then "info" else "error" end), event:"managed_external_job_cleanup", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, ok:$ok}'
+      else
+        gcloud run jobs delete $(gcloud_flags) "$RUN_JOB_NAME" --quiet >/dev/null 2>&1 || true
+      fi
     fi
     if [ -n "${RUN_ENV_FILE:-}" ]; then
       rm -f "$RUN_ENV_FILE"
     fi
+    if ! $cleanup_ok; then
+      echo "[e2e-cloud] ERROR: exact owned job cleanup could not be verified." >&2
+      exit 1
+    fi
+    return "$initial_status"
   }
   trap cleanup_run_job EXIT
   trap 'exit 130' INT
@@ -654,6 +696,19 @@ cmd_run() {
   # shared-name reads — exceeded the per-case budgets across three
   # consecutive focused runs (retry-passing flakes), while the same specs
   # are 44/44 green locally at 3 workers.
+  local -a owned_job_labels=()
+  if $managed_external; then
+    owned_job_labels=("--labels=freshell-managed-run=$FRESHELL_RUNTIME_EXTERNAL_RUN_ID,freshell-managed-candidate=$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA")
+    if [ -z "$GCP_ACCOUNT" ]; then
+      echo "[e2e-cloud] ERROR: managed external cleanup requires a resolved Cloud identity." >&2
+      exit 1
+    fi
+    # Reserve the exact name before create: a lost create acknowledgement can
+    # leave a real job even when this launcher's EXIT trap cannot complete.
+    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+      --arg jobName "$RUN_JOB_NAME" --arg project "$GCP_PROJECT" --arg region "$GCP_REGION" --arg account "$GCP_ACCOUNT" \
+      '{severity:"info", event:"managed_external_job_reserved", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, project:$project, region:$region, account:$account}'
+  fi
   gcloud run jobs create $(gcloud_flags) "$RUN_JOB_NAME" \
     --image="$IMAGE_REMOTE" \
     --tasks="$shards" \
@@ -661,7 +716,12 @@ cmd_run() {
     --max-retries=0 \
     --env-vars-file="$RUN_ENV_FILE" \
     --memory=4Gi \
-    --cpu=4
+    --cpu=4 "${owned_job_labels[@]}"
+  if $managed_external; then
+    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+      --arg jobName "$RUN_JOB_NAME" --arg image "$IMAGE_REMOTE" \
+      '{severity:"info", event:"managed_external_job_created", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, image:$image}'
+  fi
 
   # Execute this run's job and wait for completion, capturing the exit
   # status: an execute failure (quota, permissions, template error) MAY NOT
@@ -701,6 +761,11 @@ cmd_run() {
       gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true
     fi
     exit 1
+  fi
+  if $managed_external; then
+    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+      --arg jobName "$RUN_JOB_NAME" --arg executionName "$execution_id" \
+      '{severity:"info", event:"managed_external_job_execution", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, executionName:$executionName}'
   fi
 
   # Fetch logs (requires beta track for logs read).
@@ -830,6 +895,27 @@ cmd_run() {
   if [ "$retry_evidence_count" -gt 0 ]; then
     echo "[e2e-cloud] ERROR: recovered Playwright retry evidence prevents a zero-flake cloud receipt."
     exit 1
+  fi
+
+  if $managed_external; then
+    local external_query external_raw external_cases external_attempt external_complete=false
+    external_query="resource.type=\"cloud_run_job\" AND labels.\"run.googleapis.com/execution_name\"=\"${execution_id}\" AND jsonPayload.runId=\"${FRESHELL_RUNTIME_EXTERNAL_RUN_ID}\" AND jsonPayload.candidateSha=\"${FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA}\" AND (jsonPayload.event=\"managed_external_case\" OR jsonPayload.event=\"managed_external_complete\")"
+    for external_attempt in 1 2 3 4 5; do
+      if external_raw=$(gcloud logging read "$external_query" $(account_flag) --project="$GCP_PROJECT" --format=json --limit=1000 2>/dev/null); then
+        if external_cases=$(printf '%s' "$external_raw" | pnpm exec tsx -e 'import fs from "node:fs"; import { parseExternalCloudExecutionEvents } from "./scripts/testing/runtime-external-browser.ts"; const entries=JSON.parse(fs.readFileSync(0,"utf8")); const cases=parseExternalCloudExecutionEvents(entries.map((entry: { jsonPayload?: unknown })=>entry.jsonPayload), {runId:process.env.FRESHELL_RUNTIME_EXTERNAL_RUN_ID!, candidateSha:process.env.FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA!}); process.stdout.write(JSON.stringify(cases))' 2>/dev/null); then
+          external_complete=true
+          break
+        fi
+      fi
+      if [ "$external_attempt" -lt 5 ]; then sleep 3; fi
+    done
+    if ! $external_complete; then
+      echo "[e2e-cloud] ERROR: complete exact external execution observations are unavailable." >&2
+      exit 1
+    fi
+    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+      --arg jobName "$RUN_JOB_NAME" --arg executionName "$execution_id" --argjson cases "$external_cases" \
+      '{severity:"info", event:"managed_external_cloud_cases", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, executionName:$executionName, cases:$cases}'
   fi
 
   echo "[e2e-cloud] All tasks completed successfully."

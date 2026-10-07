@@ -1,5 +1,15 @@
 import { defineConfig, devices } from '@playwright/test'
 import { DEFAULT_TEST_TIMEOUT_MS } from './helpers/test-harness.js'
+import { EXTERNAL_MANAGED_SPEC_NAMES, parseExternalBrowserArguments, resolveManagedExternalDescriptor } from '../../scripts/testing/runtime-external-browser.js'
+
+const managedExternal = resolveManagedExternalDescriptor(process.env)
+if (managedExternal) {
+  const spec = process.env.FRESHELL_RUNTIME_EXTERNAL_SPEC
+  if (!spec) throw new Error('owned external spec selection is required')
+  parseExternalBrowserArguments(['--spec', spec,
+    ...(process.env.FRESHELL_RUNTIME_EXTERNAL_GREP ? ['--grep', process.env.FRESHELL_RUNTIME_EXTERNAL_GREP] : []),
+  ], process.env)
+}
 
 /** Match-all browser projects exclude only the separately selected live-CLI smoke. */
 export const CONTINUITY_SMOKE_SPEC = /continuity-smoke\.spec\.ts$/
@@ -59,7 +69,7 @@ const continuityRequested = process.env.FRESHELL_SMOKE
 
 export default defineConfig({
   testDir: './specs',
-  fullyParallel: true,
+  fullyParallel: !managedExternal,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 2 : undefined,
@@ -79,9 +89,16 @@ export default defineConfig({
     screenshot: 'only-on-failure',
     video: 'on-first-retry',
   },
-  globalSetup: './global-setup.ts',
-  globalTeardown: './global-teardown.ts',
-  projects: [
+  globalSetup: managedExternal ? undefined : './global-setup.ts',
+  globalTeardown: managedExternal ? undefined : './global-teardown.ts',
+  projects: managedExternal ? [{
+    name: 'chromium-external-target',
+    use: { ...devices['Desktop Chrome'], baseURL: managedExternal.baseUrl },
+    testMatch: EXTERNAL_MANAGED_SPEC_NAMES.map((name) => `**/${name}`),
+    testIgnore: [],
+    fullyParallel: false,
+    retries: 0,
+  }] : [
     {
       name: 'chromium',
       use: devices['Desktop Chrome'],

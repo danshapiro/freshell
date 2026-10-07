@@ -41,7 +41,12 @@ export default defineConfig({
       // These integration trees own their own runtime/artifact setup.
       'test/integration/tooling/**',
       'test/integration/electron/**',
-      'test/e2e-browser/**',
+      // This one helper executes the browser selection contract in Vitest.
+      // Every other browser file remains in its existing separate workflow.
+      'test/e2e-browser/!(helpers)/**',
+      'test/e2e-browser/*.ts',
+      'test/e2e-browser/helpers/!(selection-nonvacuity.test.ts)',
+      'test/e2e-browser/helpers/*/**',
       ...(realProviderContractsEnabled ? [] : ['test/integration/real/**']),
       // Electron tests run under config/vitest/vitest.electron.config.ts (node environment)
       'test/unit/electron/**',

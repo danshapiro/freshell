@@ -10,7 +10,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import {
   buildReceiptEnvironment,
@@ -98,17 +98,19 @@ type StepResult = {
   }
 }
 
-function playwright(spec: string, extraEnv: Record<string, string>) {
-  return (env: NodeJS.ProcessEnv, logPath: string): Promise<number> => runLogged(
-    mise,
-    [
-      'exec', 'node@22', '--', 'node_modules/.bin/playwright', 'test',
-      '--config', 'test/e2e-browser/playwright.config.ts',
-      '--project=chromium', '--reporter=line', spec,
-    ],
+export function playwright(spec: string, extraEnv: Record<string, string>, execute = runLogged) {
+  return (env: NodeJS.ProcessEnv, logPath: string): Promise<number> => execute(
+    'pnpm',
+    ['exec', 'tsx', 'scripts/testing/runtime-external-browser.ts', '--spec', spec],
     { ...env, ...extraEnv },
     logPath,
   )
+}
+
+export function campaignGate(
+  gateArgs: readonly string[], env: NodeJS.ProcessEnv, logPath: string, execute = runLogged,
+): Promise<number> {
+  return execute('pnpm', ['run', 'test:runtime', ...gateArgs], env, logPath)
 }
 
 const gateManifest = readJsonFile(path.join(repoRoot, 'test/runtime/gate-manifest.json')) as any
@@ -574,9 +576,8 @@ async function main(): Promise<number> {
       fs.mkdirSync(path.dirname(logPath), { recursive: true })
       fs.writeFileSync(logPath, `${failures[0]}\n`)
     } else {
-      exitCode = await runLogged(
-        mise,
-        ['exec', 'node@22', '--', 'npm', 'run', 'test:runtime', '--', ...step.gateArgs],
+      exitCode = await campaignGate(
+        step.gateArgs,
         {
           ...process.env,
           ...environment,
@@ -664,4 +665,6 @@ async function main(): Promise<number> {
   return outcome.exitCode
 }
 
-process.exitCode = await main()
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  process.exitCode = await main()
+}

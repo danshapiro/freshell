@@ -8,7 +8,7 @@ import { expect } from '@playwright/test'
 
 import { validateFreshAgentIngressInventory } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
 import { test } from '../helpers/fixtures.js'
-import { ManagedRuntimeBrowserRig, type ManagedRuntimeView, type FixtureNativeState } from '../helpers/managed-runtime.js'
+import { createManagedRuntimeBrowserRig, type ManagedFixtureRig, type ManagedRuntimeView, type FixtureNativeState } from '../helpers/managed-runtime.js'
 
 const FIXTURE_ENV = 'FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST'
 const PENDING_CONTROL = '[freshell-fixture:pending-approval]'
@@ -52,22 +52,12 @@ async function waitFor<T>(description: string, probe: () => Promise<T | null>, t
   throw new Error(`timed out waiting for ${description}${suffix}`)
 }
 
-async function fixtureState(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): Promise<FixtureNativeState> {
+async function fixtureState(rig: ManagedFixtureRig, view: ManagedRuntimeView): Promise<FixtureNativeState> {
   return rig.fixtureNativeState(rig.exactRuntimeHandle(view))
 }
 
-function fixtureWorkerPid(processes: string, provider: string): number {
-  const line = processes.split('\n').find((candidate) => (
-    candidate.includes('fresh-agent-fixture-worker')
-    && candidate.includes(`--provider ${provider}`)
-  ))
-  const pid = Number(line?.trim().match(/^(\d+)/)?.[1])
-  if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error(`fixture worker for ${provider} is absent`)
-  return pid
-}
-
 async function replacement(
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   sessionId: string,
   priorIncarnationId: string,
 ): Promise<ManagedRuntimeView> {
@@ -84,7 +74,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
     validateFreshAgentIngressInventory(process.cwd())
 
     const modeNames = MODES.map(({ mode }) => mode)
-    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {}, {
+    const rig = createManagedRuntimeBrowserRig(process.cwd(), 3, {}, {
       FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '250',
     }, 'test', {
       enabledProviders: [],
@@ -109,7 +99,9 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         expect(view.freshAgentSessionType).toBe(definition.mode)
         expect(view.provider).toBe(definition.provider)
         expect(view.containerId).toBeTruthy()
-        expect(rig.ownedContainerProcessTable(view.containerId!)).toContain('fresh-agent-fixture-worker')
+        const worker = await rig.fixtureWorkerFacts(rig.exactRuntimeHandle(view))
+        expect(worker.provider).toBe(definition.provider)
+        expect(worker.workerPid).toBeGreaterThan(1)
 
         const send = await post(info.baseUrl, info.token, `/api/panes/${tab.paneId}/send-keys`, {
           data: `deterministic turn for ${definition.mode}`,
@@ -124,9 +116,9 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
       }
 
       expect(new Set(created.map(({ view }) => view.containerId)).size).toBe(MODES.length)
-      const volumes = created.map(({ view }) => (
-        rig.runtime.broker.receipts().find((receipt) => receipt.soulId === view.soulId)?.providerVolumeName
-      ))
+      const volumes = await Promise.all(created.map(async ({ view }) => (
+        (await rig.providerVolumeFacts(rig.exactRuntimeHandle(view))).providerVolumeName
+      )))
       expect(volumes.every(Boolean)).toBe(true)
       expect(new Set(volumes).size).toBe(MODES.length)
 
@@ -146,17 +138,12 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         const state = (await fixtureState(rig, claude.view))
         return typeof state.pendingDecisionId === 'string' ? state : null
       })
-      const decisionId = pendingState.pendingDecisionId as string
-      rig.runtime.killOwnedRuntimeExact(claude.view.containerId!)
+      const decisionId = pendingState.pendingDecisionId
+      if (!decisionId) throw new Error('observed pending fixture decision required')
+      await rig.crashRuntimeHost(rig.exactRuntimeHandle(claude.view))
       const recoveredClaude = await replacement(rig, claude.sessionId, claude.view.incarnationId)
       expect(recoveredClaude.nativeSessionId).toBe(claude.view.nativeSessionId)
-      const epoch = await rig.controlEpoch()
-      await rig.runtime.adminOk(rig.supervisor, rig.runtime.freshAgentResolveBody(
-        recoveredClaude.soulId,
-        decisionId,
-        { behavior: 'allow' },
-        epoch,
-      ))
+      await rig.allowFixtureDecision(rig.exactRuntimeHandle(recoveredClaude), decisionId)
       await waitFor('exactly-once pending completion', async () => {
         const state = (await fixtureState(rig, recoveredClaude))
         return state.pendingDecisionId === null && state.dispatchCount === 2
@@ -164,11 +151,8 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
       })
 
       const codex = created[2]
-      const workerPid = fixtureWorkerPid(
-        rig.ownedContainerProcessTable(codex.view.containerId!),
-        'codex',
-      )
-      rig.runtime.killOwnedRuntimePidExact(codex.view.containerId!, workerPid)
+      expect((await rig.fixtureWorkerFacts(rig.exactRuntimeHandle(codex.view))).provider).toBe('codex')
+      await rig.crashFixtureWorker(rig.exactRuntimeHandle(codex.view))
       const recoveredCodex = await replacement(rig, codex.sessionId, codex.view.incarnationId)
       expect(recoveredCodex.nativeSessionId).toBe(codex.view.nativeSessionId)
       expect((await fixtureState(rig, recoveredCodex)).dispatchCount).toBe(1)

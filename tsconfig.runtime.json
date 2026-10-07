@@ -22,6 +22,7 @@
     "scripts/testing/opencode-restoration-rehearsal.ts",
     "scripts/testing/runtime-test-broker.ts",
     "scripts/testing/runtime-native-feasibility.ts",
+    "scripts/testing/runtime-external-browser.ts",
     "scripts/testing/runtime-phase5-soak.ts",
     "scripts/testing/runtime-soak-evidence.ts",
     "scripts/testing/runtime-landing-campaign.ts",

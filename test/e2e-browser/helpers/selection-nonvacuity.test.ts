@@ -6,6 +6,7 @@ import { LOCAL_ONLY_SPECS } from '../playwright.config.js'
 import { CLOUD_SKIP_SPECS, CLOUD_SKIP_TITLES } from '../playwright.cloud.config.js'
 import { createE2eServerHandle } from './external-target.js'
 import { assertRustServerInfo, RustServer } from './rust-server.js'
+import { EXTERNAL_DESCRIPTOR_KEYS, EXTERNAL_SELECTION_KEYS } from '../../../scripts/testing/runtime-external-browser.js'
 
 const require = createRequire(import.meta.url)
 const projectRoot = path.resolve(import.meta.dirname, '../../..')
@@ -26,6 +27,8 @@ function cleanEnvironment(overrides: Record<string, string> = {}): NodeJS.Proces
   const env = { ...process.env }
   delete env.CI
   delete env.FRESHELL_SMOKE
+  for (const key of [...EXTERNAL_DESCRIPTOR_KEYS, ...EXTERNAL_SELECTION_KEYS,
+    'FRESHELL_RUNTIME_EXTERNAL_SPEC', 'FRESHELL_RUNTIME_EXTERNAL_GREP']) delete env[key]
   return { ...env, ...overrides }
 }
 
@@ -94,6 +97,43 @@ function listedSpecFiles(output: string): Set<string> {
 }
 
 describe('browser selection non-vacuity', () => {
+  const fixtureSpec = 'test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts'
+  const external = {
+    FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+    FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws',
+    FRESHELL_E2E_TARGET_TOKEN: 'private-listing-token',
+    FRESHELL_RUNTIME_EXTERNAL_RUN_ID: 'b8c53aab-d4f8-4153-bb7d-0873a7dcce90',
+    FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: 'a'.repeat(40),
+    FRESHELL_RUNTIME_EXTERNAL_SPEC: fixtureSpec,
+  }
+
+  it('positively lists the requested owned external managed case on the Cloud project', () => {
+    const listed = listedProjects(cleanEnvironment({ ...external, FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST: '1' }), cloudConfig, [
+      '--project=chromium-external-target', fixtureSpec,
+    ])
+    expect(listed.tests).toBe(1)
+    expect(listed.files).toBe(1)
+    expect(listed.output).toContain('all modes share activation and exact-native recovery without provider access')
+  })
+
+  it('fails before selection when an external managed descriptor lacks the exact fixture opt-in', () => {
+    const listed = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
+      '--project=chromium-external-target', '--list', fixtureSpec], {
+      cwd: projectRoot, env: cleanEnvironment(external), encoding: 'utf8',
+    })
+    expect(listed.status).not.toBe(0)
+    expect(`${listed.stdout}${listed.stderr}`).toContain('FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST')
+  })
+
+  it('does not count an external grep matching no requested cases', () => {
+    const listed = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
+      '--project=chromium-external-target', '--list', fixtureSpec, '--grep', 'absent managed scenario'], {
+      cwd: projectRoot, env: cleanEnvironment({ ...external, FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST: '1' }), encoding: 'utf8',
+    })
+    expect(listed.status).not.toBe(0)
+    expect(`${listed.stdout}${listed.stderr}`).toMatch(/No tests found/)
+  })
+
   it('resolves only Rust application projects with the exact continuity exclusion', () => {
     const defaultProjects = resolvedConfig(playwrightConfig, cleanEnvironment())
     expect(defaultProjects.map((project) => project.name)).toEqual(['chromium'])

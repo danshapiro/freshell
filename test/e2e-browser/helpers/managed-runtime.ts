@@ -1,6 +1,8 @@
 import { ManagedRuntimeOwner } from '../../../scripts/testing/runtime-sandbox.js'
 import { RustServer } from './rust-server.js'
 import type { E2eServerInfo } from './server-fixture-support.js'
+import { resolveManagedExternalDescriptor } from '../../../scripts/testing/runtime-external-browser.js'
+import { ExternalManagedRuntimeRig } from './external-managed-runtime.js'
 
 export {
   P2_OPENCODE_VERSION, P2_OPENCODE_MODEL,
@@ -17,4 +19,16 @@ export class ManagedRuntimeBrowserRig extends ManagedRuntimeOwner {
   async start(): Promise<E2eServerInfo> {
     return super.start()
   }
+}
+
+export type ManagedFixtureRig = ManagedRuntimeBrowserRig | ExternalManagedRuntimeRig
+
+export function createManagedRuntimeBrowserRig(...args: ConstructorParameters<typeof ManagedRuntimeBrowserRig>): ManagedFixtureRig {
+  const descriptor = resolveManagedExternalDescriptor(process.env)
+  if (!descriptor) return new ManagedRuntimeBrowserRig(...args)
+  const configured = args[5] ?? { enabledProviders: ['opencode'] }
+  return new ExternalManagedRuntimeRig(descriptor, fetch, {
+    phase: args[1] ?? 2, enabledProviders: [...configured.enabledProviders],
+    freshAgentModes: [...(configured.freshAgentModes ?? [])], fixtureFreshAgentModes: [...(configured.fixtureFreshAgentModes ?? [])],
+  })
 }
