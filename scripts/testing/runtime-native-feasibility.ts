@@ -260,8 +260,8 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'claude' && caseId === 'create') {
-    return executeManagedTerminalClaude(harness, sources, caseId)
+  if (selection.provider === 'claude' && ['create', 'wrong-root', 'exact-resume', 'current-native-turn'].includes(caseId)) {
+    return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
   if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
     return executeManagedAmplifier(harness, sources, caseId, serverPath, servers)
@@ -412,7 +412,10 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
 }
 
 async function executeManagedTerminalClaude(harness: RuntimeHarness,
-  sources: { name: string; path: string; sha256: string }[], caseId: string): Promise<NativeExperimentOriginal> {
+  sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath?: string,
+  servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
+  const resumes = ['exact-resume', 'current-native-turn'].includes(caseId)
+  if (resumes && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   const grants = (['env_file', 'ca_file'] as const).map((suffix) => {
     const file = sources.find((source) => source.name === `claude/grants/${suffix}`)
     if (!file) throw new Error(`selected terminal Claude ${suffix} reference missing`)
@@ -423,21 +426,79 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   const scenario = `claude-${caseId}`
   const workspace = path.join(harness.testRoot, `${scenario}-workspace`)
   fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
+  // Select the same ordinary user file on create and controller reissue.
+  // The supported config directory keeps preferences in that selected root.
+  const home = path.join(harness.testRoot, 'native-source/claude')
+  const userRoot = path.join(home, '.claude')
+  const preferencePath = path.join(userRoot, '.claude.json')
+  fs.mkdirSync(userRoot, { recursive: true, mode: 0o700 })
+  fs.copyFileSync(preferences.path, preferencePath)
+  fs.chmodSync(preferencePath, 0o600)
   const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release',
-    env: { FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude' } })
+    env: { HOME: home, FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude' } })
   const soulId = 'soul-' + randomUUID()
   const nativeRoot = randomUUID()
+  const actualRoot = caseId === 'wrong-root' ? randomUUID() : nativeRoot
+  let managedPreparation: any
+  if (resumes) {
+    const { RustServer } = await import('../../test/e2e-browser/helpers/rust-server.js')
+    const server = new RustServer({ homeDir: home, preserveHomeOnStop: true,
+      env: { FRESHELL_BIND_HOST: '0.0.0.0', FRESHELL_MANAGED_RUNTIME_V1: '1',
+        FRESHELL_RUNTIME_CONTROL_SOCKET: supervisor.controlSocket,
+        FRESHELL_RUNTIME_CONTROL_SECRET_FILE: supervisor.controlSecretFile,
+        FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude',
+        FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE: grants[0]!.sourcePath,
+        FRESHELL_MANAGED_CLAUDE_ONECLI_CA_FILE: grants[1]!.sourcePath },
+      stripEnvPrefixes: ['GEMINI_', 'GOOGLE_API_KEY', 'ANTHROPIC_', 'CLAUDE_', 'OPENAI_', 'LUNAROUTE_'],
+      setupHome: async (selectedHome) => {
+        const config = path.join(selectedHome, '.freshell'); fs.mkdirSync(config, { recursive: true, mode: 0o700 })
+        fs.writeFileSync(path.join(config, 'config.json'), JSON.stringify({ version: 1, settings: {
+          defaultCwd: workspace, codingCli: { enabledProviders: ['claude'], providers: { claude: { model: 'claude-haiku-4-5-20251001', reasoningEffort: 'low' } } },
+        } }), { mode: 0o600 })
+      } })
+    const owned = { server, scope: scenario, pid: undefined as number | undefined }; servers.push(owned)
+    const previous = process.env.FRESHELL_E2E_RUST_SERVER_BIN
+    process.env.FRESHELL_E2E_RUST_SERVER_BIN = serverPath
+    try {
+      const info = await server.start(); owned.pid = info.pid
+      harness.writeArtifact(`${scenario}-server-private.json`, { ...info, ...server.processEvidence(),
+        executableSha256: createHash('sha256').update(fs.readFileSync(serverPath!)).digest('hex') })
+    } finally {
+      if (previous === undefined) delete process.env.FRESHELL_E2E_RUST_SERVER_BIN
+      else process.env.FRESHELL_E2E_RUST_SERVER_BIN = previous
+    }
+    managedPreparation = await new Promise((resolve, reject) => {
+      const socket = createConnection(path.join(path.dirname(supervisor.controlSocket), 'mcp.sock'))
+      const chunks: Buffer[] = []
+      socket.setTimeout(5_000, () => socket.destroy(new Error('actual native capability issue timed out')))
+      socket.once('connect', () => socket.end(JSON.stringify({ action: 'issue', controlSecret: supervisor.controlSecret,
+        soulId, incarnationId: null, grantId: null, provider: 'claude', tuiSource: null, workspace, cwd: workspace })))
+      socket.on('data', (chunk: Buffer) => chunks.push(chunk))
+      socket.once('error', reject)
+      socket.once('end', () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))) } catch { reject(new Error('actual native capability issue failed')) }
+      })
+    })
+    harness.writeArtifact(`${scenario}-managed-preparation-private.json`, managedPreparation)
+    if (!managedPreparation.context?.mcpCapability || !managedPreparation.secretReferences?.length) {
+      throw new Error('actual native managed capability/preparation missing')
+    }
+  }
+  const settings = JSON.stringify({ hooks: {
+    SessionStart: [{ hooks: [{ type: 'command', command: 'sh -lc \'d="$HOME/.freshell/session-signals/claude"; n=$(date +%s%N 2>/dev/null); case "$n" in *[!0-9]*|"") n="$(date +%s)000000000";; esac; f="$d/${FRESHELL_TERMINAL_ID:-unknown}__$n-$$"; mkdir -p "$d" && cat > "$f.tmp" && mv "$f.tmp" "$f.json"\' 2>/dev/null || true' }] }],
+    Stop: [{ hooks: [{ type: 'command', command: "printf '%s\\n' '{\"terminalSequence\":\"\\u0007\"}'" }] }],
+  } })
   const request = { method: 'launch', params: { soulId, provider: 'claude', providerStoreId: 'store-' + randomUUID(),
     nativeSessionId: nativeRoot, creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: scenario,
     limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
     terminal: { terminalId: 'native-terminal-' + randomUUID(), streamId: 'native-stream-' + randomUUID(),
-      mode: 'claude', program: 'claude', args: ['--settings', '{}', '--session-id', nativeRoot,
+      mode: 'claude', program: 'claude', args: ['--settings', settings, '--session-id', actualRoot,
         '--model', 'claude-haiku-4-5-20251001', '--effort', 'low'],
-      env: { HOME: '/home/freshell/provider', TERM: 'xterm-256color' },
+      env: { HOME: '/home/freshell/provider', CLAUDE_CONFIG_DIR: '/home/freshell/provider/.claude', TERM: 'xterm-256color' },
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
-      providerModel: 'claude-haiku-4-5-20251001', providerReasoningEffort: 'low', providerSecretReferences: grants,
-      providerBootstrapFiles: [{ sourcePath: preferences.path, providerRelativePath: '.claude.json' }],
-      providerLaunchContext: { preparation: { claude: { mcp_args: [] } }, config: [] } } } }
+      providerModel: 'claude-haiku-4-5-20251001', providerReasoningEffort: 'low', providerSecretReferences: managedPreparation?.secretReferences ?? grants,
+      providerLaunchContext: managedPreparation?.context ?? { preparation: { claude: { mcp_args: [] } }, config: [{ root: 'user_provider',
+        relativePath: '.claude.json', providerRelativePath: '.claude/.claude.json', format: 'json' }] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
   const result = await harness.adminOk(supervisor, request)
   harness.writeArtifact(`${scenario}-launch.json`, result)
@@ -445,6 +506,9 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   const deadline = Date.now() + 50_000
   while (!view.nativeIdentityObservation && Date.now() < deadline) {
     harness.writeArtifact(`${scenario}-terminal-output-private.json`, await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId)))
+    // Refresh asynchronous PTY evidence through the existing host snapshot
+    // probe before reading the registry's stored observation.
+    harness.writeArtifact(`${scenario}-store-probe.json`, await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId)))
     const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
     harness.writeArtifact(`${scenario}-inventory.json`, inventory)
     view = inventory.data.find((row: any) => row.soulId === soulId)
@@ -452,28 +516,128 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   harness.writeArtifact(`${scenario}-current-view.json`, view)
+  const nativeSignals = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId,
+    '65534:0', ['python3', '-c', String.raw`
+import pathlib,json,os,hashlib,base64
+selected=pathlib.Path('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe')
+expected=hashlib.sha256(selected.read_bytes()).hexdigest();processes=[]
+for p in pathlib.Path('/proc').iterdir():
+ if not p.name.isdigit():continue
+ try:
+  if hashlib.sha256((p/'exe').read_bytes()).hexdigest()!=expected:continue
+  env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(b'\0') if b'=' in v)
+  directory=env.get('FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR');signals=[]
+  for name in ['session-start.json','statusline-loaded.json']:
+   try:
+    f=pathlib.Path(directory)/name if directory else None
+    raw=f.read_bytes() if f else None
+    if raw is not None and len(raw)>65536:signals.append({'name':name,'error':'oversized'});continue
+    signals.append({'name':name,'bytesBase64':base64.b64encode(raw).decode() if raw is not None else None,'sha256':hashlib.sha256(raw).hexdigest() if raw is not None else None})
+   except OSError as e:signals.append({'name':name,'errno':e.errno})
+  processes.append({'pid':int(p.name),'executableSha256':expected,'launch':json.loads(env['FRESHELL_NATIVE_IDENTITY_LAUNCH']) if env.get('FRESHELL_NATIVE_IDENTITY_LAUNCH') else None,'signalDir':directory,'signals':signals})
+ except (OSError,ValueError):continue
+print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':processes}))
+`]))
+  harness.writeArtifact(`${scenario}-signal-native-private.json`, nativeSignals)
   const observation = view.nativeIdentityObservation
-  if (!observation || view.recoveryState !== 'live' || observation.source !== 'claude_native_event'
-    || observation.nativeSessionId !== nativeRoot || view.nativeSessionId !== nativeRoot
-    || observation.incarnationId !== view.incarnationId) throw new Error('terminal Claude current post-load observation missing')
+  const currentObservation = !!observation && view.recoveryState === 'live' && observation.source === 'claude_native_event'
+    && observation.nativeSessionId === nativeRoot && view.nativeSessionId === nativeRoot
+    && observation.incarnationId === view.incarnationId
+  if (caseId === 'wrong-root' ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-    ['python3', '-c', claudeNativeInspection, nativeRoot, 'false', 'terminal']))
+    ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
   harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
   if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
     || !namespace.readOnlyRoot || namespace.httpsStatus !== 200 || namespace.tlsVerifyMode !== 2 || !namespace.tlsCheckHostname
     || !namespace.version.startsWith('2.1.263') || namespace.loaded?.native?.version !== '2.1.263'
-    || namespace.loaded.native.session_id !== nativeRoot || namespace.loaded.native.model?.id !== 'claude-haiku-4-5-20251001'
+    || namespace.loaded.native.session_id !== actualRoot || namespace.loaded.native.model?.id !== 'claude-haiku-4-5-20251001'
     || namespace.loaded.native.workspace?.current_dir !== workspace
     || JSON.stringify(namespace.loaded.launch) !== JSON.stringify(namespace.hook.launch)) {
     throw new Error('actual terminal Claude pin/profile/namespace/TLS differs')
+  }
+  const assertions = caseId === 'wrong-root' ? [{ name: 'wrong-current-native-root-refused-before-input', pass: false }]
+    : [{ name: 'actual-terminal-current-native-post-load-observation-before-input', pass:
+      observation.nativeSessionId === namespace.loaded.native.session_id && observation.incarnationId === view.incarnationId }]
+  if (caseId === 'wrong-root') {
+    const rejected = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned blocked startup probe. Do not use tools.\r'))
+    harness.writeArtifact(`${scenario}-input-refusal.json`, rejected)
+    const after = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+      ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
+    harness.writeArtifact(`${scenario}-after-refused-input-native-private.json`, after)
+    // This PTY input boundary uses RecoveryBlocked when its current native
+    // observation is unavailable; inspect the provider state separately.
+    assertions[0]!.pass = !observation && actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
+      && rejected.result?.Err?.code === 'RECOVERY_BLOCKED'
+      && JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
+      && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0
+    if (!assertions[0]!.pass) throw new Error('wrong current native root released ordinary input or changed native state')
+  }
+  if (resumes) {
+    const inspect = async (containerId: string, label: string) => {
+      const current = JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
+        ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
+      harness.writeArtifact(`${scenario}-${label}-native-private.json`, current)
+      return current
+    }
+    // Count completed native model IDs, never the transport's input ACK.
+    const turn = async (containerId: string, text: string, label: string) => {
+      const before = await inspect(containerId, label + '-before-input')
+      harness.writeArtifact(`${scenario}-${label}-dispatch.json`, await harness.adminOk(supervisor,
+        harness.terminalInputBody(soulId, text + '\r')))
+      const deadline = Date.now() + 90_000
+      while (Date.now() < deadline) {
+        const current = await inspect(containerId, label)
+        harness.writeArtifact(`${scenario}-${label}-terminal-private.json`, await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId)))
+        if (current.toolEvents > before.toolEvents) throw new Error('ordinary terminal Claude seed unexpectedly requested a tool')
+        if (current.completedTurns > before.completedTurns && current.transcript?.completeEof) return current
+        await new Promise((resolve) => setTimeout(resolve, 200))
+      }
+      throw new Error('bounded ordinary terminal Claude turn deadline exceeded')
+    }
+    const marker = 'owned-memory-' + randomUUID()
+    const seed = await turn(view.containerId, `Remember this private marker: ${marker}. Reply stored. Do not use tools.`, 'seed')
+    const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
+    harness.writeArtifact(`${scenario}-completed-store-probe.json`, probe)
+    if (probe.data.kind !== 'reattach_ready') throw new Error('completed terminal Claude store not readable before death')
+    await harness.killOwnedRuntimeExact(view.containerId)
+    await harness.waitForContainerExit(view.containerId)
+    const recovery = await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+    harness.writeArtifact(`${scenario}-recovery.json`, recovery)
+    const replacement = recovery.data.view
+    if (recovery.data.outcome !== 'replaced' || replacement.incarnationId === view.incarnationId
+      || replacement.nativeSessionId !== nativeRoot || replacement.recoveryState !== 'live'
+      || replacement.nativeIdentityObservation?.source !== 'claude_native_event'
+      || replacement.nativeIdentityObservation?.nativeSessionId !== nativeRoot) throw new Error('terminal Claude exact-root replacement failed')
+    const restored = await inspect(replacement.containerId, 'after-death')
+    const retainedTranscript = seed.transcript.sha256 === restored.transcript?.sha256
+      && seed.transcript.identity[0] === restored.transcript?.identity[0]
+      && seed.transcript.identity[1] === restored.transcript?.identity[1]
+    if (!retainedTranscript) throw new Error('terminal Claude original owned transcript continuity lost')
+    const retainedProfile = JSON.stringify(seed.profileFiles.slice(0, 3)) === JSON.stringify(restored.profileFiles.slice(0, 3))
+      && JSON.stringify(seed.nativePreferences) === JSON.stringify(restored.nativePreferences)
+      && restored.loaded.native.model.id === 'claude-haiku-4-5-20251001' && restored.loaded.native.workspace.current_dir === workspace
+    if (!retainedProfile || restored.hook.native.source !== 'resume' || restored.hook.native.session_id !== nativeRoot
+      || restored.loaded.launch.incarnationId !== replacement.incarnationId || restored.hook.launch.launchNonce === namespace.hook.launch.launchNonce) {
+      throw new Error('terminal Claude current exact-resume profile/loader differs')
+    }
+    assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
+      { name: 'replacement-new-incarnation-same-native-root', pass: replacement.incarnationId !== view.incarnationId && replacement.nativeSessionId === nativeRoot },
+      { name: 'original-owned-volume-transcript-continuity', pass: retainedTranscript },
+      { name: 'same-workspace-selected-native-profile', pass: retainedProfile },
+      { name: 'current-native-resume-observation-before-replacement-input', pass: restored.hook.native.source === 'resume' && restored.hook.native.session_id === nativeRoot })
+    if (caseId === 'current-native-turn') {
+      const recalled = await turn(replacement.containerId, 'Reply with only the private marker from before. Do not use tools.', 'recall')
+      if (recalled.lastAssistantText.trim() !== marker || recalled.toolEvents !== 0) throw new Error('terminal Claude native restored context/tool-free recall differs')
+      assertions.push({ name: 'actual-restored-context-private-marker-recall', pass: recalled.lastAssistantText.trim() === marker },
+        { name: 'native-turns-requested-no-tools', pass: seed.toolEvents === 0 && recalled.toolEvents === 0 })
+    }
   }
   const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
     nativeVersion: namespace.version, executableSha256: namespace.executableSha256,
     profileSha256: createHash('sha256').update(JSON.stringify({ preferences: preferences.sha256, profileFiles: namespace.profileFiles,
       model: namespace.loaded.native.model.id, workspace })).digest('hex'),
     artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace-native-private.json`],
-    assertions: [{ name: 'actual-terminal-current-native-post-load-observation-before-input', pass:
-      observation.nativeSessionId === namespace.loaded.native.session_id && observation.incarnationId === view.incarnationId },
+    assertions: [...assertions,
     { name: 'actual-terminal-global-pin-distinct-from-sdk-child', pass: namespace.version.startsWith('2.1.263')
       && namespace.loaded.native.version === '2.1.263' },
     { name: 'actual-terminal-selected-model-workspace-profile', pass: namespace.loaded.native.model.id === 'claude-haiku-4-5-20251001'
@@ -1068,10 +1232,10 @@ opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),
 with opener.open(urllib.request.Request('https://api.anthropic.com/v1/models',headers={'anthropic-version':'2023-06-01','authorization':'Bearer '+env['CLAUDE_CODE_OAUTH_TOKEN']}),timeout=20) as r:status=r.status;r.read()
 home=pathlib.Path(env.get('CLAUDE_CONFIG_DIR') or str(pathlib.Path(env['HOME'])/'.claude'));cwd=pathlib.Path(hook['native']['cwd']);profile=[]
 files=[home/'settings.json',cwd/'.claude/settings.json',cwd/'.claude/settings.local.json']
-if terminal:files.append(pathlib.Path(env['HOME'])/'.claude.json')
+if terminal:files.append(home/'.claude.json')
 for file in files:
  profile.append({'path':str(file),'sha256':hashlib.sha256(file.read_bytes()).hexdigest() if file.exists() else None})
-transcript=None;file=pathlib.Path(hook['native']['transcript_path'])
+transcript=None;rows=[];file=pathlib.Path(hook['native']['transcript_path'])
 if file.exists():
  with file.open('rb') as f:
   before=os.fstat(f.fileno());raw=f.read();after=os.fstat(f.fileno())
@@ -1080,7 +1244,13 @@ if file.exists():
  rows=[json.loads(line) for line in raw.splitlines() if line.strip()];assert all(row.get('sessionId',root)==root for row in rows)
  transcript={'identity':identity(after),'sha256':hashlib.sha256(raw).hexdigest(),'completeEof':True,'bytesBase64':base64.b64encode(raw).decode(),'rowCount':len(rows)}
 assert not required or transcript is not None
-print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':root,'hook':hook,'loaded':loaded,'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
+assistants=[row for row in rows if row.get('type')=='assistant'];tool_events=sum(part.get('type')=='tool_use' for row in assistants for part in row.get('message',{}).get('content',[]) if isinstance(part,dict))
+completed_ids={row['message']['id'] for row in assistants if row.get('message',{}).get('stop_reason')=='end_turn' and row['message'].get('id')}
+last_text=''.join(part.get('text','') for part in (assistants[-1].get('message',{}).get('content',[]) if assistants else []) if isinstance(part,dict) and part.get('type')=='text')
+preferences=json.loads((home/'.claude.json').read_text()) if terminal else None
+native_preferences={key:preferences.get(key) for key in ['theme','hasCompletedOnboarding']} if preferences else None
+if native_preferences is not None:native_preferences['workspaceTrust']=preferences.get('projects',{}).get(str(cwd),{}).get('hasTrustDialogAccepted')
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':root,'hook':hook,'loaded':loaded,'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'nativePreferences':native_preferences,'completedTurns':len(completed_ids),'toolEvents':tool_events,'lastAssistantText':last_text,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
 `
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

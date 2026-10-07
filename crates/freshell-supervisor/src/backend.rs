@@ -1065,7 +1065,10 @@ fn runtime_tmpfs(mode: Option<&str>) -> std::collections::BTreeMap<String, Strin
             "rw,exec,nosuid,nodev,size=64m,mode=1777".to_string(),
         );
     }
-    if matches!(mode, Some("claude" | "codex" | "opencode" | "amplifier")) {
+    if matches!(
+        mode,
+        Some("claude" | "kilroy" | "codex" | "opencode" | "amplifier")
+    ) {
         mounts.insert(
             "/run/freshell-private".to_string(),
             "rw,noexec,nosuid,nodev,size=16m,mode=0700".to_string(),
@@ -2014,6 +2017,165 @@ mod tests {
         assert!(matches!(
             verify_inspect_config(&handle, &inspected),
             Err(BackendError::OwnershipMismatch(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn kilroy_creation_and_ownership_use_the_native_familys_private_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let daemon = tokio::spawn(async move {
+            let mut created = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    raw.push(byte[0]);
+                    if raw.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header = String::from_utf8(raw).unwrap();
+                let length: usize = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                let (status, response) = if header.starts_with("GET /v1.47/info ") {
+                    (
+                        200,
+                        json!({"ID":"owned-daemon", "SecurityOptions":["name=rootless"]}),
+                    )
+                } else {
+                    assert!(
+                        header.starts_with("POST /v1.47/containers/create?"),
+                        "unexpected owned Docker request"
+                    );
+                    created.push(serde_json::from_slice::<Value>(&body).unwrap());
+                    (201, json!({"Id":format!("{:064x}",created.len())}))
+                };
+                let response = serde_json::to_vec(&response).unwrap();
+                stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).as_bytes()).await.unwrap();
+                stream.write_all(&response).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+            created
+        });
+        let binary = root.path().join("host");
+        std::fs::write(&binary, b"owned-host").unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let backend = DockerEngineBackend::new(&socket);
+        let mut handles = Vec::new();
+        for (index, provider) in ["claude", "kilroy"].into_iter().enumerate() {
+            let incarnation_id =
+                IncarnationId::parse(format!("owned-incarnation-{index}")).unwrap();
+            let soul_id = SoulId::parse(format!("owned-soul-{index}")).unwrap();
+            let installation_id = InstallationId::parse("owned-installation").unwrap();
+            let runtime_dir = root.path().join(incarnation_id.as_str());
+            std::fs::create_dir(&runtime_dir).unwrap();
+            let actor_dir = host_actor_state_dir(root.path(), &installation_id, &soul_id);
+            std::fs::create_dir_all(&actor_dir).unwrap();
+            std::fs::set_permissions(&actor_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
+                "sessionId":format!("owned-session-{index}"),"provider":provider,
+                "sessionType":if provider=="kilroy" {"kilroy"} else {"freshclaude"},
+                "runtimeVariant":if provider=="kilroy" {"kilroy-claude-agent-sdk"} else {"claude-agent-sdk"},
+                "providerStoreId":format!("owned-store-{index}"),"cwd":workspace,"workspacePath":workspace,
+                "runAsUid":65534,"runAsGid":0
+            })).unwrap();
+            let spec = CreateRuntimeSpec {
+                installation_id: installation_id.clone(),
+                soul_id: soul_id.clone(),
+                incarnation_id: incarnation_id.clone(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                host_binary_path: binary.clone(),
+                runtime_dir: runtime_dir.clone(),
+                limits: RuntimeLimits {
+                    cpu_milli: 500,
+                    memory_bytes: 128 * 1024 * 1024,
+                    swap_bytes: 0,
+                    pids_max: 64,
+                },
+                test_run_id: "owned-kilroy-private-mount".into(),
+                terminal: None,
+                fresh_agent: Some(agent.clone()),
+                opencode_transfer_dir: None,
+                provider_volume_name: format!("freshell-provider-{index:024x}"),
+            };
+            let created = backend.create_stopped(&spec).await.unwrap();
+            handles.push(
+                OwnedRuntimeHandle::from_registry(
+                    installation_id,
+                    soul_id.clone(),
+                    soul_id.to_string(),
+                    incarnation_id,
+                    LaunchNonce::new(),
+                    created.daemon_id,
+                    created.container_id,
+                    spec.image_ref,
+                    runtime_dir,
+                    binary.clone(),
+                    created.immutable_config_digest,
+                    spec.limits,
+                    None,
+                    None,
+                    Some(agent),
+                    spec.provider_volume_name,
+                )
+                .with_launch_policy(Some(
+                    freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1,
+                )),
+            );
+        }
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), daemon)
+            .await
+            .unwrap()
+            .unwrap();
+        let inspect = |body: &Value| {
+            let mounts = body["HostConfig"]["Binds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|bind| {
+                    let parts = bind.as_str().unwrap().split(':').collect::<Vec<_>>();
+                    let mut mount = json!({"Destination":parts[1],"RW":parts[2]=="rw"});
+                    mount[if parts[0].starts_with("freshell-provider-") {
+                        "Name"
+                    } else {
+                        "Source"
+                    }] = json!(parts[0]);
+                    mount
+                })
+                .collect::<Vec<_>>();
+            json!({"Image":body["Image"],"Config":{"Labels":body["Labels"],"Env":body["Env"]},"HostConfig":body["HostConfig"],"Mounts":mounts})
+        };
+        let mut kilroy = inspect(&created[1]);
+        // A physical enclosure with the native family's existing private mount
+        // must qualify while keeping its own logical Kilroy labels/environment.
+        kilroy["HostConfig"]["Tmpfs"] = created[0]["HostConfig"]["Tmpfs"].clone();
+        assert!(verify_inspect_config(&handles[1], &kilroy).is_ok());
+        assert!(verify_inspect_config(&handles[1], &inspect(&created[1])).is_ok());
+        assert!(verify_saved_immutable_digest(&handles[1]).is_ok());
+        kilroy["HostConfig"]["Tmpfs"]
+            .as_object_mut()
+            .unwrap()
+            .remove("/run/freshell-private");
+        assert!(matches!(
+            verify_inspect_config(&handles[1], &kilroy),
+            Err(BackendError::PolicyMismatch(_))
+        ));
+        let mut changed = inspect(&created[1]);
+        changed["HostConfig"]["Tmpfs"]["/run/freshell-private"] = json!("rw,exec,size=32m");
+        assert!(matches!(
+            verify_inspect_config(&handles[1], &changed),
+            Err(BackendError::PolicyMismatch(_))
         ));
     }
 

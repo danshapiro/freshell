@@ -25,23 +25,112 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
-  it('sends terminal Claude through its own real launch route with the selected profile', async () => {
+  it('requires the actual owned controller artifact before terminal exact-resume can start a seed', async () => {
+    const launch = vi.fn()
+    const harness = { startSupervisor: launch } as unknown as RuntimeHarness
+    await expect(executeManagedNativeCase(harness, [], { provider: 'claude', case: 'startup' }, 'exact-resume'))
+      .rejects.toThrow('actual terminal recovery requires the owned real server artifact')
+    expect(launch).not.toHaveBeenCalled()
+  })
+  it.each(['create', 'wrong-root'])('sends terminal Claude %s through its real launch route with the selected profile', async (caseId) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-claude-route-'))
-    const launch = vi.fn(async () => { throw new Error('controlled terminal launch boundary') })
+    const launch = vi.fn(async (_supervisor: unknown, request: any) => {
+      expect(request.params.terminal.providerBootstrapFiles).toBeUndefined()
+      const selected = request.params.terminal.providerLaunchContext.config.find((file: any) => file.providerRelativePath === '.claude/.claude.json')
+      expect(selected.root).toBe('user_provider')
+      const preferences = JSON.parse(fs.readFileSync(path.join(directory, 'native-source/claude/.claude', selected.relativePath), 'utf8'))
+      expect(preferences.projects[request.params.terminal.cwd].hasTrustDialogAccepted).toBe(true)
+      throw new Error('controlled terminal launch boundary')
+    })
     const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '', adminOk: launch } as unknown as RuntimeHarness
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({
       name: 'claude/' + name, path: path.join(directory, path.basename(name)), sha256: 'e'.repeat(64) }))
+    fs.writeFileSync(sources[2]!.path, JSON.stringify({ theme: 'dark', hasCompletedOnboarding: true,
+      projects: { [path.join(directory, `claude-${caseId}-workspace`)]: { hasTrustDialogAccepted: true } } }))
     try {
-      await expect(executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, 'create'))
+      await expect(executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, caseId))
         .rejects.toThrow('controlled terminal launch boundary')
       expect(launch).toHaveBeenCalledOnce()
       const request = (launch.mock.calls[0] as any)[1]
       expect(request.params.provider).toBe('claude')
       expect(request.params.terminal.mode).toBe('claude')
-      expect(request.params.terminal.providerBootstrapFiles[0].providerRelativePath).toBe('.claude.json')
       expect(request.params.terminal.resumeSessionId).toBeUndefined()
+      const actualRoot = request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1]
+      if (caseId === 'wrong-root') expect(actualRoot).not.toBe(request.params.nativeSessionId)
+      else expect(actualRoot).toBe(request.params.nativeSessionId)
       expect(request.params.fixture).toBeUndefined()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+  it('captures current provider-owned terminal signals before a startup refusal tears down the enclosure', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-signal-failure-'))
+    const source = path.join(directory, 'preferences.json')
+    fs.writeFileSync(source, '{}')
+    const records = new Map<string, unknown>()
+    const capture = vi.fn(async (_container: string, uid: string) => {
+      expect(uid).toBe('65534:0')
+      return JSON.stringify({ processes: [{ pid: 7, signals: [] }] })
+    })
+    let now = 0
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now += 60_000)
+    const harness = { testRoot: directory, startSupervisor: async () => ({}),
+      writeArtifact: (name: string, value: unknown) => records.set(name, value),
+      adminOk: async (_supervisor: unknown, request: any) => {
+        if (request.method === 'launch') return { data: { view: { containerId: 'owned-native-container', recoveryState: 'live' } } }
+        if (request.method === 'inventory') return { data: [] }
+        return { data: {} }
+      }, execOwnedContainerAsExact: capture,
+    } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
+    try {
+      await expect(executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, 'create'))
+        .rejects.toThrow('terminal Claude current post-load observation missing')
+      expect(capture).toHaveBeenCalledOnce()
+      expect(capture.mock.calls[0]?.[0]).toBe('owned-native-container')
+      expect(records.get('claude-create-signal-native-private.json')).toEqual({ processes: [{ pid: 7, signals: [] }] })
+    } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+  it.each(['create', 'wrong-root', 'wrong-root-admitted'])('refreshes the current host and protects the terminal %s verdict', async (fault) => {
+    const caseId = fault === 'create' ? 'create' : 'wrong-root'
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-observation-refresh-'))
+    const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
+    let request: any
+    let refreshed = false
+    let now = 0
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now += 25_000)
+    const view = () => ({ soulId: request.params.soulId, containerId: 'owned-container', incarnationId: 'owned-incarnation',
+      recoveryState: 'live', nativeSessionId: request.params.nativeSessionId,
+      nativeIdentityObservation: refreshed && caseId === 'create' ? { nativeSessionId: request.params.nativeSessionId,
+        incarnationId: 'owned-incarnation', source: 'claude_native_event' } : undefined })
+    const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '',
+      inventoryBody: () => ({ method: 'inventory' }), terminalReadOutputBody: () => ({ method: 'terminal_read_output' }),
+      probeRecoveryBody: () => ({ method: 'probe_recovery' }),
+      terminalInputBody: () => ({ method: 'terminal_input' }),
+      adminRaw: async () => ({ result: fault === 'wrong-root-admitted' ? { Ok: {} } : { Err: { code: 'RECOVERY_BLOCKED' } } }),
+      adminOk: async (_supervisor: unknown, body: any) => {
+        if (body.method === 'launch') { request = body; return { data: { view: view() } } }
+        if (body.method === 'probe_recovery') { refreshed = true; return { data: { kind: 'unknown' } } }
+        return { data: body.method === 'inventory' ? [view()] : {} }
+      },
+      execOwnedContainerAsExact: async (_container: string, _uid: string, args: string[]) => JSON.stringify(args.at(-1) === 'terminal'
+        ? { uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200,
+          tlsVerifyMode: 2, tlsCheckHostname: true, version: '2.1.263', executableSha256: 'f'.repeat(64), profileFiles: [],
+          transcript: null, hook: { launch: {}, native: { session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1] } },
+          loaded: { launch: {}, native: { version: '2.1.263', session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1],
+            context_window: { total_input_tokens: 0, total_output_tokens: 0 },
+            model: { id: 'claude-haiku-4-5-20251001' }, workspace: { current_dir: request.params.terminal.cwd } } } }
+        : { processes: [] }),
+    } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
+    try {
+      const execution = executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, caseId)
+      if (fault === 'wrong-root-admitted') {
+        await expect(execution).rejects.toThrow('wrong current native root released ordinary input')
+        return
+      }
+      const original = await execution
+      expect(refreshed).toBe(true)
+      expect(original.assertions.every((assertion) => assertion.pass)).toBe(true)
+    } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
   })
   it.each(['death', 'published', 'cached', 'redispatch'])('protects the native post-effect observation boundary (%s)', async (fault) => {
     const publishedOutcome = fault === 'published'
