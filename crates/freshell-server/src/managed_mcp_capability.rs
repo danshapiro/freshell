@@ -7695,7 +7695,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 logical_path: config.clone(),
                 canonical_source: config.clone(),
                 lane: SourceLane::Main,
-                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Global,
             }],
             &workspace,
             &home,
