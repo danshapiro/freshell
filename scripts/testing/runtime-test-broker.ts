@@ -80,6 +80,8 @@ export class RestrictedDockerBroker {
     return new Set([...this.knownContainerIds, ...[...this.historyHelpers.values()].flatMap((helper) => helper.containerId ? [helper.containerId] : [])])
   }
 
+  historyHelperNames(): string[] { return [...this.historyHelpers.keys()] }
+
   eventsSnapshot(): BrokerEvent[] {
     return [...this.events]
   }

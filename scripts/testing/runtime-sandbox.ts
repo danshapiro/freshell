@@ -21,6 +21,73 @@ export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
 export const PHASE2_RUNTIME_IMAGE_TAG = 'freshell-managed-runtime:phase2'
 export const CONTROL_PROTOCOL_VERSION = 2
 
+type RunOwnedRuntimeImage = { tag: string; runId: string; candidateSha: string; digest?: string }
+
+export function assertRunOwnedRuntimeImage(observed: unknown, context: RunOwnedRuntimeImage): void {
+  const parsed = z.array(z.object({ Id: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+    RepoTags: z.array(z.string()), Config: z.object({ Labels: z.record(z.string(), z.string()) }) })).length(1).safeParse(observed)
+  const image = parsed.success ? parsed.data[0] : undefined
+  if (!image || (context.digest && image.Id !== context.digest) || !image.RepoTags.includes(context.tag)
+    || image.Config.Labels['com.freshell.runtime-test-run-id'] !== context.runId
+    || image.Config.Labels['com.freshell.runtime-test-candidate'] !== context.candidateSha) {
+    throw new Error('runtime image is not the exact owned artifact')
+  }
+}
+
+export function removeRunOwnedRuntimeImage(context: RunOwnedRuntimeImage, execute: typeof execFileSync = execFileSync): void {
+  const tags = () => String(execute('docker', ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}'],
+    { encoding: 'utf8' })).trim().split('\n')
+  if (!tags().includes(context.tag)) return
+  const image: unknown = JSON.parse(String(execute('docker', ['image', 'inspect', context.tag], { encoding: 'utf8' })))
+  assertRunOwnedRuntimeImage(image, context)
+  execute('docker', ['image', 'rm', context.tag], { encoding: 'utf8' })
+  if (tags().includes(context.tag)) throw new Error('exact owned runtime image tag remains after cleanup')
+}
+
+function runOwnedRuntimeImageTag(runId: string, candidateSha: string): string {
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(runId)
+    || !/^[a-f0-9]{40}$/.test(candidateSha)) throw new Error('exact workload image run and candidate required')
+  return `freshell-managed-runtime:task008-${candidateSha.slice(0, 12)}-${runId}`
+}
+
+export function buildRunOwnedRuntimeImage(
+  repoRoot: string, runId: string, candidateSha: string, execute: typeof execFileSync = execFileSync,
+): { tag: string; digest: string } {
+  const tag = runOwnedRuntimeImageTag(runId, candidateSha)
+  execute('docker', ['build', '--pull=false', '--provenance=false', '--sbom=false',
+    '--label', `com.freshell.runtime-test-run-id=${runId}`, '--label', `com.freshell.runtime-test-candidate=${candidateSha}`,
+    '-f', 'docker/runtime/Dockerfile', '-t', tag, '.'], { cwd: repoRoot, stdio: 'inherit' })
+  const digest = String(execute('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })).trim()
+  if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error('run-owned runtime image has no pinned digest')
+  return { tag, digest }
+}
+
+export type RuntimeOwnerIsolation = { bootstrapProviders: readonly QualifiableTerminalProvider[] }
+
+export function runtimeProviderUserRoots(isolated: boolean, homeDir = os.homedir()): string[] {
+  if (isolated) return []
+  const roots: string[] = []
+  for (const relative of ['.claude', '.codex', '.config/opencode', '.amplifier']) {
+    try {
+      const root = fs.realpathSync(path.join(homeDir, relative))
+      if (fs.statSync(root).isDirectory()) roots.push(root)
+    } catch {}
+  }
+  return roots
+}
+
+export function verifyRuntimeCleanupAbsence(
+  expected: { containerIds: readonly string[]; volumes: readonly string[]; helperNames?: readonly string[] }, observed: unknown,
+): void {
+  const parsed = z.object({ containerIds: z.array(z.string().regex(/^[a-f0-9]{64}$/)),
+    volumes: z.array(z.string().min(1)), containerNames: z.array(z.string().min(1)).optional() }).strict().safeParse(observed)
+  if (!parsed.success) throw new Error('runtime cleanup observation is missing or malformed')
+  if (expected.helperNames?.length && !parsed.data.containerNames) throw new Error('runtime cleanup helper-name observation is missing')
+  if (expected.containerIds.some(id => parsed.data.containerIds.includes(id))
+    || expected.volumes.some(volume => parsed.data.volumes.includes(volume))
+    || expected.helperNames?.some(name => parsed.data.containerNames?.includes(name))) throw new Error('exact owned runtime resource remains after cleanup')
+}
+
 export type RuntimeLimits = {
   cpuMilli: number
   memoryBytes: number
@@ -64,6 +131,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
     'describe', 'inventory', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
+    'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-supervisor', 'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
   ]),
@@ -325,6 +393,7 @@ export class RuntimeHarness {
   readonly browserDir: string
 
   imageRef = ''
+  private ownedImage?: RunOwnedRuntimeImage
   broker!: RestrictedDockerBroker
   testSupervisorBinary = ''
   testHostBinary = ''
@@ -338,7 +407,8 @@ export class RuntimeHarness {
   private readonly assertions: AssertionRecord[] = []
   private brokerStarted = false
 
-  constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1) {
+  constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1,
+    private readonly ownerIsolation?: RuntimeOwnerIsolation) {
     this.repoRoot = fs.realpathSync(repoRoot)
     this.phase = phase
     this.runId = runId
@@ -589,11 +659,21 @@ export class RuntimeHarness {
 
   async cleanup(): Promise<{ ok: boolean; errors: string[] }> {
     const errors: string[] = []
+    const exactContainerIds = [...new Set([
+      ...this.trackedSupervisorContainers, ...this.trackedForeignContainers,
+      ...this.trackedContainers, ...this.broker?.receiptIds?.() ?? [],
+    ])]
+    const providerVolumes = new Set((this.broker?.receipts?.() ?? []).map(receipt => receipt.providerVolumeName).filter((value): value is string => !!value))
+    const exactVolumes = [...new Set([...this.trackedVolumes, ...providerVolumes])]
+    const historyHelperNames = this.broker?.historyHelperNames?.() ?? []
     for (const id of [...this.trackedSupervisorContainers]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`supervisor ${id}: ${String(error)}`) }
     }
     for (const id of [...this.broker?.receiptIds?.() ?? []]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`managed runtime ${id}: ${String(error)}`) }
+    }
+    for (const name of historyHelperNames) {
+      try { this.removeContainerExact(name) } catch (error) { errors.push(`history helper ${name}: ${String(error)}`) }
     }
     for (const id of [...this.trackedForeignContainers]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`foreign sentinel ${id}: ${String(error)}`) }
@@ -601,7 +681,6 @@ export class RuntimeHarness {
     for (const id of [...this.trackedContainers]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`tracked container ${id}: ${String(error)}`) }
     }
-    const providerVolumes = new Set((this.broker?.receipts?.() ?? []).map((receipt) => receipt.providerVolumeName).filter((value): value is string => !!value))
     for (const volume of providerVolumes) {
       try { docker(['volume', 'rm', volume]) } catch (error) { errors.push(`provider volume ${volume}: ${String(error)}`) }
     }
@@ -612,20 +691,34 @@ export class RuntimeHarness {
       try { await this.broker.close() } catch (error) { errors.push(`broker close: ${String(error)}`) }
       this.brokerStarted = false
     }
+    let resourcesAbsent = false
+    try {
+      const lines = (text: string) => text.trim() ? text.trim().split('\n').map(value => value.trim()) : []
+      verifyRuntimeCleanupAbsence({ containerIds: exactContainerIds, volumes: exactVolumes, helperNames: historyHelperNames }, {
+        containerIds: lines(docker(['ps', '-aq', '--no-trunc'])),
+        volumes: lines(docker(['volume', 'ls', '--format', '{{.Name}}'])),
+        containerNames: lines(docker(['ps', '-a', '--format', '{{.Names}}'])),
+      })
+      resourcesAbsent = true
+    } catch (error) { errors.push(`runtime absence: ${error instanceof Error ? error.message : String(error)}`) }
+    if (resourcesAbsent && this.ownedImage) {
+      try { removeRunOwnedRuntimeImage(this.ownedImage) }
+      catch (error) { errors.push(`runtime image cleanup: ${error instanceof Error ? error.message : String(error)}`) }
+    }
     // Build copies are unique to this run, so retries/concurrent gates never
     // overwrite an executable that another still-running container/process
     // has mapped. Remove them only after every receipt-owned runtime stopped.
-    try { fs.rmSync(this.buildDir, { recursive: true, force: true }) } catch (error) { errors.push(`runtime build dir: ${String(error)}`) }
+    if (resourcesAbsent) {
+      try { fs.rmSync(this.buildDir, { recursive: true, force: true }) } catch (error) { errors.push(`runtime build dir: ${String(error)}`) }
+    }
     const cleanup = {
       ok: errors.length === 0,
       errors,
-      exactContainerIds: [...new Set([
-        ...this.trackedSupervisorContainers,
-        ...this.trackedForeignContainers,
-        ...this.trackedContainers,
-        ...this.broker?.receiptIds?.() ?? [],
-      ])],
-      volumes: [...this.trackedVolumes, ...providerVolumes],
+      exactContainerIds,
+      volumes: exactVolumes,
+      historyHelperNames,
+      verifiedResourcesAbsent: resourcesAbsent,
+      ownedImage: this.ownedImage,
       unsafeBrokerAttempts: this.broker?.unsafeAttempts?.() ?? [],
       completedAt: new Date().toISOString(),
     }
@@ -1543,6 +1636,14 @@ export class RuntimeHarness {
   }
 
   private ensureRuntimeImage(): void {
+    if (this.ownerIsolation && this.phase >= 2) {
+      this.ownedImage = { tag: runOwnedRuntimeImageTag(this.runId, this.candidateSha), runId: this.runId, candidateSha: this.candidateSha }
+      const image = buildRunOwnedRuntimeImage(this.repoRoot, this.runId, this.candidateSha)
+      this.ownedImage.digest = image.digest
+      this.imageRef = image.digest
+      this.recordLifecycle('runtime.owned_image_built', { tag: image.tag, digest: image.digest })
+      return
+    }
     const tag = this.phase === 1 ? PHASE1_RUNTIME_IMAGE_TAG : PHASE2_RUNTIME_IMAGE_TAG
     let inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
     if (this.phase === 1) {
@@ -1576,6 +1677,7 @@ export class RuntimeHarness {
 
   private phase2BootstrapFiles(): string[] {
     if (this.task2FiniteFixtures) return []
+    if (this.ownerIsolation) return [...new Set(this.ownerIsolation.bootstrapProviders.flatMap(provider => configuredProviderOnecliGrantFiles(provider, process.env)))]
     return phase2BootstrapFiles()
   }
 
@@ -1590,15 +1692,7 @@ export class RuntimeHarness {
   }
 
   private phase2ProviderUserRoots(): string[] {
-    if (this.task2FiniteFixtures) return []
-    const roots: string[] = []
-    for (const relative of ['.claude', '.codex', '.config/opencode', '.amplifier']) {
-      try {
-        const root = fs.realpathSync(path.join(os.homedir(), relative))
-        if (fs.statSync(root).isDirectory()) roots.push(root)
-      } catch {}
-    }
-    return roots
+    return runtimeProviderUserRoots(this.task2FiniteFixtures || Boolean(this.ownerIsolation))
   }
 
   private buildBinaries(): void {
@@ -1897,6 +1991,7 @@ export class ManagedRuntimeOwner {
   private readonly freshAgentModes: string[]
   private readonly fixtureFreshAgentModes: string[]
   private qualificationSupervisorBin: string | undefined
+  private stopSettlement?: Promise<{ ok: boolean; errors: string[] }>
 
   constructor(
     private readonly webFactory: RuntimeWebFactory,
@@ -1912,9 +2007,10 @@ export class ManagedRuntimeOwner {
       fixtureFreshAgentModes?: string[]
     } = { enabledProviders: ['opencode'] },
     webHomeDir?: string,
+    ownerIsolation?: RuntimeOwnerIsolation,
   ) {
     this.repoRoot = fs.realpathSync(repoRoot)
-    this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase)
+    this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase, ownerIsolation)
     this.serverEnv = { ...serverEnv }
     this.webHomeDir = webHomeDir
     this.supervisorEnv = { ...supervisorEnv }
@@ -2030,6 +2126,13 @@ export class ManagedRuntimeOwner {
     return this.info
   }
 
+  fixtureRegistrationFacts(): {
+    phase: number; enabledProviders: string[]; freshAgentModes: string[]; fixtureFreshAgentModes: string[]
+  } {
+    return { phase: this.runtime.phase, enabledProviders: [...this.enabledProviders],
+      freshAgentModes: [...this.freshAgentModes], fixtureFreshAgentModes: [...this.fixtureFreshAgentModes] }
+  }
+
   async restartWebGracefully(): Promise<RuntimeWebInfo> {
     return this.withManagedBin(() => this.web.restart())
   }
@@ -2077,11 +2180,26 @@ export class ManagedRuntimeOwner {
   }
 
   async stop(): Promise<{ ok: boolean; errors: string[] }> {
-    const result = await settleOwnedRuntimeCleanup(async () => { await this.web?.stop() }, () => this.runtime.cleanup())
-    const cleanupPath = path.join(this.runtime.evidenceDir, 'cleanup.json')
-    const runtimeCleanup = JSON.parse(fs.readFileSync(cleanupPath, 'utf8'))
-    this.runtime.writeArtifact('cleanup.json', { ...runtimeCleanup, ...result })
-    return result
+    if (this.stopSettlement) return this.stopSettlement
+    this.stopSettlement = (async () => {
+      const result = await settleOwnedRuntimeCleanup(async () => { await this.web?.stop() }, () => this.runtime.cleanup())
+      const cleanupPath = path.join(this.runtime.evidenceDir, 'cleanup.json')
+      let runtimeCleanup: Record<string, unknown> = {}
+      try { runtimeCleanup = objectFields(JSON.parse(fs.readFileSync(cleanupPath, 'utf8')), 'invalid owner cleanup artifact') }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          result.errors.push(`cleanup artifact: ${error instanceof Error ? error.message : String(error)}`)
+          result.ok = false
+        }
+      }
+      this.runtime.writeArtifact('cleanup.json', { ...runtimeCleanup, ...result })
+      return result
+    })()
+    try {
+      const result = await this.stopSettlement
+      if (!result.ok) this.stopSettlement = undefined
+      return result
+    } catch (error) { this.stopSettlement = undefined; throw error }
   }
 
   async destroyTestRig(): Promise<{ ok: boolean; errors: string[] }> {
@@ -2184,6 +2302,15 @@ export class ManagedRuntimeOwner {
   async crashFixtureWorker(handle: ExactRuntimeHandle): Promise<void> {
     const { workerPid } = await this.fixtureWorkerFacts(handle)
     this.runtime.killOwnedRuntimePidExact(handle.containerId, workerPid)
+  }
+
+  async allowFixtureDecision(handle: ExactRuntimeHandle, decisionId: string): Promise<void> {
+    await this.assertCurrentHandle(handle)
+    const state = await this.fixtureNativeState(handle)
+    if (!decisionId || state.pendingDecisionId !== decisionId) throw new Error('exact actually pending fixture decision required')
+    await this.runtime.adminOk(this.supervisor, this.runtime.freshAgentResolveBody(
+      handle.soulId, decisionId, { behavior: 'allow' }, await this.controlEpoch(),
+    ))
   }
 
   async fixtureNativeState(handle: ExactRuntimeHandle): Promise<FixtureNativeState> {

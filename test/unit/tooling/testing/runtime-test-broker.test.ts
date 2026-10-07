@@ -438,6 +438,7 @@ describe('receipt-owned read-only history HTTP routes', () => {
       loseHelperAck()
       expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, historyHelperBody())).status).toBe(503)
       expect(broker.receiptIds().has(helperId)).toBe(false)
+      expect(broker.historyHelperNames()).toEqual([helperName])
       const before = forwarded.length
       expect((await request('DELETE', '/v1.47/containers/freshell-history-22222222-2222-4222-8222-222222222222?force=1')).status).toBe(403)
       expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(403)
