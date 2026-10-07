@@ -25,6 +25,13 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it('requires the actual owned controller artifact before terminal exact-resume can start a seed', async () => {
+    const launch = vi.fn()
+    const harness = { startSupervisor: launch } as unknown as RuntimeHarness
+    await expect(executeManagedNativeCase(harness, [], { provider: 'claude', case: 'startup' }, 'exact-resume'))
+      .rejects.toThrow('actual terminal recovery requires the owned real server artifact')
+    expect(launch).not.toHaveBeenCalled()
+  })
   it.each(['create', 'wrong-root'])('sends terminal Claude %s through its real launch route with the selected profile', async (caseId) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-claude-route-'))
     const launch = vi.fn(async (_supervisor: unknown, request: any) => {

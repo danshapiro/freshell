@@ -260,8 +260,8 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'claude' && ['create', 'wrong-root'].includes(caseId)) {
-    return executeManagedTerminalClaude(harness, sources, caseId)
+  if (selection.provider === 'claude' && ['create', 'wrong-root', 'exact-resume', 'current-native-turn'].includes(caseId)) {
+    return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
   if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
     return executeManagedAmplifier(harness, sources, caseId, serverPath, servers)
@@ -412,7 +412,10 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
 }
 
 async function executeManagedTerminalClaude(harness: RuntimeHarness,
-  sources: { name: string; path: string; sha256: string }[], caseId: string): Promise<NativeExperimentOriginal> {
+  sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath?: string,
+  servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
+  const resumes = ['exact-resume', 'current-native-turn'].includes(caseId)
+  if (resumes && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   const grants = (['env_file', 'ca_file'] as const).map((suffix) => {
     const file = sources.find((source) => source.name === `claude/grants/${suffix}`)
     if (!file) throw new Error(`selected terminal Claude ${suffix} reference missing`)
@@ -436,6 +439,51 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   const soulId = 'soul-' + randomUUID()
   const nativeRoot = randomUUID()
   const actualRoot = caseId === 'wrong-root' ? randomUUID() : nativeRoot
+  let managedPreparation: any
+  if (resumes) {
+    const { RustServer } = await import('../../test/e2e-browser/helpers/rust-server.js')
+    const server = new RustServer({ homeDir: home, preserveHomeOnStop: true,
+      env: { FRESHELL_BIND_HOST: '0.0.0.0', FRESHELL_MANAGED_RUNTIME_V1: '1',
+        FRESHELL_RUNTIME_CONTROL_SOCKET: supervisor.controlSocket,
+        FRESHELL_RUNTIME_CONTROL_SECRET_FILE: supervisor.controlSecretFile,
+        FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude',
+        FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE: grants[0]!.sourcePath,
+        FRESHELL_MANAGED_CLAUDE_ONECLI_CA_FILE: grants[1]!.sourcePath },
+      stripEnvPrefixes: ['GEMINI_', 'GOOGLE_API_KEY', 'ANTHROPIC_', 'CLAUDE_', 'OPENAI_', 'LUNAROUTE_'],
+      setupHome: async (selectedHome) => {
+        const config = path.join(selectedHome, '.freshell'); fs.mkdirSync(config, { recursive: true, mode: 0o700 })
+        fs.writeFileSync(path.join(config, 'config.json'), JSON.stringify({ version: 1, settings: {
+          defaultCwd: workspace, codingCli: { enabledProviders: ['claude'], providers: { claude: { model: 'claude-haiku-4-5-20251001', reasoningEffort: 'low' } } },
+        } }), { mode: 0o600 })
+      } })
+    const owned = { server, scope: scenario, pid: undefined as number | undefined }; servers.push(owned)
+    const previous = process.env.FRESHELL_E2E_RUST_SERVER_BIN
+    process.env.FRESHELL_E2E_RUST_SERVER_BIN = serverPath
+    try {
+      const info = await server.start(); owned.pid = info.pid
+      harness.writeArtifact(`${scenario}-server-private.json`, { ...info, ...server.processEvidence(),
+        executableSha256: createHash('sha256').update(fs.readFileSync(serverPath!)).digest('hex') })
+    } finally {
+      if (previous === undefined) delete process.env.FRESHELL_E2E_RUST_SERVER_BIN
+      else process.env.FRESHELL_E2E_RUST_SERVER_BIN = previous
+    }
+    managedPreparation = await new Promise((resolve, reject) => {
+      const socket = createConnection(path.join(path.dirname(supervisor.controlSocket), 'mcp.sock'))
+      const chunks: Buffer[] = []
+      socket.setTimeout(5_000, () => socket.destroy(new Error('actual native capability issue timed out')))
+      socket.once('connect', () => socket.end(JSON.stringify({ action: 'issue', controlSecret: supervisor.controlSecret,
+        soulId, incarnationId: null, grantId: null, provider: 'claude', tuiSource: null, workspace, cwd: workspace })))
+      socket.on('data', (chunk: Buffer) => chunks.push(chunk))
+      socket.once('error', reject)
+      socket.once('end', () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))) } catch { reject(new Error('actual native capability issue failed')) }
+      })
+    })
+    harness.writeArtifact(`${scenario}-managed-preparation-private.json`, managedPreparation)
+    if (!managedPreparation.context?.mcpCapability || !managedPreparation.secretReferences?.length) {
+      throw new Error('actual native managed capability/preparation missing')
+    }
+  }
   const settings = JSON.stringify({ hooks: {
     SessionStart: [{ hooks: [{ type: 'command', command: 'sh -lc \'d="$HOME/.freshell/session-signals/claude"; n=$(date +%s%N 2>/dev/null); case "$n" in *[!0-9]*|"") n="$(date +%s)000000000";; esac; f="$d/${FRESHELL_TERMINAL_ID:-unknown}__$n-$$"; mkdir -p "$d" && cat > "$f.tmp" && mv "$f.tmp" "$f.json"\' 2>/dev/null || true' }] }],
     Stop: [{ hooks: [{ type: 'command', command: "printf '%s\\n' '{\"terminalSequence\":\"\\u0007\"}'" }] }],
@@ -448,8 +496,8 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
         '--model', 'claude-haiku-4-5-20251001', '--effort', 'low'],
       env: { HOME: '/home/freshell/provider', CLAUDE_CONFIG_DIR: '/home/freshell/provider/.claude', TERM: 'xterm-256color' },
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
-      providerModel: 'claude-haiku-4-5-20251001', providerReasoningEffort: 'low', providerSecretReferences: grants,
-      providerLaunchContext: { preparation: { claude: { mcp_args: [] } }, config: [{ root: 'user_provider',
+      providerModel: 'claude-haiku-4-5-20251001', providerReasoningEffort: 'low', providerSecretReferences: managedPreparation?.secretReferences ?? grants,
+      providerLaunchContext: managedPreparation?.context ?? { preparation: { claude: { mcp_args: [] } }, config: [{ root: 'user_provider',
         relativePath: '.claude.json', providerRelativePath: '.claude/.claude.json', format: 'json' }] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
   const result = await harness.adminOk(supervisor, request)
@@ -523,6 +571,66 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
       && JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
       && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0
     if (!assertions[0]!.pass) throw new Error('wrong current native root released ordinary input or changed native state')
+  }
+  if (resumes) {
+    const inspect = async (containerId: string, label: string) => {
+      const current = JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
+        ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
+      harness.writeArtifact(`${scenario}-${label}-native-private.json`, current)
+      return current
+    }
+    // Count completed native model IDs, never the transport's input ACK.
+    const turn = async (containerId: string, text: string, label: string) => {
+      const before = await inspect(containerId, label + '-before-input')
+      harness.writeArtifact(`${scenario}-${label}-dispatch.json`, await harness.adminOk(supervisor,
+        harness.terminalInputBody(soulId, text + '\r')))
+      const deadline = Date.now() + 90_000
+      while (Date.now() < deadline) {
+        const current = await inspect(containerId, label)
+        harness.writeArtifact(`${scenario}-${label}-terminal-private.json`, await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId)))
+        if (current.toolEvents > before.toolEvents) throw new Error('ordinary terminal Claude seed unexpectedly requested a tool')
+        if (current.completedTurns > before.completedTurns && current.transcript?.completeEof) return current
+        await new Promise((resolve) => setTimeout(resolve, 200))
+      }
+      throw new Error('bounded ordinary terminal Claude turn deadline exceeded')
+    }
+    const marker = 'owned-memory-' + randomUUID()
+    const seed = await turn(view.containerId, `Remember this private marker: ${marker}. Reply stored. Do not use tools.`, 'seed')
+    const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
+    harness.writeArtifact(`${scenario}-completed-store-probe.json`, probe)
+    if (probe.data.kind !== 'reattach_ready') throw new Error('completed terminal Claude store not readable before death')
+    await harness.killOwnedRuntimeExact(view.containerId)
+    await harness.waitForContainerExit(view.containerId)
+    const recovery = await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+    harness.writeArtifact(`${scenario}-recovery.json`, recovery)
+    const replacement = recovery.data.view
+    if (recovery.data.outcome !== 'replaced' || replacement.incarnationId === view.incarnationId
+      || replacement.nativeSessionId !== nativeRoot || replacement.recoveryState !== 'live'
+      || replacement.nativeIdentityObservation?.source !== 'claude_native_event'
+      || replacement.nativeIdentityObservation?.nativeSessionId !== nativeRoot) throw new Error('terminal Claude exact-root replacement failed')
+    const restored = await inspect(replacement.containerId, 'after-death')
+    const retainedTranscript = seed.transcript.sha256 === restored.transcript?.sha256
+      && seed.transcript.identity[0] === restored.transcript?.identity[0]
+      && seed.transcript.identity[1] === restored.transcript?.identity[1]
+    if (!retainedTranscript) throw new Error('terminal Claude original owned transcript continuity lost')
+    const retainedProfile = JSON.stringify(seed.profileFiles.slice(0, 3)) === JSON.stringify(restored.profileFiles.slice(0, 3))
+      && JSON.stringify(seed.nativePreferences) === JSON.stringify(restored.nativePreferences)
+      && restored.loaded.native.model.id === 'claude-haiku-4-5-20251001' && restored.loaded.native.workspace.current_dir === workspace
+    if (!retainedProfile || restored.hook.native.source !== 'resume' || restored.hook.native.session_id !== nativeRoot
+      || restored.loaded.launch.incarnationId !== replacement.incarnationId || restored.hook.launch.launchNonce === namespace.hook.launch.launchNonce) {
+      throw new Error('terminal Claude current exact-resume profile/loader differs')
+    }
+    assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
+      { name: 'replacement-new-incarnation-same-native-root', pass: replacement.incarnationId !== view.incarnationId && replacement.nativeSessionId === nativeRoot },
+      { name: 'original-owned-volume-transcript-continuity', pass: retainedTranscript },
+      { name: 'same-workspace-selected-native-profile', pass: retainedProfile },
+      { name: 'current-native-resume-observation-before-replacement-input', pass: restored.hook.native.source === 'resume' && restored.hook.native.session_id === nativeRoot })
+    if (caseId === 'current-native-turn') {
+      const recalled = await turn(replacement.containerId, 'Reply with only the private marker from before. Do not use tools.', 'recall')
+      if (recalled.lastAssistantText.trim() !== marker || recalled.toolEvents !== 0) throw new Error('terminal Claude native restored context/tool-free recall differs')
+      assertions.push({ name: 'actual-restored-context-private-marker-recall', pass: recalled.lastAssistantText.trim() === marker },
+        { name: 'native-turns-requested-no-tools', pass: seed.toolEvents === 0 && recalled.toolEvents === 0 })
+    }
   }
   const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
     nativeVersion: namespace.version, executableSha256: namespace.executableSha256,
@@ -1127,7 +1235,7 @@ files=[home/'settings.json',cwd/'.claude/settings.json',cwd/'.claude/settings.lo
 if terminal:files.append(home/'.claude.json')
 for file in files:
  profile.append({'path':str(file),'sha256':hashlib.sha256(file.read_bytes()).hexdigest() if file.exists() else None})
-transcript=None;file=pathlib.Path(hook['native']['transcript_path'])
+transcript=None;rows=[];file=pathlib.Path(hook['native']['transcript_path'])
 if file.exists():
  with file.open('rb') as f:
   before=os.fstat(f.fileno());raw=f.read();after=os.fstat(f.fileno())
@@ -1136,7 +1244,13 @@ if file.exists():
  rows=[json.loads(line) for line in raw.splitlines() if line.strip()];assert all(row.get('sessionId',root)==root for row in rows)
  transcript={'identity':identity(after),'sha256':hashlib.sha256(raw).hexdigest(),'completeEof':True,'bytesBase64':base64.b64encode(raw).decode(),'rowCount':len(rows)}
 assert not required or transcript is not None
-print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':root,'hook':hook,'loaded':loaded,'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
+assistants=[row for row in rows if row.get('type')=='assistant'];tool_events=sum(part.get('type')=='tool_use' for row in assistants for part in row.get('message',{}).get('content',[]) if isinstance(part,dict))
+completed_ids={row['message']['id'] for row in assistants if row.get('message',{}).get('stop_reason')=='end_turn' and row['message'].get('id')}
+last_text=''.join(part.get('text','') for part in (assistants[-1].get('message',{}).get('content',[]) if assistants else []) if isinstance(part,dict) and part.get('type')=='text')
+preferences=json.loads((home/'.claude.json').read_text()) if terminal else None
+native_preferences={key:preferences.get(key) for key in ['theme','hasCompletedOnboarding']} if preferences else None
+if native_preferences is not None:native_preferences['workspaceTrust']=preferences.get('projects',{}).get(str(cwd),{}).get('hasTrustDialogAccepted')
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':root,'hook':hook,'loaded':loaded,'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'nativePreferences':native_preferences,'completedTurns':len(completed_ids),'toolEvents':tool_events,'lastAssistantText':last_text,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
 `
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
