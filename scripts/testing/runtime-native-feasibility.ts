@@ -67,6 +67,36 @@ export function nativeFeasibilityCases(selection: NativeSelection): readonly str
   return ['create', 'exact-resume', 'wrong-root', 'cancellation']
 }
 
+type NativeCheckpointSnapshot = { nativeRoot: string; transcript: {
+  identity: string[]; sha256: string; bytesBase64: string; completeEof: boolean
+} }
+export function nativeCheckpointTranscriptRetained(before: NativeCheckpointSnapshot,
+  after: NativeCheckpointSnapshot, toolUseID: string): boolean {
+  try {
+    if (!before.nativeRoot || before.nativeRoot !== after.nativeRoot || !toolUseID.startsWith('toolu_')
+      || !before.transcript.completeEof || !after.transcript.completeEof
+      || before.transcript.identity.length < 2 || after.transcript.identity.length < 2
+      || before.transcript.identity[0] !== after.transcript.identity[0]
+      || before.transcript.identity[1] !== after.transcript.identity[1]) return false
+    const original = Buffer.from(before.transcript.bytesBase64, 'base64')
+    const current = Buffer.from(after.transcript.bytesBase64, 'base64')
+    const digest = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
+    if (!original.length || original.at(-1) !== 10 || current.at(-1) !== 10
+      || digest(original) !== before.transcript.sha256 || digest(current) !== after.transcript.sha256
+      || !current.subarray(0, original.length).equals(original)) return false
+    const tail = current.subarray(original.length).toString('utf8')
+    if (tail.includes('"tool_use_id":"' + toolUseID + '"')) return false
+    // A current resumed hook may append its lifecycle rows. Neither a new
+    // operation/checkpoint nor any tool outcome can precede the user decision.
+    return tail.split('\n').filter(Boolean).every((line) => {
+      const row = JSON.parse(line)
+      return (!row.sessionId || row.sessionId === before.nativeRoot)
+        && ((row.type === 'queue-operation' && ['enqueue', 'dequeue'].includes(row.operation))
+          || (row.type === 'attachment' && row.attachment?.type === 'hook_success'))
+    })
+  } catch { return false }
+}
+
 /** Finite process dispatcher only; fixture children never establish native qualification. */
 export async function dispatchNativeFeasibility(input: {
   selection: NativeSelection
@@ -580,9 +610,9 @@ async function executeManagedNativeApproval(input: {
     || currentPayload.nativeBinding?.launch.incarnationId !== currentView.incarnationId
     || effectCount() !== 0) throw new Error('same native operation did not rebind to a fresh current request')
   const after = await inspect(currentView.containerId, 'checkpoint-after-death', true)
-  if (before.transcript.sha256 !== after.transcript.sha256
-    || before.transcript.identity[0] !== after.transcript.identity[0]
-    || before.transcript.identity[1] !== after.transcript.identity[1]) throw new Error('original native checkpoint changed across owned enclosure death')
+  if (!nativeCheckpointTranscriptRetained(before, after, oldPayload.toolUseID)) {
+    throw new Error('original native checkpoint changed across owned enclosure death')
+  }
   const decision = input.decision === 'allow' ? { behavior: 'allow', updatedInput: currentPayload.tool.input }
     : { behavior: 'deny', message: 'Denied this original owned operation' }
   const receipt = await harness.adminOk(supervisor, harness.freshAgentResolveBody(soulId, current.decision_id, decision))
@@ -603,8 +633,8 @@ async function executeManagedNativeApproval(input: {
   }
   return [{ name: 'same-native-operation-new-current-request-after-death',
     pass: currentPayload.nativeRequestId !== oldPayload.nativeRequestId && current.decision_id === old.decision_id },
-    { name: 'native-checkpoint-original-volume-continuity', pass: before.transcript.sha256 === after.transcript.sha256
-      && before.transcript.identity[1] === after.transcript.identity[1] },
+    { name: 'native-checkpoint-original-volume-continuity',
+      pass: nativeCheckpointTranscriptRetained(before, after, oldPayload.toolUseID) },
     { name: 'correlated-native-tool-result', pass: toolResult.tool_use_id === oldPayload.toolUseID
       && toolResult.is_error === (input.decision === 'deny') },
     { name: 'independent-native-effect-count', pass: count === (input.decision === 'allow' ? 1 : 0) }]

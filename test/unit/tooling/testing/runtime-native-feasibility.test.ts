@@ -6,7 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility,
+  runNativeFeasibility, nativeCheckpointTranscriptRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -193,4 +193,39 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(cleaned).toBe(true)
     },
   )
+})
+
+describe('original native checkpoint byte continuity (fixtures do not qualify providers)', () => {
+  const root = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  const toolUseID = 'toolu_original1'
+  const bytes = Buffer.from(JSON.stringify({ type: 'attachment', sessionId: root,
+    attachment: { type: 'hook_deferred_tool', toolUseID } }) + '\n')
+  const snapshot = (raw: Buffer, device = '2065', inode = '42') => ({ nativeRoot: root,
+    transcript: { bytesBase64: raw.toString('base64'), sha256: createHash('sha256').update(raw).digest('hex'),
+      completeEof: raw.at(-1) === 10, identity: [device, inode, String(raw.length)] } })
+  const lifecycle = Buffer.from(JSON.stringify({ type: 'queue-operation', operation: 'enqueue', sessionId: root }) + '\n'
+    + JSON.stringify({ type: 'attachment', sessionId: root, attachment: { type: 'hook_success' } }) + '\n')
+  it('retains the original EOF bytes and inode when native resume appends only lifecycle rows', () => {
+    expect(nativeCheckpointTranscriptRetained(snapshot(bytes), snapshot(bytes), toolUseID)).toBe(true)
+    expect(nativeCheckpointTranscriptRetained(snapshot(bytes), snapshot(Buffer.concat([bytes, lifecycle])), toolUseID)).toBe(true)
+  })
+  it.each(['mutation', 'truncation', 'replacement', 'device', 'incomplete-eof', 'tool-result', 'new-checkpoint', 'wrong-root', 'malformed-tail', 'wrong-tail-root', 'new-assistant', 'missing-identity'])(
+    'refuses actual %s before an approval decision', (fault) => {
+      const before = snapshot(bytes)
+      let raw = Buffer.concat([bytes, lifecycle])
+      if (fault === 'mutation') { raw = Buffer.from(raw); raw[10] ^= 1 }
+      if (fault === 'truncation') raw = bytes.subarray(0, bytes.length - 2)
+      if (fault === 'incomplete-eof') raw = raw.subarray(0, raw.length - 1)
+      if (fault === 'tool-result') raw = Buffer.concat([bytes, Buffer.from(JSON.stringify({ type: 'user', sessionId: root,
+        message: { content: [{ type: 'tool_result', tool_use_id: toolUseID, is_error: true }] } }) + '\n')])
+      if (fault === 'new-checkpoint') raw = Buffer.concat([bytes, bytes])
+      if (fault === 'malformed-tail') raw = Buffer.concat([bytes, Buffer.from('{broken\n')])
+      if (fault === 'wrong-tail-root') raw = Buffer.concat([bytes, Buffer.from(JSON.stringify({ type: 'queue-operation',
+        operation: 'enqueue', sessionId: 'different-native-root' }) + '\n')])
+      if (fault === 'new-assistant') raw = Buffer.concat([bytes, Buffer.from(JSON.stringify({ type: 'assistant', sessionId: root }) + '\n')])
+      const after = snapshot(raw, fault === 'device' ? '2066' : '2065', fault === 'replacement' ? '43' : '42')
+      if (fault === 'wrong-root') after.nativeRoot = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+      if (fault === 'missing-identity') { before.transcript.identity = []; after.transcript.identity = [] }
+      expect(nativeCheckpointTranscriptRetained(before, after, toolUseID)).toBe(false)
+    })
 })
