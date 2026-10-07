@@ -220,7 +220,13 @@ pub(super) fn bind_in_transaction(
     let Some(id) = reservation_reference(input) else {
         return Ok(());
     };
-    if input.native_session_id.is_some() {
+    // Ordinary resources bind to the same provider/soul/creation seed even
+    // when the launcher has already assigned an exact native identity.
+    // This does not grant native-auth lookup; OpenCode's initial auth authority
+    // still requires an identity-free creation, and host resume checks remain.
+    if input.native_session_id.is_some()
+        && !matches!(input.provider.as_str(), "codex" | "claude" | "amplifier")
+    {
         return Err(RegistryError::RequestConflict);
     }
     let changed=tx.execute(

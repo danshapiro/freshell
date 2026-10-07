@@ -2967,52 +2967,56 @@ mod tests {
     #[tokio::test]
     async fn provider_ordinary_initial_reservation_preserves_provider_identity() {
         for provider in ["codex", "claude", "amplifier"] {
-            let dir = tempfile::tempdir().unwrap();
-            let binary = dir.path().join("synthetic-host");
-            std::fs::write(&binary, "synthetic artifact").unwrap();
-            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
-            let soul = SoulId::new();
-            let request = freshell_runtime_protocol::ReserveProviderInputsRequest {
-                expected_control_epoch: Some(registry.control_epoch()),
-                soul_id: soul.clone(),
-                provider: provider.into(),
-                creation_seed_ref: "seed".into(),
-            };
-            let image = format!("sha256:{}", "a".repeat(64));
-            let reserved = registry
-                .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
-                .await
-                .expect("ordinary selected inputs require their own provider's creation authority");
-            let retry = registry
-                .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
-                .await
-                .unwrap();
-            assert_eq!(reserved.id, retry.id);
-            let mut foreign = request.clone();
-            foreign.provider = "opencode".into();
-            assert!(matches!(
-                registry
-                    .reserve_initial_inputs(foreign, image, binary)
-                    .await,
-                Err(RegistryError::RequestConflict)
-            ));
-            let receipt = registry
-                .record_initial_observation(
-                    reserved,
-                    freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
-                        daemon_id: DockerDaemonId::new(),
-                    },
-                )
-                .await
-                .unwrap();
-            assert_eq!(receipt.provider, provider);
-            let mut launch = prep(soul.clone(), RequestId::new(), "ordinary-reserved-inputs");
-            launch.provider = provider.into();
-            // Reservation binding protects actual workload preparation, regardless
-            // of which finite provider's selected ordinary resources it owns.
-            launch.terminal = Some(serde_json::from_value(serde_json::json!({
+            for native_session_id in [None, Some("fixture-native-session".to_string())] {
+                let dir = tempfile::tempdir().unwrap();
+                let binary = dir.path().join("synthetic-host");
+                std::fs::write(&binary, "synthetic artifact").unwrap();
+                let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+                let soul = SoulId::new();
+                let request = freshell_runtime_protocol::ReserveProviderInputsRequest {
+                    expected_control_epoch: Some(registry.control_epoch()),
+                    soul_id: soul.clone(),
+                    provider: provider.into(),
+                    creation_seed_ref: "seed".into(),
+                };
+                let image = format!("sha256:{}", "a".repeat(64));
+                let reserved = registry
+                    .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
+                    .await
+                    .expect(
+                        "ordinary selected inputs require their own provider's creation authority",
+                    );
+                let retry = registry
+                    .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(reserved.id, retry.id);
+                let mut foreign = request.clone();
+                foreign.provider = "opencode".into();
+                assert!(matches!(
+                    registry
+                        .reserve_initial_inputs(foreign, image, binary)
+                        .await,
+                    Err(RegistryError::RequestConflict)
+                ));
+                let receipt = registry
+                    .record_initial_observation(
+                        reserved,
+                        freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+                            daemon_id: DockerDaemonId::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(receipt.provider, provider);
+                let mut launch = prep(soul.clone(), RequestId::new(), "ordinary-reserved-inputs");
+                launch.provider = provider.into();
+                launch.native_session_id = native_session_id.clone();
+                // Reservation binding protects actual workload preparation, regardless
+                // of which finite provider's selected ordinary resources it owns.
+                launch.terminal = Some(serde_json::from_value(serde_json::json!({
                 "terminalId":"synthetic-terminal", "streamId":"synthetic-stream", "projectKey":"test-project", "mode":provider,
-                "program":provider,"args":[],"env":{}, "cwd":"/synthetic/workspace",
+                "program":provider,"args":[],"env":{},"resumeSessionId":native_session_id, "cwd":"/synthetic/workspace",
                 "workspacePath":"/synthetic/workspace","cols":80,"rows":24,"runAsUid":65534,"runAsGid":0,
                 "providerLaunchContext": {
                     "preparation":match provider {
@@ -3026,56 +3030,57 @@ mod tests {
                         "manifest":{"relativePath":".freshell/input-manifest.json","sha256":"a".repeat(64),"sourceCount":0,"aliasCount":0,"recipeCount":0}}
                 }
             })).unwrap());
-            let mut wrong = launch.clone();
-            wrong.provider = "opencode".into();
-            let workload = wrong.terminal.as_mut().unwrap();
-            workload.mode = "opencode".into();
-            workload
-                .provider_launch_context
-                .as_mut()
-                .unwrap()
-                .preparation = freshell_runtime_protocol::ProviderPreparation::Opencode {
-                project_config: vec![],
-                tui_config: None,
-                tui_source: None,
-                inline_config: false,
-            };
-            let wrong_result = registry.prepare_launch(wrong.clone()).await;
-            assert!(
-                matches!(wrong_result, Err(RegistryError::RequestConflict)),
-                "foreign provider bind outcome: {wrong_result:?}"
-            );
-            let prepared = registry.prepare_launch(launch.clone()).await.unwrap();
-            assert_eq!(
-                registry
-                    .prepare_launch(launch.clone())
+                let mut wrong = launch.clone();
+                wrong.provider = "opencode".into();
+                let workload = wrong.terminal.as_mut().unwrap();
+                workload.mode = "opencode".into();
+                workload
+                    .provider_launch_context
+                    .as_mut()
+                    .unwrap()
+                    .preparation = freshell_runtime_protocol::ProviderPreparation::Opencode {
+                    project_config: vec![],
+                    tui_config: None,
+                    tui_source: None,
+                    inline_config: false,
+                };
+                let wrong_result = registry.prepare_launch(wrong.clone()).await;
+                assert!(
+                    matches!(wrong_result, Err(RegistryError::RequestConflict)),
+                    "foreign provider bind outcome: {wrong_result:?}"
+                );
+                let prepared = registry.prepare_launch(launch.clone()).await.unwrap();
+                assert_eq!(
+                    registry
+                        .prepare_launch(launch.clone())
+                        .await
+                        .unwrap()
+                        .incarnation_id,
+                    prepared.incarnation_id
+                );
+                assert!(matches!(registry.prepare_launch(wrong).await, Err(RegistryError::RequestConflict)),
+                "a bound reservation retry cannot change provider even when its caller reuses the payload digest");
+                let mut changed_seed = launch;
+                changed_seed.creation_seed_ref = "changed-creation-seed".into();
+                assert!(
+                    matches!(
+                        registry.prepare_launch(changed_seed).await,
+                        Err(RegistryError::RequestConflict)
+                    ),
+                    "a bound reservation retry cannot change its creation seed"
+                );
+                let bound = registry
+                    .bound_input_reservation(prepared.incarnation_id)
                     .await
                     .unwrap()
-                    .incarnation_id,
-                prepared.incarnation_id
-            );
-            assert!(matches!(registry.prepare_launch(wrong).await, Err(RegistryError::RequestConflict)),
-                "a bound reservation retry cannot change provider even when its caller reuses the payload digest");
-            let mut changed_seed = launch;
-            changed_seed.creation_seed_ref = "changed-creation-seed".into();
-            assert!(
-                matches!(
-                    registry.prepare_launch(changed_seed).await,
-                    Err(RegistryError::RequestConflict)
-                ),
-                "a bound reservation retry cannot change its creation seed"
-            );
-            let bound = registry
-                .bound_input_reservation(prepared.incarnation_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(bound.reservation.soul_id, soul);
-            assert!(registry
-                .initial_input_reservation(soul, receipt.reservation_id)
-                .await
-                .unwrap()
-                .is_none());
+                    .unwrap();
+                assert_eq!(bound.reservation.soul_id, soul);
+                assert!(registry
+                    .initial_input_reservation(soul, receipt.reservation_id)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
         }
     }
 
@@ -3140,6 +3145,15 @@ mod tests {
                         "sourceCount":0,"aliasCount":0,"recipeCount":0}}
             }
         })).expect("the complete prepared context must carry its initial auth reservation"));
+        let mut existing_native = launch.clone();
+        existing_native.native_session_id = Some("preexisting-opencode-session".into());
+        assert!(
+            matches!(
+                registry.prepare_launch(existing_native).await,
+                Err(RegistryError::RequestConflict)
+            ),
+            "OpenCode initial native-auth authority must remain identity-free"
+        );
         let first = registry.prepare_launch(launch.clone()).await.unwrap();
         let replay = registry.prepare_launch(launch.clone()).await.unwrap();
         assert_eq!(first.incarnation_id, replay.incarnation_id);
