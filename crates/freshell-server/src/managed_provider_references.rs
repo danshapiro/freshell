@@ -750,9 +750,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         native_source_flags,
     } = request;
     use sources::*;
-    if original("OPENCODE_CONFIG_CONTENT").is_some_and(|value| !value.is_empty())
-        || original("OPENCODE_TUI_CONFIG").is_some_and(|value| !value.is_empty())
-    {
+    if original("OPENCODE_CONFIG_CONTENT").is_some_and(|value| !value.is_empty()) {
         return Err(
             "selected OpenCode inline/TUI source requires its owned pre-recipe view".into(),
         );
@@ -788,7 +786,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         })
         .map_err(str::to_string)?
     };
-    let loaded = read_opencode_sources(selected).map_err(|error| error.to_string())?;
+    let mut loaded = read_opencode_sources(selected).map_err(|error| error.to_string())?;
     let native_source_flags = if let Some(flags) = native_source_flags {
         flags
     } else {
@@ -827,11 +825,45 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         }
         flags
     };
-    if loaded
+    let mut retained_views = loaded
         .iter()
-        .any(|source| source.source.lane == SourceLane::Tui)
-    {
-        return Err("selected OpenCode TUI source requires its owned pre-recipe view".into());
+        .try_fold(0usize, |bytes, source| bytes.checked_add(source.view.len()))
+        .ok_or("source-view byte count overflow")?;
+    for source in &mut loaded {
+        if source.source.lane == SourceLane::Tui
+            && native_source_flags.iter().any(|flag| {
+                flag.kind == freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui
+                    && Path::new(&flag.runtime_destination)
+                        == sources::runtime_config_destination(
+                            home,
+                            &config_root,
+                            &source.source.logical_path,
+                        )
+            })
+        {
+            let remaining = (64 * 1024 * 1024usize)
+                .checked_sub(retained_views)
+                .ok_or("simultaneous source views exceed 64 MiB")?;
+            let content = freshell_platform::opencode_plugin::selected_tui_content_bounded(
+                &source.view,
+                &freshell_platform::opencode_plugin::rebind_plugin_path(Path::new(
+                    "/home/freshell/provider",
+                )), remaining,
+            )
+            .map_err(|_| {
+                format!(
+                    "selected OpenCode TUI source {} has invalid JSONC/plugin list or exceeds the source-view profile",
+                    source.source.logical_path.display()
+                )
+            })?;
+            if content.len() > 16 * 1024 * 1024 {
+                return Err("selected OpenCode effective TUI source exceeds 16 MiB".into());
+            }
+            retained_views = retained_views
+                .checked_add(content.len())
+                .ok_or("source-view byte count overflow")?;
+            source.view = std::sync::Arc::new(content);
+        }
     }
     let names = source_environment_names(&loaded).map_err(|error| error.to_string())?;
     let mut environment = environment::SourceEnvironment::read(names, &references, original)?;
@@ -848,7 +880,11 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
     } else {
         None
     };
-    if environment.needs_native_auth() {
+    if environment.needs_native_auth()
+        && loaded
+            .iter()
+            .any(|source| source.source.lane == SourceLane::Main)
+    {
         let authority = if let Some(authority) = auth_authority {
             authority.to_owned()
         } else {

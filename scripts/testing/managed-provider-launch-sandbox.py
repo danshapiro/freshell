@@ -167,7 +167,9 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
             receipt["exitCode"]=exit_code
             receipt["consumedRoutes"]=[json.loads(line.split("provider_launch_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_launch_consumer " in line]
             print(outcome.stdout,end="",flush=True);print(outcome.stderr,end="",flush=True)
-            if exit_code==0 and (len(receipt["consumedRoutes"])!=2 or "test result: ok. 1 passed;" not in outcome.stdout):
+            expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")}
+            observed_routes={(item.get("provider"),item.get("route")) for item in receipt["consumedRoutes"]}
+            if exit_code==0 and (len(receipt["consumedRoutes"])!=3 or observed_routes!=expected_routes or "test result: ok. 1 passed;" not in outcome.stdout):
                 receipt["exitCode"]=2;receipt["failureClass"]="native_startup_count_mismatch"
             (root/"broker-complete").write_text("ok")
             deadline=time.monotonic()+10

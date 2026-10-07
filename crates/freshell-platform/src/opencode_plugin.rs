@@ -122,36 +122,85 @@ pub fn ensure_rebind_plugin_with_user_config(
     let tui_json = tui_config_path(home);
     let content = if let Some(selected) = selected {
         let raw = std::fs::read_to_string(selected)?;
-        let mut config = crate::opencode_config::parse_jsonc_object(&raw).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "OpenCode TUI config contains malformed JSONC or is not an object",
-            )
-        })?;
-        let plugins = config
-            .as_object_mut()
-            .expect("validated object")
-            .entry("plugin")
-            .or_insert_with(|| serde_json::json!([]));
-        let Some(plugins) = plugins.as_array_mut() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "OpenCode TUI plugin list is not an array",
-            ));
-        };
-        let own = plugin_file_spec(&plugin);
-        if !plugins
-            .iter()
-            .any(|entry| entry.as_str() == Some(own.as_str()))
-        {
-            plugins.push(serde_json::Value::String(own));
-        }
-        config.to_string()
+        selected_tui_content(&raw, &plugin)?
     } else {
         tui_config_content(&plugin)
     };
     write_atomic_if_changed(&tui_json, &content)?;
     Ok(tui_json)
+}
+
+/// Normalize the selected source before reference spans are captured. This
+/// function never resolves environment or file tokens and never changes the
+/// declaring origin.
+pub fn selected_tui_content(raw: &str, plugin: &Path) -> std::io::Result<String> {
+    selected_tui_content_bounded(raw, plugin, 16 * 1024 * 1024)
+}
+
+pub fn selected_tui_content_bounded(
+    raw: &str,
+    plugin: &Path,
+    remaining: usize,
+) -> std::io::Result<String> {
+    let mut config = crate::opencode_config::parse_jsonc_object(raw).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "OpenCode TUI config contains malformed JSONC or is not an object",
+        )
+    })?;
+    let plugins = config
+        .as_object_mut()
+        .expect("validated object")
+        .entry("plugin")
+        .or_insert_with(|| serde_json::json!([]));
+    let Some(plugins) = plugins.as_array_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "OpenCode TUI plugin list is not an array",
+        ));
+    };
+    let own = plugin_file_spec(plugin);
+    if !plugins
+        .iter()
+        .any(|entry| entry.as_str() == Some(own.as_str()))
+    {
+        plugins.push(serde_json::Value::String(own));
+    }
+    struct BoundedView {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl Write for BoundedView {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self
+                .bytes
+                .len()
+                .checked_add(bytes.len())
+                .is_none_or(|size| size > self.limit)
+            {
+                return Err(std::io::Error::other(
+                    "OpenCode effective TUI source-view profile exceeded",
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut view = BoundedView {
+        bytes: Vec::new(),
+        limit: remaining.min(16 * 1024 * 1024),
+    };
+    serde_json::to_writer(&mut view, &config).map_err(std::io::Error::other)?;
+    String::from_utf8(view.bytes).map_err(std::io::Error::other)
+}
+
+/// Install only the implementation when the controller already prepared the
+/// selected TUI source. Re-parsing that source here would change recipe spans.
+pub fn ensure_rebind_plugin_source(home: &Path) -> std::io::Result<()> {
+    write_atomic_if_changed(&rebind_plugin_path(home), REBIND_PLUGIN_SOURCE)
 }
 
 #[cfg(test)]

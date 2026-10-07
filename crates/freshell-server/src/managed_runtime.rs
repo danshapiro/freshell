@@ -180,43 +180,12 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             };
             let args = managed_provider_args(&request.mode, request.spec.args)?;
             let request_id = stable_request_id(create_key)?;
-            let tui_source = if request.mode == "opencode" {
-                request
-                    .env
-                    .get("OPENCODE_TUI_CONFIG")
-                    .map(|raw| {
-                        let home = std::env::var_os("HOME")
-                            .map(std::path::PathBuf::from)
-                            .ok_or("managed provider HOME is unavailable")?;
-                        crate::managed_mcp_capability::approved_tui_source(
-                            raw, &cwd, &workspace, &home,
-                        )
-                    })
-                    .transpose()?
-            } else {
-                None
+            let opencode_input = crate::managed_mcp_capability::OpencodeEphemeralInput {
+                cwd: Some(&cwd),
+                workspace: Some(&workspace),
+                ..Default::default()
             };
-            let opencode_input = if request.mode == "opencode" {
-                crate::managed_mcp_capability::OpencodeEphemeralInput {
-                    inline_config: request
-                        .env
-                        .get("OPENCODE_CONFIG_CONTENT")
-                        .map(String::as_str),
-                    tui_config_path: request.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
-                    tui_source: tui_source.as_ref(),
-                    cwd: Some(&cwd),
-                    workspace: Some(&workspace),
-                    source_plan: None,
-                    ..Default::default()
-                }
-            } else {
-                crate::managed_mcp_capability::OpencodeEphemeralInput {
-                    cwd: Some(&cwd),
-                    workspace: Some(&workspace),
-                    ..Default::default()
-                }
-            };
-            let (mcp_capability, mut provider_launch_context) = if request.mode == "opencode" {
+            let (mcp_capability, provider_launch_context) = if request.mode == "opencode" {
                 let home = request
                     .env
                     .get("HOME")
@@ -273,39 +242,6 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     )?;
                 (mcp_capability, provider_launch_context)
             };
-            if let Some(context) = provider_launch_context.as_mut() {
-                if let freshell_runtime_protocol::ProviderPreparation::Opencode {
-                    inline_config,
-                    tui_config,
-                    tui_source: context_tui_source,
-                    ..
-                } = &mut context.preparation
-                {
-                    *inline_config = opencode_input.inline_config.is_some();
-                    if opencode_input.tui_config_path.is_some() {
-                        let jsonc = opencode_input
-                            .tui_config_path
-                            .is_some_and(|path| path.to_ascii_lowercase().ends_with(".jsonc"));
-                        *tui_config = Some(freshell_runtime_protocol::ProviderConfigReference {
-                            root: freshell_runtime_protocol::ProviderConfigRoot::Ephemeral,
-                            relative_path: if jsonc {
-                                "tui-config.jsonc"
-                            } else {
-                                "tui-config.json"
-                            }
-                            .into(),
-                            provider_relative_path: if jsonc {
-                                ".freshell/opencode/user-tui.jsonc"
-                            } else {
-                                ".freshell/opencode/user-tui.json"
-                            }
-                            .into(),
-                            format: if jsonc { "jsonc" } else { "json" }.into(),
-                        });
-                        *context_tui_source = tui_source.clone();
-                    }
-                }
-            }
             if mcp_capability.is_some() && provider_launch_context.is_none() {
                 if let Some(capability) = &mcp_capability {
                     let _ =

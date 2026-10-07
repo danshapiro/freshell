@@ -119,24 +119,26 @@ pub async fn prepare_terminal(
             Some("0" | "false")
         );
         if !rebind_disabled {
+            let prepared_tui = terminal
+                .provider_launch_context
+                .as_ref()
+                .is_some_and(|context| context.prepared_inputs.is_some())
+                && child_env.contains_key("OPENCODE_TUI_CONFIG");
             let source = terminal
                 .env
                 .get("OPENCODE_TUI_CONFIG")
                 .or_else(|| child_env.get("OPENCODE_TUI_CONFIG"))
                 .cloned();
-            let mut args = vec!["opencode-rebind"];
-            if let Some(source) = source.as_deref() {
-                args.push(source);
-            }
-            prepare_provider_features_for_identity(
+            if let Some(selector) = prepare_opencode_rebind(
                 terminal.run_as_uid,
                 terminal.run_as_gid,
-                &args,
-            )?;
-            terminal.env.insert(
-                "OPENCODE_TUI_CONFIG".into(),
-                "/home/freshell/provider/.freshell/opencode/tui.json".into(),
-            );
+                prepared_tui,
+                source.as_deref(),
+            )? {
+                terminal
+                    .env
+                    .insert("OPENCODE_TUI_CONFIG".into(), selector.into());
+            }
         }
         let permission = terminal
             .env
@@ -326,18 +328,41 @@ pub fn prepare_fresh_agent_child_environment(
             .map(String::as_str),
         Some("0" | "false")
     ) {
+        let prepared_tui = launch
+            .provider_launch_context
+            .as_ref()
+            .is_some_and(|context| context.prepared_inputs.is_some())
+            && child_env.contains_key("OPENCODE_TUI_CONFIG");
         let source = child_env.get("OPENCODE_TUI_CONFIG").cloned();
-        let mut args = vec!["opencode-rebind"];
-        if let Some(source) = source.as_deref() {
-            args.push(source);
+        if let Some(selector) = prepare_opencode_rebind(
+            launch.run_as_uid,
+            launch.run_as_gid,
+            prepared_tui,
+            source.as_deref(),
+        )? {
+            child_env.insert("OPENCODE_TUI_CONFIG".into(), selector.into());
         }
-        prepare_provider_features_for_identity(launch.run_as_uid, launch.run_as_gid, &args)?;
-        child_env.insert(
-            "OPENCODE_TUI_CONFIG".into(),
-            "/home/freshell/provider/.freshell/opencode/tui.json".into(),
-        );
     }
     Ok(())
+}
+
+fn prepare_opencode_rebind(
+    uid: u32,
+    gid: u32,
+    prepared_source: bool,
+    selected: Option<&str>,
+) -> Result<Option<&'static str>, String> {
+    if prepared_source {
+        prepare_provider_features_for_identity(uid, gid, &["opencode-rebind-source"])?;
+        Ok(None)
+    } else {
+        let mut args = vec!["opencode-rebind"];
+        if let Some(selected) = selected {
+            args.push(selected);
+        }
+        prepare_provider_features_for_identity(uid, gid, &args)?;
+        Ok(Some("/home/freshell/provider/.freshell/opencode/tui.json"))
+    }
 }
 
 fn opencode_plan(
@@ -377,6 +402,10 @@ pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String
                 .open(destination)
                 .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes))
                 .map_err(|error| error.to_string())
+        }
+        [operation] if operation == "opencode-rebind-source" => {
+            freshell_platform::opencode_plugin::ensure_rebind_plugin_source(provider_home)
+                .map_err(|_| "managed OpenCode rebind plugin installation failed".into())
         }
         [operation] | [operation, _] if operation == "opencode-rebind" => {
             let selected = args.get(1).map(std::path::Path::new);

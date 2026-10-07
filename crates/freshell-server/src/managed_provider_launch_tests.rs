@@ -291,6 +291,18 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
     let explicit_rule = fixture.join("workspace/selected-rule");
     std::fs::write(&explicit_rule, "native-explicit-selected-rule").unwrap();
     std::fs::set_permissions(&explicit_rule, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let tui_plugin = fixture.join("source-home/.config/opencode/plugins/probe-tui");
+    std::fs::create_dir_all(&tui_plugin).unwrap();
+    std::fs::write(tui_plugin.join("index.mjs"), r#"import fs from 'node:fs';import crypto from 'node:crypto';
+export default {id:'closed-native-tui-fixture',async tui(api,options){
+ fs.writeFileSync(options.receipt,JSON.stringify({theme:crypto.createHash('sha256').update(api.tuiConfig.theme).digest('hex')}));
+}};
+"#).unwrap();
+    let selected_tui = fixture.join("workspace/selected-tui.jsonc");
+    let tui_receipt = fixture.join("workspace/native-tui-consumed.json");
+    let selected_tui_bytes = format!("{{ // selected origin\n\"theme\":\"{{file:./selected-theme}}\",\"plugin\":[[\"file:///home/freshell/provider/.config/opencode/plugins/probe-tui/index.mjs\",{{\"receipt\":{}}}]],}}", serde_json::to_string(&tui_receipt).unwrap());
+    std::fs::write(&selected_tui, &selected_tui_bytes).unwrap();
+    std::fs::write(fixture.join("workspace/selected-theme"), "  dark\n").unwrap();
     let request: ManagedTerminalLaunch = ManagedTerminalLaunch {
         spec: freshell_platform::spawn::SpawnSpec {
             program: "opencode".into(),
@@ -300,7 +312,10 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
             cols: 120,
             rows: 30,
         },
-        env: BTreeMap::from([("OPENCODE_CONFIG".into(), "selected-config.json".into())]),
+        env: BTreeMap::from([
+            ("OPENCODE_CONFIG".into(), "selected-config.json".into()),
+            ("OPENCODE_TUI_CONFIG".into(), "selected-tui.jsonc".into()),
+        ]),
         terminal_id: "closed-native-terminal".into(),
         stream_id: "closed-native-stream".into(),
         mode: "opencode".into(),
@@ -378,6 +393,20 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
         }
     };
     assert_eq!(terminal_receipt, expected);
+    assert_eq!(
+        read_receipt(&tui_receipt)
+            .await
+            .expect("actual TUI plugin must consume the selected effective TUI configuration"),
+        json!({"theme":format!("{:x}",Sha256::digest(b"dark"))})
+    );
+    assert_eq!(
+        std::fs::read_to_string(&selected_tui).unwrap(),
+        selected_tui_bytes
+    );
+    println!(
+        "provider_launch_consumer {}",
+        json!({"provider":"opencode","route":"terminal-tui","digest":format!("{:x}",Sha256::digest(b"dark"))})
+    );
     assert_eq!(std::fs::read(&original_config).unwrap(), original_bytes);
     assert_eq!(std::fs::read(&explicit_config).unwrap(), explicit_bytes);
     println!(
@@ -392,6 +421,7 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
     // Fresh launches use current server controls; the terminal exercised a
     // request-only relative control. Both must activate the explicit layer.
     std::env::set_var("OPENCODE_CONFIG", &explicit_config);
+    std::env::set_var("OPENCODE_TUI_CONFIG", &selected_tui);
     let (broadcast, _) = tokio::sync::broadcast::channel(256);
     let mut events = broadcast.subscribe();
     let proxy = crate::fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(

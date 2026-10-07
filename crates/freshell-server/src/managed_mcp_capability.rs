@@ -3488,6 +3488,91 @@ except Exception as error:
     }
 
     #[tokio::test]
+    async fn managed_provider_selected_tui_keeps_origin_and_applies_owned_edits_before_references()
+    {
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let config = workspace.join("selected-tui.jsonc");
+        let raw = "{ // original comment\n\"theme\":\"{file:./theme.txt}\",\"plugin\":[],}";
+        std::fs::write(&config, raw).unwrap();
+        let theme = workspace.join("theme.txt");
+        std::fs::write(&theme, "dark").unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let prepared = crate::managed_provider_references::prepare_managed_opencode_with_publisher(
+            crate::managed_provider_references::OpencodePreparation {
+                client: &client,
+                soul: &soul,
+                creation_seed: "fixture-existing-soul",
+                home: &home,
+                cwd: &workspace,
+                workspace: &workspace,
+                original: &|name| {
+                    (name == "OPENCODE_TUI_CONFIG").then(|| "selected-tui.jsonc".into())
+                },
+                references: vec![],
+                auth_authority: Some("fixture-owned-attempt"),
+                selected_sources: None,
+                native_source_flags: None,
+            },
+            |soul, home, context, input| {
+                let capability = store.issue(
+                    soul.clone(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("opencode", home, &context.config)),
+                    OpencodeEphemeralInput {
+                        launch_context: Some(context),
+                        ..input
+                    },
+                    None,
+                )?;
+                read_prepared_context(&directory, &capability)
+            },
+        )
+        .await
+        .expect("selected TUI must remain supported through the shared managed producer");
+        let stage = staged_provider_root_path(
+            &directory,
+            &prepared.context.mcp_capability.as_ref().unwrap().grant_id,
+        )
+        .unwrap();
+        let manifest: freshell_platform::opencode_recipe::SourceManifest = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.native_source_flags.len(), 1);
+        assert_eq!(
+            manifest.native_source_flags[0].kind.variable(),
+            "OPENCODE_TUI_CONFIG"
+        );
+        let effective =
+            std::fs::read_to_string(stage.join(&manifest.sources[0].unexpanded_relative_path))
+                .unwrap();
+        let effective: serde_json::Value = serde_json::from_str(&effective).unwrap();
+        assert_eq!(effective["theme"], "{file:./theme.txt}");
+        assert_eq!(
+            effective["plugin"],
+            serde_json::json!([
+                "file:///home/freshell/provider/.freshell/opencode/freshell-rebind-plugin.ts"
+            ]),
+            "selected rebind normalization must precede the source view used by reference recipes"
+        );
+        assert_eq!(prepared.references[0].source_path, theme.to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+    }
+
+    #[tokio::test]
     async fn managed_provider_explicit_native_source_selection_survives_preparation() {
         use freshell_runtime_protocol::*;
         let owned = tempfile::tempdir().unwrap();
