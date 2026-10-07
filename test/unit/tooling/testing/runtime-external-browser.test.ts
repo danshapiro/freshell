@@ -612,6 +612,23 @@ describe('closed external owner control', () => {
     const request = { runId: context.runId, candidateSha: context.candidateSha, scenarioId: 'browser-managed-runtime', operationId: 'operation-owned', action: 'inventory' }
     return { owned, context, inventory, stop, request }
   }
+  it('returns only registered synthetic source IDs, digests and actual counts across the finite transport', async () => {
+    const { owned, context, request } = fixture()
+    const facts = { rootId: 'source-root', childId: 'source-child', grandchildId: 'source-grandchild',
+      unrelatedId: 'source-unrelated', lastMessageId: 'source-tail', nonce: '0123456789abcdef',
+      baselineMessages: { 'source-tail': 'a'.repeat(64) }, baselineParts: { 'source-part': 'b'.repeat(64) }, rootMessageCount: 106 }
+    const read = vi.spyOn(owned, 'syntheticOpenCodeSourceFacts').mockResolvedValue(facts)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.prepareSyntheticOpenCodeSource()).resolves.toEqual(facts)
+    expect(read).toHaveBeenCalledOnce()
+    await expect(control({ ...request, action: 'synthetic-source-facts', sql: 'SELECT * FROM message' })).rejects.toThrow(/operation/)
+    expect(read).toHaveBeenCalledOnce()
+    read.mockResolvedValue({ ...facts, rootMessageCount: -1 })
+    await expect(rig.syntheticOpenCodeSourceFacts()).rejects.toThrow(/invalid/)
+  })
   it('routes exact inventory observations and binds the reply to run, candidate and operation', async () => {
     const { owned, context, inventory, request } = fixture()
     const control = runner.createExternalRuntimeControl(owned, context)

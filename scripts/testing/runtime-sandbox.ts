@@ -561,6 +561,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
     'native-challenge-register',
     'synthetic-history-challenge',
+    'synthetic-source-facts',
     'retained-start', 'retained-status', 'retained-observed', 'retained-finish',
   ]),
   handle: z.object({

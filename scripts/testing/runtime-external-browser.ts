@@ -16,7 +16,7 @@ import os from 'node:os'
 import path from 'node:path'
 import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
-  ManagedMigrationFactsSchema, ManagedStopResultSchema } from './runtime-sandbox.js'
+  ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -26,7 +26,7 @@ import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
-import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge } from './runtime-sandbox.js'
+import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -680,6 +680,12 @@ export class ExternalManagedRuntimeRig {
     return description.info
   }
   async inventory(): Promise<ManagedRuntimeView[]> { return this.rpc('inventory', z.array(ExternalRuntimeViewSchema)) }
+  async prepareSyntheticOpenCodeSource(): Promise<SyntheticOpenCodeSourceFacts> {
+    return this.syntheticOpenCodeSourceFacts()
+  }
+  async syntheticOpenCodeSourceFacts(): Promise<SyntheticOpenCodeSourceFacts> {
+    return this.rpc('synthetic-source-facts', SyntheticOpenCodeSourceFactsSchema)
+  }
   async inventorySnapshot(): Promise<ManagedRuntimeInventorySnapshot> {
     return this.rpc('inventory-snapshot', ManagedRuntimeInventorySnapshotSchema)
   }
@@ -928,6 +934,7 @@ export function createExternalRuntimeControl(
           registration: owner.fixtureRegistrationFacts() }
         break
       case 'inventory': result = await owner.inventory(); break
+      case 'synthetic-source-facts': result = await owner.syntheticOpenCodeSourceFacts(); break
       case 'inventory-snapshot': result = await owner.inventorySnapshot(); break
       case 'control-epoch': result = await owner.controlEpoch(); break
       case 'managed-opt-in':
@@ -1498,6 +1505,10 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     const fixture = path.basename(selection.spec) === 'runtime-fresh-agent-fixture-rust.spec.ts'
     const smoke = path.basename(selection.spec) === 'runtime-external-target-smoke-rust.spec.ts'
     const deterministic = fixture || smoke
+    const sourceTitle = 'managed OpenCode source-to-soul resume › imports only the selected synthetic conversation and reopens under its native ID'
+    const sourceSelection = path.basename(selection.spec) === 'runtime-provider-resurrection-rust.spec.ts'
+      && this.environment.FRESHELL_RUNTIME_SYNTHETIC_RESUME === '1'
+      && (!selection.grep || new RegExp(selection.grep).test(sourceTitle))
     const retainedSelection = path.basename(selection.spec) === 'runtime-managed-provider-qualification-rust.spec.ts'
       && this.environment.FRESHELL_RUNTIME_SYNTHETIC_RESUME === '1'
     const retainedArtifacts = retainedSelection ? readRetainedArtifacts(this.environment.FRESHELL_TASK002_FIXTURE_ARTIFACT_MANIFEST,
@@ -1509,10 +1520,12 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
         : path.basename(selection.spec).includes('rehydrate') ? 4
           : /chaos|lost-soul/.test(selection.spec) ? 5 : 2
     this.owner = new ManagedRuntimeOwner(options => new ManagedRuntimeWebServer({ ...options, preserveHomeOnStop: false }), root, phase,
-      {}, {}, deterministic ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
+      {}, {}, deterministic || sourceSelection ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
         fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
-        bootstrapProviders: deterministic || retainedArtifacts ? [] : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
+        bootstrapProviders: deterministic || retainedArtifacts ? [] : sourceSelection ? ['opencode']
+          : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
       })
+    if (sourceSelection) await this.owner.prepareSyntheticOpenCodeSource()
     execFileSync('pnpm', ['run', 'build:client'], { cwd: root, stdio: 'inherit' })
     execFileSync('pnpm', ['run', 'build:tools'], { cwd: root, stdio: 'inherit' })
     await this.owner.start()
