@@ -22,6 +22,16 @@ fn request_only_absence_reference(context: &RecoveryContext) -> String {
     format!("nativeAbsenceCensus=sha256:{:x}", Sha256::digest(fields))
 }
 
+fn native_census_terminal(provider: &str) -> freshell_runtime_protocol::TerminalLaunchSpec {
+    serde_json::from_value(serde_json::json!({
+        "terminalId":"absent-store", "streamId":"absent-store", "mode":provider,
+        "program":provider, "cwd":"/workspace", "workspacePath":"/workspace",
+        "env":{"HOME":"/home/freshell/provider"}, "runAsUid":65534, "runAsGid":0,
+        "cols":80, "rows":24, "projectKey":"test"
+    }))
+    .unwrap()
+}
+
 fn evidence(context: Option<&RecoveryContext>) -> Vec<RecoveryPathEvidence> {
     let native_evidence = context
         .and_then(|context| context.native_session_id.as_deref().map(|id| (context, id)))
@@ -34,13 +44,7 @@ fn evidence(context: Option<&RecoveryContext>) -> Vec<RecoveryPathEvidence> {
                 connection.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
                 connection.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES ('unrelated-exact-root','slug','prj','/synthetic','synthetic','1.18.21',1,1)", []).unwrap();
             }
-            let terminal = serde_json::from_value(serde_json::json!({
-                "terminalId":"absent-store", "streamId":"absent-store", "mode":context.provider,
-                "program":context.provider, "cwd":"/workspace", "workspacePath":"/workspace",
-                "env":{"HOME":"/home/freshell/provider"},
-                "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24, "projectKey":"test"
-            }))
-            .unwrap();
+            let terminal = native_census_terminal(&context.provider);
             let spec = freshell_agent_runtime::build_resume_spec(
                 freshell_agent_runtime::ResumeSpecInput {
                     provider: &context.provider,
@@ -212,11 +216,19 @@ fn decision_for(
     registry: &Registry,
     context: &RecoveryContext,
 ) -> Result<LostDecision, LossDecisionError> {
+    decision_with_paths(registry, context, evidence(Some(context)))
+}
+
+fn decision_with_paths(
+    registry: &Registry,
+    context: &RecoveryContext,
+    path_evidence: Vec<RecoveryPathEvidence>,
+) -> Result<LostDecision, LossDecisionError> {
     LostDecision::try_new(LossDecisionInput {
         installation_id: registry.installation_id(),
         context,
         cleanup_handle: &context.prior_handle,
-        path_evidence: evidence(Some(context)),
+        path_evidence,
         builds: LossBuildEvidence {
             web_commit: "d".repeat(40),
             supervisor_commit: "d".repeat(40),
@@ -242,6 +254,204 @@ fn decision_for(
         },
         created_at: Some("2026-09-09T00:00:00.000Z".into()),
     })
+}
+
+async fn prepared_collection_context(root: &std::path::Path) -> (Registry, RecoveryContext) {
+    let (registry, context) = prepared_context(root).await;
+    // Include the saved launch environment so the production collector can
+    // compare the real reader's environment fingerprint to an exact spec.
+    let terminal = native_census_terminal(&context.provider);
+    let conn = Connection::open(registry.database_path()).unwrap();
+    conn.execute(
+        "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+        params![
+            serde_json::to_string(&terminal).unwrap(),
+            context.prior_handle.incarnation_id().as_str()
+        ],
+    )
+    .unwrap();
+    let context = registry.recovery_context(context.soul_id).await.unwrap();
+    assert!(
+        crate::resume_catalog::exact_resume_candidate(&context, None)
+            .unwrap()
+            .is_some()
+    );
+    (registry, context)
+}
+
+#[tokio::test]
+async fn collected_native_absence_can_commit_and_finalize_loss_without_transient_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, context) = prepared_collection_context(dir.path()).await;
+    // This helper runs the actual reader over a complete compatible OpenCode
+    // store containing an unrelated root, retaining its filesystem for CAS.
+    let native = evidence(Some(&context)).remove(1);
+    let original_census = native
+        .evidence_refs
+        .iter()
+        .find(|reference| reference.starts_with("nativeAbsenceCensus=v2:"))
+        .unwrap()
+        .clone();
+    let mut reader_evidence = native.evidence_refs;
+    let reference = reader_evidence
+        .iter_mut()
+        .find(|reference| reference.starts_with("nativeAbsenceCensus=v2:"))
+        .unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(reference.strip_prefix("nativeAbsenceCensus=v2:").unwrap()).unwrap();
+    *reference = format!(
+        "nativeAbsenceCensus=v2:{}",
+        serde_json::to_string_pretty(&parsed).unwrap()
+    );
+    reader_evidence.extend([
+        "private transcript body".into(),
+        "Bearer private-credential".into(),
+    ]);
+    let probe = freshell_runtime_protocol::RecoveryProbe::DefinitivelyUnavailable {
+        path: RecoveryPath::NativeResume,
+        reason: "private reader diagnostic".into(),
+        evidence: reader_evidence,
+        store_state: native.store_state,
+    };
+    let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    let paths = supervisor
+        .collect_loss_path_evidence(&context, &probe)
+        .await
+        .unwrap();
+    let decision = decision_with_paths(&registry, &context, paths)
+        .expect("actual collector output must retain qualified native absence");
+    let encoded = serde_json::to_string(decision.certificate()).unwrap();
+    for private in [
+        "private transcript body",
+        "private-credential",
+        "private reader diagnostic",
+    ] {
+        assert!(!encoded.contains(private));
+    }
+    let native = decision
+        .certificate()
+        .recovery_paths
+        .iter()
+        .find(|row| row.path == RecoveryPath::NativeResume)
+        .unwrap();
+    assert!(
+        native.evidence_refs.contains(&original_census),
+        "receipt is canonical typed JSON"
+    );
+    assert!(native
+        .evidence_refs
+        .iter()
+        .any(|reference| reference.starts_with("transientEvidenceDigest=sha256:")));
+    let prepared = registry.prepare_loss(decision).await.unwrap();
+    registry
+        .finalize_loss_cleanup(
+            prepared.certificate.incident_id.clone(),
+            StopOutcome::VerifiedEmpty,
+            cleanup(&prepared),
+        )
+        .await
+        .unwrap();
+    let final_context = registry.recovery_context(context.soul_id).await.unwrap();
+    assert_eq!(
+        final_context.recovery_state,
+        freshell_runtime_protocol::RecoveryState::Lost
+    );
+    let conn = Connection::open(registry.database_path()).unwrap();
+    let state: String = conn
+        .query_row(
+            "SELECT cleanup_state FROM loss_incidents WHERE incident_id=?1",
+            [prepared.certificate.incident_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "closed");
+}
+
+#[tokio::test]
+async fn collector_rejects_malformed_unqualified_and_stale_native_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, context) = prepared_collection_context(dir.path()).await;
+    let native = evidence(Some(&context)).remove(1);
+    let reference = native
+        .evidence_refs
+        .iter()
+        .find(|reference| reference.starts_with("nativeAbsenceCensus=v2:"))
+        .unwrap();
+    let census: serde_json::Value =
+        serde_json::from_str(reference.strip_prefix("nativeAbsenceCensus=v2:").unwrap()).unwrap();
+    let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    for fault in [
+        "malformed",
+        "duplicate",
+        "private_field",
+        "generation",
+        "revision",
+        "identity",
+        "environment",
+        "request_token",
+    ] {
+        let mut changed = census.clone();
+        let refs = match fault {
+            "malformed" => vec!["nativeAbsenceCensus=v2:{".into()],
+            "duplicate" => vec![reference.clone(), reference.clone()],
+            "request_token" => vec![request_only_absence_reference(&context)],
+            _ => {
+                match fault {
+                    "private_field" => changed["transcriptBody"] = "private transcript body".into(),
+                    "generation" => changed["generation"] = "0".repeat(64).into(),
+                    "revision" => {
+                        changed["evidenceRevision"] = (context.evidence_revision + 1).into()
+                    }
+                    "identity" => changed["nativeId"] = "another-native-root".into(),
+                    "environment" => changed["environmentFingerprint"] = "0".repeat(64).into(),
+                    _ => unreachable!(),
+                }
+                vec![format!(
+                    "nativeAbsenceCensus=v2:{}",
+                    serde_json::to_string(&changed).unwrap()
+                )]
+            }
+        };
+        let probe = freshell_runtime_protocol::RecoveryProbe::DefinitivelyUnavailable {
+            path: RecoveryPath::NativeResume,
+            reason: "reader negative".into(),
+            evidence: refs,
+            store_state: native.store_state,
+        };
+        assert!(
+            supervisor
+                .collect_loss_path_evidence(&context, &probe)
+                .await
+                .is_err(),
+            "{fault}"
+        );
+    }
+    // Storage changes without a registry revision also invalidate the real
+    // reader receipt before it can survive normalization or enter loss CAS.
+    restore_native_history(&context);
+    let stale_probe = freshell_runtime_protocol::RecoveryProbe::DefinitivelyUnavailable {
+        path: RecoveryPath::NativeResume,
+        reason: native.reason_code,
+        evidence: native.evidence_refs,
+        store_state: native.store_state,
+    };
+    assert!(supervisor
+        .collect_loss_path_evidence(&context, &stale_probe)
+        .await
+        .is_err());
+    assert!(registry
+        .unresolved_loss_incident_ids()
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        registry
+            .recovery_context(context.soul_id)
+            .await
+            .unwrap()
+            .desired_state,
+        DesiredState::Running
+    );
 }
 
 async fn prepared_loss(root: &std::path::Path) -> (Registry, PreparedLoss) {
