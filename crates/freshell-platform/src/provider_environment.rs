@@ -588,14 +588,14 @@ fn copy_environment_with_account_home(
     )
 }
 
-/// Directory subpaths mounted at native discovery aliases retain in-unit
-/// relative links, while cross-unit links address the final physical HOME.
+/// Mounted directory aliases retain in-unit relative links. Mounted regular
+/// files retain their existing inode, so native aliases see the published bytes.
 pub fn copy_environment_for_mounts(
     selections: &[CopySelection],
     destination_root: &Path,
     excluded_canonical_sources: &[PathBuf],
     limits: CopyLimits,
-    mounted_directories: &[PathBuf],
+    mounted_roots: &[PathBuf],
 ) -> Result<CopyReport, CopyError> {
     let account_home = std::env::var_os("HOME").and_then(|home| fs::canonicalize(home).ok());
     copy_environment_projection(
@@ -604,7 +604,7 @@ pub fn copy_environment_for_mounts(
         excluded_canonical_sources,
         limits,
         account_home,
-        mounted_directories,
+        mounted_roots,
     )
 }
 
@@ -614,15 +614,15 @@ fn copy_environment_projection(
     excluded_canonical_sources: &[PathBuf],
     limits: CopyLimits,
     account_home: Option<PathBuf>,
-    mounted_directories: &[PathBuf],
+    mounted_roots: &[PathBuf],
 ) -> Result<CopyReport, CopyError> {
     bound(
         Path::new(""),
         "entries",
-        mounted_directories.len() as u64,
+        mounted_roots.len() as u64,
         limits.max_entries as u64,
     )?;
-    for root in mounted_directories {
+    for root in mounted_roots {
         if !valid_relative(root) || !destination_root.is_absolute() {
             return Err(error(
                 root,
@@ -717,6 +717,37 @@ fn copy_environment_projection(
         Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => false,
         Err(cause) => return Err(io_error(Path::new(""), "inspect_destination", cause)),
     };
+    let mut prior_mounted_bytes = 0u64;
+    for root in mounted_roots.iter().collect::<BTreeSet<_>>() {
+        if !matches!(plan.nodes.get(root), Some(Node::File(..))) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(destination_root.join(root))
+            .map_err(|cause| io_error(root, "inspect_mounted_file", cause))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(error(
+                root,
+                "inspect_mounted_file",
+                "mounted resource must retain an owned physical regular inode",
+            ));
+        }
+        bound(root, "file_bytes", metadata.len(), limits.max_file_bytes)?;
+        prior_mounted_bytes = prior_mounted_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| {
+                error(
+                    root,
+                    "inspect_mounted_file",
+                    "prior mounted byte accounting overflow",
+                )
+            })?;
+        bound(
+            root,
+            "total_bytes",
+            prior_mounted_bytes,
+            limits.max_total_bytes,
+        )?;
+    }
     let parent = if existing_root {
         destination_root
     } else {
@@ -790,9 +821,7 @@ fn copy_environment_projection(
                 mode(&destination, private_file_mode(*source_mode), relative)?;
             }
             Node::Link(target) => {
-                let mounted = mounted_directories
-                    .iter()
-                    .find(|root| relative.starts_with(root));
+                let mounted = mounted_roots.iter().find(|root| relative.starts_with(root));
                 let target = if mounted.is_some_and(|root| !target.starts_with(root)) {
                     destination_root.join(target)
                 } else {
@@ -892,6 +921,21 @@ fn copy_environment_projection(
                         .map_err(|cause| io_error(relative, "publish_directory", cause))?;
                 }
                 mode(&destination, 0o700, relative)?;
+            } else if mounted_roots.contains(relative) && matches!(node, Node::File(..)) {
+                let Node::File(_, source_mode, _) = node else {
+                    unreachable!()
+                };
+                publish_mounted_file(
+                    &temporary.0.join(relative),
+                    &destination,
+                    &temporary.0.join(format!(
+                        ".freshell-mounted-backup-{}",
+                        NEXT_PROJECTION.fetch_add(1, Ordering::Relaxed)
+                    )),
+                    relative,
+                    *source_mode,
+                    limits,
+                )?;
             } else {
                 fs::rename(temporary.0.join(relative), destination)
                     .map_err(|cause| io_error(relative, "publish_leaf", cause))?;
@@ -906,8 +950,230 @@ fn copy_environment_projection(
     })
 }
 
+fn publish_mounted_file(
+    source: &Path,
+    destination: &Path,
+    backup: &Path,
+    relative: &Path,
+    source_mode: u32,
+    limits: CopyLimits,
+) -> Result<(), CopyError> {
+    use std::io::{Seek, SeekFrom};
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let metadata = fs::symlink_metadata(destination)
+        .map_err(|cause| io_error(relative, "inspect_mounted_file", cause))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(error(
+            relative,
+            "inspect_mounted_file",
+            "mounted resource must retain an owned physical regular inode",
+        ));
+    }
+    bound(
+        relative,
+        "file_bytes",
+        metadata.len(),
+        limits.max_file_bytes,
+    )?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut target = options
+        .open(destination)
+        .map_err(|cause| io_error(relative, "open_mounted_file", cause))?;
+    #[cfg(unix)]
+    {
+        let opened = target
+            .metadata()
+            .map_err(|cause| io_error(relative, "inspect_mounted_file", cause))?;
+        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+            return Err(error(
+                relative,
+                "inspect_mounted_file",
+                "mounted resource inode changed before publication",
+            ));
+        }
+    }
+    // Preserve the previous selected bytes before modifying an inode that is
+    // already bound into the worker. Both copies are streamed on its own HOME.
+    let mut saved = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(backup)
+        .map_err(|cause| io_error(relative, "backup_mounted_file", cause))?;
+    mode(backup, 0o600, relative)?;
+    let observed = std::io::copy(
+        &mut (&mut target).take(metadata.len().checked_add(1).ok_or_else(|| {
+            error(
+                relative,
+                "backup_mounted_file",
+                "mounted file size overflow",
+            )
+        })?),
+        &mut saved,
+    )
+    .map_err(|cause| io_error(relative, "backup_mounted_file", cause))?;
+    if observed != metadata.len() {
+        return Err(error(
+            relative,
+            "backup_mounted_file",
+            "mounted resource changed before publication; retry with a quiescent owner",
+        ));
+    }
+    let result = (|| -> std::io::Result<()> {
+        let incoming = File::open(source)?;
+        let expected = incoming.metadata()?.len();
+        if expected > limits.max_file_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged mounted file exceeds copy profile",
+            ));
+        }
+        let maximum = expected.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "staged file size overflow")
+        })?;
+        target.seek(SeekFrom::Start(0))?;
+        let copied = std::io::copy(&mut incoming.take(maximum), &mut target)?;
+        if copied != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged mounted file changed",
+            ));
+        }
+        target.set_len(copied)?;
+        target.sync_all()?;
+        mode(destination, private_file_mode(source_mode), relative).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "mounted file mode publication failed",
+            )
+        })?;
+        Ok(())
+    })();
+    if let Err(cause) = result {
+        let restore = (|| -> std::io::Result<()> {
+            saved.seek(SeekFrom::Start(0))?;
+            target.seek(SeekFrom::Start(0))?;
+            let restored = std::io::copy(&mut saved, &mut target)?;
+            target.set_len(restored)?;
+            target.sync_all()?;
+            fs::set_permissions(destination, metadata.permissions())?;
+            Ok(())
+        })();
+        if let Err(restore) = restore {
+            return Err(io_error(relative, "restore_mounted_file", restore));
+        }
+        return Err(io_error(relative, "publish_mounted_file", cause));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_environment_mounted_file_alias_reads_complete_publication_on_same_inode() {
+        use std::io::{Read, Seek};
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("selected-instructions");
+        fs::write(&source, b"complete selected instructions").unwrap();
+        let home = fixture.path().join("provider-home");
+        let leaf = PathBuf::from(".freshell/provider-roots/root-0/source");
+        fs::create_dir_all(home.join(leaf.parent().unwrap())).unwrap();
+        fs::write(home.join(&leaf), b"").unwrap();
+        // Docker binds the already owned regular inode at a native alias
+        // before the session host publishes its complete selected inputs.
+        let mut alias = fs::File::open(home.join(&leaf)).unwrap();
+        let selection = [CopySelection {
+            source: source.clone(),
+            destination_relative: leaf.clone(),
+        }];
+        for content in [
+            b"complete selected instructions".as_slice(),
+            b"replacement selected instructions".as_slice(),
+        ] {
+            fs::write(&source, content).unwrap();
+            copy_environment_for_mounts(
+                &selection,
+                &home,
+                &[],
+                CopyLimits::default(),
+                std::slice::from_ref(&leaf),
+            )
+            .unwrap();
+            alias.rewind().unwrap();
+            let mut observed = Vec::new();
+            alias.read_to_end(&mut observed).unwrap();
+            assert_eq!(observed,content,"an existing native file alias must see complete initial and refreshed resource bytes");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_environment_mounted_file_invalid_target_and_profile_failure_preserve_prior_bytes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        fs::write(&source, b"x").unwrap();
+        let home = fixture.path().join("provider-home");
+        let leaf = PathBuf::from(".freshell/provider-roots/root-0/source");
+        fs::create_dir_all(home.join(leaf.parent().unwrap())).unwrap();
+        fs::write(home.join(&leaf), b"prior selected bytes").unwrap();
+        let selection = [CopySelection {
+            source: source.clone(),
+            destination_relative: leaf.clone(),
+        }];
+        let limits = CopyLimits {
+            max_total_bytes: 2,
+            ..Default::default()
+        };
+        assert!(copy_environment_for_mounts(
+            &selection,
+            &home,
+            &[],
+            limits,
+            std::slice::from_ref(&leaf)
+        )
+        .is_err());
+        assert_eq!(fs::read(home.join(&leaf)).unwrap(), b"prior selected bytes");
+        let outside = fixture.path().join("unselected");
+        fs::write(&outside, b"unselected original bytes").unwrap();
+        fs::remove_file(home.join(&leaf)).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(&leaf)).unwrap();
+        assert!(copy_environment_for_mounts(
+            &selection,
+            &home,
+            &[],
+            Default::default(),
+            std::slice::from_ref(&leaf)
+        )
+        .is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"unselected original bytes");
+        assert!(fs::symlink_metadata(home.join(&leaf))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn provider_environment_shared_mounted_file_aliases_use_one_prior_byte_budget() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        fs::write(&source, b"y").unwrap();
+        let home = fixture.path().join("provider-home");
+        let leaf = PathBuf::from(".freshell/provider-roots/root-0/source");
+        fs::create_dir_all(home.join(leaf.parent().unwrap())).unwrap();
+        fs::write(home.join(&leaf), b"x").unwrap();
+        let selections = [CopySelection {
+            source,
+            destination_relative: leaf.clone(),
+        }];
+        copy_environment_for_mounts(&selections,&home,&[],CopyLimits {max_total_bytes:1,..Default::default()},&[leaf.clone(),leaf.clone(),leaf.clone()])
+            .expect("three native aliases to one physical resource must retain the full shared byte capacity");
+        assert_eq!(fs::read(home.join(leaf)).unwrap(), b"y");
+    }
+
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};

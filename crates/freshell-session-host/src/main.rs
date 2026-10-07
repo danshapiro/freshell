@@ -1760,7 +1760,6 @@ fn resource_mount_roots(
         .prepared_inputs
         .iter()
         .flat_map(|inputs| &inputs.resource_mounts)
-        .filter(|root| root.kind == freshell_runtime_protocol::ProviderResourceKind::Directory)
         .map(|root| PathBuf::from(&root.provider_relative_path))
         .collect()
 }
