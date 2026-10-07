@@ -261,6 +261,10 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         return typeof content?.sessionRef?.sessionId === 'string' ? content.sessionRef.sessionId : null
       }, 120_000)
       const expectedRuntimeIdentity = { ...initial, nativeSessionId: providerSessionId }
+      const nativeHandle = rig.exactRuntimeHandle(expectedRuntimeIdentity)
+      const approvalChallenge = await rig.registerNativeChallenge(nativeHandle, 'chaos-approval')
+      const longToolChallenge = await rig.registerNativeChallenge(nativeHandle, 'chaos-long-tool')
+      const followUpChallenge = await rig.registerNativeChallenge(nativeHandle, 'chaos-follow-up')
       const initialRuntime = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)
 
       // Permission remains provider-native and pending across web replacement.
@@ -277,7 +281,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       }, 180_000)
       expect((await markerCount(rig, initial.containerId, 'p5-chaos-approval-count'))).toBe(0)
       const approvalBefore = await waitForValue('one pending provider-native approval tool request', async () => {
-        const evidence = (await nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-approval-count'))
+        const evidence = (await nativeToolEvidence(rig, nativeHandle, approvalChallenge.challengeId))
         return evidence.requestIds.length === 1 && evidence.resultIds.length === 0 && evidence.replayCount === 0
           ? evidence
           : null
@@ -321,7 +325,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         (await markerCount(rig, initial.containerId!, 'p5-chaos-approval-count')) === 1 ? true : null
       ), 180_000)
       const approvalAfter = await waitForValue('one completed provider-native approval tool result', async () => {
-        const evidence = (await nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-approval-count'))
+        const evidence = (await nativeToolEvidence(rig, nativeHandle, approvalChallenge.challengeId))
         return evidence.requestIds.length === 1 && evidence.resultIds.length === 1 && evidence.replayCount === 0
           ? evidence
           : null
@@ -428,13 +432,13 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       await executeInPane(page, paneId, 'Reply with exactly P5_CHAOS_FOLLOWUP and use no tools.')
       await waitForPaneOutput(page, harness, tabId, paneId, 'P5_CHAOS_FOLLOWUP', 180_000)
       const longToolEvidence = await waitForValue('one completed native long-tool request/result', async () => {
-        const evidence = (await nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-long-tool-count'))
+        const evidence = (await nativeToolEvidence(rig, nativeHandle, longToolChallenge.challengeId))
         return evidence.requestIds.length === 1 && evidence.resultIds.length === 1 && evidence.replayCount === 0
           ? evidence
           : null
       }, 60_000)
       const followUpMessageIds = await waitForValue('one provider-native follow-up message', async () => {
-        const ids = (await nativeFollowUpMessageIds(rig, initial.containerId!, providerSessionId, 'P5_CHAOS_FOLLOWUP'))
+        const ids = (await nativeFollowUpMessageIds(rig, nativeHandle, followUpChallenge.challengeId))
         return ids.length === 1 ? ids : null
       }, 60_000)
 

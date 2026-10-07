@@ -119,6 +119,40 @@ function fixture() {
 }
 
 describe('exact owned runtime facts', () => {
+  it('reads challenge IDs from actual SQLite rows while retaining transcript bytes on the owner', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-fixed-native-probe-'))
+    const file = path.join(root, 'opencode.db')
+    const seed = `const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.argv[1]);
+      db.exec('CREATE TABLE session(id TEXT);CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT);CREATE TABLE part(id TEXT,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT)');
+      db.prepare('INSERT INTO session VALUES(?)').run('native-owned');
+      db.prepare('INSERT INTO message VALUES(?,?,?,?)').run('actual-message','native-owned',1,JSON.stringify({role:'assistant',time:{completed:2},providerID:'synthetic',modelID:'synthetic'}));
+      const insert=db.prepare('INSERT INTO part VALUES(?,?,?,?,?)');
+      insert.run('actual-text','native-owned','actual-message',1,JSON.stringify({type:'text',text:'P5_CHAOS_FOLLOWUP synthetic owner-only response'}));
+      insert.run('actual-tool','native-owned','actual-message',2,JSON.stringify({type:'tool',tool:'bash',state:{status:'completed',input:'p5-chaos-approval-count'}}));db.close();`
+    execFileSync(process.execPath, ['--no-warnings', '-e', seed, file])
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (containerId, args) => {
+      expect(containerId).toBe(current.containerId)
+      expect(args[0]).toBe('node')
+      expect(args[4]).toBe('/home/freshell/provider/.local/share/opencode/opencode.db')
+      const nodeArgs = args.slice(1)
+      nodeArgs[3] = file
+      return execFileSync(process.execPath, nodeArgs, { encoding: 'utf8' })
+    })
+    try {
+      const approval = await rig.registerNativeChallenge(current, 'chaos-approval')
+      const followUp = await rig.registerNativeChallenge(current, 'chaos-follow-up')
+      expect(await rig.nativeToolEvidence(current, approval.challengeId)).toEqual({ requestIds: ['actual-tool'], resultIds: ['actual-tool'], replayCount: 0 })
+      const ids = await rig.nativeFollowUpMessageIds(current, followUp.challengeId)
+      expect(ids).toEqual(['actual-message'])
+      expect(JSON.stringify(ids)).not.toContain('synthetic owner-only response')
+      await expect(rig.nativeFollowUpMessageIds({ ...current, nativeSessionId: 'foreign-root' }, followUp.challengeId)).rejects.toThrow(/challenge/)
+    } finally {
+      await fsp.rm(root, { recursive: true })
+    }
+  })
   it('reads fixed facts only for the current exact owned runtime', async () => {
     const { adapter, read } = fixture()
     const value = await owner.readExactRuntimeHostFacts(adapter, handle)

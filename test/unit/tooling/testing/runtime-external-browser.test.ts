@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { z } from 'zod'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import fsp from 'node:fs/promises'
@@ -669,6 +670,23 @@ describe('closed external owner control', () => {
     expect(signal).toHaveBeenLastCalledWith(handle.containerId, handle.incarnationId, 'SIGCONT', 1234)
     await expect(control({ ...request, operationId: 'duplicate-release', action: 'release-host', handle })).rejects.toThrow(/held/)
     expect(signal).toHaveBeenCalledTimes(2)
+  })
+  it('registers a closed native challenge and refuses unknown or wrong-root probe requests before reading', async () => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'challenge-owned-soul',
+      incarnationId: 'challenge-owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'challenge-owned-boot', nativeSessionId: 'challenge-owned-native' }
+    vi.spyOn(owned, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const exec = vi.spyOn(owned, 'ownedProviderExec').mockResolvedValue(JSON.stringify({ requestIds: ['tool-actual'], resultIds: ['tool-actual'], replayCount: 0 }))
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const reply = await control({ ...request, action: 'native-challenge-register', handle, challengeId: 'chaos-approval' })
+    const parsed = z.object({ result: z.object({ challengeId: z.string().uuid() }) }).passthrough().parse(reply)
+    await expect(control({ ...request, operationId: 'unknown-probe', action: 'native-tool-evidence', handle, challengeId: 'unregistered' })).rejects.toThrow(/challenge/)
+    await expect(control({ ...request, operationId: 'wrong-root', action: 'native-tool-evidence',
+      handle: { ...handle, nativeSessionId: 'foreign-root' }, challengeId: parsed.result.challengeId })).rejects.toThrow(/challenge/)
+    expect(exec).not.toHaveBeenCalled()
+    await expect(control({ ...request, operationId: 'owned-probe', action: 'native-tool-evidence', handle, challengeId: parsed.result.challengeId }))
+      .resolves.toMatchObject({ result: { requestIds: ['tool-actual'], resultIds: ['tool-actual'], replayCount: 0 } })
+    expect(exec).toHaveBeenCalledExactlyOnceWith(handle.containerId, expect.arrayContaining(['challenge-owned-native', 'p5-chaos-approval-count']))
   })
 })
 

@@ -118,6 +118,43 @@ export type NativeToolEvidence = {
   resultIds: string[]
   replayCount: number
 }
+export type NativeChallengeKind = 'chaos-approval' | 'chaos-long-tool' | 'chaos-follow-up'
+const NativeChallengeMarkers: Record<NativeChallengeKind, string> = {
+  'chaos-approval': 'p5-chaos-approval-count', 'chaos-long-tool': 'p5-chaos-long-tool-count',
+  'chaos-follow-up': 'P5_CHAOS_FOLLOWUP',
+}
+
+export const OPENCODE_TOOL_EVIDENCE_SCRIPT = String.raw`
+const fs = require('node:fs');
+const { DatabaseSync } = require('node:sqlite');
+const filename = process.argv[1];
+const sessionId = process.argv[2];
+const marker = process.argv[3];
+if (!filename || !sessionId || !marker) throw new Error('tool probe requires an exact store, session, and marker');
+if (!fs.existsSync(filename)) {
+  process.stdout.write(JSON.stringify({ requestIds: [], resultIds: [], replayCount: 0 }));
+} else {
+  const db = new DatabaseSync(filename, { readOnly: true });
+  try {
+    db.exec('PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;');
+    const rows = db.prepare('SELECT id, data FROM part WHERE session_id = ? ORDER BY time_created, id LIMIT 512').all(sessionId);
+    const matches = [];
+    for (const row of rows) {
+      const part = JSON.parse(row.data);
+      if (part.type !== 'tool' || !JSON.stringify(part).includes(marker)) continue;
+      matches.push({ id: row.id, completed: part.state?.status === 'completed' });
+    }
+    process.stdout.write(JSON.stringify({
+      requestIds: matches.map((row) => row.id),
+      resultIds: matches.filter((row) => row.completed).map((row) => row.id),
+      replayCount: Math.max(0, matches.length - 1),
+    }));
+  } catch {
+    console.error('native tool evidence query failed');
+    process.exitCode = 1;
+  } finally { db.close(); }
+}
+`
 
 export const OPENCODE_NATIVE_HISTORY_SCRIPT = String.raw`
 const fs = require('node:fs');
@@ -241,6 +278,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-supervisor', 'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
+    'native-challenge-register',
     'retained-start', 'retained-status', 'retained-observed', 'retained-finish',
   ]),
   handle: z.object({
@@ -2176,6 +2214,7 @@ export class ManagedRuntimeOwner {
   private qualificationSupervisorBin: string | undefined
   private stopSettlement?: Promise<{ ok: boolean; errors: string[] }>
   private readonly heldHosts = new Map<string, { handle: ExactRuntimeHandle; pid: number }>()
+  private readonly nativeChallenges = new Map<string, { soulId: string; nativeSessionId: string; marker: string }>()
 
   constructor(
     private readonly webFactory: RuntimeWebFactory,
@@ -2472,6 +2511,41 @@ export class ManagedRuntimeOwner {
   async crashRuntimeHost(handle: ExactRuntimeHandle): Promise<void> {
     await this.assertCurrentHandle(handle)
     this.runtime.killOwnedRuntimeExact(handle.containerId)
+  }
+
+  async registerNativeChallenge(handle: ExactRuntimeHandle, kind: NativeChallengeKind): Promise<{ challengeId: string }> {
+    await this.assertCurrentHandle(handle)
+    if (!Object.hasOwn(NativeChallengeMarkers, kind)) throw new Error('registered native challenge kind required')
+    const challengeId = randomUUID()
+    this.nativeChallenges.set(challengeId, { soulId: handle.soulId, nativeSessionId: handle.nativeSessionId,
+      marker: NativeChallengeMarkers[kind] })
+    return { challengeId }
+  }
+
+  private async nativeChallengeMarker(handle: ExactRuntimeHandle, challengeId: string): Promise<string> {
+    await this.assertCurrentHandle(handle)
+    const registered = this.nativeChallenges.get(challengeId)
+    if (!registered || registered.soulId !== handle.soulId || registered.nativeSessionId !== handle.nativeSessionId) {
+      throw new Error('exact registered native challenge root required')
+    }
+    return registered.marker
+  }
+
+  async nativeToolEvidence(handle: ExactRuntimeHandle, challengeId: string): Promise<NativeToolEvidence> {
+    const marker = await this.nativeChallengeMarker(handle, challengeId)
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', OPENCODE_TOOL_EVIDENCE_SCRIPT,
+      '/home/freshell/provider/.local/share/opencode/opencode.db', handle.nativeSessionId, marker])
+    return z.object({ requestIds: z.array(z.string().min(1)), resultIds: z.array(z.string().min(1)),
+      replayCount: z.number().int().nonnegative() }).strict().parse(JSON.parse(raw))
+  }
+
+  async nativeFollowUpMessageIds(handle: ExactRuntimeHandle, challengeId: string): Promise<string[]> {
+    const marker = await this.nativeChallengeMarker(handle, challengeId)
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
+      '/home/freshell/provider/.local/share/opencode/opencode.db', handle.nativeSessionId])
+    const history = z.object({ provider: z.literal('opencode'), nativeSessionId: z.literal(handle.nativeSessionId),
+      turns: z.array(z.object({ text: z.string(), messageId: z.string().min(1).optional() }).passthrough()) }).passthrough().parse(JSON.parse(raw))
+    return history.turns.filter(turn => turn.text.includes(marker)).flatMap(turn => turn.messageId ? [turn.messageId] : [])
   }
 
   private heldHostKey(handle: ExactRuntimeHandle): string {

@@ -22,6 +22,7 @@ import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
+import type { NativeChallengeKind, NativeToolEvidence } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -710,6 +711,16 @@ export class ExternalManagedRuntimeRig {
   async holdRuntimeHost(handle: ExactRuntimeHandle): Promise<{ pid: number }> {
     return this.rpc('hold-host', z.object({ pid: z.number().int().positive() }).strict(), { handle })
   }
+  async registerNativeChallenge(handle: ExactRuntimeHandle, kind: NativeChallengeKind): Promise<{ challengeId: string }> {
+    return this.rpc('native-challenge-register', z.object({ challengeId: z.string().uuid() }).strict(), { handle, challengeId: kind })
+  }
+  async nativeToolEvidence(handle: ExactRuntimeHandle, challengeId: string): Promise<NativeToolEvidence> {
+    return this.rpc('native-tool-evidence', z.object({ requestIds: z.array(z.string().min(1)), resultIds: z.array(z.string().min(1)),
+      replayCount: z.number().int().nonnegative() }).strict(), { handle, challengeId })
+  }
+  async nativeFollowUpMessageIds(handle: ExactRuntimeHandle, challengeId: string): Promise<string[]> {
+    return this.rpc('native-follow-up-ids', z.array(z.string().min(1)), { handle, challengeId })
+  }
   async releaseRuntimeHost(handle: ExactRuntimeHandle): Promise<void> {
     await this.rpc('release-host', CompletedOwnerOperationSchema, { handle })
   }
@@ -911,6 +922,18 @@ export function createExternalRuntimeControl(
         break
       case 'crash-host': await owner.crashRuntimeHost(handle()); result = { completed: true }; break
       case 'hold-host': result = await owner.holdRuntimeHost(handle()); break
+      case 'native-challenge-register':
+        if (request.challengeId !== 'chaos-approval' && request.challengeId !== 'chaos-long-tool' && request.challengeId !== 'chaos-follow-up') throw new Error('registered native challenge kind required')
+        result = await owner.registerNativeChallenge(handle(), request.challengeId)
+        break
+      case 'native-tool-evidence':
+        if (!request.challengeId) throw new Error('registered native challenge required')
+        result = await owner.nativeToolEvidence(handle(), request.challengeId)
+        break
+      case 'native-follow-up-ids':
+        if (!request.challengeId) throw new Error('registered native challenge required')
+        result = await owner.nativeFollowUpMessageIds(handle(), request.challengeId)
+        break
       case 'release-host': await owner.releaseRuntimeHost(handle()); result = { completed: true }; break
       case 'crash-provider': await owner.crashFixtureWorker(handle()); result = { completed: true }; break
       case 'replace-web':

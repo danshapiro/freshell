@@ -1,41 +1,11 @@
+import type { ExactRuntimeHandle, NativeToolEvidence } from '../../../scripts/testing/runtime-sandbox.js'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
-import type { ManagedRuntimeBrowserRig, ManagedRuntimeView } from './managed-runtime.js'
-import { OPENCODE_NATIVE_HISTORY_SCRIPT, type NativeHistory } from './opencode-native-history.js'
+import type { ManagedRuntimeBrowserRig, ManagedRuntimeView, ManagedFixtureRig } from './managed-runtime.js'
 
-const OPENCODE_TOOL_EVIDENCE_SCRIPT = String.raw`
-const fs = require('node:fs');
-const { DatabaseSync } = require('node:sqlite');
-const filename = process.argv[1];
-const sessionId = process.argv[2];
-const marker = process.argv[3];
-if (!filename || !sessionId || !marker) throw new Error('tool probe requires an exact store, session, and marker');
-if (!fs.existsSync(filename)) {
-  process.stdout.write(JSON.stringify({ requestIds: [], resultIds: [], replayCount: 0 }));
-} else {
-  const db = new DatabaseSync(filename, { readOnly: true });
-  try {
-    db.exec('PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;');
-    const rows = db.prepare('SELECT id, data FROM part WHERE session_id = ? ORDER BY time_created, id LIMIT 512').all(sessionId);
-    const matches = [];
-    for (const row of rows) {
-      const part = JSON.parse(row.data);
-      if (part.type !== 'tool' || !JSON.stringify(part).includes(marker)) continue;
-      matches.push({ id: row.id, completed: part.state?.status === 'completed' });
-    }
-    process.stdout.write(JSON.stringify({
-      requestIds: matches.map((row) => row.id),
-      resultIds: matches.filter((row) => row.completed).map((row) => row.id),
-      replayCount: Math.max(0, matches.length - 1),
-    }));
-  } catch {
-    console.error('native tool evidence query failed');
-    process.exitCode = 1;
-  } finally { db.close(); }
-}
-`
+
 
 export type ChaosRuntimeObservation = {
   soulId: string
@@ -50,11 +20,7 @@ export type ChaosRuntimeObservation = {
   limits: { cpuMax: string; memoryMax: string; swapMax: string; pidsMax: string }
 }
 
-export type NativeToolEvidence = {
-  requestIds: string[]
-  resultIds: string[]
-  replayCount: number
-}
+export type { NativeToolEvidence } from '../../../scripts/testing/runtime-sandbox.js'
 
 export type StructuredChaosLog = {
   source: 'server' | 'browser'
@@ -105,34 +71,15 @@ export async function captureChaosRuntimeObservation(
 }
 
 export async function nativeToolEvidence(
-  rig: ManagedRuntimeBrowserRig,
-  containerId: string,
-  nativeSessionId: string,
-  marker: string,
+  rig: ManagedFixtureRig, handle: ExactRuntimeHandle, challengeId: string,
 ): Promise<NativeToolEvidence> {
-  return JSON.parse((await rig.ownedProviderExec(containerId, [
-    'node', '--no-warnings', '-e', OPENCODE_TOOL_EVIDENCE_SCRIPT,
-    '/home/freshell/provider/.local/share/opencode/opencode.db', nativeSessionId, marker,
-  ])))
+  return rig.nativeToolEvidence(handle, challengeId)
 }
 
 export async function nativeFollowUpMessageIds(
-  rig: ManagedRuntimeBrowserRig,
-  containerId: string,
-  nativeSessionId: string,
-  marker: string,
+  rig: ManagedFixtureRig, handle: ExactRuntimeHandle, challengeId: string,
 ): Promise<string[]> {
-  const result = JSON.parse((await rig.ownedProviderExec(containerId, [
-    'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
-    '/home/freshell/provider/.local/share/opencode/opencode.db', nativeSessionId,
-  ]))) as NativeHistory
-  if (result.provider !== 'opencode' || result.nativeSessionId !== nativeSessionId) {
-    throw new Error('native follow-up probe returned a conflicting OpenCode identity')
-  }
-  return result.turns
-    .filter((turn) => turn.text.includes(marker))
-    .map((turn) => turn.messageId)
-    .filter((messageId): messageId is string => typeof messageId === 'string' && messageId.length > 0)
+  return rig.nativeFollowUpMessageIds(handle, challengeId)
 }
 
 export function structuredChaosLog(
