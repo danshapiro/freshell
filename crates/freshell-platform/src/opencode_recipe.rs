@@ -24,6 +24,24 @@ pub struct GeneratedFileRecipe {
 
 /// Private filesystem metadata linking one native loader occurrence to its
 /// original source view. Documents and expanded values are never in this DTO.
+/// Native discovery role, independent of the selected file's physical inode.
+/// A project below the original HOME remains at its workspace path.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryRole {
+    #[default]
+    Workspace,
+    Global,
+    Home,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiscoveryRoot {
+    pub logical_path: PathBuf,
+    pub role: DiscoveryRole,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceManifest {
@@ -39,7 +57,7 @@ pub struct SourceManifest {
     #[serde(default)]
     pub native_source_flags: Vec<NativeSourceFlag>,
     #[serde(default)]
-    pub resource_roots: Vec<PathBuf>,
+    pub resource_roots: Vec<DiscoveryRoot>,
     #[serde(default = "default_rebind_enabled")]
     pub rebind_enabled: bool,
     #[serde(default)]
@@ -77,6 +95,8 @@ impl NativeSourceFlagKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceView {
     pub logical_path: PathBuf,
+    #[serde(default)]
+    pub discovery_role: DiscoveryRole,
     #[serde(default)]
     pub native_destination: Option<String>,
     pub lane: SourceLane,

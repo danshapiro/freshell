@@ -1,4 +1,5 @@
 //! Ordered native source occurrences for managed OpenCode preparation.
+pub use freshell_platform::opencode_recipe::{DiscoveryRole, DiscoveryRoot};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -12,6 +13,7 @@ pub struct SourceOccurrence {
     pub logical_path: PathBuf,
     pub canonical_source: PathBuf,
     pub lane: SourceLane,
+    pub role: DiscoveryRole,
 }
 
 pub struct OpencodeDiscovery<'a> {
@@ -33,6 +35,7 @@ pub fn discover_opencode(
             &mut sources,
             request.config_root.join(name),
             SourceLane::Main,
+            DiscoveryRole::Global,
         )?;
     }
     if let Some(path) = (request.env)("OPENCODE_CONFIG").filter(|value| !value.is_empty()) {
@@ -40,6 +43,7 @@ pub fn discover_opencode(
             &mut sources,
             absolute_from_cwd(&path, request.cwd),
             SourceLane::Main,
+            DiscoveryRole::Workspace,
         )?;
     }
     if !disabled {
@@ -48,17 +52,27 @@ pub fn discover_opencode(
             .rev()
         {
             for name in ["opencode.json", "opencode.jsonc"] {
-                add_source(&mut sources, directory.join(name), SourceLane::Main)?;
+                add_source(
+                    &mut sources,
+                    directory.join(name),
+                    SourceLane::Main,
+                    DiscoveryRole::Workspace,
+                )?;
             }
         }
     }
     for directory in config_directories(&request, Some(request.worktree), disabled)? {
-        if directory.file_name() == Some(std::ffi::OsStr::new(".opencode"))
+        if directory.logical_path.file_name() == Some(std::ffi::OsStr::new(".opencode"))
             || (request.env)("OPENCODE_CONFIG_DIR")
-                .is_some_and(|path| absolute_from_cwd(&path, request.cwd) == directory)
+                .is_some_and(|path| absolute_from_cwd(&path, request.cwd) == directory.logical_path)
         {
             for name in ["opencode.json", "opencode.jsonc"] {
-                add_source(&mut sources, directory.join(name), SourceLane::Main)?;
+                add_source(
+                    &mut sources,
+                    directory.logical_path.join(name),
+                    SourceLane::Main,
+                    directory.role,
+                )?;
             }
         }
     }
@@ -67,6 +81,7 @@ pub fn discover_opencode(
             &mut sources,
             request.config_root.join(name),
             SourceLane::Tui,
+            DiscoveryRole::Global,
         )?;
     }
     if let Some(path) = (request.env)("OPENCODE_TUI_CONFIG").filter(|value| !value.is_empty()) {
@@ -74,45 +89,70 @@ pub fn discover_opencode(
             &mut sources,
             absolute_from_cwd(&path, request.cwd),
             SourceLane::Tui,
+            DiscoveryRole::Workspace,
         )?;
     }
     if !disabled {
         for directory in ancestors(request.cwd, None).into_iter().rev() {
             for name in ["tui.json", "tui.jsonc"] {
-                add_source(&mut sources, directory.join(name), SourceLane::Tui)?;
+                add_source(
+                    &mut sources,
+                    directory.join(name),
+                    SourceLane::Tui,
+                    DiscoveryRole::Workspace,
+                )?;
             }
         }
     }
     for directory in config_directories(&request, None, disabled)? {
-        if directory.file_name() == Some(std::ffi::OsStr::new(".opencode"))
+        if directory.logical_path.file_name() == Some(std::ffi::OsStr::new(".opencode"))
             || (request.env)("OPENCODE_CONFIG_DIR")
-                .is_some_and(|path| absolute_from_cwd(&path, request.cwd) == directory)
+                .is_some_and(|path| absolute_from_cwd(&path, request.cwd) == directory.logical_path)
         {
             for name in ["tui.json", "tui.jsonc"] {
-                add_source(&mut sources, directory.join(name), SourceLane::Tui)?;
+                add_source(
+                    &mut sources,
+                    directory.logical_path.join(name),
+                    SourceLane::Tui,
+                    directory.role,
+                )?;
             }
         }
     }
     Ok(sources)
 }
 
-pub fn runtime_config_destination(home: &Path, global: &Path, logical: &Path) -> PathBuf {
+pub fn runtime_config_destination(
+    home: &Path,
+    global: &Path,
+    logical: &Path,
+    role: DiscoveryRole,
+) -> PathBuf {
     let runtime_home = Path::new("/home/freshell/provider");
-    if let Ok(relative) = logical.strip_prefix(global) {
-        runtime_home.join(".config/opencode").join(relative)
-    } else {
-        logical
+    match role {
+        DiscoveryRole::Global => logical
+            .strip_prefix(global)
+            .map(|relative| runtime_home.join(".config/opencode").join(relative))
+            .unwrap_or_else(|_| logical.into()),
+        DiscoveryRole::Home => logical
             .strip_prefix(home)
             .map(|relative| runtime_home.join(relative))
-            .unwrap_or_else(|_| logical.into())
+            .unwrap_or_else(|_| logical.into()),
+        DiscoveryRole::Workspace => logical.into(),
     }
 }
 
-pub fn runtime_directory_destination(home: &Path, global: &Path, logical: &Path) -> PathBuf {
+pub fn runtime_directory_destination(
+    home: &Path,
+    global: &Path,
+    logical: &Path,
+    role: DiscoveryRole,
+) -> PathBuf {
     runtime_config_destination(
         home,
         global,
         &freshell_platform::opencode_config::lexical_path(logical),
+        role,
     )
 }
 
@@ -140,21 +180,28 @@ pub fn config_directories(
     request: &OpencodeDiscovery<'_>,
     stop: Option<&Path>,
     disabled: bool,
-) -> Result<Vec<PathBuf>, &'static str> {
-    let mut result = vec![request.config_root.to_owned()];
+) -> Result<Vec<DiscoveryRoot>, &'static str> {
+    let mut result = vec![DiscoveryRoot {
+        logical_path: request.config_root.to_owned(),
+        role: DiscoveryRole::Global,
+    }];
     let mut candidates = Vec::new();
     if !disabled {
-        candidates.extend(
-            ancestors(request.cwd, stop)
-                .into_iter()
-                .map(|directory| directory.join(".opencode")),
-        );
+        candidates.extend(ancestors(request.cwd, stop).into_iter().map(|directory| {
+            DiscoveryRoot {
+                logical_path: directory.join(".opencode"),
+                role: DiscoveryRole::Workspace,
+            }
+        }));
     }
-    candidates.push(request.home.join(".opencode"));
+    candidates.push(DiscoveryRoot {
+        logical_path: request.home.join(".opencode"),
+        role: DiscoveryRole::Home,
+    });
     for directory in candidates {
-        match std::fs::symlink_metadata(&directory) {
+        match std::fs::symlink_metadata(&directory.logical_path) {
             Ok(_) => {
-                if !std::fs::metadata(&directory)
+                if !std::fs::metadata(&directory.logical_path)
                     .map_err(|_| "selected OpenCode config directory is unavailable")?
                     .is_dir()
                 {
@@ -169,7 +216,10 @@ pub fn config_directories(
         }
     }
     if let Some(path) = (request.env)("OPENCODE_CONFIG_DIR").filter(|value| !value.is_empty()) {
-        let directory = absolute_from_cwd(&path, request.cwd);
+        let directory = DiscoveryRoot {
+            logical_path: absolute_from_cwd(&path, request.cwd),
+            role: DiscoveryRole::Workspace,
+        };
         if !result.contains(&directory) {
             result.push(directory);
         }
@@ -181,19 +231,27 @@ pub fn config_directories(
 /// configuration document exists. Keep these selections independent of files.
 pub fn select_opencode_resource_roots(
     request: &OpencodeDiscovery<'_>,
-) -> Result<Vec<PathBuf>, &'static str> {
+) -> Result<Vec<DiscoveryRoot>, &'static str> {
     let disabled = (request.env)("OPENCODE_DISABLE_PROJECT_CONFIG")
         .is_some_and(|value| matches!(value.as_str(), "1" | "true"));
     let mut roots = config_directories(request, None, disabled)?;
-    for directory in std::iter::once(request.home.to_path_buf())
-        .chain(ancestors(request.cwd, Some(request.worktree)))
+    for (directory, role) in std::iter::once((request.home.to_path_buf(), DiscoveryRole::Home))
+        .chain(
+            ancestors(request.cwd, Some(request.worktree))
+                .into_iter()
+                .map(|path| (path, DiscoveryRole::Workspace)),
+        )
     {
         for name in [".claude/skills", ".agents/skills"] {
             let path = directory.join(name);
             match std::fs::symlink_metadata(&path) {
                 Ok(_) => {
-                    if !roots.contains(&path) {
-                        roots.push(path);
+                    let root = DiscoveryRoot {
+                        logical_path: path,
+                        role,
+                    };
+                    if !roots.contains(&root) {
+                        roots.push(root);
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -201,9 +259,9 @@ pub fn select_opencode_resource_roots(
             }
         }
     }
-    roots.retain(|root| root != request.config_root);
+    roots.retain(|root| root.role != DiscoveryRole::Global);
     for root in &roots {
-        let canonical = std::fs::canonicalize(root).map_err(|_| {
+        let canonical = std::fs::canonicalize(&root.logical_path).map_err(|_| {
             "selected OpenCode resource directory is missing, inaccessible or cyclic"
         })?;
         if !canonical.is_dir() || canonical == request.home || canonical == Path::new("/") {
@@ -217,6 +275,7 @@ fn add_source(
     sources: &mut Vec<SourceOccurrence>,
     logical_path: PathBuf,
     lane: SourceLane,
+    role: DiscoveryRole,
 ) -> Result<(), &'static str> {
     match std::fs::symlink_metadata(&logical_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -237,6 +296,7 @@ fn add_source(
         logical_path,
         canonical_source,
         lane,
+        role,
     });
     Ok(())
 }
@@ -530,11 +590,13 @@ mod tests {
                 logical_path: left.join("opencode.json"),
                 canonical_source: shared.clone(),
                 lane: SourceLane::Main,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
             },
             SourceOccurrence {
                 logical_path: right.join("opencode.json"),
                 canonical_source: shared.clone(),
                 lane: SourceLane::Main,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
             },
         ];
         let lookups = std::cell::Cell::new(0);
@@ -584,11 +646,13 @@ mod tests {
                 logical_path: first.clone(),
                 canonical_source: first.clone(),
                 lane: SourceLane::Main,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
             },
             SourceOccurrence {
                 logical_path: second.clone(),
                 canonical_source: second,
                 lane: SourceLane::Tui,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
             },
         ];
         let loaded = read_opencode_sources(sources).unwrap();
@@ -693,6 +757,7 @@ mod tests {
                 logical_path: config.clone(),
                 canonical_source: config,
                 lane: SourceLane::Main,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
             });
         }
         let plan = plan_opencode_sources(sources, &cwd, &home, &|_, _, _| None).unwrap();
@@ -732,6 +797,7 @@ mod tests {
                     logical_path: config.clone(),
                     canonical_source: config.clone(),
                     lane,
+                    role: DiscoveryRole::Workspace,
                 })
                 .collect()
         };

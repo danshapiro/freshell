@@ -39,7 +39,7 @@ pub(crate) struct OpencodeEphemeralInput<'a> {
     pub workspace: Option<&'a Path>,
     pub source_plan:
         Option<&'a [crate::managed_provider_references::sources::PlannedSourceOccurrence]>,
-    pub resource_roots: Option<&'a [PathBuf]>,
+    pub resource_roots: Option<&'a [freshell_platform::opencode_recipe::DiscoveryRoot]>,
     pub initial_auth_reservation: Option<&'a str>,
     pub secret_references: Option<&'a [freshell_runtime_protocol::ProviderSecretReference]>,
     pub config_root: Option<&'a Path>,
@@ -382,7 +382,7 @@ async fn apply_prepared_callback(
             let canonical=std::fs::canonicalize(&source.logical_path)
                 .map_err(|_|format!("prior selected configuration source {ordinal} is unavailable; repair it before reissue"))?;
             Ok(crate::managed_provider_references::sources::SourceOccurrence {
-                logical_path:source.logical_path.clone(),canonical_source:canonical,
+                logical_path:source.logical_path.clone(),canonical_source:canonical,role:source.discovery_role,
                 lane:match source.lane {freshell_platform::opencode_recipe::SourceLane::Main=>crate::managed_provider_references::sources::SourceLane::Main,
                     freshell_platform::opencode_recipe::SourceLane::Tui=>crate::managed_provider_references::sources::SourceLane::Tui,
                     freshell_platform::opencode_recipe::SourceLane::Inline=>crate::managed_provider_references::sources::SourceLane::Inline},
@@ -1125,8 +1125,16 @@ fn stage_provider_root(
                 .map(|reference| PathBuf::from(&reference.source_path)),
         );
         if let Some(plan) = opencode_input.source_plan {
-            let units =
-                source_stage::resource_units(home, &source, plan, opencode_input.resource_roots)?;
+            let units = source_stage::resource_units(
+                home,
+                &source,
+                opencode_input
+                    .workspace
+                    .or(opencode_input.cwd)
+                    .unwrap_or(home),
+                plan,
+                opencode_input.resource_roots,
+            )?;
             selections.extend(units.iter().map(|(source, mount)| CopySelection {
                 source: source.clone(),
                 destination_relative: mount.stage_relative_path.clone().into(),
@@ -1590,6 +1598,10 @@ impl CapabilityStore {
                 &reference,
                 opencode_input.initial_auth_reservation,
                 opencode_input.config_root,
+                opencode_input
+                    .workspace
+                    .or(opencode_input.cwd)
+                    .unwrap_or(home),
             )
             .and_then(|inputs| {
                 if let Some(context) = opencode_input.launch_context {
@@ -3330,11 +3342,13 @@ except Exception as error:
                     logical_path: config.clone(),
                     canonical_source: config.clone(),
                     lane: SourceLane::Main,
+                    role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
                 },
                 SourceOccurrence {
                     logical_path: explicit.clone(),
                     canonical_source: explicit.clone(),
                     lane: SourceLane::Main,
+                    role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
                 },
             ],
             &workspace,
@@ -4039,6 +4053,142 @@ except Exception as error:
     }
 
     #[test]
+    fn managed_provider_ancestor_root_has_its_own_native_mount_location() {
+        use crate::managed_provider_references::sources::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path();
+        let workspace = home.join("workspace");
+        let root = workspace.join(".opencode");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&root, home.join(".opencode")).unwrap();
+        let roots = vec![
+            DiscoveryRoot {
+                logical_path: root.clone(),
+                role: DiscoveryRole::Workspace,
+            },
+            DiscoveryRoot {
+                logical_path: home.join(".opencode"),
+                role: DiscoveryRole::Workspace,
+            },
+            DiscoveryRoot {
+                logical_path: home.join(".opencode"),
+                role: DiscoveryRole::Home,
+            },
+        ];
+        let units = source_stage::resource_units(
+            home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &[],
+            Some(&roots),
+        )
+        .unwrap();
+        let ancestor = units
+            .iter()
+            .find(|(_, mount)| Path::new(&mount.logical_destination) == home.join(".opencode"))
+            .unwrap();
+        assert_eq!(Path::new(&ancestor.1.effective_destination), home.join(".opencode"),
+            "ancestor discovery is outside the mounted workspace: its original logical symlink is absent in the container, so mount that exact logical root");
+        let effective = units
+            .iter()
+            .map(|(_, mount)| &mount.effective_destination)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(effective.len(),3,"native HOME, workspace and outside ancestor discovery each need a mount without duplicate effective targets");
+        assert!(units
+            .iter()
+            .all(|(_, mount)| mount.provider_relative_path == units[0].1.provider_relative_path));
+    }
+
+    #[test]
+    fn managed_provider_home_workspace_discovery_keeps_project_origins() {
+        use crate::managed_provider_references::sources::*;
+        use freshell_runtime_protocol::*;
+        for nested_workspace in [false, true] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let workspace = if nested_workspace {
+                home.join("project")
+            } else {
+                home.clone()
+            };
+            let global = home.join(".config/opencode");
+            std::fs::create_dir_all(&global).unwrap();
+            std::fs::create_dir_all(workspace.join(".opencode/skills/probe")).unwrap();
+            std::fs::write(
+                workspace.join("opencode.json"),
+                r#"{"agent":{"probe":{"description":"project-nonce"}}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                workspace.join(".opencode/opencode.json"),
+                r#"{"agent":{"probe":{"prompt":"root-nonce"}}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                workspace.join(".opencode/skills/probe/SKILL.md"),
+                "skill-nonce",
+            )
+            .unwrap();
+            let discovery = OpencodeDiscovery {
+                home: &home,
+                cwd: &workspace,
+                worktree: &workspace,
+                config_root: &global,
+                env: &|_| None,
+            };
+            let roots = select_opencode_resource_roots(&discovery).unwrap();
+            let sources = discover_opencode(discovery).unwrap();
+            let plan = plan_opencode_sources(sources, &workspace, &home, &|_, _, _| None).unwrap();
+            let directory = owned.path().join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let capability = CapabilityStore::default()
+                .issue(
+                    SoulId::new(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("opencode", &home, &[])),
+                    OpencodeEphemeralInput {
+                        cwd: Some(&workspace),
+                        workspace: Some(&workspace),
+                        source_plan: Some(&plan),
+                        resource_roots: Some(&roots),
+                        secret_references: Some(&[]),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+            let inputs: PreparedProviderInputs = serde_json::from_slice(
+                &std::fs::read(stage.join(".freshell/prepared-inputs.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(inputs.config_binds.iter().any(|bind| Path::new(&bind.logical_destination) == workspace.join("opencode.json") && Path::new(&bind.effective_destination) == workspace.join("opencode.json")),
+                "native project discovery beneath original HOME must consume the original workspace location");
+            assert!(inputs.resource_mounts.iter().any(|root| Path::new(&root.logical_destination) == workspace.join(".opencode")),
+                "native workspace discovery must retain its original root independently of physical provider HOME");
+            if !nested_workspace {
+                assert!(inputs.resource_mounts.iter().any(|root| root.logical_destination == "/home/freshell/provider/.opencode"),
+                    "the same original HOME/workspace root also supplies provider-HOME discovery");
+            }
+            let manifest: freshell_platform::opencode_recipe::SourceManifest =
+                serde_json::from_slice(
+                    &std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+                )
+                .unwrap();
+            assert!(manifest
+                .sources
+                .iter()
+                .any(|source| source.native_destination.as_deref()
+                    == workspace.join("opencode.json").to_str()));
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("opencode.json")).unwrap(),
+                r#"{"agent":{"probe":{"description":"project-nonce"}}}"#
+            );
+        }
+    }
+
+    #[test]
     fn managed_provider_home_and_workspace_root_aliases_share_one_physical_unit() {
         use freshell_runtime_protocol::*;
         let owned = tempfile::tempdir().unwrap();
@@ -4051,7 +4201,16 @@ except Exception as error:
         std::fs::write(shared.join("skills/probe/SKILL.md"), "shared-root-resource").unwrap();
         std::os::unix::fs::symlink(&shared, home.join(".opencode")).unwrap();
         std::os::unix::fs::symlink(&shared, workspace.join(".opencode")).unwrap();
-        let roots = vec![home.join(".opencode"), workspace.join(".opencode")];
+        let roots = vec![
+            freshell_platform::opencode_recipe::DiscoveryRoot {
+                logical_path: home.join(".opencode"),
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Home,
+            },
+            freshell_platform::opencode_recipe::DiscoveryRoot {
+                logical_path: workspace.join(".opencode"),
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
+            },
+        ];
         let directory = owned.path().join("control/mcp-capabilities");
         std::fs::create_dir_all(&directory).unwrap();
         let store = CapabilityStore::default();
@@ -4460,6 +4619,7 @@ except Exception as error:
                 logical_path: config.clone(),
                 canonical_source: config.clone(),
                 lane: SourceLane::Main,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
             }],
             &workspace,
             &home,
@@ -4698,6 +4858,7 @@ except Exception as error:
                 logical_path: config.clone(),
                 canonical_source: config.clone(),
                 lane: SourceLane::Main,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
             }],
             &workspace,
             &home,
@@ -4776,6 +4937,7 @@ except Exception as error:
                 logical_path: config.clone(),
                 canonical_source: config.clone(),
                 lane: SourceLane::Main,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
             }],
             &workspace,
             &home,
@@ -4854,6 +5016,7 @@ except Exception as error:
                 logical_path: config.clone(),
                 canonical_source: config.clone(),
                 lane: SourceLane::Tui,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
             }],
             &workspace,
             &home,
@@ -4932,6 +5095,7 @@ except Exception as error:
                 logical_path: config.clone(),
                 canonical_source: config,
                 lane: SourceLane::Main,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
             }],
             &workspace,
             &home,

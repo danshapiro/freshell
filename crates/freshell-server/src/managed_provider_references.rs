@@ -723,7 +723,7 @@ pub(crate) struct OpencodePreparation<'a> {
     pub references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
     pub auth_authority: Option<&'a str>,
     pub selected_sources: Option<Vec<sources::SourceOccurrence>>,
-    pub selected_resource_roots: Option<Vec<PathBuf>>,
+    pub selected_resource_roots: Option<Vec<sources::DiscoveryRoot>>,
     pub native_source_flags: Option<Vec<freshell_platform::opencode_recipe::NativeSourceFlag>>,
     pub rebind_enabled: Option<bool>,
     pub inherited_inline: Option<String>,
@@ -867,6 +867,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
                 logical_path: "OPENCODE_CONFIG_CONTENT".into(),
                 canonical_source: "OPENCODE_CONFIG_CONTENT".into(),
                 lane: SourceLane::Inline,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
             },
             view: std::sync::Arc::new(view),
         };
@@ -898,12 +899,17 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
                 };
                 let source_ordinal = loaded
                     .iter()
-                    .position(|source| source.source.logical_path == path && match kind {
+                    .position(|source| source.source.logical_path == path && source.source.role == DiscoveryRole::Workspace && match kind {
                         freshell_platform::opencode_recipe::NativeSourceFlagKind::Main => source.source.lane == SourceLane::Main,
                         freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui => source.source.lane == SourceLane::Tui,
                         freshell_platform::opencode_recipe::NativeSourceFlagKind::Directory => false,
                     }).ok_or_else(|| format!("selected {name} source is missing or unavailable; repair it before dispatch"))?;
-                let destination = sources::runtime_config_destination(home, &config_root, &path);
+                let destination = sources::runtime_config_destination(
+                    home,
+                    &config_root,
+                    &path,
+                    loaded[source_ordinal].source.role,
+                );
                 flags.push(freshell_platform::opencode_recipe::NativeSourceFlag {
                     kind,
                     source_ordinal: Some(
@@ -923,7 +929,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
             } else {
                 cwd.join(path)
             };
-            if !resource_roots.contains(&path) {
+            if !resource_roots.iter().any(|root| root.logical_path == path) {
                 return Err(
                     "selected OPENCODE_CONFIG_DIR root is unavailable before dispatch".into(),
                 );
@@ -935,6 +941,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
                     home,
                     &config_root,
                     &path,
+                    DiscoveryRole::Workspace,
                 )
                 .to_str()
                 .ok_or("selected directory is not UTF-8")?
@@ -957,6 +964,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
                             home,
                             &config_root,
                             &source.source.logical_path,
+                            source.source.role,
                         )
             })
         {

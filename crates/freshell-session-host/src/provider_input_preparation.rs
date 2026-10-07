@@ -273,6 +273,7 @@ mod tests {
             cwd: "/original-unavailable/project".into(),
             original_home: "/original-unavailable/home".into(),
             sources: vec![SourceView {
+                discovery_role: DiscoveryRole::Workspace,
                 logical_path: "/original-unavailable/project/opencode.json".into(),
                 native_destination: Some("/original-unavailable/project/opencode.json".into()),
                 lane: SourceLane::Main,

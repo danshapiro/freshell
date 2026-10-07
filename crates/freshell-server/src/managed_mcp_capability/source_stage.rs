@@ -9,8 +9,9 @@ use std::{collections::BTreeMap, path::Path};
 pub(super) fn resource_units(
     home: &Path,
     global: &Path,
+    workspace: &Path,
     plan: &[PlannedSourceOccurrence],
-    accepted_roots: Option<&[std::path::PathBuf]>,
+    accepted_roots: Option<&[freshell_platform::opencode_recipe::DiscoveryRoot]>,
 ) -> Result<
     Vec<(
         std::path::PathBuf,
@@ -21,12 +22,12 @@ pub(super) fn resource_units(
     use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
     let mut roots = BTreeMap::new();
     for root in accepted_roots.unwrap_or_default() {
-        let canonical = std::fs::canonicalize(root)
+        let canonical = std::fs::canonicalize(&root.logical_path)
             .map_err(|_| "selected OpenCode resource root is unavailable, dangling or cyclic")?;
         if !canonical.is_dir() {
             return Err("selected OpenCode resource root must be a directory".into());
         }
-        roots.insert(root.clone(), canonical);
+        roots.insert((root.logical_path.clone(), root.role), canonical);
     }
     for source in plan {
         if source.source.lane == SourceLane::Inline {
@@ -43,24 +44,27 @@ pub(super) fn resource_units(
         if !canonical.is_dir() {
             return Err("selected OpenCode resource root must be a directory".into());
         }
-        roots.insert(parent.to_path_buf(), canonical);
+        roots.insert((parent.to_path_buf(), source.source.role), canonical);
     }
     let mut units = Vec::new();
     let mut identities = BTreeMap::new();
-    for (logical, canonical) in roots {
+    for ((logical, role), canonical) in roots {
         let next = identities.len();
         let ordinal = *identities.entry(canonical.clone()).or_insert(next);
         let destination =
             crate::managed_provider_references::sources::runtime_directory_destination(
-                home, global, &logical,
+                home, global, &logical, role,
             );
-        let effective = if destination.starts_with("/home/freshell/provider") {
-            // HOME is a new physical graph, so its native discovery root is
-            // mounted directly; the original user symlink remains untouched.
+        let effective = if destination.starts_with("/home/freshell/provider")
+            || !logical.starts_with(workspace)
+        {
+            // HOME is a new physical graph. Ancestor links outside the mounted
+            // workspace are also absent there, so mount their logical roots
+            // directly without modifying the original user topology.
             destination.clone()
         } else {
             crate::managed_provider_references::sources::runtime_directory_destination(
-                home, global, &canonical,
+                home, global, &canonical, role,
             )
         };
         units.push((
@@ -178,11 +182,13 @@ pub(super) fn stage(
         }
         manifest.sources.push(SourceView {
             logical_path: source.source.logical_path.clone(),
+            discovery_role: source.source.role,
             native_destination: Some(
                 crate::managed_provider_references::sources::runtime_config_destination(
                     home,
                     input.config_root.unwrap_or(&home.join(".config/opencode")),
                     &source.source.logical_path,
+                    source.source.role,
                 )
                 .to_str()
                 .ok_or("native source destination is not UTF-8")?
@@ -235,6 +241,7 @@ pub(super) fn describe(
     capability: &freshell_runtime_protocol::McpCapabilityReference,
     initial_auth_reservation: Option<&str>,
     config_root: Option<&Path>,
+    workspace: &Path,
 ) -> Result<freshell_runtime_protocol::PreparedProviderInputs, String> {
     use freshell_runtime_protocol::*;
     use sha2::{Digest, Sha256};
@@ -264,10 +271,18 @@ pub(super) fn describe(
             let logical = &occurrence.source.logical_path;
             let destination = freshell_platform::opencode_config::lexical_path(
                 &crate::managed_provider_references::sources::runtime_config_destination(
-                    home, global, logical,
+                    home,
+                    global,
+                    logical,
+                    occurrence.source.role,
                 ),
             );
-            let effective = if let Ok(relative) = logical.strip_prefix(&global) {
+            let effective = if occurrence.source.role
+                == freshell_platform::opencode_recipe::DiscoveryRole::Global
+            {
+                let relative = logical
+                    .strip_prefix(global)
+                    .map_err(|_| "global source is outside its discovery root")?;
                 let physical = std::fs::canonicalize(root.join(relative))
                     .map_err(|_| "selected global config is unavailable in its private stage")?;
                 let relative = physical
@@ -278,13 +293,27 @@ pub(super) fn describe(
                 } else {
                     runtime_home.join(".config/opencode").join(relative)
                 }
+            } else if let Some(unit) = resource_mounts
+                .iter()
+                .find(|unit| destination.starts_with(&unit.logical_destination))
+            {
+                Path::new(&unit.effective_destination).join(
+                    destination
+                        .strip_prefix(&unit.logical_destination)
+                        .map_err(|_| "config origin is outside its selected resource root")?,
+                )
+            } else if occurrence.source.role
+                == freshell_platform::opencode_recipe::DiscoveryRole::Workspace
+                && !logical.starts_with(workspace)
+            {
+                destination.clone()
             } else {
-                occurrence
-                    .source
-                    .canonical_source
-                    .strip_prefix(home)
-                    .map(|relative| runtime_home.join(relative))
-                    .unwrap_or_else(|_| occurrence.source.canonical_source.clone())
+                crate::managed_provider_references::sources::runtime_config_destination(
+                    home,
+                    global,
+                    &occurrence.source.canonical_source,
+                    occurrence.source.role,
+                )
             };
             binds.push(ProviderConfigBind {
                 source_relative_path: format!(".freshell/templates/source-{ordinal}"),
@@ -330,6 +359,7 @@ pub(super) fn describe(
                         home,
                         global,
                         &approved.approved_alias,
+                        occurrence.source.role,
                     );
                 let effective = if let Some(unit) = resource_mounts.iter().find(|unit| {
                     unit.kind == ProviderResourceKind::Directory
@@ -344,7 +374,10 @@ pub(super) fn describe(
                     )
                 } else {
                     crate::managed_provider_references::sources::runtime_config_destination(
-                        home, global, selected,
+                        home,
+                        global,
+                        selected,
+                        occurrence.source.role,
                     )
                 };
                 if let Some(prior) = alias_sources.insert(logical.clone(), source_id) {

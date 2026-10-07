@@ -19,7 +19,7 @@ const broker=new RestrictedDockerBroker({
   runtimeRootPrefix:path.join(root,'scenarios'),allowedHostBinaryPaths:new Set([configuration.hostBinaryPath]),
   allowedImageRefs:new Set([image]),allowTerminalWorkloads:true,
   allowedWorkspaceRoots:new Set([path.join(root,'workspace')]),
-  allowedProviderUserRoots:new Set(['/home/freshell/provider']),
+  allowedProviderUserRoots:new Set(['/home/freshell/provider',path.join(root,'.opencode')]),
   allowedBootstrapFiles:new Set([path.join(root,'grants/environment.env'),path.join(root,'grants/auth.json')]),
   allowedHostGatewayAddresses:gateways,
   testRunId:configuration.runId,logPath:path.join(root,'broker.jsonl'),

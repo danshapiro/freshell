@@ -262,6 +262,7 @@ mod tests {
                     logical_path: config.clone(),
                     canonical_source: config.clone(),
                     lane: SourceLane::Main,
+                    role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
                 },
                 view: std::sync::Arc::new(raw.into()),
             }]
@@ -328,6 +329,7 @@ mod tests {
                             logical_path: config.clone(),
                             canonical_source: config,
                             lane: SourceLane::Main,
+                            role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
                         },
                         view: std::sync::Arc::new(raw),
                     }],
@@ -385,6 +387,7 @@ mod tests {
                         logical_path: config.clone(),
                         canonical_source: config,
                         lane: SourceLane::Main,
+                        role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
                     },
                     view: std::sync::Arc::new(raw.into()),
                 }],
