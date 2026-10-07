@@ -541,18 +541,22 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
         return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'defer',
           permissionDecisionReason: 'Managed native no-effect continuation checkpoint' } }
       }] }] } : undefined,
-      spawnClaudeCodeProcess: state.nativeChannel ? (options) => spawnObservedNative(options, {
-        onStderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
-        onControlWrite: (frame, error) => {
-          if (state.queryGeneration !== generation) return
-          const binding = state.nativeRequests?.get(frame.response.request_id)
-          if (!binding) return
-          state.nativeRequests.delete(frame.response.request_id)
-          emit({ type: `sdk.${binding.kind}.dispatch`, sessionId, requestId: binding.requestId,
-            nativeRequestId: frame.response.request_id, ok: !error && frame.response.subtype === 'success',
-            acceptanceAmbiguous: !!error, message: error?.message ?? frame.response.error })
-        },
-      }) : undefined,
+      spawnClaudeCodeProcess: state.nativeChannel ? (options) => {
+        const child = spawnObservedNative(options, {
+          onStderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
+          onControlWrite: (frame, error) => {
+            if (state.queryGeneration !== generation) return
+            const binding = state.nativeRequests?.get(frame.response.request_id)
+            if (!binding) return
+            state.nativeRequests.delete(frame.response.request_id)
+            emit({ type: `sdk.${binding.kind}.dispatch`, sessionId, requestId: binding.requestId,
+              nativeRequestId: frame.response.request_id, ok: !error && frame.response.subtype === 'success',
+              acceptanceAmbiguous: !!error, message: error?.message ?? frame.response.error })
+          },
+        })
+        state.nativeChildClosed = new Promise((resolve) => child.once('close', resolve))
+        return child
+      } : undefined,
       settingSources: ['user', 'project', 'local'],
       stderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
       canUseTool: async (toolName, input, options) => {
@@ -610,6 +614,7 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
 async function continueNativeCheckpoint(sessionId, state, record) {
   const previousQuery = state.query
   const previousAbort = state.abort
+  const previousNativeClosed = state.nativeChildClosed
   state.query = undefined
   state.nativeContinuation = record
   state.nativeReady = false
@@ -618,6 +623,15 @@ async function continueNativeCheckpoint(sessionId, state, record) {
   state.abort = new AbortController()
   previousQuery.close?.()
   previousAbort.abort()
+  if (previousNativeClosed) {
+    let timeout
+    try {
+      await Promise.race([previousNativeClosed, new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('original native writer did not close')), 5_000)
+      })])
+    } finally { clearTimeout(timeout) }
+  }
+  if (sessions.get(sessionId) !== state || state.abort.signal.aborted) throw new Error('native continuation cancelled before exact resume')
   await openSessionQuery(sessionId, state, { ...state.createRequest, resumeSessionId: record.nativeSessionId }, state.launch, false)
   await state.nativeReadyPromise
   await deliverNativeContinuation(sessionId, state, record)

@@ -20,11 +20,12 @@ async function hook(channel: any) {
   child.stdin.end(JSON.stringify(native))
   expect(await exited).toBe(0)
 }
-function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false) {
+function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false, delayedNativeExit = false) {
   const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/index.mjs')], {
     env: { ...process.env, HOME: directory, FRESHELL_SIDECAR_TEST_CHECKPOINT: '1',
       FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID: nativeRequestId,
       FRESHELL_SIDECAR_TEST_DEFERRED_TRANSCRIPT_DELAY: delayedTranscript ? '1' : '0',
+      FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY: delayedNativeExit ? '1' : '0',
       FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(launch),
       FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -153,6 +154,29 @@ describe('native solo deferred checkpoint inspection', () => {
 })
 
 describe('production sidecar native checkpoint continuation', () => {
+  it('waits for the original native child to close before spawning its exact-resume writer', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-writer-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    const worker = checkpointSidecar(directory, 'native-writer', false, true)
+    try {
+      worker.send({ type: 'create', requestId: 'writer-close', cwd: directory, resumeSessionId: root, permissionMode: 'default' })
+      const session = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: session.sessionId, text: 'owned original operation' })
+      await worker.wait('sdk.permission.request')
+      expect(worker.frames.filter((frame) => frame.type === 'probe.native-child')).toHaveLength(2)
+      expect(worker.frames.some((frame) => frame.type === 'probe.native-overlap')).toBe(false)
+    } finally {
+      await worker.close()
+      const pids = worker.frames.filter((frame) => frame.type === 'probe.native-child').map((frame) => frame.pid)
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (pids.every((pid) => { try { process.kill(pid, 0); return false } catch { return true } })) break
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
   it('waits for the genuine deferred native transcript publication before exposing its pending card', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'sidecar-deferred-publication-'))
     await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')

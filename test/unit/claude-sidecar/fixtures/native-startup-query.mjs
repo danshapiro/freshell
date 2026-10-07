@@ -2,6 +2,7 @@
 import { exec } from 'node:child_process'
 import { appendFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+const nativeChildren = new Set()
 export function query({ prompt, options }) {
   if (process.env.FRESHELL_SIDECAR_TEST_PREINIT_PERMISSION === '1') {
     void options.canUseTool('Bash', { command: 'owned-preinit-effect' }, {}).then((decision) =>
@@ -9,6 +10,15 @@ export function query({ prompt, options }) {
   }
   const nativeRoot = options.resume ?? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
   const checkpointScenario = process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT === '1'
+  const child = checkpointScenario && process.env.FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY === '1'
+    ? options.spawnClaudeCodeProcess({ command: process.execPath,
+      args: ['-e', "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.exit(0),150))"], env: options.env }) : undefined
+  if (child) {
+    if (nativeChildren.size) process.stdout.write(JSON.stringify({ type: 'probe.native-overlap' }) + '\n')
+    nativeChildren.add(child.pid)
+    process.stdout.write(JSON.stringify({ type: 'probe.native-child', pid: child.pid }) + '\n')
+    child.once('close', () => nativeChildren.delete(child.pid))
+  }
   const transcriptPath = checkpointScenario ? join(options.cwd, 'native.jsonl') : '/owned/native.jsonl'
   const loaded = new Promise((resolve, reject) => {
     const command = options.settings?.hooks?.SessionStart?.[0]?.hooks?.[0]?.command
@@ -62,6 +72,6 @@ export function query({ prompt, options }) {
         }
       }
     },
-    close() { options.abortController.abort() },
+    close() { child?.stdin.end(); options.abortController.abort() },
   }
 }
