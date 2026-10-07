@@ -269,14 +269,13 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
   if (caseId === 'crash-before-checkpoint' || caseId === 'effect-before-observation') {
     const directory = path.join(workspace, '.claude'); fs.mkdirSync(directory, { mode: 0o770 }); fs.chmodSync(directory, 0o770)
-    const settings = caseId === 'effect-before-observation' ? { permissions: { allow: ['Bash'] } }
-      : { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command',
-        command: `python3 '${path.join(directory, 'pause-before-checkpoint.py')}' '${path.join(workspace, 'native-before-checkpoint.json')}'`, timeout: 60 }] }] } }
-    if (caseId === 'crash-before-checkpoint') {
-      const hook = path.join(directory, 'pause-before-checkpoint.py')
-      fs.writeFileSync(hook, "import sys,json,pathlib,time\nvalue=json.load(sys.stdin)\np=pathlib.Path(sys.argv[1])\np.write_text(json.dumps(value))\ntime.sleep(45)\nprint('{}')\n", { mode: 0o660 })
-      fs.chmodSync(hook, 0o660)
-    }
+    const afterEffect = caseId === 'effect-before-observation'
+    const hook = path.join(directory, afterEffect ? 'pause-after-effect.py' : 'pause-before-checkpoint.py')
+    const signal = path.join(workspace, afterEffect ? 'native-after-effect-before-observation.json' : 'native-before-checkpoint.json')
+    const settings = { hooks: { [afterEffect ? 'PostToolUse' : 'PreToolUse']: [{ matcher: 'Bash', hooks: [{ type: 'command',
+      command: `python3 '${hook}' '${signal}'`, timeout: 60 }] }] } }
+    fs.writeFileSync(hook, "import sys,json,pathlib,time\nvalue=json.load(sys.stdin)\np=pathlib.Path(sys.argv[1])\np.write_text(json.dumps(value))\ntime.sleep(45)\nprint('{}')\n", { mode: 0o660 })
+    fs.chmodSync(hook, 0o660)
     fs.writeFileSync(path.join(directory, 'settings.json'), JSON.stringify(settings), { mode: 0o660 })
     fs.chmodSync(path.join(directory, 'settings.json'), 0o660)
   }
@@ -585,7 +584,7 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
   return original
 }
 
-async function executeManagedNativeApproval(input: {
+export async function executeManagedNativeApproval(input: {
   harness: RuntimeHarness; supervisor: any; soulId: string; workspace: string; view: any; scenario: string
   decision: string; inspect: (containerId: string, label: string, requireTranscript: boolean) => Promise<any>
 }): Promise<{ name: string; pass: boolean }[]> {
@@ -630,6 +629,7 @@ async function executeManagedNativeApproval(input: {
       : `Use the Bash tool exactly once with this exact command: ${command}. Do not use other tools or another command. After its result, reply done.` } })
   if (['crash-before-checkpoint', 'multiple-tools', 'effect-before-observation'].includes(input.decision)) {
     let originalOperation: any
+    let effectDecision: any
     if (input.decision === 'crash-before-checkpoint') {
       const paused = path.join(workspace, 'native-before-checkpoint.json')
       await harness.waitForFile(paused, 90_000)
@@ -649,13 +649,28 @@ async function executeManagedNativeApproval(input: {
       }
       if (!nativeTwoToolBatchMatches(native, commands)) throw new Error('actual native multi-tool batch differs')
     } else {
-      originalOperation = (await wait((event) => event.kind === 'provider'
-        && event.data.payload.event?.type === 'freshAgent.result', 'ordinary native allow-policy result')).data.payload.event
-      if (originalOperation.nativeSessionId !== view.nativeSessionId || originalOperation.isError || effectCount() !== 1
-        || observed.some((event) => event.kind === 'permission_requested')) throw new Error('ordinary native allow policy did not complete once without a callback/card')
-      const nativeResult = observed.filter((event) => event.kind === 'provider'
-        && event.data.payload.event?.type === 'freshAgent.tool.result').flatMap((event) => event.data.payload.event.content ?? [])
-      if (nativeResult.length !== 1 || nativeResult[0].is_error) throw new Error('ordinary native allow branch lacks its actual successful correlated tool result')
+      const current = (await wait(isCard, 'current native ask before effect')).data
+      effectDecision = current
+      const payload = current.payload
+      if (payload.tool?.name !== 'Bash' || payload.tool.input?.command !== command
+        || payload.nativeCheckpoint.nativeSessionId !== view.nativeSessionId
+        || payload.nativeCheckpoint.toolUseID !== payload.toolUseID || effectCount() !== 0) {
+        throw new Error('original current native operation differs before effect')
+      }
+      // Resolve the actual current native ask, then deliberately stop reading
+      // normalized outcomes. The supported PostToolUse hook parks only after
+      // the native command has executed, before its result is observed.
+      const receipt = await harness.adminOk(supervisor, harness.freshAgentResolveBody(soulId, current.decision_id,
+        { behavior: 'allow', updatedInput: payload.tool.input }))
+      harness.writeArtifact(`${scenario}-current-allow-dispatch.json`, receipt)
+      const paused = path.join(workspace, 'native-after-effect-before-observation.json')
+      await harness.waitForFile(paused, 90_000)
+      originalOperation = JSON.parse(fs.readFileSync(paused, 'utf8'))
+      if (originalOperation.hook_event_name !== 'PostToolUse' || originalOperation.session_id !== view.nativeSessionId
+        || originalOperation.tool_name !== 'Bash' || originalOperation.tool_use_id !== payload.toolUseID
+        || originalOperation.tool_input?.command !== command || effectCount() !== 1) {
+        throw new Error('actual native post-effect hook did not park the original completed effect')
+      }
     }
     const before = await inspect(view.containerId, 'native-edge-before-death', true)
     harness.writeArtifact(`${scenario}-original-native-operation-private.json`, originalOperation)
@@ -663,6 +678,16 @@ async function executeManagedNativeApproval(input: {
     if (input.decision !== 'effect-before-observation' && (effectCount() !== 0
       || rows.some((row) => row.type === 'attachment' && row.attachment?.type === 'hook_deferred_tool'))) {
       throw new Error('actual crash/batch operation already produced an effect or deferred checkpoint')
+    }
+    if (input.decision === 'effect-before-observation') {
+      if (rows.some((row) => row.type === 'user' && Array.isArray(row.message?.content)
+        && row.message.content.some((block: any) => block.type === 'tool_result' && block.tool_use_id === originalOperation.tool_use_id))) {
+        throw new Error('post-effect native outcome was already published')
+      }
+      const files = await captureCheckpointState(view.containerId, 'effect-before-observation')
+      const record = JSON.parse(Buffer.from(files.find((file) => file.readerUid === 65534).bytesBase64, 'base64').toString('utf8'))
+      if (record.phase !== 'dispatching' || record.nativeSessionId !== view.nativeSessionId
+        || record.toolUseID !== originalOperation.tool_use_id) throw new Error('native effect has no durable ambiguous dispatch fence')
     }
     const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
     harness.writeArtifact(`${scenario}-native-edge-store-probe.json`, probe)
@@ -674,7 +699,13 @@ async function executeManagedNativeApproval(input: {
       || recovery.data.view.nativeSessionId !== view.nativeSessionId || recovery.data.view.recoveryState !== 'live'
       || !recovery.data.view.nativeIdentityObservation) throw new Error('actual native edge replacement did not preserve its root/current gate')
     let refused
-    if (input.decision !== 'effect-before-observation') {
+    if (input.decision === 'effect-before-observation') {
+      await inspect(recovery.data.view.containerId, 'native-edge-after-effect-recovery', true)
+      refused = await harness.adminRaw(supervisor, harness.freshAgentResolveBody(soulId, effectDecision.decision_id,
+        { behavior: 'allow', updatedInput: effectDecision.payload.tool.input }))
+      harness.writeArtifact(`${scenario}-ambiguous-decision-refused.json`, refused)
+      if (!refused.result?.Err) throw new Error('ambiguous completed effect accepted its old decision again')
+    } else {
       await inspect(recovery.data.view.containerId, 'native-edge-after-death-before-input', true)
       refused = await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: { soulId,
         text: 'Do not perform any tools. Report whether the unfinished original operation is blocked.' } })
@@ -707,7 +738,7 @@ async function executeManagedNativeApproval(input: {
     || oldPayload.nativeCheckpoint.toolUseID !== oldPayload.toolUseID || effectCount() !== 0) {
     throw new Error('original native solo checkpoint/effect oracle differs')
   }
-  const captureCheckpointState = async (containerId: string, label: string) => {
+  async function captureCheckpointState(containerId: string, label: string) {
     const files = []
     for (const [uid, file] of [['0:0', '/run/freshell-host-actor/fresh-agent-state.json'],
       ['65534:0', `/home/freshell/provider/.freshell/native-checkpoints/claude/${view.nativeSessionId}.json`]]) {
@@ -716,6 +747,7 @@ async function executeManagedNativeApproval(input: {
       files.push(JSON.parse(source))
     }
     harness.writeArtifact(`${scenario}-${label}-checkpoint-state-private.json`, { nativeRoot: view.nativeSessionId, files })
+    return files
   }
   const before = await inspect(view.containerId, 'checkpoint-before-death', true)
   await captureCheckpointState(view.containerId, 'before-death')

@@ -6,7 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -25,6 +25,57 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each([false, true])('faults after a current ordinary Allow and refuses an already published outcome (%s)', async (publishedOutcome) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'native-effect-edge-'))
+    const command = `printf 'effect\\n' >> '${path.join(workspace, 'owned-native-effect.jsonl')}'`
+    const toolUseID = 'toolu_original1'
+    const nativeRoot = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const methods: string[] = []
+    let read = false
+    const payload = { tool: { name: 'Bash', input: { command } }, toolUseID,
+      nativeCheckpoint: { nativeSessionId: nativeRoot, toolUseID }, nativeRequestId: 'current-native-request' }
+    const harness = { writeArtifact: () => '',
+      freshAgentResolveBody: (_soul: string, decision: string, value: unknown) => ({ method: 'fresh_agent_resolve', params: { decision, value } }),
+      probeRecoveryBody: () => ({ method: 'probe_recovery' }),
+      adminOk: async (_supervisor: unknown, body: any) => {
+        methods.push(body.method)
+        if (body.method === 'fresh_agent_read_events') {
+          if (read) throw new Error('unexpected observation read after parked card')
+          read = true
+          return { data: { head: 1, events: [{ event: { kind: 'permission_requested', data: { decision_id: 'current-card', payload } } }] } }
+        }
+        if (body.method === 'fresh_agent_resolve') {
+          expect(body.params.decision).toBe('current-card')
+          expect(body.params.value).toEqual({ behavior: 'allow', updatedInput: { command } })
+          fs.writeFileSync(path.join(workspace, 'owned-native-effect.jsonl'), 'effect\n')
+          fs.writeFileSync(path.join(workspace, 'native-after-effect-before-observation.json'), JSON.stringify({
+            hook_event_name: 'PostToolUse', session_id: nativeRoot, tool_name: 'Bash', tool_use_id: toolUseID, tool_input: { command } }))
+        }
+        return { data: { kind: 'reattach_ready' } }
+      },
+      waitForFile: async (file: string) => { expect(fs.existsSync(file)).toBe(true) },
+      execOwnedContainerAsExact: async (_container: string, uid: string, args: string[]) => {
+        const bytes = Buffer.from(JSON.stringify({ phase: 'dispatching', nativeSessionId: nativeRoot, toolUseID }))
+        return JSON.stringify({ path: args.at(-1), readerUid: Number(uid.split(':')[0]), bytesBase64: bytes.toString('base64'),
+          sha256: createHash('sha256').update(bytes).digest('hex') })
+      },
+      killOwnedRuntimeExact: async () => { throw new Error('controlled exact native death') },
+    } as unknown as RuntimeHarness
+    const rows = [{ type: 'assistant', sessionId: nativeRoot, message: { id: 'msg_original',
+      content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command } }] } },
+    { type: 'attachment', sessionId: nativeRoot, attachment: { type: 'hook_deferred_tool', toolUseID } }]
+    const bytes = Buffer.from(rows.map((row) => JSON.stringify(row)).join('\n') + '\n')
+    const nativeBytes = publishedOutcome ? Buffer.concat([bytes, Buffer.from(JSON.stringify({ type: 'user', sessionId: nativeRoot,
+      message: { content: [{ type: 'tool_result', tool_use_id: toolUseID, is_error: false }] } }) + '\n')]) : bytes
+    try {
+      await expect(executeManagedNativeApproval({ harness, supervisor: {}, soulId: 'owned-soul', workspace,
+        view: { nativeSessionId: nativeRoot, containerId: 'owned-container' }, scenario: 'controlled-effect-edge',
+        decision: 'effect-before-observation', inspect: async () => ({ nativeRoot,
+          transcript: { bytesBase64: nativeBytes.toString('base64'), sha256: createHash('sha256').update(nativeBytes).digest('hex'), completeEof: true } }) }))
+        .rejects.toThrow(publishedOutcome ? 'post-effect native outcome was already published' : 'controlled exact native death')
+      expect(methods).toEqual(['fresh_agent_send', 'fresh_agent_read_events', 'fresh_agent_resolve', ...(publishedOutcome ? [] : ['probe_recovery'])])
+    } finally { fs.rmSync(workspace, { recursive: true, force: true }) }
+  })
   it.each(['changed-tool', 'missing-tool', 'changed-input', 'changed-profile', 'changed-root', 'stale-callback',
     'crash-before-checkpoint', 'multiple-tools', 'effect-before-observation'])(
     'dispatches %s through the managed native launch boundary', async (caseId) => {
