@@ -1,11 +1,12 @@
 import { execFileSync } from 'node:child_process'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
+  runNativeFeasibility,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -24,6 +25,33 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it('actual entrypoint prepares finite phase-one artifacts and joins cleanup on preparation failure', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-entry-unit-'))
+    const manifest = path.join(directory, 'artifacts.json')
+    const previous = process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
+    fs.writeFileSync(manifest, JSON.stringify({ candidateSha, imageDigest,
+      artifacts: { supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
+        host: { path: '/fixture/host', sha256: 'd'.repeat(64) } }, sourceFiles: [] }), { mode: 0o600 })
+    process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = manifest
+    let selectedPhase: number | undefined
+    const prepare = vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function () {
+      selectedPhase = this.phase
+      throw new Error('controlled native preparation failure')
+    })
+    const cleanup = vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    try {
+      await expect(runNativeFeasibility(['--mode', 'freshclaude', '--case', 'startup']))
+        .rejects.toThrow('controlled native preparation failure')
+      expect(selectedPhase).toBe(1)
+      expect(prepare).toHaveBeenCalledOnce()
+      expect(cleanup).toHaveBeenCalledOnce()
+    } finally {
+      prepare.mockRestore(); cleanup.mockRestore()
+      if (previous === undefined) delete process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
+      else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = previous
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
   it('prepares only exact private native artifacts and selected source copies without ambient mounts', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-artifact-unit-'))
     execFileSync('git', ['init', '-q', directory])
