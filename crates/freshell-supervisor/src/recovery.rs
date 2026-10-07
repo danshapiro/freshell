@@ -134,6 +134,12 @@ fn retained_status_observed(
         && current_native_observation(context, status).is_some()
 }
 
+fn deterministic_fresh_fixture(context: &RecoveryContext) -> bool {
+    context.fresh_agent.as_ref().is_some_and(|agent| {
+        crate::registry::deterministic_fresh_agent_fixture(&context.provider, agent)
+    })
+}
+
 fn current_native_observation<'a>(
     context: &RecoveryContext,
     status: &'a crate::service::HostStatus,
@@ -1778,8 +1784,9 @@ impl Supervisor {
                     // A loader may emit its native root before later restoration
                     // fails. Re-read the current child after the independent store
                     // read, then persist only that still-live current observation.
-                    let requires_native_observation =
-                        context.provider != "shell" && context.fixture.is_none();
+                    let requires_native_observation = context.provider != "shell"
+                        && context.fixture.is_none()
+                        && !deterministic_fresh_fixture(context);
                     let status = if !status.exited && requires_native_observation {
                         self.host_status(
                             context.prior_handle.incarnation_id().clone(),
@@ -1810,6 +1817,7 @@ impl Supervisor {
                     if !status.exited
                         && context.provider != "shell"
                         && context.fixture.is_none()
+                        && !deterministic_fresh_fixture(context)
                         && !native_observation_qualified
                         && matches!(
                             &captured,
@@ -1832,7 +1840,9 @@ impl Supervisor {
                             container_id: context.prior_handle.container_id().to_owned(),
                         },
                         after_native_probe(context, captured),
-                        context.provider != "shell" && context.fixture.is_none(),
+                        context.provider != "shell"
+                            && context.fixture.is_none()
+                            && !deterministic_fresh_fixture(context),
                     ));
                 }
                 Err(_)
@@ -1863,6 +1873,7 @@ impl Supervisor {
             BackendRuntimeState::Exited | BackendRuntimeState::Dead | BackendRuntimeState::Missing
         ) {
             if context.fixture.is_none()
+                && !deterministic_fresh_fixture(context)
                 && context.provider == "opencode"
                 && context.native_session_id.is_some()
             {
@@ -3755,7 +3766,7 @@ impl Supervisor {
                     })?;
                 if !status.exited {
                     let handle=ReattachHandle{incarnation_id:context.prior_handle.incarnation_id().clone(),host_boot_id:status.host_boot_id.clone(),container_id:context.prior_handle.container_id().into()};
-                    if context.provider!="shell" && context.fixture.is_none() {
+                    if context.provider!="shell" && context.fixture.is_none() && !deterministic_fresh_fixture(context) {
                         let candidate=resume_catalog::exact_resume_candidate(context,None)?;
                         let captured=self.probe_host_store(context,&host,candidate).await.map_err(|error|blocked(RecoveryPath::Reattach,RecoveryBlockReason::StoreUnreadable,&error.message,Some(2000)))?;
                         let captured=after_native_probe(context,captured);
@@ -4283,8 +4294,9 @@ impl Supervisor {
             };
             // This named lifecycle fixture exercises replacement and storage,
             // but never produces a real-provider qualification observation.
-            if current.provider == "native-session-fixture"
-                && current.fixture == Some(freshell_runtime_protocol::FixtureKind::NativeSession)
+            if ((current.provider == "native-session-fixture"
+                && current.fixture == Some(freshell_runtime_protocol::FixtureKind::NativeSession))
+                || deterministic_fresh_fixture(&current))
                 && !status.exited
                 && current
                     .native_identity_launch

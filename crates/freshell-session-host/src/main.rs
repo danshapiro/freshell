@@ -706,6 +706,12 @@ async fn dispatch_with_effects(
                         native_session_id = native_identity_observation
                             .as_ref()
                             .map(|o| o.native_session_id.clone());
+                        #[cfg(feature = "fresh-agent-fixtures")]
+                        if evidence["fixtureTransport"] == "deterministic" {
+                            // The explicit transport fixture can report its raw
+                            // synthetic root while its native observation stays absent.
+                            native_session_id = agent.observed_native_session_id().await;
+                        }
                         evidence = serde_json::json!({
                             "workload":"fresh-agent",
                             "nativeSessionId":native_session_id,
