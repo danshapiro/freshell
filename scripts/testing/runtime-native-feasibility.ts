@@ -250,7 +250,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
     return executeManagedAmplifier(harness, sources, caseId, serverPath, servers)
   }
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
-    || !['create', 'current-native-turn', 'allow', 'deny', 'changed-tool', 'missing-tool',
+    || !['create', 'exact-resume', 'current-native-turn', 'allow', 'deny', 'changed-tool', 'missing-tool',
       'changed-input', 'changed-profile', 'changed-root', 'stale-callback', 'crash-before-checkpoint',
       'multiple-tools', 'effect-before-observation'].includes(caseId)) {
     throw new Error(`actual native case has no qualified execution path: ${selection.mode ?? selection.provider}/${caseId}`)
@@ -317,7 +317,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (namespace.uid !== 65534 || namespace.gid !== 0 || !namespace.version.includes('2.1.237')) {
     throw new Error('actual selected native child/UID differs')
   }
-  if (caseId === 'current-native-turn') {
+  if (caseId === 'current-native-turn' || caseId === 'exact-resume') {
     const marker = 'owned-memory-' + randomUUID()
     let cursor = 0
     const nativeTurn = async (text: string, label: string): Promise<any[]> => {
@@ -360,20 +360,26 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
     const after = await inspect(recovery.data.view.containerId, 'after-death', true)
     if (before.transcript.sha256 !== after.transcript.sha256 || before.transcript.identity[0] !== after.transcript.identity[0]
       || before.transcript.identity[1] !== after.transcript.identity[1]) throw new Error('native transcript lost original owned volume/file continuity')
-    const recalled = await nativeTurn('Reply with only the private marker from before. Do not use tools.', 'recall')
-    const text = recalled.flatMap((event) => event.content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('').trim()
-    if (text !== marker) throw new Error('native restored context did not recall the private marker')
-    if (recalled.some((event) => (event.content ?? []).some((part: any) => part.type === 'tool_use'))) throw new Error('native recall unexpectedly requested a tool')
     assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
       { name: 'replacement-new-incarnation-same-native-root', pass: recovery.data.outcome === 'replaced'
         && recovery.data.view.incarnationId !== view.incarnationId && recovery.data.view.nativeSessionId === view.nativeSessionId
         && recovery.data.view.nativeIdentityObservation.nativeSessionId === view.nativeSessionId },
       { name: 'original-owned-volume-transcript-continuity', pass: before.transcript.sha256 === after.transcript.sha256
         && before.transcript.identity[0] === after.transcript.identity[0] && before.transcript.identity[1] === after.transcript.identity[1] },
-      { name: 'same-workspace-selected-native-profile', pass: JSON.stringify(before.profileFiles) === JSON.stringify(after.profileFiles) },
-      { name: 'actual-restored-context-private-marker-recall', pass: text === marker },
-      { name: 'native-turns-requested-no-tools', pass: ![...seedEvents, ...recalled].some((event) =>
-        (event.content ?? []).some((part: any) => part.type === 'tool_use')) })
+      { name: 'same-workspace-selected-native-profile', pass: JSON.stringify(before.profileFiles) === JSON.stringify(after.profileFiles) })
+    if (caseId === 'current-native-turn') {
+      const recalled = await nativeTurn('Reply with only the private marker from before. Do not use tools.', 'recall')
+      const text = recalled.flatMap((event) => event.content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('').trim()
+      if (text !== marker) throw new Error('native restored context did not recall the private marker')
+      if (recalled.some((event) => (event.content ?? []).some((part: any) => part.type === 'tool_use'))) throw new Error('native recall unexpectedly requested a tool')
+      assertions.push({ name: 'actual-restored-context-private-marker-recall', pass: text === marker },
+        { name: 'native-turns-requested-no-tools', pass: ![...seedEvents, ...recalled].some((event) =>
+          (event.content ?? []).some((part: any) => part.type === 'tool_use')) })
+    } else {
+      assertions.push({ name: 'current-native-resume-observation-before-replacement-input', pass:
+        after.hook.native.source === 'resume' && after.hook.native.session_id === view.nativeSessionId
+        && recovery.data.view.nativeIdentityObservation.incarnationId === recovery.data.view.incarnationId })
+    }
   }
   if (selection.case === 'approval-checkpoint') {
     assertions.push(...await executeManagedNativeApproval({ harness, supervisor, soulId, workspace,
@@ -688,6 +694,13 @@ export async function executeManagedNativeApproval(input: {
       const record = JSON.parse(Buffer.from(files.find((file) => file.readerUid === 65534).bytesBase64, 'base64').toString('utf8'))
       if (record.phase !== 'dispatching' || record.nativeSessionId !== view.nativeSessionId
         || record.toolUseID !== originalOperation.tool_use_id) throw new Error('native effect has no durable ambiguous dispatch fence')
+      const actor = JSON.parse(Buffer.from(files.find((file) => file.readerUid === 0).bytesBase64, 'base64').toString('utf8'))
+      const resolved = actor.decisions[effectDecision.decision_id]
+      const responseDigest = createHash('sha256').update(JSON.stringify({ behavior: 'allow',
+        updatedInput: effectDecision.payload.tool.input })).digest('hex')
+      if (resolved?.state !== 'resolved' || resolved.responseDigest !== responseDigest) {
+        throw new Error('native effect lacks its original durably acknowledged decision')
+      }
     }
     const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
     harness.writeArtifact(`${scenario}-native-edge-store-probe.json`, probe)
@@ -701,10 +714,22 @@ export async function executeManagedNativeApproval(input: {
     let refused
     if (input.decision === 'effect-before-observation') {
       await inspect(recovery.data.view.containerId, 'native-edge-after-effect-recovery', true)
+      // Original dispatch acknowledgements precede this new event cursor.
+      // An identical resolved decision may return its durable cached success;
+      // only an actual new native dispatch would constitute replay.
+      const baseline = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events',
+        params: { soulId, afterSequence: cursor, maxEvents: 128 } })
+      harness.writeArtifact(`${scenario}-effect-recovery-event-baseline-private.json`, baseline)
+      cursor = baseline.data.head
+      if (baseline.data.events.some((row: any) => row.event.kind === 'permission_requested')) {
+        throw new Error('ambiguous effect revived a native permission callback')
+      }
       refused = await harness.adminRaw(supervisor, harness.freshAgentResolveBody(soulId, effectDecision.decision_id,
         { behavior: 'allow', updatedInput: effectDecision.payload.tool.input }))
       harness.writeArtifact(`${scenario}-ambiguous-decision-refused.json`, refused)
-      if (!refused.result?.Err) throw new Error('ambiguous completed effect accepted its old decision again')
+      const completedCacheReply = refused.result?.Ok?.kind === 'fresh_agent_command'
+        && refused.result.Ok.data?.state === 'completed'
+      if (!refused.result?.Err && !completedCacheReply) throw new Error('old native decision has no refusal or identical completed cache reply')
     } else {
       await inspect(recovery.data.view.containerId, 'native-edge-after-death-before-input', true)
       refused = await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: { soulId,
@@ -721,6 +746,10 @@ export async function executeManagedNativeApproval(input: {
     await new Promise((resolve) => setTimeout(resolve, 1_000))
     const current = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events', params: { soulId, afterSequence: cursor, maxEvents: 128 } })
     const cards = current.data.events.filter((row: any) => row.event.kind === 'permission_requested')
+    if (input.decision === 'effect-before-observation' && current.data.events.some((row: any) =>
+      row.event.kind === 'provider' && row.event.data.payload.event?.type === 'freshAgent.permission.dispatch')) {
+      throw new Error('native decision dispatched again after its effect')
+    }
     const expected = input.decision === 'effect-before-observation' ? 1 : 0
     harness.writeArtifact(`${scenario}-native-edge-outcome-private.json`, { recovery, refused, current, effectCount: effectCount() })
     if (cards.length || effectCount() !== expected) throw new Error('uncheckpointed or completed native operation revived a callback or repeated an effect')

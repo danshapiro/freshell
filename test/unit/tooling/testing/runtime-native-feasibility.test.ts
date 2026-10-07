@@ -25,7 +25,9 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
-  it.each([false, true])('faults after a current ordinary Allow and refuses an already published outcome (%s)', async (publishedOutcome) => {
+  it.each(['death', 'published', 'cached', 'redispatch'])('protects the native post-effect observation boundary (%s)', async (fault) => {
+    const publishedOutcome = fault === 'published'
+    const recover = fault === 'cached' || fault === 'redispatch'
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'native-effect-edge-'))
     const command = `printf 'effect\\n' >> '${path.join(workspace, 'owned-native-effect.jsonl')}'`
     const toolUseID = 'toolu_original1'
@@ -37,9 +39,12 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     const harness = { writeArtifact: () => '',
       freshAgentResolveBody: (_soul: string, decision: string, value: unknown) => ({ method: 'fresh_agent_resolve', params: { decision, value } }),
       probeRecoveryBody: () => ({ method: 'probe_recovery' }),
+      recoverBody: () => ({ method: 'recover' }),
       adminOk: async (_supervisor: unknown, body: any) => {
         methods.push(body.method)
         if (body.method === 'fresh_agent_read_events') {
+          if (read && recover) return { data: { head: 2, events: fault === 'redispatch' && methods.filter((m) => m === 'fresh_agent_read_events').length > 2
+            ? [{ event: { kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true } } } } }] : [] } }
           if (read) throw new Error('unexpected observation read after parked card')
           read = true
           return { data: { head: 1, events: [{ event: { kind: 'permission_requested', data: { decision_id: 'current-card', payload } } }] } }
@@ -51,15 +56,22 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
           fs.writeFileSync(path.join(workspace, 'native-after-effect-before-observation.json'), JSON.stringify({
             hook_event_name: 'PostToolUse', session_id: nativeRoot, tool_name: 'Bash', tool_use_id: toolUseID, tool_input: { command } }))
         }
+        if (body.method === 'recover') return { data: { outcome: 'replaced', view: {
+          incarnationId: 'new-incarnation', containerId: 'replacement-container', nativeSessionId: nativeRoot,
+          recoveryState: 'live', nativeIdentityObservation: { nativeSessionId: nativeRoot } } } }
         return { data: { kind: 'reattach_ready' } }
       },
+      adminRaw: async () => { methods.push('cached-decision-resolve'); return { result: { Ok: { kind: 'fresh_agent_command', data: { state: 'completed' } } } } },
       waitForFile: async (file: string) => { expect(fs.existsSync(file)).toBe(true) },
       execOwnedContainerAsExact: async (_container: string, uid: string, args: string[]) => {
-        const bytes = Buffer.from(JSON.stringify({ phase: 'dispatching', nativeSessionId: nativeRoot, toolUseID }))
+        const bytes = Buffer.from(JSON.stringify(uid === '0:0' ? { decisions: { 'current-card': { state: 'resolved',
+          responseDigest: createHash('sha256').update(JSON.stringify({ behavior: 'allow', updatedInput: { command } })).digest('hex') } } }
+          : { phase: 'dispatching', nativeSessionId: nativeRoot, toolUseID }))
         return JSON.stringify({ path: args.at(-1), readerUid: Number(uid.split(':')[0]), bytesBase64: bytes.toString('base64'),
           sha256: createHash('sha256').update(bytes).digest('hex') })
       },
-      killOwnedRuntimeExact: async () => { throw new Error('controlled exact native death') },
+      killOwnedRuntimeExact: async () => { if (!recover) throw new Error('controlled exact native death') },
+      waitForContainerExit: async () => {},
     } as unknown as RuntimeHarness
     const rows = [{ type: 'assistant', sessionId: nativeRoot, message: { id: 'msg_original',
       content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command } }] } },
@@ -68,16 +80,22 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     const nativeBytes = publishedOutcome ? Buffer.concat([bytes, Buffer.from(JSON.stringify({ type: 'user', sessionId: nativeRoot,
       message: { content: [{ type: 'tool_result', tool_use_id: toolUseID, is_error: false }] } }) + '\n')]) : bytes
     try {
-      await expect(executeManagedNativeApproval({ harness, supervisor: {}, soulId: 'owned-soul', workspace,
-        view: { nativeSessionId: nativeRoot, containerId: 'owned-container' }, scenario: 'controlled-effect-edge',
+      const run = executeManagedNativeApproval({ harness, supervisor: {}, soulId: 'owned-soul', workspace,
+        view: { incarnationId: 'old-incarnation', nativeSessionId: nativeRoot, containerId: 'owned-container' }, scenario: 'controlled-effect-edge',
         decision: 'effect-before-observation', inspect: async () => ({ nativeRoot,
-          transcript: { bytesBase64: nativeBytes.toString('base64'), sha256: createHash('sha256').update(nativeBytes).digest('hex'), completeEof: true } }) }))
-        .rejects.toThrow(publishedOutcome ? 'post-effect native outcome was already published' : 'controlled exact native death')
-      expect(methods).toEqual(['fresh_agent_send', 'fresh_agent_read_events', 'fresh_agent_resolve', ...(publishedOutcome ? [] : ['probe_recovery'])])
+          transcript: { bytesBase64: nativeBytes.toString('base64'), sha256: createHash('sha256').update(nativeBytes).digest('hex'), completeEof: true } }) })
+      if (fault === 'cached') await expect(run).resolves.toBeDefined()
+      else await expect(run).rejects.toThrow(publishedOutcome ? 'post-effect native outcome was already published'
+        : fault === 'redispatch' ? 'native decision dispatched again after its effect' : 'controlled exact native death')
+      if (recover) {
+        expect(methods.filter((m) => m === 'fresh_agent_resolve')).toHaveLength(1)
+        expect(methods.filter((m) => m === 'cached-decision-resolve')).toHaveLength(1)
+        expect(fs.readFileSync(path.join(workspace, 'owned-native-effect.jsonl'), 'utf8')).toBe('effect\n')
+      } else expect(methods).toEqual(['fresh_agent_send', 'fresh_agent_read_events', 'fresh_agent_resolve', ...(publishedOutcome ? [] : ['probe_recovery'])])
     } finally { fs.rmSync(workspace, { recursive: true, force: true }) }
   })
   it.each(['changed-tool', 'missing-tool', 'changed-input', 'changed-profile', 'changed-root', 'stale-callback',
-    'crash-before-checkpoint', 'multiple-tools', 'effect-before-observation'])(
+    'crash-before-checkpoint', 'multiple-tools', 'effect-before-observation', 'exact-resume'])(
     'dispatches %s through the managed native launch boundary', async (caseId) => {
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-negative-route-'))
       const launch = vi.fn(async (_supervisor: unknown, _body: any) => { throw new Error('controlled native launch boundary') })
@@ -87,7 +105,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         await expect(executeManagedNativeCase(harness,
           ['env_file', 'ca_file'].map((suffix) => ({ name: 'claude/grants/' + suffix,
             path: path.join(directory, suffix), sha256: 'e'.repeat(64) })),
-          { mode: 'freshclaude', case: 'approval-checkpoint' }, caseId))
+          { mode: 'freshclaude', case: caseId === 'exact-resume' ? 'startup' : 'approval-checkpoint' }, caseId))
           .rejects.toThrow('controlled native launch boundary')
         expect(launch).toHaveBeenCalledOnce()
         expect(launch.mock.calls[0]![1].params.freshAgent.sessionType).toBe('freshclaude')
