@@ -148,12 +148,10 @@ impl SourceEnvironment {
     ) -> Result<ProviderPathInputs, String> {
         let mut selected = std::collections::BTreeSet::new();
         for source in plan {
-            let names = if source.references.recipes.is_empty() {
-                &source.references.path_variables
-            } else {
-                &source.references.referenced_variables
-            };
-            for name in names {
+            // A whole-document recipe does not grant unrelated ambient keys
+            // new forwarding authority. Auth and OneCLI remain host-resolved;
+            // freeze only original inputs that select accepted file paths.
+            for name in &source.references.path_variables {
                 if self.onecli.contains_key(name)
                     || (source.source.lane == SourceLane::Main
                         && self
@@ -248,7 +246,11 @@ mod tests {
         let input = format!("PRIVATE_PREFIX{{file:{}}}PRIVATE_SUFFIX", rules.display());
         let mut environment =
             SourceEnvironment::read(vec!["INSERT".into(), "UNRELATED".into()], &[], &|name| {
-                (name == "INSERT").then(|| input.clone())
+                match name {
+                    "INSERT" => Some(input.clone()),
+                    "UNRELATED" => Some("PRIVATE_UNRELATED_AMBIENT_SECRET".into()),
+                    _ => None,
+                }
             })
             .unwrap();
         let loaded = || {
@@ -274,6 +276,13 @@ mod tests {
         let frozen = environment.frozen_inputs(&plan).unwrap();
         assert_eq!(frozen.get("INSERT"), Some(input.as_str()));
         assert!(frozen.get("UNRELATED").is_none());
+        let handoff = serde_json::to_vec(&frozen).unwrap();
+        assert!(
+            !handoff
+                .windows(b"PRIVATE_UNRELATED_AMBIENT_SECRET".len())
+                .any(|bytes| bytes == b"PRIVATE_UNRELATED_AMBIENT_SECRET"),
+            "private IPC serialization must not gain unrelated ambient credentials"
+        );
         assert!(!plan[0].references.template.contains("PRIVATE_PREFIX"));
         assert!(!plan[0]
             .references
