@@ -19,6 +19,27 @@ const handle = {
 }
 
 describe('finite Phase 3 approval effect operations', () => {
+  it('publishes the existing browser observation on the owner without returning a filesystem path', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-p3-receipt-'))
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const file = path.join(root, 'browser.json')
+    vi.stubEnv('FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT', file)
+    const browser: owner.Phase3BrowserObservation = { browserInteraction: true, provider: 'opencode', providerVersion: '1.18.21', model: 'openai/gpt-5.6-luna',
+      paneId: 'pane', terminalId: 'terminal', soulId: current.soulId, incarnationIdBefore: 'old-incarnation', incarnationIdAfter: current.incarnationId,
+      providerSessionIdBefore: current.nativeSessionId, providerSessionIdAfter: current.nativeSessionId, approvalPromptNativeId: current.nativeSessionId,
+      permissionPromptHandled: true, approvalSurvived: true, samePane: true, visibleRecoveryState: true, rejectedInputWhileRecovering: true,
+      accidentalApproval: false, toolCompletedExactlyOnce: true, providerHostSurvivedWebRestart: true, followUpCompleted: true,
+      followUpResponse: 'P3_FOLLOWUP_OK' }
+    try {
+      const result = await rig.publishPhase3BrowserReceipt(current, browser)
+      expect(result).toEqual({ artifactRef: expect.stringMatching(/^phase3-browser:[a-f0-9]{64}$/) })
+      expect(JSON.parse(await fsp.readFile(file, 'utf8'))).toEqual({ schemaVersion: 1, status: 'PASS', candidateSha: current.candidateSha, browser })
+      await expect(rig.publishPhase3BrowserReceipt(current, { ...browser, providerSessionIdAfter: 'foreign' })).rejects.toThrow(/address|native/)
+    } finally { vi.unstubAllEnvs(); await fsp.rm(root, { recursive: true, force: true }) }
+  })
   it('resets and counts only the existing owned marker file before native identity materializes', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-p3-effect-'))
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)

@@ -16,6 +16,7 @@ import {
   type ManagedRuntimeView,
   type SyntheticOpenCodeSourceFacts,
   type ManagedFixtureRig,
+  type Phase3BrowserObservation,
 } from '../helpers/managed-runtime.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
@@ -228,7 +229,9 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       expect(approvalSurvivedWebRestart).toBe(true)
       expect(await rig.phase3ApprovalEffectCount(rig.runtimeEnclosureHandle(before))).toBe(0)
 
-      rig.runtime.killOwnedRuntimeExact(before.containerId)
+      const currentBeforeCrash = await waitForRunningView(rig, terminalId,
+        view => view.incarnationId === before.incarnationId && view.nativeSessionId === providerSessionIdBefore, 120_000)
+      await rig.crashRuntimeHost(rig.exactRuntimeHandle(currentBeforeCrash))
       await new Promise((resolve) => setTimeout(resolve, 1_500))
 
       const fenceNotice = await waitForValue('visible managed recovery input fence', async () => {
@@ -280,38 +283,35 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       const followUpText = await terminal.getVisibleText(terminalId)
       expect(await rig.phase3ApprovalEffectCount(rig.runtimeEnclosureHandle(after))).toBe(1)
 
-      const receipt = {
-        schemaVersion: 1,
-        status: 'PASS',
-        candidateSha: rig.runtime.candidateSha,
-        browser: {
-          browserInteraction: true,
-          provider: 'opencode',
-          providerVersion: P2_OPENCODE_VERSION,
-          model: P2_OPENCODE_MODEL,
-          paneId,
-          terminalId,
-          soulId: before.soulId,
-          incarnationIdBefore: before.incarnationId,
-          incarnationIdAfter: after.incarnationId,
-          providerSessionIdBefore,
-          providerSessionIdAfter,
-          approvalPromptNativeId: providerSessionIdBefore,
-          permissionPromptHandled: toolEffectCount === 1,
-          approvalSurvived: approvalSurvivedWebRestart && promptAfterRecovery.includes('Permission required'),
-          samePane: leafAfterWebRestart.id === paneId,
-          visibleRecoveryState,
-          rejectedInputWhileRecovering,
-          accidentalApproval,
-          toolCompletedExactlyOnce: toolEffectCount === 1,
-          providerHostSurvivedWebRestart,
-          followUpCompleted: followUpText.includes('P3_FOLLOWUP_OK'),
-          followUpResponse: 'P3_FOLLOWUP_OK',
-        },
+      const browserObservation: Phase3BrowserObservation = {
+        browserInteraction: true,
+        provider: 'opencode',
+        providerVersion: P2_OPENCODE_VERSION,
+        model: P2_OPENCODE_MODEL,
+        paneId,
+        terminalId,
+        soulId: before.soulId,
+        incarnationIdBefore: before.incarnationId,
+        incarnationIdAfter: after.incarnationId,
+        providerSessionIdBefore,
+        providerSessionIdAfter,
+        approvalPromptNativeId: providerSessionIdBefore,
+        permissionPromptHandled: toolEffectCount === 1,
+        approvalSurvived: approvalSurvivedWebRestart && promptAfterRecovery.includes('Permission required'),
+        samePane: leafAfterWebRestart.id === paneId,
+        visibleRecoveryState,
+        rejectedInputWhileRecovering,
+        accidentalApproval,
+        toolCompletedExactlyOnce: toolEffectCount === 1,
+        providerHostSurvivedWebRestart,
+        followUpCompleted: followUpText.includes('P3_FOLLOWUP_OK'),
+        followUpResponse: 'P3_FOLLOWUP_OK',
       }
-      const receiptPath = rig.writePhase3BrowserReceipt(receipt)
+      const currentForReceipt = await waitForRunningView(rig, terminalId,
+        view => view.incarnationId === after.incarnationId && view.nativeSessionId === providerSessionIdAfter, 120_000)
+      const { artifactRef } = await rig.publishPhase3BrowserReceipt(rig.exactRuntimeHandle(currentForReceipt), browserObservation)
       // eslint-disable-next-line no-console
-      console.log(`[P3-G10] provider resurrection receipt: ${receiptPath}`)
+      console.log(`[P3-G10] provider resurrection receipt: ${artifactRef}`)
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)

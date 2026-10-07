@@ -17,7 +17,7 @@ import path from 'node:path'
 import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
-  SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -28,6 +28,7 @@ import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
+import type { Phase3BrowserObservation } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -700,7 +701,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -818,6 +819,10 @@ export class ExternalManagedRuntimeRig {
   }
   async phase3ApprovalEffectCount(enclosure: RuntimeEnclosureHandle): Promise<number> {
     return this.rpc('phase3-effect-count', z.number().int().min(-1), { enclosure })
+  }
+  async publishPhase3BrowserReceipt(handle: ExactRuntimeHandle, browser: Phase3BrowserObservation): Promise<{ artifactRef: string }> {
+    return this.rpc('phase3-browser-receipt', z.object({ artifactRef: z.string().regex(/^phase3-browser:[a-f0-9]{64}$/) }).strict(),
+      { handle, phase3Browser: Phase3BrowserObservationSchema.parse(browser) })
   }
   async openCodeVersionFacts(handle: RuntimeEnclosureHandle): Promise<{ provider: 'opencode'; version: string }> {
     return this.rpc('opencode-version', z.object({ provider: z.literal('opencode'),
@@ -1071,6 +1076,10 @@ export function createExternalRuntimeControl(
       case 'phase3-effect-count':
         if (!request.enclosure) throw new Error('exact current runtime enclosure address required')
         result = await owner.phase3ApprovalEffectCount(request.enclosure)
+        break
+      case 'phase3-browser-receipt':
+        if (!request.phase3Browser) throw new Error('closed Phase 3 browser observation required')
+        result = await owner.publishPhase3BrowserReceipt(handle(), request.phase3Browser)
         break
       case 'crash-provider-worker': await owner.crashProviderWorker(handle()); result = { completed: true }; break
       case 'fixture-state': result = await owner.fixtureNativeState(handle()); break

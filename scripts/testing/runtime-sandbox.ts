@@ -601,6 +601,18 @@ export const SyntheticOpenCodeHistoryFactsSchema = z.object({
 }).strict()
 export type SyntheticOpenCodeHistoryFacts = z.infer<typeof SyntheticOpenCodeHistoryFactsSchema>
 
+export const Phase3BrowserObservationSchema = z.object({
+  browserInteraction: z.boolean(), provider: z.literal('opencode'), providerVersion: z.string().regex(/^\d+\.\d+\.\d+$/),
+  model: z.string().min(1).max(200), paneId: z.string().min(1).max(200), terminalId: z.string().min(1).max(200),
+  soulId: z.string().min(1).max(200), incarnationIdBefore: z.string().min(1).max(200), incarnationIdAfter: z.string().min(1).max(200),
+  providerSessionIdBefore: z.string().min(1).max(200), providerSessionIdAfter: z.string().min(1).max(200),
+  approvalPromptNativeId: z.string().min(1).max(200), permissionPromptHandled: z.boolean(), approvalSurvived: z.boolean(),
+  samePane: z.boolean(), visibleRecoveryState: z.boolean(), rejectedInputWhileRecovering: z.boolean(), accidentalApproval: z.boolean(),
+  toolCompletedExactlyOnce: z.boolean(), providerHostSurvivedWebRestart: z.boolean(), followUpCompleted: z.boolean(),
+  followUpResponse: z.literal('P3_FOLLOWUP_OK'),
+}).strict()
+export type Phase3BrowserObservation = z.infer<typeof Phase3BrowserObservationSchema>
+
 const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
@@ -617,6 +629,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'synthetic-source-history', 'synthetic-source-exclusions',
     'synthetic-source-adoption',
     'synthetic-source-follow-up',
+    'phase3-browser-receipt',
     'retained-start', 'retained-status', 'retained-observed', 'retained-finish',
   ]),
   handle: z.object({
@@ -631,6 +644,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   expectedControlEpoch: z.number().int().nonnegative().optional(),
   expectedIntentRevision: z.number().int().nonnegative().optional(),
   generation: z.number().int().nonnegative().optional(),
+  phase3Browser: Phase3BrowserObservationSchema.optional(),
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
@@ -3376,6 +3390,22 @@ export class ManagedRuntimeOwner {
       fs.writeFileSync(target, JSON.stringify(receipt, null, 2))
     }
     return { receipt, paths: [...targets] }
+  }
+
+  async publishPhase3BrowserReceipt(handle: ExactRuntimeHandle, input: Phase3BrowserObservation): Promise<{ artifactRef: string }> {
+    if (this.runtime.phase !== 3) throw new Error('Phase 3 browser fixture required')
+    await this.assertCurrentHandle(handle)
+    const browser = Phase3BrowserObservationSchema.parse(input)
+    if (browser.soulId !== handle.soulId || browser.incarnationIdAfter !== handle.incarnationId
+      || browser.providerSessionIdBefore !== handle.nativeSessionId || browser.providerSessionIdAfter !== handle.nativeSessionId
+      || browser.approvalPromptNativeId !== handle.nativeSessionId) {
+      throw new Error('browser observation differs from the exact native address')
+    }
+    const target = this.writePhase3BrowserReceipt({ schemaVersion: 1, status: 'PASS', candidateSha: this.runtime.candidateSha, browser })
+    const sha256 = createHash('sha256').update(fs.readFileSync(target)).digest('hex')
+    const artifactRef = `phase3-browser:${sha256}`
+    this.runtime.recordLifecycle('external.phase3_browser_receipt', { severity: 'info', artifactRef, artifactPath: target, sha256 })
+    return { artifactRef }
   }
 
   writePhase3BrowserReceipt(value: unknown): string {

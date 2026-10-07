@@ -14,7 +14,7 @@ import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
-import { ManagedRuntimeOwner, RuntimeHarness, type SupervisorInstance } from '../../../../scripts/testing/runtime-sandbox.js'
+import { ManagedRuntimeOwner, RuntimeHarness, type SupervisorInstance, type Phase3BrowserObservation } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 
 beforeEach(() => execute.mockReset())
@@ -939,6 +939,27 @@ describe('closed external owner control', () => {
     await expect(control({ ...request, operationId: 'forged-effect', action: 'phase3-effect-reset', enclosure,
       path: '/arbitrary' })).rejects.toThrow(/operation/)
     expect(reset).toHaveBeenCalledOnce()
+  })
+  it('publishes only the fixed Phase3 browser observation and returns an opaque artifact reference', async () => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',
+      incarnationId: 'p3-incarnation', containerId: 'b'.repeat(64), hostBootId: 'p3-boot', nativeSessionId: 'p3-native' }
+    const browser: Phase3BrowserObservation = { browserInteraction: true, provider: 'opencode', providerVersion: '1.18.21', model: 'openai/gpt-5.6-luna',
+      paneId: 'pane', terminalId: 'terminal', soulId: handle.soulId, incarnationIdBefore: 'old', incarnationIdAfter: handle.incarnationId,
+      providerSessionIdBefore: handle.nativeSessionId, providerSessionIdAfter: handle.nativeSessionId, approvalPromptNativeId: handle.nativeSessionId,
+      permissionPromptHandled: true, approvalSurvived: true, samePane: true, visibleRecoveryState: true, rejectedInputWhileRecovering: true,
+      accidentalApproval: false, toolCompletedExactlyOnce: true, providerHostSurvivedWebRestart: true, followUpCompleted: true, followUpResponse: 'P3_FOLLOWUP_OK' }
+    const publish = vi.spyOn(owned, 'publishPhase3BrowserReceipt').mockResolvedValue({ artifactRef: `phase3-browser:${'d'.repeat(64)}` })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.publishPhase3BrowserReceipt(handle, browser)).resolves.toEqual({ artifactRef: `phase3-browser:${'d'.repeat(64)}` })
+    expect(publish).toHaveBeenCalledExactlyOnceWith(handle, browser)
+    await expect(control({ ...request, action: 'phase3-browser-receipt', handle })).rejects.toThrow(/observation/)
+    await expect(control({ ...request, operationId: 'forged-receipt', action: 'phase3-browser-receipt', handle,
+      phase3Browser: { ...browser, credential: 'not-an-observation' } })).rejects.toThrow(/operation/)
+    expect(publish).toHaveBeenCalledOnce()
   })
   it('refuses arbitrary commands, foreign metadata and absent current handles before owner work', async () => {
     const { owned, context, inventory, request } = fixture()
