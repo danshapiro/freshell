@@ -500,6 +500,28 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       await fsp.rm(directory, { recursive: true })
     }
   })
+  it('starts provider-free fixture web without inherited OneCLI references while retaining its controller', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
+      candidateSha: 'a'.repeat(40), buildDirty: false, setupHome: setup, preserveHomeOnStop: false,
+      providerFreeFixture: true, env: { NODE_OPTIONS: `--require=${entry}`,
+        FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: '/owned/unit/env-reference',
+        FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: '/owned/unit/auth-reference',
+        FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: '/owned/unit/ca-reference',
+        FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/unit/control.sock' } })
+    try {
+      const info = await server.start()
+      const response = await fetch(`${info.baseUrl}/api/server-info`, { headers: { 'x-auth-token': info.token } })
+      const observed = await response.json()
+      expect(observed.environmentKeys).not.toContain('FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE')
+      expect(observed.environmentKeys).not.toContain('FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE')
+      expect(observed.environmentKeys).not.toContain('FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE')
+      expect(observed.environmentKeys).toContain('FRESHELL_RUNTIME_CONTROL_SOCKET')
+    } finally {
+      await server.stop()
+      await fsp.rm(directory, { recursive: true })
+    }
+  })
   it('keeps the relay token admitted when the retained fixture selects another owned web process', async () => {
     const { fixture: directory, entry, setup } = await fixture()
     await fsp.writeFile(entry, `require('node:http').createServer((req,res)=>{res.setHeader('content-type','application/json');if(req.headers['x-auth-token']!==process.env.AUTH_TOKEN){res.writeHead(401);res.end('{}');return}res.end(JSON.stringify({runtime:'rust',commit:'${'a'.repeat(40)}',buildDirty:false}))}).listen(Number(process.env.PORT),'127.0.0.1')`)

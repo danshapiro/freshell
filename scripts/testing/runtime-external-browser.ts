@@ -15,7 +15,7 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
-import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath } from './runtime-sandbox.js'
+import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
 import { pathToFileURL } from 'node:url'
@@ -239,9 +239,8 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
       XDG_DATA_HOME: path.join(home, '.local/share'), XDG_CONFIG_HOME: path.join(home, '.config'),
       LOCALAPPDATA: path.join(home, 'AppData/Local'), APPDATA: path.join(home, 'AppData/Roaming'),
     }
-    for (const key of Object.keys(env)) {
-      if (this.options.stripEnvPrefixes?.some(prefix => key.startsWith(prefix))) delete env[key]
-    }
+    const stripPrefixes = runtimeWebStripPrefixes(this.options)
+    for (const key of Object.keys(env)) if (stripPrefixes.some(prefix => key.startsWith(prefix))) delete env[key]
     delete env.VITE_PORT
     this.process = await OwnedRuntimeChild.create(this.options.binary, [], this.options.repoRoot, env)
     this.bootCount += 1

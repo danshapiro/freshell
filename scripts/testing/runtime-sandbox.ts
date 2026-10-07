@@ -2148,6 +2148,7 @@ export type RuntimeWebConstructOptions = {
   candidateSha: string; buildDirty: boolean
   env: Record<string, string>; setupHome: (homeDir: string) => Promise<void>
   stripEnvPrefixes?: string[]
+  providerFreeFixture?: boolean
   token?: string
 }
 export interface RuntimeWebHandle {
@@ -2162,6 +2163,12 @@ export interface RuntimeWebHandle {
   ownedChildPids(): number[]
 }
 export type RuntimeWebFactory = (options: RuntimeWebConstructOptions) => RuntimeWebHandle
+export function runtimeWebStripPrefixes(options: Pick<RuntimeWebConstructOptions, 'stripEnvPrefixes' | 'providerFreeFixture'>): string[] {
+  return [...options.stripEnvPrefixes ?? [], ...(options.providerFreeFixture ? [
+    'ANTHROPIC_', 'OPENAI_', 'GEMINI_', 'ONECLI_', 'FRESHELL_MANAGED_CLAUDE_',
+    'FRESHELL_MANAGED_CODEX_', 'FRESHELL_MANAGED_OPENCODE_', 'FRESHELL_MANAGED_AMPLIFIER_',
+  ] : [])]
+}
 
 export const P2_OPENCODE_VERSION = '1.18.21'
 export const P2_OPENCODE_MODEL = 'openai/gpt-5.6-luna'
@@ -2322,6 +2329,8 @@ export class ManagedRuntimeOwner {
       binary: this.serverBin, repoRoot: this.repoRoot, candidateSha: this.runtime.candidateSha,
       buildDirty: git(this.repoRoot, ['status', '--porcelain']).trim().length > 0,
       preserveHomeOnStop: true,
+      providerFreeFixture: this.fixtureFreshAgentModes.length > 0 && this.enabledProviders.length === 0
+        && this.freshAgentModes.every(mode => this.fixtureFreshAgentModes.includes(mode)),
       homeDir: this.webHomeDir,
       env: {
         // Managed MCP calls back from Docker workloads, so this owned

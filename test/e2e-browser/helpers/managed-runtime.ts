@@ -1,4 +1,4 @@
-import { ManagedRuntimeOwner } from '../../../scripts/testing/runtime-sandbox.js'
+import { ManagedRuntimeOwner, runtimeWebStripPrefixes } from '../../../scripts/testing/runtime-sandbox.js'
 import { RustServer } from './rust-server.js'
 import type { E2eServerInfo } from './server-fixture-support.js'
 import { resolveManagedExternalDescriptor } from '../../../scripts/testing/runtime-external-browser.js'
@@ -13,7 +13,7 @@ export {
 /** The browser fixture supplies its owned web process to the shared owner. */
 export class ManagedRuntimeBrowserRig extends ManagedRuntimeOwner {
   constructor(...args: ConstructorParameters<typeof ManagedRuntimeOwner> extends [unknown, ...infer Rest] ? Rest : never) {
-    super((options) => new RustServer(options), ...args)
+    super((options) => new RustServer({ ...options, stripEnvPrefixes: runtimeWebStripPrefixes(options) }), ...args)
   }
 
   async start(): Promise<E2eServerInfo> {
