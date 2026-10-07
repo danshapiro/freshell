@@ -350,6 +350,37 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
 "agent":{"probe":{"description":"{env:INLINE_VALUE}"}}}"#;
     let inline_value = "INLINE_PREFIX{file:./inline-rule}INLINE_SUFFIX";
     std::fs::write(nested.join("inline-rule"), "native-inline-selected-rule\n").unwrap();
+    let resource_root = fixture.join("workspace/.opencode");
+    let root_receipt = fixture.join("workspace/native-root-consumed.json");
+    std::fs::create_dir_all(resource_root.join("plugins/selected/node_modules/fixture-dependency"))
+        .unwrap();
+    std::fs::write(
+        resource_root.join("plugins/selected/node_modules/fixture-dependency/package.json"),
+        r#"{"name":"fixture-dependency","type":"module","exports":"./index.mjs"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        resource_root.join("plugins/selected/node_modules/fixture-dependency/index.mjs"),
+        "export default 'selected-root-dependency';",
+    )
+    .unwrap();
+    std::fs::write(
+        resource_root.join("plugins/selected/resource"),
+        "selected-root-resource",
+    )
+    .unwrap();
+    std::fs::write(resource_root.join("plugins/selected/index.mjs"), r#"import fs from 'node:fs';import crypto from 'node:crypto';import dependency from 'fixture-dependency';
+export default {id:'closed-writable-selected-root',async server(input,options){return {async config(config){
+ const root=new URL('../../',import.meta.url); const path=new URL('provider-owned-write',root);
+ fs.writeFileSync(path,'selected-root-write');
+ fs.writeFileSync(options.receipt,JSON.stringify({dependency:crypto.createHash('sha256').update(dependency).digest('hex'),resource:crypto.createHash('sha256').update(fs.readFileSync(new URL('./resource',import.meta.url))).digest('hex'),write:crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex')}));
+}}}};
+"#).unwrap();
+    let root_config = serde_json::to_vec(
+        &json!({"plugin":[["./plugins/selected/index.mjs", {"receipt":root_receipt}]]}),
+    )
+    .unwrap();
+    std::fs::write(resource_root.join("opencode.json"), &root_config).unwrap();
 
     let request: ManagedTerminalLaunch = ManagedTerminalLaunch {
         spec: freshell_platform::spawn::SpawnSpec {
@@ -443,6 +474,16 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
         }
     };
     assert_eq!(terminal_receipt, expected);
+    let expected_root = json!({"dependency":format!("{:x}",Sha256::digest(b"selected-root-dependency")),"resource":format!("{:x}",Sha256::digest(b"selected-root-resource")),"write":format!("{:x}",Sha256::digest(b"selected-root-write"))});
+    assert_eq!(read_receipt(&root_receipt).await.unwrap(), expected_root);
+    assert!(
+        !resource_root.join("provider-owned-write").exists(),
+        "native writes must land in the selected soul subpath, preserving originals"
+    );
+    assert_eq!(
+        std::fs::read(resource_root.join("opencode.json")).unwrap(),
+        root_config
+    );
     assert_eq!(
         read_receipt(&shared_receipt).await.unwrap(),
         json!({"root":format!("{:x}",Sha256::digest(b"native-shared-root-rule")),"nested":format!("{:x}",Sha256::digest(b"native-shared-nested-rule"))})
@@ -484,6 +525,7 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
         .unwrap();
     std::fs::remove_file(&receipt).unwrap();
     std::fs::remove_file(&shared_receipt).unwrap();
+    std::fs::remove_file(&root_receipt).unwrap();
     // Fresh launches use current server controls; the terminal exercised a
     // request-only relative control. Both must activate the explicit layer.
     std::env::set_var("OPENCODE_CONFIG", &explicit_config);
@@ -532,6 +574,12 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
         .dispatch(HostedFreshAgentCommand::Send(send))
         .await;
     assert_eq!(read_receipt(&receipt).await.unwrap(), fresh_expected);
+    assert_eq!(read_receipt(&root_receipt).await.unwrap(), expected_root);
+    assert!(!resource_root.join("provider-owned-write").exists());
+    assert_eq!(
+        std::fs::read(resource_root.join("opencode.json")).unwrap(),
+        root_config
+    );
     assert_eq!(
         read_receipt(&shared_receipt).await.unwrap(),
         json!({"root":format!("{:x}",Sha256::digest(b"native-shared-root-rule")),"nested":format!("{:x}",Sha256::digest(b"native-shared-nested-rule"))})

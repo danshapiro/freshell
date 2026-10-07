@@ -1687,7 +1687,7 @@ fn copy_provider_config_references_with_ownership(
     use freshell_platform::provider_environment::CopySelection;
     use freshell_runtime_protocol::ProviderConfigRoot;
     context.validate(provider).map_err(|error| error.message)?;
-    let selections = provider_config_references(context)
+    let mut selections = provider_config_references(context)
         .into_iter()
         .map(|reference| {
             let root = match reference.root {
@@ -1701,6 +1701,16 @@ fn copy_provider_config_references_with_ownership(
             }
         })
         .collect::<Vec<_>>();
+    selections.extend(
+        context
+            .prepared_inputs
+            .iter()
+            .flat_map(|inputs| &inputs.resource_mounts)
+            .map(|unit| CopySelection {
+                source: user_provider_root.join(&unit.stage_relative_path),
+                destination_relative: unit.provider_relative_path.clone().into(),
+            }),
+    );
     let protected = private_bound_destinations(context);
     let mut excluded = provider_credential_sources(user_provider_root);
     for selection in &selections {
@@ -1757,7 +1767,7 @@ fn private_bound_destinations(
     context: &freshell_runtime_protocol::ProviderLaunchContext,
 ) -> std::collections::BTreeSet<String> {
     let home = Path::new("/home/freshell/provider");
-    context
+    let mut protected = context
         .prepared_inputs
         .iter()
         .flat_map(|inputs| {
@@ -1779,7 +1789,34 @@ fn private_bound_destinations(
                 .and_then(Path::to_str)
                 .map(str::to_owned)
         })
-        .collect()
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(inputs) = &context.prepared_inputs {
+        for destination in inputs
+            .config_binds
+            .iter()
+            .map(|bind| &bind.effective_destination)
+            .chain(inputs.indexed_files.iter().flat_map(|files| {
+                files
+                    .aliases
+                    .iter()
+                    .map(|alias| &alias.effective_destination)
+            }))
+        {
+            for unit in &inputs.resource_mounts {
+                if let Ok(relative) =
+                    Path::new(destination).strip_prefix(&unit.effective_destination)
+                {
+                    protected.insert(
+                        Path::new(&unit.provider_relative_path)
+                            .join(relative)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+    }
+    protected
 }
 
 const PROVIDER_PROJECTION_MANIFEST: &str = ".freshell-config-projection.json";
@@ -1881,10 +1918,17 @@ fn refresh_provider_config_references(
         unsafe { libc::geteuid() },
         unsafe { libc::getegid() },
     )?;
-    let destinations = provider_config_references(context)
+    let mut destinations = provider_config_references(context)
         .iter()
         .map(|reference| reference.provider_relative_path.clone())
         .collect::<Vec<_>>();
+    destinations.extend(
+        context
+            .prepared_inputs
+            .iter()
+            .flat_map(|inputs| &inputs.resource_mounts)
+            .map(|unit| unit.provider_relative_path.clone()),
+    );
     std::fs::write(
         stage.path().join("manifest.json"),
         serde_json::to_vec(&destinations).map_err(|error| error.to_string())?,
@@ -3262,6 +3306,102 @@ mod tests {
             .expect("two-stage executable spawn");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"resource-nonce");
+    }
+
+    #[test]
+    fn provider_config_selected_resource_root_populates_and_refreshes_stable_soul_directory() {
+        use freshell_runtime_protocol::*;
+        use std::os::unix::fs::MetadataExt;
+        let owned = tempfile::tempdir().unwrap();
+        let source = owned.path().join("stage");
+        let home = owned.path().join("home");
+        let unit = source.join(".freshell/resource-units/root-0");
+        let destination = home.join(".freshell/provider-roots/root-0");
+        std::fs::create_dir_all(unit.join("node_modules/dependency")).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(
+            unit.join("node_modules/dependency/index.js"),
+            "dependency-initial",
+        )
+        .unwrap();
+        std::fs::write(destination.join("native-owned-sibling"), "preserved").unwrap();
+        let inode = std::fs::metadata(&destination).unwrap().ino();
+        let capability = McpCapabilityReference {
+            grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
+            endpoint: "http://host.docker.internal:1234".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let context = ProviderLaunchContext {
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: "a".repeat(64),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                resource_mounts: vec![ProviderResourceMount {
+                    stage_relative_path: ".freshell/resource-units/root-0".into(),
+                    provider_relative_path: ".freshell/provider-roots/root-0".into(),
+                    logical_destination: "/synthetic/outside/.opencode".into(),
+                    effective_destination: "/synthetic/outside/.opencode".into(),
+                    kind: ProviderResourceKind::Directory,
+                }],
+                indexed_files: None,
+            }),
+            mcp_capability: Some(capability),
+            config: vec![],
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+        };
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        refresh_provider_config_references(
+            &context,
+            "opencode",
+            owned.path(),
+            &source,
+            &home,
+            uid,
+            gid,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(destination.join("node_modules/dependency/index.js")).unwrap(),
+            "dependency-initial"
+        );
+        std::fs::write(
+            unit.join("node_modules/dependency/index.js"),
+            "dependency-refreshed",
+        )
+        .unwrap();
+        refresh_provider_config_references(
+            &context,
+            "opencode",
+            owned.path(),
+            &source,
+            &home,
+            uid,
+            gid,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(destination.join("node_modules/dependency/index.js")).unwrap(),
+            "dependency-refreshed"
+        );
+        assert_eq!(std::fs::metadata(&destination).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read_to_string(destination.join("native-owned-sibling")).unwrap(),
+            "preserved"
+        );
     }
 
     #[test]

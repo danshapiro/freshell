@@ -4,6 +4,66 @@ use crate::managed_provider_references::sources::{PlannedSourceOccurrence, Sourc
 use freshell_platform::opencode_recipe::{SelectedSourceFile, SourceManifest, SourceView};
 use std::{collections::BTreeMap, path::Path};
 
+/// Selected discovery roots are complete writable units, independent of the
+/// private rewritten configuration leaves mounted inside them.
+pub(super) fn resource_units(
+    home: &Path,
+    global: &Path,
+    plan: &[PlannedSourceOccurrence],
+) -> Result<
+    Vec<(
+        std::path::PathBuf,
+        freshell_runtime_protocol::ProviderResourceMount,
+    )>,
+    String,
+> {
+    use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
+    let mut roots = BTreeMap::new();
+    for source in plan {
+        if source.source.lane == SourceLane::Inline {
+            continue;
+        }
+        let Some(parent) = source.source.logical_path.parent() else {
+            continue;
+        };
+        if parent == global || parent.file_name() != Some(std::ffi::OsStr::new(".opencode")) {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(parent)
+            .map_err(|_| "selected OpenCode resource root is unavailable, dangling or cyclic")?;
+        if !canonical.is_dir() {
+            return Err("selected OpenCode resource root must be a directory".into());
+        }
+        roots.insert(parent.to_path_buf(), canonical);
+    }
+    let mut units = Vec::new();
+    for (ordinal, (logical, canonical)) in roots.into_iter().enumerate() {
+        let destination = crate::managed_provider_references::sources::runtime_config_destination(
+            home, global, &logical,
+        );
+        let effective = crate::managed_provider_references::sources::runtime_config_destination(
+            home, global, &canonical,
+        );
+        units.push((
+            canonical,
+            ProviderResourceMount {
+                stage_relative_path: format!(".freshell/resource-units/root-{ordinal}"),
+                provider_relative_path: format!(".freshell/provider-roots/root-{ordinal}"),
+                logical_destination: destination
+                    .to_str()
+                    .ok_or("resource destination is not UTF-8")?
+                    .into(),
+                effective_destination: effective
+                    .to_str()
+                    .ok_or("resource destination is not UTF-8")?
+                    .into(),
+                kind: ProviderResourceKind::Directory,
+            },
+        ));
+    }
+    Ok(units)
+}
+
 pub(super) fn read_source_view(root: &Path, relative: &str) -> Result<String, String> {
     use std::io::Read;
     if Path::new(relative)
@@ -299,7 +359,18 @@ pub(super) fn describe(
             recipe_count: u16::try_from(recipes).map_err(|_| "recipe count overflow")?,
         },
         config_binds: binds,
-        resource_mounts: Vec::new(),
+        resource_mounts: {
+            let mut bytes = Vec::new();
+            std::fs::File::open(root.join(".freshell/resource-mounts.json"))
+                .map_err(|_| "prepared resource manifest unavailable")?
+                .take(MAX_CONTROL_FRAME_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "prepared resource manifest read failed")?;
+            if bytes.len() > MAX_CONTROL_FRAME_BYTES {
+                return Err("prepared resource descriptor exceeds control profile".into());
+            }
+            serde_json::from_slice(&bytes).map_err(|_| "prepared resource descriptors invalid")?
+        },
         indexed_files: (!sources.is_empty()).then(|| IndexedProviderFiles {
             volume_name: indexed_provider_volume_name(soul, &capability.grant_id),
             aliases,

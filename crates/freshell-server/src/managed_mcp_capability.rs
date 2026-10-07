@@ -1120,6 +1120,23 @@ fn stage_provider_root(
                 .iter()
                 .map(|reference| PathBuf::from(&reference.source_path)),
         );
+        if let Some(plan) = opencode_input.source_plan {
+            let units = source_stage::resource_units(home, &source, plan)?;
+            selections.extend(units.iter().map(|(source, mount)| CopySelection {
+                source: source.clone(),
+                destination_relative: mount.stage_relative_path.clone().into(),
+            }));
+            let descriptors = units
+                .into_iter()
+                .map(|(_, mount)| mount)
+                .collect::<Vec<_>>();
+            let metadata = freshell_runtime_protocol::bounded_json_bytes(
+                &descriptors,
+                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+            )
+            .map_err(|_| "prepared resource descriptor exceeds control profile")?;
+            write_private_bytes(&temporary.join(".freshell/resource-mounts.json"), &metadata)?;
+        }
         let amplifier_resources = if provider == "amplifier" {
             Some(amplifier_resources::prepare(
                 home,
@@ -3790,6 +3807,82 @@ except Exception as error:
             .unwrap();
             assert_eq!(retained, effective, "request-only inline source and owned edits must survive reissue without current inline env");
         }
+    }
+
+    #[test]
+    fn managed_provider_selected_config_root_stages_complete_writable_dependencies() {
+        use crate::managed_provider_references::sources::*;
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let selected = workspace.join(".opencode");
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(selected.join("plugins/probe/node_modules/dependency")).unwrap();
+        let raw = r#"{"plugin":["./plugins/probe/index.js"]}"#;
+        std::fs::write(selected.join("opencode.json"), raw).unwrap();
+        std::fs::write(
+            selected.join("plugins/probe/index.js"),
+            "export default {};",
+        )
+        .unwrap();
+        std::fs::write(
+            selected.join("plugins/probe/node_modules/dependency/index.js"),
+            "dependency-nonce",
+        )
+        .unwrap();
+        let sources = discover_opencode(OpencodeDiscovery {
+            home: &home,
+            cwd: &workspace,
+            worktree: &workspace,
+            config_root: &home.join(".config/opencode"),
+            env: &|_| None,
+        })
+        .unwrap();
+        let plan = plan_opencode_sources(sources, &workspace, &home, &|_, _, _| None).unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let capability = store
+            .issue(
+                SoulId::new(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &[])),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    source_plan: Some(&plan),
+                    secret_references: Some(&[]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+        let inputs: PreparedProviderInputs = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/prepared-inputs.json")).unwrap(),
+        )
+        .unwrap();
+        let root = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| mount.logical_destination == selected.to_str().unwrap())
+            .expect("selected config directories require complete writable soul-backed roots");
+        assert_eq!(root.kind, ProviderResourceKind::Directory);
+        assert_eq!(
+            std::fs::read_to_string(
+                stage
+                    .join(&root.stage_relative_path)
+                    .join("plugins/probe/node_modules/dependency/index.js")
+            )
+            .unwrap(),
+            "dependency-nonce"
+        );
+        assert_eq!(
+            std::fs::read_to_string(selected.join("opencode.json")).unwrap(),
+            raw
+        );
     }
 
     #[tokio::test]
