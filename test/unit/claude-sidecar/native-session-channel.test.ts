@@ -20,7 +20,7 @@ async function hook(channel: any) {
   child.stdin.end(JSON.stringify(native))
   expect(await exited).toBe(0)
 }
-function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false, delayedNativeExit = false, providerHome = directory, eagerResume = false, eagerCallbackOnly = false) {
+function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false, delayedNativeExit = false, providerHome = directory, eagerResume = false, eagerCallbackOnly = false, splitBatch: boolean | 'incomplete' = false) {
   const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/index.mjs')], {
     env: { ...process.env, HOME: providerHome, FRESHELL_SIDECAR_TEST_CHECKPOINT: '1',
       FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID: nativeRequestId,
@@ -28,6 +28,7 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
       FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY: delayedNativeExit ? '1' : '0',
       FRESHELL_SIDECAR_TEST_CHECKPOINT_EAGER_RESUME: eagerResume ? '1' : '0',
       FRESHELL_SIDECAR_TEST_CHECKPOINT_EAGER_CALLBACK_ONLY: eagerCallbackOnly ? '1' : '0',
+      FRESHELL_SIDECAR_TEST_SPLIT_BATCH: splitBatch === 'incomplete' ? splitBatch : splitBatch ? '1' : '0',
       FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(launch),
       FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -124,7 +125,7 @@ describe('native solo deferred checkpoint inspection', () => {
   const input = { command: 'printf harmless >> /owned/effect-count' }
   const inputDigest = createHash('sha256').update(JSON.stringify(input)).digest('hex')
   const assistant = { type: 'assistant', sessionId: root, uuid: 'assistant-original', version: '2.1.237',
-    message: { content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input }] } }
+    message: { id: 'msg_original', content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input }] } }
   const checkpoint = { type: 'attachment', sessionId: root, uuid: 'checkpoint-original', version: '2.1.237',
     attachment: { type: 'hook_deferred_tool', toolUseID, toolName: 'Bash', toolInput: input,
       hookName: 'PreToolUse:Bash', hookEvent: 'PreToolUse', permissionMode: 'default' } }
@@ -146,16 +147,42 @@ describe('native solo deferred checkpoint inspection', () => {
   it('refuses changed native input, root, and a non-solo original batch', async () => {
     expect(await inspect([assistant, { ...checkpoint, attachment: { ...checkpoint.attachment, toolInput: { command: 'changed' } } }])).toBeNull()
     expect(await inspect([assistant, { ...checkpoint, sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }])).toBeNull()
-    expect(await inspect([{ ...assistant, message: { content: [...assistant.message.content, { type: 'tool_use', id: 'toolu_second1', name: 'Bash', input }] } }, checkpoint])).toBeNull()
+    expect(await inspect([{ ...assistant, message: { ...assistant.message, content: [...assistant.message.content, { type: 'tool_use', id: 'toolu_second1', name: 'Bash', input }] } }, checkpoint])).toBeNull()
   })
   it('refuses consumed native operations and incomplete EOF rather than replaying', async () => {
     const result = { type: 'user', sessionId: root, message: { content: [{ type: 'tool_result', tool_use_id: toolUseID, is_error: true }] } }
     expect(await inspect([assistant, checkpoint, result])).toBeNull()
     expect(await inspect([assistant, checkpoint], false)).toBeNull()
   })
+  it('refuses two operations serialized as separate rows of one native model response', async () => {
+    const second = { ...assistant, uuid: 'assistant-second', message: { id: assistant.message.id,
+      content: [{ type: 'tool_use', id: 'toolu_second1', name: 'Bash', input }] } }
+    expect(await inspect([second, assistant, checkpoint])).toBeNull()
+    expect(await inspect([assistant, checkpoint, second])).toBeNull()
+  })
+  it('requires a native response ID while permitting separate thinking rows and prior turns', async () => {
+    expect(await inspect([{ ...assistant, message: { content: assistant.message.content } }, checkpoint])).toBeNull()
+    const thinking = { ...assistant, uuid: 'thinking', message: { id: assistant.message.id,
+      content: [{ type: 'thinking', thinking: 'owned fixture' }] } }
+    const prior = { ...assistant, uuid: 'prior', message: { ...assistant.message, id: 'msg_prior' } }
+    expect(await inspect([prior, thinking, assistant, checkpoint])).not.toBeNull()
+  })
 })
 
 describe('production sidecar native checkpoint continuation', () => {
+  it.each([true, 'incomplete'] as const)('keeps split-row native batch hooks on ordinary policy (completion: %s)', async (completion) => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-batch-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    const worker = checkpointSidecar(directory, 'native-batch', false, false, directory, false, false, completion)
+    try {
+      worker.send({ type: 'create', requestId: 'batch-create', cwd: directory, resumeSessionId: root, permissionMode: 'default' })
+      const created = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: created.sessionId, text: 'two independent operations' })
+      expect((await worker.wait('probe.batch-hooks')).outcomes).toEqual([{}, {}])
+      expect(worker.frames.some((frame) => frame.nativeCheckpoint)).toBe(false)
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
   it('persists managed continuation state outside provider-native project artifacts', async () => {
     const home = await mkdtemp(join(tmpdir(), 'sidecar-native-census-'))
     const directory = join(home, '.claude', 'projects', 'owned-project')
@@ -327,7 +354,7 @@ describe('production sidecar native checkpoint continuation', () => {
     const directory = await mkdtemp(join(tmpdir(), 'sidecar-resume-input-'))
     const input = { command: 'fixture owned harmless counter' }
     const assistant = { type: 'assistant', sessionId: root, uuid: 'assistant-original', version: '2.1.237',
-      message: { content: [{ type: 'tool_use', id: 'toolu_original1', name: 'Bash', input }] } }
+      message: { id: 'msg_original', content: [{ type: 'tool_use', id: 'toolu_original1', name: 'Bash', input }] } }
     const checkpoint = { type: 'attachment', sessionId: root, uuid: 'checkpoint-original', version: '2.1.237',
       attachment: { type: 'hook_deferred_tool', toolUseID: 'toolu_original1', toolName: 'Bash', toolInput: input,
         hookEvent: 'PreToolUse', permissionMode: 'default' } }

@@ -95,7 +95,14 @@ export async function inspectNativeDeferredCheckpoint({ path, nativeSessionId, t
       || (consumed && !includeConsumed)) return null
     const assistant = rows.slice(0, checkpointIndex).findLast((row) => row.type === 'assistant'
       && Array.isArray(row.message?.content) && row.message.content.some((block) => block.type === 'tool_use' && block.id === toolUseID))
-    const tools = assistant?.message.content.filter((block) => block.type === 'tool_use')
+    const messageId = assistant?.message.id
+    if (typeof messageId !== 'string' || !messageId) return null
+    // Native streaming serializes one model response into multiple assistant
+    // rows. Count the entire response, including rows after the attachment.
+    const batchRows = rows.filter((row) => row.type === 'assistant' && row.message?.id === messageId)
+    if (batchRows.some((row) => row.sessionId !== nativeSessionId || row.version !== '2.1.237'
+      || !Array.isArray(row.message.content))) return null
+    const tools = batchRows.flatMap((row) => row.message.content.filter((block) => block.type === 'tool_use'))
     if (assistant?.sessionId !== nativeSessionId || assistant.version !== '2.1.237'
       || typeof assistant.uuid !== 'string' || !assistant.uuid || tools?.length !== 1
       || tools[0].name !== attachment.toolName || nativeInputDigest(tools[0].input) !== inputDigest) return null
