@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
+import { execFileSync } from 'node:child_process'
+import managedRuntimeReducer, { managedRuntimeSnapshotReceived } from '@/store/managedRuntimeSlice'
 import {
   ManagedRuntimeRestoreLostSoulsRequestSchema, ManagedRuntimeRepairBatchScopeSchema,
   ManagedRuntimeRestoreLostSoulsResultSchema, ManagedRuntimeInventorySnapshotSchema,
+  ManagedRuntimeSoulSchema,
+  ManagedRuntimeSoulDetailSchema,
 } from '@shared/managed-runtime'
 
 const digest = 'a'.repeat(64)
@@ -15,6 +19,49 @@ const request = {
 }
 
 describe('production managed runtime repair wire parsing', () => {
+  it('consumes actual production Rust serialization for inventory, detail and legacy observations', () => {
+    const produced = JSON.parse(execFileSync('cargo', [
+      'run', '--quiet', '--locked', '-p', 'freshell-runtime-protocol', '--example', 'native-identity-wire',
+    ], { encoding: 'utf8', timeout: 180_000, maxBuffer: 128 * 1024 }))
+    const inventory = ManagedRuntimeInventorySnapshotSchema.parse(produced.inventory)
+    const detail = ManagedRuntimeSoulDetailSchema.parse(produced.detail)
+    const consumed = managedRuntimeReducer(undefined, managedRuntimeSnapshotReceived({
+      snapshot: inventory, reconstructedViewCount: 0,
+    }))
+    expect(consumed.souls[0]?.nativeIdentityObservation).toEqual(produced.observation)
+    expect(detail.soul.nativeIdentityObservation).toEqual(consumed.souls[0]?.nativeIdentityObservation)
+    expect(ManagedRuntimeSoulSchema.parse(produced.legacy).nativeIdentityObservation).toBeUndefined()
+    for (const change of [{ source: 'requested_id' }, { launchNonce: undefined }, { evidenceRevision: '1' }]) {
+      expect(ManagedRuntimeSoulSchema.safeParse({ ...produced.inventory.souls[0],
+        nativeIdentityObservation: { ...produced.observation, ...change },
+      }).success).toBe(false)
+    }
+  }, 180_000)
+  it('round-trips current native observation and preserves unobserved legacy identity', () => {
+    const soul = {
+      soulId: 'soul-wire', incarnationId: 'incarnation-wire', launchState: 'running',
+      cleanupState: 'none', intentRevision: 1, executionGeneration: 1,
+      desiredState: 'running', recoveryState: 'live', durabilityState: 'unknown',
+      allocationState: 'allocated', nativeSessionId: 'requested-root',
+      evidenceRevision: 1, successfulRecoveriesInWindow: 0,
+    }
+    const observation = {
+      nativeSessionId: 'requested-root', incarnationId: soul.incarnationId,
+      launchNonce: 'grant-current', evidenceRevision: 1,
+      source: 'claude_native_event', evidenceDigest: digest,
+    }
+    expect(ManagedRuntimeSoulSchema.parse(JSON.parse(JSON.stringify({
+      ...soul, nativeIdentityObservation: observation,
+    }))).nativeIdentityObservation).toEqual(observation)
+    expect(ManagedRuntimeSoulSchema.parse(soul).nativeIdentityObservation).toBeUndefined()
+    for (const invalid of [
+      { ...observation, source: 'requested_id' },
+      { ...observation, launchNonce: undefined },
+      { ...observation, evidenceRevision: '1' },
+    ]) {
+      expect(ManagedRuntimeSoulSchema.safeParse({ ...soul, nativeIdentityObservation: invalid }).success).toBe(false)
+    }
+  })
   it('admits the scoped nine-target request through the exported production schema', () => {
     expect(ManagedRuntimeRestoreLostSoulsRequestSchema.parse(request).targets).toHaveLength(9)
   })

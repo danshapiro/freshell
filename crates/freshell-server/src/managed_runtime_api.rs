@@ -1254,6 +1254,7 @@ mod tests {
         current_intent.visibility = ViewVisibilityIntent::Hidden;
         let mut stopped = snapshot(4, current_intent);
         stopped.souls.push(RuntimeView {
+            native_identity_observation: None,
             soul_id: SoulId::parse("soul-test").unwrap(),
             incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
             launch_state: freshell_runtime_protocol::LaunchState::Stopped,

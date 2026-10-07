@@ -1,0 +1,75 @@
+import { createHash } from 'node:crypto'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { describe, expect, it } from 'vitest'
+import { createNativeCheckpointStore } from '../../../crates/freshell-claude-sidecar/native-checkpoint-state.mjs'
+
+const root = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const toolUseID = 'toolu_original1'
+const input = { command: 'harmless effect counter' }
+const inputDigest = createHash('sha256').update(JSON.stringify(input)).digest('hex')
+const profileDigest = 'b'.repeat(64)
+const binding = { launch: { incarnationId: 'current', launchNonce: 'nonce', evidenceRevision: 0,
+  executionGeneration: 1, requestedNativeSessionId: root }, queryGeneration: 2, nativeRequestId: 'native-current' }
+
+async function scenario(run: (store: any, reopen: (profile?: string) => any, paths: any) => Promise<void>) {
+  const directory = await mkdtemp(join(tmpdir(), 'native-checkpoint-state-'))
+  const transcriptPath = join(directory, root + '.jsonl')
+  const recordPath = join(directory, 'checkpoint.json')
+  const assistant = { type: 'assistant', sessionId: root, uuid: 'assistant-original', version: '2.1.237',
+    message: { content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input }] } }
+  const attachment = { type: 'attachment', sessionId: root, uuid: 'checkpoint-original', version: '2.1.237',
+    attachment: { type: 'hook_deferred_tool', toolUseID, toolName: 'Bash', toolInput: input,
+      hookEvent: 'PreToolUse', permissionMode: 'default' } }
+  await writeFile(transcriptPath, JSON.stringify(assistant) + '\n' + JSON.stringify(attachment) + '\n')
+  const reopen = (profile = profileDigest) => createNativeCheckpointStore({ recordPath, transcriptPath,
+    nativeSessionId: root, profileDigest: profile })
+  try { await run(reopen(), reopen, { recordPath, transcriptPath }) }
+  finally { await rm(directory, { recursive: true, force: true }) }
+}
+
+describe('restricted native checkpoint durable phases', () => {
+  it('publishes only the inspected native checkpoint and keeps its record body-free', async () => scenario(async (store, reopen, paths) => {
+    const checkpoint = await store.publish(toolUseID, inputDigest)
+    expect(checkpoint).toMatchObject({ nativeSessionId: root, toolUseID, inputDigest, profileDigest, phase: 'checkpointed' })
+    expect(await reopen().readRecoverable()).toEqual(checkpoint)
+    expect(await readFile(paths.recordPath, 'utf8')).not.toContain(input.command)
+  }))
+  it('never automatically replays a continuation or decision that became ambiguous across reopen', async () => scenario(async (store, reopen) => {
+    await store.publish(toolUseID, inputDigest)
+    expect(await store.beginContinuation()).toBe(true)
+    expect(await reopen().readRecoverable()).toBeNull()
+    expect(await store.parkPermission(toolUseID, inputDigest, binding)).toBe(true)
+    expect(await reopen().readRecoverable()).toMatchObject({ phase: 'approval_waiting', nativeBinding: binding })
+    expect(await store.beginDecision('old-native')).toBe(false)
+    expect(await store.beginDecision(binding.nativeRequestId)).toBe(true)
+    expect(await reopen().readRecoverable()).toBeNull()
+    expect(await store.finishNativeResult(toolUseID, false)).toBe(true)
+    expect(await reopen().readRecoverable()).toBeNull()
+  }))
+  it('refuses a changed profile and wrong current native operation', async () => scenario(async (store, reopen) => {
+    await store.publish(toolUseID, inputDigest)
+    expect(await reopen('c'.repeat(64)).readRecoverable()).toBeNull()
+    await store.beginContinuation()
+    expect(await store.parkPermission('toolu_other1', inputDigest, binding)).toBe(false)
+    expect(await store.parkPermission(toolUseID, 'd'.repeat(64), binding)).toBe(false)
+    expect(await store.finishNativeResult('toolu_other1', false)).toBe(false)
+  }))
+  it('keeps an explicit interrupted operation unavailable and serializes one continuation claim', async () => scenario(async (store, reopen) => {
+    await store.publish(toolUseID, inputDigest)
+    expect(await Promise.all([store.beginContinuation(), store.beginContinuation()])).toEqual([true, false])
+    await store.parkPermission(toolUseID, inputDigest, binding)
+    await store.interrupt()
+    expect(await reopen().readRecoverable()).toBeNull()
+    expect(await store.beginDecision(binding.nativeRequestId)).toBe(false)
+  }))
+  it('refuses a native checkpoint consumed after metadata publication', async () => scenario(async (store, reopen, paths) => {
+    await store.publish(toolUseID, inputDigest)
+    const original = await readFile(paths.transcriptPath, 'utf8')
+    await writeFile(paths.transcriptPath, original + JSON.stringify({ type: 'user', sessionId: root,
+      message: { content: [{ type: 'tool_result', tool_use_id: toolUseID, is_error: false }] } }) + '\n')
+    expect(await reopen().readRecoverable()).toBeNull()
+    expect(await store.beginContinuation()).toBe(false)
+  }))
+})

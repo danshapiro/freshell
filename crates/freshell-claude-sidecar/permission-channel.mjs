@@ -197,7 +197,9 @@ export function canUseTool({ session, emit, nanoid, nextMonotonic, sessionId, to
   if (toolName === 'AskUserQuestion') {
     return raiseQuestionRequest({ session, emit, nanoid, nextMonotonic, sessionId, input, signal: options?.signal, nativeRequestId: options?.requestId })
   }
-  if (session.permissionMode === 'bypassPermissions') {
+  // Managed callbacks arrive only after native policy selected an ask. Even
+  // bypass mode can have explicit/org/safety-required native asks; preserve it.
+  if (session.permissionMode === 'bypassPermissions' && !session.nativeChannel) {
     return { behavior: 'allow', updatedInput: input }
   }
   return raisePermissionRequest({ session, emit, nanoid, nextMonotonic, sessionId, toolName, input, options })

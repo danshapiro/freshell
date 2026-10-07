@@ -1240,6 +1240,27 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "commit_running_state", error)
             })?;
+        if let Some(observation) =
+            accepted
+                .native_identity_observation
+                .as_ref()
+                .filter(|observation| {
+                    accepted.native_session_id.as_deref()
+                        == Some(observation.native_session_id.as_str())
+                })
+        {
+            self.registry
+                .record_native_identity_observation(
+                    workload.soul_id.clone(),
+                    observation.clone(),
+                    fence.clone(),
+                )
+                .await
+                .map_err(map_registry)
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "record_native_observation", error)
+                })?;
+        }
         if let Err(error) = self.cleanup_opencode_transfer_staging().await {
             append_event(
                 &self.config.lifecycle_log,
@@ -2470,7 +2491,28 @@ impl Supervisor {
         grant: &ExecutionGrantRecord,
     ) -> Result<AcceptedGrant, RuntimeError> {
         let incarnation_id = handle.incarnation_id().clone();
+        let identity_context = self
+            .registry
+            .recovery_context(workload.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let native_identity_launch = self
+            .registry
+            .bind_native_identity_launch(freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: incarnation_id.clone(),
+                launch_nonce: handle.launch_nonce().as_str().into(),
+                evidence_revision: identity_context.evidence_revision,
+                execution_generation: grant.execution_generation,
+                requested_native_session_id: workload
+                    .resume_spec
+                    .as_ref()
+                    .map(|spec| spec.provider_session.native_session_id.clone())
+                    .or(identity_context.native_session_id.clone()),
+            })
+            .await
+            .map_err(map_registry)?;
         let command = HostCommand::GrantExecution {
+            native_identity_launch: Some(native_identity_launch.clone()),
             incarnation_id: incarnation_id.clone(),
             soul_id: workload.soul_id.clone(),
             host_boot_id: grant.host_boot_id.clone(),
@@ -2487,11 +2529,12 @@ impl Supervisor {
             .await?
         {
             HostResult::GrantAccepted {
+                native_identity_observation,
                 host_boot_id,
                 worker_pid,
                 worker_launch_count,
                 fixture_evidence,
-                native_session_id,
+                native_session_id: _,
                 opencode_transfer_receipt,
                 ..
             } => Ok(AcceptedGrant {
@@ -2499,7 +2542,17 @@ impl Supervisor {
                 worker_pid,
                 worker_launch_count,
                 fixture_evidence,
-                native_session_id,
+                native_session_id: native_identity_observation
+                    .as_ref()
+                    .filter(|observation| {
+                        observation.matches_launch(&native_identity_launch)
+                            && observation.matches_provider(
+                                &identity_context.provider,
+                                workload.fresh_agent.is_some(),
+                            )
+                    })
+                    .map(|observation| observation.native_session_id.clone()),
+                native_identity_observation,
                 opencode_transfer_receipt: validate_opencode_transfer_receipt(
                     workload
                         .terminal
@@ -2537,6 +2590,8 @@ impl Supervisor {
             .await?
         {
             HostResult::Status {
+                native_identity_observation,
+                max_execution_generation,
                 host_boot_id,
                 worker_pid,
                 worker_launch_count,
@@ -2547,6 +2602,8 @@ impl Supervisor {
                 opencode_transfer_receipt,
                 ..
             } => Ok(HostStatus {
+                native_identity_observation,
+                max_execution_generation,
                 host_boot_id,
                 worker_pid,
                 worker_launch_count,
@@ -2772,6 +2829,7 @@ pub(crate) struct AuthenticatedHost {
     effective_limits: RuntimeLimits,
 }
 pub(crate) struct AcceptedGrant {
+    native_identity_observation: Option<freshell_runtime_protocol::NativeIdentityObservation>,
     host_boot_id: HostBootId,
     worker_pid: u32,
     worker_launch_count: u64,
@@ -2780,6 +2838,9 @@ pub(crate) struct AcceptedGrant {
     opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
 }
 pub(crate) struct HostStatus {
+    pub(crate) max_execution_generation: u64,
+    pub(crate) native_identity_observation:
+        Option<freshell_runtime_protocol::NativeIdentityObservation>,
     pub(crate) host_boot_id: HostBootId,
     pub(crate) worker_pid: Option<u32>,
     pub(crate) worker_launch_count: u64,
@@ -4462,6 +4523,7 @@ mod native_observation_ipc_tests {
                             effective_limits: requested_limits,
                         },
                         HostCommand::Status { .. } => HostResult::Status {
+                            native_identity_observation: None,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(123),
                             worker_launch_count: 1,
@@ -4564,6 +4626,7 @@ mod native_observation_ipc_tests {
                             effective_limits: captured.requested_limits,
                         },
                         HostCommand::Status { .. } if step == 1 => HostResult::Status {
+                            native_identity_observation: None,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(123),
                             worker_launch_count: 1,

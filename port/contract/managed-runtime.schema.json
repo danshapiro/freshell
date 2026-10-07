@@ -1,7 +1,7 @@
 {
   "description": "Generated from shared/managed-runtime.ts. Do not edit by hand.",
   "generator": "port/contract/generate-managed-runtime-contract.ts",
-  "schemaCount": 42,
+  "schemaCount": 43,
   "schemas": {
     "ManagedRuntimeAllocationStateSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -479,6 +479,54 @@
                   "failed"
                 ],
                 "type": "string"
+              },
+              "nativeIdentityObservation": {
+                "additionalProperties": false,
+                "properties": {
+                  "evidenceDigest": {
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": "string"
+                  },
+                  "evidenceRevision": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "incarnationId": {
+                    "maxLength": 160,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "launchNonce": {
+                    "maxLength": 160,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "nativeSessionId": {
+                    "maxLength": 160,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "source": {
+                    "enum": [
+                      "codex_app_server",
+                      "opencode_tui",
+                      "claude_native_event",
+                      "amplifier_native_loaded_context",
+                      "fresh_provider_handshake"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "nativeSessionId",
+                  "incarnationId",
+                  "launchNonce",
+                  "evidenceRevision",
+                  "source",
+                  "evidenceDigest"
+                ],
+                "type": "object"
               },
               "nativeSessionId": {
                 "type": "string"
@@ -1014,6 +1062,55 @@
         "projectedMemoryBytes",
         "projectedPids",
         "blockers"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeNativeIdentityObservationSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "evidenceDigest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "evidenceRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "incarnationId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "launchNonce": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "nativeSessionId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "codex_app_server",
+            "opencode_tui",
+            "claude_native_event",
+            "amplifier_native_loaded_context",
+            "fresh_provider_handshake"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "nativeSessionId",
+        "incarnationId",
+        "launchNonce",
+        "evidenceRevision",
+        "source",
+        "evidenceDigest"
       ],
       "type": "object"
     },
@@ -2446,6 +2543,54 @@
               ],
               "type": "string"
             },
+            "nativeIdentityObservation": {
+              "additionalProperties": false,
+              "properties": {
+                "evidenceDigest": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "evidenceRevision": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "incarnationId": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "launchNonce": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "nativeSessionId": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "source": {
+                  "enum": [
+                    "codex_app_server",
+                    "opencode_tui",
+                    "claude_native_event",
+                    "amplifier_native_loaded_context",
+                    "fresh_provider_handshake"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "nativeSessionId",
+                "incarnationId",
+                "launchNonce",
+                "evidenceRevision",
+                "source",
+                "evidenceDigest"
+              ],
+              "type": "object"
+            },
             "nativeSessionId": {
               "type": "string"
             },
@@ -2794,6 +2939,54 @@
           ],
           "type": "string"
         },
+        "nativeIdentityObservation": {
+          "additionalProperties": false,
+          "properties": {
+            "evidenceDigest": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            "evidenceRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "incarnationId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "launchNonce": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "nativeSessionId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "source": {
+              "enum": [
+                "codex_app_server",
+                "opencode_tui",
+                "claude_native_event",
+                "amplifier_native_loaded_context",
+                "fresh_provider_handshake"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "nativeSessionId",
+            "incarnationId",
+            "launchNonce",
+            "evidenceRevision",
+            "source",
+            "evidenceDigest"
+          ],
+          "type": "object"
+        },
         "nativeSessionId": {
           "type": "string"
         },
@@ -3113,6 +3306,54 @@
                 "failed"
               ],
               "type": "string"
+            },
+            "nativeIdentityObservation": {
+              "additionalProperties": false,
+              "properties": {
+                "evidenceDigest": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "evidenceRevision": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "incarnationId": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "launchNonce": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "nativeSessionId": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "source": {
+                  "enum": [
+                    "codex_app_server",
+                    "opencode_tui",
+                    "claude_native_event",
+                    "amplifier_native_loaded_context",
+                    "fresh_provider_handshake"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "nativeSessionId",
+                "incarnationId",
+                "launchNonce",
+                "evidenceRevision",
+                "source",
+                "evidenceDigest"
+              ],
+              "type": "object"
             },
             "nativeSessionId": {
               "type": "string"

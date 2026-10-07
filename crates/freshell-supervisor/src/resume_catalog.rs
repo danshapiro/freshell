@@ -407,6 +407,7 @@ mod tests {
         let soul = SoulId::parse("soul-resume-catalog").unwrap();
         let incarnation = IncarnationId::parse("incarnation-resume-catalog").unwrap();
         RecoveryContext {
+            native_identity_launch: None,
             soul_id: soul.clone(),
             prior_handle: OwnedRuntimeHandle::from_registry(
                 InstallationId::parse("installation-resume-catalog").unwrap(),

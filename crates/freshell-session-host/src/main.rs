@@ -36,6 +36,8 @@ use tokio::{
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PersistedHostState {
+    #[serde(default)]
+    native_identity_launch: Option<freshell_runtime_protocol::NativeIdentityLaunch>,
     host_boot_id: Option<HostBootId>,
     max_control_epoch: u64,
     max_execution_generation: u64,
@@ -413,6 +415,7 @@ async fn run() -> Result<(), String> {
         #[cfg(feature = "fresh-agent-fixtures")]
         Some("fresh-agent-fixture-state-worker") => providers::run_fresh_agent_fixture_state_worker(&args[2..]),
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
+        Some("native-identity-read") => providers::native_identity::run_signal_read_worker(&args[2..]),
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
         Some("publish-provider-files") => {
@@ -575,6 +578,7 @@ async fn dispatch_with_effects(
                     "owned-provider-config-v1".into(),
                     "provider-store-probe-v1".into(),
                     "opencode-adoption-observation-v1".into(),
+                    "native-identity-observation-v1".into(),
                     "grant-v1".into(),
                     "stop-v1".into(),
                     "security-probe-v1".into(),
@@ -595,6 +599,7 @@ async fn dispatch_with_effects(
             )?;
             match command {
                 HostCommand::GrantExecution {
+                    native_identity_launch,
                     incarnation_id,
                     soul_id,
                     host_boot_id,
@@ -616,6 +621,7 @@ async fn dispatch_with_effects(
                     grant_execution(
                         state,
                         GrantExecutionRequest {
+                            native_identity_launch,
                             soul_id,
                             control_epoch,
                             execution_generation,
@@ -666,10 +672,14 @@ async fn dispatch_with_effects(
                     let mut evidence = persisted.fixture_evidence;
                     let mut exited = false;
                     let mut native_session_id = None;
+                    let mut native_identity_observation = None;
                     let mut opencode_adoption = OpenCodeAdoptionStatus::NotRequired;
                     if let Some(pty) = state.pty.lock().await.as_ref() {
                         exited = pty.exited();
-                        native_session_id = pty.native_session_id();
+                        native_identity_observation = pty.native_identity_observation();
+                        native_session_id = native_identity_observation
+                            .as_ref()
+                            .map(|o| o.native_session_id.clone());
                         opencode_adoption = pty.opencode_adoption_status();
                         evidence = serde_json::json!({
                             "workload":"terminal",
@@ -683,7 +693,19 @@ async fn dispatch_with_effects(
                         });
                     } else if let Some(agent) = state.fresh_agent.lock().await.as_ref() {
                         exited = !agent.is_live().await;
-                        native_session_id = agent.profile().await.native_session_id;
+                        if let (Some(launch), Some(native)) = (
+                            persisted.native_identity_launch.as_ref(),
+                            agent.observed_native_session_id().await,
+                        ) {
+                            if let Some(evidence) = agent.observed_native_identity_evidence().await
+                            {
+                                native_identity_observation = providers::native_identity::bind_provider_observation(
+                                    launch,&native,freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,&evidence);
+                            }
+                        }
+                        native_session_id = native_identity_observation
+                            .as_ref()
+                            .map(|o| o.native_session_id.clone());
                         evidence = serde_json::json!({
                             "workload":"fresh-agent",
                             "nativeSessionId":native_session_id,
@@ -716,6 +738,7 @@ async fn dispatch_with_effects(
                         }
                     }
                     Ok(HostResult::Status {
+                        native_identity_observation,
                         host_boot_id: state.host_boot_id.clone(),
                         worker_pid: persisted.worker_pid,
                         worker_launch_count: persisted.worker_launch_count,
@@ -1053,6 +1076,7 @@ struct GrantExecutionRequest {
     terminal: Option<TerminalLaunchSpec>,
     fresh_agent: Option<FreshAgentLaunchSpec>,
     resume_spec: Option<ResumeSpec>,
+    native_identity_launch: Option<freshell_runtime_protocol::NativeIdentityLaunch>,
 }
 
 async fn grant_execution(
@@ -1069,6 +1093,7 @@ async fn grant_execution(
         terminal,
         fresh_agent,
         resume_spec,
+        native_identity_launch,
     } = request;
     let mut persisted = state.persisted.lock().await;
     let mut transfer_prepared_terminal = None;
@@ -1085,12 +1110,13 @@ async fn grant_execution(
     if let Some(existing) = persisted.grant_id.as_ref() {
         if existing == &grant_id {
             if let Some(pid) = persisted.worker_pid {
-                let actor = state.fresh_agent.lock().await.clone();
-                let native_session_id = match actor {
-                    Some(actor) => actor.profile().await.native_session_id,
-                    None => None,
-                };
+                let native_identity_observation =
+                    current_native_observation(state, &persisted).await;
+                let native_session_id = native_identity_observation
+                    .as_ref()
+                    .map(|observation| observation.native_session_id.clone());
                 return Ok(HostResult::GrantAccepted {
+                    native_identity_observation,
                     host_boot_id: state.host_boot_id.clone(),
                     worker_pid: pid,
                     worker_launch_count: persisted.worker_launch_count,
@@ -1172,12 +1198,17 @@ async fn grant_execution(
         if let Some(existing) = persisted.grant_id.as_ref() {
             if existing == &grant_id {
                 if let Some(pid) = persisted.worker_pid {
+                    let native_identity_observation =
+                        current_native_observation(state, &persisted).await;
                     return Ok(HostResult::GrantAccepted {
+                        native_session_id: native_identity_observation
+                            .as_ref()
+                            .map(|observation| observation.native_session_id.clone()),
+                        native_identity_observation,
                         host_boot_id: state.host_boot_id.clone(),
                         worker_pid: pid,
                         worker_launch_count: persisted.worker_launch_count,
                         fixture_evidence: persisted.fixture_evidence.clone(),
-                        native_session_id: None,
                         opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
                         opencode_adoption: state
                             .pty
@@ -1211,6 +1242,18 @@ async fn grant_execution(
             .map_err(opencode_transfer_phase_error)?;
     }
     persisted.max_control_epoch = control_epoch;
+    if let Some(binding) = native_identity_launch.as_ref() {
+        if binding.incarnation_id != state.incarnation_id
+            || binding.execution_generation != execution_generation
+            || binding.launch_nonce.is_empty()
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryWrongIdentity,
+                "native observation launch binding does not match the current grant",
+            ));
+        }
+    }
+    persisted.native_identity_launch = native_identity_launch;
     persisted.max_execution_generation = execution_generation;
     persisted.grant_id = Some(grant_id.clone());
     persisted.worker_pid = None;
@@ -1228,7 +1271,7 @@ async fn grant_execution(
     let opencode_adoption_required = terminal
         .as_ref()
         .is_some_and(|terminal| terminal.opencode_adoption.is_some());
-    let (pid, evidence, native_session_id) = match (fixture, terminal, fresh_agent) {
+    let (pid, evidence, _native_session_id) = match (fixture, terminal, fresh_agent) {
         (Some(fixture), None, None) => {
             let exe = std::env::current_exe()
                 .map_err(|e| RuntimeError::new(RuntimeErrorCode::HostUnreachable, e.to_string()))?;
@@ -1342,7 +1385,7 @@ async fn grant_execution(
                     format!("prepare OneCLI provider files: {error}"),
                 )
             })?;
-            let prepared = providers::prepare_terminal(terminal, &resolved_secrets.environment)
+            let mut prepared = providers::prepare_terminal(terminal, &resolved_secrets.environment)
                 .await
                 .map_err(|error| {
                     RuntimeError::new(
@@ -1350,6 +1393,13 @@ async fn grant_execution(
                         format!("prepare managed provider: {error}"),
                     )
                 })?;
+            if let Some(binding) = persisted.native_identity_launch.as_ref() {
+                prepared.child_env.insert(
+                    providers::native_identity::LAUNCH_ENV.into(),
+                    serde_json::to_string(binding)
+                        .map_err(|error| registry_like_error(error.to_string()))?,
+                );
+            }
             let terminal = prepared.terminal;
             let spawn = || {
                 effects.spawn_terminal_pty(
@@ -1487,6 +1537,13 @@ async fn grant_execution(
                 &mut resolved_secrets.environment,
             )
             .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+            if let Some(binding) = persisted.native_identity_launch.as_ref() {
+                resolved_secrets.environment.insert(
+                    providers::native_identity::LAUNCH_ENV.into(),
+                    serde_json::to_string(binding)
+                        .map_err(|error| registry_like_error(error.to_string()))?,
+                );
+            }
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             let actor = effects
@@ -1499,7 +1556,7 @@ async fn grant_execution(
                     )
                 })?;
             let profile = actor.profile().await;
-            let native_session_id = profile.native_session_id.clone();
+            let native_session_id = actor.observed_native_session_id().await;
             let evidence = serde_json::json!({
                 "workload":"fresh-agent",
                 "provider":launch.provider.as_str(),
@@ -1531,15 +1588,38 @@ async fn grant_execution(
         .as_ref()
         .map(HostedPty::opencode_adoption_status)
         .unwrap_or_else(|| adoption_status_for_required(opencode_adoption_required));
+    let native_identity_observation = current_native_observation(state, &persisted).await;
     Ok(HostResult::GrantAccepted {
+        native_session_id: native_identity_observation
+            .as_ref()
+            .map(|observation| observation.native_session_id.clone()),
+        native_identity_observation,
         host_boot_id: state.host_boot_id.clone(),
         worker_pid: pid,
         worker_launch_count: persisted.worker_launch_count,
         fixture_evidence: persisted.fixture_evidence.clone(),
-        native_session_id,
         opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
         opencode_adoption,
     })
+}
+
+async fn current_native_observation(
+    state: &HostState,
+    persisted: &PersistedHostState,
+) -> Option<freshell_runtime_protocol::NativeIdentityObservation> {
+    if let Some(pty) = state.pty.lock().await.as_ref() {
+        return pty.native_identity_observation();
+    }
+    let launch = persisted.native_identity_launch.as_ref()?;
+    let actor = state.fresh_agent.lock().await.clone()?;
+    let native = actor.observed_native_session_id().await?;
+    let evidence = actor.observed_native_identity_evidence().await?;
+    providers::native_identity::bind_provider_observation(
+        launch,
+        &native,
+        freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+        &evidence,
+    )
 }
 
 fn adoption_status_for_required(required: bool) -> OpenCodeAdoptionStatus {
@@ -5466,6 +5546,7 @@ mod tests {
         let envelope = authenticated_host_envelope(
             &state,
             HostCommand::GrantExecution {
+                native_identity_launch: None,
                 incarnation_id: state.incarnation_id.clone(),
                 soul_id: SoulId::new(),
                 host_boot_id: HostBootId::new(),
@@ -5690,6 +5771,7 @@ mod tests {
             authenticated_host_envelope(
                 &state,
                 HostCommand::GrantExecution {
+                    native_identity_launch: None,
                     incarnation_id: state.incarnation_id.clone(),
                     soul_id: soul.clone(),
                     host_boot_id: state.host_boot_id.clone(),
@@ -5767,6 +5849,7 @@ mod tests {
             authenticated_host_envelope(
                 &repaired,
                 HostCommand::GrantExecution {
+                    native_identity_launch: None,
                     incarnation_id: repaired.incarnation_id.clone(),
                     soul_id: soul.clone(),
                     host_boot_id: repaired.host_boot_id.clone(),
@@ -5802,6 +5885,153 @@ mod tests {
         assert!(state.fresh_agent.lock().await.is_none());
         let actor = repaired.fresh_agent.lock().await.take().unwrap();
         actor.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn requested_identity_is_not_provider_observation() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let native_root = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let history = root.path().join(format!("{native_root}.jsonl"));
+        let original = serde_json::json!({"type":"user", "sessionId":native_root,
+            "message":{"role":"user","content":"owned fixture history"}})
+        .to_string();
+        std::fs::write(&history, &original).unwrap();
+        let program = root.path().join("provider");
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = test_host_state();
+        let launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"requested-identity", "streamId":"requested-identity", "mode":"claude",
+            "program":program, "args":["--resume",native_root],
+            "resumeSessionId":native_root, "cwd":root.path(), "workspacePath":root.path(),
+            "projectKey":"owned-identity", "cols":80, "rows":24,
+            "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+            "env":{"HOME":root.path(),"PATH":"/usr/bin:/bin"}
+        }))
+        .unwrap();
+        let pty = HostedPty::spawn(
+            &state.state_dir,
+            state.incarnation_id.clone(),
+            &launch,
+            std::collections::BTreeMap::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        *state.pty.lock().await = Some(pty);
+        let status = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::Status {
+                    incarnation_id: state.incarnation_id.clone(),
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        let mut pty = state.pty.lock().await.take().unwrap();
+        pty.stop().await;
+        assert_eq!(std::fs::read_to_string(history).unwrap(), original);
+        assert!(
+            matches!(
+                status,
+                HostResult::Status {
+                    native_identity_observation: None,
+                    native_session_id: None,
+                    ..
+                }
+            ),
+            "requested root and retained transcript must not fill native observation: {status:?}"
+        );
+        let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: state.incarnation_id.clone(),
+            launch_nonce: "current-native-launch".into(),
+            evidence_revision: 2,
+            execution_generation: 1,
+            requested_native_session_id: Some(native_root.into()),
+        };
+        let mut launch = launch;
+        launch.args.extend([
+            "--settings".into(),
+            freshell_platform::cli_launch::claude_settings_json(
+                freshell_platform::cli_launch::ProviderTarget::Unix,
+            ),
+        ]);
+        let pty = HostedPty::spawn(
+            &state.state_dir,
+            state.incarnation_id.clone(),
+            &launch,
+            std::collections::BTreeMap::from([(
+                providers::native_identity::LAUNCH_ENV.into(),
+                serde_json::to_string(&binding).unwrap(),
+            )]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        *state.pty.lock().await = Some(pty);
+        let directory = root
+            .path()
+            .join(".freshell/native-identity/current-native-launch");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("session-start.json");
+        let native = serde_json::json!({"hook_event_name":"SessionStart","session_id":native_root,"source":"resume"});
+        let mut variants = vec![];
+        let mut wrong = binding.clone();
+        wrong.launch_nonce = "old-launch".into();
+        variants.push((
+            "old nonce",
+            serde_json::json!({"launch":wrong,"native":native}),
+            false,
+        ));
+        let mut wrong = binding.clone();
+        wrong.evidence_revision += 1;
+        variants.push((
+            "wrong revision",
+            serde_json::json!({"launch":wrong,"native":native}),
+            false,
+        ));
+        variants.push(("fork source",serde_json::json!({"launch":binding,"native":{"hook_event_name":"SessionStart","session_id":native_root,"source":"fork"}}),false));
+        variants.push((
+            "current",
+            serde_json::json!({"launch":binding,"native":native}),
+            true,
+        ));
+        let mut outcomes = vec![];
+        for (name, value, expected) in variants {
+            std::fs::write(&file, value.to_string()).unwrap();
+            let result = dispatch(
+                authenticated_host_envelope(
+                    &state,
+                    HostCommand::Status {
+                        incarnation_id: state.incarnation_id.clone(),
+                    },
+                ),
+                &state,
+            )
+            .await
+            .unwrap();
+            outcomes.push((
+                name,
+                expected,
+                matches!(
+                    result,
+                    HostResult::Status {
+                        native_identity_observation: Some(_),
+                        native_session_id: Some(_),
+                        ..
+                    }
+                ),
+            ));
+        }
+        state.pty.lock().await.take().unwrap().stop().await;
+        for (name, expected, observed) in outcomes {
+            assert_eq!(observed, expected, "native current host signal {name}");
+        }
     }
 
     #[tokio::test]
@@ -5964,6 +6194,7 @@ mod tests {
         let denied = authenticated_host_envelope(
             &blocked_state,
             HostCommand::GrantExecution {
+                native_identity_launch: None,
                 incarnation_id: blocked_state.incarnation_id.clone(),
                 soul_id: SoulId::new(),
                 host_boot_id: blocked_state.host_boot_id.clone(),
@@ -5997,6 +6228,7 @@ mod tests {
         let envelope = authenticated_host_envelope(
             &state,
             HostCommand::GrantExecution {
+                native_identity_launch: None,
                 incarnation_id: state.incarnation_id.clone(),
                 soul_id: SoulId::new(),
                 host_boot_id: state.host_boot_id.clone(),
@@ -6923,6 +7155,7 @@ mod tests {
         let envelope = authenticated_host_envelope(
             &state,
             HostCommand::GrantExecution {
+                native_identity_launch: None,
                 incarnation_id,
                 soul_id,
                 host_boot_id,
@@ -7230,6 +7463,7 @@ mod tests {
         let envelope = authenticated_host_envelope(
             &state,
             HostCommand::GrantExecution {
+                native_identity_launch: None,
                 incarnation_id,
                 soul_id,
                 host_boot_id: state.host_boot_id.clone(),
@@ -7408,6 +7642,7 @@ mod tests {
         let envelope = authenticated_host_envelope(
             &state,
             HostCommand::GrantExecution {
+                native_identity_launch: None,
                 incarnation_id,
                 soul_id,
                 host_boot_id,

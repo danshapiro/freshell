@@ -128,22 +128,29 @@ fn retained_status_observed(
     host: &crate::service::AuthenticatedHost,
     status: &crate::service::HostStatus,
 ) -> bool {
-    if context.provider == "opencode" {
-        host.capabilities
-            .iter()
-            .any(|value| value == "opencode-adoption-observation-v1")
-            && matches!(&status.opencode_adoption,freshell_runtime_protocol::OpenCodeAdoptionStatus::Observed{observation} if Some(observation.root_session_id.as_str())==status.native_session_id.as_deref() && context.native_session_id.as_deref().is_none_or(|expected|expected==observation.root_session_id) && &observation.incarnation_id==context.prior_handle.incarnation_id() && observation.hydrated)
-    } else {
-        host.capabilities
-            .iter()
-            .any(|value| value == "native-identity-observation-v1")
-            && status.native_session_id.as_deref().is_some_and(|observed| {
-                context
-                    .native_session_id
-                    .as_deref()
-                    .is_none_or(|expected| expected == observed)
-            })
-    }
+    host.capabilities
+        .iter()
+        .any(|value| value == "native-identity-observation-v1")
+        && current_native_observation(context, status).is_some()
+}
+
+fn current_native_observation<'a>(
+    context: &RecoveryContext,
+    status: &'a crate::service::HostStatus,
+) -> Option<&'a freshell_runtime_protocol::NativeIdentityObservation> {
+    let launch = context.native_identity_launch.as_ref()?;
+    let observation = status.native_identity_observation.as_ref()?;
+    (observation.matches_launch(launch)
+        && observation.matches_provider(&context.provider, context.fresh_agent.is_some())
+        && observation.incarnation_id == *context.prior_handle.incarnation_id()
+        && launch.launch_nonce == context.prior_handle.launch_nonce().as_str()
+        && launch.execution_generation == status.max_execution_generation
+        && status.native_session_id.as_deref() == Some(observation.native_session_id.as_str())
+        && context
+            .native_session_id
+            .as_deref()
+            .is_none_or(|root| root == observation.native_session_id))
+    .then_some(observation)
 }
 
 fn native_identity_wait_timeout(opencode_adoption_required: bool) -> Duration {
@@ -1768,6 +1775,38 @@ impl Supervisor {
                         other => other,
                     };
 
+                    // A loader may emit its native root before later restoration
+                    // fails. Re-read the current child after the independent store
+                    // read, then persist only that still-live current observation.
+                    let requires_native_observation =
+                        context.provider != "shell" && context.fixture.is_none();
+                    let status = if !status.exited && requires_native_observation {
+                        self.host_status(
+                            context.prior_handle.incarnation_id().clone(),
+                            context.prior_handle.runtime_dir(),
+                            &host,
+                        )
+                        .await?
+                    } else {
+                        status
+                    };
+                    let native_observation_qualified = !requires_native_observation
+                        || retained_status_observed(context, &host, &status);
+                    if !status.exited && requires_native_observation && native_observation_qualified
+                    {
+                        self.registry
+                            .record_native_identity_observation(
+                                context.soul_id.clone(),
+                                status
+                                    .native_identity_observation
+                                    .clone()
+                                    .expect("qualified observation"),
+                                context.write_fence(),
+                            )
+                            .await
+                            .map_err(map_registry)?;
+                    }
+
                     if !status.exited
                         && context.provider != "shell"
                         && context.fixture.is_none()
@@ -2214,25 +2253,25 @@ impl Supervisor {
                         } else {
                             RecoveryPath::NativeResume
                         };
-                        self.replace(
+                        Box::pin(self.replace(
                             request.soul_id,
                             request.trigger,
                             path,
                             Some(*resume_spec),
                             rechecked,
                             rechecked_context.write_fence(),
-                        )
+                        ))
                         .await
                     }
                     RecoveryProbe::PristineSeedReady { .. } => {
-                        self.replace(
+                        Box::pin(self.replace(
                             request.soul_id,
                             request.trigger,
                             RecoveryPath::PristineSeed,
                             None,
                             rechecked,
                             rechecked_context.write_fence(),
-                        )
+                        ))
                         .await
                     }
                     RecoveryProbe::Blocked {
@@ -2280,30 +2319,32 @@ impl Supervisor {
                 } else {
                     RecoveryPath::NativeResume
                 };
-                self.replace(
+                Box::pin(self.replace(
                     request.soul_id,
                     request.trigger,
                     path,
                     Some(*resume_spec),
                     probe,
                     observed_context.write_fence(),
-                )
+                ))
                 .await
             }
             RecoveryProbe::PristineSeedReady { .. } => {
-                self.replace(
+                Box::pin(self.replace(
                     request.soul_id,
                     request.trigger,
                     RecoveryPath::PristineSeed,
                     None,
                     probe,
                     observed_context.write_fence(),
-                )
+                ))
                 .await
             }
         }
     }
 
+    // Callers box this large, infrequent recovery future so its owned launch
+    // and post-loader probe state do not inflate their polling stack.
     async fn replace(
         &self,
         soul_id: SoulId,
@@ -2613,8 +2654,12 @@ impl Supervisor {
         let expected_native_session_id = resume_spec
             .as_ref()
             .map(|spec| spec.provider_session.native_session_id.clone());
-        let observed_native_session_id = if let Some(expected) =
-            expected_native_session_id.as_deref()
+        let requires_native = start.context.fixture.is_none()
+            && matches!(
+                start.context.provider.as_str(),
+                "claude" | "kilroy" | "codex" | "opencode" | "amplifier"
+            );
+        let observed_native_session_id = if expected_native_session_id.is_some() || requires_native
         {
             let adoption_required = resume_spec
                 .as_ref()
@@ -2665,6 +2710,10 @@ impl Supervisor {
                 | NativeIdentityWait::StopIntent { .. }
                 | NativeIdentityWait::IntentChanged { .. } => None,
             };
+            let expected = expected_native_session_id
+                .as_deref()
+                .or(observed.as_deref())
+                .unwrap_or("");
             if let Err((reason, message)) = validate_native_identity_wait(expected, wait.clone()) {
                 let (wait_outcome, adoption_pending, elapsed_ms) = match wait {
                     NativeIdentityWait::Observed { elapsed_ms, .. } => {
@@ -2734,6 +2783,48 @@ impl Supervisor {
         } else {
             None
         };
+
+        if requires_native {
+            let (current_probe, current) = self.probe_recovery_observed(soul_id.clone()).await?;
+            let ready = matches!(&current_probe,RecoveryProbe::ReattachReady {handle,..}
+                if handle.incarnation_id==prepared.prepared.incarnation_id);
+            verdict_fence = current.write_fence_for_attempt(attempt_id.clone());
+            if !ready {
+                let (reason, message) = match &current_probe {
+                    RecoveryProbe::Blocked {
+                        reason, evidence, ..
+                    } => (*reason, evidence.join("; ")),
+                    _ => (
+                        RecoveryBlockReason::ProviderUnavailable,
+                        "current replacement lost its native/store readiness".into(),
+                    ),
+                };
+                self.cleanup_failed_replacement(&prepared.prepared.incarnation_id)
+                    .await;
+                self.registry
+                    .mark_recovery_blocked(
+                        soul_id.clone(),
+                        Some(attempt_id.clone()),
+                        reason,
+                        vec![message.clone()],
+                        verdict_fence.clone(),
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                return Ok(RecoveryResult {
+                    outcome: RecoveryOutcome::Blocked,
+                    view: self
+                        .view_for_or_prior(&prepared.prepared.incarnation_id, &prior_incarnation_id)
+                        .await?,
+                    probe: Some(blocked(path, reason, &message, Some(2000))),
+                    prior_incarnation_id: Some(prior_incarnation_id),
+                    attempt_id: Some(attempt_id),
+                    expected_native_session_id,
+                    observed_native_session_id,
+                    incident_id: None,
+                });
+            }
+        }
 
         if let Err(message) = self
             .replay_queued_inputs(soul_id.clone(), prepared.prepared.incarnation_id.clone())
@@ -3212,18 +3303,18 @@ impl Supervisor {
                 } else {
                     RecoveryPath::NativeResume
                 };
-                self.replace(soul_id, trigger, path, Some(*resume_spec), probe, fence)
+                Box::pin(self.replace(soul_id, trigger, path, Some(*resume_spec), probe, fence))
                     .await
             }
             RecoveryProbe::PristineSeedReady { .. } => {
-                self.replace(
+                Box::pin(self.replace(
                     soul_id,
                     trigger,
                     RecoveryPath::PristineSeed,
                     None,
                     probe,
                     fence,
-                )
+                ))
                 .await
             }
             RecoveryProbe::Blocked {
@@ -4026,6 +4117,11 @@ impl Supervisor {
             let host = self
                 .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
                 .await;
+            let native_capability = host.as_ref().is_ok_and(|host| {
+                host.capabilities
+                    .iter()
+                    .any(|value| value == "native-identity-observation-v1")
+            });
             let status = match host {
                 Ok(host) => self
                     .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), &host)
@@ -4059,9 +4155,55 @@ impl Supervisor {
                     }
                 }
             };
+            let observation = current_native_observation(&current, &status)
+                .filter(|observation| {
+                    native_capability && observation.incarnation_id == *incarnation_id
+                })
+                .cloned();
+            if !status.exited {
+                if let Some(observation) = observation.as_ref() {
+                    let mut fence = current.write_fence();
+                    if current.native_session_id.is_none() {
+                        fence = match self
+                            .registry
+                            .record_native_session_fenced(
+                                soul_id.clone(),
+                                incarnation_id.clone(),
+                                observation.native_session_id.clone(),
+                                fence,
+                            )
+                            .await
+                        {
+                            Ok(fence) => fence,
+                            Err(error) => {
+                                return NativeIdentityWait::HostUnavailable {
+                                    message: map_registry(error).message,
+                                    elapsed_ms,
+                                }
+                            }
+                        };
+                    }
+                    if let Err(error) = self
+                        .registry
+                        .record_native_identity_observation(
+                            soul_id.clone(),
+                            observation.clone(),
+                            fence,
+                        )
+                        .await
+                    {
+                        return NativeIdentityWait::HostUnavailable {
+                            message: map_registry(error).message,
+                            elapsed_ms,
+                        };
+                    }
+                }
+            }
             if let Some(result) = native_identity_wait_from_status(
                 status.exited,
-                status.native_session_id,
+                observation
+                    .as_ref()
+                    .map(|observation| observation.native_session_id.clone()),
                 started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             ) {
                 return result;
@@ -4517,6 +4659,162 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 pub(crate) mod tests {
     use super::*;
     use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
+
+    #[tokio::test]
+    async fn provider_observed_replacement() {
+        use freshell_runtime_protocol::{
+            host_proof, read_frame, write_frame, Envelope, HostBootId, HostReply,
+            NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource, RecoveryState,
+        };
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let runtime = dir.path().join("owned-host");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET runtime_dir=?1,execution_generation=1 WHERE incarnation_id=?2",
+            rusqlite::params![runtime.to_string_lossy(), prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='claude' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "ses_requested".into(),
+            )
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let binding = registry
+            .bind_native_identity_launch(NativeIdentityLaunch {
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+                evidence_revision: context.evidence_revision,
+                execution_generation: 1,
+                requested_native_session_id: Some("ses_requested".into()),
+            })
+            .await
+            .unwrap();
+        let current = NativeIdentityObservation {
+            native_session_id: "ses_requested".into(),
+            incarnation_id: binding.incarnation_id.clone(),
+            launch_nonce: binding.launch_nonce.clone(),
+            evidence_revision: binding.evidence_revision,
+            source: NativeIdentitySource::ClaudeNativeEvent,
+            evidence_digest: "a".repeat(64),
+        };
+        let observation = Arc::new(std::sync::Mutex::new(None::<NativeIdentityObservation>));
+        let responder_observation = Arc::clone(&observation);
+        let supervisor = missing_supervisor(&dir, registry.clone());
+        let limits = registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .requested_limits;
+        let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+        let responder = tokio::spawn(async move {
+            let boot = HostBootId::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                let result = match request.body {
+                    HostCommand::Hello {
+                        incarnation_id,
+                        challenge,
+                    } => HostResult::Hello {
+                        proof: host_proof(b"synthetic-secret", &challenge, &boot, &incarnation_id),
+                        host_boot_id: boot.clone(),
+                        capabilities: vec!["native-identity-observation-v1".into()],
+                        effective_limits: limits.clone(),
+                    },
+                    HostCommand::Status { .. } => HostResult::Status {
+                        native_identity_observation: responder_observation.lock().unwrap().clone(),
+                        host_boot_id: boot.clone(),
+                        worker_pid: Some(123),
+                        worker_launch_count: 1,
+                        max_control_epoch: 1,
+                        max_execution_generation: 1,
+                        fixture_evidence: serde_json::json!({}),
+                        exited: false,
+                        native_session_id: Some("ses_requested".into()),
+                        opencode_transfer_receipt: None,
+                        opencode_adoption: Default::default(),
+                    },
+                    _ => panic!("unexpected command"),
+                };
+                write_frame(
+                    &mut socket,
+                    &HostReply {
+                        request_id: request.request_id,
+                        result: Ok(result),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let mut variants = vec![("missing", None)];
+        let mut wrong = current.clone();
+        wrong.native_session_id = "ses_other".into();
+        variants.push(("wrong root", Some(wrong)));
+        let mut wrong = current.clone();
+        wrong.incarnation_id = IncarnationId::new();
+        variants.push(("previous incarnation", Some(wrong)));
+        let mut wrong = current.clone();
+        wrong.launch_nonce = "previous-nonce".into();
+        variants.push(("previous nonce", Some(wrong)));
+        let mut wrong = current.clone();
+        wrong.evidence_revision += 1;
+        variants.push(("wrong evidence revision", Some(wrong)));
+        let mut wrong = current.clone();
+        wrong.source = NativeIdentitySource::CodexAppServer;
+        variants.push(("wrong native source", Some(wrong)));
+        variants.push(("current", Some(current)));
+        let mut results = vec![];
+        for (name, value) in variants {
+            *observation.lock().unwrap() = value;
+            let wait = supervisor
+                .wait_for_native_identity(
+                    &soul,
+                    &prepared.incarnation_id,
+                    prepared.intent_revision,
+                    Duration::from_millis(20),
+                )
+                .await;
+            results.push((name, matches!(wait, NativeIdentityWait::Observed { .. })));
+        }
+        responder.abort();
+        for (name, observed) in results {
+            assert_eq!(
+                observed,
+                name == "current",
+                "native replacement acceptance for {name}"
+            );
+        }
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        registry
+            .mark_recovery_live(soul.clone(), prepared.incarnation_id, context.write_fence())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .recovery_state,
+            RecoveryState::Live
+        );
+    }
 
     #[test]
     fn missing_adoption_observation_is_not_reported_as_wrong_native_identity() {

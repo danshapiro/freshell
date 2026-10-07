@@ -266,6 +266,8 @@ struct FakeTransport {
     stops: AtomicUsize,
     ambiguous_dispatch: bool,
     live: std::sync::atomic::AtomicBool,
+    native_evidence: std::sync::Mutex<Option<Value>>,
+    prepared_checkpoints: std::sync::Mutex<Vec<Value>>,
 }
 
 struct MaterializingTransport {
@@ -364,6 +366,8 @@ impl FakeTransport {
             stops: AtomicUsize::new(0),
             ambiguous_dispatch: false,
             live: std::sync::atomic::AtomicBool::new(true),
+            native_evidence: std::sync::Mutex::new(None),
+            prepared_checkpoints: std::sync::Mutex::new(Vec::new()),
         })
     }
     fn ambiguous(native: &str) -> Arc<Self> {
@@ -377,6 +381,8 @@ impl FakeTransport {
                 stops: AtomicUsize::new(0),
                 ambiguous_dispatch: false,
                 live: std::sync::atomic::AtomicBool::new(true),
+                native_evidence: std::sync::Mutex::new(None),
+                prepared_checkpoints: std::sync::Mutex::new(Vec::new()),
             }
         })
     }
@@ -384,6 +390,16 @@ impl FakeTransport {
 
 #[async_trait]
 impl FreshAgentTransport for FakeTransport {
+    async fn prepare_native_permission_recovery(
+        &self,
+        checkpoints: Vec<Value>,
+    ) -> Result<(), String> {
+        *self.prepared_checkpoints.lock().unwrap() = checkpoints;
+        Ok(())
+    }
+    async fn native_identity_evidence(&self) -> Option<Value> {
+        self.native_evidence.lock().unwrap().clone()
+    }
     async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         Ok(TransportStart {
@@ -779,6 +795,153 @@ async fn pending_permission_persists_and_is_answered_exactly_once_after_gateway_
         .await
         .unwrap();
     assert_eq!(transport.decisions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn native_callback_cancellation_cannot_be_answered_as_completed() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("current-native-root");
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "cancel-store", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    actor
+        .record_permission(
+            "current-card".into(),
+            serde_json::json!({"type":"freshAgent.permission.request","toolUseID":"toolu-current"}),
+        )
+        .await
+        .unwrap();
+    actor.record_event(AgentEvent::Provider {payload:serde_json::json!({"type":"freshAgent.event","event":{"type":"freshAgent.permission.cancelled","requestId":"current-card"}})}).await.unwrap();
+    let result = actor
+        .resolve_permission("current-card", serde_json::json!({"behavior":"allow"}))
+        .await;
+    assert!(
+        result.is_err(),
+        "a cancelled current native callback must remain interrupted"
+    );
+    assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
+    assert!(!actor
+        .read_events(0, 100)
+        .await
+        .events
+        .iter()
+        .any(|entry| matches!(entry.event, AgentEvent::DecisionResolved { .. })));
+}
+
+#[tokio::test]
+async fn restart_does_not_resurrect_an_ordinary_claude_callback() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = "same-native-root";
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "restart-decision-store", None),
+        FakeTransport::new(native),
+    )
+    .await
+    .unwrap();
+    actor.record_permission("dead-process-card".into(),serde_json::json!({"type":"freshAgent.permission.request","toolUseID":"toolu-old","nativeRequestId":"dead-native-request"})).await.unwrap();
+    drop(actor);
+    let replacement = FakeTransport::new(native);
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "restart-decision-store", None),
+        replacement.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(actor.resolve_permission("dead-process-card",serde_json::json!({"behavior":"allow"})).await.is_err(),
+        "an ordinary callback has no native no-effect checkpoint and cannot become a recoverable pending decision");
+    assert_eq!(replacement.decisions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let launch = |nonce: &str| {
+        serde_json::json!({"incarnationId":nonce,"launchNonce":nonce,
+        "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":native})
+    };
+    let input = serde_json::json!({"command":"harmless"});
+    let checkpoint = serde_json::json!({"nativeSessionId":native,"toolUseID":"toolu_original1",
+        "toolName":"Bash","inputDigest":digest(&serde_json::to_vec(&input).unwrap()),"profileDigest":"b".repeat(64),
+        "checkpointUuid":"original-checkpoint","assistantUuid":"original-assistant",
+        "checkpointDigest":"c".repeat(64),"nativeVersion":"2.1.237"});
+    let payload = |nonce: &str| {
+        serde_json::json!({"type":"freshAgent.permission.request",
+        "requestId":"same-checkpoint-card","nativeRequestId":nonce,"toolUseID":"toolu_original1",
+        "tool":{"name":"Bash","input":input},"nativeCheckpoint":checkpoint,
+        "nativeBinding":{"launch":launch(nonce),"queryGeneration":2,"nativeRequestId":nonce}})
+    };
+    let old = FakeTransport::new(native);
+    *old.native_evidence.lock().unwrap() =
+        Some(serde_json::json!({"launch":launch("old"),"queryGeneration":2}));
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "checkpoint-store", None),
+        old,
+    )
+    .await
+    .unwrap();
+    actor
+        .record_permission("same-checkpoint-card".into(), payload("old"))
+        .await
+        .unwrap();
+    drop(actor);
+    let current = FakeTransport::new(native);
+    *current.native_evidence.lock().unwrap() =
+        Some(serde_json::json!({"launch":launch("current"),"queryGeneration":2}));
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "checkpoint-store", None),
+        current.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *current.prepared_checkpoints.lock().unwrap(),
+        vec![checkpoint.clone()],
+        "prepare only the persisted exact native checkpoint before current native start"
+    );
+    assert!(actor
+        .resolve_permission(
+            "same-checkpoint-card",
+            serde_json::json!({"behavior":"allow"})
+        )
+        .await
+        .is_err());
+    let mut changed = payload("current");
+    changed["nativeCheckpoint"]["inputDigest"] = serde_json::json!("d".repeat(64));
+    assert!(actor
+        .record_permission("same-checkpoint-card".into(), changed)
+        .await
+        .is_err());
+    assert!(actor
+        .record_permission("same-checkpoint-card".into(), payload("stale"))
+        .await
+        .is_err());
+    let mut old_query = payload("current");
+    old_query["nativeBinding"]["queryGeneration"] = serde_json::json!(1);
+    assert!(actor
+        .record_permission("same-checkpoint-card".into(), old_query)
+        .await
+        .is_err());
+    actor
+        .record_permission("same-checkpoint-card".into(), payload("current"))
+        .await
+        .expect("current native same-operation proof must rebind the interrupted card");
+    actor
+        .resolve_permission(
+            "same-checkpoint-card",
+            serde_json::json!({"behavior":"deny"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.decisions.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -343,11 +343,20 @@ function handleSdkMessage(sessionId, msg) {
 
 async function consumeStream(sessionId, sdkQuery) {
   const st = sessions.get(sessionId)
+  const nativeChannel = st?.nativeChannel
+  const abort = st?.abort
   try {
-    for await (const msg of sdkQuery) handleSdkMessage(sessionId, msg)
+    for await (const msg of sdkQuery) {
+      if (st?.query === sdkQuery && sessions.get(sessionId) === st) handleSdkMessage(sessionId, msg)
+    }
   } catch (err) {
-    emit({ type: 'sdk.error', sessionId, message: `SDK error: ${err?.message || 'Unknown error'}` })
+    if (st?.query === sdkQuery) emit({ type: 'sdk.error', sessionId, message: `SDK error: ${err?.message || 'Unknown error'}` })
   } finally {
+    if (st?.query !== sdkQuery) {
+      abort?.abort()
+      await nativeChannel?.cleanup()
+      return
+    }
     // Stream ended (natural end, error, or abort). The transport is closing:
     // clear any parked cards WITHOUT resolving their promises (LB-04: a late
     // resolve lands inside the SDK's floating promise chain → unhandled
@@ -379,6 +388,101 @@ async function consumeStream(sessionId, sdkQuery) {
 }
 
 // ── request handlers ─────────────────────────────────────────────────────────
+async function openSessionQuery(sessionId, state, req, launch, announceCreated = true) {
+  const abort = state.abort
+  const generation = state.queryGeneration = (state.queryGeneration ?? 0) + 1
+  state.nativeReady = false
+  state.commandsInitSeen = false
+  const { iterable, handle } = createInputStream((isCompact) => {
+    if (isCompact) state.handedCompactLikely = true
+  })
+  state.inputStream = handle
+  if (launch) state.nativeChannel = await createNativeSessionChannel({ launch, signal: abort.signal })
+
+  const sdkQuery = query({
+    prompt: iterable,
+    options: {
+      cwd: req.cwd || undefined,
+      resume: req.resumeSessionId,
+      // kata 1wxv Task 4 (fork-at-point emulation): the ONLY sanctioned lane is
+      // the query() options triple — NEVER the standalone forkSession() fn (it
+      // remaps every uuid).
+      resumeSessionAt: req.resumeSessionAt || undefined,
+      forkSession: req.forkSession === true || undefined,
+      resumeDropsTurn: req.resumeDropsTurn || undefined,
+      model: req.model,
+      permissionMode: req.permissionMode,
+      // Enables the user's in-session permission selector; the selected mode
+      // still controls whether approval is required for each tool.
+      allowDangerouslySkipPermissions: true,
+      effort: req.effort,
+      plugins: Array.isArray(req.plugins)
+        ? req.plugins.map(path => ({ type: 'local', path }))
+        : undefined,
+      pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
+      includePartialMessages: true,
+      abortController: abort,
+      env: { ...createClaudeSdkCleanEnv(process.env), ...state.nativeChannel?.env },
+      settings: state.nativeChannel?.settings,
+      spawnClaudeCodeProcess: state.nativeChannel ? (options) => spawnObservedNative(options, {
+        onStderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
+        onControlWrite: (frame, error) => {
+          if (state.queryGeneration !== generation) return
+          const binding = state.nativeRequests?.get(frame.response.request_id)
+          if (!binding) return
+          state.nativeRequests.delete(frame.response.request_id)
+          emit({ type: `sdk.${binding.kind}.dispatch`, sessionId, requestId: binding.requestId,
+            nativeRequestId: frame.response.request_id, ok: !error && frame.response.subtype === 'success',
+            acceptanceAmbiguous: !!error, message: error?.message ?? frame.response.error })
+        },
+      }) : undefined,
+      settingSources: ['user', 'project', 'local'],
+      stderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
+      canUseTool: async (toolName, input, options) => {
+        const s = sessions.get(sessionId)
+        if (!s || s !== state || state.queryGeneration !== generation || (s.nativeChannel && !s.nativeReady)) {
+          return { behavior: 'deny', message: 'Current native session is not ready' }
+        }
+        // AskUserQuestion routes first (even under bypassPermissions), then the
+        // bypass fast-path, else park-and-surface a pending request — legacy
+        // ordering, sdk-bridge.ts:203-214.
+        return routeCanUseTool({ session: s, emit, nanoid, nextMonotonic, sessionId, toolName, input, options })
+      },
+    },
+  })
+  state.query = sdkQuery
+  state.commandsChangedSeen = false
+  if (typeof sdkQuery.supportedCommands === 'function') {
+    Promise.resolve().then(() => sdkQuery.supportedCommands()).then((rows) => {
+      if (state.query !== sdkQuery || state.commandsChangedSeen) return
+      const commands = normalizeCommands(rows)
+      if (commands === undefined) return
+      state.commandCatalog = commands
+      publishCommands(sessionId, state)
+    }).catch((error) => logerr(`session commands unavailable: ${error?.message || error}`))
+  }
+
+  // Placeholder returns IMMEDIATELY (the SDK query is lazy) — exactly as
+  // SdkBridge.createSession returns the nanoid before system/init arrives.
+  if (announceCreated) emit({ type: 'created', requestId: req.requestId, sessionId })
+  consumeStream(sessionId, sdkQuery).catch((err) => logerr(`consume error: ${err?.message}`))
+  if (state.nativeChannel) {
+    state.nativeReadyPromise = state.nativeChannel.waitReady(sdkQuery).then((observation) => {
+      if (sessions.get(sessionId) !== state || state.queryGeneration !== generation || abort.signal.aborted) return
+      state.nativeReady = true
+      state.cliSessionId = observation.nativeSessionId
+      emit({ type: 'sdk.session.init', sessionId, cliSessionId: observation.nativeSessionId,
+        cwd: observation.native.cwd, model: req.model, nativeIdentityEvidence: {
+          launch, digest: observation.evidenceDigest, source: observation.native.source, queryGeneration: generation,
+        } })
+    }).catch((error) => {
+      if (state.queryGeneration !== generation) return
+      emit({ type: 'sdk.error', sessionId, message: `native startup: ${error.message}` })
+      abort.abort()
+    })
+  }
+}
+
 async function handleCreate(req) {
   const requestId = req.requestId
   let sessionId
@@ -404,10 +508,6 @@ async function handleCreate(req) {
       turnCompleteGate: createTurnCompleteGate(),
       pendingResults: 0,
     }
-    const { iterable, handle } = createInputStream((isCompact) => {
-      if (isCompact) state.handedCompactLikely = true
-    })
-    state.inputStream = handle
     // Liveness IS session-map membership: consumeStream's finally removes the
     // session synchronously after cancelPending (LB-04 — a parked canUseTool
     // promise must never be resolved after transport close), and stdin line
@@ -416,88 +516,7 @@ async function handleCreate(req) {
 
     const launch = process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH
       ? JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) : undefined
-    if (launch) state.nativeChannel = await createNativeSessionChannel({ launch, signal: abort.signal })
-
-    const sdkQuery = query({
-      prompt: iterable,
-      options: {
-        cwd: req.cwd || undefined,
-        resume: req.resumeSessionId,
-        // kata 1wxv Task 4 (fork-at-point emulation): the ONLY sanctioned lane is
-        // the query() options triple — NEVER the standalone forkSession() fn (it
-        // remaps every uuid).
-        resumeSessionAt: req.resumeSessionAt || undefined,
-        forkSession: req.forkSession === true || undefined,
-        resumeDropsTurn: req.resumeDropsTurn || undefined,
-        model: req.model,
-        permissionMode: req.permissionMode,
-        // Enables the user's in-session permission selector; the selected mode
-        // still controls whether approval is required for each tool.
-        allowDangerouslySkipPermissions: true,
-        effort: req.effort,
-        plugins: Array.isArray(req.plugins)
-          ? req.plugins.map(path => ({ type: 'local', path }))
-          : undefined,
-        pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
-        includePartialMessages: true,
-        abortController: abort,
-        env: { ...createClaudeSdkCleanEnv(process.env), ...state.nativeChannel?.env },
-        settings: state.nativeChannel?.settings,
-        spawnClaudeCodeProcess: state.nativeChannel ? (options) => spawnObservedNative(options, {
-          onStderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
-          onControlWrite: (frame, error) => {
-            const binding = state.nativeRequests?.get(frame.response.request_id)
-            if (!binding) return
-            state.nativeRequests.delete(frame.response.request_id)
-            emit({ type: `sdk.${binding.kind}.dispatch`, sessionId, requestId: binding.requestId,
-              nativeRequestId: frame.response.request_id, ok: !error && frame.response.subtype === 'success',
-              acceptanceAmbiguous: !!error, message: error?.message ?? frame.response.error })
-          },
-        }) : undefined,
-        settingSources: ['user', 'project', 'local'],
-        stderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
-        canUseTool: async (toolName, input, options) => {
-          const s = sessions.get(sessionId)
-          if (!s || (s.nativeChannel && !s.nativeReady)) {
-            return { behavior: 'deny', message: 'Current native session is not ready' }
-          }
-          // AskUserQuestion routes first (even under bypassPermissions), then the
-          // bypass fast-path, else park-and-surface a pending request — legacy
-          // ordering, sdk-bridge.ts:203-214.
-          return routeCanUseTool({ session: s, emit, nanoid, nextMonotonic, sessionId, toolName, input, options })
-        },
-      },
-    })
-    state.query = sdkQuery
-    state.commandsChangedSeen = false
-    if (typeof sdkQuery.supportedCommands === 'function') {
-      Promise.resolve().then(() => sdkQuery.supportedCommands()).then((rows) => {
-        if (state.query !== sdkQuery || state.commandsChangedSeen) return
-        const commands = normalizeCommands(rows)
-        if (commands === undefined) return
-        state.commandCatalog = commands
-        publishCommands(sessionId, state)
-      }).catch((error) => logerr(`session commands unavailable: ${error?.message || error}`))
-    }
-
-    // Placeholder returns IMMEDIATELY (the SDK query is lazy) — exactly as
-    // SdkBridge.createSession returns the nanoid before system/init arrives.
-    emit({ type: 'created', requestId, sessionId })
-    consumeStream(sessionId, sdkQuery).catch((err) => logerr(`consume error: ${err?.message}`))
-    if (state.nativeChannel) {
-      state.nativeChannel.waitReady(sdkQuery).then((observation) => {
-        if (sessions.get(sessionId) !== state || abort.signal.aborted) return
-        state.nativeReady = true
-        state.cliSessionId = observation.nativeSessionId
-        emit({ type: 'sdk.session.init', sessionId, cliSessionId: observation.nativeSessionId,
-          cwd: observation.native.cwd, model: req.model, nativeIdentityEvidence: {
-            launch, digest: observation.evidenceDigest, source: observation.native.source,
-          } })
-      }).catch((error) => {
-        emit({ type: 'sdk.error', sessionId, message: `native startup: ${error.message}` })
-        abort.abort()
-      })
-    }
+    await openSessionQuery(sessionId, state, req, launch)
   } catch (err) {
     if (sessionId) sessions.delete(sessionId)
     emit({ type: 'create.failed', requestId, message: err?.message || String(err) })

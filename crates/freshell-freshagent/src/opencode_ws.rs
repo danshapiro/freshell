@@ -1453,6 +1453,86 @@ impl FreshOpencodeState {
 
     // ── freshAgent.send (WS) — materialize-or-send ─────────────────────────
 
+    pub async fn prepare_managed_native_session(
+        &self,
+        mut msg: FreshAgentCreate,
+    ) -> Result<String, String> {
+        // Managed admission already owns this soul's isolated provider store.
+        // Create/load through the same native manager and resume ownership lane;
+        // ordinary browser creates retain their lazy, placeholder-only behavior.
+        self.ensure_daemon_loss_watcher().await;
+        let manager = self.fresh_agent.ensure_manager().await;
+        let selected = match msg
+            .session_ref
+            .as_ref()
+            .map(|reference| reference.session_id.clone())
+            .or(msg.resume_session_id.clone())
+        {
+            Some(root) => root,
+            None => {
+                manager
+                    .create_session(None, None, msg.cwd.as_deref())
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .id
+            }
+        };
+        let base = manager
+            .base_url()
+            .await
+            .ok_or("native OpenCode daemon is unavailable")?;
+        let route = msg.cwd.clone();
+        let budget = crate::resolve_probe_timeout_ms(
+            None,
+            std::env::var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+        );
+        let (info, messages) = tokio::time::timeout(Duration::from_millis(budget), async {
+            let info = manager
+                .get_session_at(&selected, &route, &base)
+                .await
+                .map_err(|error| error.to_string())?;
+            let messages = manager
+                .list_messages_at(&selected, &route, &base)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((info, messages))
+        })
+        .await
+        .map_err(|_| "native OpenCode history load timed out".to_string())??;
+        let actual = info
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("native OpenCode root response lacks identity")?
+            .to_string();
+        if actual != selected || !info["parentID"].is_null() || !info["parent_id"].is_null() {
+            return Err("native OpenCode loaded a different or parent-bearing root".into());
+        }
+        let rows = messages
+            .as_array()
+            .ok_or("native OpenCode history response is not an array")?;
+        if rows.iter().any(|row| !row["info"].is_object()) {
+            return Err("native OpenCode history response is malformed".into());
+        }
+        let evidence = json!({"rootSessionId":actual,"parentSessionId":null,"messagesRead":"complete_v1",
+            "messageCount":rows.len(),"tailMessageId":rows.last().and_then(|row|row["info"]["id"].as_str())});
+        msg.resume_session_id = Some(actual.clone());
+        msg.session_ref = Some(SessionLocator {
+            provider: PROVIDER.into(),
+            session_id: actual.clone(),
+        });
+        self.handle_create(msg, None).await;
+        if !self.has_live_session(&actual).await {
+            return Err("native OpenCode loaded root was not registered".into());
+        }
+        self.broadcast(&event_frame(
+            &actual,
+            json!({"type":"freshAgent.native.loaded","nativeSessionId":actual,"evidence":evidence}),
+        ));
+        Ok(actual)
+    }
+
     /// The resume branch of `handle_create` (P1.13 Task 8, V2/A4): rebind the
     /// surviving durable `ses_*` session instead of minting a `freshopencode-*`
     /// placeholder. Routes through the SAME resume machinery `freshAgent.attach`
@@ -12507,6 +12587,83 @@ mod tests {
             first_real_id, second_real_id,
             "second send must reuse the durable session id"
         );
+    }
+
+    struct NativeBootstrapHttp {
+        inner: RealisticServeHttp,
+        requests: StdMutex<Vec<(bool, String)>>,
+    }
+    impl ServeHttp for NativeBootstrapHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.requests.lock().unwrap().push((
+                matches!(req.method, freshell_opencode::serve::HttpMethod::Post),
+                req.url.clone(),
+            ));
+            self.inner.request(req)
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_native_bootstrap_creates_and_loads_before_any_prompt() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let owner = FreshAgentState::new(Arc::new("owned-native".into()), Arc::new(tx));
+        let http = Arc::new(NativeBootstrapHttp {
+            inner: RealisticServeHttp::new(),
+            requests: StdMutex::new(vec![]),
+        });
+        let manager = OpencodeServeManager::new(
+            ServeDeps {
+                spawner: Arc::new(TrackedSpawner {
+                    killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                }),
+                http: http.clone(),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            },
+            ServeConfig::default(),
+        );
+        manager.ensure_started().await.unwrap();
+        owner.set_manager_for_test(manager).await;
+        let runtime = FreshOpencodeState::new(owner);
+        let root = runtime
+            .prepare_managed_native_session(create_msg("managed-empty-input"))
+            .await
+            .unwrap();
+        assert!(
+            root.starts_with("ses_"),
+            "native root must come from actual provider creation, not a local placeholder"
+        );
+        assert!(runtime.has_live_session(&root).await);
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(
+                    |(post, url)| *post && (url.ends_with("/session") || url.contains("/session?"))
+                )
+                .count(),
+            1
+        );
+        assert!(requests
+            .iter()
+            .any(|(post, url)| !*post && url.contains(&format!("/session/{root}/message"))));
+        assert!(
+            !requests
+                .iter()
+                .any(|(_, url)| url.contains("/prompt_async")),
+            "bootstrap may never submit model input"
+        );
+        let session = runtime.sessions.lock().await.get(&root).unwrap().clone();
+        assert!(session.lock().await.turn_task.is_none());
     }
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {

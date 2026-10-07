@@ -2567,7 +2567,8 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
                     digest.as_str(),
                     "aa8900bab7bd9bcbb64634d60593a9217c1639b539cea23318122b3428d123c6"
                         | "d2dcb96c036160b2469bcd732fdc8d767dd481f9c0c864ce47d58ed057652c4d"
-                ) || [freshell_platform::cli_launch::ProviderTarget::Unix,freshell_platform::cli_launch::ProviderTarget::Windows].into_iter().any(|target|value==&freshell_platform::cli_launch::claude_settings_json(target))
+                ) || value==&freshell_platform::cli_launch::claude_managed_settings_json()
+                    || [freshell_platform::cli_launch::ProviderTarget::Unix,freshell_platform::cli_launch::ProviderTarget::Windows].into_iter().any(|target|value==&freshell_platform::cli_launch::claude_settings_json(target))
             }
             ("claude", "--mcp-config") => matches!(
                 value.as_str(),
@@ -3105,6 +3106,76 @@ pub enum OpenCodeVerifiedRootTail {
 pub struct OpenCodeAdoptionBaseline {
     pub descriptor: OpenCodeTransferDescriptor,
     pub manifest_sha256: String,
+}
+
+/// Identity selected by the current native provider loader, never by argv or
+/// an old transcript. The digest covers body-free producer evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeIdentitySource {
+    CodexAppServer,
+    OpencodeTui,
+    ClaudeNativeEvent,
+    AmplifierNativeLoadedContext,
+    FreshProviderHandshake,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeIdentityObservation {
+    pub native_session_id: String,
+    pub incarnation_id: IncarnationId,
+    pub launch_nonce: String,
+    pub evidence_revision: u64,
+    pub source: NativeIdentitySource,
+    pub evidence_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeIdentityLaunch {
+    pub incarnation_id: IncarnationId,
+    pub launch_nonce: String,
+    pub evidence_revision: u64,
+    pub execution_generation: u64,
+    pub requested_native_session_id: Option<String>,
+}
+
+impl NativeIdentityObservation {
+    pub fn matches_provider(&self, provider: &str, fresh_agent: bool) -> bool {
+        if fresh_agent {
+            return matches!(provider, "claude" | "kilroy" | "codex" | "opencode")
+                && self.source == NativeIdentitySource::FreshProviderHandshake;
+        }
+        matches!(
+            (provider, &self.source),
+            ("claude", NativeIdentitySource::ClaudeNativeEvent)
+                | ("codex", NativeIdentitySource::CodexAppServer)
+                | ("opencode", NativeIdentitySource::OpencodeTui)
+                | (
+                    "amplifier",
+                    NativeIdentitySource::AmplifierNativeLoadedContext
+                )
+        )
+    }
+
+    pub fn matches_launch(&self, launch: &NativeIdentityLaunch) -> bool {
+        !self.native_session_id.is_empty()
+            && !self.native_session_id.chars().any(char::is_control)
+            && self.incarnation_id == launch.incarnation_id
+            && !self.launch_nonce.is_empty()
+            && self.launch_nonce == launch.launch_nonce
+            && self.evidence_revision == launch.evidence_revision
+            && launch
+                .requested_native_session_id
+                .as_deref()
+                .is_none_or(|root| root == self.native_session_id)
+            && self.evidence_digest.len() == 64
+            && self
+                .evidence_digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
 }
 
 impl OpenCodeAdoptionBaseline {
@@ -3742,6 +3813,8 @@ pub enum AdminCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_identity_observation: Option<NativeIdentityObservation>,
     pub soul_id: SoulId,
     pub incarnation_id: IncarnationId,
     pub launch_state: LaunchState,
@@ -3926,6 +3999,8 @@ pub enum HostCommand {
         fresh_agent: Option<Box<FreshAgentLaunchSpec>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resume_spec: Option<Box<ResumeSpec>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_identity_launch: Option<NativeIdentityLaunch>,
     },
     Stop {
         incarnation_id: IncarnationId,
@@ -4037,6 +4112,8 @@ pub enum HostResult {
         fixture_evidence: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_identity_observation: Option<NativeIdentityObservation>,
         /// Present only when an OpenCode transfer's durable provider-reader
         /// receipt was revalidated before this grant was consumed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4076,6 +4153,8 @@ pub enum HostResult {
         exited: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_identity_observation: Option<NativeIdentityObservation>,
         /// Persisted post-import and provider-reader receipt. Recovery uses it
         /// to finish the supervisor's release marker after a crash between
         /// grant acknowledgement and marker persistence.

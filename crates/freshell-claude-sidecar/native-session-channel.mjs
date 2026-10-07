@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -9,6 +9,64 @@ const signalKey = 'FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'
 const ownPath = fileURLToPath(import.meta.url)
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`
 const validRoot = (root) => typeof root === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(root)
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']'
+  if (value !== null && typeof value === 'object') {
+    return '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + canonicalJson(value[key])).join(',') + '}'
+  }
+  if (value === null || typeof value === 'string' || typeof value === 'boolean'
+    || (typeof value === 'number' && Number.isFinite(value))) return JSON.stringify(value)
+  throw new Error('native operation input is not JSON')
+}
+
+export const nativeInputDigest = (input) => createHash('sha256').update(canonicalJson(input)).digest('hex')
+
+/** Native parser only: a persisted card or an attachment without its original
+ * solo assistant operation never establishes a recoverable no-effect point. */
+export async function inspectNativeDeferredCheckpoint({ path, nativeSessionId, toolUseID, inputDigest }) {
+  if (!validRoot(nativeSessionId) || typeof toolUseID !== 'string' || !/^toolu_[A-Za-z0-9]+$/.test(toolUseID)
+    || typeof inputDigest !== 'string' || !/^[a-f0-9]{64}$/.test(inputDigest)) return null
+  let file
+  try {
+    file = await open(path, 'r')
+    const before = await file.stat({ bigint: true })
+    if (!before.isFile() || before.size > 32n * 1024n * 1024n) return null
+    const bytes = await file.readFile()
+    const after = await file.stat({ bigint: true })
+    const current = await stat(path, { bigint: true })
+    const identity = (metadata) => [metadata.dev, metadata.ino, metadata.size, metadata.mtimeNs, metadata.ctimeNs].join(':')
+    if (identity(before) !== identity(after) || identity(after) !== identity(current)
+      || BigInt(bytes.length) !== after.size || bytes.length === 0 || bytes.at(-1) !== 10) return null
+    const lines = bytes.toString('utf8').split('\n').filter((line) => line.trim())
+    const rows = lines.map((line) => JSON.parse(line))
+    const checkpointIndex = rows.findLastIndex((row) => row.type === 'attachment' && row.attachment?.type === 'hook_deferred_tool')
+    if (checkpointIndex < 0) return null
+    const checkpoint = rows[checkpointIndex]
+    const attachment = checkpoint.attachment
+    if (checkpoint.sessionId !== nativeSessionId || checkpoint.version !== '2.1.237'
+      || typeof checkpoint.uuid !== 'string' || !checkpoint.uuid || attachment.toolUseID !== toolUseID
+      || attachment.toolName !== 'Bash' || attachment.hookEvent !== 'PreToolUse'
+      || nativeInputDigest(attachment.toolInput) !== inputDigest) return null
+    // The pinned native loader scans only the final MiB and invalidates the
+    // marker on any later raw correlated tool_use_id, including denials.
+    const checkpointOffset = Buffer.byteLength(lines.slice(0, checkpointIndex).join('\n')) + (checkpointIndex ? 1 : 0)
+    if (bytes.length - checkpointOffset > 1024 * 1024
+      || lines.slice(checkpointIndex + 1).some((line) => line.includes('"tool_use_id":"' + toolUseID + '"'))) return null
+    const assistant = rows.slice(0, checkpointIndex).findLast((row) => row.type === 'assistant'
+      && Array.isArray(row.message?.content) && row.message.content.some((block) => block.type === 'tool_use' && block.id === toolUseID))
+    const tools = assistant?.message.content.filter((block) => block.type === 'tool_use')
+    if (assistant?.sessionId !== nativeSessionId || assistant.version !== '2.1.237'
+      || typeof assistant.uuid !== 'string' || !assistant.uuid || tools?.length !== 1
+      || tools[0].name !== attachment.toolName || nativeInputDigest(tools[0].input) !== inputDigest) return null
+    return { nativeSessionId, toolUseID, inputDigest, toolName: attachment.toolName,
+      checkpointUuid: checkpoint.uuid, assistantUuid: assistant.uuid, nativeVersion: checkpoint.version,
+      checkpointDigest: createHash('sha256').update(lines[checkpointIndex]).digest('hex') }
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error instanceof SyntaxError) return null
+    throw new Error('native deferred checkpoint is unreadable')
+  } finally { await file?.close() }
+}
 
 export async function writeNativeSessionSignal(input, env = process.env) {
   const launch = JSON.parse(env[launchKey] ?? 'null')

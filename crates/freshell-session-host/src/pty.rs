@@ -53,6 +53,9 @@ pub struct HostedPty {
     terminal_id: String,
     stream_epoch: String,
     native_session_id: Arc<Mutex<Option<String>>>,
+    native_identity_launch: Option<freshell_runtime_protocol::NativeIdentityLaunch>,
+    provider_mode: String,
+    native_signal: Option<(PathBuf, u32, u32, String)>,
     opencode_adoption: Option<Arc<Mutex<OpenCodeAdoptionGate>>>,
     codex: Option<CodexLifecycle>,
 }
@@ -67,6 +70,14 @@ impl HostedPty {
         opencode_adoption_revalidator: Option<OpenCodeAdoptionRevalidator>,
     ) -> Result<Self, String> {
         launch.validate().map_err(|e| e.message)?;
+        let native_identity_launch =
+            crate::providers::native_identity::launch_from_environment(&child_secret_env)?;
+        if native_identity_launch
+            .as_ref()
+            .is_some_and(|binding| binding.incarnation_id != incarnation_id)
+        {
+            return Err("native launch belongs to another incarnation".into());
+        }
         let opencode_adoption = launch
             .opencode_adoption
             .as_ref()
@@ -127,7 +138,16 @@ impl HostedPty {
         });
         let mut provider_args = crate::provider_identity_args(launch.run_as_uid, launch.run_as_gid);
         provider_args.push(launch.program.clone());
-        provider_args.extend(launch.args.clone());
+        let mut native_args = launch.args.clone();
+        if launch.mode == "claude" && native_identity_launch.is_some() {
+            for index in 0..native_args.len().saturating_sub(1) {
+                if native_args[index] == "--settings" {
+                    native_args[index + 1] =
+                        freshell_platform::cli_launch::claude_managed_settings_json();
+                }
+            }
+        }
+        provider_args.extend(native_args);
         let spec = SpawnSpec {
             program: "/usr/bin/setpriv".to_string(),
             args: provider_args,
@@ -138,6 +158,40 @@ impl HostedPty {
         };
         let mut provider_env = launch.env.clone();
         provider_env.extend(child_secret_env);
+        let native_signal = if matches!(launch.mode.as_str(), "claude" | "amplifier") {
+            native_identity_launch
+                .as_ref()
+                .map(|binding| {
+                    let home = provider_env
+                        .get("HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("/home/freshell/provider"));
+                    let directory =
+                        crate::providers::native_identity::signal_directory(&home, binding)?;
+                    provider_env.insert(
+                        crate::providers::native_identity::SIGNAL_DIR_ENV.into(),
+                        directory.to_string_lossy().into(),
+                    );
+                    let name = if launch.mode == "amplifier" {
+                        "amplifier-loaded-context.json"
+                    } else {
+                        "session-start.json"
+                    };
+                    Ok::<_, String>((
+                        directory.join(name),
+                        launch.run_as_uid,
+                        launch.run_as_gid,
+                        if launch.resume_session_id.is_some() {
+                            "resume".into()
+                        } else {
+                            "startup".into()
+                        },
+                    ))
+                })
+                .transpose()?
+        } else {
+            None
+        };
         if let Some(expectation) = launch.opencode_adoption.as_ref() {
             set_opencode_adoption_environment(&mut provider_env, expectation);
             provider_env.insert("FRESHELL_TERMINAL_ID".into(), launch.terminal_id.clone());
@@ -169,10 +223,7 @@ impl HostedPty {
         let commands = CommandJournal::open(state_dir)?;
         // Codex must report the thread identity through its app-server proxy;
         // do not treat the requested resume id as provider-observed evidence.
-        let initial_native_id = (launch.mode != "codex" && opencode_adoption.is_none())
-            .then(|| launch.resume_session_id.clone())
-            .flatten();
-        let native_session_id = Arc::new(Mutex::new(initial_native_id));
+        let native_session_id = Arc::new(Mutex::new(None));
         if launch.mode == "opencode" && launch.resume_session_id.is_none() {
             spawn_opencode_identity_watcher(
                 launch,
@@ -234,6 +285,9 @@ impl HostedPty {
             terminal_id: launch.terminal_id.clone(),
             stream_epoch,
             native_session_id,
+            native_identity_launch,
+            provider_mode: launch.mode.clone(),
+            native_signal,
             opencode_adoption,
             codex,
         })
@@ -245,8 +299,18 @@ impl HostedPty {
         data: &str,
     ) -> Result<CommandState, RuntimeError> {
         let adoption_gate = self.opencode_adoption.clone();
+        let native_ready = !matches!(
+            self.provider_mode.as_str(),
+            "claude" | "codex" | "opencode" | "amplifier"
+        ) || self.native_identity_observation().is_some();
         let disposition =
             begin_input_after_gate(&mut self.commands, request_id, data.as_bytes(), || {
+                if !native_ready {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::RecoveryBlocked,
+                        "provider has not acknowledged the current native session",
+                    ));
+                }
                 let Some(gate) = adoption_gate.as_ref() else {
                     return Ok(true);
                 };
@@ -355,6 +419,53 @@ impl HostedPty {
             .lock()
             .ok()
             .and_then(|session| session.clone())
+    }
+
+    pub fn native_identity_observation(
+        &self,
+    ) -> Option<freshell_runtime_protocol::NativeIdentityObservation> {
+        use freshell_runtime_protocol::NativeIdentitySource;
+        if self.exited() {
+            return None;
+        }
+        let launch = self.native_identity_launch.as_ref()?;
+        if let Some((path, uid, gid, source)) = self.native_signal.as_ref() {
+            let result = if self.provider_mode == "amplifier" {
+                crate::providers::native_identity::read_amplifier_observation(
+                    path, *uid, *gid, launch, source,
+                )
+            } else {
+                crate::providers::native_identity::read_claude_observation(
+                    path, *uid, *gid, launch, source,
+                )
+            };
+            return match result {
+                Ok(observation) if !self.exited() => observation,
+                Ok(_) => None,
+                Err(reason) => {
+                    tracing::warn!(incarnation_id=%launch.incarnation_id,launch_nonce=%launch.launch_nonce,provider=%self.provider_mode,reason,"managed_provider.native_identity_blocked");
+                    None
+                }
+            };
+        }
+        let native = self.native_session_id()?;
+        let (source, evidence) = match self.provider_mode.as_str() {
+            "codex" => (
+                NativeIdentitySource::CodexAppServer,
+                serde_json::json!({"threadId":native,"handshake":"app_server"}),
+            ),
+            "opencode" => match self.opencode_adoption_status() {
+                OpenCodeAdoptionStatus::Observed { observation } => (
+                    NativeIdentitySource::OpencodeTui,
+                    serde_json::to_value(observation).ok()?,
+                ),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        crate::providers::native_identity::bind_provider_observation(
+            launch, &native, source, &evidence,
+        )
     }
 
     pub fn opencode_adoption_status(&self) -> OpenCodeAdoptionStatus {

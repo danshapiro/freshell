@@ -257,6 +257,13 @@ pub fn claude_settings_json(target: ProviderTarget) -> String {
     .to_string()
 }
 
+pub fn claude_managed_settings_json() -> String {
+    serde_json::json!({"hooks": {
+        "SessionStart": [{"hooks": [{"type":"command","command":"node /opt/freshell-claude-sidecar/native-session-channel.mjs"}]}],
+        "Stop": [{"hooks": [{"type":"command","command":CLAUDE_BELL_COMMAND_UNIX}]}],
+    }}).to_string()
+}
+
 /// Truthy env lookup (JS `env.X` truthiness: unset and `''` are both falsy).
 fn env_truthy(env: &dyn Env, key: &str) -> Option<String> {
     env.get(key).filter(|v| !v.is_empty())
@@ -659,6 +666,75 @@ mod tests {
             out, "1769000000000000000",
             "BSD fallback: seconds + 9 zero digits"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_claude_hook_runs_owned_native_signal_writer() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        let owned = tempfile::tempdir().unwrap();
+        let binary_dir = owned.path().join("bin");
+        std::fs::create_dir(&binary_dir).unwrap();
+        let node = Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+            .unwrap();
+        assert!(node.status.success());
+        let node = String::from_utf8(node.stdout).unwrap();
+        let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../freshell-claude-sidecar/native-session-channel.mjs")
+            .canonicalize()
+            .unwrap();
+        let wrapper = binary_dir.join("node");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nexec '{}' '{}'\n", node.trim(), module.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&claude_managed_settings_json()).unwrap();
+        let command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        let directory = owned.path().join("current-signal");
+        let launch = serde_json::json!({"incarnationId":"current-incarnation","launchNonce":"current-nonce","evidenceRevision":2,"executionGeneration":1,"requestedNativeSessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"});
+        let mut child = Command::new("sh")
+            .args(["-c", command])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    binary_dir.display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("HOME", owned.path())
+            .env("FRESHELL_NATIVE_IDENTITY_LAUNCH", launch.to_string())
+            .env("FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR", &directory)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(br#"{"hook_event_name":"SessionStart","session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","source":"resume"}"#).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let signal = std::fs::read(directory.join("session-start.json"))
+            .expect("current managed command must write its launch-owned native signal");
+        let signal: serde_json::Value = serde_json::from_slice(&signal).unwrap();
+        assert_eq!(signal["launch"], launch);
+        assert_eq!(signal["native"]["source"], "resume");
+        assert!(!owned
+            .path()
+            .join(".freshell/session-signals/claude")
+            .exists());
     }
 
     #[test]

@@ -130,6 +130,16 @@ export const ManagedRuntimeReadinessSchema = z.object({
   initialScanDurationMs: NonNegativeIntSchema.optional(),
 }).strict()
 
+export const ManagedRuntimeNativeIdentityObservationSchema = z.object({
+  nativeSessionId: NonEmptyIdSchema,
+  incarnationId: NonEmptyIdSchema,
+  launchNonce: NonEmptyIdSchema,
+  evidenceRevision: NonNegativeIntSchema,
+  source: z.enum(['codex_app_server', 'opencode_tui', 'claude_native_event',
+    'amplifier_native_loaded_context', 'fresh_provider_handshake']),
+  evidenceDigest: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict()
+
 export const ManagedRuntimeSoulSchema = z.object({
   soulId: NonEmptyIdSchema,
   incarnationId: NonEmptyIdSchema,
@@ -160,6 +170,7 @@ export const ManagedRuntimeSoulSchema = z.object({
   allocationState: ManagedRuntimeAllocationStateSchema,
   provider: z.string().optional(),
   nativeSessionId: z.string().optional(),
+  nativeIdentityObservation: ManagedRuntimeNativeIdentityObservationSchema.optional(),
   recoveryReason: z.string().optional(),
   incidentId: NonEmptyIdSchema.optional(),
   priorIncarnationId: z.string().optional(),

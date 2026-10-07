@@ -9,8 +9,8 @@ pub use freshell_runtime_protocol::{
 };
 use freshell_runtime_protocol::{
     CommandState, FreshAgentCapture, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentTurnSettings, ProviderLaunchContext, ProviderModelSelection, ProviderSecretReference,
-    ProviderSessionReference, RequestId,
+    FreshAgentTurnSettings, NativeIdentityLaunch, ProviderLaunchContext, ProviderModelSelection,
+    ProviderSecretReference, ProviderSessionReference, RequestId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -194,6 +194,15 @@ pub enum FreshAgentOperation {
 
 #[async_trait]
 pub trait FreshAgentTransport: Send + Sync {
+    async fn prepare_native_permission_recovery(
+        &self,
+        _checkpoints: Vec<Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    async fn native_identity_evidence(&self) -> Option<Value> {
+        None
+    }
     async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String>;
     async fn dispatch(
         &self,
@@ -297,6 +306,7 @@ enum DecisionState {
     Dispatching,
     Resolved,
     Ambiguous,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,6 +387,9 @@ pub struct FreshAgentHostActor {
     state_dir: PathBuf,
     transport: Arc<dyn FreshAgentTransport>,
     state: Mutex<PersistedActorState>,
+    /// Ephemeral acknowledgement from this transport start. Saved profile
+    /// identity remains a resume request and cannot populate this slot.
+    observed_native_session_id: Mutex<Option<String>>,
     dispatch_lock: Mutex<()>,
     event_byte_cap: usize,
     event_count_cap: usize,
@@ -430,9 +443,17 @@ impl FreshAgentHostActor {
                     command.state = CommandState::Ambiguous;
                 }
             }
+            let claude_replacement = matches!(
+                loaded.profile.provider,
+                FreshProvider::Claude | FreshProvider::Kilroy
+            );
             for decision in loaded.decisions.values_mut() {
                 if matches!(decision.state, DecisionState::Dispatching) {
                     decision.state = DecisionState::Ambiguous;
+                } else if claude_replacement && matches!(decision.state, DecisionState::Pending) {
+                    // A new native query has no old JS callback. Only a newly
+                    // verified deferred checkpoint can publish a pending card.
+                    decision.state = DecisionState::Interrupted;
                 }
             }
             loaded
@@ -440,10 +461,27 @@ impl FreshAgentHostActor {
             PersistedActorState::new(profile)
         };
 
+        if matches!(
+            state.profile.provider,
+            FreshProvider::Claude | FreshProvider::Kilroy
+        ) {
+            let checkpoints=state.decisions.values().filter(|decision|
+                matches!(decision.state,DecisionState::Pending|DecisionState::Interrupted))
+                .filter_map(|decision| {
+                    let binding=decision.payload.get("nativeBinding")?;
+                    let evidence=serde_json::json!({"launch":binding["launch"],"queryGeneration":binding["queryGeneration"]});
+                    current_native_checkpoint(&decision.payload,state.profile.native_session_id.as_deref(),Some(&evidence))
+                }).collect();
+            transport
+                .prepare_native_permission_recovery(checkpoints)
+                .await
+                .map_err(ActorError::Transport)?;
+        }
         let started = transport
             .start(&state.profile)
             .await
             .map_err(ActorError::Transport)?;
+        let observed_native_session_id = started.native_session_id.clone();
         if let Some(expected) = state.profile.native_session_id.as_deref() {
             if started.native_session_id.as_deref() != Some(expected) {
                 return Err(ActorError::NativeIdentityMismatch);
@@ -462,6 +500,7 @@ impl FreshAgentHostActor {
             state_dir,
             transport: Arc::clone(&transport),
             state: Mutex::new(state),
+            observed_native_session_id: Mutex::new(observed_native_session_id),
             dispatch_lock: Mutex::new(()),
             event_byte_cap,
             event_count_cap,
@@ -496,6 +535,18 @@ impl FreshAgentHostActor {
         self.state.lock().await.profile.clone()
     }
 
+    pub async fn observed_native_session_id(&self) -> Option<String> {
+        if !self.is_live().await {
+            return None;
+        }
+        self.observed_native_session_id.lock().await.clone()
+    }
+
+    pub async fn observed_native_identity_evidence(&self) -> Option<Value> {
+        self.observed_native_session_id().await?;
+        self.transport.native_identity_evidence().await
+    }
+
     pub async fn observe_native_identity(
         &self,
         native_session_id: String,
@@ -508,9 +559,13 @@ impl FreshAgentHostActor {
             Some(existing) if existing != native_session_id => {
                 return Err(ActorError::NativeIdentityMismatch)
             }
-            Some(_) => return Ok(()),
+            Some(_) => {
+                *self.observed_native_session_id.lock().await = Some(native_session_id);
+                return Ok(());
+            }
             None => state.profile.native_session_id = Some(native_session_id.clone()),
         }
+        *self.observed_native_session_id.lock().await = Some(native_session_id.clone());
         push_event_bounded(
             &mut state,
             AgentEvent::Started { native_session_id },
@@ -940,6 +995,26 @@ impl FreshAgentHostActor {
 
     pub async fn record_event(&self, event: AgentEvent) -> Result<u64, ActorError> {
         let mut state = self.state.lock().await;
+        if let AgentEvent::Provider { payload } = &event {
+            let native = payload.get("event").unwrap_or(payload);
+            if matches!(
+                native.get("type").and_then(Value::as_str),
+                Some("freshAgent.permission.cancelled" | "freshAgent.question.cancelled")
+            ) {
+                if let Some(decision) = native
+                    .get("requestId")
+                    .and_then(Value::as_str)
+                    .and_then(|request| state.decisions.get_mut(request))
+                {
+                    if matches!(
+                        decision.state,
+                        DecisionState::Pending | DecisionState::Dispatching
+                    ) {
+                        decision.state = DecisionState::Interrupted;
+                    }
+                }
+            }
+        }
         let sequence =
             push_event_bounded(&mut state, event, self.event_byte_cap, self.event_count_cap)?;
         write_state(&self.state_dir, &state)?;
@@ -951,8 +1026,38 @@ impl FreshAgentHostActor {
         decision_id: String,
         payload: Value,
     ) -> Result<u64, ActorError> {
+        let current_root = self.observed_native_session_id().await;
+        let current_evidence = self.observed_native_identity_evidence().await;
+        let verified_checkpoint =
+            current_native_checkpoint(&payload, current_root.as_deref(), current_evidence.as_ref());
+        if payload.get("nativeCheckpoint").is_some() && verified_checkpoint.is_none() {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
         let mut state = self.state.lock().await;
         if let Some(existing) = state.decisions.get(&decision_id) {
+            if matches!(existing.state, DecisionState::Interrupted)
+                && verified_checkpoint.is_some()
+                && existing.payload.get("nativeCheckpoint") == verified_checkpoint.as_ref()
+            {
+                let existing = state
+                    .decisions
+                    .get_mut(&decision_id)
+                    .expect("checked decision");
+                existing.payload = payload.clone();
+                existing.state = DecisionState::Pending;
+                existing.response_digest = None;
+                let sequence = push_event_bounded(
+                    &mut state,
+                    AgentEvent::PermissionRequested {
+                        decision_id,
+                        payload,
+                    },
+                    self.event_byte_cap,
+                    self.event_count_cap,
+                )?;
+                write_state(&self.state_dir, &state)?;
+                return Ok(sequence);
+            }
             if existing.payload != payload {
                 return Err(ActorError::RequestConflict);
             }
@@ -1029,6 +1134,7 @@ impl FreshAgentHostActor {
                 .ok_or(ActorError::UnknownDecision)?;
             match pending.state {
                 DecisionState::Pending => {}
+                DecisionState::Interrupted => return Err(ActorError::UnknownDecision),
                 DecisionState::Resolved
                     if pending.response_digest.as_deref() == Some(&response_digest) =>
                 {
@@ -1052,6 +1158,9 @@ impl FreshAgentHostActor {
             .decisions
             .get_mut(decision_id)
             .expect("pending decision");
+        if matches!(pending.state, DecisionState::Interrupted) {
+            return Err(ActorError::UnknownDecision);
+        }
         match result {
             Ok(()) => {
                 pending.state = DecisionState::Resolved;
@@ -1175,6 +1284,61 @@ fn pending_decision_ids(state: &PersistedActorState) -> BTreeSet<String> {
         .filter(|(_, decision)| matches!(decision.state, DecisionState::Pending))
         .map(|(decision_id, _)| decision_id.clone())
         .collect()
+}
+
+fn current_native_checkpoint(
+    payload: &Value,
+    root: Option<&str>,
+    evidence: Option<&Value>,
+) -> Option<Value> {
+    let checkpoint = payload.get("nativeCheckpoint")?;
+    let binding = payload.get("nativeBinding")?;
+    let evidence = evidence?;
+    let launch: NativeIdentityLaunch = serde_json::from_value(binding["launch"].clone()).ok()?;
+    let current_launch: NativeIdentityLaunch =
+        serde_json::from_value(evidence["launch"].clone()).ok()?;
+    let native = root?;
+    let tool = checkpoint["toolUseID"]
+        .as_str()
+        .filter(|tool| tool.starts_with("toolu_") && tool.len() > 6)?;
+    let request = payload["nativeRequestId"]
+        .as_str()
+        .filter(|request| !request.is_empty())?;
+    let generation = binding["queryGeneration"]
+        .as_u64()
+        .filter(|generation| *generation > 0)?;
+    let hash = |value: &Value| {
+        value.as_str().is_some_and(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    };
+    if launch != current_launch
+        || launch.execution_generation == 0
+        || launch
+            .requested_native_session_id
+            .as_deref()
+            .is_some_and(|root| root != native)
+        || evidence["queryGeneration"].as_u64() != Some(generation)
+        || binding["nativeRequestId"] != request
+        || checkpoint["nativeSessionId"] != native
+        || payload["toolUseID"] != tool
+        || checkpoint["toolName"] != "Bash"
+        || payload["tool"]["name"] != "Bash"
+        || checkpoint["nativeVersion"] != "2.1.237"
+        || !["inputDigest", "profileDigest", "checkpointDigest"]
+            .iter()
+            .all(|key| hash(&checkpoint[key]))
+        || !["checkpointUuid", "assistantUuid"]
+            .iter()
+            .all(|key| checkpoint[key].as_str().is_some_and(|id| !id.is_empty()))
+        || checkpoint["inputDigest"] != digest(&serde_json::to_vec(&payload["tool"]["input"]).ok()?)
+    {
+        return None;
+    }
+    Some(checkpoint.clone())
 }
 
 fn event_is_pending_decision(entry: &JournalEvent, pending_ids: &BTreeSet<String>) -> bool {

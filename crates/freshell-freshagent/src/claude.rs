@@ -465,6 +465,33 @@ struct ClaudeCreateRecord {
 struct ClaudePending {
     permissions: Vec<PendingApprovalEntry>,
     questions: Vec<PendingQuestionEntry>,
+    native_requests: std::collections::BTreeMap<String, String>,
+    native_dispatches: std::collections::BTreeMap<
+        String,
+        (
+            String,
+            tokio::sync::oneshot::Sender<Result<(), NativeControlFailure>>,
+        ),
+    >,
+}
+
+#[derive(Debug)]
+pub struct NativeControlFailure {
+    pub message: String,
+    pub acceptance_ambiguous: bool,
+}
+
+impl ClaudePending {
+    fn cancel_native_control(&mut self, kind: &str, request_id: &str) {
+        let key = format!("{kind}:{request_id}");
+        self.native_requests.remove(&key);
+        if let Some((_, sender)) = self.native_dispatches.remove(&key) {
+            let _ = sender.send(Err(NativeControlFailure {
+                message: "native callback cancelled before dispatch".into(),
+                acceptance_ambiguous: false,
+            }));
+        }
+    }
 }
 
 /// One pending claude approval (an `sdk.permission.request` not yet answered/cancelled),
@@ -4821,6 +4848,122 @@ impl FreshClaudeState {
             .retain(|p| p.request_id != request_id);
     }
 
+    pub async fn dispatch_approval_checked(
+        &self,
+        msg: FreshAgentApprovalRespond,
+    ) -> Result<(), NativeControlFailure> {
+        if !msg.decision.is_object() {
+            return Err(NativeControlFailure {
+                message: "approval requires an object decision".into(),
+                acceptance_ambiguous: false,
+            });
+        }
+        self.dispatch_native_control_checked(
+            &msg.session_id,
+            msg.session_type,
+            "permission",
+            request_id_string(&msg.request_id),
+            json!({"decision":msg.decision}),
+        )
+        .await
+    }
+
+    pub async fn dispatch_question_checked(
+        &self,
+        msg: FreshAgentQuestionRespond,
+    ) -> Result<(), NativeControlFailure> {
+        self.dispatch_native_control_checked(
+            &msg.session_id,
+            msg.session_type,
+            "question",
+            request_id_string(&msg.request_id),
+            json!({"answers":msg.answers}),
+        )
+        .await
+    }
+
+    async fn dispatch_native_control_checked(
+        &self,
+        session_id: &str,
+        session_type: SessionType,
+        kind: &str,
+        request_id: String,
+        payload: Value,
+    ) -> Result<(), NativeControlFailure> {
+        let reject = |message: &str, acceptance_ambiguous| NativeControlFailure {
+            message: message.into(),
+            acceptance_ambiguous,
+        };
+        let Some(mut session) = self.respond_session_guard(session_id, session_type).await else {
+            return Err(reject("current native session is unavailable", false));
+        };
+        let key = format!("{kind}:{request_id}");
+        let pending = Arc::clone(&session.pending);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        {
+            let mut state = pending.lock().expect("pending lock");
+            let present = if kind == "permission" {
+                state
+                    .permissions
+                    .iter()
+                    .any(|entry| entry.request_id == request_id)
+            } else {
+                state
+                    .questions
+                    .iter()
+                    .any(|entry| entry.request_id == request_id)
+            };
+            let native_request_id = state.native_requests.get(&key).cloned();
+            if !present || native_request_id.is_none() || state.native_dispatches.contains_key(&key)
+            {
+                return Err(reject(
+                    "current native callback is unavailable or already dispatching",
+                    false,
+                ));
+            }
+            state
+                .native_dispatches
+                .insert(key.clone(), (native_request_id.unwrap(), send));
+        }
+        let mut command = payload;
+        command["type"] = json!(format!("{kind}.respond"));
+        command["sessionId"] = json!(session.sidecar_session_id);
+        command["requestId"] = json!(request_id);
+        let written = write_line(&mut session.stdin, &command).await;
+        drop(session);
+        if let Err(message) = written {
+            pending
+                .lock()
+                .expect("pending lock")
+                .native_dispatches
+                .remove(&key);
+            return Err(NativeControlFailure {
+                message,
+                acceptance_ambiguous: true,
+            });
+        }
+        let result = match tokio::time::timeout(Duration::from_secs(5), receive).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(reject("native dispatch channel closed", true)),
+            Err(_) => Err(reject("native dispatch acknowledgement timed out", true)),
+        };
+        let mut state = pending.lock().expect("pending lock");
+        state.native_dispatches.remove(&key);
+        if result.is_ok() {
+            state.native_requests.remove(&key);
+            if kind == "permission" {
+                state
+                    .permissions
+                    .retain(|entry| entry.request_id != request_id)
+            } else {
+                state
+                    .questions
+                    .retain(|entry| entry.request_id != request_id)
+            }
+        }
+        result
+    }
+
     /// Handle a `freshAgent.question.respond` for claude/kilroy: identical ordering
     /// discipline to [`Self::handle_approval_respond`]; the frame is
     /// `question.respond` with the answers as a JSON object (the sidecar wraps them
@@ -9034,6 +9177,43 @@ fn fold_pending_frame(pending: &std::sync::Mutex<ClaudePending>, value: &Value) 
         return;
     };
     match sdk_type {
+        "sdk.permission.dispatch" | "sdk.question.dispatch" => {
+            let Some(request_id) = value.get("requestId").and_then(frame_request_id) else {
+                return;
+            };
+            let kind = if sdk_type == "sdk.permission.dispatch" {
+                "permission"
+            } else {
+                "question"
+            };
+            let key = format!("{kind}:{request_id}");
+            let mut state = pending.lock().expect("pending lock");
+            let Some((expected, _)) = state.native_dispatches.get(&key) else {
+                return;
+            };
+            let ok = value.get("ok").and_then(Value::as_bool) == Some(true);
+            if ok && value.get("nativeRequestId").and_then(Value::as_str) != Some(expected) {
+                return;
+            }
+            if let Some((_, sender)) = state.native_dispatches.remove(&key) {
+                let result = if ok {
+                    Ok(())
+                } else {
+                    Err(NativeControlFailure {
+                        message: value
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("native control dispatch rejected")
+                            .into(),
+                        acceptance_ambiguous: value
+                            .get("acceptanceAmbiguous")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                };
+                let _ = sender.send(result);
+            }
+        }
         "sdk.permission.request" => {
             let Some(request_id) = value.get("requestId").and_then(frame_request_id) else {
                 return;
@@ -9060,16 +9240,22 @@ fn fold_pending_frame(pending: &std::sync::Mutex<ClaudePending>, value: &Value) 
                 input: value.get("tool").and_then(|t| t.get("input")).cloned(),
             };
             let mut p = pending.lock().expect("pending lock");
+            if let Some(native) = value
+                .get("nativeRequestId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                p.native_requests
+                    .insert(format!("permission:{}", entry.request_id), native.into());
+            }
             p.permissions.retain(|e| e.request_id != entry.request_id);
             p.permissions.push(entry);
         }
         "sdk.permission.cancelled" => {
             if let Some(request_id) = value.get("requestId").and_then(frame_request_id) {
-                pending
-                    .lock()
-                    .expect("pending lock")
-                    .permissions
-                    .retain(|e| e.request_id != request_id);
+                let mut state = pending.lock().expect("pending lock");
+                state.permissions.retain(|e| e.request_id != request_id);
+                state.cancel_native_control("permission", &request_id);
             }
         }
         "sdk.question.request" => {
@@ -9089,16 +9275,22 @@ fn fold_pending_frame(pending: &std::sync::Mutex<ClaudePending>, value: &Value) 
                 questions: normalize_question_definitions(value.get("questions")),
             };
             let mut p = pending.lock().expect("pending lock");
+            if let Some(native) = value
+                .get("nativeRequestId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                p.native_requests
+                    .insert(format!("question:{}", entry.request_id), native.into());
+            }
             p.questions.retain(|e| e.request_id != entry.request_id);
             p.questions.push(entry);
         }
         "sdk.question.cancelled" => {
             if let Some(request_id) = value.get("requestId").and_then(frame_request_id) {
-                pending
-                    .lock()
-                    .expect("pending lock")
-                    .questions
-                    .retain(|e| e.request_id != request_id);
+                let mut state = pending.lock().expect("pending lock");
+                state.questions.retain(|e| e.request_id != request_id);
+                state.cancel_native_control("question", &request_id);
             }
         }
         _ => {}
@@ -9228,9 +9420,12 @@ fn normalize_sdk_type(sdk_type: &str) -> Option<&'static str> {
         "sdk.session.init" => "freshAgent.session.init",
         "sdk.session.metadata" => "freshAgent.session.metadata",
         "sdk.assistant" => "freshAgent.assistant",
+        "sdk.tool.result" => "freshAgent.tool.result",
         "sdk.stream" => "freshAgent.stream",
         "sdk.result" => "freshAgent.result",
         "sdk.permission.request" => "freshAgent.permission.request",
+        "sdk.permission.dispatch" => "freshAgent.permission.dispatch",
+        "sdk.question.dispatch" => "freshAgent.question.dispatch",
         "sdk.permission.cancelled" => "freshAgent.permission.cancelled",
         "sdk.question.request" => "freshAgent.question.request",
         // Task 2 (fresh-eyes round-3 F3): forwarded, not dropped — the client folds
@@ -18648,6 +18843,7 @@ rl.on('line', (line) => {
                 input: None,
             }],
             questions: Vec::new(),
+            ..ClaudePending::default()
         };
         insert_dead_stdin_session(&st, "dead-stdin-approval", pending).await;
 
@@ -18668,6 +18864,86 @@ rl.on('line', (line) => {
             vec!["req-9".to_string()],
             "a failed write leaves the entry pending (never clear-then-fail)"
         );
+    }
+
+    #[tokio::test]
+    async fn checked_native_approval_refuses_absent_current_callback() {
+        let (state, _) = state_with_bus();
+        let result = state
+            .dispatch_approval_checked(approval_respond_msg(
+                "absent-current-session",
+                SessionType::Freshclaude,
+                "old-request",
+                json!({ "behavior": "allow" }),
+            ))
+            .await;
+        assert!(
+            result.is_err(),
+            "an absent native callback must not report successful dispatch"
+        );
+        assert!(!result.unwrap_err().acceptance_ambiguous);
+    }
+
+    #[tokio::test]
+    async fn native_dispatch_fold_requires_exact_current_native_request() {
+        let pending = std::sync::Mutex::new(ClaudePending::default());
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.request","requestId":"current-card","nativeRequestId":"current-native","tool":{"name":"Bash","input":{"command":"owned"}}}),
+        );
+        let (send, mut receive) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().native_dispatches.insert(
+            "permission:current-card".into(),
+            ("current-native".into(), send),
+        );
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.dispatch","requestId":"old-card","nativeRequestId":"current-native","ok":true}),
+        );
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.dispatch","requestId":"current-card","nativeRequestId":"old-native","ok":true}),
+        );
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.dispatch","requestId":"current-card","nativeRequestId":"current-native","ok":true}),
+        );
+        assert!(receive.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn native_dispatch_fold_returns_provider_cancellation_before_dispatch() {
+        let pending = std::sync::Mutex::new(ClaudePending::default());
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.request","requestId":"current-card","nativeRequestId":"current-native","tool":{"name":"Bash","input":{"command":"owned"}}}),
+        );
+        let (send, mut receive) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().native_dispatches.insert(
+            "permission:current-card".into(),
+            ("current-native".into(), send),
+        );
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.cancelled","requestId":"current-card"}),
+        );
+        let result = receive
+            .try_recv()
+            .expect("native cancellation must settle the checked response");
+        assert!(!result.unwrap_err().acceptance_ambiguous);
+        assert!(!pending
+            .lock()
+            .unwrap()
+            .native_requests
+            .contains_key("permission:current-card"));
     }
 
     /// D2-M3 (delta-review round 2): the shared protocol requires the decision to be a

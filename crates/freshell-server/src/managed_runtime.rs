@@ -1236,6 +1236,7 @@ mod tests {
     fn running_soul_is_reused_before_launch_payload_rehash_and_mismatches_fail_closed() {
         let soul = SoulId::parse("soul-terminal-test").unwrap();
         let running = freshell_runtime_protocol::RuntimeView {
+            native_identity_observation: None,
             soul_id: soul.clone(),
             incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
             launch_state: freshell_runtime_protocol::LaunchState::Running,

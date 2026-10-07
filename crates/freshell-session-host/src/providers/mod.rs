@@ -10,6 +10,7 @@ mod codex;
 #[cfg(feature = "fresh-agent-fixtures")]
 mod deterministic_fresh_agent;
 mod fresh_agent;
+pub(crate) mod native_identity;
 mod opencode;
 
 #[cfg(feature = "fresh-agent-fixtures")]
@@ -116,6 +117,23 @@ where
             .is_some_and(|context| context.mcp_capability.is_some())
     {
         prepare_features(terminal.run_as_uid, terminal.run_as_gid, &["claude-mcp"])?;
+    }
+    if terminal.mode == "amplifier" {
+        let bundle = match terminal
+            .provider_launch_context
+            .as_ref()
+            .map(|context| &context.preparation)
+        {
+            Some(freshell_runtime_protocol::ProviderPreparation::Amplifier { bundle, .. }) => {
+                bundle.as_str()
+            }
+            _ => return Err("managed Amplifier launch lacks its selected ordinary bundle".into()),
+        };
+        prepare_features(
+            terminal.run_as_uid,
+            terminal.run_as_gid,
+            &["amplifier-profile", bundle],
+        )?;
     }
     if terminal.mode == "opencode" {
         if let Some(context) = terminal.provider_launch_context.as_ref() {
@@ -418,6 +436,20 @@ fn run_provider_features_worker_at(
     provider_home: &std::path::Path,
 ) -> Result<Option<std::path::PathBuf>, String> {
     match args {
+        [operation, bundle] if operation == "amplifier-profile" => {
+            let output = std::process::Command::new("/opt/amplifier-src/.venv/bin/python")
+                .arg("/opt/prepare-amplifier-profile.py")
+                .arg(bundle)
+                .env("HOME", provider_home)
+                .current_dir(provider_home)
+                .output()
+                .map_err(|_| "native Amplifier profile preparation did not start")?;
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), &output.stderr);
+            if !output.status.success() {
+                return Err("native Amplifier selected profile preparation failed".into());
+            }
+            Ok(None)
+        }
         [operation] if operation == "claude-mcp" => {
             use std::os::unix::fs::OpenOptionsExt;
             let destination = provider_home.join(".claude/freshell-mcp.json");
@@ -690,6 +722,45 @@ mod provider_secret_context_tests {
                 "native-one"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn managed_amplifier_prepares_only_selected_ordinary_profile() {
+        let mut terminal: freshell_runtime_protocol::TerminalLaunchSpec =
+            serde_json::from_value(serde_json::json!({
+                "terminalId":"terminal-amplifier-profile", "streamId":"stream-amplifier-profile",
+                "mode":"amplifier", "program":"amplifier", "args":["run","--mode","chat"],
+                "cwd":"/workspace", "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,
+                "projectKey":"selected-profile","workspacePath":"/workspace"
+            }))
+            .unwrap();
+        terminal.provider_launch_context = Some(ProviderLaunchContext {
+            preparation: ProviderPreparation::Amplifier {
+                bundle: "default".into(),
+                resume_args: vec![],
+            },
+            config: vec![],
+            mcp_capability: None,
+        });
+        let invoked = std::cell::Cell::new(0);
+        let prepared = prepare_terminal_with_provider_feature_runner(
+            terminal,
+            &std::collections::BTreeMap::new(),
+            |uid, gid, args| {
+                assert_eq!((uid, gid), (65534, 0));
+                assert_eq!(args, ["amplifier-profile", "default"]);
+                invoked.set(invoked.get() + 1);
+                Ok(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            invoked.get(),
+            1,
+            "selected profile must be prepared under provider identity"
+        );
+        assert_eq!(prepared.terminal.args, ["run", "--mode", "chat"]);
     }
 
     #[tokio::test]
