@@ -93,13 +93,6 @@ async function sendNoToolTurn(page: Page, paneId: string, sessionId: string, ins
   })
 }
 
-function providerPid(table: string, pattern: RegExp): number {
-  const row = table.split('\n').find((line) => pattern.test(line))
-  const pid = Number(row?.trim().match(/^(\d+)/)?.[1])
-  if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error('actual provider child PID was not found')
-  return pid
-}
-
 async function replacement(rig: ManagedRuntimeBrowserRig, sessionId: string, prior: string): Promise<ManagedRuntimeView> {
   return waitFor('replacement incarnation', async () => {
     const view = await rig.runningViewForFreshSession(sessionId)
@@ -178,8 +171,7 @@ async function qualify(
   expect(afterHost.nativeSessionId).toBe(nativeSessionId)
   expect(rig.runtime.isContainerRunning(initial.containerId)).toBe(false)
 
-  const childPid = providerPid(rig.ownedContainerProcessTable(afterHost.containerId), definition.processPattern)
-  rig.runtime.killOwnedRuntimePidExact(afterHost.containerId, childPid)
+  await rig.crashProviderWorker(rig.exactRuntimeHandle(afterHost))
   const afterProvider = await replacement(rig, sessionId, afterHost.incarnationId)
   expect(afterProvider.nativeSessionId).toBe(nativeSessionId)
   const claim = await rig.writerClaimFacts(rig.exactRuntimeHandle(afterProvider))

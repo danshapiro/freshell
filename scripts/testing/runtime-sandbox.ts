@@ -3114,7 +3114,10 @@ export class ManagedRuntimeOwner {
 
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {
     await this.assertCurrentHandle(handle)
-    const facts = await this.chaosHostFacts(handle)
+    const row = (await this.inventory()).find(view => view.soulId === handle.soulId)
+    const facts = row?.freshAgentSessionType
+      ? await this.freshAgentLaunchFacts(this.runtimeEnclosureHandle(handle))
+      : await this.chaosHostFacts(handle)
     if (!Number.isSafeInteger(facts.workerPid) || facts.workerPid <= 1) throw new Error('exact host-recorded provider child PID required')
     this.runtime.recordLifecycle('external.provider_worker_crash', { severity: 'info', ...handle, workerPid: facts.workerPid })
     this.runtime.killOwnedRuntimePidExact(handle.containerId, facts.workerPid)

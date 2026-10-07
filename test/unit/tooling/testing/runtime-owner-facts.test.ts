@@ -19,6 +19,24 @@ const handle = {
 }
 
 describe('fixed fresh-agent launch observations', () => {
+  it('crashes the matching fresh provider child rather than its adapter PID', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 5, {}, {}, 'release', {
+      enabledProviders: [], freshAgentModes: ['freshclaude'],
+    })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...current, provider: 'claude', freshAgentSessionType: 'freshclaude',
+      launchState: 'running', intentRevision: 1 }])
+    const launch = vi.spyOn(rig, 'freshAgentLaunchFacts').mockResolvedValue({ provider: 'claude', version: '2.1.263', workerPid: 42 })
+    const host = vi.spyOn(rig, 'chaosHostFacts').mockResolvedValue({ workerPid: 99, workerLaunchCount: 1, unsafeBrokerAttempts: 0,
+      limits: { cpuMax: '200000 100000', memoryMax: '4294967296', swapMax: '0', pidsMax: '512' } })
+    const kill = vi.spyOn(rig.runtime, 'killOwnedRuntimePidExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    await rig.crashProviderWorker(current)
+    expect(kill).toHaveBeenCalledExactlyOnceWith(current.containerId, 42)
+    expect(launch).toHaveBeenCalledExactlyOnceWith(rig.runtimeEnclosureHandle(current))
+    expect(host).not.toHaveBeenCalled()
+  })
   it.each([
     { mode: 'freshclaude', provider: 'claude', version: '2.1.263', command: 'claude --session owned' },
     { mode: 'freshcodex', provider: 'codex', version: '0.147.0', command: 'codex app-server' },
