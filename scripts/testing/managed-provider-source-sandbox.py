@@ -20,11 +20,15 @@ def docker(*args, check=True):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--provider",choices=["amplifier","codex"],default="amplifier")
+    parser.add_argument("--provider",choices=["amplifier","codex","claude"],default="amplifier")
     parser.add_argument("--test-binary", type=Path, required=True)
     parser.add_argument("--receipt-dir", type=Path, required=True)
     args = parser.parse_args()
-    selected_test = TEST if args.provider == "amplifier" else "managed_mcp_capability::tests::managed_provider_codex_native_typed_inputs_survive_transport"
+    selected_test = {
+        "amplifier": TEST,
+        "codex": "managed_mcp_capability::tests::managed_provider_codex_native_typed_inputs_survive_transport",
+        "claude": "managed_provider_sdk_tests::managed_provider_claude_default_sdk_initializes_fixed_mcp_without_a_prompt",
+    }[args.provider]
     binary = args.test_binary.resolve(strict=True)
     if not binary.is_file() or not re.fullmatch(r"freshell_server-[0-9a-f]{16}", binary.name):
         raise RuntimeError("source fixture requires its compiled server test artifact")
@@ -71,7 +75,7 @@ def main():
                 value = json.loads(line.split(marker, 1)[1])
                 cases.append({"provider": value["provider"], "case": value["case"], "digest": value["digest"]})
         receipt["consumedCases"] = cases
-        if result.returncode == 0 and (len(cases) != (18 if args.provider == "amplifier" else 4) or "test result: ok. 1 passed;" not in result.stdout):
+        if result.returncode == 0 and (len(cases) != {"amplifier":18,"codex":4,"claude":1}[args.provider] or "test result: ok. 1 passed;" not in result.stdout):
             receipt["exitCode"] = 2
             receipt["failureClass"] = "native_consumer_count_mismatch"
         # Only the Rust fixture's classified assertion/digest receipt is emitted.
@@ -86,7 +90,8 @@ def main():
                 raise RuntimeError("source fixture cleanup ownership changed")
             docker("rm", "--force", value["Id"])
         receipt["ownedCleanup"] = docker("container", "inspect", name, check=False).returncode != 0
-        (args.receipt_dir / ("task002-native-source-consumers.json" if args.provider == "amplifier" else "task002-native-codex-source-consumers.json")).write_text(json.dumps(receipt, sort_keys=True) + "\n")
+        receipt_name = {"amplifier":"task002-native-source-consumers.json", "codex":"task002-native-codex-source-consumers.json", "claude":"task002-native-claude-sdk-consumers.json"}[args.provider]
+        (args.receipt_dir / receipt_name).write_text(json.dumps(receipt, sort_keys=True) + "\n")
     if not created or not receipt["ownedCleanup"]:
         raise RuntimeError("source fixture failed its owned cleanup proof")
     raise SystemExit(receipt["exitCode"])

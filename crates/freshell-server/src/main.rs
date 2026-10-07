@@ -47,6 +47,8 @@ mod managed_provider_bootstrap;
 mod managed_provider_launch_tests;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_provider_references;
+#[cfg(all(test, unix, feature = "managed-provider-qualification"))]
+mod managed_provider_sdk_tests;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_runtime;
 #[cfg(feature = "managed-runtime-v1")]
