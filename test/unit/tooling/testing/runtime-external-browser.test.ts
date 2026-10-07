@@ -977,6 +977,22 @@ describe('closed external owner control', () => {
       command: ['claude', 'arbitrary'] })).rejects.toThrow(/operation/)
     expect(facts).toHaveBeenCalledOnce()
   })
+  it('reads only the bound prior-container status through the finite client', async () => {
+    const { owned, context, request } = fixture()
+    const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'prior-soul',
+      incarnationId: 'prior-incarnation', containerId: 'b'.repeat(64), hostBootId: 'prior-boot' }
+    const state = vi.spyOn(owned, 'ownedContainerState').mockResolvedValue({ present: true, running: false })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.ownedContainerState(enclosure)).resolves.toEqual({ present: true, running: false })
+    expect(state).toHaveBeenCalledExactlyOnceWith(enclosure)
+    await expect(control({ ...request, action: 'container-state' })).rejects.toThrow(/enclosure/)
+    await expect(control({ ...request, operationId: 'forged-state', action: 'container-state', enclosure,
+      path: '/arbitrary' })).rejects.toThrow(/operation/)
+    expect(state).toHaveBeenCalledOnce()
+  })
   it('publishes only the fixed Phase3 browser observation and returns an opaque artifact reference', async () => {
     const { owned, context, request } = fixture()
     const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',

@@ -18,7 +18,7 @@ import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, R
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema,
-  FreshAgentLaunchFactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -29,7 +29,7 @@ import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
-import type { Phase3BrowserObservation, FreshAgentLaunchFacts } from './runtime-sandbox.js'
+import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -823,6 +823,9 @@ export class ExternalManagedRuntimeRig {
   async freshAgentLaunchFacts(enclosure: RuntimeEnclosureHandle): Promise<FreshAgentLaunchFacts> {
     return this.rpc('fresh-agent-launch-facts', FreshAgentLaunchFactsSchema, { enclosure })
   }
+  async ownedContainerState(enclosure: RuntimeEnclosureHandle): Promise<OwnedContainerState> {
+    return this.rpc('container-state', OwnedContainerStateSchema, { enclosure })
+  }
   async phase3ApprovalEffectCount(enclosure: RuntimeEnclosureHandle): Promise<number> {
     return this.rpc('phase3-effect-count', z.number().int().min(-1), { enclosure })
   }
@@ -1082,6 +1085,10 @@ export function createExternalRuntimeControl(
       case 'fresh-agent-launch-facts':
         if (!request.enclosure) throw new Error('exact current runtime enclosure address required')
         result = await owner.freshAgentLaunchFacts(request.enclosure)
+        break
+      case 'container-state':
+        if (!request.enclosure) throw new Error('exact tracked runtime enclosure address required')
+        result = await owner.ownedContainerState(request.enclosure)
         break
       case 'phase3-effect-count':
         if (!request.enclosure) throw new Error('exact current runtime enclosure address required')

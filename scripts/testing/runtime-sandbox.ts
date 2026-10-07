@@ -605,6 +605,12 @@ export const FreshAgentLaunchFactsSchema = z.object({ provider: z.enum(['claude'
   version: z.string().regex(/^\d+\.\d+\.\d+$/), workerPid: z.number().int().min(2) }).strict()
 export type FreshAgentLaunchFacts = z.infer<typeof FreshAgentLaunchFactsSchema>
 
+export const OwnedContainerStateSchema = z.discriminatedUnion('present', [
+  z.object({ present: z.literal(false), running: z.literal(false) }).strict(),
+  z.object({ present: z.literal(true), running: z.boolean() }).strict(),
+])
+export type OwnedContainerState = z.infer<typeof OwnedContainerStateSchema>
+
 export const Phase3BrowserObservationSchema = z.object({
   browserInteraction: z.boolean(), provider: z.literal('opencode'), providerVersion: z.string().regex(/^\d+\.\d+\.\d+$/),
   model: z.string().min(1).max(200), paneId: z.string().min(1).max(200), terminalId: z.string().min(1).max(200),
@@ -624,7 +630,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt',
-    'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
     'native-challenge-register',
@@ -3091,6 +3097,26 @@ export class ManagedRuntimeOwner {
     return { provider, version, workerPid }
   }
 
+  /** A prior tracked enclosure may be stopped or removed; this never qualifies a native root. */
+  async ownedContainerState(handle: RuntimeEnclosureHandle): Promise<OwnedContainerState> {
+    const receipts = this.runtime.broker.receipts().filter(receipt => receipt.soulId === handle.soulId
+      && receipt.incarnationId === handle.incarnationId && receipt.containerId === handle.containerId)
+    if (handle.runId !== this.runtime.runId || handle.candidateSha !== this.runtime.candidateSha || receipts.length !== 1) {
+      throw new Error('exact owned container address required')
+    }
+    const state = z.object({ hostBootId: z.literal(handle.hostBootId) }).passthrough()
+      .safeParse(JSON.parse(await fsp.readFile(path.join(receipts[0].runtimeDir, 'host-state.json'), 'utf8')))
+    if (!state.success) throw new Error('owned container address belongs to another boot')
+    const listed = (await this.trackedDockerProbe(handle.containerId, ['ps', '-a', '--no-trunc', '--filter',
+      `id=${handle.containerId}`, '--format', '{{.ID}}'])).trim()
+    if (!listed) return { present: false, running: false }
+    if (listed !== handle.containerId) throw new Error('owned container inspection identity is ambiguous or differs')
+    const inspected = z.array(z.object({ Id: z.literal(handle.containerId),
+      State: z.object({ Running: z.boolean() }).passthrough() }).passthrough()).length(1)
+      .parse(JSON.parse(await this.trackedDockerProbe(handle.containerId, ['inspect', handle.containerId])))
+    return { present: true, running: inspected[0].State.Running }
+  }
+
   async resetPhase3ApprovalEffect(handle: RuntimeEnclosureHandle): Promise<void> {
     if (this.runtime.phase !== 3) throw new Error('Phase 3 approval fixture required')
     await this.assertCurrentOpenCodeEnclosure(handle)
@@ -3267,6 +3293,11 @@ export class ManagedRuntimeOwner {
   }
 
   private async ownedDockerProbe(containerId: string, args: string[], providerUser: boolean): Promise<string> {
+    return this.trackedDockerProbe(containerId, ['exec', ...(providerUser ? ['--user', '65534:0'] : []), containerId,
+      'env', 'HOME=/home/freshell/provider', ...args])
+  }
+
+  private async trackedDockerProbe(containerId: string, args: string[]): Promise<string> {
     if (!this.runtime.broker.receiptIds().has(containerId)
       && !this.runtime.transferOwnedIds().containers.includes(containerId)) throw new Error('exact owned provider probe container required')
     const probeId = randomUUID()
@@ -3280,8 +3311,7 @@ export class ManagedRuntimeOwner {
     this.providerProbes.set(probeId, record)
     try {
       this.runtime.recordLifecycle('external.provider_probe_started', { severity: 'info', probeId, containerId })
-      record.child = execFile('docker', ['exec', ...(providerUser ? ['--user', '65534:0'] : []), containerId,
-        'env', 'HOME=/home/freshell/provider', ...args], {
+      record.child = execFile('docker', args, {
         cwd: this.repoRoot, encoding: 'utf8', timeout: 120_000, maxBuffer: 32 * 1024 * 1024,
       }, (error, stdout, stderr) => {
         this.providerProbes.delete(probeId)

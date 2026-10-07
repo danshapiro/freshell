@@ -169,7 +169,7 @@ async function qualify(
   const afterHost = await replacement(rig, sessionId, initial.incarnationId)
   if (!afterHost.containerId) throw new Error('host replacement has no enclosure')
   expect(afterHost.nativeSessionId).toBe(nativeSessionId)
-  expect(rig.runtime.isContainerRunning(initial.containerId)).toBe(false)
+  expect((await rig.ownedContainerState(rig.runtimeEnclosureHandle(initial))).running).toBe(false)
 
   await rig.crashProviderWorker(rig.exactRuntimeHandle(afterHost))
   const afterProvider = await replacement(rig, sessionId, afterHost.incarnationId)

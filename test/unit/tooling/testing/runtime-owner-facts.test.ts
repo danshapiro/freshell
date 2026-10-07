@@ -18,6 +18,44 @@ const handle = {
   hostBootId: 'boot-owned', nativeSessionId: 'native-owned',
 }
 
+describe('fixed observations of an owned prior enclosure', () => {
+  it('distinguishes stopped, running, absent and failed Docker inspection for the exact recorded boot', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-container-state-'))
+    const modeFile = path.join(root, 'mode')
+    const calls = path.join(root, 'calls.jsonl')
+    const docker = path.join(root, 'docker')
+    await fsp.writeFile(docker, `#!${process.execPath}\nconst fs=require('node:fs');const mode=fs.readFileSync(${JSON.stringify(modeFile)},'utf8');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(mode==='failed')process.exit(9);if(args[0]==='ps'){if(mode!=='absent')process.stdout.write('${handle.containerId}\\n');if(mode==='ambiguous')process.stdout.write('other-container\\n')}else if(args[0]==='inspect')process.stdout.write(JSON.stringify([{Id:'${handle.containerId}',State:{Running:mode==='malformed'?'unknown':mode==='running'}}]));else process.exit(10)\n`, { mode: 0o700 })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') })
+    const address = rig.runtimeEnclosureHandle(handle)
+    await fsp.writeFile(path.join(root, 'host-state.json'), JSON.stringify({ hostBootId: address.hostBootId }))
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(root, 'unused.sock'), proxySocketPath: path.join(root, 'proxy.sock'),
+      runtimeRootPrefix: root, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId, logPath: path.join(root, 'broker.jsonl') })
+    vi.spyOn(rig.runtime.broker, 'receipts').mockReturnValue([{ ...address, runtimeDir: root, imageRef: 'owned-image',
+      createdAt: new Date().toISOString(), requestDigest: 'd'.repeat(64) }])
+    vi.spyOn(rig.runtime.broker, 'receiptIds').mockReturnValue(new Set([address.containerId]))
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    vi.stubEnv('PATH', `${root}${path.delimiter}${process.env.PATH}`)
+    try {
+      for (const [mode, expected] of [
+        ['stopped', { present: true, running: false }], ['running', { present: true, running: true }], ['absent', { present: false, running: false }],
+      ] as const) {
+        await fsp.writeFile(modeFile, mode)
+        await expect(rig.ownedContainerState(address)).resolves.toEqual(expected)
+      }
+      await fsp.writeFile(modeFile, 'failed')
+      await expect(rig.ownedContainerState(address)).rejects.toThrow(/probe|inspection/)
+      await fsp.writeFile(modeFile, 'ambiguous')
+      await expect(rig.ownedContainerState(address)).rejects.toThrow(/ambiguous|differs/)
+      await fsp.writeFile(modeFile, 'malformed')
+      await expect(rig.ownedContainerState(address)).rejects.toThrow()
+      const before = await fsp.readFile(calls, 'utf8')
+      await expect(rig.ownedContainerState({ ...address, hostBootId: 'foreign' })).rejects.toThrow(/boot|address/)
+      await expect(rig.ownedContainerState({ ...address, runId: 'foreign' })).rejects.toThrow(/owned|address/)
+      expect(await fsp.readFile(calls, 'utf8')).toBe(before)
+    } finally { vi.unstubAllEnvs(); await fsp.rm(root, { recursive: true, force: true }) }
+  })
+})
+
 describe('fixed fresh-agent launch observations', () => {
   it('crashes the matching fresh provider child rather than its adapter PID', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 5, {}, {}, 'release', {
