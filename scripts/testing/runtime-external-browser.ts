@@ -195,6 +195,38 @@ export function validateManagedWebProvenance(observed: unknown, candidateSha: st
   }
 }
 
+export type OwnedWebDiagnosticRecord = {
+  pid: number; bootAttemptCount: number; ignoredLineCount: number
+  facts: { severity: string; event: string; fields: Record<string, string | number | boolean> }[]
+}
+
+function ownedWebDiagnosticFacts(output: { stdout: string; stderr: string }): Pick<OwnedWebDiagnosticRecord, 'facts' | 'ignoredLineCount'> {
+  const facts: OwnedWebDiagnosticRecord['facts'] = []
+  let ignoredLineCount = 0
+  for (const line of `${output.stdout}\n${output.stderr}`.split('\n').filter(value => value.trim())) {
+    let body: unknown
+    try { body = JSON.parse(line) } catch { ignoredLineCount++; continue }
+    const parsed = z.object({ level: z.enum(['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']),
+      fields: z.record(z.string(), z.unknown()).optional() }).passthrough().safeParse(body)
+    if (!parsed.success) { ignoredLineCount++; continue }
+    const values = { ...parsed.data, ...parsed.data.fields }
+    const event = values.message ?? values.event
+    if (typeof event !== 'string' || !/^(?:fresh_agent|freshagent|managed_runtime|runtime|server)\.[A-Za-z0-9_.]+$/.test(event)) {
+      ignoredLineCount++; continue
+    }
+    const fields: Record<string, string | number | boolean> = {}
+    for (const key of ['code', 'runtime_code', 'runtime_error_code', 'soul_id', 'incarnation_id', 'terminal_id',
+      'session_id', 'request_id', 'provider', 'session_type', 'outcome', 'reason', 'evidence_revision',
+      'identity_revision', 'control_epoch', 'execution_generation', 'native_session_id', 'host_boot_id']) {
+      const value = values[key]
+      if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))
+        || (typeof value === 'string' && /^[A-Za-z0-9_.:()/-]{1,256}$/.test(value))) fields[key] = value
+    }
+    facts.push({ severity: parsed.data.level.toLowerCase(), event, fields })
+  }
+  return { facts, ignoredLineCount }
+}
+
 /** The runtime owner supplies the artifact; this class never builds or locates a foreign server. */
 export class ManagedRuntimeWebServer implements RuntimeWebHandle {
   private process?: OwnedRuntimeChild
@@ -202,14 +234,16 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
   private homeDir?: string
   private bootCount = 0
   private homeConfigured = false
+  private lastOutput = { stdout: '', stderr: '' }
 
-  constructor(private readonly options: RuntimeWebConstructOptions) {}
+  constructor(private readonly options: RuntimeWebConstructOptions,
+    private readonly diagnostics?: (record: OwnedWebDiagnosticRecord) => void | Promise<void>) {}
 
   get info(): RuntimeWebInfo {
     if (!this.current) throw new Error('owned managed web is not started')
     return this.current
   }
-  capturedOutput(): { stdout: string; stderr: string } { return this.process?.output() ?? { stdout: '', stderr: '' } }
+  capturedOutput(): { stdout: string; stderr: string } { return this.process?.output() ?? this.lastOutput }
   processEvidence(): { pid: number; bootAttemptCount: number } {
     return { pid: this.info.pid, bootAttemptCount: this.bootCount }
   }
@@ -292,7 +326,12 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
     return this.boot(port, token)
   }
   async kill(signal: NodeJS.Signals = 'SIGKILL'): Promise<void> {
-    if (this.process) await this.process.stop(signal)
+    if (this.process) {
+      await this.process.stop(signal)
+      this.lastOutput = this.process.output()
+      await this.diagnostics?.({ pid: this.process.identity.pid, bootAttemptCount: this.bootCount,
+        ...ownedWebDiagnosticFacts(this.lastOutput) })
+    }
     this.process = undefined
   }
   async stop(): Promise<void> {
@@ -848,7 +887,7 @@ export class OwnedRetainedBrowserFixtures implements ExternalRetainedFixtureCont
   private readonly cleanupErrors: string[] = []
   constructor(private readonly owner: ManagedRuntimeOwner, private readonly artifacts: RetainedArtifacts,
     private readonly allowed: readonly ('config' | 'legacy')[],
-    private readonly webFactory: RuntimeWebFactory = options => new ManagedRuntimeWebServer(options)) {}
+    private readonly webFactory?: RuntimeWebFactory) {}
 
   get backend(): string { return this.activeWeb?.info.baseUrl ?? this.owner.info.baseUrl }
   start(fixtureId: 'config' | 'legacy'): void {
@@ -860,7 +899,9 @@ export class OwnedRetainedBrowserFixtures implements ExternalRetainedFixtureCont
     this.session = new RetainedFixtureBrowserSession()
     this.facts = undefined
     const factory: RuntimeWebFactory = options => {
-      const web = this.webFactory({ ...options, token: this.owner.info.token })
+      const configured = { ...options, token: this.owner.info.token }
+      const web = this.webFactory ? this.webFactory(configured) : new ManagedRuntimeWebServer(configured,
+        record => h.recordLifecycle('external.web_diagnostics', { severity: 'info', ...record }))
       this.webs.add(web)
       const start = web.start.bind(web), stop = web.stop.bind(web)
       web.start = async () => { const info = await start(); this.activeWeb = web; return info }
@@ -1538,7 +1579,10 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
       : path.basename(selection.spec).includes('resurrection') ? 3
         : path.basename(selection.spec).includes('rehydrate') ? 4
           : /chaos|lost-soul/.test(selection.spec) ? 5 : 2
-    this.owner = new ManagedRuntimeOwner(options => new ManagedRuntimeWebServer({ ...options, preserveHomeOnStop: false }), root, phase,
+    this.owner = new ManagedRuntimeOwner(options => new ManagedRuntimeWebServer({ ...options, preserveHomeOnStop: false }, record => {
+      if (!this.owner) throw new Error('owned web diagnostic sink is unavailable')
+      this.owner.runtime.recordLifecycle('external.web_diagnostics', { severity: 'info', ...record })
+    }), root, phase,
       {}, {}, deterministic || sourceSelection ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
         fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
         bootstrapProviders: deterministic || retainedArtifacts ? [] : sourceSelection ? ['opencode']

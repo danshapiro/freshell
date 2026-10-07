@@ -410,6 +410,42 @@ describe('owned web process lifetime (Node process fixture only)', () => {
     })
     return { fixture, entry, home, setup }
   }
+  it('retains stopped owned output and records structured failure facts without credentials or bodies', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    const line = { level: 'WARN', fields: { message: 'fresh_agent.hosted_snapshot_unavailable',
+      code: 'CAPABILITY_PENDING', soul_id: 'owned-soul', authToken: 'credential-must-not-persist', transcript: 'body-must-not-persist' } }
+    await fsp.writeFile(entry, `process.stderr.write(${JSON.stringify(JSON.stringify(line) + '\n')});\n${await fsp.readFile(entry, 'utf8')}`)
+    const diagnostics = vi.fn()
+    const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
+      candidateSha: 'a'.repeat(40), buildDirty: false, setupHome: setup, preserveHomeOnStop: false,
+      env: { NODE_OPTIONS: `--require=${entry}` } }, diagnostics)
+    let pid: number | undefined
+    try {
+      pid = (await server.start()).pid
+      await server.stop()
+      expect(diagnostics).toHaveBeenCalledOnce()
+      expect(diagnostics.mock.calls[0][0]).toMatchObject({ pid, bootAttemptCount: 1,
+        facts: [{ severity: 'warn', event: 'fresh_agent.hosted_snapshot_unavailable', fields: { code: 'CAPABILITY_PENDING', soul_id: 'owned-soul' } }] })
+      expect(JSON.stringify(diagnostics.mock.calls)).not.toContain('credential-must-not-persist')
+      expect(JSON.stringify(diagnostics.mock.calls)).not.toContain('body-must-not-persist')
+      expect(server.capturedOutput().stderr).toContain('fresh_agent.hosted_snapshot_unavailable')
+      await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
+    } finally { await server.stop(); await fsp.rm(directory, { recursive: true }) }
+  })
+  it('reports diagnostic finalizer failure after stopping only its exact owned web child', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    let failed = true
+    const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
+      candidateSha: 'a'.repeat(40), buildDirty: false, setupHome: setup, preserveHomeOnStop: false,
+      env: { NODE_OPTIONS: `--require=${entry}` } }, () => {
+      if (failed) throw new Error('owned diagnostic write failed')
+    })
+    try {
+      const { pid } = await server.start()
+      await expect(server.stop()).rejects.toThrow('owned diagnostic write failed')
+      await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
+    } finally { failed = false; await server.stop(); await fsp.rm(directory, { recursive: true }) }
+  })
   it('stops the actual factory-created web PID when retained producer readiness fails', async () => {
     const { fixture: directory, entry } = await fixture()
     const h = new RuntimeHarness(process.cwd(), undefined, 3)
