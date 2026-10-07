@@ -4882,6 +4882,25 @@ impl FreshClaudeState {
         .await
     }
 
+    /// Private managed recovery control. Its receipt certifies only admission
+    /// of the exact checkpoint continuation to the current sidecar input stream.
+    pub async fn resume_native_checkpoint_checked(
+        &self,
+        session_id: &str,
+        session_type: SessionType,
+        checkpoints: Vec<Value>,
+        native_binding: Value,
+    ) -> Result<(), NativeControlFailure> {
+        self.dispatch_native_control_checked(
+            session_id,
+            session_type,
+            "checkpoint",
+            uuid::Uuid::new_v4().to_string(),
+            json!({"checkpoints":checkpoints,"nativeBinding":native_binding}),
+        )
+        .await
+    }
+
     async fn dispatch_native_control_checked(
         &self,
         session_id: &str,
@@ -4902,18 +4921,31 @@ impl FreshClaudeState {
         let (send, receive) = tokio::sync::oneshot::channel();
         {
             let mut state = pending.lock().expect("pending lock");
-            let present = if kind == "permission" {
-                state
+            let present = match kind {
+                "permission" => state
                     .permissions
                     .iter()
-                    .any(|entry| entry.request_id == request_id)
-            } else {
-                state
+                    .any(|entry| entry.request_id == request_id),
+                "question" => state
                     .questions
                     .iter()
-                    .any(|entry| entry.request_id == request_id)
+                    .any(|entry| entry.request_id == request_id),
+                "checkpoint" => {
+                    payload["checkpoints"]
+                        .as_array()
+                        .is_some_and(|keys| !keys.is_empty() && keys.len() <= 32)
+                        && payload["nativeBinding"]["launch"].is_object()
+                        && payload["nativeBinding"]["queryGeneration"]
+                            .as_u64()
+                            .is_some_and(|generation| generation > 0)
+                }
+                _ => false,
             };
-            let native_request_id = state.native_requests.get(&key).cloned();
+            let native_request_id = if kind == "checkpoint" {
+                Some(request_id.clone())
+            } else {
+                state.native_requests.get(&key).cloned()
+            };
             if !present || native_request_id.is_none() || state.native_dispatches.contains_key(&key)
             {
                 return Err(reject(
@@ -4926,7 +4958,11 @@ impl FreshClaudeState {
                 .insert(key.clone(), (native_request_id.unwrap(), send));
         }
         let mut command = payload;
-        command["type"] = json!(format!("{kind}.respond"));
+        command["type"] = json!(if kind == "checkpoint" {
+            "checkpoint.resume".into()
+        } else {
+            format!("{kind}.respond")
+        });
         command["sessionId"] = json!(session.sidecar_session_id);
         command["requestId"] = json!(request_id);
         let written = write_line(&mut session.stdin, &command).await;
@@ -4955,7 +4991,7 @@ impl FreshClaudeState {
                 state
                     .permissions
                     .retain(|entry| entry.request_id != request_id)
-            } else {
+            } else if kind == "question" {
                 state
                     .questions
                     .retain(|entry| entry.request_id != request_id)
@@ -9177,14 +9213,14 @@ fn fold_pending_frame(pending: &std::sync::Mutex<ClaudePending>, value: &Value) 
         return;
     };
     match sdk_type {
-        "sdk.permission.dispatch" | "sdk.question.dispatch" => {
+        "sdk.permission.dispatch" | "sdk.question.dispatch" | "sdk.checkpoint.dispatch" => {
             let Some(request_id) = value.get("requestId").and_then(frame_request_id) else {
                 return;
             };
-            let kind = if sdk_type == "sdk.permission.dispatch" {
-                "permission"
-            } else {
-                "question"
+            let kind = match sdk_type {
+                "sdk.permission.dispatch" => "permission",
+                "sdk.question.dispatch" => "question",
+                _ => "checkpoint",
             };
             let key = format!("{kind}:{request_id}");
             let mut state = pending.lock().expect("pending lock");
@@ -9418,6 +9454,7 @@ fn normalize_sdk_type(sdk_type: &str) -> Option<&'static str> {
         "sdk.session.snapshot" => "freshAgent.session.snapshot",
         "sdk.session.changed" => "freshAgent.session.changed",
         "sdk.session.init" => "freshAgent.session.init",
+        "sdk.session.loading" => "freshAgent.session.loading",
         "sdk.session.metadata" => "freshAgent.session.metadata",
         "sdk.assistant" => "freshAgent.assistant",
         "sdk.tool.result" => "freshAgent.tool.result",
@@ -11016,6 +11053,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn native_loading_frame_preserves_current_binding_through_the_actual_normalizer() {
+        let binding = json!({"launch":{"incarnationId":"current","launchNonce":"nonce",
+            "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":null},"queryGeneration":2});
+        for flavor in ["freshclaude", "kilroy"] {
+            let frame = sdk_line_to_frame(
+                &json!({"type":"sdk.session.loading", "sessionId":"local-key",
+                "nativeBinding":binding}),
+                "native-public-root",
+                flavor,
+            )
+            .expect("current loading must reach the host before another query can be certified");
+            let wire: ServerMessage = serde_json::from_str(&frame).unwrap();
+            let ServerMessage::FreshAgentEvent(wire) = wire else {
+                panic!("wrong normalized envelope")
+            };
+            assert_eq!(wire.session_id, "native-public-root");
+            assert_eq!(wire.session_type, flavor);
+            assert_eq!(wire.event["type"], "freshAgent.session.loading");
+            assert_eq!(wire.event["nativeBinding"], binding);
+        }
+    }
+
+    #[test]
     fn session_init_frame_carries_inner_type_and_durable_uuid() {
         // sdk.session.init → freshAgent.event { event.type: freshAgent.session.init, cliSessionId }.
         let line = json!({
@@ -11356,6 +11416,12 @@ rl.on('line', (line) => {
     }
     if (deferCreateMs > 0) setTimeout(answer, deferCreateMs)
     else answer()
+  } else if (msg.type === 'checkpoint.resume') {
+    if (respondLog) fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
+    console.log(JSON.stringify({ type: 'sdk.checkpoint.dispatch', sessionId: msg.sessionId, requestId: msg.requestId,
+      nativeRequestId: 'old-release', ok: true }))
+    console.log(JSON.stringify({ type: 'sdk.checkpoint.dispatch', sessionId: msg.sessionId, requestId: msg.requestId,
+      nativeRequestId: msg.requestId, ok: true }))
   } else if (msg.type === 'configure') {
     if (respondLog) fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
     console.log(JSON.stringify({ type: 'sdk.session.changed', sessionId: msg.sessionId, reason: 'session-commands', commands: [{ name: 'review', description: 'Review changes' }] }))
@@ -18917,6 +18983,71 @@ rl.on('line', (line) => {
             &json!({"type":"sdk.permission.dispatch","requestId":"current-card","nativeRequestId":"current-native","ok":true}),
         );
         assert!(receive.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn checked_checkpoint_release_uses_the_actual_owned_child_receipt() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut events) = state_with_bus();
+        state
+            .handle_create(dedup_create_msg("checked-release-create"), None)
+            .await;
+        let created = await_claude_created(&mut events, "checked-release-create").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_owned();
+        let checkpoints = json!([{"nativeSessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","toolUseID":"toolu_original1"}]);
+        let binding =
+            json!({"launch":{"incarnationId":"owned","launchNonce":"current"},"queryGeneration":1});
+        let result = state
+            .dispatch_native_control_checked(
+                &session_id,
+                SessionType::Freshclaude,
+                "checkpoint",
+                "release-current".into(),
+                json!({"checkpoints":checkpoints,"nativeBinding":binding}),
+            )
+            .await;
+        state.shutdown().await;
+        assert!(
+            result.is_ok(),
+            "only the current real child receipt may certify private release dispatch: {result:?}"
+        );
+        let commands = env.respond_log_frames(1).await;
+        let command = commands
+            .iter()
+            .find(|command| command["type"] == "checkpoint.resume")
+            .expect("private release must reach owned child stdin");
+        assert_eq!(command["checkpoints"], checkpoints);
+        assert_eq!(command["nativeBinding"], binding);
+        assert_eq!(command["requestId"], "release-current");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_dispatch_fold_requires_current_release_request_and_native_receipt() {
+        let pending = std::sync::Mutex::new(ClaudePending::default());
+        let (send, mut receive) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().native_dispatches.insert(
+            "checkpoint:release-current".into(),
+            ("release-current".into(), send),
+        );
+        for frame in [
+            json!({"type":"sdk.checkpoint.dispatch","requestId":"release-old","nativeRequestId":"release-current","ok":true}),
+            json!({"type":"sdk.checkpoint.dispatch","requestId":"release-current","nativeRequestId":"release-old","ok":true}),
+        ] {
+            fold_pending_frame(&pending, &frame);
+            assert!(matches!(
+                receive.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.checkpoint.dispatch","requestId":"release-current","nativeRequestId":"release-current","ok":true}),
+        );
+        assert!(receive
+            .try_recv()
+            .expect("current release receipt must settle the checked private control")
+            .is_ok());
     }
 
     #[tokio::test]

@@ -71,15 +71,18 @@
 // sdk.permission.request / sdk.question.request, and waits for the Rust side's
 // permission.respond / question.respond (unknown respond ids return a typed
 // rejection). Managed dispatch acknowledgements follow the actual native stdin
-// control write; they do not certify a tool effect. The auto-allow shortcut remains ONLY for bypassPermissions sessions
+// control write; they do not certify a tool effect. The auto-allow shortcut remains ONLY for unbound legacy bypassPermissions sessions
 // (AskUserQuestion still routes to the question path first, per legacy ordering).
 
 import { createInterface } from 'node:readline'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
+import { readFile, readdir, lstat } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
-import { createNativeSessionChannel } from './native-session-channel.mjs'
+import { createNativeSessionChannel, nativeInputDigest } from './native-session-channel.mjs'
+import { createNativeCheckpointStore } from './native-checkpoint-state.mjs'
 import { spawnObservedNative } from './native-process.mjs'
 import {
   canUseTool as routeCanUseTool,
@@ -119,6 +122,59 @@ function createClaudeSdkCleanEnv(env = process.env) {
   const { CLAUDECODE: _c, ANTHROPIC_API_KEY: apiKey, FRESHELL_CLAUDE_ONECLI_API_KEY: onecliApiKey, ...cleanEnv } = env
   if (onecliApiKey === '1' && apiKey) cleanEnv.ANTHROPIC_API_KEY = apiKey
   return cleanEnv
+}
+
+// Bind only the selected native profile, excluding rotating grant/auth files.
+// These are known settings/plugin resources, never a native identity search.
+async function nativeProfileDigest(req, settings) {
+  const digest = createHash('sha256')
+  digest.update(JSON.stringify({ cwd: req.cwd ?? null, model: settings.model ?? null,
+    effort: settings.effort ?? null, permissionMode: settings.permissionMode ?? null,
+    plugins: req.plugins ?? [] }))
+  const userDirectory = process.env.CLAUDE_CONFIG_DIR ?? join(process.env.HOME ?? '', '.claude')
+  const projectDirectory = join(resolve(req.cwd ?? process.cwd()), '.claude')
+  let bytesRead = 0
+  async function addFile(path) {
+    try {
+      const bytes = await readFile(path)
+      bytesRead += bytes.length
+      if (bytesRead > 32 * 1024 * 1024) throw new Error('selected native profile exceeds bounded read')
+      digest.update(path).update('\0').update(bytes).update('\0')
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+      digest.update(path).update('\0absent\0')
+    }
+  }
+  for (const path of [join(userDirectory, 'settings.json'), join(projectDirectory, 'settings.json'),
+    join(projectDirectory, 'settings.local.json')]) await addFile(path)
+  async function addPlugin(directory) {
+    for (const name of (await readdir(directory)).sort()) {
+      if (name === '.git') continue
+      const path = join(directory, name)
+      const metadata = await lstat(path)
+      if (metadata.isDirectory()) await addPlugin(path)
+      else if (metadata.isFile()) await addFile(path)
+      else throw new Error('selected native plugin resource is unsupported')
+    }
+  }
+  for (const plugin of req.plugins ?? []) await addPlugin(plugin)
+  return digest.digest('hex')
+}
+
+async function routeNativePermission({ session, sessionId, req, launch, generation, toolName, input, options }) {
+  let currentOptions = options
+  const record = session.nativeContinuation
+  if (record) {
+    const binding = { launch, queryGeneration: generation, nativeRequestId: options?.requestId }
+    if (toolName !== 'Bash' || await nativeProfileDigest(req, session.settings) !== record.profileDigest
+      || !await session.nativeStore.parkPermission(options?.toolUseID, nativeInputDigest(input), binding)
+      || session.queryGeneration !== generation || !session.nativeReady) {
+      return { behavior: 'deny', message: 'Current original native checkpoint is unavailable' }
+    }
+    currentOptions = { ...options, publicDecisionId: 'checkpoint-' + record.checkpoint.checkpointUuid,
+      nativeCheckpoint: { ...record.checkpoint, profileDigest: record.profileDigest }, nativeBinding: binding }
+  }
+  return routeCanUseTool({ session, emit, nanoid, nextMonotonic, sessionId, toolName, input, options: currentOptions })
 }
 
 // ── streaming input stream (server/sdk-bridge.ts:274-316) ────────────────────
@@ -215,7 +271,7 @@ function publishCommands(sessionId, state) {
 }
 
 // ── SDK message -> sdk.* event (faithful port of SdkBridge.handleSdkMessage) ──
-function handleSdkMessage(sessionId, msg) {
+async function handleSdkMessage(sessionId, msg) {
   const st = sessions.get(sessionId)
   if (!st) return
 
@@ -287,6 +343,8 @@ function handleSdkMessage(sessionId, msg) {
     }
     case 'assistant': {
       const content = msg.message?.content || []
+      const tools = content.filter((block) => block.type === 'tool_use')
+      st.nativeSoloTool = tools.length === 1 ? tools[0] : undefined
       const blocks = content.map((b) => {
         if (b.type === 'text') return { type: 'text', text: b.text }
         if (b.type === 'thinking') return { type: 'thinking', thinking: b.thinking }
@@ -299,11 +357,27 @@ function handleSdkMessage(sessionId, msg) {
     }
     case 'user': {
       const content = Array.isArray(msg.message?.content) ? msg.message.content.filter((block) => block.type === 'tool_result') : []
+      if (st.nativeContinuation && msg.session_id === st.cliSessionId) {
+        for (const block of content) {
+          if (await st.nativeStore.finishNativeResult(block.tool_use_id, block.is_error)) st.nativeContinuation = undefined
+        }
+      }
       if (content.length) emit({ type: 'sdk.tool.result', sessionId, nativeSessionId: msg.session_id,
         uuid: msg.uuid, parentToolUseId: msg.parent_tool_use_id, content })
       break
     }
     case 'result': {
+      if (st.nativeChannel && msg.stop_reason === 'tool_deferred') {
+        const tool = msg.deferred_tool_use
+        if (!tool || tool.name !== 'Bash' || msg.session_id !== st.cliSessionId
+          || st.nativeSoloTool?.id !== tool.id || nativeInputDigest(st.nativeSoloTool.input) !== nativeInputDigest(tool.input)) {
+          throw new Error('native deferred result does not match the original solo operation')
+        }
+        const record = await st.nativeStore.publish(tool.id, nativeInputDigest(tool.input))
+        if (!record) throw new Error('native deferred checkpoint is unavailable or ambiguous')
+        await continueNativeCheckpoint(sessionId, st, record)
+        break
+      }
       // The awaited turn's terminal frame arrived: drop one pending send
       // (clamped at 0 — an unsolicited result must not underflow the counter).
       st.pendingResults = Math.max(0, st.pendingResults - 1)
@@ -347,7 +421,7 @@ async function consumeStream(sessionId, sdkQuery) {
   const abort = st?.abort
   try {
     for await (const msg of sdkQuery) {
-      if (st?.query === sdkQuery && sessions.get(sessionId) === st) handleSdkMessage(sessionId, msg)
+      if (st?.query === sdkQuery && sessions.get(sessionId) === st) await handleSdkMessage(sessionId, msg)
     }
   } catch (err) {
     if (st?.query === sdkQuery) emit({ type: 'sdk.error', sessionId, message: `SDK error: ${err?.message || 'Unknown error'}` })
@@ -424,6 +498,36 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
       abortController: abort,
       env: { ...createClaudeSdkCleanEnv(process.env), ...state.nativeChannel?.env },
       settings: state.nativeChannel?.settings,
+      hooks: state.nativeChannel ? { PreToolUse: [{ matcher: 'Bash', hooks: [async (input) => {
+        const deny = (reason) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse',
+          permissionDecision: 'deny', permissionDecisionReason: reason } })
+        if (state.queryGeneration !== generation || !state.nativeReady || input.session_id !== state.cliSessionId) {
+          return deny('Current native query is not observed')
+        }
+        const original = state.nativeContinuation?.checkpoint
+        if (original) {
+          if (original.toolUseID !== input.tool_use_id || original.inputDigest !== nativeInputDigest(input.tool_input)) {
+            return deny('Native continuation changed its original operation')
+          }
+          return {}
+        }
+        // SDK control callbacks and the output iterator have independent
+        // consumers. Wait briefly for the actual assistant batch; never infer
+        // solo execution from the hook's one-tool view alone.
+        const deadline = Date.now() + 100
+        while (state.nativeSoloTool?.id !== input.tool_use_id && Date.now() < deadline
+          && state.queryGeneration === generation && !abort.signal.aborted) {
+          await new Promise((resolve) => setTimeout(resolve, 1))
+        }
+        if (state.queryGeneration !== generation || !state.nativeReady || abort.signal.aborted) {
+          return deny('Current native query was replaced')
+        }
+        const solo = state.nativeSoloTool
+        if (solo?.name !== 'Bash' || solo.id !== input.tool_use_id
+          || nativeInputDigest(solo.input) !== nativeInputDigest(input.tool_input)) return {}
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'defer',
+          permissionDecisionReason: 'Managed native no-effect continuation checkpoint' } }
+      }] }] } : undefined,
       spawnClaudeCodeProcess: state.nativeChannel ? (options) => spawnObservedNative(options, {
         onStderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
         onControlWrite: (frame, error) => {
@@ -446,7 +550,7 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
         // AskUserQuestion routes first (even under bypassPermissions), then the
         // bypass fast-path, else park-and-surface a pending request — legacy
         // ordering, sdk-bridge.ts:203-214.
-        return routeCanUseTool({ session: s, emit, nanoid, nextMonotonic, sessionId, toolName, input, options })
+        return routeNativePermission({ session: s, sessionId, req, launch, generation, toolName, input, options })
       },
     },
   })
@@ -467,8 +571,15 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
   if (announceCreated) emit({ type: 'created', requestId: req.requestId, sessionId })
   consumeStream(sessionId, sdkQuery).catch((err) => logerr(`consume error: ${err?.message}`))
   if (state.nativeChannel) {
-    state.nativeReadyPromise = state.nativeChannel.waitReady(sdkQuery).then((observation) => {
+    state.nativeReadyPromise = state.nativeChannel.waitReady(sdkQuery).then(async (observation) => {
       if (sessions.get(sessionId) !== state || state.queryGeneration !== generation || abort.signal.aborted) return
+      if (req.resumeSessionId && observation.nativeSessionId !== req.resumeSessionId) throw new Error('native exact resume changed root')
+      if (await nativeProfileDigest(req, state.settings) !== state.nativeProfileDigest) throw new Error('selected native profile changed during startup')
+      if (state.queryGeneration !== generation || abort.signal.aborted) return
+      state.nativeStore = createNativeCheckpointStore({ nativeSessionId: observation.nativeSessionId,
+        transcriptPath: observation.native.transcript_path,
+        recordPath: join(dirname(observation.native.transcript_path), '.freshell-checkpoint-' + observation.nativeSessionId + '.json'),
+        profileDigest: state.nativeProfileDigest, allowMissingTranscript: !req.resumeSessionId })
       state.nativeReady = true
       state.cliSessionId = observation.nativeSessionId
       emit({ type: 'sdk.session.init', sessionId, cliSessionId: observation.nativeSessionId,
@@ -480,6 +591,63 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
       emit({ type: 'sdk.error', sessionId, message: `native startup: ${error.message}` })
       abort.abort()
     })
+  }
+}
+
+async function continueNativeCheckpoint(sessionId, state, record) {
+  const previousQuery = state.query
+  const previousAbort = state.abort
+  state.query = undefined
+  state.nativeContinuation = record
+  state.nativeReady = false
+  emit({ type: 'sdk.session.loading', sessionId,
+    nativeBinding: { launch: state.launch, queryGeneration: state.queryGeneration + 1 } })
+  state.abort = new AbortController()
+  previousQuery.close?.()
+  previousAbort.abort()
+  await openSessionQuery(sessionId, state, { ...state.createRequest, resumeSessionId: record.nativeSessionId }, state.launch, false)
+  await state.nativeReadyPromise
+  await deliverNativeContinuation(sessionId, state, record)
+}
+
+async function deliverNativeContinuation(sessionId, state, record) {
+  const generation = state.queryGeneration
+  if (!state.nativeReady || !await state.nativeStore.beginContinuation()) throw new Error('current native continuation could not be claimed')
+  if (sessions.get(sessionId) !== state || state.queryGeneration !== generation || !state.nativeReady || state.abort.signal.aborted) {
+    throw new Error('native continuation query changed before delivery')
+  }
+  state.nativeContinuation = record
+  state.inputStream.push({ type: 'user', message: { role: 'user', content: 'Continue only the original pending native operation. Do not select another tool.' },
+    parent_tool_use_id: null, session_id: record.nativeSessionId })
+}
+
+async function handleCheckpointResume(req) {
+  const state = sessions.get(req.sessionId)
+  const receipt = (ok, message) => emit({ type: 'sdk.checkpoint.dispatch', sessionId: req.sessionId,
+    requestId: req.requestId, nativeRequestId: req.requestId, ok, message })
+  try {
+    const binding = req.nativeBinding
+    if (!state?.nativeReady || !state.nativeStore || state.nativeContinuation
+      || typeof req.requestId !== 'string' || !req.requestId
+      || !Array.isArray(req.checkpoints) || req.checkpoints.length > 32
+      || binding?.queryGeneration !== state.queryGeneration
+      || !binding.launch || !Object.keys(state.launch).every((key) => binding.launch[key] === state.launch[key])) {
+      receipt(false, 'current native checkpoint release is unavailable')
+      return
+    }
+    const record = await state.nativeStore.readRecoverable()
+    const expected = record && { ...record.checkpoint, profileDigest: record.profileDigest }
+    if (!expected || !req.checkpoints.some((checkpoint) => checkpoint &&
+      Object.keys(expected).every((key) => checkpoint[key] === expected[key]))
+      || await nativeProfileDigest(state.createRequest, state.settings) !== record.profileDigest) {
+      receipt(false, 'trusted original native checkpoint does not match current source/profile')
+      return
+    }
+    await deliverNativeContinuation(req.sessionId, state, record)
+    state.pendingResults += 1
+    receipt(true)
+  } catch (error) {
+    receipt(false, error?.message ?? 'native continuation release failed')
   }
 }
 
@@ -516,6 +684,9 @@ async function handleCreate(req) {
 
     const launch = process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH
       ? JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) : undefined
+    state.createRequest = req
+    state.launch = launch
+    if (launch) state.nativeProfileDigest = await nativeProfileDigest(req, state.settings)
     await openSessionQuery(sessionId, state, req, launch)
   } catch (err) {
     if (sessionId) sessions.delete(sessionId)
@@ -523,7 +694,7 @@ async function handleCreate(req) {
   }
 }
 
-function handleSend(req) {
+async function handleSend(req) {
   const st = sessions.get(req.sessionId)
   // ep3-r2 F2: the signed frame — when the JS session is gone but stdout stays
   // open (consumeStream deleted it), NO terminal edge or EOF follows; the Rust
@@ -532,6 +703,17 @@ function handleSend(req) {
   if (st.nativeChannel && !st.nativeReady) {
     emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'native startup is not observed' })
     return
+  }
+  if (st.nativeStore) {
+    const generation = st.queryGeneration
+    if (await st.nativeStore.inputState() !== 'clear') {
+      emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'Native checkpoint requires a current fenced continuation; ordinary input is blocked' })
+      return
+    }
+    if (sessions.get(req.sessionId) !== st || generation !== st.queryGeneration || !st.nativeReady || st.abort.signal.aborted) {
+      emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'Current native query changed before input admission' })
+      return
+    }
   }
   // ep4-r3: /compact is the only dispatch rollback ever absorbs; mark it so
   // the quiesce handler can drain never-handed compacts from the input queue
@@ -664,11 +846,22 @@ rl.on('line', (line) => {
   try { req = JSON.parse(trimmed) } catch { logerr(`unparseable request: ${trimmed.slice(0, 200)}`); return }
   switch (req?.type) {
     case 'create': handleCreate(req); break
-    case 'send': handleSend(req); break
+    case 'send': {
+      const st = sessions.get(req.sessionId)
+      if (st?.nativeStore) st.inputChain = (st.inputChain ?? Promise.resolve()).then(() => handleSend(req))
+      else void handleSend(req)
+      break
+    }
     case 'configure': {
       const st = sessions.get(req.sessionId)
       if (st) st.configureChain = (st.configureChain ?? Promise.resolve()).then(() => handleConfigure(req))
       else void handleConfigure(req)
+      break
+    }
+    case 'checkpoint.resume': {
+      const st = sessions.get(req.sessionId)
+      if (st) st.controlChain = (st.controlChain ?? Promise.resolve()).then(() => handleCheckpointResume(req))
+      else void handleCheckpointResume(req)
       break
     }
     case 'interrupt': handleInterrupt(req); break
@@ -686,10 +879,18 @@ rl.on('line', (line) => {
         break
       }
       // Unknown requestId: reject without resolving any callback.
-      if (!respondPermission(st, String(req.requestId), req.decision)) {
-        logerr(`permission.respond: no pending request ${req.requestId} for session ${req.sessionId}`)
-        emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'current callback unavailable' })
-      }
+      st.controlChain = (st.controlChain ?? Promise.resolve()).then(async () => {
+        const current = st.pendingPermissions?.get(String(req.requestId))
+        if (current?.nativeCheckpoint && !await st.nativeStore.beginDecision(current.nativeBinding.nativeRequestId)) {
+          emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'current checkpoint decision is unavailable' })
+          return
+        }
+        if (!respondPermission(st, String(req.requestId), req.decision)) {
+          logerr(`permission.respond: no pending request ${req.requestId} for session ${req.sessionId}`)
+          emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'current callback unavailable' })
+        }
+      }).catch((error) => emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId,
+        ok: false, message: error.message, acceptanceAmbiguous: true }))
       break
     }
     case 'question.respond': {

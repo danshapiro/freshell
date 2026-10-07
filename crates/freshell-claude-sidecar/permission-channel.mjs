@@ -46,7 +46,7 @@ export function raisePermissionRequest({ session, emit, nanoid, nextMonotonic, s
     return Promise.resolve({ behavior: 'deny', message: 'Aborted by provider' })
   }
   ensurePending(session)
-  const requestId = nanoid()
+  const requestId = options?.publicDecisionId ?? nanoid()
   const wasIdle = session.pendingPermissions.size === 0 && session.pendingQuestions.size === 0
   return new Promise((resolve) => {
     session.pendingPermissions.set(requestId, {
@@ -56,6 +56,8 @@ export function raisePermissionRequest({ session, emit, nanoid, nextMonotonic, s
       suggestions: options?.suggestions,
       blockedPath: options?.blockedPath,
       decisionReason: options?.decisionReason,
+      nativeCheckpoint: options?.nativeCheckpoint,
+      nativeBinding: options?.nativeBinding,
       resolve,
     })
     if (session.nativeChannel && options?.requestId) {
@@ -79,6 +81,8 @@ export function raisePermissionRequest({ session, emit, nanoid, nextMonotonic, s
       tool: { name: toolName, input },
       toolUseID: options?.toolUseID,
       nativeRequestId: options?.requestId,
+      nativeCheckpoint: options?.nativeCheckpoint,
+      nativeBinding: options?.nativeBinding,
       suggestions: options?.suggestions,
       blockedPath: options?.blockedPath,
       decisionReason: options?.decisionReason,

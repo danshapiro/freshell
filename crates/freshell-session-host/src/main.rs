@@ -808,6 +808,28 @@ async fn dispatch_with_effects(
                         )?;
                     Ok(HostResult::TerminalOutput(batch))
                 }
+                HostCommand::FreshAgentResumePending { incarnation_id } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    ensure_current_fresh_native_observation(state).await?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    actor
+                        .resume_pending_native_permissions()
+                        .await
+                        .map_err(map_actor_error)?;
+                    let persisted = state.persisted.lock().await.clone();
+                    let native_session_id = current_native_observation(state, &persisted)
+                        .await
+                        .map(|observation| observation.native_session_id);
+                    Ok(HostResult::FreshAgentCommand {
+                        state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                        native_session_id,
+                    })
+                }
                 HostCommand::FreshAgentSend {
                     incarnation_id,
                     request_id,
@@ -815,6 +837,7 @@ async fn dispatch_with_effects(
                     settings,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
                         .lock()
@@ -838,6 +861,7 @@ async fn dispatch_with_effects(
                     input,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
                         .lock()
@@ -863,6 +887,7 @@ async fn dispatch_with_effects(
                     cwd,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
                         .lock()
@@ -893,6 +918,7 @@ async fn dispatch_with_effects(
                     cwd,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
                         .lock()
@@ -952,6 +978,7 @@ async fn dispatch_with_effects(
                     decision,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
                         .lock()
@@ -1563,6 +1590,7 @@ async fn grant_execution(
                 "sessionType":launch.session_type,
                 "runtimeVariant":profile.runtime_variant,
                 "nativeSessionId":profile.native_session_id,
+                "fixtureTransport":launch.fixture_transport,
             });
             *state.fresh_agent.lock().await = Some(actor);
             (std::process::id(), evidence, native_session_id)
@@ -1620,6 +1648,36 @@ async fn current_native_observation(
         freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
         &evidence,
     )
+}
+
+async fn ensure_current_fresh_native_observation(state: &HostState) -> Result<(), RuntimeError> {
+    let persisted = state.persisted.lock().await.clone();
+    // The typed deterministic transport exists only in the explicit fixture
+    // build. Its counters never certify native mode readiness.
+    if cfg!(feature = "fresh-agent-fixtures")
+        && persisted.fixture_evidence["fixtureTransport"] == "deterministic"
+    {
+        return Ok(());
+    }
+    if current_native_observation(state, &persisted)
+        .await
+        .is_some()
+    {
+        return Ok(());
+    }
+    append_event_with_secret(
+        &state.state_dir,
+        &state.secret,
+        "host.native_input.refused",
+        serde_json::json!({"severity":"warn","incarnationId":state.incarnation_id,
+            "executionGeneration":persisted.max_execution_generation,
+            "controlEpoch":persisted.max_control_epoch,"reason":"NATIVE_IDENTITY_UNOBSERVED"}),
+    )
+    .ok();
+    Err(RuntimeError::new(
+        RuntimeErrorCode::RecoveryWrongIdentity,
+        "current native provider observation is unavailable",
+    ))
 }
 
 fn adoption_status_for_required(required: bool) -> OpenCodeAdoptionStatus {
@@ -5139,6 +5197,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct RpcFixtureTransport {
+        native_evidence: std::sync::Mutex<Option<serde_json::Value>>,
         dispatches: AtomicUsize,
         decisions: AtomicUsize,
         operations: AtomicUsize,
@@ -5148,6 +5207,9 @@ mod tests {
 
     #[async_trait]
     impl FreshAgentTransport for RpcFixtureTransport {
+        async fn native_identity_evidence(&self) -> Option<serde_json::Value> {
+            self.native_evidence.lock().unwrap().clone()
+        }
         async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
             Ok(TransportStart {
                 native_session_id: Some("fixture-native-thread".into()),
@@ -5258,9 +5320,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_agent_input_refuses_a_withdrawn_current_native_observation_before_journaling() {
+        let state = test_host_state();
+        let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: state.incarnation_id.clone(),
+            launch_nonce: "current-rpc-native".into(),
+            evidence_revision: 0,
+            execution_generation: 1,
+            requested_native_session_id: Some("fixture-native-thread".into()),
+        };
+        state.persisted.lock().await.native_identity_launch = Some(binding.clone());
+        let transport = Arc::new(RpcFixtureTransport {
+            native_evidence: std::sync::Mutex::new(Some(
+                serde_json::json!({"launch":binding,"queryGeneration":1}),
+            )),
+            dispatches: AtomicUsize::new(0),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("current-native-rpc-agent"),
+            FreshAgentProfile {
+                provider: FreshProvider::Claude,
+                runtime_variant: "fixture-sdk".into(),
+                cwd: "/workspace".into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "fixture-store".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: Vec::new(),
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        *state.fresh_agent.lock().await = Some(actor.clone());
+        let persisted = state.persisted.lock().await.clone();
+        assert!(current_native_observation(&state, &persisted)
+            .await
+            .is_some());
+        *transport.native_evidence.lock().unwrap() = None;
+        assert_eq!(
+            actor.profile().await.native_session_id.as_deref(),
+            Some("fixture-native-thread")
+        );
+        let result = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentSend {
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id: RequestId::parse("withdrawn-rpc-send").unwrap(),
+                    text: "must not reach native input".into(),
+                    settings: None,
+                },
+            ),
+            &state,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError {
+                    code: RuntimeErrorCode::RecoveryWrongIdentity,
+                    ..
+                })
+            ),
+            "retained address without current provider evidence must refuse: {result:?}"
+        );
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+        assert!(!actor
+            .read_events(0, 32)
+            .await
+            .events
+            .iter()
+            .any(|event| serde_json::to_string(event)
+                .unwrap()
+                .contains("withdrawn-rpc-send")));
+        actor.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn authenticated_fresh_agent_rpc_keeps_one_host_owned_transport_until_explicit_stop() {
         let state = test_host_state();
+        let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: state.incarnation_id.clone(),
+            launch_nonce: "rpc-fixture-current".into(),
+            evidence_revision: 0,
+            execution_generation: 1,
+            requested_native_session_id: Some("fixture-native-thread".into()),
+        };
+        state.persisted.lock().await.native_identity_launch = Some(binding.clone());
         let transport = Arc::new(RpcFixtureTransport {
+            native_evidence: std::sync::Mutex::new(Some(
+                serde_json::json!({"launch":binding,"queryGeneration":1}),
+            )),
             dispatches: AtomicUsize::new(0),
             decisions: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
@@ -5294,6 +5455,35 @@ mod tests {
             .await
             .unwrap();
         *state.fresh_agent.lock().await = Some(actor);
+
+        let (mut release_client, release_server) = UnixStream::pair().unwrap();
+        let serving_release = tokio::spawn(handle_connection(release_server, state.clone()));
+        write_frame(
+            &mut release_client,
+            &authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentResumePending {
+                    incarnation_id: state.incarnation_id.clone(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let release: HostReply = freshell_runtime_protocol::read_frame(&mut release_client)
+            .await
+            .unwrap();
+        serving_release.await.unwrap().unwrap();
+        assert!(
+            matches!(
+                release.result,
+                Ok(HostResult::FreshAgentCommand {
+                    state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                    ..
+                })
+            ),
+            "authenticated internal release must return a checked dispatch receipt: {:?}",
+            release.result
+        );
 
         let request_id = RequestId::parse("rpc-command-one").unwrap();
         let result = dispatch(
@@ -5618,6 +5808,7 @@ mod tests {
         ) -> Result<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>, String> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             let transport = Arc::new(RpcFixtureTransport {
+                native_evidence: std::sync::Mutex::new(None),
                 dispatches: AtomicUsize::new(0),
                 decisions: AtomicUsize::new(0),
                 operations: AtomicUsize::new(0),

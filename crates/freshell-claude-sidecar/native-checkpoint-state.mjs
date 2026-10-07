@@ -2,12 +2,12 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
 import { dirname, isAbsolute } from 'node:path'
-import { inspectNativeDeferredCheckpoint } from './native-session-channel.mjs'
+import { inspectNativeDeferredCheckpoint, nativeTranscriptHasDeferredOperation } from './native-session-channel.mjs'
 
 const recoverable = new Set(['checkpointed', 'approval_waiting'])
 const phases = new Set([...recoverable, 'continuing', 'dispatching', 'resolved', 'interrupted'])
 
-export function createNativeCheckpointStore({ recordPath, transcriptPath, nativeSessionId, profileDigest }) {
+export function createNativeCheckpointStore({ recordPath, transcriptPath, nativeSessionId, profileDigest, allowMissingTranscript = false }) {
   if (!isAbsolute(recordPath) || !isAbsolute(transcriptPath) || !/^[a-f0-9]{64}$/.test(profileDigest)) {
     throw new Error('native checkpoint store requires its exact owned paths and profile')
   }
@@ -51,12 +51,28 @@ export function createNativeCheckpointStore({ recordPath, transcriptPath, native
       toolUseID: record.checkpoint.toolUseID, inputDigest: record.checkpoint.inputDigest })
     return observed !== null && JSON.stringify(observed) === JSON.stringify(record.checkpoint)
   }
+  async function consumed(record) {
+    const proof = await inspectNativeDeferredCheckpoint({ path: transcriptPath, nativeSessionId,
+      toolUseID: record.checkpoint.toolUseID, inputDigest: record.checkpoint.inputDigest,
+      checkpointUuid: record.checkpoint.checkpointUuid, includeConsumed: true })
+    if (!proof?.consumed) return false
+    delete proof.consumed
+    return JSON.stringify(proof) === JSON.stringify(record.checkpoint)
+  }
   return {
+    inputState: () => run(async () => {
+      try {
+        const record = await read()
+        if (!record) return await nativeTranscriptHasDeferredOperation({ path: transcriptPath, allowMissing: allowMissingTranscript }) ? 'blocked' : 'clear'
+        if (await consumed(record)) return 'clear'
+        return recoverable.has(record.phase) && await current(record) ? 'recoverable' : 'blocked'
+      } catch { return 'blocked' }
+    }),
     publish: (toolUseID, inputDigest) => run(async () => {
       const checkpoint = await inspectNativeDeferredCheckpoint({ path: transcriptPath, nativeSessionId, toolUseID, inputDigest })
       if (!checkpoint) return null
       const previous = await read()
-      if (previous && !['resolved', 'interrupted'].includes(previous.phase)) {
+      if (previous && !['resolved', 'interrupted'].includes(previous.phase) && !await consumed(previous)) {
         return recoverable.has(previous.phase) && await current(previous) ? previous : null
       }
       return save({ schemaVersion: 1, checkpoint, nativeSessionId, toolUseID, inputDigest, profileDigest, phase: 'checkpointed' })
