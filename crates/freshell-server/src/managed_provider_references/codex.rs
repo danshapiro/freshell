@@ -474,8 +474,8 @@ pub fn discover(
         .collect::<Vec<_>>();
     directories.reverse();
     let mut resources = global_instruction_resources(&manifest.codex_home)?;
+    add_rule_resources(&manifest.codex_home.join("rules"), &mut resources)?;
     for path in [
-        manifest.codex_home.join("rules"),
         manifest.codex_home.join("skills"),
         manifest.original_home.join(".agents/skills"),
     ] {
@@ -500,11 +500,17 @@ pub fn discover(
             if exists(&skills)? {
                 resources.push(skills);
             }
+            let enabled = trusted(&preceding, directory, root);
+            if enabled {
+                // Even a missing project TOML leaves an enabled config folder
+                // from which native Codex discovers immediate rule files.
+                add_rule_resources(&folder.join("rules"), &mut resources)?;
+            }
             let path = folder.join("config.toml");
             if exists(&path)? {
                 layers.push(SourceLayer {
                     logical_path: path,
-                    enabled: trusted(&preceding, directory, root),
+                    enabled,
                     kind: LayerKind::Project,
                 });
             }
@@ -584,6 +590,48 @@ pub fn discover(
         inputs,
         resource_roots: resources,
     })
+}
+
+fn add_rule_resources(root: &Path, resources: &mut Vec<PathBuf>) -> Result<(), &'static str> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("Codex selected rules directory is unreadable; repair it and retry"),
+    };
+    let max_entries = freshell_platform::provider_environment::CopyLimits::default().max_entries;
+    let mut entry_count = 0usize;
+    let mut metadata_bytes = resources
+        .iter()
+        .try_fold(0usize, |bytes, path| {
+            bytes.checked_add(path.as_os_str().len())
+        })
+        .ok_or("Codex selected resource metadata overflow")?;
+    for entry in entries {
+        entry_count += 1;
+        if entry_count > max_entries {
+            return Err("Codex selected rules directory entry budget exceeded");
+        }
+        let entry = entry.map_err(|_| "Codex selected rules directory enumeration failed")?;
+        let kind = entry
+            .file_type()
+            .map_err(|_| "Codex selected rules entry metadata unavailable")?;
+        let path = entry.path();
+        // Native collection uses DirEntry type: symlink files are not selected,
+        // and directories are never recursively activated as policy files.
+        if kind.is_file() && path.extension() == Some(std::ffi::OsStr::new("rules")) {
+            if resources.len() >= MAX_SOURCE_EVENTS {
+                return Err("Codex selected resource event budget exceeded");
+            }
+            metadata_bytes = metadata_bytes
+                .checked_add(path.as_os_str().len())
+                .ok_or("Codex selected resource metadata overflow")?;
+            if metadata_bytes > MAX_SOURCE_EVENT_BYTES {
+                return Err("Codex selected resource metadata budget exceeded");
+            }
+            resources.push(path);
+        }
+    }
+    Ok(())
 }
 
 // Native global instructions try the override before the default and skip
@@ -819,6 +867,134 @@ mod tests {
             enabled,
             kind: LayerKind::User,
         }
+    }
+
+    #[test]
+    fn managed_provider_codex_rules_follow_project_trust_without_requiring_project_toml() {
+        use freshell_platform::{
+            codex_inputs::CodexInputManifest,
+            provider_environment::{copy_environment, CopyLimits, CopySelection},
+        };
+        for trust in ["trusted", "untrusted"] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let root = owned.path().join("project");
+            let cwd = root.join("nested");
+            let codex_home = home.join("selected-codex");
+            std::fs::create_dir_all(&codex_home).unwrap();
+            std::fs::create_dir_all(root.join(".git")).unwrap();
+            std::fs::create_dir_all(root.join(".codex/rules")).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+            std::fs::write(
+                codex_home.join("config.toml"),
+                format!(
+                    "[projects.{}]\ntrust_level={trust:?}\n",
+                    serde_json::to_string(root.to_str().unwrap()).unwrap()
+                ),
+            )
+            .unwrap();
+            let rule = root.join(".codex/rules/probe.rules");
+            std::fs::write(
+                &rule,
+                "prefix_rule(pattern=[\"synthetic-never-run\"],decision=\"forbidden\")\n",
+            )
+            .unwrap();
+            let found = discover(CodexInputManifest {
+                version: 1,
+                original_home: home,
+                cwd,
+                codex_home,
+                named_profile: None,
+            })
+            .unwrap();
+            let stage = owned.path().join("stage");
+            let selections = found
+                .resource_roots
+                .iter()
+                .map(|source| CopySelection {
+                    source: source.clone(),
+                    destination_relative: source.strip_prefix(owned.path()).unwrap().into(),
+                })
+                .collect::<Vec<_>>();
+            copy_environment(&selections, &stage, &[], CopyLimits::default()).unwrap();
+            // This executes the copied resource, not a discovery-list/text test.
+            // The genuine automatic native policy consumer is qualified separately.
+            let output = std::process::Command::new("node").args(["-e", "const fs=require('node:fs');const p=process.argv[1];process.stdout.write(fs.existsSync(p)?fs.readFileSync(p,'utf8'):'unselected')"])
+                .arg(stage.join("project/.codex/rules/probe.rules")).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout,
+                if trust == "trusted" {
+                    std::fs::read(&rule).unwrap()
+                } else {
+                    b"unselected".to_vec()
+                }
+            );
+            assert!(!root.join(".codex/config.toml").exists());
+            assert_eq!(
+                std::fs::read(&rule).unwrap(),
+                b"prefix_rule(pattern=[\"synthetic-never-run\"],decision=\"forbidden\")\n"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_provider_codex_rules_copy_only_immediate_regular_rule_files() {
+        use freshell_platform::{
+            codex_inputs::CodexInputManifest,
+            provider_environment::{copy_environment, CopyLimits, CopySelection},
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("project");
+        let codex_home = home.join(".codex");
+        let rules = codex_home.join("rules");
+        std::fs::create_dir_all(rules.join("nested.rules")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(rules.join("probe.rules"), "selected-global-policy").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("unselected-missing", rules.join("ignored.txt")).unwrap();
+            std::os::unix::fs::symlink("unselected-missing", rules.join("linked.rules")).unwrap();
+            std::os::unix::fs::symlink(
+                "unselected-missing",
+                rules.join("nested.rules/inner.rules"),
+            )
+            .unwrap();
+        }
+        let found = discover(CodexInputManifest {
+            version: 1,
+            original_home: home,
+            cwd,
+            codex_home: codex_home.clone(),
+            named_profile: None,
+        })
+        .unwrap();
+        let stage = owned.path().join("stage");
+        let selections = found
+            .resource_roots
+            .iter()
+            .map(|source| CopySelection {
+                source: source.clone(),
+                destination_relative: source.strip_prefix(&codex_home).unwrap().into(),
+            })
+            .collect::<Vec<_>>();
+        copy_environment(&selections,&stage,&[],CopyLimits::default()).expect("native-unselected nested, non-rule, and symlink entries must not become copy dependencies");
+        let output = std::process::Command::new("node")
+            .args([
+                "-e",
+                "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))",
+            ])
+            .arg(stage.join("rules/probe.rules"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"selected-global-policy");
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_link(rules.join("linked.rules")).unwrap(),
+            Path::new("unselected-missing")
+        );
     }
 
     #[test]
