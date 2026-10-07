@@ -2137,8 +2137,22 @@ impl Supervisor {
         let (probe, observed_context) = self
             .probe_recovery_observed(request.soul_id.clone())
             .await?;
+        // Select one boxed action rather than polling every recovery branch
+        // in a single large future on the default debug worker stack.
+        self.complete_recovery_probe(request, probe, observed_context)
+            .await
+    }
+
+    fn complete_recovery_probe(
+        &self,
+        request: RecoverRequest,
+        probe: RecoveryProbe,
+        observed_context: RecoveryContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RecoveryResult, RuntimeError>> + Send + '_>,
+    > {
         match probe.clone() {
-            RecoveryProbe::ReattachReady { handle, .. } => {
+            RecoveryProbe::ReattachReady { handle, .. } => Box::pin(async move {
                 self.registry
                     .mark_recovery_live(
                         request.soul_id.clone(),
@@ -2162,10 +2176,10 @@ impl Supervisor {
                     observed_native_session_id: None,
                     incident_id: None,
                 })
-            }
+            }),
             RecoveryProbe::Blocked {
                 reason, evidence, ..
-            } => {
+            } => Box::pin(async move {
                 if reason == RecoveryBlockReason::StopIntent {
                     let context = self
                         .registry
@@ -2208,8 +2222,8 @@ impl Supervisor {
                     observed_native_session_id: None,
                     incident_id: None,
                 })
-            }
-            RecoveryProbe::DefinitivelyUnavailable { .. } => {
+            }),
+            RecoveryProbe::DefinitivelyUnavailable { .. } => Box::pin(async move {
                 // Legacy and opt-out rollout states retain Phase 3 semantics:
                 // a definitive provider-path negative is preserved as BLOCKED.
                 // Only newly opted-in/default managed operation may authorize
@@ -2322,8 +2336,8 @@ impl Supervisor {
                             .await
                     }
                 }
-            }
-            RecoveryProbe::ResumeReady { resume_spec, .. } => {
+            }),
+            RecoveryProbe::ResumeReady { resume_spec, .. } => Box::pin(async move {
                 let path = if resume_spec.checkpoint_revision > 0 {
                     RecoveryPath::CheckpointRestore
                 } else {
@@ -2338,8 +2352,8 @@ impl Supervisor {
                     observed_context.write_fence(),
                 ))
                 .await
-            }
-            RecoveryProbe::PristineSeedReady { .. } => {
+            }),
+            RecoveryProbe::PristineSeedReady { .. } => Box::pin(async move {
                 Box::pin(self.replace(
                     request.soul_id,
                     request.trigger,
@@ -2349,7 +2363,7 @@ impl Supervisor {
                     observed_context.write_fence(),
                 ))
                 .await
-            }
+            }),
         }
     }
 
@@ -4267,6 +4281,29 @@ impl Supervisor {
                     }
                 }
             };
+            // This named lifecycle fixture exercises replacement and storage,
+            // but never produces a real-provider qualification observation.
+            if current.provider == "native-session-fixture"
+                && current.fixture == Some(freshell_runtime_protocol::FixtureKind::NativeSession)
+                && !status.exited
+                && current
+                    .native_identity_launch
+                    .as_ref()
+                    .is_some_and(|launch| {
+                        launch.execution_generation == status.max_execution_generation
+                    })
+                && status.native_session_id.as_deref().is_some_and(|root| {
+                    !root.is_empty() && current.native_session_id.as_deref() == Some(root)
+                })
+            {
+                return NativeIdentityWait::Observed {
+                    native_session_id: status
+                        .native_session_id
+                        .clone()
+                        .expect("checked fixture root"),
+                    elapsed_ms,
+                };
+            }
             let observation = current_native_observation(&current, &status)
                 .filter(|observation| {
                     native_capability && observation.incarnation_id == *incarnation_id
