@@ -146,13 +146,13 @@ function ordinaryProviderArgs(argv: string[], provider: Provider): string[] {
   return result
 }
 
-function normalized(record: RecordRow): unknown {
+function normalized(record: RecordRow) {
   const env = record.env as Record<string, unknown>
   const tuiConfig = record.provider === 'opencode' && typeof record.tuiConfig === 'string'
     ? JSON.parse(record.tuiConfig) as { plugin?: string[]; [key: string]: unknown }
     : record.tuiConfig
   if (tuiConfig && typeof tuiConfig === 'object' && Array.isArray(tuiConfig.plugin)) {
-    tuiConfig.plugin = tuiConfig.plugin.map(plugin => plugin.endsWith('/freshell-rebind-plugin.ts')
+    tuiConfig.plugin = tuiConfig.plugin.map((plugin: string) => plugin.endsWith('/freshell-rebind-plugin.ts')
       ? '<freshell-rebind-plugin>' : plugin)
   }
   return {
@@ -531,7 +531,7 @@ describe('ordinary and managed terminal provider parity', () => {
       return view?.containerId ? view : undefined
     })
     if (!before.containerId) throw new Error('initial OpenCode container missing')
-    rig.ownedProviderExec(before.containerId, ['sh', '-c',
+    await rig.ownedProviderExec(before.containerId, ['sh', '-c',
       'printf provider-owned-state > /home/freshell/provider/.config/opencode/plugins/provider-owned.txt'])
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/new-provider.jsonc'), '{"replacement":true}\n')
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/opencode.jsonc'), '{"replacementOriginal":true}\n')
@@ -604,12 +604,12 @@ describe('ordinary and managed terminal provider parity', () => {
       fs.writeFileSync(path.join(signals, terminal + '__' + Date.now() + '.json'),
         JSON.stringify({ session_id: next }))
     `
-    rig.ownedProviderExec(before.containerId, [
+    await rig.ownedProviderExec(before.containerId, [
       'node', '-e', writeSignal, initial.nativeSession.value, switchedId, terminalId,
     ])
     await wire.wait(frame => frame.type === 'terminal.session.associated'
       && frame.terminalId === terminalId && frame.sessionRef?.sessionId === switchedId, 30_000).catch(async error => {
-      throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; web: ${rig.web.capturedOutput().slice(-3000)}`)
+      throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; web: ${Object.values(rig.web.capturedOutput()).join('\n').slice(-3000)}`)
     })
     await wire.wait(frame => frame.type === 'terminal.meta.updated'
       && frame.upsert?.some((row: any) => row.terminalId === terminalId && row.sessionId === switchedId), 30_000)
@@ -624,7 +624,7 @@ describe('ordinary and managed terminal provider parity', () => {
       const view = await rig.runningViewForTerminal(terminalId)
       return view?.containerId && view.incarnationId !== before.incarnationId ? view : undefined
     }, 120_000).catch(async error => {
-      throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; supervisor: ${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-4000)}; web: ${rig.web.capturedOutput().slice(-4000)}`)
+      throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; supervisor: ${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-4000)}; web: ${Object.values(rig.web.capturedOutput()).join('\n').slice(-4000)}`)
     })
     expect(after.soulId).toBe(before.soulId)
     expect((await rig.inventory()).find((row: any) => row.terminalId === terminalId)?.nativeSessionId).toBe(switchedId)

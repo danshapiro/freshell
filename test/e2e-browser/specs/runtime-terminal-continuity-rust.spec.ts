@@ -116,8 +116,8 @@ function waitForOwnedPidFile(
   filePath: string,
   timeoutMs: number,
 ): Promise<number> {
-  return waitForValue(`numeric PID in ${filePath}`, () => {
-    const raw = rig.ownedProviderExec(containerId, ['sh', '-lc', `cat ${JSON.stringify(filePath)} 2>/dev/null || true`]).trim()
+  return waitForValue(`numeric PID in ${filePath}`, async () => {
+    const raw = (await rig.ownedProviderExec(containerId, ['sh', '-lc', `cat ${JSON.stringify(filePath)} 2>/dev/null || true`])).trim()
     if (!/^\d+$/.test(raw)) return null
     const pid = Number(raw)
     return Number.isSafeInteger(pid) && pid > 0 ? pid : null
@@ -131,12 +131,12 @@ function waitForOwnedFileValue(
   expected: string,
   timeoutMs: number,
 ): Promise<string> {
-  return waitForValue(`${expected} in ${filePath}`, () => {
-    const actual = rig.ownedProviderExec(containerId, [
+  return waitForValue(`${expected} in ${filePath}`, async () => {
+    const actual = (await rig.ownedProviderExec(containerId, [
       'sh',
       '-lc',
       `cat ${JSON.stringify(filePath)} 2>/dev/null || true`,
-    ]).trim()
+    ])).trim()
     return actual === expected ? actual : null
   }, timeoutMs)
 }
@@ -174,14 +174,16 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       recordWsEvent({ event: 'open', url: socket.url() })
       socket.on('close', () => recordWsEvent({ event: 'close' }))
       for (const event of ['framesent', 'framereceived'] as const) {
-        socket.on(event, (frame) => {
+        const listener = (frame: { payload: string | Buffer }) => {
           try {
             const message = JSON.parse(String(frame.payload))
             recordWsEvent({ event, type: message.type, terminalId: message.terminalId, code: message.code })
           } catch {
             recordWsEvent({ event, type: 'non-json' })
           }
-        })
+        }
+        if (event === 'framesent') socket.on(event, listener)
+        else socket.on(event, listener)
       }
     })
 
@@ -269,16 +271,11 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
           })}`)
         }
 
-        let heartbeat: number
-        try {
-          heartbeat = await waitForValue(`heartbeat advance after web cycle ${cycle}`, async () => {
+        const heartbeat = await waitForValue(`heartbeat advance after web cycle ${cycle}`, async () => {
             const text = await terminal.getVisibleText(pane.terminalId)
             const value = Number(text.match(/P2_HEARTBEAT:(\d+)/g)?.at(-1)?.split(':')[1] ?? -1)
             return value > lastHeartbeat ? value : null
-          }, 60_000)
-        } catch (error) {
-          await failWithDiagnostics(error)
-        }
+          }, 60_000).catch(failWithDiagnostics)
         outputAdvanced = true
         lastHeartbeat = heartbeat
 
@@ -369,12 +366,12 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       const view = await waitForRunningView(rig, terminalId, 90_000)
       if (!view?.containerId || !view.hostBootId) throw new Error('real OpenCode managed view missing ownership identity')
       expect(rig.ownedContainerExec(view.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
-      const authProbe = rig.ownedProviderExec(view.containerId, [
+      const authProbe = (await rig.ownedProviderExec(view.containerId, [
         'node', '--no-warnings', '-e',
         "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||openai.type!=='oauth'||openai.access!=='onecli-managed'||openai.refresh!=='onecli-managed'||openai.expires<Date.now()+3600000)process.exit(2);fs.accessSync('/home/freshell/provider/.config/onecli/gateway-ca.pem',fs.constants.R_OK);process.stdout.write('onecli managed OpenAI stub and CA present')",
-      ])
+      ]))
       expect(authProbe.trim()).toBe('onecli managed OpenAI stub and CA present')
-      const availableModels = rig.ownedProviderExec(view.containerId, ['opencode', 'models', 'openai'])
+      const availableModels = (await rig.ownedProviderExec(view.containerId, ['opencode', 'models', 'openai']))
       expect(availableModels).toContain(P2_OPENCODE_MODEL.split('/')[1])
       const processArgs = rig.ownedContainerExec(view.containerId, ['sh', '-lc', "pgrep -af '[o]pencode' || true"])
       expect(processArgs).toContain(`--model ${P2_OPENCODE_MODEL}`)
@@ -398,19 +395,19 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         readTerminalText: () => terminal.getVisibleText(terminalId),
         wait: (milliseconds) => page.waitForTimeout(milliseconds),
         description: `OpenCode tool marker ${firstTurnMarker}`,
-        succeeds: () => rig.ownedProviderExec(view.containerId!, [
+        succeeds: async () => (await rig.ownedProviderExec(view.containerId!, [
             'sh', '-lc', 'cat /home/freshell/provider/p2-opencode-first-turn 2>/dev/null || true',
-          ]).trim() === firstTurnMarker,
+          ])).trim() === firstTurnMarker,
         timeoutMs: 90_000,
       })
 
       const sessionId = await waitForSessionId(content, 90_000)
       expect(sessionId).toMatch(/^ses_/)
-      const firstTurn = await waitForValue('native OpenCode first reply', () => {
-        const nativeHistory = JSON.parse(rig.ownedProviderExec(view.containerId!, [
+      const firstTurn = await waitForValue('native OpenCode first reply', async () => {
+        const nativeHistory = JSON.parse((await rig.ownedProviderExec(view.containerId!, [
           'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
           '/home/freshell/provider/.local/share/opencode/opencode.db', sessionId,
-        ])) as NativeHistory
+        ]))) as NativeHistory
         if (nativeHistory.nativeSessionId !== sessionId) return null
         return nativeHistory.turns.find((turn) => turn.text.includes('READY')) ?? null
       }, 30_000)
@@ -441,8 +438,8 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       expect(afterView?.containerId).toBe(view.containerId)
       expect(afterView?.hostBootId).toBe(view.hostBootId)
 
-      await expect.poll(() => {
-        const count = rig.ownedProviderExec(view.containerId!, ['sh', '-lc', 'test -f /home/freshell/provider/p2-opencode-tool-count && wc -l < /home/freshell/provider/p2-opencode-tool-count || echo 0'])
+      await expect.poll(async () => {
+        const count = (await rig.ownedProviderExec(view.containerId!, ['sh', '-lc', 'test -f /home/freshell/provider/p2-opencode-tool-count && wc -l < /home/freshell/provider/p2-opencode-tool-count || echo 0']))
         return Number(count.trim())
       }, { timeout: 60_000 }).toBe(1)
 
@@ -452,8 +449,8 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         'Use the bash tool to run exactly: echo P2_OPENCODE_FOLLOWUP_DONE > "$HOME/p2-opencode-followup". Reply with exactly FOLLOWUP when the command completes.',
         afterIndex,
       )
-      await expect.poll(() => {
-        return rig.ownedProviderExec(view.containerId!, ['sh', '-lc', 'cat /home/freshell/provider/p2-opencode-followup 2>/dev/null || true']).trim()
+      await expect.poll(async () => {
+        return (await rig.ownedProviderExec(view.containerId!, ['sh', '-lc', 'cat /home/freshell/provider/p2-opencode-followup 2>/dev/null || true'])).trim()
       }, { timeout: 90_000 }).toBe('P2_OPENCODE_FOLLOWUP_DONE')
       const runtimeDir = rig.runtime.runtimeDir(rig.supervisor, view.incarnationId)
       const hostState = JSON.parse(fs.readFileSync(path.join(runtimeDir, 'host-state.json'), 'utf8'))

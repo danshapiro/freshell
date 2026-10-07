@@ -123,7 +123,7 @@ async function qualify(
   const sessionId = created.sessionId as string
   const initial = await waitFor('managed fresh-agent view', () => rig.runningViewForFreshSession(sessionId))
   if (!initial.containerId) throw new Error('managed fresh-agent view has no enclosure')
-  expect(rig.ownedProviderExec(initial.containerId, definition.versionCommand)).toContain(definition.version)
+  expect((await rig.ownedProviderExec(initial.containerId, definition.versionCommand))).toContain(definition.version)
   const initialProcesses = rig.ownedContainerProcessTable(initial.containerId)
   expect(initialProcesses).toMatch(definition.processPattern)
 

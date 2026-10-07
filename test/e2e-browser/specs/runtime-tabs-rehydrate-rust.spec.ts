@@ -234,13 +234,13 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const transcript = makeTranscript(view.nativeSessionId!)
       expect(Buffer.byteLength(transcript)).toBeGreaterThan(1024 * 1024)
       // Generate in the owned provider process, avoiding a multi-MiB argv value.
-      rig.ownedProviderExec(view.containerId!, ['node', '--input-type=module', '-e',
+      await rig.ownedProviderExec(view.containerId!, ['node', '--input-type=module', '-e',
         `import fs from "node:fs"; import path from "node:path"; const makeTranscript = ${makeTranscript.toString()}; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1], makeTranscript(process.argv[2]));`,
         rolloutPath, view.nativeSessionId!])
-      const fixtureState = () => JSON.parse(rig.ownedProviderExec(view.containerId!, [
+      const fixtureState = async () => JSON.parse((await rig.ownedProviderExec(view.containerId!, [
         'cat', '/home/freshell/provider/.freshell-fixture/provider-native-state.json',
-      ]))
-      const before = fixtureState()
+      ])))
+      const before = (await fixtureState())
       const ownedSnapshot = await rig.runtime.adminOk(rig.supervisor, {
         method: 'fresh_agent_read_snapshot', params: { soulId: view.soulId, expectedControlEpoch: await rig.controlEpoch() },
       })
@@ -323,21 +323,21 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await expect(page.getByTestId('managed-runtime-recovery-card')).toHaveCount(0)
       await expect(pane.getByRole('button', { name: 'Start new session' })).toHaveCount(0)
       await expectOriginalConversation()
-      expect(fixtureState().dispatchCount).toBe(before.dispatchCount)
+      expect((await fixtureState()).dispatchCount).toBe(before.dispatchCount)
       release()
       await expect(composer).toBeEnabled()
       await expect(composer).toHaveValue('Draft stays in this managed conversation')
       await composer.press('Enter')
-      await expect.poll(() => fixtureState().completionCount, { timeout: 30_000 }).toBe(before.completionCount + 1)
-      expect(fixtureState().dispatchCount).toBe(before.dispatchCount + 1)
-      expect(fixtureState().nativeSessionId).toBe(view.nativeSessionId)
+      await expect.poll(async () => (await fixtureState()).completionCount, { timeout: 30_000 }).toBe(before.completionCount + 1)
+      expect((await fixtureState()).dispatchCount).toBe(before.dispatchCount + 1)
+      expect((await fixtureState()).nativeSessionId).toBe(view.nativeSessionId)
       const current = (await rig.inventory()).find((row) => row.soulId === view.soulId)
       expect(current).toMatchObject({ soulId: view.soulId, containerId: view.containerId,
         incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId })
       await expectOriginalConversation()
       expect(sent.slice(baseline).filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')).toHaveLength(0)
-      expect(rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath])).toBe(transcript)
-      const stableProviderState = fixtureState()
+      expect((await rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath]))).toBe(transcript)
+      const stableProviderState = (await fixtureState())
       // A tracked host can stop answering while its managed projection still says live.
       // Its saved source is the owned provider volume, never a coincident web-local file.
       await page.unroute('**/api/fresh-agent/threads/**')
@@ -360,9 +360,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(reattached).toMatchObject({ soulId: view.soulId, containerId: view.containerId,
         incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId,
         desiredState: 'running', launchState: 'running', recoveryState: 'live' })
-      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+      expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
-      expect(rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath])).toBe(transcript)
+      expect((await rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath]))).toBe(transcript)
       expect(await fs.readFile(wrongPath, 'utf8')).toBe(wrongTranscript)
       await expectOriginalConversation()
       expect(sent.slice(controllerSentBaseline).filter((frame) => frame.type === 'freshAgent.create'
@@ -408,7 +408,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expectLargeRetainedHistory(history)
       expect(JSON.stringify(history)).not.toContain('Wrong web-local answer')
       expect(sent.slice(unavailableBaseline).filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')).toHaveLength(0)
-      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+      expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
       const reloadSentBaseline = sent.length
       const reloadReceivedBaseline = received.length
@@ -458,9 +458,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await expect(pane.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0)
       await expect(pane.getByText('Wrong web-local answer', { exact: false })).toHaveCount(0)
       await expectOriginalConversation()
-      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+      expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
-      expect(rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath])).toBe(transcript)
+      expect((await rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath]))).toBe(transcript)
       expect(await fs.readFile(wrongPath, 'utf8')).toBe(wrongTranscript)
       const managedReceipts = rig.runtime.broker.receipts().filter((receipt) => receipt.soulId === view.soulId)
       expect(managedReceipts).toHaveLength(1)
@@ -476,7 +476,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const historyEvidence = { source: 'owned provider-volume native history',
         wrongSource: 'coincident web-local native history', heldHost, bootstrap: bootstrap.request,
         bootstrapCreates: bootstrapLifecycle().filter((frame) => frame.type === 'freshAgent.create'),
-        nativeSessionId: view.nativeSessionId, beforeHistory: stableProviderState, afterReload: fixtureState(),
+        nativeSessionId: view.nativeSessionId, beforeHistory: stableProviderState, afterReload: (await fixtureState()),
         originalIdentity: canonicalIdentity, managedLaunch: launches[0], bothSourcesUnchanged: true }
       rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGCONT', pid)
       const releasedAt = Date.now()
@@ -486,7 +486,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const resumedAt = Date.now()
       expect(resumedAt, 'exact owned host must resume before the first observer pass').toBeLessThan(firstObservationNotBefore)
       await expectOriginalConversation()
-      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+      expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
       expectOnlyCanonicalBootstrap()
       expect(bootstrapLifecycle()).toHaveLength(settledLifecycleCount)
@@ -520,8 +520,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
                 const totals = new Map<number, { samples: number, durationMs: number }>()
                 const seconds = new Map<number, { durationMs: number, samples: number, idleMs: number }>()
                 let elapsedUs = 0
-                for (let index = 0; index < (profile.samples?.length ?? 0); index += 1) {
-                  const id = profile.samples[index]
+                const samples = profile.samples ?? []
+                for (let index = 0; index < samples.length; index += 1) {
+                  const id = samples[index]
                   const durationMs = (profile.timeDeltas?.[index] ?? 0) / 1000
                   const total = totals.get(id) ?? { samples: 0, durationMs: 0 }
                   total.samples += 1

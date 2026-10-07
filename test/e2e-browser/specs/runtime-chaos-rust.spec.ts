@@ -146,10 +146,10 @@ async function runningView(rig: ManagedRuntimeBrowserRig, terminalId: string): P
   }, 90_000)
 }
 
-function markerCount(rig: ManagedRuntimeBrowserRig, containerId: string, name: string): number {
-  const raw = rig.ownedProviderExec(containerId, [
+async function markerCount(rig: ManagedRuntimeBrowserRig, containerId: string, name: string): Promise<number> {
+  const raw = (await rig.ownedProviderExec(containerId, [
     'sh', '-lc', `test -f "$HOME/${name}" && wc -l < "$HOME/${name}" || printf 0`,
-  ]).trim()
+  ])).trim()
   return /^\d+$/.test(raw) ? Number(raw) : -1
 }
 
@@ -264,7 +264,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       const initialRuntime = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)
 
       // Permission remains provider-native and pending across web replacement.
-      rig.ownedProviderExec(initial.containerId, ['rm', '-f', '/home/freshell/provider/p5-chaos-approval-count'])
+      await rig.ownedProviderExec(initial.containerId, ['rm', '-f', '/home/freshell/provider/p5-chaos-approval-count'])
       await executeInPane(
         page,
         paneId,
@@ -275,9 +275,9 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         const text = await terminal.getVisibleText(currentId ?? terminalId)
         return text.includes('Permission required') && text.includes('Allow once') ? true : null
       }, 180_000)
-      expect(markerCount(rig, initial.containerId, 'p5-chaos-approval-count')).toBe(0)
-      const approvalBefore = await waitForValue('one pending provider-native approval tool request', () => {
-        const evidence = nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-approval-count')
+      expect((await markerCount(rig, initial.containerId, 'p5-chaos-approval-count'))).toBe(0)
+      const approvalBefore = await waitForValue('one pending provider-native approval tool request', async () => {
+        const evidence = (await nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-approval-count'))
         return evidence.requestIds.length === 1 && evidence.resultIds.length === 0 && evidence.replayCount === 0
           ? evidence
           : null
@@ -317,11 +317,11 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         }),
       ))
       await pressInPane(page, paneId, 'Enter')
-      await waitForValue('approval tool exactly once', () => (
-        markerCount(rig, initial.containerId!, 'p5-chaos-approval-count') === 1 ? true : null
+      await waitForValue('approval tool exactly once', async () => (
+        (await markerCount(rig, initial.containerId!, 'p5-chaos-approval-count')) === 1 ? true : null
       ), 180_000)
-      const approvalAfter = await waitForValue('one completed provider-native approval tool result', () => {
-        const evidence = nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-approval-count')
+      const approvalAfter = await waitForValue('one completed provider-native approval tool result', async () => {
+        const evidence = (await nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-approval-count'))
         return evidence.requestIds.length === 1 && evidence.resultIds.length === 1 && evidence.replayCount === 0
           ? evidence
           : null
@@ -329,7 +329,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       expect(approvalAfter.requestIds).toEqual(approvalBefore.requestIds)
 
       // Start a long-running side effect and replace the web process repeatedly.
-      rig.ownedProviderExec(initial.containerId, ['rm', '-f', '/home/freshell/provider/p5-chaos-long-tool-count'])
+      await rig.ownedProviderExec(initial.containerId, ['rm', '-f', '/home/freshell/provider/p5-chaos-long-tool-count'])
       await executeInPane(
         page,
         paneId,
@@ -421,20 +421,20 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         ))
       }
 
-      await waitForValue('long tool one side effect', () => (
-        markerCount(rig, initial.containerId!, 'p5-chaos-long-tool-count') === 1 ? true : null
+      await waitForValue('long tool one side effect', async () => (
+        (await markerCount(rig, initial.containerId!, 'p5-chaos-long-tool-count')) === 1 ? true : null
       ), 240_000)
-      expect(markerCount(rig, initial.containerId, 'p5-chaos-long-tool-count')).toBe(1)
+      expect((await markerCount(rig, initial.containerId, 'p5-chaos-long-tool-count'))).toBe(1)
       await executeInPane(page, paneId, 'Reply with exactly P5_CHAOS_FOLLOWUP and use no tools.')
       await waitForPaneOutput(page, harness, tabId, paneId, 'P5_CHAOS_FOLLOWUP', 180_000)
-      const longToolEvidence = await waitForValue('one completed native long-tool request/result', () => {
-        const evidence = nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-long-tool-count')
+      const longToolEvidence = await waitForValue('one completed native long-tool request/result', async () => {
+        const evidence = (await nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-long-tool-count'))
         return evidence.requestIds.length === 1 && evidence.resultIds.length === 1 && evidence.replayCount === 0
           ? evidence
           : null
       }, 60_000)
-      const followUpMessageIds = await waitForValue('one provider-native follow-up message', () => {
-        const ids = nativeFollowUpMessageIds(rig, initial.containerId!, providerSessionId, 'P5_CHAOS_FOLLOWUP')
+      const followUpMessageIds = await waitForValue('one provider-native follow-up message', async () => {
+        const ids = (await nativeFollowUpMessageIds(rig, initial.containerId!, providerSessionId, 'P5_CHAOS_FOLLOWUP'))
         return ids.length === 1 ? ids : null
       }, 60_000)
 
@@ -492,11 +492,11 @@ test.describe.serial('Phase 5 runtime chaos', () => {
           toolRequestId: approvalAfter.requestIds[0],
           decisionsBeforeClick: approvalBefore.resultIds.length,
           decisionsAfterClick: approvalAfter.resultIds.length,
-          markerCount: markerCount(rig, initial.containerId, 'p5-chaos-approval-count'),
+          markerCount: (await markerCount(rig, initial.containerId, 'p5-chaos-approval-count')),
         },
         longTool: {
           toolRequestId: longToolEvidence.requestIds[0],
-          markerCount: markerCount(rig, initial.containerId, 'p5-chaos-long-tool-count'),
+          markerCount: (await markerCount(rig, initial.containerId, 'p5-chaos-long-tool-count')),
           sleepSeconds: 180,
         },
         falseLossQuery: {

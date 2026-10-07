@@ -336,7 +336,7 @@ async function qualifyProvider(
   const created = await createProviderPane(page, harness, rig, tabId, definition)
   if (!created.view.containerId) throw new Error(`${definition.provider} view has no owned container`)
 
-  const version = rig.ownedProviderExec(created.view.containerId, definition.versionCommand)
+  const version = (await rig.ownedProviderExec(created.view.containerId, definition.versionCommand))
   expect(version).toMatch(definition.versionPattern)
   const processTable = rig.ownedContainerProcessTable(created.view.containerId)
   expectActualProviderProcess(processTable, definition.processBinary)

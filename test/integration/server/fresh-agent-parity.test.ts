@@ -154,9 +154,9 @@ describe('hosted fresh-agent provider inputs', () => {
       const candidate = await rig.runningViewForFreshSession(created.sessionId)
       return candidate?.containerId ? candidate : undefined
     })
-    const recorded = JSON.parse(rig.ownedProviderExec(view.containerId!, [
+    const recorded = JSON.parse((await rig.ownedProviderExec(view.containerId!, [
       'cat', '/home/freshell/provider/.freshell-fixture/provider-native-state.json',
-    ]))
+    ])))
     const profile = recorded.createProfile
     expect(profile).toMatchObject({
       provider: row.provider, cwd, model: 'fixture-model', effort: 'low',
@@ -171,11 +171,11 @@ describe('hosted fresh-agent provider inputs', () => {
       expect(reference.sourcePath).toMatch(/onecli/)
       expect(reference.profile).toMatch(new RegExp(`^${row.provider}_onecli_`))
     }
-    const childObservation = await waitFor('redacted fresh provider worker observation', () => {
+    const childObservation = await waitFor('redacted fresh provider worker observation', async () => {
       try {
-        return JSON.parse(rig.ownedProviderExec(view.containerId!, [
+        return JSON.parse((await rig.ownedProviderExec(view.containerId!, [
           'cat', '/home/freshell/provider/.freshell-fixture/provider-child-observation.json',
-        ]))
+        ])))
       } catch { return undefined }
     })
     expect(childObservation.argv).toEqual(['fresh-agent-fixture-worker', '--provider', row.provider])
@@ -196,9 +196,9 @@ describe('hosted fresh-agent provider inputs', () => {
           `${path.basename(opencodeProject)}/.opencode/opencode.jsonc`,
         ]),
       )
-      const tuiConfig = rig.ownedProviderExec(view.containerId!, [
+      const tuiConfig = (await rig.ownedProviderExec(view.containerId!, [
         'cat', '/home/freshell/provider/.freshell/opencode/tui.json',
-      ])
+      ]))
       expect(JSON.parse(tuiConfig).plugin).toEqual([
         expect.stringContaining('freshell-rebind-plugin.ts'),
       ])
@@ -206,15 +206,15 @@ describe('hosted fresh-agent provider inputs', () => {
     for (const config of profile.providerLaunchContext.config) {
       if (config.format === 'directory') {
         if (row.provider === 'opencode' && config.relativePath === 'plugin') {
-          expect(rig.ownedProviderExec(view.containerId!, [
+          expect((await rig.ownedProviderExec(view.containerId!, [
             'cat', path.posix.join('/home/freshell/provider', config.providerRelativePath, 'user-plugin.ts'),
-          ])).toContain('export const User')
+          ]))).toContain('export const User')
         }
         continue
       }
-      const contents = rig.ownedProviderExec(view.containerId!, [
+      const contents = (await rig.ownedProviderExec(view.containerId!, [
         'cat', path.posix.join('/home/freshell/provider', config.providerRelativePath),
-      ])
+      ]))
       if (row.provider === 'opencode') {
         expect(contents).toMatch(/global_fixture|other_global|project_fixture|project JSONC/)
       } else {

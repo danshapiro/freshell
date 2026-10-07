@@ -89,48 +89,43 @@ export async function captureChaosRuntimeObservation(
   if (claim.activeClaimCount !== 1 || claim.globalConflictingClaimCount !== 0) {
     throw new Error('chaos writer claim is not uniquely owned')
   }
-  const statePath = path.join(rig.runtime.runtimeDir(rig.supervisor, expected.incarnationId), 'host-state.json')
-  const hostState = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-  const limits = JSON.parse(rig.ownedContainerExec(expected.containerId, [
-    'sh', '-lc',
-    `printf '{"cpuMax":"%s","memoryMax":"%s","swapMax":"%s","pidsMax":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/memory.swap.max)" "$(cat /sys/fs/cgroup/pids.max)"`,
-  ]))
+  const ownerFacts = await rig.chaosHostFacts(rig.exactRuntimeHandle(expected))
   return {
     soulId: row.soulId,
     incarnationId: row.incarnationId,
     containerId: row.containerId ?? '',
     hostBootId: row.hostBootId ?? '',
     nativeSessionId: row.nativeSessionId ?? '',
-    providerPid: Number(hostState.workerPid),
-    providerLaunchCount: Number(hostState.workerLaunchCount),
+    providerPid: ownerFacts.workerPid,
+    providerLaunchCount: ownerFacts.workerLaunchCount,
     activeWriters: claim.activeClaimCount,
-    unsafeBrokerAttempts: rig.runtime.broker.unsafeAttempts().length,
-    limits,
+    unsafeBrokerAttempts: ownerFacts.unsafeBrokerAttempts,
+    limits: ownerFacts.limits,
   }
 }
 
-export function nativeToolEvidence(
+export async function nativeToolEvidence(
   rig: ManagedRuntimeBrowserRig,
   containerId: string,
   nativeSessionId: string,
   marker: string,
-): NativeToolEvidence {
-  return JSON.parse(rig.ownedProviderExec(containerId, [
+): Promise<NativeToolEvidence> {
+  return JSON.parse((await rig.ownedProviderExec(containerId, [
     'node', '--no-warnings', '-e', OPENCODE_TOOL_EVIDENCE_SCRIPT,
     '/home/freshell/provider/.local/share/opencode/opencode.db', nativeSessionId, marker,
-  ]))
+  ])))
 }
 
-export function nativeFollowUpMessageIds(
+export async function nativeFollowUpMessageIds(
   rig: ManagedRuntimeBrowserRig,
   containerId: string,
   nativeSessionId: string,
   marker: string,
-): string[] {
-  const result = JSON.parse(rig.ownedProviderExec(containerId, [
+): Promise<string[]> {
+  const result = JSON.parse((await rig.ownedProviderExec(containerId, [
     'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
     '/home/freshell/provider/.local/share/opencode/opencode.db', nativeSessionId,
-  ])) as NativeHistory
+  ]))) as NativeHistory
   if (result.provider !== 'opencode' || result.nativeSessionId !== nativeSessionId) {
     throw new Error('native follow-up probe returned a conflicting OpenCode identity')
   }

@@ -94,12 +94,12 @@ function waitForRunningView(
   }, timeoutMs)
 }
 
-function markerLineCount(rig: ManagedRuntimeBrowserRig, containerId: string): number {
-  const raw = rig.ownedProviderExec(containerId, [
+async function markerLineCount(rig: ManagedRuntimeBrowserRig, containerId: string): Promise<number> {
+  const raw = (await rig.ownedProviderExec(containerId, [
     'sh',
     '-lc',
     'if test -f "$HOME/p3-tool-effect-count"; then wc -l < "$HOME/p3-tool-effect-count"; else printf 0; fi',
-  ]).trim()
+  ])).trim()
   return /^\d+$/.test(raw) ? Number(raw) : -1
 }
 
@@ -154,18 +154,18 @@ type NativeDigests = {
   parts: Record<string, string>
 }
 
-function providerHistoryDigests(rig: ManagedRuntimeBrowserRig, containerId: string, rootId: string): NativeDigests {
-  return JSON.parse(rig.ownedProviderExec(containerId, [
+async function providerHistoryDigests(rig: ManagedRuntimeBrowserRig, containerId: string, rootId: string): Promise<NativeDigests> {
+  return JSON.parse((await rig.ownedProviderExec(containerId, [
     'node', '--no-warnings', '-e', PROVIDER_HISTORY_DIGESTS,
     '/home/freshell/provider/.local/share/opencode/opencode.db', rootId,
-  ])) as NativeDigests
+  ]))) as NativeDigests
 }
 
-function assertExcludedSentinelsAbsent(rig: ManagedRuntimeBrowserRig, containerId: string): void {
-  const matches = JSON.parse(rig.ownedProviderExec(containerId, [
+async function assertExcludedSentinelsAbsent(rig: ManagedRuntimeBrowserRig, containerId: string): Promise<void> {
+  const matches = JSON.parse((await rig.ownedProviderExec(containerId, [
     'node', '--no-warnings', '-e', PROVIDER_SENTINEL_SCAN,
     '/home/freshell/provider/.local/share/opencode/opencode.db', JSON.stringify(EXCLUDED_SOURCE_SENTINELS),
-  ])) as string[]
+  ]))) as string[]
   expect(matches).toEqual([])
 }
 
@@ -238,7 +238,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       )
       if (!before.containerId || !before.hostBootId) throw new Error('managed OpenCode view lacks container/host identity')
       expect(rig.ownedContainerExec(before.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
-      rig.ownedProviderExec(before.containerId, ['sh', '-lc', 'rm -f "$HOME/p3-tool-effect-count"'])
+      await rig.ownedProviderExec(before.containerId, ['sh', '-lc', 'rm -f "$HOME/p3-tool-effect-count"'])
 
       // Phrase this as the ordinary file-edit task it is. The earlier
       // anonymous model refused the prior wording outright, producing no tool
@@ -254,7 +254,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
           ? text
           : null
       }, 180_000)
-      expect(markerLineCount(rig, before.containerId)).toBe(0)
+      expect((await markerLineCount(rig, before.containerId))).toBe(0)
 
       // OpenCode writes its session row on the FIRST turn, never at TUI start
       // -- that IS the capability manifest's `session-row-must-materialize`
@@ -292,7 +292,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       }, 90_000)
       expect(leafAfterWebRestart.id).toBe(paneId)
       expect(approvalSurvivedWebRestart).toBe(true)
-      expect(markerLineCount(rig, before.containerId)).toBe(0)
+      expect((await markerLineCount(rig, before.containerId))).toBe(0)
 
       rig.runtime.killOwnedRuntimeExact(before.containerId)
       await new Promise((resolve) => setTimeout(resolve, 1_500))
@@ -326,14 +326,14 @@ test.describe.serial('Phase 3 provider resurrection', () => {
         return text.includes('Permission required') && text.includes('Allow once') ? text : null
       }, 180_000)
       const visibleRecoveryState = rejectedInputWhileRecovering && after.incarnationId !== before.incarnationId
-      const accidentalApproval = markerLineCount(rig, after.containerId) !== 0
+      const accidentalApproval = (await markerLineCount(rig, after.containerId)) !== 0
       expect(promptAfterRecovery).toContain('Permission required')
       expect(accidentalApproval).toBe(false)
 
       // "Allow once" is the provider-native default selected action.
       await terminal.pressKey('Enter', 1)
-      const toolEffectCount = await waitForValue('exactly one provider tool side effect', () => {
-        const count = markerLineCount(rig, after.containerId!)
+      const toolEffectCount = await waitForValue('exactly one provider tool side effect', async () => {
+        const count = (await markerLineCount(rig, after.containerId!))
         return count === 1 ? count : null
       }, 180_000)
       expect(toolEffectCount).toBe(1)
@@ -344,7 +344,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
         timeout: 180_000,
       })
       const followUpText = await terminal.getVisibleText(terminalId)
-      expect(markerLineCount(rig, after.containerId)).toBe(1)
+      expect((await markerLineCount(rig, after.containerId))).toBe(1)
 
       const receipt = {
         schemaVersion: 1,
@@ -442,16 +442,16 @@ test.describe('managed OpenCode source-to-soul resume', () => {
       // The stage is removed once import receipts are durable. Verify the
       // actual provider database after the managed launch instead of requiring
       // transient staging bytes to outlive their documented cleanup point.
-      const imported = providerHistoryDigests(rig, before.containerId!, source.rootId)
+      const imported = (await providerHistoryDigests(rig, before.containerId!, source.rootId))
       assertBaselinePreserved(source, imported)
       expect(Object.keys(imported.messages)).toHaveLength(source.baselineMessages.size)
       expect(Object.keys(imported.parts)).toHaveLength(source.baselineParts.size)
-      assertExcludedSentinelsAbsent(rig, before.containerId!)
+      await assertExcludedSentinelsAbsent(rig, before.containerId!)
 
       // Wait for the session host to accept the TUI's exact-session/current-tail
       // observation. A live runtime alone can still reject input at this gate.
-      const adoption = await waitForValue('provider-observed managed pane', () => {
-        const status = rig.ownedOpenCodeAdoptionStatus(before)
+      const adoption = await waitForValue('provider-observed managed pane', async () => {
+        const status = (await rig.ownedOpenCodeAdoptionStatus(before))
         return status.state === 'observed' ? status.data.observation : null
       }, 180_000)
       expect(adoption).toMatchObject({
@@ -473,11 +473,11 @@ test.describe('managed OpenCode source-to-soul resume', () => {
         await page.locator(`[data-pane-id="${paneId}"] .xterm:visible`).last().click()
         await page.keyboard.insertText(`Reply with exactly SYNTHETIC_FOLLOWUP_${nonce} and use no tools.`)
         await page.keyboard.press('Enter')
-        const nativeFollowup = await waitForValue('completed synthetic follow-up in native history', () => {
-          const raw = rig.ownedProviderExec(before.containerId!, [
+        const nativeFollowup = await waitForValue('completed synthetic follow-up in native history', async () => {
+          const raw = (await rig.ownedProviderExec(before.containerId!, [
             'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
             '/home/freshell/provider/.local/share/opencode/opencode.db', source.rootId,
-          ])
+          ]))
           const history = JSON.parse(raw) as { turns: Array<{ messageId: string; text: string; toolCalls: unknown[] }> }
           return history.turns.find((turn) =>
             !source.baselineMessages.has(turn.messageId)
@@ -486,8 +486,8 @@ test.describe('managed OpenCode source-to-soul resume', () => {
         }, 180_000)
         expect(nativeFollowup.messageId).toBeTruthy()
         expectedTailMessageId = nativeFollowup.messageId
-        appended = await waitForValue('native follow-up append', () => {
-          const snapshot = providerHistoryDigests(rig, before.containerId!, source.rootId)
+        appended = await waitForValue('native follow-up append', async () => {
+          const snapshot = (await providerHistoryDigests(rig, before.containerId!, source.rootId))
           return snapshot.messages[nativeFollowup.messageId] ? snapshot : null
         }, 180_000)
         assertBaselinePreserved(source, appended)
@@ -501,10 +501,10 @@ test.describe('managed OpenCode source-to-soul resume', () => {
       expect(reopened.soulId).toBe(before.soulId)
       expect(reopened.nativeSessionId).toBe(source.rootId)
       expect(reopened.hostBootId).not.toBe(before.hostBootId)
-      const reopenedAdoption = await waitForValue('replacement provider-observed managed pane', () => {
+      const reopenedAdoption = await waitForValue('replacement provider-observed managed pane', async () => {
         // The probe authenticates this exact host boot against the reopened
         // inventory row before reading its input gate.
-        const status = rig.ownedOpenCodeAdoptionStatus(reopened)
+        const status = (await rig.ownedOpenCodeAdoptionStatus(reopened))
         return status.state === 'observed' ? status.data.observation : null
       }, 180_000)
       expect(reopenedAdoption).toMatchObject({
@@ -518,7 +518,7 @@ test.describe('managed OpenCode source-to-soul resume', () => {
       expect(reopenedAdoption.evidenceGeneration).toMatch(/^[0-9a-f]{64}$/)
       expect(reopenedAdoption.launchNonce).toBeTruthy()
       expect(reopenedAdoption.launchNonce).not.toBe(adoption.launchNonce)
-      const reopenedHistory = providerHistoryDigests(rig, reopened.containerId!, source.rootId)
+      const reopenedHistory = (await providerHistoryDigests(rig, reopened.containerId!, source.rootId))
       assertBaselinePreserved(source, reopenedHistory)
       if (appended) {
         for (const [id, digest] of Object.entries(appended.messages)) expect(reopenedHistory.messages[id], id).toBe(digest)

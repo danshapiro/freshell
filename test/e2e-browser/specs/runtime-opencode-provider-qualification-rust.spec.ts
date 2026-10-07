@@ -307,7 +307,7 @@ async function waitForReplacementPrompt(
       rig.supervisor,
       rig.runtime.terminalReadOutputBody(view.soulId, 0, 256 * 1024, await rig.controlEpoch()),
     ), 'terminal_output')
-    const sourceText = (output.frames ?? []).map((frame) => {
+    const sourceText = (output.frames ?? []).map((frame: { streamEpoch: string; terminalId: string; data: string }) => {
       if (frame.streamEpoch !== output.streamEpoch || frame.terminalId !== terminalId) {
         throw new Error('replacement prompt frame has mismatched ownership')
       }
@@ -361,12 +361,12 @@ async function paneSessionId(
   return typeof content?.sessionRef?.sessionId === 'string' ? content.sessionRef.sessionId : null
 }
 
-function nativeAssistantTurns(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string): NativeAssistantTurn[] {
+async function nativeAssistantTurns(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string): Promise<NativeAssistantTurn[]> {
   if (!view.containerId) throw new Error('native evidence probe has no exact owned container')
-  const raw = rig.ownedProviderExec(view.containerId, [
+  const raw = (await rig.ownedProviderExec(view.containerId, [
     'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
     '/home/freshell/provider/.local/share/opencode/opencode.db', sessionId,
-  ])
+  ]))
   const evidence = JSON.parse(raw)
   expect(evidence.schemaVersion).toBe(1)
   expect(evidence.nativeSessionId).toBe(sessionId)
@@ -379,8 +379,8 @@ async function nextNativeAssistantTurn(
   rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string,
   priorMessageIds: ReadonlySet<string>, expectedText: string,
 ): Promise<NativeAssistantTurn> {
-  return waitForValue('the correlated completed native assistant response, not a rendered echo', () => (
-    selectNativeAssistantTurn(nativeAssistantTurns(rig, view, sessionId), priorMessageIds, expectedText)
+  return waitForValue('the correlated completed native assistant response, not a rendered echo', async () => (
+    selectNativeAssistantTurn((await nativeAssistantTurns(rig, view, sessionId)), priorMessageIds, expectedText)
   ), 180_000, async () => {
     const terminalOutput = await page.evaluate((id) => (
       window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer?.(id) ?? ''
@@ -484,6 +484,7 @@ test.describe.serial('OpenCode provider qualification', () => {
             if (typeof message.type === 'string') observedWebSocketFrameTypes.add(message.type)
             if (
               message.type === 'terminal.stream.changed'
+              && typeof message.terminalId === 'string'
               && message.terminalId === qualifiedTerminalId
               && typeof message.streamId === 'string'
               && typeof message.reason === 'string'
@@ -526,12 +527,12 @@ test.describe.serial('OpenCode provider qualification', () => {
         .toBe(P2_OPENCODE_VERSION)
       const processArgs = rig.ownedContainerProcessTable(first.view.containerId)
       expect(processArgs).toContain(P2_OPENCODE_MODEL)
-      const authProbe = rig.ownedProviderExec(first.view.containerId, [
+      const authProbe = (await rig.ownedProviderExec(first.view.containerId, [
         'node', '--no-warnings', '-e',
         "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||openai.type!=='oauth'||openai.access!=='onecli-managed'||openai.refresh!=='onecli-managed'||openai.expires<Date.now()+3600000)process.exit(2);fs.accessSync('/home/freshell/provider/.config/onecli/gateway-ca.pem',fs.constants.R_OK);process.stdout.write('OneCLI OpenAI stub and CA present')",
-      ])
+      ]))
       expect(authProbe.trim()).toBe('OneCLI OpenAI stub and CA present')
-      const availableModels = rig.ownedProviderExec(first.view.containerId, ['opencode', 'models', 'openai'])
+      const availableModels = (await rig.ownedProviderExec(first.view.containerId, ['opencode', 'models', 'openai']))
       expect(availableModels).toContain(P2_OPENCODE_MODEL.split('/')[1])
       const exactLimits = cgroupLimitEvidence(rig, first.view)
       expect(exactLimits.swapMax).toBe('0')
@@ -582,7 +583,10 @@ test.describe.serial('OpenCode provider qualification', () => {
         page, harness, rig, tabId, first.paneId, afterHostCrash, beforeHostCrashStreamId,
         observedStreamChanges, observedWebSocketFrameTypes, observedWebSocketCount,
       )
-      const beforeRecall = new Set(nativeAssistantTurns(rig, afterHostCrash, nativeSessionId).map((turn) => turn.messageId))
+      const beforeRecall = new Set((await nativeAssistantTurns(rig, afterHostCrash, nativeSessionId)).map((turn) => {
+        if (!turn.messageId) throw new Error('native assistant turn has no message identity')
+        return turn.messageId
+      }))
       await executeInPane(page, first.paneId,
         'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
       const recalledAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterHostCrash, nativeSessionId, beforeRecall, nonce)
@@ -621,7 +625,10 @@ test.describe.serial('OpenCode provider qualification', () => {
         page, harness, rig, tabId, first.paneId, afterProviderCrash, beforeProviderCrashStreamId,
         observedStreamChanges, observedWebSocketFrameTypes, observedWebSocketCount,
       )
-      const beforeProviderFollowup = new Set(nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId).map((turn) => turn.messageId))
+      const beforeProviderFollowup = new Set((await nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId)).map((turn) => {
+        if (!turn.messageId) throw new Error('native assistant turn has no message identity')
+        return turn.messageId
+      }))
       await executeInPane(page, first.paneId,
         'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
       const providerAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup, nonce)

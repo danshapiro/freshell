@@ -8,7 +8,7 @@ import { expect } from '@playwright/test'
 
 import { validateFreshAgentIngressInventory } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
 import { test } from '../helpers/fixtures.js'
-import { ManagedRuntimeBrowserRig, type ManagedRuntimeView } from '../helpers/managed-runtime.js'
+import { ManagedRuntimeBrowserRig, type ManagedRuntimeView, type FixtureNativeState } from '../helpers/managed-runtime.js'
 
 const FIXTURE_ENV = 'FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST'
 const PENDING_CONTROL = '[freshell-fixture:pending-approval]'
@@ -52,10 +52,8 @@ async function waitFor<T>(description: string, probe: () => Promise<T | null>, t
   throw new Error(`timed out waiting for ${description}${suffix}`)
 }
 
-function fixtureState(rig: ManagedRuntimeBrowserRig, containerId: string): any {
-  return JSON.parse(rig.ownedProviderExec(containerId, [
-    'cat', '/home/freshell/provider/.freshell-fixture/provider-native-state.json',
-  ]))
+async function fixtureState(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): Promise<FixtureNativeState> {
+  return rig.fixtureNativeState(rig.exactRuntimeHandle(view))
 }
 
 function fixtureWorkerPid(processes: string, provider: string): number {
@@ -118,7 +116,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         })
         expect(send.sessionId).toBe(tab.sessionId)
         const state = await waitFor('one provider-native fixture completion', async () => {
-          const current = fixtureState(rig, view.containerId!)
+          const current = (await fixtureState(rig, view))
           return current.dispatchCount === 1 && current.completionCount === 1 ? current : null
         })
         expect(view.nativeSessionId).toBe(state.nativeSessionId)
@@ -145,7 +143,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         timeout: 0,
       })
       const pendingState = await waitFor('fixture approval request', async () => {
-        const state = fixtureState(rig, claude.view.containerId!)
+        const state = (await fixtureState(rig, claude.view))
         return typeof state.pendingDecisionId === 'string' ? state : null
       })
       const decisionId = pendingState.pendingDecisionId as string
@@ -160,7 +158,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         epoch,
       ))
       await waitFor('exactly-once pending completion', async () => {
-        const state = fixtureState(rig, recoveredClaude.containerId!)
+        const state = (await fixtureState(rig, recoveredClaude))
         return state.pendingDecisionId === null && state.dispatchCount === 2
           && state.completionCount === 2 ? state : null
       })
@@ -173,7 +171,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
       rig.runtime.killOwnedRuntimePidExact(codex.view.containerId!, workerPid)
       const recoveredCodex = await replacement(rig, codex.sessionId, codex.view.incarnationId)
       expect(recoveredCodex.nativeSessionId).toBe(codex.view.nativeSessionId)
-      expect(fixtureState(rig, recoveredCodex.containerId!).dispatchCount).toBe(1)
+      expect((await fixtureState(rig, recoveredCodex)).dispatchCount).toBe(1)
 
       await rig.restartSupervisor()
       await rig.crashAndRestartWeb()
