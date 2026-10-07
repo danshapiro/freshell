@@ -500,11 +500,19 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
       providerLaunchContext: managedPreparation?.context ?? { preparation: { claude: { mcp_args: [] } }, config: [{ root: 'user_provider',
         relativePath: '.claude.json', providerRelativePath: '.claude/.claude.json', format: 'json' }] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
-  const result = await harness.adminOk(supervisor, request)
+  const wrongRoot = caseId === 'wrong-root'
+  const result = wrongRoot ? await harness.adminRaw(supervisor, request) : await harness.adminOk(supervisor, request)
   harness.writeArtifact(`${scenario}-launch.json`, result)
-  let view = result.data.view
+  let view: any
+  if (wrongRoot) {
+    if (result.result?.Err?.code !== 'RECOVERY_BLOCKED') throw new Error('wrong current native root published a running launch')
+    const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+    harness.writeArtifact(`${scenario}-inventory.json`, inventory)
+    view = inventory.data.find((row: any) => row.soulId === soulId)
+    if (view?.launchState !== 'starting' || view.nativeIdentityObservation) throw new Error('wrong current native root published a running launch')
+  } else view = result.data.view
   const deadline = Date.now() + 50_000
-  while (!view.nativeIdentityObservation && Date.now() < deadline) {
+  while (!wrongRoot && !view.nativeIdentityObservation && Date.now() < deadline) {
     harness.writeArtifact(`${scenario}-terminal-output-private.json`, await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId)))
     // Refresh asynchronous PTY evidence through the existing host snapshot
     // probe before reading the registry's stored observation.
@@ -543,7 +551,7 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
   const currentObservation = !!observation && view.recoveryState === 'live' && observation.source === 'claude_native_event'
     && observation.nativeSessionId === nativeRoot && view.nativeSessionId === nativeRoot
     && observation.incarnationId === view.incarnationId
-  if (caseId === 'wrong-root' ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
+  if (wrongRoot ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
     ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
   harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
@@ -555,19 +563,19 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     || JSON.stringify(namespace.loaded.launch) !== JSON.stringify(namespace.hook.launch)) {
     throw new Error('actual terminal Claude pin/profile/namespace/TLS differs')
   }
-  const assertions = caseId === 'wrong-root' ? [{ name: 'wrong-current-native-root-refused-before-input', pass: false }]
+  const assertions = wrongRoot ? [{ name: 'wrong-current-native-root-refused-before-running-and-input', pass: false }]
     : [{ name: 'actual-terminal-current-native-post-load-observation-before-input', pass:
       observation.nativeSessionId === namespace.loaded.native.session_id && observation.incarnationId === view.incarnationId }]
-  if (caseId === 'wrong-root') {
+  if (wrongRoot) {
     const rejected = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned blocked startup probe. Do not use tools.\r'))
     harness.writeArtifact(`${scenario}-input-refusal.json`, rejected)
     const after = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
       ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
     harness.writeArtifact(`${scenario}-after-refused-input-native-private.json`, after)
-    // This PTY input boundary uses RecoveryBlocked when its current native
-    // observation is unavailable; inspect the provider state separately.
+    // No Running incarnation exists, so the ordinary input route has no
+    // admissible target. Inspect actual provider state separately.
     assertions[0]!.pass = !observation && actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
-      && rejected.result?.Err?.code === 'RECOVERY_BLOCKED'
+      && view.launchState === 'starting' && rejected.result?.Err?.code === 'UNKNOWN_SOUL'
       && JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
       && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0
     if (!assertions[0]!.pass) throw new Error('wrong current native root released ordinary input or changed native state')

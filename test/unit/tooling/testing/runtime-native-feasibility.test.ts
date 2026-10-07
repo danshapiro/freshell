@@ -113,7 +113,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(preferences.projects[request.params.terminal.cwd].hasTrustDialogAccepted).toBe(true)
       throw new Error('controlled terminal launch boundary')
     })
-    const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '', adminOk: launch } as unknown as RuntimeHarness
+    const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '', adminOk: launch, adminRaw: launch } as unknown as RuntimeHarness
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({
       name: 'claude/' + name, path: path.join(directory, path.basename(name)), sha256: 'e'.repeat(64) }))
     fs.writeFileSync(sources[2]!.path, JSON.stringify({ theme: 'dark', hasCompletedOnboarding: true,
@@ -160,7 +160,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(records.get('claude-create-signal-native-private.json')).toEqual({ processes: [{ pid: 7, signals: [] }] })
     } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['create', 'wrong-root', 'wrong-root-admitted'])('refreshes the current host and protects the terminal %s verdict', async (fault) => {
+  it.each(['create', 'wrong-root', 'wrong-root-admitted', 'wrong-root-published', 'wrong-root-late-published'])('refreshes the current host and protects the terminal %s verdict', async (fault) => {
     const caseId = fault === 'create' ? 'create' : 'wrong-root'
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-observation-refresh-'))
     const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
@@ -169,6 +169,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     let now = 0
     const clock = vi.spyOn(Date, 'now').mockImplementation(() => now += 25_000)
     const view = () => ({ soulId: request.params.soulId, containerId: 'owned-container', incarnationId: 'owned-incarnation',
+      launchState: caseId === 'create' || fault.includes('published') ? 'running' : 'starting',
       recoveryState: 'live', nativeSessionId: request.params.nativeSessionId,
       nativeIdentityObservation: refreshed && caseId === 'create' ? { nativeSessionId: request.params.nativeSessionId,
         incarnationId: 'owned-incarnation', source: 'claude_native_event' } : undefined })
@@ -176,7 +177,13 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       inventoryBody: () => ({ method: 'inventory' }), terminalReadOutputBody: () => ({ method: 'terminal_read_output' }),
       probeRecoveryBody: () => ({ method: 'probe_recovery' }),
       terminalInputBody: () => ({ method: 'terminal_input' }),
-      adminRaw: async () => ({ result: fault === 'wrong-root-admitted' ? { Ok: {} } : { Err: { code: 'RECOVERY_BLOCKED' } } }),
+      adminRaw: async (_supervisor: unknown, body: any) => {
+        if (body.method === 'launch') {
+          request = body
+          return { result: fault === 'wrong-root-published' ? { Ok: { view: view() } } : { Err: { code: 'RECOVERY_BLOCKED' } } }
+        }
+        return { result: fault === 'wrong-root-admitted' ? { Ok: {} } : { Err: { code: fault === 'wrong-root-published' ? 'RECOVERY_BLOCKED' : 'UNKNOWN_SOUL' } } }
+      },
       adminOk: async (_supervisor: unknown, body: any) => {
         if (body.method === 'launch') { request = body; return { data: { view: view() } } }
         if (body.method === 'probe_recovery') { refreshed = true; return { data: { kind: 'unknown' } } }
@@ -194,12 +201,16 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
     try {
       const execution = executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, caseId)
+      if (fault.includes('published')) {
+        await expect(execution).rejects.toThrow('wrong current native root published a running launch')
+        return
+      }
       if (fault === 'wrong-root-admitted') {
         await expect(execution).rejects.toThrow('wrong current native root released ordinary input')
         return
       }
       const original = await execution
-      expect(refreshed).toBe(true)
+      expect(refreshed).toBe(caseId === 'create')
       expect(original.assertions.every((assertion) => assertion.pass)).toBe(true)
     } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
   })
