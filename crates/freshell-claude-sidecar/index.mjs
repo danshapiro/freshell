@@ -313,6 +313,7 @@ async function handleSdkMessage(sessionId, msg) {
           type: 'sdk.session.init',
           sessionId,
           cliSessionId: msg.session_id,
+          cliVersion: msg.claude_code_version,
           model: msg.model,
           cwd: msg.cwd,
           tools: Array.isArray(msg.tools) ? msg.tools.map((t) => ({ name: t })) : undefined,

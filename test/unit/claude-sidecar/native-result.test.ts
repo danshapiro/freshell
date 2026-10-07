@@ -35,6 +35,9 @@ it('preserves a native denied tool result before system init and its successful 
     expect(toolResult?.nativeSessionId).toBe('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
     expect(toolResult?.uuid).toBe('native-user-uuid')
     expect(toolResult?.content[0]).toMatchObject({ tool_use_id: 'toolu-original', is_error: true })
+    const init = frames.find((frame) => frame.type === 'sdk.session.init')
+    expect(init).toMatchObject({ cliSessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', cliVersion: '2.1.237' })
+    expect(frames.indexOf(toolResult)).toBeLessThan(frames.indexOf(init))
     expect(result).toMatchObject({ result: 'success', nativeSessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', uuid: 'native-result-uuid', isError: false, stopReason: 'end_turn', permissionDenials: [{ tool_use_id: 'toolu-original' }] })
     expect(frames.indexOf(toolResult)).toBeLessThan(frames.indexOf(result))
   } finally { send({ type: 'shutdown' }); await exited }
