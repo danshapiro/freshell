@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createNativeSessionChannel, inspectNativeDeferredCheckpoint } from '../../../crates/freshell-claude-sidecar/native-session-channel.mjs'
@@ -19,6 +19,39 @@ async function hook(channel: any) {
   const exited = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', resolve) })
   child.stdin.end(JSON.stringify(native))
   expect(await exited).toBe(0)
+}
+function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false) {
+  const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/index.mjs')], {
+    env: { ...process.env, HOME: directory, FRESHELL_SIDECAR_TEST_CHECKPOINT: '1',
+      FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID: nativeRequestId,
+      FRESHELL_SIDECAR_TEST_DEFERRED_TRANSCRIPT_DELAY: delayedTranscript ? '1' : '0',
+      FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(launch),
+      FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  const frames: any[] = []
+  let buffer = ''
+  child.stdout.on('data', (chunk) => {
+    buffer += chunk
+    while (buffer.includes('\n')) {
+      const boundary = buffer.indexOf('\n')
+      frames.push(JSON.parse(buffer.slice(0, boundary)))
+      buffer = buffer.slice(boundary + 1)
+    }
+  })
+  const exited = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('exit', () => resolve()) })
+  const send = (value: unknown) => child.stdin.write(JSON.stringify(value) + '\n')
+  return { frames, send,
+    wait: async (type: string) => {
+      for (let attempt = 0; attempt < 300; attempt++) {
+        const frame = frames.find((frame) => frame.type === type)
+        if (frame) return frame
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      throw new Error(`missing ${type}: ${JSON.stringify(frames)}`)
+    },
+    close: async () => { send({ type: 'shutdown' }); await exited },
+  }
 }
 describe('managed native startup channel', () => {
   it('production sidecar emits the normalized native identity before any input and blocks early input', async () => {
@@ -116,5 +149,198 @@ describe('native solo deferred checkpoint inspection', () => {
     const result = { type: 'user', sessionId: root, message: { content: [{ type: 'tool_result', tool_use_id: toolUseID, is_error: true }] } }
     expect(await inspect([assistant, checkpoint, result])).toBeNull()
     expect(await inspect([assistant, checkpoint], false)).toBeNull()
+  })
+})
+
+describe('production sidecar native checkpoint continuation', () => {
+  it('waits for the genuine deferred native transcript publication before exposing its pending card', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-deferred-publication-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    const worker = checkpointSidecar(directory, 'native-delayed', true)
+    try {
+      worker.send({ type: 'create', requestId: 'delayed-native', cwd: directory, resumeSessionId: root, permissionMode: 'default' })
+      const session = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: session.sessionId, text: 'owned original operation' })
+      const card = await worker.wait('sdk.permission.request')
+      expect(card.nativeCheckpoint.toolUseID).toBe('toolu_original1')
+      expect(worker.frames.some((frame) => frame.type === 'sdk.error')).toBe(false)
+      worker.send({ type: 'permission.respond', sessionId: session.sessionId, requestId: card.requestId,
+        decision: { behavior: 'deny', message: 'owned denial' } })
+      expect((await worker.wait('sdk.tool.result')).content[0].is_error).toBe(true)
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it.each(['current', 'current-reordered', 'current-changed-decision-input', 'current-missing-decision-input', 'current-changed-profile', 'wrong-input', 'dispatching'])('releases only a trusted recoverable checkpoint after explicit current control (%s)', async (scenario) => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-explicit-resume-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    let worker = checkpointSidecar(directory, 'native-old')
+    const create = async () => {
+      worker.send({ type: 'create', requestId: 'explicit-resume', cwd: directory, resumeSessionId: root, permissionMode: 'default' })
+      const session = await worker.wait('created')
+      const init = await worker.wait('sdk.session.init')
+      return { sessionId: session.sessionId, init }
+    }
+    try {
+      const first = await create()
+      worker.send({ type: 'send', sessionId: first.sessionId, text: 'owned original operation' })
+      const oldCard = await worker.wait('sdk.permission.request')
+      await worker.close()
+      if (scenario === 'dispatching') {
+        const path = join(directory, '.freshell-checkpoint-' + root + '.json')
+        const record = JSON.parse(await readFile(path, 'utf8'))
+        await writeFile(path, JSON.stringify({ ...record, phase: 'dispatching' }) + '\n')
+      }
+      worker = checkpointSidecar(directory, 'native-new')
+      const current = await create()
+      expect(worker.frames.some((frame) => frame.type === 'probe.native-input')).toBe(false)
+      const checkpoint = { ...oldCard.nativeCheckpoint }
+      if (scenario === 'wrong-input') checkpoint.inputDigest = 'c'.repeat(64)
+      const currentLaunch = scenario === 'current-reordered' ? Object.fromEntries(Object.entries(launch).reverse()) : launch
+      worker.send({ type: 'checkpoint.resume', sessionId: current.sessionId, requestId: 'current-release',
+        checkpoints: [checkpoint], nativeBinding: { launch: currentLaunch, queryGeneration: current.init.nativeIdentityEvidence.queryGeneration } })
+      const receipt = await worker.wait('sdk.checkpoint.dispatch')
+      expect(receipt.requestId).toBe('current-release')
+      expect(receipt.nativeRequestId).toBe('current-release')
+      expect(receipt.ok).toBe(scenario.startsWith('current'))
+      if (scenario.startsWith('current')) {
+        const card = await worker.wait('sdk.permission.request')
+        expect(card.requestId).toBe(oldCard.requestId)
+        expect(card.nativeCheckpoint).toEqual(oldCard.nativeCheckpoint)
+        expect(card.nativeRequestId).toBe('native-new')
+        expect(card.nativeBinding.queryGeneration).toBe(1)
+        if (scenario.startsWith('current-') && scenario !== 'current-reordered') {
+          const profile = join(directory, '.claude', 'settings.json')
+          if (scenario === 'current-changed-profile') {
+            await mkdir(join(directory, '.claude'), { recursive: true })
+            await writeFile(profile, JSON.stringify({ permissions: { allow: ['Bash'] } }))
+          }
+          worker.send({ type: 'permission.respond', sessionId: current.sessionId, requestId: card.requestId,
+            decision: { behavior: 'allow', updatedInput: scenario === 'current-changed-decision-input'
+              ? { command: 'changed operation' } : scenario === 'current-missing-decision-input' ? undefined : card.tool.input } })
+          expect((await worker.wait('sdk.permission.dispatch')).ok).toBe(false)
+          expect(worker.frames.some((frame) => frame.type === 'sdk.tool.result')).toBe(false)
+          const parked = JSON.parse(await readFile(join(directory, '.freshell-checkpoint-' + root + '.json'), 'utf8'))
+          expect(parked.phase).toBe('approval_waiting')
+          if (scenario === 'current-changed-profile') await rm(profile)
+        }
+        worker.send({ type: 'permission.respond', sessionId: current.sessionId, requestId: card.requestId,
+          decision: { behavior: 'deny', message: 'owned denial after recovery' } })
+        expect((await worker.wait('sdk.tool.result')).content[0].is_error).toBe(true)
+      } else {
+        expect(worker.frames.some((frame) => frame.type === 'probe.native-input')).toBe(false)
+        expect(worker.frames.some((frame) => frame.type === 'sdk.permission.request')).toBe(false)
+      }
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it.each(['unregistered', 'incomplete', 'consumed'])('admits resume input only after native marker consumption (%s)', async (state) => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-resume-input-'))
+    const input = { command: 'fixture owned harmless counter' }
+    const assistant = { type: 'assistant', sessionId: root, uuid: 'assistant-original', version: '2.1.237',
+      message: { content: [{ type: 'tool_use', id: 'toolu_original1', name: 'Bash', input }] } }
+    const checkpoint = { type: 'attachment', sessionId: root, uuid: 'checkpoint-original', version: '2.1.237',
+      attachment: { type: 'hook_deferred_tool', toolUseID: 'toolu_original1', toolName: 'Bash', toolInput: input,
+        hookEvent: 'PreToolUse', permissionMode: 'default' } }
+    const rows: unknown[] = [assistant, checkpoint]
+    if (state === 'consumed') rows.push({ type: 'user', sessionId: root,
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_original1', is_error: true }] } })
+    await writeFile(join(directory, 'native.jsonl'), rows.map((row) => JSON.stringify(row)).join('\n') + (state === 'incomplete' ? '' : '\n'))
+    const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/index.mjs')], {
+      env: { ...process.env, HOME: directory, FRESHELL_SIDECAR_TEST_CHECKPOINT: '1',
+        FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(launch),
+        FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    const frames: any[] = []
+    let buffer = ''
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk
+      while (buffer.includes('\n')) {
+        const boundary = buffer.indexOf('\n')
+        frames.push(JSON.parse(buffer.slice(0, boundary)))
+        buffer = buffer.slice(boundary + 1)
+      }
+    })
+    const exited = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('exit', () => resolve()) })
+    const send = (value: unknown) => child.stdin.write(JSON.stringify(value) + '\n')
+    const wait = async (types: string[]) => {
+      for (let attempt = 0; attempt < 300; attempt++) {
+        const frame = frames.find((frame) => types.includes(frame.type))
+        if (frame) return frame
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      throw new Error(`missing ${types.join(',')}`)
+    }
+    try {
+      send({ type: 'create', requestId: 'resume-input', cwd: directory, resumeSessionId: root, permissionMode: 'default' })
+      const created = await wait(['created'])
+      await wait(['sdk.session.init'])
+      send({ type: 'send', sessionId: created.sessionId, text: 'ordinary next input' })
+      const admission = await wait(['sdk.error', 'probe.native-input'])
+      expect(admission.type).toBe(state === 'consumed' ? 'probe.native-input' : 'sdk.error')
+      if (state !== 'consumed') {
+        expect(admission.message).toContain('checkpoint')
+        expect(frames.some((frame) => frame.type === 'probe.native-input')).toBe(false)
+        expect(frames.some((frame) => frame.type === 'sdk.permission.request')).toBe(false)
+      }
+    } finally {
+      send({ type: 'shutdown' })
+      await exited
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+  it.each([false, true])('surfaces a recoverable card after native defer/resume/current ask (hook first: %s)', async (hookFirst) => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-checkpoint-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root, version: '2.1.237' }) + '\n')
+    const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/index.mjs')], {
+      env: { ...process.env, HOME: directory, FRESHELL_SIDECAR_TEST_CHECKPOINT: '1',
+        FRESHELL_SIDECAR_TEST_CHECKPOINT_HOOK_FIRST: hookFirst ? '1' : '0',
+        FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(launch),
+        FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    const frames: any[] = []
+    let buffer = ''
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk
+      while (buffer.includes('\n')) {
+        const boundary = buffer.indexOf('\n')
+        frames.push(JSON.parse(buffer.slice(0, boundary)))
+        buffer = buffer.slice(boundary + 1)
+      }
+    })
+    const exited = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('exit', () => resolve()) })
+    const send = (value: unknown) => child.stdin.write(JSON.stringify(value) + '\n')
+    const wait = async (type: string) => {
+      for (let attempt = 0; attempt < 500; attempt++) {
+        const found = frames.find((frame) => frame.type === type)
+        if (found) return found
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      throw new Error(`missing ${type}: ${JSON.stringify(frames)}`)
+    }
+    try {
+      send({ type: 'create', requestId: 'checkpoint-create', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      const created = await wait('created')
+      await wait('sdk.session.init')
+      send({ type: 'send', sessionId: created.sessionId, text: 'owned original operation' })
+      const card = await wait('sdk.permission.request')
+      expect(card.nativeCheckpoint).toMatchObject({ nativeSessionId: root, toolUseID: 'toolu_original1',
+        toolName: 'Bash', checkpointUuid: 'checkpoint-original', assistantUuid: 'assistant-original' })
+      expect(card.nativeCheckpoint.profileDigest).toMatch(/^[a-f0-9]{64}$/)
+      expect(card.requestId).toBe('checkpoint-checkpoint-original')
+      expect(card.nativeBinding).toMatchObject({ launch, queryGeneration: 2, nativeRequestId: 'native-query-current' })
+      expect(frames.filter((frame) => frame.type === 'sdk.session.init').map((frame) => frame.nativeIdentityEvidence.queryGeneration)).toEqual([1, 2])
+      expect(frames.findIndex((frame) => frame.type === 'sdk.session.loading')).toBeLessThan(frames.indexOf(card))
+      const transcript = await readFile(join(directory, 'native.jsonl'), 'utf8')
+      expect(transcript).toContain('hook_deferred_tool')
+      send({ type: 'permission.respond', sessionId: created.sessionId, requestId: card.requestId,
+        decision: { behavior: 'deny', message: 'owned user denial' } })
+      expect((await wait('sdk.tool.result')).content[0]).toMatchObject({ tool_use_id: 'toolu_original1', is_error: true })
+    } finally {
+      send({ type: 'shutdown' })
+      await exited
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 })

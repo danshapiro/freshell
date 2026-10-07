@@ -268,7 +268,10 @@ impl Supervisor {
 
     pub async fn dispatch(&self, envelope: Envelope<AdminCommand>) -> AdminReply {
         let request_id = envelope.request_id.clone();
-        let result = self.dispatch_inner(envelope).await;
+        // The command switch retains provider/recovery futures of different
+        // sizes. Poll it on the heap rather than nesting that whole state in
+        // this outer reply future on the runtime worker's stack.
+        let result = Box::pin(self.dispatch_inner(envelope)).await;
         AdminReply { request_id, result }
     }
 
@@ -781,7 +784,12 @@ impl Supervisor {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                self.recover(request).await.map(AdminResult::Recovery)
+                // Recovery polls several bounded provider/store paths. Keep its
+                // state outside the command-dispatch future so debug builds
+                // do not stack both large async frames on a Tokio worker.
+                Box::pin(self.recover(request))
+                    .await
+                    .map(AdminResult::Recovery)
             }
         }
     }

@@ -60,7 +60,8 @@ struct HostedTransport {
     state: ProviderState,
     profile: std::sync::Mutex<Option<FreshAgentProfile>>,
     session_id: Mutex<Option<String>>,
-    created_rx: Mutex<watch::Receiver<Option<Result<String, ()>>>>,
+    prepared_native_checkpoints: std::sync::Mutex<Option<Vec<Value>>>,
+    created_rx: Mutex<watch::Receiver<Option<Result<String, String>>>>,
     native_rx: Mutex<watch::Receiver<Option<String>>>,
     native_evidence_rx: Mutex<watch::Receiver<Option<Value>>>,
     send_outcomes: broadcast::Sender<(String, bool)>,
@@ -215,6 +216,7 @@ impl HostedTransport {
             state,
             profile: std::sync::Mutex::new(None),
             session_id: Mutex::new(None),
+            prepared_native_checkpoints: std::sync::Mutex::new(None),
             created_rx: Mutex::new(created_rx),
             native_rx: Mutex::new(native_rx),
             native_evidence_rx: Mutex::new(native_evidence_rx),
@@ -262,7 +264,7 @@ impl HostedTransport {
         tokio::time::timeout(CREATE_TIMEOUT, async {
             loop {
                 if let Some(result) = receiver.borrow().clone() {
-                    return result.map_err(|_| "provider create rejected".to_string());
+                    return result;
                 }
                 receiver
                     .changed()
@@ -408,6 +410,70 @@ impl HostedTransport {
 
 #[async_trait]
 impl FreshAgentTransport for HostedTransport {
+    async fn prepare_native_permission_recovery(
+        &self,
+        checkpoints: Vec<Value>,
+    ) -> Result<(), String> {
+        if checkpoints.len() > 32 {
+            return Err("too many pending native checkpoints".into());
+        }
+        *self
+            .prepared_native_checkpoints
+            .lock()
+            .expect("checkpoint lock") = Some(checkpoints);
+        Ok(())
+    }
+
+    async fn resume_native_permission_recovery(&self) -> Result<(), DispatchFailure> {
+        let reject = |message: &str| DispatchFailure {
+            message: message.into(),
+            acceptance_ambiguous: false,
+        };
+        let checkpoints = self
+            .prepared_native_checkpoints
+            .lock()
+            .expect("checkpoint lock")
+            .take()
+            .ok_or_else(|| {
+                reject("native recovery release is not prepared or was already attempted")
+            })?;
+        if checkpoints.is_empty() {
+            return Ok(());
+        }
+        let session_id = self
+            .session_id
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| reject("current native session is unavailable"))?;
+        let evidence = self
+            .native_evidence_rx
+            .lock()
+            .await
+            .borrow()
+            .clone()
+            .ok_or_else(|| reject("current native query is not observed"))?;
+        let binding =
+            json!({"launch":evidence["launch"],"queryGeneration":evidence["queryGeneration"]});
+        let ProviderState::Claude(state) = &self.state else {
+            return Err(reject(
+                "provider does not support native approval continuation",
+            ));
+        };
+        state
+            .resume_native_checkpoint_checked(
+                &session_id,
+                self.session_type(),
+                checkpoints,
+                binding,
+            )
+            .await
+            .map_err(|failure| DispatchFailure {
+                message: failure.message,
+                acceptance_ambiguous: failure.acceptance_ambiguous,
+            })
+    }
+
     async fn native_identity_evidence(&self) -> Option<Value> {
         self.native_evidence_rx.lock().await.borrow().clone()
     }
@@ -465,6 +531,11 @@ impl FreshAgentTransport for HostedTransport {
             }
             None => None,
         };
+        if matches!(self.provider, FreshProvider::Claude | FreshProvider::Kilroy) {
+            // The Claude adapter's live registration is indexed by the native
+            // UUID. The temporary SDK create key is not a live-session lookup.
+            *self.session_id.lock().await = native_session_id.clone();
+        }
         Ok(TransportStart { native_session_id })
     }
 
@@ -1057,7 +1128,7 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
 }
 
 struct BroadcastBridgeOutputs {
-    created: watch::Sender<Option<Result<String, ()>>>,
+    created: watch::Sender<Option<Result<String, String>>>,
     native: watch::Sender<Option<String>>,
     native_evidence: watch::Sender<Option<Value>>,
     events: mpsc::Sender<AgentEvent>,
@@ -1087,6 +1158,7 @@ fn spawn_broadcast_bridge(
     } = outputs;
     tokio::spawn(async move {
         let mut dropped = 0u64;
+        let mut native_query_generation = 0u64;
         loop {
             let frame = match receiver.recv().await {
                 Ok(frame) => frame,
@@ -1118,7 +1190,15 @@ fn spawn_broadcast_bridge(
                 }
             }
             if value.get("type").and_then(Value::as_str) == Some("freshAgent.create.failed") {
-                let _ = created.send(Some(Err(())));
+                let code = value
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("PROVIDER_CREATE_FAILED");
+                let message = value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider create rejected");
+                let _ = created.send(Some(Err(format!("{code}: {message}"))));
             }
             if value.get("type").and_then(Value::as_str) == Some("freshAgent.created") {
                 if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
@@ -1151,7 +1231,42 @@ fn spawn_broadcast_bridge(
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if event_type == "freshAgent.session.loading"
+                    && matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy)
+                {
+                    let binding = &event["nativeBinding"];
+                    let launch = serde_json::from_value::<
+                        freshell_runtime_protocol::NativeIdentityLaunch,
+                    >(binding["launch"].clone())
+                    .ok();
+                    let current = native_evidence.borrow().clone();
+                    let current_launch = expected_launch.clone().or_else(|| {
+                        current.as_ref().and_then(|evidence| {
+                            serde_json::from_value::<
+                                    freshell_runtime_protocol::NativeIdentityLaunch,
+                                >(evidence["launch"].clone())
+                                .ok()
+                        })
+                    });
+                    if launch.is_some() && launch == current_launch {
+                        if let Some(generation) = binding["queryGeneration"]
+                            .as_u64()
+                            .filter(|generation| *generation > native_query_generation)
+                        {
+                            native_query_generation = generation;
+                            let _ = native.send(None);
+                            let _ = native_evidence.send(None);
+                        }
+                    }
+                }
                 if event_type == "freshAgent.session.init" {
+                    let generation = event["nativeIdentityEvidence"]["queryGeneration"].as_u64();
+                    if generation.is_some_and(|generation| generation < native_query_generation)
+                        || (expected_launch.is_some()
+                            && generation.is_none_or(|generation| generation == 0))
+                    {
+                        continue;
+                    }
                     if let Some(expected) = expected_launch.as_ref() {
                         let evidence = &event["nativeIdentityEvidence"];
                         let actual = serde_json::from_value::<
@@ -1176,6 +1291,9 @@ fn spawn_broadcast_bridge(
                                 .is_none_or(|expected| expected == *id)
                         })
                     {
+                        if let Some(generation) = generation {
+                            native_query_generation = generation;
+                        }
                         let _=native_evidence.send(Some(event.get("nativeIdentityEvidence").cloned()
                             .unwrap_or_else(||json!({"nativeSessionId":session_id,"source":"native_sdk_system_init"}))));
                         let _ = native.send(Some(session_id.to_string()));
@@ -1408,6 +1526,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_query_loading_withdraws_the_previous_current_host_observation() {
+        let (sender, receiver) = broadcast::channel(16);
+        let (created, _) = watch::channel(None);
+        let (native, native_rx) = watch::channel(None);
+        let (native_evidence, evidence_rx) = watch::channel(None);
+        let (events, mut event_rx) = mpsc::channel(16);
+        let (send_outcomes, _) = broadcast::channel(16);
+        let (kill_outcomes, _) = broadcast::channel(16);
+        spawn_broadcast_bridge(
+            FreshProvider::Claude,
+            receiver,
+            BroadcastBridgeOutputs {
+                created,
+                native,
+                native_evidence,
+                events,
+                send_outcomes,
+                kill_outcomes,
+                suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            },
+        );
+        let launch = freshell_platform::managed_child_secrets::snapshot()
+            .and_then(|environment| {
+                environment
+                    .get(super::super::native_identity::LAUNCH_ENV)
+                    .cloned()
+            })
+            .map(|value| serde_json::from_str::<Value>(&value).unwrap())
+            .unwrap_or(
+                json!({"incarnationId":"current","launchNonce":"current-nonce",
+                "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":null}),
+            );
+        let root = launch["requestedNativeSessionId"]
+            .as_str()
+            .unwrap_or("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        sender.send(json!({"type":"freshAgent.event","event":{"type":"freshAgent.session.init",
+            "cliSessionId":root,"nativeIdentityEvidence":{"launch":launch,"digest":"a".repeat(64),"queryGeneration":1}}}).to_string()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(event_rx.recv().await, Some(AgentEvent::Started { .. })) {}
+        })
+        .await
+        .unwrap();
+        assert_eq!(native_rx.borrow().as_deref(), Some(root));
+        assert!(evidence_rx.borrow().is_some());
+        sender
+            .send(
+                json!({"type":"freshAgent.event","event":{"type":"freshAgent.session.loading",
+            "nativeBinding":{"launch":launch,"queryGeneration":2}}})
+                .to_string(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(AgentEvent::Provider { payload }) = event_rx.recv().await {
+                    if payload["event"]["type"] == "freshAgent.session.loading" {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            native_rx.borrow().is_none(),
+            "old query identity cannot authorize the new loading query"
+        );
+        assert!(
+            evidence_rx.borrow().is_none(),
+            "old receipt must also be withdrawn"
+        );
+        sender.send(json!({"type":"freshAgent.event","event":{"type":"freshAgent.session.init",
+            "cliSessionId":root,"nativeIdentityEvidence":{"launch":launch,"digest":"a".repeat(64),"queryGeneration":1}}}).to_string()).unwrap();
+        sender
+            .send(
+                json!({"type":"freshAgent.event","event":{"type":"query-test-ordering-barrier"}})
+                    .to_string(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(AgentEvent::Provider { payload }) = event_rx.recv().await {
+                    if payload["event"]["type"] == "query-test-ordering-barrier" {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            native_rx.borrow().is_none(),
+            "a late previous-query init cannot refill the withdrawn gate"
+        );
+        sender.send(json!({"type":"freshAgent.event","event":{"type":"freshAgent.session.init",
+            "cliSessionId":root,"nativeIdentityEvidence":{"launch":launch,"digest":"b".repeat(64),"queryGeneration":2}}}).to_string()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(event_rx.recv().await, Some(AgentEvent::Started { .. })) {}
+        })
+        .await
+        .unwrap();
+        assert_eq!(native_rx.borrow().as_deref(), Some(root));
+        assert_eq!(evidence_rx.borrow().as_ref().unwrap()["queryGeneration"], 2);
+    }
+
+    #[tokio::test]
+    async fn native_provider_create_failure_keeps_the_existing_typed_diagnostic() {
+        let (sender, receiver) = broadcast::channel(16);
+        let (created, mut created_rx) = watch::channel(None);
+        let (native, _) = watch::channel(None);
+        let (native_evidence, _) = watch::channel(None);
+        let (events, _events_rx) = mpsc::channel(16);
+        let (send_outcomes, _) = broadcast::channel(16);
+        let (kill_outcomes, _) = broadcast::channel(16);
+        spawn_broadcast_bridge(
+            FreshProvider::Claude,
+            receiver,
+            BroadcastBridgeOutputs {
+                created,
+                native,
+                native_evidence,
+                events,
+                send_outcomes,
+                kill_outcomes,
+                suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            },
+        );
+        sender
+            .send(
+                json!({"type":"freshAgent.create.failed", "code":"CLAUDE_CREATE_FAILED",
+            "message":"current native launch signal is unwritable"})
+                .to_string(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), created_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(created_rx.borrow().clone()).unwrap(),
+            json!({"Err":"CLAUDE_CREATE_FAILED: current native launch signal is unwritable"})
+        );
+    }
+
+    #[tokio::test]
     async fn normalized_claude_init_reaches_current_host_native_receiver() {
         let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
         let root = tempfile::tempdir().unwrap();
@@ -1452,10 +1714,11 @@ mod tests {
             let ProviderState::Claude(state) = &transport.state else {
                 unreachable!()
             };
-            state
-                .handle_create(create_request_for_profile(&profile), None)
-                .await;
+            let started = transport.start(&profile).await.unwrap();
             let created = transport.wait_created().await.unwrap();
+            assert_eq!(started.native_session_id, profile.native_session_id);
+            let observed_live = transport.is_live().await;
+            let observed_evidence = transport.native_identity_evidence().await;
             let mut receiver = transport.native_rx.lock().await;
             let native = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -1471,6 +1734,11 @@ mod tests {
             .unwrap_or(None);
             drop(receiver);
             state.shutdown().await;
+            assert!(
+                observed_live,
+                "the observed native session must remain a live host transport after startup"
+            );
+            assert!(observed_evidence.is_some());
             assert_ne!(
                 created,
                 profile.native_session_id.clone().unwrap(),
@@ -1478,6 +1746,132 @@ mod tests {
             );
             assert_eq!(native,profile.native_session_id,
                 "production sidecar sdk.session.init must pass the actual upstream normalizer and reach the host");
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_checkpoint_recovery_stages_without_input_and_releases_current_native_ask_once()
+    {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let keys = [
+            "HOME",
+            "CLAUDE_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+            "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+            "FRESHELL_SIDECAR_TEST_CHECKPOINT",
+            "FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID",
+        ];
+        let _restore = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+            let owned = tempfile::tempdir().unwrap();
+            let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            std::fs::write(
+                owned.path().join("native.jsonl"),
+                format!("{{\"type\":\"system\",\"sessionId\":\"{native}\"}}\n"),
+            )
+            .unwrap();
+            std::env::set_var("HOME", owned.path());
+            std::env::set_var("CLAUDE_HOME", owned.path().join(".claude"));
+            std::env::set_var("CLAUDE_CONFIG_DIR", owned.path().join(".claude"));
+            std::env::set_var(
+                "FRESHELL_CLAUDE_SIDECAR",
+                repo.join("crates/freshell-claude-sidecar/index.mjs"),
+            );
+            std::env::set_var(
+                "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+                repo.join("test/unit/claude-sidecar/fixtures/native-startup-query.mjs"),
+            );
+            std::env::set_var("FRESHELL_SIDECAR_TEST_CHECKPOINT", "1");
+            std::env::set_var(
+                "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+                json!({"incarnationId":"current","launchNonce":"current-nonce",
+                "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":native})
+                .to_string(),
+            );
+            let mut profile = parity_profile(FreshProvider::Claude);
+            profile.provider = provider.clone();
+            profile.cwd = owned.path().to_string_lossy().into();
+            profile.native_session_id = Some(native.into());
+            profile.session_ref = None;
+            profile.provider_launch_context = None;
+            profile.provider_secret_references.clear();
+            profile.plugins = None;
+            profile.permission_mode = Some("default".into());
+            std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID", "native-old");
+            let original = HostedTransport::new(provider.clone()).await;
+            let mut original_events = original.take_event_stream().unwrap();
+            original.start(&profile).await.unwrap();
+            original
+                .dispatch(
+                    &RequestId::parse("original-operation").unwrap(),
+                    "owned original operation",
+                    &profile,
+                )
+                .await
+                .unwrap();
+            let checkpoint = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(AgentEvent::PermissionRequested { payload, .. }) =
+                        original_events.recv().await
+                    {
+                        break payload["nativeCheckpoint"].clone();
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            if let ProviderState::Claude(state) = &original.state {
+                state.shutdown().await;
+            }
+            std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID", "native-new");
+            let current = HostedTransport::new(provider).await;
+            let mut events = current.take_event_stream().unwrap();
+            current
+                .prepare_native_permission_recovery(vec![checkpoint.clone()])
+                .await
+                .unwrap();
+            current.start(&profile).await.unwrap();
+            let before = std::fs::read(owned.path().join("native.jsonl")).unwrap();
+            let receipt = current.resume_native_permission_recovery().await;
+            let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(AgentEvent::PermissionRequested { payload, .. }) =
+                        events.recv().await
+                    {
+                        break payload;
+                    }
+                }
+            })
+            .await;
+            let duplicate = current.resume_native_permission_recovery().await;
+            if let ProviderState::Claude(state) = &current.state {
+                state.shutdown().await;
+            }
+            assert!(
+                receipt.is_ok(),
+                "current exact checkpoint release must be checked: {receipt:?}"
+            );
+            let recovered = recovered
+                .expect("explicit hosted release must surface the same current native ask");
+            assert_eq!(recovered["nativeCheckpoint"], checkpoint);
+            assert_eq!(recovered["nativeRequestId"], "native-new");
+            assert!(
+                duplicate.is_err(),
+                "staged recovery release cannot run twice"
+            );
+            assert_eq!(
+                std::fs::read(owned.path().join("native.jsonl")).unwrap(),
+                before,
+                "parked native ask must not execute or rewrite history"
+            );
+            assert!(!owned.path().join("effect-count").exists());
         }
     }
 

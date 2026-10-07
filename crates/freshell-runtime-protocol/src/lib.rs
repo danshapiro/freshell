@@ -4030,6 +4030,9 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_stream_epoch: Option<String>,
     },
+    FreshAgentResumePending {
+        incarnation_id: IncarnationId,
+    },
     FreshAgentSend {
         incarnation_id: IncarnationId,
         request_id: RequestId,

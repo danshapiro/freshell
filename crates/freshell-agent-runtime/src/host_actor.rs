@@ -194,6 +194,9 @@ pub enum FreshAgentOperation {
 
 #[async_trait]
 pub trait FreshAgentTransport: Send + Sync {
+    async fn resume_native_permission_recovery(&self) -> Result<(), DispatchFailure> {
+        Ok(())
+    }
     async fn prepare_native_permission_recovery(
         &self,
         _checkpoints: Vec<Value>,
@@ -391,12 +394,71 @@ pub struct FreshAgentHostActor {
     /// identity remains a resume request and cannot populate this slot.
     observed_native_session_id: Mutex<Option<String>>,
     dispatch_lock: Mutex<()>,
+    native_recovery_released: std::sync::atomic::AtomicBool,
+    native_recovery_prepared: bool,
     event_byte_cap: usize,
     event_count_cap: usize,
     _writer_lock: WriterLock,
 }
 
 impl FreshAgentHostActor {
+    pub async fn resume_pending_native_permissions(&self) -> Result<(), ActorError> {
+        let _serial = self.dispatch_lock.lock().await;
+        if !self.native_recovery_prepared {
+            return Ok(());
+        }
+        if self
+            .native_recovery_released
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ActorError::AmbiguousDispatch);
+        }
+        let state = self.state.lock().await;
+        if !matches!(
+            state.profile.provider,
+            FreshProvider::Claude | FreshProvider::Kilroy
+        ) || native_recovery_checkpoints(&state).is_empty()
+        {
+            return Ok(());
+        }
+        let expected = state.profile.native_session_id.clone();
+        drop(state);
+        let observed = self.observed_native_session_id.lock().await.clone();
+        let evidence = self
+            .transport
+            .native_identity_evidence()
+            .await
+            .ok_or(ActorError::NativeIdentityMismatch)?;
+        let launch: NativeIdentityLaunch = serde_json::from_value(evidence["launch"].clone())
+            .map_err(|_| ActorError::NativeIdentityMismatch)?;
+        if expected.is_none()
+            || observed != expected
+            || launch.execution_generation == 0
+            || evidence["queryGeneration"].as_u64().unwrap_or(0) == 0
+            || launch
+                .requested_native_session_id
+                .as_ref()
+                .is_some_and(|root| Some(root) != expected.as_ref())
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        if self
+            .native_recovery_released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ActorError::AmbiguousDispatch);
+        }
+        self.transport
+            .resume_native_permission_recovery()
+            .await
+            .map_err(|failure| {
+                if failure.acceptance_ambiguous {
+                    ActorError::AmbiguousDispatch
+                } else {
+                    ActorError::Transport(failure.message)
+                }
+            })
+    }
     pub async fn open(
         state_dir: impl Into<PathBuf>,
         profile: FreshAgentProfile,
@@ -461,17 +523,13 @@ impl FreshAgentHostActor {
             PersistedActorState::new(profile)
         };
 
+        let mut native_recovery_prepared = false;
         if matches!(
             state.profile.provider,
             FreshProvider::Claude | FreshProvider::Kilroy
         ) {
-            let checkpoints=state.decisions.values().filter(|decision|
-                matches!(decision.state,DecisionState::Pending|DecisionState::Interrupted))
-                .filter_map(|decision| {
-                    let binding=decision.payload.get("nativeBinding")?;
-                    let evidence=serde_json::json!({"launch":binding["launch"],"queryGeneration":binding["queryGeneration"]});
-                    current_native_checkpoint(&decision.payload,state.profile.native_session_id.as_deref(),Some(&evidence))
-                }).collect();
+            let checkpoints = native_recovery_checkpoints(&state);
+            native_recovery_prepared = !checkpoints.is_empty();
             transport
                 .prepare_native_permission_recovery(checkpoints)
                 .await
@@ -502,6 +560,8 @@ impl FreshAgentHostActor {
             state: Mutex::new(state),
             observed_native_session_id: Mutex::new(observed_native_session_id),
             dispatch_lock: Mutex::new(()),
+            native_recovery_released: std::sync::atomic::AtomicBool::new(false),
+            native_recovery_prepared,
             event_byte_cap,
             event_count_cap,
             _writer_lock: writer_lock,
@@ -1284,6 +1344,16 @@ fn pending_decision_ids(state: &PersistedActorState) -> BTreeSet<String> {
         .filter(|(_, decision)| matches!(decision.state, DecisionState::Pending))
         .map(|(decision_id, _)| decision_id.clone())
         .collect()
+}
+
+fn native_recovery_checkpoints(state: &PersistedActorState) -> Vec<Value> {
+    state.decisions.values().filter(|decision|
+        matches!(decision.state, DecisionState::Pending | DecisionState::Interrupted))
+        .filter_map(|decision| {
+            let binding = decision.payload.get("nativeBinding")?;
+            let evidence = serde_json::json!({"launch":binding["launch"],"queryGeneration":binding["queryGeneration"]});
+            current_native_checkpoint(&decision.payload, state.profile.native_session_id.as_deref(), Some(&evidence))
+        }).collect()
 }
 
 fn current_native_checkpoint(

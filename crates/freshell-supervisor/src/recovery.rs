@@ -2137,8 +2137,22 @@ impl Supervisor {
         let (probe, observed_context) = self
             .probe_recovery_observed(request.soul_id.clone())
             .await?;
+        // Select one boxed action rather than polling every recovery branch
+        // in a single large future on the default debug worker stack.
+        self.complete_recovery_probe(request, probe, observed_context)
+            .await
+    }
+
+    fn complete_recovery_probe(
+        &self,
+        request: RecoverRequest,
+        probe: RecoveryProbe,
+        observed_context: RecoveryContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RecoveryResult, RuntimeError>> + Send + '_>,
+    > {
         match probe.clone() {
-            RecoveryProbe::ReattachReady { handle, .. } => {
+            RecoveryProbe::ReattachReady { handle, .. } => Box::pin(async move {
                 self.registry
                     .mark_recovery_live(
                         request.soul_id.clone(),
@@ -2147,6 +2161,11 @@ impl Supervisor {
                     )
                     .await
                     .map_err(map_registry)?;
+                self.release_pending_native_permissions_after_live(
+                    request.soul_id.clone(),
+                    handle.incarnation_id.clone(),
+                )
+                .await?;
                 Ok(RecoveryResult {
                     outcome: RecoveryOutcome::Reattached,
                     view: self.view_for(&handle.incarnation_id).await?,
@@ -2157,10 +2176,10 @@ impl Supervisor {
                     observed_native_session_id: None,
                     incident_id: None,
                 })
-            }
+            }),
             RecoveryProbe::Blocked {
                 reason, evidence, ..
-            } => {
+            } => Box::pin(async move {
                 if reason == RecoveryBlockReason::StopIntent {
                     let context = self
                         .registry
@@ -2203,8 +2222,8 @@ impl Supervisor {
                     observed_native_session_id: None,
                     incident_id: None,
                 })
-            }
-            RecoveryProbe::DefinitivelyUnavailable { .. } => {
+            }),
+            RecoveryProbe::DefinitivelyUnavailable { .. } => Box::pin(async move {
                 // Legacy and opt-out rollout states retain Phase 3 semantics:
                 // a definitive provider-path negative is preserved as BLOCKED.
                 // Only newly opted-in/default managed operation may authorize
@@ -2236,6 +2255,11 @@ impl Supervisor {
                             )
                             .await
                             .map_err(map_registry)?;
+                        self.release_pending_native_permissions_after_live(
+                            request.soul_id.clone(),
+                            handle.incarnation_id.clone(),
+                        )
+                        .await?;
                         Ok(RecoveryResult {
                             outcome: RecoveryOutcome::Reattached,
                             view: self.view_for(&handle.incarnation_id).await?,
@@ -2312,8 +2336,8 @@ impl Supervisor {
                             .await
                     }
                 }
-            }
-            RecoveryProbe::ResumeReady { resume_spec, .. } => {
+            }),
+            RecoveryProbe::ResumeReady { resume_spec, .. } => Box::pin(async move {
                 let path = if resume_spec.checkpoint_revision > 0 {
                     RecoveryPath::CheckpointRestore
                 } else {
@@ -2328,8 +2352,8 @@ impl Supervisor {
                     observed_context.write_fence(),
                 ))
                 .await
-            }
-            RecoveryProbe::PristineSeedReady { .. } => {
+            }),
+            RecoveryProbe::PristineSeedReady { .. } => Box::pin(async move {
                 Box::pin(self.replace(
                     request.soul_id,
                     request.trigger,
@@ -2339,7 +2363,7 @@ impl Supervisor {
                     observed_context.write_fence(),
                 ))
                 .await
-            }
+            }),
         }
     }
 
@@ -2826,17 +2850,42 @@ impl Supervisor {
             }
         }
 
-        if let Err(message) = self
-            .replay_queued_inputs(soul_id.clone(), prepared.prepared.incarnation_id.clone())
+        let provider = start.context.provider.clone();
+        self.registry
+            .mark_recovery_success(
+                soul_id.clone(),
+                prepared.prepared.incarnation_id.clone(),
+                attempt_id.clone(),
+                verdict_fence,
+            )
+            .await
+            .map_err(map_registry)?;
+        let input_admission = match self
+            .release_pending_native_permissions_after_live(
+                soul_id.clone(),
+                prepared.prepared.incarnation_id.clone(),
+            )
             .await
         {
+            Ok(()) => {
+                self.replay_queued_inputs(soul_id.clone(), prepared.prepared.incarnation_id.clone())
+                    .await
+            }
+            Err(error) => Err(error.message),
+        };
+        if let Err(message) = input_admission {
+            let live_context = self
+                .registry
+                .recovery_context(soul_id.clone())
+                .await
+                .map_err(map_registry)?;
             self.registry
                 .mark_recovery_blocked(
                     soul_id.clone(),
-                    Some(attempt_id.clone()),
+                    None,
                     RecoveryBlockReason::CommandAmbiguous,
                     vec![message.clone()],
-                    verdict_fence.clone(),
+                    live_context.write_fence(),
                 )
                 .await
                 .map_err(map_registry)?;
@@ -2857,16 +2906,6 @@ impl Supervisor {
             });
         }
 
-        let provider = start.context.provider.clone();
-        self.registry
-            .mark_recovery_success(
-                soul_id,
-                prepared.prepared.incarnation_id.clone(),
-                attempt_id.clone(),
-                verdict_fence,
-            )
-            .await
-            .map_err(map_registry)?;
         let elapsed_ms = recovery_started
             .elapsed()
             .as_millis()
@@ -2911,6 +2950,88 @@ impl Supervisor {
             observed_native_session_id,
             incident_id: None,
         })
+    }
+
+    async fn release_pending_native_permissions_after_live(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: freshell_runtime_protocol::IncarnationId,
+    ) -> Result<(), RuntimeError> {
+        let context = self
+            .registry
+            .recovery_context(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let Some(agent) = context.fresh_agent.as_ref().filter(|agent| {
+            matches!(
+                agent.provider,
+                freshell_runtime_protocol::FreshProvider::Claude
+                    | freshell_runtime_protocol::FreshProvider::Kilroy
+            )
+        }) else {
+            return Ok(());
+        };
+        if agent.fixture_transport.is_some() || context.fixture.is_some() {
+            return Ok(());
+        }
+        if context.recovery_state != freshell_runtime_protocol::RecoveryState::Live
+            || context.desired_state != DesiredState::Running
+            || context.prior_handle.incarnation_id() != &incarnation_id
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryBlocked,
+                "native permission release requires current durable LIVE admission",
+            ));
+        }
+        let host = self
+            .authenticate_host(&incarnation_id, context.prior_handle.runtime_dir())
+            .await?;
+        let status = self
+            .host_status(
+                incarnation_id.clone(),
+                context.prior_handle.runtime_dir(),
+                &host,
+            )
+            .await?;
+        if status.exited
+            || !host
+                .capabilities
+                .iter()
+                .any(|capability| capability == "native-identity-observation-v1")
+            || current_native_observation(&context, &status).is_none()
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryWrongIdentity,
+                "current native observation is unavailable before permission release",
+            ));
+        }
+        let reply = self
+            .send_authenticated_host_command(
+                incarnation_id.clone(),
+                context.prior_handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentResumePending {
+                    incarnation_id: incarnation_id.clone(),
+                },
+            )
+            .await?;
+        match reply {
+            HostResult::FreshAgentCommand {
+                state: CommandState::ProviderAcked,
+                ..
+            } => {
+                crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.native_permission.released",
+                    serde_json::json!({"severity":"info","soulId":soul_id,"incarnationId":incarnation_id,"dispatchOnly":true}),
+                );
+                Ok(())
+            }
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "native permission release has no current dispatch acknowledgement",
+            )),
+        }
     }
 
     async fn preserve_definitive_as_blocked(
@@ -3283,9 +3404,14 @@ impl Supervisor {
         match probe.clone() {
             RecoveryProbe::ReattachReady { handle, .. } => {
                 self.registry
-                    .mark_recovery_live(soul_id, handle.incarnation_id.clone(), fence)
+                    .mark_recovery_live(soul_id.clone(), handle.incarnation_id.clone(), fence)
                     .await
                     .map_err(map_registry)?;
+                self.release_pending_native_permissions_after_live(
+                    soul_id,
+                    handle.incarnation_id.clone(),
+                )
+                .await?;
                 Ok(RecoveryResult {
                     outcome: RecoveryOutcome::Reattached,
                     view: self.view_for(&handle.incarnation_id).await?,
@@ -4155,6 +4281,29 @@ impl Supervisor {
                     }
                 }
             };
+            // This named lifecycle fixture exercises replacement and storage,
+            // but never produces a real-provider qualification observation.
+            if current.provider == "native-session-fixture"
+                && current.fixture == Some(freshell_runtime_protocol::FixtureKind::NativeSession)
+                && !status.exited
+                && current
+                    .native_identity_launch
+                    .as_ref()
+                    .is_some_and(|launch| {
+                        launch.execution_generation == status.max_execution_generation
+                    })
+                && status.native_session_id.as_deref().is_some_and(|root| {
+                    !root.is_empty() && current.native_session_id.as_deref() == Some(root)
+                })
+            {
+                return NativeIdentityWait::Observed {
+                    native_session_id: status
+                        .native_session_id
+                        .clone()
+                        .expect("checked fixture root"),
+                    elapsed_ms,
+                };
+            }
             let observation = current_native_observation(&current, &status)
                 .filter(|observation| {
                     native_capability && observation.incarnation_id == *incarnation_id
@@ -4813,6 +4962,228 @@ pub(crate) mod tests {
                 .unwrap()
                 .recovery_state,
             RecoveryState::Live
+        );
+    }
+
+    fn pending_release_test_agent(
+        native: &str,
+        workspace: &std::path::Path,
+    ) -> FreshAgentLaunchSpec {
+        serde_json::from_value(serde_json::json!({"sessionId":"pending-release","provider":"claude",
+            "sessionType":"freshclaude","runtimeVariant":"claude-sdk-sidecar","providerStoreId":"owned-store",
+            "cwd":workspace,"workspacePath":workspace,"runAsUid":65534,"runAsGid":0,"nativeSessionId":native})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pending_native_release_requires_durable_live_before_owned_host_input() {
+        use freshell_runtime_protocol::{
+            host_proof, read_frame, write_frame, Envelope, HostBootId, HostReply,
+            NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource, RecoveryState,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let runtime = dir.path().join("owned-host");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute("UPDATE incarnations SET runtime_dir=?1,execution_generation=1,fixture_kind=NULL,fresh_agent_spec=?2 WHERE incarnation_id=?3",
+            rusqlite::params![runtime.to_string_lossy(), serde_json::to_string(&pending_release_test_agent(native, dir.path())).unwrap(), prepared.incarnation_id.as_str()]).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='claude',recovery_state='recovering' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        registry
+            .record_native_session(soul.clone(), prepared.incarnation_id.clone(), native.into())
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let binding = registry
+            .bind_native_identity_launch(NativeIdentityLaunch {
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+                evidence_revision: context.evidence_revision,
+                execution_generation: 1,
+                requested_native_session_id: Some(native.into()),
+            })
+            .await
+            .unwrap();
+        let observation = NativeIdentityObservation {
+            native_session_id: native.into(),
+            incarnation_id: binding.incarnation_id,
+            launch_nonce: binding.launch_nonce,
+            evidence_revision: binding.evidence_revision,
+            source: NativeIdentitySource::FreshProviderHandshake,
+            evidence_digest: "a".repeat(64),
+        };
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        registry
+            .record_native_identity_observation(
+                soul.clone(),
+                observation.clone(),
+                context.write_fence(),
+            )
+            .await
+            .unwrap();
+        let current_observation = Arc::new(std::sync::Mutex::new(Some(observation.clone())));
+        let responder_observation = current_observation.clone();
+        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let actual_releases = releases.clone();
+        let actual_registry = registry.clone();
+        let actual_soul = soul.clone();
+        let limits = context.requested_limits.clone();
+        let listener = tokio::net::UnixListener::bind(runtime.join("host.sock")).unwrap();
+        let responder = tokio::spawn(async move {
+            let boot = HostBootId::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                let result = match request.body {
+                    HostCommand::Hello {
+                        incarnation_id,
+                        challenge,
+                    } => HostResult::Hello {
+                        proof: host_proof(b"synthetic-secret", &challenge, &boot, &incarnation_id),
+                        host_boot_id: boot.clone(),
+                        capabilities: vec!["native-identity-observation-v1".into()],
+                        effective_limits: limits.clone(),
+                    },
+                    HostCommand::Status { .. } => HostResult::Status {
+                        native_identity_observation: responder_observation.lock().unwrap().clone(),
+                        host_boot_id: boot.clone(),
+                        worker_pid: Some(123),
+                        worker_launch_count: 1,
+                        max_control_epoch: 1,
+                        max_execution_generation: 1,
+                        fixture_evidence: serde_json::json!({}),
+                        exited: false,
+                        native_session_id: Some(native.into()),
+                        opencode_transfer_receipt: None,
+                        opencode_adoption: Default::default(),
+                    },
+                    HostCommand::FreshAgentResumePending { .. } => {
+                        assert_eq!(
+                            actual_registry
+                                .recovery_context(actual_soul.clone())
+                                .await
+                                .unwrap()
+                                .recovery_state,
+                            RecoveryState::Live,
+                            "release cannot precede durable LIVE"
+                        );
+                        actual_releases.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        HostResult::FreshAgentCommand {
+                            state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                            native_session_id: Some(native.into()),
+                        }
+                    }
+                    _ => panic!("unexpected pending-release command"),
+                };
+                write_frame(
+                    &mut socket,
+                    &HostReply {
+                        request_id: request.request_id,
+                        result: Ok(result),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let supervisor = missing_supervisor(&dir, registry.clone());
+        let before = supervisor
+            .release_pending_native_permissions_after_live(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+            )
+            .await;
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        registry
+            .mark_recovery_live(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                context.write_fence(),
+            )
+            .await
+            .unwrap();
+        *current_observation.lock().unwrap() = None;
+        let withdrawn = supervisor
+            .release_pending_native_permissions_after_live(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+            )
+            .await;
+        let mut stale = observation.clone();
+        stale.launch_nonce = "old-query-nonce".into();
+        *current_observation.lock().unwrap() = Some(stale);
+        let stale = supervisor
+            .release_pending_native_permissions_after_live(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+            )
+            .await;
+        *current_observation.lock().unwrap() = Some(observation);
+        let after = supervisor
+            .release_pending_native_permissions_after_live(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+            )
+            .await;
+        conn.execute(
+            "UPDATE souls SET recovery_state='recovering' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let lifecycle = supervisor.lifecycle_lock(&soul).await;
+        let _lifecycle_guard = lifecycle.lock().await;
+        let reattached = supervisor
+            .preserve_nonloss_probe(
+                soul,
+                RecoveryTrigger::StartupReconcile,
+                RecoveryProbe::ReattachReady {
+                    handle: ReattachHandle {
+                        incarnation_id: prepared.incarnation_id,
+                        host_boot_id: HostBootId::new(),
+                        container_id: context.prior_handle.container_id().into(),
+                    },
+                    protocol_version: CONTROL_PROTOCOL_VERSION,
+                },
+                context.write_fence(),
+            )
+            .await;
+        responder.abort();
+        assert!(
+            before.is_err(),
+            "pending release must refuse before durable LIVE"
+        );
+        assert!(
+            withdrawn.is_err(),
+            "withdrawn current observation must refuse before native input"
+        );
+        assert!(
+            stale.is_err(),
+            "stale current observation must refuse before native input"
+        );
+        assert!(
+            after.is_ok(),
+            "current LIVE release must reach the authenticated owned host: {after:?}"
+        );
+        assert!(matches!(
+            reattached,
+            Ok(RecoveryResult {
+                outcome: RecoveryOutcome::Reattached,
+                ..
+            })
+        ));
+        assert_eq!(
+            releases.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "production reattach admission must dispatch after committing durable LIVE"
         );
     }
 

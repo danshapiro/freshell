@@ -259,6 +259,7 @@ impl FreshAgentTransport for OperationTransport {
 }
 
 struct FakeTransport {
+    recovery_releases: AtomicUsize,
     native: String,
     starts: AtomicUsize,
     dispatches: AtomicUsize,
@@ -368,6 +369,7 @@ impl FakeTransport {
             live: std::sync::atomic::AtomicBool::new(true),
             native_evidence: std::sync::Mutex::new(None),
             prepared_checkpoints: std::sync::Mutex::new(Vec::new()),
+            recovery_releases: AtomicUsize::new(0),
         })
     }
     fn ambiguous(native: &str) -> Arc<Self> {
@@ -383,6 +385,7 @@ impl FakeTransport {
                 live: std::sync::atomic::AtomicBool::new(true),
                 native_evidence: std::sync::Mutex::new(None),
                 prepared_checkpoints: std::sync::Mutex::new(Vec::new()),
+                recovery_releases: AtomicUsize::new(0),
             }
         })
     }
@@ -390,6 +393,10 @@ impl FakeTransport {
 
 #[async_trait]
 impl FreshAgentTransport for FakeTransport {
+    async fn resume_native_permission_recovery(&self) -> Result<(), DispatchFailure> {
+        self.recovery_releases.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
     async fn prepare_native_permission_recovery(
         &self,
         checkpoints: Vec<Value>,
@@ -883,7 +890,7 @@ async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_ope
     let actor = FreshAgentHostActor::open(
         dir.path(),
         profile(FreshProvider::Claude, "checkpoint-store", None),
-        old,
+        old.clone(),
     )
     .await
     .unwrap();
@@ -891,6 +898,9 @@ async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_ope
         .record_permission("same-checkpoint-card".into(), payload("old"))
         .await
         .unwrap();
+    actor.resume_pending_native_permissions().await.unwrap();
+    assert_eq!(old.recovery_releases.load(Ordering::SeqCst), 0,
+        "retained current callback is not a prepared recovered checkpoint and must not receive recovery input");
     drop(actor);
     let current = FakeTransport::new(native);
     *current.native_evidence.lock().unwrap() =
@@ -907,6 +917,22 @@ async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_ope
         vec![checkpoint.clone()],
         "prepare only the persisted exact native checkpoint before current native start"
     );
+    assert_eq!(
+        current.recovery_releases.load(Ordering::SeqCst),
+        0,
+        "preparing and starting cannot release the old operation"
+    );
+    actor.resume_pending_native_permissions().await.unwrap();
+    assert_eq!(
+        current.recovery_releases.load(Ordering::SeqCst),
+        1,
+        "explicit fenced release must reach the current transport once"
+    );
+    assert!(
+        actor.resume_pending_native_permissions().await.is_err(),
+        "duplicate recovery release must be refused before native input"
+    );
+    assert_eq!(current.recovery_releases.load(Ordering::SeqCst), 1);
     assert!(actor
         .resolve_permission(
             "same-checkpoint-card",

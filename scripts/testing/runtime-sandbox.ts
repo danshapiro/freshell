@@ -473,6 +473,13 @@ export class RuntimeGateBlockedError extends Error {
 }
 
 type Task2FixtureArtifact = { path: string; sha256: string }
+type NativeArtifacts = {
+  candidateSha: string
+  imageDigest: string
+  supervisor: Task2FixtureArtifact
+  host: Task2FixtureArtifact
+  sourceFiles: { name: string; path: string; sha256: string }[]
+}
 type Task2FixtureArtifacts = {
   candidateSha: string
   imageDigest: string
@@ -604,6 +611,72 @@ export class RuntimeHarness {
     writePrivateJson(path.join(this.evidenceDir, 'capabilities.json'), this.collectCapabilities())
     writePrivateJson(path.join(this.evidenceDir, 'build.json'), this.collectBuildInfo())
     this.recordLifecycle('gate.prepare.completed', { imageRef: this.imageRef, brokerSocket: proxySocketPath })
+  }
+
+  async prepareNativeArtifacts(input: NativeArtifacts): Promise<{ sourceRoot: string; files: { name: string; path: string; sha256: string }[] }> {
+    // Phase one avoids the existing broad qualification home/bootstrap mounts.
+    // The explicit immutable image, actual binaries and native selectors define
+    // this experiment; no phase label establishes provider qualification.
+    if (this.phase !== 1 || input.candidateSha !== this.candidateSha
+      || !/^sha256:[a-f0-9]{64}$/.test(input.imageDigest) || !await dockerIsRootless()) {
+      throw new Error('finite native preparation requires exact candidate/image and rootless Docker')
+    }
+    if ((await docker(['image', 'inspect', input.imageDigest, '--format', '{{.Id}}'])).trim() !== input.imageDigest) {
+      throw new Error('native image identity mismatch')
+    }
+    const fileBytes = (file: Task2FixtureArtifact, executable: boolean): Buffer => {
+      const metadata = fs.lstatSync(file.path)
+      if (!path.isAbsolute(file.path) || fs.realpathSync(file.path) !== file.path || !metadata.isFile()
+        || (executable && (metadata.mode & 0o222) !== 0) || !/^[a-f0-9]{64}$/.test(file.sha256)) {
+        throw new Error('exact native file artifact required')
+      }
+      const bytes = fs.readFileSync(file.path)
+      if (createHash('sha256').update(bytes).digest('hex') !== file.sha256) throw new Error('native file artifact changed')
+      return bytes
+    }
+    const binaries = [input.supervisor, input.host]
+    for (const binary of binaries) fileBytes(binary, true)
+    const names = new Set<string>()
+    for (const file of input.sourceFiles) {
+      if (!/^(claude|kilroy|codex|opencode|amplifier)\/[a-zA-Z0-9._/-]+$/.test(file.name)
+        || file.name.split('/').some((part) => !part || part === '.' || part === '..') || names.has(file.name)) {
+        throw new Error('unique selected native source name required')
+      }
+      names.add(file.name)
+      fileBytes(file, false)
+    }
+    if (fs.existsSync(this.testRoot) || fs.existsSync(this.buildDir)) throw new Error('native run already exists')
+    for (const directory of [this.testRoot, this.buildDir, this.evidenceDir, this.incidentsDir, this.browserDir]) ensurePrivateDirectory(directory)
+    const destinations = ['freshell-supervisor-native', 'freshell-session-host-native']
+    for (const [index, binary] of binaries.entries()) {
+      const destination = path.join(this.buildDir, destinations[index]!)
+      fs.writeFileSync(destination, fileBytes(binary, true), { flag: 'wx', mode: index === 1 ? 0o550 : 0o500 })
+      if (createHash('sha256').update(fs.readFileSync(destination)).digest('hex') !== binary.sha256) throw new Error('native executable copy changed')
+    }
+    const sourceRoot = path.join(this.testRoot, 'native-source')
+    ensurePrivateDirectory(sourceRoot)
+    const files = input.sourceFiles.map((source) => {
+      const destination = path.join(sourceRoot, source.name)
+      ensurePrivateDirectory(path.dirname(destination))
+      fs.writeFileSync(destination, fileBytes(source, false), { flag: 'wx', mode: 0o600 })
+      if (createHash('sha256').update(fs.readFileSync(destination)).digest('hex') !== source.sha256) throw new Error('native selected source copy changed')
+      return { name: source.name, path: destination, sha256: source.sha256 }
+    })
+    this.imageRef = input.imageDigest
+    this.testSupervisorBinary = this.releaseSupervisorBinary = path.join(this.buildDir, destinations[0]!)
+    this.testHostBinary = this.releaseHostBinary = path.join(this.buildDir, destinations[1]!)
+    this.broker = new RestrictedDockerBroker({
+      realSocketPath: dockerSocketPath(), proxySocketPath: path.join(this.testRoot, 'broker/docker.sock'),
+      runtimeRootPrefix: path.join(this.testRoot, 'r'), allowedHostBinaryPaths: new Set([this.testHostBinary]),
+      allowedImageRefs: new Set([this.imageRef]), allowTerminalWorkloads: true,
+      allowedWorkspaceRoots: new Set([this.testRoot]), allowedProviderUserRoots: new Set([sourceRoot]),
+      allowedBootstrapFiles: new Set(files.map((file) => file.path)), testRunId: this.runId,
+      logPath: path.join(this.evidenceDir, 'broker.jsonl'),
+    })
+    await this.broker.start()
+    this.brokerStarted = true
+    this.writeArtifact('native-artifacts.json', { ...input, preparedSources: files })
+    return { sourceRoot, files }
   }
 
   async prepareTask2FixtureArtifacts(input: Task2FixtureArtifacts): Promise<void> {
