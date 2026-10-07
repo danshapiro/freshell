@@ -1022,7 +1022,7 @@ export function createExternalRuntimeControl(
         baseUrl: descriptor.baseUrl, wsUrl: descriptor.wsUrl, token: descriptor.token,
       } } } : stage
   }
-  const queue = new RuntimeOwnerOperationQueue(descriptor.runId, descriptor.candidateSha, 'browser-managed-runtime', async request => {
+  const execute = async (request: RuntimeOwnerOperationRequest) => {
     if (finished && request.action !== 'finish' && request.action !== 'abort') throw new Error('external owned runtime is finished')
     const handle = () => {
       if (!request.handle) throw new Error('exact current owner handle required')
@@ -1147,6 +1147,21 @@ export function createExternalRuntimeControl(
       default: throw new Error('owner operation is not admitted by this external fixture controller')
     }
     return { runId: descriptor.runId, candidateSha: descriptor.candidateSha, operationId: request.operationId, result }
+  }
+  const queue = new RuntimeOwnerOperationQueue(descriptor.runId, descriptor.candidateSha, 'browser-managed-runtime', async request => {
+    try { return await execute(request) } catch (error) {
+      const runtime = z.object({ runtimeError: z.object({ code: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/) }) }).safeParse(error)
+      owner.runtime.recordLifecycle('external.owner_operation_refused', {
+        severity: 'warn', runId: descriptor.runId, candidateSha: descriptor.candidateSha,
+        operationId: request.operationId, action: request.action,
+        reason: runtime.success ? 'runtime_rejection'
+          : error instanceof Error && error.message === 'exact actually pending fixture decision required'
+            ? 'pending_decision_mismatch' : 'owner_operation_refused',
+        ...(runtime.success ? { runtimeCode: runtime.data.runtimeError.code } : {}),
+        ...(request.handle ? { soulId: request.handle.soulId, incarnationId: request.handle.incarnationId } : {}),
+      })
+      throw error
+    }
   })
   return input => queue.perform(input)
 }

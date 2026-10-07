@@ -727,6 +727,40 @@ describe('closed external owner control', () => {
     const request = { runId: context.runId, candidateSha: context.candidateSha, scenarioId: 'browser-managed-runtime', operationId: 'operation-owned', action: 'inventory' }
     return { owned, context, inventory, stop, request }
   }
+  it('preserves a body-free typed diagnostic when an admitted owner operation is refused', async () => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-soul',
+      incarnationId: 'owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'owned-boot', nativeSessionId: 'owned-root' }
+    const failure = Object.assign(new Error('private command body and credential must remain omitted'), {
+      runtimeError: { code: 'HOST_UNREACHABLE', message: 'private runtime message' },
+    })
+    vi.spyOn(owned, 'allowFixtureDecision').mockRejectedValue(failure)
+    const log = vi.spyOn(owned.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const operation = { ...request, action: 'fixture-decision-allow', handle, challengeId: 'pending-owned' }
+    await expect(control(operation)).rejects.toBe(failure)
+    await expect(control(operation)).rejects.toBe(failure)
+    expect(log).toHaveBeenCalledExactlyOnceWith('external.owner_operation_refused', {
+      severity: 'warn', runId: context.runId, candidateSha: context.candidateSha,
+      operationId: request.operationId, action: 'fixture-decision-allow', reason: 'runtime_rejection',
+      runtimeCode: 'HOST_UNREACHABLE', soulId: handle.soulId, incarnationId: handle.incarnationId,
+    })
+    expect(JSON.stringify(log.mock.calls)).not.toContain('private')
+  })
+  it('identifies the actual pending-decision predicate without exposing decision or message bodies', async () => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-soul',
+      incarnationId: 'owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'owned-boot', nativeSessionId: 'owned-root' }
+    vi.spyOn(owned, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(owned, 'fixtureNativeState').mockResolvedValue({ nativeSessionId: handle.nativeSessionId,
+      pendingDecisionId: null, dispatchCount: 2, completionCount: 1 })
+    const log = vi.spyOn(owned.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    await expect(control({ ...request, action: 'fixture-decision-allow', handle, challengeId: 'private-decision' })).rejects.toThrow(/pending/)
+    expect(log).toHaveBeenCalledWith('external.owner_operation_refused', expect.objectContaining({ reason: 'pending_decision_mismatch' }))
+    expect(log.mock.calls[0][1]).not.toHaveProperty('runtimeCode')
+    expect(JSON.stringify(log.mock.calls)).not.toContain('private-decision')
+  })
   it('returns only registered synthetic source IDs, digests and actual counts across the finite transport', async () => {
     const { owned, context, request } = fixture()
     const facts = { rootId: 'source-root', childId: 'source-child', grandchildId: 'source-grandchild',
