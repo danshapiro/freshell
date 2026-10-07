@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import fs from 'node:fs'
 import path from 'node:path'
+import { createConnection } from 'node:net'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from './runtime-sandbox.js'
 
@@ -121,19 +122,21 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     || !fs.lstatSync(manifestPath).isFile()) throw new Error('exact private native artifact manifest required')
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as {
     candidateSha: string; imageDigest: string
-    artifacts: { supervisor: { path: string; sha256: string }; host: { path: string; sha256: string } }
+    artifacts: { supervisor: { path: string; sha256: string }; host: { path: string; sha256: string }; server?: { path: string; sha256: string } }
     sourceFiles: { name: string; path: string; sha256: string }[]
   }
   const harness = new RuntimeHarness(process.cwd(), undefined, 1)
+  const servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []
   try {
     const prepared = await harness.prepareNativeArtifacts({ candidateSha: manifest.candidateSha,
       imageDigest: manifest.imageDigest, supervisor: manifest.artifacts.supervisor, host: manifest.artifacts.host,
+      ...(manifest.artifacts.server ? { server: manifest.artifacts.server } : {}),
       sourceFiles: manifest.sourceFiles })
     harness.writeArtifact('native-selection.json', selection)
     const originals = await dispatchNativeFeasibility({ selection, imageDigest: manifest.imageDigest,
       candidateSha: manifest.candidateSha, ownerId: harness.runId,
       execute: async (caseId) => {
-        try { return await executeManagedNativeCase(harness, prepared.files, selection, caseId) }
+        try { return await executeManagedNativeCase(harness, prepared.files, selection, caseId, prepared.serverPath, servers) }
         catch (error) {
           const reason = error instanceof Error ? error.message : 'unknown native case failure'
           harness.writeArtifact(`native-case-${caseId}-failure.json`, { severity: 'error',
@@ -145,6 +148,17 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     })
     harness.writeArtifact('native-originals.json', originals)
   } finally {
+    const serverCleanupErrors: string[] = []
+    for (const owned of servers) {
+      harness.writeArtifact(`${owned.scope}-server-output-private.json`, owned.server.capturedOutput())
+      if (owned.pid === undefined) {
+        try { owned.pid = owned.server.processEvidence().pid } catch { /* Failed startup may have already joined its child. */ }
+      }
+      try { await owned.server.stop() } catch (error) { serverCleanupErrors.push(String(error)) }
+      const absent = owned.pid === undefined ? null : !fs.existsSync(`/proc/${owned.pid}`)
+      harness.writeArtifact(`${owned.scope}-server-cleanup.json`, { pid: owned.pid, absent })
+      if (absent === false) serverCleanupErrors.push('owned native server did not stop')
+    }
     const containers = new Set([...harness.transferOwnedIds().containers,
       ...(harness.broker?.receipts() ?? []).map((receipt) => receipt.containerId)])
     for (const containerId of containers) {
@@ -154,14 +168,16 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     }
     const cleanup = await harness.cleanup()
     if (!cleanup.ok) throw new Error(`native owned cleanup failed: ${cleanup.errors.join('; ')}`)
+    if (serverCleanupErrors.length) throw new Error(`native server cleanup failed: ${serverCleanupErrors.join('; ')}`)
   }
 }
 
 async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
-  caseId: string): Promise<NativeExperimentOriginal> {
+  caseId: string, serverPath?: string,
+  servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
   if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
-    return executeManagedAmplifier(harness, sources, caseId)
+    return executeManagedAmplifier(harness, sources, caseId, serverPath, servers)
   }
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
     || !['create', 'current-native-turn', 'allow', 'deny'].includes(caseId)) {
@@ -288,7 +304,8 @@ async function executeManagedNativeCase(harness: RuntimeHarness,
 }
 
 async function executeManagedAmplifier(harness: RuntimeHarness,
-  sources: { name: string; path: string; sha256: string }[], caseId: string): Promise<NativeExperimentOriginal> {
+  sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath: string | undefined,
+  servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[]): Promise<NativeExperimentOriginal> {
   const grants = (['env_file', 'ca_file'] as const).map((suffix) => {
     const file = sources.find((source) => source.name === `amplifier/grants/${suffix}`)
     if (!file) throw new Error(`selected Amplifier ${suffix} reference missing`)
@@ -306,6 +323,52 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
     env: { HOME: home, FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'amplifier' } })
   const soulId = 'soul-' + randomUUID()
   const nativeRoot = randomUUID()
+  let managedPreparation: any
+  if (caseId === 'current-native-turn') {
+    if (!serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
+    const { RustServer } = await import('../../test/e2e-browser/helpers/rust-server.js')
+    const server = new RustServer({ homeDir: home, preserveHomeOnStop: true,
+      env: { FRESHELL_BIND_HOST: '0.0.0.0', FRESHELL_MANAGED_RUNTIME_V1: '1',
+        FRESHELL_RUNTIME_CONTROL_SOCKET: supervisor.controlSocket,
+        FRESHELL_RUNTIME_CONTROL_SECRET_FILE: supervisor.controlSecretFile,
+        FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'amplifier',
+        FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE: grants[0]!.sourcePath,
+        FRESHELL_MANAGED_AMPLIFIER_ONECLI_CA_FILE: grants[1]!.sourcePath },
+      stripEnvPrefixes: ['GEMINI_', 'GOOGLE_API_KEY', 'ANTHROPIC_', 'CLAUDE_', 'OPENAI_', 'LUNAROUTE_'],
+      setupHome: async (selectedHome) => {
+        const config = path.join(selectedHome, '.freshell'); fs.mkdirSync(config, { recursive: true, mode: 0o700 })
+        fs.writeFileSync(path.join(config, 'config.json'), JSON.stringify({ version: 1, settings: {
+          defaultCwd: workspace, codingCli: { enabledProviders: ['amplifier'], providers: { amplifier: { model: 'glm-5.3', reasoningEffort: 'low' } } },
+        } }), { mode: 0o600 })
+      } })
+    const owned = { server, scope: 'amplifier-native', pid: undefined as number | undefined }; servers.push(owned)
+    const previous = process.env.FRESHELL_E2E_RUST_SERVER_BIN
+    process.env.FRESHELL_E2E_RUST_SERVER_BIN = serverPath
+    try {
+      const info = await server.start(); owned.pid = info.pid
+      harness.writeArtifact('amplifier-native-server-private.json', { ...info, ...server.processEvidence(),
+        executableSha256: createHash('sha256').update(fs.readFileSync(serverPath)).digest('hex') })
+    } finally {
+      if (previous === undefined) delete process.env.FRESHELL_E2E_RUST_SERVER_BIN
+      else process.env.FRESHELL_E2E_RUST_SERVER_BIN = previous
+    }
+    managedPreparation = await new Promise((resolve, reject) => {
+      const socket = createConnection(path.join(path.dirname(supervisor.controlSocket), 'mcp.sock'))
+      const chunks: Buffer[] = []
+      socket.setTimeout(5_000, () => socket.destroy(new Error('actual native capability issue timed out')))
+      socket.once('connect', () => socket.end(JSON.stringify({ action: 'issue', controlSecret: supervisor.controlSecret,
+        soulId, incarnationId: null, grantId: null, provider: 'amplifier', tuiSource: null, workspace, cwd: workspace })))
+      socket.on('data', (chunk: Buffer) => chunks.push(chunk))
+      socket.once('error', reject)
+      socket.once('end', () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))) } catch { reject(new Error('actual native capability issue failed')) }
+      })
+    })
+    harness.writeArtifact('amplifier-native-managed-preparation-private.json', managedPreparation)
+    if (!managedPreparation.context?.mcpCapability || !managedPreparation.secretReferences?.length) {
+      throw new Error('actual native managed capability/preparation missing')
+    }
+  }
   const request = { method: 'launch', params: { soulId, provider: 'amplifier', providerStoreId: 'store-' + randomUUID(),
     nativeSessionId: nativeRoot,
     creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: 'amplifier-native-create',
@@ -315,8 +378,8 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
       resumeSessionId: nativeRoot, env: { HOME: '/home/freshell/provider', PROMPT_TOOLKIT_NO_CPR: '1' },
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30,
       projectKey: 'amplifier-native-create', providerModel: 'glm-5.3', providerReasoningEffort: 'low',
-      providerSecretReferences: grants,
-      providerLaunchContext: { preparation: { amplifier: { bundle: 'default', resume_args: [] } },
+      providerSecretReferences: managedPreparation?.secretReferences ?? grants,
+      providerLaunchContext: managedPreparation?.context ?? { preparation: { amplifier: { bundle: 'default', resume_args: [] } },
         config: profile.map((file) => ({ root: 'user_provider', relativePath: file.relative,
           providerRelativePath: '.amplifier/' + file.relative, format: 'yaml' })) } } } }
   harness.writeArtifact('amplifier-create-request.json', request)
