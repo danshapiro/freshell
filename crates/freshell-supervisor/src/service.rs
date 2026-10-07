@@ -1209,15 +1209,14 @@ impl Supervisor {
                 .resume_spec
                 .as_ref()
                 .is_some_and(|spec| spec.opencode_adoption_baseline.is_some());
-            let wait = self
-                .wait_for_native_identity(
-                    &workload.soul_id,
-                    handle.incarnation_id(),
-                    prepared.intent_revision,
-                    crate::recovery::native_identity_wait_timeout(adoption_required),
-                    false,
-                )
-                .await;
+            let wait = Box::pin(self.wait_for_native_identity(
+                &workload.soul_id,
+                handle.incarnation_id(),
+                prepared.intent_revision,
+                crate::recovery::native_identity_wait_timeout(adoption_required),
+                false,
+            ))
+            .await;
             let observed = match wait {
                 crate::recovery::NativeIdentityWait::Observed {
                     native_session_id, ..
@@ -4475,15 +4474,26 @@ mod native_observation_ipc_tests {
                     .unwrap();
                 })
             };
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                supervisor.terminal_read_output(soul.clone(), 0, 4096, None),
-            )
-            .await
-            .unwrap();
+            let mut request = Envelope::new(
+                RequestId::new(),
+                ControlRole::Web,
+                AdminCommand::TerminalReadOutput(
+                    freshell_runtime_protocol::TerminalReadOutputRequest {
+                        soul_id: soul.clone(),
+                        after_seq: 0,
+                        max_bytes: 4096,
+                        expected_stream_epoch: None,
+                        expected_control_epoch: None,
+                    },
+                ),
+            );
+            request.auth = Some(supervisor.config.control_secret.clone());
+            let result = tokio::time::timeout(Duration::from_secs(5), supervisor.dispatch(request))
+                .await
+                .unwrap();
             responder.await.unwrap();
             assert!(
-                result.is_err(),
+                result.result.is_err(),
                 "a late response must retain its pre-IPC fence"
             );
             let current = registry.recovery_context(soul).await.unwrap();
