@@ -305,6 +305,7 @@ pub struct PlannedSourceOccurrence {
     pub source: SourceOccurrence,
     pub references: super::ResolvedFileReferencePlan,
     pub original_form: bool,
+    pub requires_config_bind: bool,
 }
 
 #[derive(Default)]
@@ -347,6 +348,7 @@ pub fn retained_source_view_bytes(
 pub struct LoadedSourceOccurrence {
     pub source: SourceOccurrence,
     pub view: std::sync::Arc<String>,
+    pub requires_config_bind: bool,
 }
 
 /// Retain one bounded canonical read while keeping every native logical origin.
@@ -393,7 +395,11 @@ pub fn read_opencode_sources(
             canonical.insert(source.canonical_source.clone(), view.clone());
             view
         };
-        loaded.push(LoadedSourceOccurrence { source, view });
+        loaded.push(LoadedSourceOccurrence {
+            source,
+            view,
+            requires_config_bind: false,
+        });
     }
     Ok(loaded)
 }
@@ -602,6 +608,7 @@ pub fn plan_loaded_opencode_sources_relocated(
             source,
             references,
             original_form,
+            requires_config_bind: loaded.requires_config_bind,
         });
     }
     Ok(result)

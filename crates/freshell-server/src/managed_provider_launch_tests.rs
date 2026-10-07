@@ -16,12 +16,48 @@ use std::{
     time::Duration,
 };
 
+fn assert_private_sentinels_absent(root: &Path, certificate_sentinel: &[u8]) {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let metadata = entry.file_type().unwrap();
+        if metadata.is_dir() {
+            assert_private_sentinels_absent(&entry.path(), certificate_sentinel);
+        } else if metadata.is_file() {
+            let bytes = std::fs::read(entry.path()).unwrap();
+            for (ordinal, sentinel) in [
+                certificate_sentinel,
+                b"AUTH_PREFIX".as_slice(),
+                b"native-rule".as_slice(),
+                b"native-explicit-selected-rule".as_slice(),
+                b"native-inline-selected-rule".as_slice(),
+                b"native-shared-root-rule".as_slice(),
+                b"native-shared-nested-rule".as_slice(),
+                b"shared-home-private-rule".as_slice(),
+                b"shared-home-sensitive-file".as_slice(),
+                b"INLINE_PREFIX".as_slice(),
+                b"AUTH_INLINE_SHADOW_NO_FILE".as_slice(),
+                b"synthetic-onecli-shadowed".as_slice(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(
+                    !bytes.windows(sentinel.len()).any(|value| value == sentinel),
+                    "private input sentinel {ordinal} leaked to owned surface {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+}
+
 /// Delegates every lifecycle operation to the actual Docker backend. The only
 /// added operation delivers metadata to the closed fixture's trusted broker.
 struct BrokerAuthorizedBackend {
     real: DockerEngineBackend,
     control: PathBuf,
     handoff: PathBuf,
+    certificate_sentinel: Vec<u8>,
 }
 impl BrokerAuthorizedBackend {
     async fn authorize(&self, spec: &CreateRuntimeSpec) -> Result<(), BackendError> {
@@ -50,6 +86,13 @@ impl BrokerAuthorizedBackend {
         inputs
             .validate_references(references)
             .map_err(|_| invalid())?;
+        assert_private_sentinels_absent(
+            &self
+                .control
+                .join("provider-roots")
+                .join(&inputs.generation_id),
+            &self.certificate_sentinel,
+        );
         let indexed = references
             .iter()
             .enumerate()
@@ -203,10 +246,19 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
         InstallationId::parse(std::env::var("FRESHELL_PROVIDER_LAUNCH_INSTALLATION").unwrap())
             .unwrap();
     let registry = Registry::open(fixture.join("registry"), Some(installation)).unwrap();
+    let certificate = std::fs::read_to_string(fixture.join("grants/ca.pem")).unwrap();
+    let certificate_sentinel = certificate
+        .lines()
+        .find(|line| !line.starts_with("-----"))
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    assert!(certificate_sentinel.len() >= 32);
     let backend = Arc::new(BrokerAuthorizedBackend {
         real: DockerEngineBackend::new(fixture.join("broker.sock")),
         control: control.clone(),
         handoff: fixture.join("handoff"),
+        certificate_sentinel: certificate_sentinel.clone(),
     });
     let socket = control.join("control.sock");
     let secret_file = control.join("secret");
@@ -296,13 +348,19 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
     let shared_home_rule = fixture.join("workspace/home rule with spaces.txt");
     std::fs::write(&shared_home_rule, "shared-home-sensitive-file\n").unwrap();
     std::fs::set_permissions(&shared_home_rule, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let shared_bytes = serde_json::to_vec(&json!({"agent":{
+    let shared_lane_receipt = fixture.join("workspace/shared-lane-consumed");
+    let shared_json = serde_json::to_string(&json!({"agent":{
         "probe":{"prompt":"{env:OPENAI_API_KEY}"},
         "sharedRelative":{"prompt":"{file:./rules.txt}"},
         "sharedAbsolute":{"prompt":format!("{{file:{}}}", shared_home_rule.display())},
         "sharedHome":{"prompt":"{file:~/home rule with spaces.txt}"}
-    }, "plugin":[["./shared-probe.mjs", {"receipt":shared_receipt}]]}))
+    }, "plugin":[["./shared-probe", {"receipt":shared_receipt,"laneReceipt":shared_lane_receipt,"auth":"{env:OPENAI_API_KEY}","ca":"{file:{env:NODE_EXTRA_CA_CERTS}}"}]]}))
     .unwrap();
+    let shared_bytes = format!(
+        "{{\n // native comment {{file:./unselected-missing}}\n{}",
+        &shared_json[1..]
+    )
+    .into_bytes();
     for (directory, label) in [
         (fixture.join("workspace"), "root"),
         (nested.clone(), "nested"),
@@ -311,12 +369,29 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
             r#"import fs from 'node:fs';import crypto from 'node:crypto';
 export default {{id:'closed-shared-{label}',async server(input,options){{return {{async config(config){{
  let receipt=fs.existsSync(options.receipt)?JSON.parse(fs.readFileSync(options.receipt,'utf8')):{{}};
- receipt.{label}={{relative:crypto.createHash('sha256').update(fs.readFileSync(new URL('./rules.txt',import.meta.url))).digest('hex'),absolute:crypto.createHash('sha256').update(config.agent.sharedAbsolute.prompt).digest('hex'),home:crypto.createHash('sha256').update(config.agent.sharedHome.prompt).digest('hex')}};
+ receipt.{label}={{relative:crypto.createHash('sha256').update(fs.readFileSync(new URL('../rules.txt',import.meta.url))).digest('hex'),absolute:crypto.createHash('sha256').update(config.agent.sharedAbsolute.prompt).digest('hex'),home:crypto.createHash('sha256').update(config.agent.sharedHome.prompt).digest('hex')}};
  fs.writeFileSync(options.receipt,JSON.stringify(receipt));
+ fs.writeFileSync(options.laneReceipt+'.{label}.main',JSON.stringify({{auth:crypto.createHash('sha256').update(options.auth).digest('hex'),ca:crypto.createHash('sha256').update(options.ca).digest('hex')}}));
 }}}}}}}};
 "#
         );
-        std::fs::write(directory.join("shared-probe.mjs"), plugin).unwrap();
+        let tui_plugin = format!(
+            r#"import fs from 'node:fs';import crypto from 'node:crypto';
+export default {{id:'closed-shared-{label}',async tui(api,options){{
+ fs.writeFileSync(options.laneReceipt+'.{label}.tui',JSON.stringify({{auth:crypto.createHash('sha256').update(options.auth).digest('hex'),ca:crypto.createHash('sha256').update(options.ca).digest('hex'),theme:crypto.createHash('sha256').update(api.tuiConfig.theme).digest('hex')}}));
+ setTimeout(()=>{{const dir='/home/freshell/provider/.freshell/session-signals/opencode';const alive=fs.existsSync(dir)&&fs.readdirSync(dir).some(name=>name.startsWith('closed-native-terminal__')&&JSON.parse(fs.readFileSync(dir+'/'+name,'utf8')).hello===true);fs.writeFileSync(options.laneReceipt+'.{label}.rebind',JSON.stringify({{alive}}));}},1500);
+}}}};
+"#
+        );
+        let package = directory.join("shared-probe");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("server.mjs"), plugin).unwrap();
+        std::fs::write(package.join("tui.mjs"), tui_plugin).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"exports":{"./server":"./server.mjs","./tui":"./tui.mjs"}}"#,
+        )
+        .unwrap();
     }
     std::fs::write(&shared_source, &shared_bytes).unwrap();
     std::os::unix::fs::symlink("shared.json", fixture.join("workspace/opencode.json")).unwrap();
@@ -351,9 +426,11 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
 }};
 "#).unwrap();
     let selected_tui = fixture.join("workspace/selected-tui.jsonc");
+    std::os::unix::fs::symlink("shared.json", &selected_tui).unwrap();
+    let project_tui = fixture.join("workspace/tui.jsonc");
     let tui_receipt = fixture.join("workspace/native-tui-consumed.json");
     let selected_tui_bytes = format!("{{ // selected origin\n\"theme\":\"{{file:./selected-theme}}\",\"plugin\":[[\"file:///home/freshell/provider/.config/opencode/plugins/probe-tui/index.mjs\",{{\"receipt\":{}}}]],}}", serde_json::to_string(&tui_receipt).unwrap());
-    std::fs::write(&selected_tui, &selected_tui_bytes).unwrap();
+    std::fs::write(&project_tui, &selected_tui_bytes).unwrap();
     std::fs::write(fixture.join("workspace/selected-theme"), "  dark\n").unwrap();
     let inline_source = r#"{ // inline instance origin
 "agent":{"probe":{"description":"{env:INLINE_VALUE}"}}}"#;
@@ -492,6 +569,10 @@ export default {{id:'closed-directory-discovery',async server(){{
             rows: 30,
         },
         env: BTreeMap::from([
+            (
+                "FRESHELL_TERMINAL_ID".into(),
+                "closed-native-terminal".into(),
+            ),
             ("OPENCODE_CONFIG_DIR".into(), "../selected-directory".into()),
             ("OPENCODE_CONFIG".into(), "../selected-config.json".into()),
             ("OPENCODE_TUI_CONFIG".into(), "../selected-tui.jsonc".into()),
@@ -603,8 +684,45 @@ export default {{id:'closed-directory-discovery',async server(){{
         std::fs::read(resource_root.join("opencode.json")).unwrap(),
         root_config
     );
+    let shared_consumption = read_receipt(&shared_receipt).await;
+    if shared_consumption.is_err() {
+        let output = client
+            .read_output(
+                SoulId::parse(terminal.soul_id.clone()).unwrap(),
+                0,
+                1024 * 1024,
+            )
+            .await
+            .unwrap();
+        let text = output
+            .frames
+            .iter()
+            .map(|frame| frame.data.as_str())
+            .collect::<String>();
+        let classes = [
+            "shared-probe",
+            "SyntaxError",
+            "TypeError",
+            "ConfigInvalidError",
+            "ConfigJsonError",
+            "ENOENT",
+            "EACCES",
+            "failed to load plugin",
+            "Plugin export",
+            "OpenSSL",
+            "certificate",
+            "Failed to import",
+        ]
+        .into_iter()
+        .filter(|class| text.contains(class))
+        .collect::<Vec<_>>();
+        println!(
+            "provider_launch_diagnostic {}",
+            json!({"route":"shared-main","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"classes":classes})
+        );
+    }
     assert_eq!(
-        read_receipt(&shared_receipt).await.unwrap(),
+        shared_consumption.unwrap(),
         json!({"root":{"relative":format!("{:x}",Sha256::digest(b"native-shared-root-rule")),"absolute":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file")),"home":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file"))},"nested":{"relative":format!("{:x}",Sha256::digest(b"native-shared-nested-rule")),"absolute":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file")),"home":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file"))}})
     );
     assert_eq!(
@@ -613,8 +731,31 @@ export default {{id:'closed-directory-discovery',async server(){{
             .expect("actual TUI plugin must consume the selected effective TUI configuration"),
         json!({"theme":format!("{:x}",Sha256::digest(b"dark"))})
     );
+    let ca_digest = format!(
+        "{:x}",
+        Sha256::digest(
+            std::fs::read_to_string(fixture.join("grants/ca.pem"))
+                .unwrap()
+                .trim()
+                .as_bytes()
+        )
+    );
     assert_eq!(
-        std::fs::read_to_string(&selected_tui).unwrap(),
+        read_receipt(&shared_lane_receipt.with_extension("root.main"))
+            .await
+            .unwrap(),
+        json!({"auth":format!("{:x}",Sha256::digest(b"AUTH_PREFIXshared-home-sensitive-fileAUTH_SUFFIX")),"ca":ca_digest})
+    );
+    assert_eq!(
+        read_receipt(&shared_lane_receipt.with_extension("root.tui"))
+            .await
+            .unwrap(),
+        json!({"auth":format!("{:x}",Sha256::digest(b"synthetic-onecli-shadowed")),"ca":ca_digest,"theme":format!("{:x}",Sha256::digest(b"dark"))})
+    );
+    assert_eq!(read_receipt(&shared_lane_receipt.with_extension("root.rebind")).await.unwrap(), json!({"alive":true}),
+        "the actual native TUI loader must execute the owned package entrypoint, not merely retain its config spec");
+    assert_eq!(
+        std::fs::read_to_string(&project_tui).unwrap(),
         selected_tui_bytes
     );
     println!(
@@ -647,6 +788,7 @@ export default {{id:'closed-directory-discovery',async server(){{
     std::fs::remove_file(&root_receipt).unwrap();
     std::fs::remove_file(&home_root_receipt).unwrap();
     std::fs::remove_file(&directory_receipt).unwrap();
+    std::fs::remove_file(shared_lane_receipt.with_extension("root.main")).unwrap();
     // Fresh launches use current server controls; the terminal exercised a
     // request-only relative control. Both must activate the explicit layer.
     // The fresh route has a workspace beneath original HOME. Both role
@@ -705,6 +847,12 @@ export default {{id:'closed-directory-discovery',async server(){{
         .dispatch(HostedFreshAgentCommand::Send(send))
         .await;
     assert_eq!(read_receipt(&receipt).await.unwrap(), fresh_expected);
+    assert_eq!(
+        read_receipt(&shared_lane_receipt.with_extension("root.main"))
+            .await
+            .unwrap(),
+        json!({"auth":format!("{:x}",Sha256::digest(b"AUTH_PREFIXshared-home-sensitive-fileAUTH_SUFFIX")),"ca":ca_digest})
+    );
     assert_eq!(read_receipt(&root_receipt).await.unwrap(), expected_root);
     assert_eq!(
         read_receipt(&home_root_receipt).await.unwrap(),
@@ -758,38 +906,8 @@ export default {{id:'closed-directory-discovery',async server(){{
     );
     // Scan only run-owned durable/staged surfaces; referenced payloads belong
     // in private indexed files, not ordinary resource/configuration trees.
-    fn assert_private_sentinels_absent(root: &Path) {
-        for entry in std::fs::read_dir(root).unwrap() {
-            let entry = entry.unwrap();
-            let metadata = entry.file_type().unwrap();
-            if metadata.is_dir() {
-                assert_private_sentinels_absent(&entry.path());
-            } else if metadata.is_file() {
-                let bytes = std::fs::read(entry.path()).unwrap();
-                for sentinel in [
-                    b"AUTH_PREFIX".as_slice(),
-                    b"native-rule".as_slice(),
-                    b"native-explicit-selected-rule".as_slice(),
-                    b"native-inline-selected-rule".as_slice(),
-                    b"native-shared-root-rule".as_slice(),
-                    b"native-shared-nested-rule".as_slice(),
-                    b"shared-home-private-rule".as_slice(),
-                    b"shared-home-sensitive-file".as_slice(),
-                    b"INLINE_PREFIX".as_slice(),
-                    b"AUTH_INLINE_SHADOW_NO_FILE".as_slice(),
-                    b"synthetic-onecli-shadowed".as_slice(),
-                ] {
-                    assert!(
-                        !bytes.windows(sentinel.len()).any(|value| value == sentinel),
-                        "private input leaked to an owned durable/staged surface"
-                    );
-                }
-            }
-        }
-    }
-    assert_private_sentinels_absent(&fixture.join("registry"));
-    assert_private_sentinels_absent(&control.join("provider-roots"));
-    assert_private_sentinels_absent(&fixture.join("handoff"));
+    assert_private_sentinels_absent(&fixture.join("registry"), &certificate_sentinel);
+    assert_private_sentinels_absent(&fixture.join("handoff"), &certificate_sentinel);
     for view in client.inventory().await.unwrap() {
         if view.desired_state == DesiredState::Running {
             client.stop(view.soul_id).await.unwrap();

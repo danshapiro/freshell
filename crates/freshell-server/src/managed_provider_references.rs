@@ -910,6 +910,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         )
         .map_err(|error| error.to_string())?;
         let inline = LoadedSourceOccurrence {
+            requires_config_bind: true,
             source: SourceOccurrence {
                 logical_path: "OPENCODE_CONFIG_CONTENT".into(),
                 canonical_source: "OPENCODE_CONFIG_CONTENT".into(),
@@ -999,7 +1000,9 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
     };
     let mut retained_views =
         sources::retained_source_view_bytes(&loaded).map_err(str::to_string)?;
-    for source in &mut loaded {
+    let mut edited = std::collections::BTreeSet::new();
+    for ordinal in 0..loaded.len() {
+        let source = &loaded[ordinal];
         if rebind_enabled
             && source.source.lane == SourceLane::Tui
             && native_source_flags.iter().any(|flag| {
@@ -1013,14 +1016,28 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
                         )
             })
         {
+            let canonical = source.source.canonical_source.clone();
+            if !edited.insert(canonical.clone()) {
+                continue;
+            }
+            let shared = loaded
+                .iter()
+                .filter(|source| source.source.canonical_source == canonical)
+                .count()
+                > 1;
             let remaining = (64 * 1024 * 1024usize)
                 .checked_sub(retained_views)
                 .ok_or("simultaneous source views exceed 64 MiB")?;
+            let runtime_home = Path::new("/home/freshell/provider");
+            let plugin = if shared {
+                freshell_platform::opencode_plugin::rebind_plugin_package_path(runtime_home)
+            } else {
+                freshell_platform::opencode_plugin::rebind_plugin_path(runtime_home)
+            };
             let content = freshell_platform::opencode_plugin::selected_tui_content_bounded(
                 &source.view,
-                &freshell_platform::opencode_plugin::rebind_plugin_path(Path::new(
-                    "/home/freshell/provider",
-                )), remaining,
+                &plugin,
+                remaining,
             )
             .map_err(|_| {
                 format!(
@@ -1034,7 +1051,13 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
             retained_views = retained_views
                 .checked_add(content.len())
                 .ok_or("source-view byte count overflow")?;
-            source.view = std::sync::Arc::new(content);
+            let view = std::sync::Arc::new(content);
+            for (index, source) in loaded.iter_mut().enumerate() {
+                if index == ordinal || shared && source.source.canonical_source == canonical {
+                    source.view = view.clone();
+                    source.requires_config_bind = true;
+                }
+            }
         }
     }
     let names = source_environment_names(&loaded).map_err(|error| error.to_string())?;

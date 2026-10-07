@@ -20,6 +20,12 @@ pub fn rebind_plugin_path(home: &Path) -> PathBuf {
         .join("freshell-rebind-plugin.ts")
 }
 
+/// Native package entrypoints let a shared Main/TUI source select this
+/// directory: the server loader skips it and the TUI loader selects ./tui.
+pub fn rebind_plugin_package_path(home: &Path) -> PathBuf {
+    home.join(".freshell/opencode")
+}
+
 /// The freshell-owned TUI config injected per-pane via OPENCODE_TUI_CONFIG.
 /// Lives under ~/.freshell/opencode/ — deliberately NOT an ancestor of any
 /// pane cwd (opencode's project tui.json discovery walks up to `/`).
@@ -130,9 +136,8 @@ pub fn ensure_rebind_plugin_with_user_config(
     Ok(tui_json)
 }
 
-/// Normalize the selected source before reference spans are captured. This
-/// function never resolves environment or file tokens and never changes the
-/// declaring origin.
+/// Append the owned plugin before reference spans are captured while retaining
+/// the source's native text and declaring origin. Tokens remain unresolved.
 pub fn selected_tui_content(raw: &str, plugin: &Path) -> std::io::Result<String> {
     selected_tui_content_bounded(raw, plugin, 16 * 1024 * 1024)
 }
@@ -142,37 +147,153 @@ pub fn selected_tui_content_bounded(
     plugin: &Path,
     remaining: usize,
 ) -> std::io::Result<String> {
-    let mut config = crate::opencode_config::parse_jsonc_object(raw).ok_or_else(|| {
+    if raw.len() > remaining.min(16 * 1024 * 1024) {
+        return Err(std::io::Error::other(
+            "OpenCode TUI source-view profile exceeded",
+        ));
+    }
+    let config = crate::opencode_config::parse_jsonc_object(raw).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "OpenCode TUI config contains malformed JSONC or is not an object",
         )
     })?;
-    let plugins = config
-        .as_object_mut()
-        .expect("validated object")
-        .entry("plugin")
-        .or_insert_with(|| serde_json::json!([]));
-    let Some(plugins) = plugins.as_array_mut() else {
+    let plugins = config.get("plugin");
+    if plugins.is_some_and(|plugins| !plugins.is_array()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "OpenCode TUI plugin list is not an array",
         ));
-    };
-    let own = plugin_file_spec(plugin);
-    if !plugins
-        .iter()
-        .any(|entry| entry.as_str() == Some(own.as_str()))
-    {
-        plugins.push(serde_json::Value::String(own));
     }
-    crate::opencode_config::serialize_source_view(&config, remaining)
+    let own = plugin_file_spec(plugin);
+    if plugins
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|plugins| {
+            plugins
+                .iter()
+                .any(|entry| entry.as_str() == Some(own.as_str()))
+        })
+    {
+        return Ok(raw.into());
+    }
+    // Keep the native document's comments, escapes and replacement spans.
+    // Only append one literal plugin entry to the effective top-level array.
+    let (offset, separator) = plugin_insertion(raw, plugins.is_some())?;
+    let own = serde_json::to_string(&own).map_err(std::io::Error::other)?;
+    let addition = if plugins.is_some() {
+        format!("{separator}{own}")
+    } else {
+        format!("{separator}\"plugin\":[{own}]")
+    };
+    if raw
+        .len()
+        .checked_add(addition.len())
+        .is_none_or(|length| length > remaining.min(16 * 1024 * 1024))
+    {
+        return Err(std::io::Error::other(
+            "OpenCode TUI source-view profile exceeded",
+        ));
+    }
+    let mut content = String::with_capacity(raw.len() + addition.len());
+    content.push_str(&raw[..offset]);
+    content.push_str(&addition);
+    content.push_str(&raw[offset..]);
+    Ok(content)
+}
+
+/// Scan validated JSONC without allocating tokens or decoding values. The
+/// last top-level plugin array is effective when a source repeats that key.
+fn plugin_insertion(raw: &str, has_plugins: bool) -> std::io::Result<(usize, &'static str)> {
+    let bytes = raw.as_bytes();
+    let mut cursor = 0;
+    let mut depth = 0usize;
+    let mut previous = b' ';
+    let mut plugin_key = false;
+    let mut plugin_array = false;
+    let mut insertion = None;
+    while cursor < bytes.len() {
+        let start = cursor;
+        let token = bytes[cursor];
+        cursor += 1;
+        if token.is_ascii_whitespace() {
+            continue;
+        }
+        if token == b'/' && bytes.get(cursor) == Some(&b'/') {
+            while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
+                cursor += 1;
+            }
+            continue;
+        }
+        if token == b'/' && bytes.get(cursor) == Some(&b'*') {
+            cursor += 1;
+            while cursor + 1 < bytes.len() && &bytes[cursor..cursor + 2] != b"*/" {
+                cursor += 1;
+            }
+            cursor += 2;
+            continue;
+        }
+        if token == b'"' {
+            while cursor < bytes.len() {
+                let byte = bytes[cursor];
+                cursor += 1;
+                if byte == b'\\' {
+                    cursor += 1;
+                } else if byte == b'"' {
+                    break;
+                }
+            }
+            if depth == 1 && matches!(previous, b'{' | b',') {
+                plugin_key = serde_json::from_str::<String>(&raw[start..cursor])
+                    .is_ok_and(|key| key == "plugin");
+            }
+        } else {
+            match token {
+                b'[' | b'{' => {
+                    if depth == 1 && previous == b':' {
+                        plugin_array = plugin_key && token == b'[';
+                    }
+                    depth += 1;
+                }
+                b']' | b'}' => {
+                    if depth == 2 && plugin_array && token == b']' {
+                        insertion = Some((
+                            start,
+                            if matches!(previous, b'[' | b',') {
+                                ""
+                            } else {
+                                ","
+                            },
+                        ));
+                        plugin_array = false;
+                    }
+                    if depth == 1 && !has_plugins {
+                        insertion = Some((
+                            start,
+                            if matches!(previous, b'{' | b',') {
+                                ""
+                            } else {
+                                ","
+                            },
+                        ));
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        previous = token;
+    }
+    insertion.ok_or_else(|| std::io::Error::other("OpenCode TUI plugin array is unavailable"))
 }
 
 /// Install only the implementation when the controller already prepared the
 /// selected TUI source. Re-parsing that source here would change recipe spans.
 pub fn ensure_rebind_plugin_source(home: &Path) -> std::io::Result<()> {
-    write_atomic_if_changed(&rebind_plugin_path(home), REBIND_PLUGIN_SOURCE)
+    write_atomic_if_changed(&rebind_plugin_path(home), REBIND_PLUGIN_SOURCE)?;
+    write_atomic_if_changed(
+        &rebind_plugin_package_path(home).join("package.json"),
+        r#"{"exports":{"./tui":"./freshell-rebind-plugin.ts"}}"#,
+    )
 }
 
 #[cfg(test)]
@@ -279,12 +400,75 @@ mod tests {
         std::fs::write(&selected, raw).unwrap();
         let generated =
             ensure_rebind_plugin_with_user_config(home.path(), Some(&selected)).unwrap();
-        let effective: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(generated).unwrap()).unwrap();
+        let effective = crate::opencode_config::parse_jsonc_object(
+            &std::fs::read_to_string(generated).unwrap(),
+        )
+        .unwrap();
         assert_eq!(effective["theme"], "dark");
         assert_eq!(effective["plugin"].as_array().unwrap().len(), 2);
         assert_eq!(effective["plugin"][0], "file:///user.ts");
         assert_eq!(std::fs::read_to_string(selected).unwrap(), raw);
+    }
+
+    #[test]
+    fn shared_tui_edit_preserves_native_file_and_auth_lexemes() {
+        let raw = "{\n // native comment {file:./missing}\n\"agent\":{\"probe\":{\"prompt\":\"{env:AUTH}\",\"description\":\"\\u007bfile:./literal\\u007d\"}},\"plugin\":[[\"./probe.mjs\",{\"key\":\"{file:./rule}\"}], /* tail */], }";
+        let content = selected_tui_content(raw, Path::new("/owned/rebind.ts")).unwrap();
+        assert!(
+            content.contains("// native comment {file:./missing}"),
+            "normalizing a shared source changes the native comment-prefix file exclusion"
+        );
+        assert!(content.contains("\\u007bfile:./literal\\u007d"),
+            "native replacement happens before JSONC decoding, so raw escape spellings must survive");
+        assert!(content.contains("\"prompt\":\"{env:AUTH}\""));
+        let mut selected = Vec::new();
+        crate::opencode_config::transform_file_tokens(
+            &content,
+            &|name| (name == "AUTH").then(|| "{file:./auth-rule}".into()),
+            |token| {
+                selected.push(token.path.to_string());
+                Ok::<_, ()>(format!("{{file:{}}}", token.path))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            ["./auth-rule", "./rule"],
+            "native replacement must not select comment-prefixed or escaped file-looking strings"
+        );
+        let config = crate::opencode_config::parse_jsonc_object(&content).unwrap();
+        assert_eq!(config["plugin"].as_array().unwrap().len(), 2);
+        assert_eq!(config["plugin"][0][0], "./probe.mjs");
+    }
+
+    #[test]
+    fn tui_plugin_insertion_handles_native_arrays_comments_and_effective_duplicate_keys() {
+        for raw in [
+            "{}",
+            "{\"theme\":\"dark\", /* tail */}",
+            "{\"plugin\":[]}",
+            "{\"plugin\":[\"file:///user.ts\", /* tail */]}",
+            "{\"plugin\":[[\"file:///user.ts\",{\"nested\":[1,2],\"text\":\"]}\\\"\"}]]}",
+            "{\"plugin\":[\"discarded\"],\"pl\\u0075gin\":[],\"nested\":{\"plugin\":[\"unrelated\"]}}",
+        ] {
+            let before = crate::opencode_config::parse_jsonc_object(raw).unwrap();
+            let plugin = Path::new("/owned/rebind");
+            let content = selected_tui_content(raw, plugin).unwrap();
+            let after = crate::opencode_config::parse_jsonc_object(&content).unwrap();
+            let before_plugins = before.get("plugin").and_then(serde_json::Value::as_array);
+            let after_plugins = after["plugin"].as_array().unwrap();
+            assert_eq!(after_plugins.len(), before_plugins.map_or(0, Vec::len) + 1);
+            if let Some(before_plugins) = before_plugins {
+                assert_eq!(&after_plugins[..before_plugins.len()], before_plugins);
+            }
+            assert_eq!(after_plugins.last().unwrap(), "file:///owned/rebind");
+            for (key, value) in before.as_object().unwrap() {
+                if key != "plugin" { assert_eq!(&after[key], value); }
+            }
+            assert_eq!(selected_tui_content(&content, plugin).unwrap(), content);
+            assert!(selected_tui_content_bounded(raw, plugin, content.len() - 1).is_err());
+            assert_eq!(selected_tui_content_bounded(raw, plugin, content.len()).unwrap(), content);
+        }
     }
 
     #[test]

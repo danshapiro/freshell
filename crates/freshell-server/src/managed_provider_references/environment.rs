@@ -258,6 +258,7 @@ mod tests {
             .unwrap();
         let loaded = || {
             vec![LoadedSourceOccurrence {
+                requires_config_bind: false,
                 source: SourceOccurrence {
                     logical_path: config.clone(),
                     canonical_source: config.clone(),
@@ -325,6 +326,7 @@ mod tests {
             let plan = environment
                 .plan_sources(
                     vec![LoadedSourceOccurrence {
+                        requires_config_bind: false,
                         source: SourceOccurrence {
                             logical_path: config.clone(),
                             canonical_source: config,
@@ -383,6 +385,7 @@ mod tests {
         let plan = environment
             .plan_sources(
                 vec![LoadedSourceOccurrence {
+                    requires_config_bind: false,
                     source: SourceOccurrence {
                         logical_path: config.clone(),
                         canonical_source: config,

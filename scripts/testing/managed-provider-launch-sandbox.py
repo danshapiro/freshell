@@ -125,10 +125,12 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                 (config/f"{ordinal}.txt").write_text(f"native-{ordinal}-rule\n")
                 agents[ordinal]={"prompt":"{file:./"+ordinal+".txt}"}
             (config/"opencode.json").write_text(json.dumps({"agent":agents,"plugin":[["./plugins/probe-server/index.mjs",{"receipt":str(root/"workspace/native-consumed.json")}]]}))
-            (root/"grants/environment.env").write_text("OPENAI_API_KEY=synthetic-onecli-shadowed\n")
+            (root/"grants/environment.env").write_text("OPENAI_API_KEY=synthetic-onecli-shadowed\nNODE_EXTRA_CA_CERTS=/home/freshell/provider/.config/onecli/gateway-ca.pem\n")
+            (root/"grants/ca.pem").write_bytes((repo/"test/e2e-browser/fixtures/tls/ca.cert.pem").read_bytes())
             (root/"grants/auth.json").write_text(json.dumps({"fixture":{"type":"wellknown","key":"OPENAI_API_KEY","token":"AUTH_PREFIX{file:./rules.txt}AUTH_SUFFIX"}}))
             # These newly created synthetic grants alone receive private mode.
             (root/"grants/environment.env").chmod(0o600);(root/"grants/auth.json").chmod(0o600)
+            (root/"grants/ca.pem").chmod(0o600)
             broker_name=run+"-broker"
             create(broker_name,"--network","none","--user","0:0","--cap-drop","ALL",
                    "--mount",f"type=bind,src={root},dst={root}",
@@ -154,6 +156,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                    "--env",f"FRESHELL_PROVIDER_LAUNCH_INSTALLATION={installation}","--env",f"FRESHELL_PROVIDER_LAUNCH_RUN_ID={run}",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE={root}/grants/environment.env",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE={root}/grants/auth.json",
+                   "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE={root}/grants/ca.pem",
                    "--entrypoint","/runtime/startup-tests",IMAGE,"--exact",TEST,"--nocapture","--test-threads","1")
             docker("start",controller)
             controller_metadata=json.loads(docker("container","inspect",controller).stdout)[0]

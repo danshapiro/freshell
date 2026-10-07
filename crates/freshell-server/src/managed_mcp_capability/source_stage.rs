@@ -253,6 +253,7 @@ pub(super) fn describe(
     initial_auth_reservation: Option<&str>,
     config_root: Option<&Path>,
     workspace: &Path,
+    secret_references: &[freshell_runtime_protocol::ProviderSecretReference],
 ) -> Result<freshell_runtime_protocol::PreparedProviderInputs, String> {
     use freshell_runtime_protocol::*;
     use sha2::{Digest, Sha256};
@@ -281,6 +282,7 @@ pub(super) fn describe(
     for (ordinal, occurrence) in plan.iter().enumerate() {
         if occurrence.source.lane != SourceLane::Inline
             && (!occurrence.original_form
+                || occurrence.requires_config_bind
                 || occurrence.references.template.as_str()
                     != occurrence.references.unexpanded_source())
         {
@@ -406,6 +408,25 @@ pub(super) fn describe(
                         )
                     }
                 };
+                // The host installs the selected typed file at this path.
+                // Covering it with a readonly alias would prevent its atomic
+                // refresh, even when both projections selected the same bytes.
+                if let Some(reference) = secret_references.iter().find(|reference| {
+                    reference.profile == ProviderSecretProfile::OpencodeOnecliCaFile
+                        && reference
+                            .profile
+                            .provider_file_relative_path()
+                            .is_some_and(|relative| runtime_home.join(relative) == logical)
+                }) {
+                    let typed_source =
+                        std::fs::canonicalize(&reference.source_path).map_err(|_| {
+                            "selected typed CA source is unavailable before publication"
+                        })?;
+                    if typed_source != **selected {
+                        return Err("selected runtime CA alias conflicts with its typed source; retain prior inputs and reprepare".into());
+                    }
+                    continue;
+                }
                 let effective = if let Some(unit) = resource_mounts.iter().find(|unit| {
                     unit.kind == ProviderResourceKind::Directory
                         && logical.starts_with(&unit.logical_destination)

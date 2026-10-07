@@ -1607,6 +1607,7 @@ impl CapabilityStore {
                     .workspace
                     .or(opencode_input.cwd)
                     .unwrap_or(home),
+                opencode_input.secret_references.unwrap_or(&[]),
             )
             .and_then(|inputs| {
                 if let Some(context) = opencode_input.launch_context {
@@ -4226,6 +4227,206 @@ except Exception as error:
                 );
             }
         }
+    }
+
+    #[test]
+    fn managed_provider_shared_runtime_ca_reuses_the_selected_typed_file() {
+        use crate::managed_provider_references::sources::*;
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ca = home.join("synthetic-ca.pem");
+        std::fs::write(&ca, "PRIVATE_SYNTHETIC_CA_PAYLOAD").unwrap();
+        let runtime_ca = PathBuf::from("/home/freshell/provider/.config/onecli/gateway-ca.pem");
+        let shared = workspace.join("shared.json");
+        let raw = r#"{"agent":{"probe":{"prompt":"{file:{env:NODE_EXTRA_CA_CERTS}}"}}}"#;
+        std::fs::write(&shared, raw).unwrap();
+        let sources = [SourceLane::Main, SourceLane::Tui]
+            .into_iter()
+            .map(|lane| LoadedSourceOccurrence {
+                requires_config_bind: false,
+                source: SourceOccurrence {
+                    logical_path: workspace.join(if lane == SourceLane::Main {
+                        "opencode.json"
+                    } else {
+                        "tui.json"
+                    }),
+                    canonical_source: shared.clone(),
+                    lane,
+                    role: DiscoveryRole::Workspace,
+                },
+                view: std::sync::Arc::new(raw.into()),
+            })
+            .collect();
+        let plan = plan_loaded_opencode_sources_relocated(
+            sources,
+            &workspace,
+            &home,
+            &|_, _, name| {
+                (name == "NODE_EXTRA_CA_CERTS").then(|| runtime_ca.to_str().unwrap().into())
+            },
+            &std::collections::BTreeMap::from([(runtime_ca.clone(), ca.clone())]),
+        )
+        .unwrap();
+        let references = [
+            ProviderSecretReference {
+                source_path: ca.to_str().unwrap().into(),
+                profile: ProviderSecretProfile::OpencodeOnecliCaFile,
+                provider_relative_path: None,
+            },
+            ProviderSecretReference {
+                source_path: ca.to_str().unwrap().into(),
+                profile: ProviderSecretProfile::OpencodeConfigurationFile,
+                provider_relative_path: Some(".freshell/references/0".into()),
+            },
+        ];
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let capability = CapabilityStore::default()
+            .issue(
+                SoulId::new(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &[])),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    source_plan: Some(&plan),
+                    secret_references: Some(&references),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+        let inputs: PreparedProviderInputs = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/prepared-inputs.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(inputs.indexed_files.as_ref().unwrap().aliases.is_empty(),
+            "the host's typed CA projection already owns this exact file; a readonly indexed alias must not cover its writable installation path");
+        assert_eq!(inputs.manifest.source_count, 1);
+        assert_eq!(std::fs::read_to_string(&shared).unwrap(), raw);
+        assert_eq!(
+            std::fs::read_to_string(&ca).unwrap(),
+            "PRIVATE_SYNTHETIC_CA_PAYLOAD"
+        );
+        let different_ca = home.join("changed-ca.pem");
+        std::fs::write(&different_ca, "PRIVATE_CHANGED_CA_PAYLOAD").unwrap();
+        let mut changed = references.clone();
+        changed[0].source_path = different_ca.to_str().unwrap().into();
+        let error = CapabilityStore::default()
+            .issue(
+                SoulId::new(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &[])),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    source_plan: Some(&plan),
+                    secret_references: Some(&changed),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("runtime CA alias conflicts"));
+        assert!(!error.contains("PRIVATE_CHANGED_CA_PAYLOAD"));
+        assert!(
+            stage.join(".freshell/prepared-inputs.json").is_file(),
+            "a changed typed source cannot retire the prior usable projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_provider_selected_tui_can_share_a_main_source_without_flattening_it() {
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let shared = workspace.join("shared.jsonc");
+        let raw = "{\n // comment {file:./unselected-missing}\n\"agent\":{\"probe\":{\"prompt\":\"{file:./rules}\",\"description\":\"\\u007bfile:./literal\\u007d\"}},\"plugin\":[],}";
+        std::fs::write(&shared, raw).unwrap();
+        std::fs::write(workspace.join("rules"), "PRIVATE_SHARED_LANE_RULE").unwrap();
+        std::os::unix::fs::symlink("shared.jsonc", workspace.join("opencode.jsonc")).unwrap();
+        std::os::unix::fs::symlink("shared.jsonc", workspace.join("selected-tui.jsonc")).unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let prepared = crate::managed_provider_references::prepare_managed_opencode_with_publisher(
+            crate::managed_provider_references::OpencodePreparation {
+                client: &client,
+                soul: &soul,
+                creation_seed: "existing-fixture",
+                home: &home,
+                cwd: &workspace,
+                workspace: &workspace,
+                original: &|name| {
+                    (name == "OPENCODE_TUI_CONFIG").then(|| "selected-tui.jsonc".into())
+                },
+                references: vec![],
+                auth_authority: Some("existing-owned-attempt"),
+                selected_sources: None,
+                accepted_global_root: None,
+                selected_resource_roots: None,
+                native_source_flags: None,
+                rebind_enabled: None,
+                inherited_inline: None,
+                inline_edits: None,
+            },
+            |soul, home, context, input| {
+                let capability = store.issue(
+                    soul.clone(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("opencode", home, &context.config)),
+                    OpencodeEphemeralInput {
+                        launch_context: Some(context),
+                        ..input
+                    },
+                    None,
+                )?;
+                read_prepared_context(&directory, &capability)
+            },
+        )
+        .await
+        .expect("one shared Main/TUI source retains a uniform original-form projection");
+        let inputs = prepared.context.prepared_inputs.as_ref().unwrap();
+        assert_eq!(inputs.config_binds.len(), 1);
+        assert_eq!(
+            Path::new(&inputs.config_binds[0].effective_destination),
+            shared
+        );
+        let stage = staged_provider_root_path(&directory, &inputs.generation_id).unwrap();
+        let template =
+            std::fs::read_to_string(stage.join(&inputs.config_binds[0].source_relative_path))
+                .unwrap();
+        assert!(template.contains("// comment {file:./unselected-missing}"));
+        assert!(template.contains("\\u007bfile:./literal\\u007d"));
+        assert!(template.contains("{file:./rules}"));
+        let config = freshell_platform::opencode_config::parse_jsonc_object(&template).unwrap();
+        assert_eq!(
+            config["plugin"],
+            serde_json::json!(["file:///home/freshell/provider/.freshell/opencode"])
+        );
+        assert_eq!(inputs.indexed_files.as_ref().unwrap().aliases.len(), 1);
+        assert_eq!(std::fs::read_to_string(shared).unwrap(), raw);
+        assert!(
+            std::fs::symlink_metadata(workspace.join("selected-tui.jsonc"))
+                .unwrap()
+                .is_symlink()
+        );
     }
 
     #[test]
