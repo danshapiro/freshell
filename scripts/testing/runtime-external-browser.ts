@@ -15,11 +15,12 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
-import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes } from './runtime-sandbox.js'
+import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
+  ManagedMigrationFactsSchema } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
 import { ManagedRuntimeInventorySnapshotSchema, type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
-import type { RuntimeWriterClaimFacts } from './runtime-sandbox.js'
+import type { RuntimeWriterClaimFacts, ManagedMigrationFacts } from './runtime-sandbox.js'
 import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
@@ -682,6 +683,9 @@ export class ExternalManagedRuntimeRig {
     return this.rpc('inventory-snapshot', ManagedRuntimeInventorySnapshotSchema)
   }
   async controlEpoch(): Promise<number> { return this.rpc('control-epoch', z.number().int().nonnegative()) }
+  async applyManagedOptIn(expectedControlEpoch: number): Promise<ManagedMigrationFacts> {
+    return this.rpc('managed-opt-in', ManagedMigrationFactsSchema, { expectedControlEpoch })
+  }
   async writerClaimFacts(handle: ExactRuntimeHandle): Promise<RuntimeWriterClaimFacts> {
     return this.rpc('writer-claim', z.object({ provider: z.string().min(1), providerStoreId: z.string().min(1),
       nativeSessionId: z.literal(handle.nativeSessionId), soulId: z.literal(handle.soulId), incarnationId: z.literal(handle.incarnationId),
@@ -745,7 +749,9 @@ export class ExternalManagedRuntimeRig {
     await this.rpc('fixture-decision-allow', CompletedOwnerOperationSchema, { handle, challengeId: decisionId })
   }
   async crashAndRestartWeb(): Promise<ManagedBrowserConnectionInfo> { return this.rpc('replace-web', this.infoSchema()) }
+  async restartWebGracefully(): Promise<ManagedBrowserConnectionInfo> { return this.rpc('replace-web-graceful', this.infoSchema()) }
   async restartSupervisor(): Promise<void> { await this.rpc('replace-supervisor', CompletedOwnerOperationSchema) }
+  async restartSupervisorAbrupt(): Promise<void> { await this.rpc('replace-supervisor-abrupt', CompletedOwnerOperationSchema) }
   async startRetainedFixture(fixtureId: 'config' | 'legacy'): Promise<Task2RetainedBrowserStage> {
     return this.rpc('retained-start', Task2RetainedBrowserStageSchema, { challengeId: fixtureId })
   }
@@ -908,6 +914,10 @@ export function createExternalRuntimeControl(
       case 'inventory': result = await owner.inventory(); break
       case 'inventory-snapshot': result = await owner.inventorySnapshot(); break
       case 'control-epoch': result = await owner.controlEpoch(); break
+      case 'managed-opt-in':
+        if (request.expectedControlEpoch === undefined) throw new Error('exact managed preset controller epoch required')
+        result = await owner.applyManagedOptIn(request.expectedControlEpoch)
+        break
       case 'writer-claim': result = await owner.writerClaimFacts(handle()); break
       case 'retained-start':
         if (!retained || (request.challengeId !== 'config' && request.challengeId !== 'legacy')) throw new Error('registered retained fixture required')
@@ -958,7 +968,12 @@ export function createExternalRuntimeControl(
         await owner.crashAndRestartWeb()
         result = { baseUrl: descriptor.baseUrl, wsUrl: descriptor.wsUrl, token: descriptor.token }
         break
+      case 'replace-web-graceful':
+        await owner.restartWebGracefully()
+        result = { baseUrl: descriptor.baseUrl, wsUrl: descriptor.wsUrl, token: descriptor.token }
+        break
       case 'replace-supervisor': await owner.restartSupervisor(); result = { completed: true }; break
+      case 'replace-supervisor-abrupt': await owner.restartSupervisorAbrupt(); result = { completed: true }; break
       case 'finish':
       case 'abort': {
         const errors: string[] = []

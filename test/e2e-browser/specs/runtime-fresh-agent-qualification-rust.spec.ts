@@ -182,6 +182,7 @@ async function qualify(
   const afterProvider = await replacement(rig, sessionId, afterHost.incarnationId)
   expect(afterProvider.nativeSessionId).toBe(nativeSessionId)
   const claim = await rig.writerClaimFacts(rig.exactRuntimeHandle(afterProvider))
+  expect(claim.provider).toBe(afterProvider.provider)
   expect(claim.activeClaimCount).toBe(1)
   expect(claim.globalConflictingClaimCount).toBe(0)
 

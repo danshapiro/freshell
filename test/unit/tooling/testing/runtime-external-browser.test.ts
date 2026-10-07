@@ -646,6 +646,44 @@ describe('closed external owner control', () => {
     read.mockResolvedValue({ ...evidence, nativeSessionId: 'foreign-root' })
     await expect(rig.writerClaimFacts(handle)).rejects.toThrow(/invalid/)
   })
+  it('applies only the registered managed opt-in preset with the exact controller epoch', async () => {
+    const { owned, context, request } = fixture()
+    vi.spyOn(owned, 'controlEpoch').mockResolvedValue(4)
+    const facts = { migrationId: 'migration-owned', currentMode: 'managed-opt-in', requestedMode: 'managed-opt-in',
+      dryRun: false, controllerReady: true, imageVerified: true, registryBackupRequired: false, registryBackupVerified: false,
+      managedSoulCount: 0, legacyMetadataCount: 0, projectedCpuMilli: 0, projectedMemoryBytes: 0, projectedPids: 0, blockers: [],
+      registryBackupPath: '/owner-private/backup' }
+    const admin = vi.spyOn(owned.runtime, 'adminOk').mockResolvedValue({ kind: 'migration_plan', data: facts })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const wire: unknown[] = []
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      const reply = await control(JSON.parse(String(init.body)))
+      wire.push(reply)
+      return new Response(JSON.stringify(reply), { status: 200 })
+    })
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.applyManagedOptIn(4)).resolves.toMatchObject({ currentMode: 'managed-opt-in', dryRun: false })
+    expect(admin).toHaveBeenCalledExactlyOnceWith(owned.supervisor, owned.runtime.migrationPlanBody({
+      requestedMode: 'managed-opt-in', apply: true, expectedControlEpoch: 4 }))
+    expect(wire[0]).toMatchObject({ result: { currentMode: 'managed-opt-in' } })
+    expect(wire[0]).not.toHaveProperty('result.registryBackupPath')
+    await expect(control({ ...request, action: 'managed-opt-in', expectedControlEpoch: 3 })).rejects.toThrow(/epoch/)
+    await expect(control({ ...request, action: 'managed-opt-in', requestedMode: 'managed-default', expectedControlEpoch: 4 })).rejects.toThrow(/operation/)
+    expect(admin).toHaveBeenCalledOnce()
+  })
+  it('preserves graceful web and abrupt supervisor replacement as separate finite operations', async () => {
+    const { owned, context } = fixture()
+    const web = vi.spyOn(owned, 'restartWebGracefully').mockResolvedValue({} as Awaited<ReturnType<typeof owned.restartWebGracefully>>)
+    const supervisor = vi.spyOn(owned, 'restartSupervisorAbrupt').mockResolvedValue({} as SupervisorInstance)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.restartWebGracefully()).resolves.toEqual(rig.info)
+    await rig.restartSupervisorAbrupt()
+    expect(web).toHaveBeenCalledOnce()
+    expect(supervisor).toHaveBeenCalledOnce()
+  })
   it('refuses arbitrary commands, foreign metadata and absent current handles before owner work', async () => {
     const { owned, context, inventory, request } = fixture()
     const control = runner.createExternalRuntimeControl(owned, context)

@@ -6,7 +6,8 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
-import { ManagedRuntimeInventorySnapshotSchema, type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
+import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchema,
+  type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
 
 
 import fsp from 'node:fs/promises'
@@ -304,7 +305,8 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   action: z.enum([
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
-    'replace-web', 'replace-supervisor', 'crash-host', 'crash-provider', 'hold-host', 'release-host',
+    'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt',
+    'managed-opt-in', 'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
     'native-challenge-register',
     'synthetic-history-challenge',
@@ -327,6 +329,9 @@ export type RuntimeWriterClaimFacts = {
   provider: string; providerStoreId: string; nativeSessionId: string; soulId: string; incarnationId: string
   activeClaimCount: number; globalConflictingClaimCount: number
 }
+
+export const ManagedMigrationFactsSchema = ManagedRuntimeMigrationPlanSchema.omit({ registryBackupPath: true }).strip()
+export type ManagedMigrationFacts = z.infer<typeof ManagedMigrationFactsSchema>
 
 /** A run keeps operation settlements until teardown so a lost reply cannot repeat a mutation. */
 export class RuntimeOwnerOperationQueue {
@@ -2497,6 +2502,14 @@ export class ManagedRuntimeOwner {
     const health = await this.runtime.adminOk(this.supervisor, { method: 'health' })
     const data = this.dataOf(health, 'health')
     return data.controlEpoch ?? data.control_epoch
+  }
+
+  async applyManagedOptIn(expectedControlEpoch: number): Promise<ManagedMigrationFacts> {
+    if (expectedControlEpoch !== await this.controlEpoch()) throw new Error('managed preset controller epoch is stale')
+    const result = await this.runtime.adminOk(this.supervisor, this.runtime.migrationPlanBody({
+      requestedMode: 'managed-opt-in', apply: true, expectedControlEpoch,
+    }))
+    return ManagedMigrationFactsSchema.parse(this.dataOf(result, 'migration_plan'))
   }
 
   async inventory(): Promise<ManagedRuntimeView[]> {

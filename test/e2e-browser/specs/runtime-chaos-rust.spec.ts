@@ -206,14 +206,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
     let receiptReady = false
     try {
       const info = await rig.start()
-      const migration = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.migrationPlanBody({
-          requestedMode: 'managed-opt-in',
-          apply: true,
-          expectedControlEpoch: await rig.controlEpoch(),
-        }),
-      ), 'migration_plan')
+      const migration = await rig.applyManagedOptIn(await rig.controlEpoch())
       expect(migration.currentMode).toBe('managed-opt-in')
 
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)

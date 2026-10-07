@@ -408,6 +408,7 @@ async function qualifyProvider(
   expect(runningWriters).toHaveLength(1)
   const writerHandle = rig.exactRuntimeHandle(afterProviderLoss)
   const writerClaim = await rig.writerClaimFacts(writerHandle)
+  expect(writerClaim.provider).toBe(definition.provider)
   expect(writerClaim.activeClaimCount).toBe(1)
   expect(writerClaim.globalConflictingClaimCount).toBe(0)
   const notices = await rig.runtime.adminOk(rig.supervisor, rig.runtime.pendingNoticesBody(

@@ -456,14 +456,7 @@ test.describe.serial('OpenCode provider qualification', () => {
     let providerRow: ProviderQualificationRow | undefined
     try {
       const info = await rig.start()
-      const rollout = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.migrationPlanBody({
-          requestedMode: 'managed-opt-in',
-          apply: true,
-          expectedControlEpoch: await rig.controlEpoch(),
-        }),
-      ), 'migration_plan')
+      const rollout = await rig.applyManagedOptIn(await rig.controlEpoch())
       expect(rollout.currentMode).toBe('managed-opt-in')
 
       let qualifiedTerminalId: string | undefined
@@ -690,6 +683,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(firstViews).toHaveLength(2)
       const writerHandle = rig.exactRuntimeHandle(afterProviderCrash)
       const writerClaim = await rig.writerClaimFacts(writerHandle)
+      expect(writerClaim.provider).toBe('opencode')
       expect(writerClaim.activeClaimCount).toBe(1)
       expect(writerClaim.globalConflictingClaimCount).toBe(0)
 

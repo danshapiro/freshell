@@ -47,7 +47,7 @@ export async function captureChaosRuntimeObservation(
   if (rows.length !== 1) throw new Error(`chaos expected exactly one running incarnation, observed ${rows.length}`)
   const row = rows[0]
   const claim = await rig.writerClaimFacts(rig.exactRuntimeHandle(expected))
-  if (claim.activeClaimCount !== 1 || claim.globalConflictingClaimCount !== 0) {
+  if (claim.provider !== 'opencode' || claim.activeClaimCount !== 1 || claim.globalConflictingClaimCount !== 0) {
     throw new Error('chaos writer claim is not uniquely owned')
   }
   const ownerFacts = await rig.chaosHostFacts(rig.exactRuntimeHandle(expected))

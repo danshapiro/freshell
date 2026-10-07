@@ -193,14 +193,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
     try {
       const info = await rig.start()
       const controlEpoch = await rig.controlEpoch()
-      const migration = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.migrationPlanBody({
-          requestedMode: 'managed-opt-in',
-          apply: true,
-          expectedControlEpoch: controlEpoch,
-        }),
-      ), 'migration_plan')
+      const migration = await rig.applyManagedOptIn(controlEpoch)
       expect(migration.currentMode).toBe('managed-opt-in')
 
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
