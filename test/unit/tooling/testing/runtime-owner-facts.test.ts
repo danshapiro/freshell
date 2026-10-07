@@ -19,6 +19,36 @@ const handle = {
 }
 
 describe('owner-side synthetic OpenCode source preparation', () => {
+  it('owns source setup and teardown while returning only IDs, digests and observed counts', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    const lifecycle = vi.spyOn(rig.runtime, 'recordLifecycle')
+    vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    let sourceRoot: string | undefined
+    try {
+      const source = await rig.prepareSyntheticOpenCodeSource()
+      expect(source.rootMessageCount).toBe(106)
+      expect(Object.keys(source.baselineMessages)).toHaveLength(108)
+      expect(source).not.toHaveProperty('databasePath')
+      expect(source).not.toHaveProperty('selectedSentinel')
+      const preparation = lifecycle.mock.calls.find(([event]) => event === 'source-fixture.prepared')
+      const reference = Object.getOwnPropertyDescriptor(preparation?.[1] ?? {}, 'sourceReference')?.value
+      if (typeof reference !== 'string') throw new Error('actual owned source reference required')
+      sourceRoot = reference
+      expect(sourceRoot).toMatch(/\.freshell-opencode-resume-/)
+      const database = path.join(sourceRoot, 'web-home', '.local/share/opencode/opencode.db')
+      const db = new DatabaseSync(database)
+      try { db.prepare('DELETE FROM message WHERE id = ?').run(source.lastMessageId) } finally { db.close() }
+      expect((await rig.syntheticOpenCodeSourceFacts()).rootMessageCount).toBe(105)
+      expect((await rig.prepareSyntheticOpenCodeSource()).rootId).toBe(source.rootId)
+      expect((await rig.stop()).ok).toBe(true)
+      await expect(fsp.stat(sourceRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      vi.unstubAllEnvs()
+      await rig.stop()
+    }
+  })
+
   it('seeds the actual default conversation graph and keeps unrelated history outside its baselines', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-source-owner-'))
     const databasePath = path.join(root, 'opencode.db')

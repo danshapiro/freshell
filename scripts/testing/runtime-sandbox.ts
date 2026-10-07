@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { execFile, execFileSync, spawnSync, spawn, type ChildProcess } from 'node:child_process'
 import { pipeline } from 'node:stream/promises'
@@ -539,6 +539,15 @@ export type RuntimeHostFacts = {
   limits: { cpuMax: string; memoryMax: string; swapMax: string; pidsMax: string }
   unsafeBrokerAttempts: number
 }
+
+export const SyntheticOpenCodeSourceFactsSchema = z.object({
+  rootId: z.string().min(1), childId: z.string().min(1), grandchildId: z.string().min(1),
+  unrelatedId: z.string().min(1), lastMessageId: z.string().min(1), nonce: z.string().regex(/^[a-f0-9]{16}$/),
+  baselineMessages: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/)),
+  baselineParts: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/)),
+  rootMessageCount: z.number().int().nonnegative(),
+}).strict()
+export type SyntheticOpenCodeSourceFacts = z.infer<typeof SyntheticOpenCodeSourceFactsSchema>
 
 const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
@@ -2509,7 +2518,7 @@ export class ManagedRuntimeOwner {
   info!: RuntimeWebInfo
   private serverBin = ''
   private readonly serverEnv: Record<string, string>
-  private readonly webHomeDir: string | undefined
+  private webHomeDir: string | undefined
   private readonly supervisorEnv: Record<string, string>
   private readonly supervisorBinaryKind: 'test' | 'release'
   private readonly enabledProviders: string[]
@@ -2521,6 +2530,7 @@ export class ManagedRuntimeOwner {
   private readonly heldHosts = new Map<string, { handle: ExactRuntimeHandle; pid: number }>()
   private readonly nativeChallenges = new Map<string, { soulId: string; nativeSessionId: string; marker: string }>()
   private readonly providerProbes = new Map<string, { child?: ChildProcess; settlement: Promise<string> }>()
+  private syntheticSource?: { source: SyntheticSource; root: string; nonce: string }
 
   constructor(
     private readonly webFactory: RuntimeWebFactory,
@@ -2551,6 +2561,48 @@ export class ManagedRuntimeOwner {
     if (this.fixtureFreshAgentModes.length > 0 && supervisorBinaryKind !== 'test') {
       throw new Error('deterministic fresh-agent fixtures require the test session-host build')
     }
+  }
+
+  async prepareSyntheticOpenCodeSource(): Promise<SyntheticOpenCodeSourceFacts> {
+    if (this.syntheticSource) return this.syntheticOpenCodeSourceFacts()
+    if (process.env.FRESHELL_RUNTIME_SYNTHETIC_RESUME !== '1' || this.runtime.phase !== 3
+      || this.enabledProviders.length !== 1 || this.enabledProviders[0] !== 'opencode'
+      || this.web || this.stopSettlement || this.webHomeDir) {
+      throw new Error('synthetic OpenCode source requires its exact opt-in before owned web setup')
+    }
+    const root = fs.mkdtempSync(path.join(this.repoRoot, '.freshell-opencode-resume-'))
+    try {
+      const nonce = randomBytes(8).toString('hex')
+      const home = path.join(root, 'web-home')
+      const databasePath = path.join(home, '.local/share/opencode/opencode.db')
+      const source = seedManagedOpenCodeSource({ repoRoot: this.repoRoot, databasePath, workspace: this.repoRoot, nonce })
+      this.syntheticSource = { source, root, nonce }
+      const facts = await this.syntheticOpenCodeSourceFacts()
+      this.webHomeDir = home
+      this.serverEnv.OPENCODE_DB = databasePath
+      this.supervisorEnv.OPENCODE_DB = databasePath
+      this.runtime.recordLifecycle('source-fixture.prepared', { sourceReference: root, rootId: source.rootId })
+      return facts
+    } catch (error) {
+      fs.rmSync(root, { recursive: true, force: true })
+      this.syntheticSource = undefined
+      throw error
+    }
+  }
+
+  async syntheticOpenCodeSourceFacts(): Promise<SyntheticOpenCodeSourceFacts> {
+    const fixture = this.syntheticSource
+    if (!fixture) throw new Error('synthetic OpenCode source is not registered')
+    const { source, nonce } = fixture
+    const db = new DatabaseSync(source.databasePath, { readOnly: true })
+    try {
+      const rootMessageCount = z.number().int().nonnegative().parse(
+        db.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get(source.rootId)?.count)
+      return SyntheticOpenCodeSourceFactsSchema.parse({ rootId: source.rootId, childId: source.childId,
+        grandchildId: source.grandchildId, unrelatedId: source.unrelatedId, lastMessageId: source.lastMessageId,
+        nonce, baselineMessages: Object.fromEntries(source.baselineMessages), baselineParts: Object.fromEntries(source.baselineParts),
+        rootMessageCount })
+    } finally { db.close() }
   }
 
   async start(): Promise<RuntimeWebInfo> {
@@ -2724,6 +2776,10 @@ export class ManagedRuntimeOwner {
     if (this.stopSettlement) return this.stopSettlement
     this.stopSettlement = (async () => {
       const result = await settleOwnedRuntimeCleanup(() => this.stopWebAndReleaseHeldHosts(), () => this.runtime.cleanup())
+      if (result.ok && this.syntheticSource) {
+        try { await fsp.rm(this.syntheticSource.root, { recursive: true, force: true }) }
+        catch { result.ok = false; result.errors.push('owned synthetic source cleanup failed') }
+      }
       const cleanupPath = path.join(this.runtime.evidenceDir, 'cleanup.json')
       let runtimeCleanup: Record<string, unknown> = {}
       try { runtimeCleanup = objectFields(JSON.parse(fs.readFileSync(cleanupPath, 'utf8')), 'invalid owner cleanup artifact') }
