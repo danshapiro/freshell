@@ -1,4 +1,8 @@
 //! Select ordinary Markdown imports from their declaring logical origins.
+use freshell_platform::provider_input_profiles::{
+    MAX_SIMULTANEOUS_SOURCE_VIEW_BYTES, MAX_SOURCE_EVENTS, MAX_SOURCE_EVENT_BYTES,
+    MAX_SOURCE_VIEW_BYTES,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
@@ -37,7 +41,7 @@ struct ImportGraph<'a> {
     excluded: &'a [PathBuf],
     active: BTreeSet<PathBuf>,
     visited: BTreeSet<PathBuf>,
-    sources: BTreeMap<PathBuf, Arc<str>>,
+    sources: BTreeMap<PathBuf, Arc<String>>,
     bytes: u64,
     events: usize,
     path_bytes: usize,
@@ -67,41 +71,50 @@ impl ImportGraph<'_> {
         if self.visited.contains(&logical) {
             return Ok(());
         }
-        if self.visited.len() >= 256 {
-            return Err(error("reference alias profile exceeded"));
+        if self.visited.len() >= MAX_SOURCE_EVENTS {
+            return Err(error("ordinary source event profile exceeded"));
         }
+        let path_bytes = self
+            .path_bytes
+            .checked_add(logical.as_os_str().len())
+            .and_then(|bytes| bytes.checked_add(source.as_os_str().len()))
+            .ok_or_else(|| error("ordinary source metadata accounting overflow"))?;
+        if path_bytes > MAX_SOURCE_EVENT_BYTES {
+            return Err(error("ordinary source event metadata profile exceeded"));
+        }
+        self.path_bytes = path_bytes;
         let raw = if let Some(raw) = self.sources.get(&source) {
             Arc::clone(raw)
         } else {
-            use freshell_platform::provider_input_exchange::{MAX_FILE_BYTES, MAX_TOTAL_BYTES};
             let file = std::fs::File::open(&source)
                 .map_err(|cause| error(&format!("selected file unreadable: {cause}")))?;
             let metadata = file
                 .metadata()
                 .map_err(|cause| error(&format!("selected file metadata failed: {cause}")))?;
-            if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-                return Err(error("reference source type or per-file profile exceeded"));
+            if !metadata.is_file() || metadata.len() > MAX_SOURCE_VIEW_BYTES {
+                return Err(error("ordinary source type or per-view profile exceeded"));
             }
             let next = self
                 .bytes
                 .checked_add(metadata.len())
                 .ok_or_else(|| error("reference source accounting overflow"))?;
-            if self.sources.len() >= 128 || next > MAX_TOTAL_BYTES {
-                return Err(error("reference source aggregate profile exceeded"));
+            if next > MAX_SIMULTANEOUS_SOURCE_VIEW_BYTES {
+                return Err(error("ordinary simultaneous source view profile exceeded"));
             }
             let mut raw = String::new();
-            file.take(MAX_FILE_BYTES + 1)
+            file.take(MAX_SOURCE_VIEW_BYTES + 1)
                 .read_to_string(&mut raw)
                 .map_err(|cause| error(&format!("selected Markdown read failed: {cause}")))?;
             let next = self
                 .bytes
                 .checked_add(raw.len() as u64)
                 .ok_or_else(|| error("reference source accounting overflow"))?;
-            if raw.len() as u64 > MAX_FILE_BYTES || next > MAX_TOTAL_BYTES {
-                return Err(error("reference source grew beyond its profile"));
+            if raw.len() as u64 > MAX_SOURCE_VIEW_BYTES || next > MAX_SIMULTANEOUS_SOURCE_VIEW_BYTES
+            {
+                return Err(error("ordinary source grew beyond its view profile"));
             }
             self.bytes = next;
-            let raw: Arc<str> = raw.into();
+            let raw = Arc::new(raw);
             self.sources.insert(source.clone(), Arc::clone(&raw));
             raw
         };
@@ -113,11 +126,7 @@ impl ImportGraph<'_> {
                 .events
                 .checked_add(1)
                 .ok_or_else(|| error("source event accounting overflow"))?;
-            self.path_bytes = self
-                .path_bytes
-                .checked_add(selected.len())
-                .ok_or_else(|| error("source path accounting overflow"))?;
-            if self.events > 8192 || self.path_bytes > 8 * 1024 * 1024 {
+            if self.events > MAX_SOURCE_EVENTS {
                 return Err(error("source event metadata profile exceeded"));
             }
             let selected = if let Some(relative) = selected.strip_prefix("~/") {
@@ -263,6 +272,27 @@ impl Iterator for ImportPaths<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_memory_graph_does_not_inherit_private_indexed_payload_count_limit() {
+        let owned = tempfile::tempdir().unwrap();
+        let root = owned.path().join("CLAUDE.md");
+        let mut memory = String::new();
+        for index in 0..129 {
+            let name = format!("memory-{index}.md");
+            std::fs::write(owned.path().join(&name), format!("ordinary-memory-{index}")).unwrap();
+            memory.push_str(&format!("@{name}\n"));
+        }
+        std::fs::write(&root, memory).unwrap();
+        let selected = imports(owned.path(), &[root], &[])
+            .expect("ordinary references retain the declared source event profile");
+        assert_eq!(selected.len(), 129);
+        for path in selected {
+            assert!(std::fs::read_to_string(path)
+                .unwrap()
+                .starts_with("ordinary-memory-"));
+        }
+    }
 
     #[test]
     fn selected_memory_imports_resolve_home_absolute_and_escaped_spaces() {

@@ -1,4 +1,5 @@
 //! Finite original Claude source selection and ordinary first-volume authority.
+use freshell_platform::provider_input_profiles::{MAX_SOURCE_EVENTS, MAX_SOURCE_EVENT_BYTES};
 use freshell_runtime_protocol::*;
 use std::path::Path;
 
@@ -37,7 +38,7 @@ pub(crate) async fn prepare_managed(
         path_bytes = path_bytes
             .checked_add(path.as_os_str().len())
             .ok_or("Claude plugin source metadata overflow")?;
-        if plugin_dirs.len() >= 8192 || path_bytes > 8 * 1024 * 1024 {
+        if plugin_dirs.len() >= MAX_SOURCE_EVENTS || path_bytes > MAX_SOURCE_EVENT_BYTES {
             return Err("Claude plugin source event metadata profile exceeded".into());
         }
         plugin_dirs.push(path);

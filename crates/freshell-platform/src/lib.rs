@@ -69,6 +69,7 @@ pub mod provider_environment;
 pub mod provider_environment_grants;
 pub mod provider_exec;
 pub mod provider_input_exchange;
+pub mod provider_input_profiles;
 pub mod provider_mountpoints;
 pub mod resume_gate;
 pub mod spawn;

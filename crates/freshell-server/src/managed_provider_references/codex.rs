@@ -1,4 +1,7 @@
 //! Finite Codex typed inputs, resolved per declaring logical TOML layer.
+use freshell_platform::provider_input_profiles::{
+    MAX_SOURCE_EVENTS, MAX_SOURCE_EVENT_BYTES, MAX_SOURCE_VIEW_BYTES,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,7 +57,7 @@ struct Selection<'a> {
 
 impl Selection<'_> {
     fn add(&mut self, logical_path: PathBuf, kind: InputKind) -> Result<PathBuf, &'static str> {
-        if self.inputs.len() >= 8192 {
+        if self.inputs.len() >= MAX_SOURCE_EVENTS {
             return Err("Codex selected input event budget exceeded");
         }
         let canonical_source = std::fs::canonicalize(&logical_path)
@@ -69,7 +72,7 @@ impl Selection<'_> {
             .checked_add(logical_path.as_os_str().len())
             .and_then(|bytes| bytes.checked_add(canonical_source.as_os_str().len()))
             .ok_or("Codex selected input metadata size overflow")?;
-        if self.metadata_bytes > 8 * 1024 * 1024 {
+        if self.metadata_bytes > MAX_SOURCE_EVENT_BYTES {
             return Err("Codex selected input metadata budget exceeded");
         }
         self.inputs.push(SelectedInput {
@@ -104,10 +107,10 @@ impl Selection<'_> {
             let mut raw = String::new();
             std::fs::File::open(&canonical)
                 .map_err(|_| "Codex selected configuration unreadable")?
-                .take(16 * 1024 * 1024 + 1)
+                .take(MAX_SOURCE_VIEW_BYTES + 1)
                 .read_to_string(&mut raw)
                 .map_err(|_| "Codex selected configuration is unreadable or not UTF-8")?;
-            if raw.len() > 16 * 1024 * 1024 {
+            if raw.len() as u64 > MAX_SOURCE_VIEW_BYTES {
                 return Err("Codex selected configuration source view exceeded");
             }
             let value: toml::Value =
@@ -127,7 +130,7 @@ impl Selection<'_> {
             let mut role_paths = Vec::new();
             let mut role_path_bytes = 0usize;
             if let Some(roles) = value.get("agents").and_then(toml::Value::as_table) {
-                if roles.len() > 8192 - self.inputs.len() {
+                if roles.len() > MAX_SOURCE_EVENTS - self.inputs.len() {
                     return Err("Codex selected role event budget exceeded");
                 }
                 for role in roles.values() {
@@ -136,7 +139,7 @@ impl Selection<'_> {
                         role_path_bytes = role_path_bytes
                             .checked_add(path.as_os_str().len())
                             .ok_or("Codex selected role metadata overflow")?;
-                        if role_path_bytes > 8 * 1024 * 1024 - self.metadata_bytes {
+                        if role_path_bytes > MAX_SOURCE_EVENT_BYTES - self.metadata_bytes {
                             return Err("Codex selected role metadata budget exceeded");
                         }
                         role_paths.push(path);
@@ -159,11 +162,11 @@ impl Selection<'_> {
             }
             if kind != LayerKind::Role {
                 let declared = role_paths.iter().cloned().collect();
-                let remaining_events = 8192usize
+                let remaining_events = MAX_SOURCE_EVENTS
                     .checked_sub(self.inputs.len())
                     .and_then(|value| value.checked_sub(role_paths.len()))
                     .ok_or("Codex selected role event budget exceeded")?;
-                let remaining_metadata = (8 * 1024 * 1024usize)
+                let remaining_metadata = (MAX_SOURCE_EVENT_BYTES)
                     .checked_sub(self.metadata_bytes)
                     .and_then(|value| value.checked_sub(role_path_bytes))
                     .ok_or("Codex selected role metadata budget exceeded")?;
@@ -576,7 +579,7 @@ fn read_config(path: &Path) -> Result<toml::Value, &'static str> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .map_err(|_| "Codex selected configuration is unavailable")?
-        .take(16 * 1024 * 1024 + 1)
+        .take(MAX_SOURCE_VIEW_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "Codex selected configuration is unreadable")?;
     if bytes.len() > 16 * 1024 * 1024 {

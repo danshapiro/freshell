@@ -13,7 +13,9 @@ pub struct ClaudeInputManifest {
 }
 impl ClaudeInputManifest {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.version != 1 || self.plugin_dirs.len() > 8192 {
+        if self.version != 1
+            || self.plugin_dirs.len() > crate::provider_input_profiles::MAX_SOURCE_EVENTS
+        {
             return Err("accepted Claude discovery context profile exceeded");
         }
         for path in [&self.original_home, &self.cwd, &self.workspace]
