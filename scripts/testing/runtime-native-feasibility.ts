@@ -549,9 +549,14 @@ async function executeManagedNativeApproval(input: {
     throw new Error('original native solo checkpoint/effect oracle differs')
   }
   const captureCheckpointState = async (containerId: string, label: string) => {
-    const source = await harness.execOwnedContainerAsExact(containerId, '0:0', ['python3', '-c',
-      "import pathlib,json,base64,hashlib,sys;root=sys.argv[1];assert len(root)==36 and all(c in '0123456789abcdef-' for c in root);files=[]\nfor p in [pathlib.Path('/run/freshell-host-actor/fresh-agent-state.json'),pathlib.Path('/home/freshell/provider/.freshell/native-checkpoints/claude')/(root+'.json')]:\n raw=p.read_bytes();assert len(raw)<=32*1024*1024;json.loads(raw);files.append({'path':str(p),'sha256':hashlib.sha256(raw).hexdigest(),'bytesBase64':base64.b64encode(raw).decode()})\nprint(json.dumps({'nativeRoot':root,'files':files}))", view.nativeSessionId])
-    harness.writeArtifact(`${scenario}-${label}-checkpoint-state-private.json`, JSON.parse(source))
+    const files = []
+    for (const [uid, file] of [['0:0', '/run/freshell-host-actor/fresh-agent-state.json'],
+      ['65534:0', `/home/freshell/provider/.freshell/native-checkpoints/claude/${view.nativeSessionId}.json`]]) {
+      const source = await harness.execOwnedContainerAsExact(containerId, uid!, ['python3', '-c',
+        "import pathlib,json,base64,hashlib,sys;file=pathlib.Path(sys.argv[1]);raw=file.read_bytes();assert len(raw)<=32*1024*1024;json.loads(raw);print(json.dumps({'path':str(file),'sha256':hashlib.sha256(raw).hexdigest(),'bytesBase64':base64.b64encode(raw).decode(),'readerUid':__import__('os').getuid()}))", file!])
+      files.push(JSON.parse(source))
+    }
+    harness.writeArtifact(`${scenario}-${label}-checkpoint-state-private.json`, { nativeRoot: view.nativeSessionId, files })
   }
   const before = await inspect(view.containerId, 'checkpoint-before-death', true)
   await captureCheckpointState(view.containerId, 'before-death')
