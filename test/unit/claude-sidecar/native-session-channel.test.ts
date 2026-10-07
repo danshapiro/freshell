@@ -20,9 +20,9 @@ async function hook(channel: any) {
   child.stdin.end(JSON.stringify(native))
   expect(await exited).toBe(0)
 }
-function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false, delayedNativeExit = false) {
+function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false, delayedNativeExit = false, providerHome = directory) {
   const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/index.mjs')], {
-    env: { ...process.env, HOME: directory, FRESHELL_SIDECAR_TEST_CHECKPOINT: '1',
+    env: { ...process.env, HOME: providerHome, FRESHELL_SIDECAR_TEST_CHECKPOINT: '1',
       FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID: nativeRequestId,
       FRESHELL_SIDECAR_TEST_DEFERRED_TRANSCRIPT_DELAY: delayedTranscript ? '1' : '0',
       FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY: delayedNativeExit ? '1' : '0',
@@ -154,6 +154,23 @@ describe('native solo deferred checkpoint inspection', () => {
 })
 
 describe('production sidecar native checkpoint continuation', () => {
+  it('persists managed continuation state outside provider-native project artifacts', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'sidecar-native-census-'))
+    const directory = join(home, '.claude', 'projects', 'owned-project')
+    await mkdir(directory, { recursive: true })
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    const worker = checkpointSidecar(directory, 'native-isolated', false, false, home)
+    try {
+      worker.send({ type: 'create', requestId: 'isolated-checkpoint', cwd: directory, resumeSessionId: root, permissionMode: 'default' })
+      const session = await worker.wait('created'); await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: session.sessionId, text: 'owned original operation' })
+      const card = await worker.wait('sdk.permission.request')
+      const record = JSON.parse(await readFile(join(home, '.freshell', 'native-checkpoints', 'claude', root + '.json'), 'utf8'))
+      expect(record.checkpoint.toolUseID).toBe(card.nativeCheckpoint.toolUseID)
+      expect(await inspectNativeDeferredCheckpoint({ path: join(directory, 'native.jsonl'), nativeSessionId: root,
+        toolUseID: card.nativeCheckpoint.toolUseID, inputDigest: card.nativeCheckpoint.inputDigest })).not.toBeNull()
+    } finally { await worker.close(); await rm(home, { recursive: true, force: true }) }
+  })
   it('waits for the original native child to close before spawning its exact-resume writer', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-writer-'))
     await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
@@ -210,7 +227,7 @@ describe('production sidecar native checkpoint continuation', () => {
       const oldCard = await worker.wait('sdk.permission.request')
       await worker.close()
       if (scenario === 'dispatching') {
-        const path = join(directory, '.freshell-checkpoint-' + root + '.json')
+        const path = join(directory, '.freshell', 'native-checkpoints', 'claude', root + '.json')
         const record = JSON.parse(await readFile(path, 'utf8'))
         await writeFile(path, JSON.stringify({ ...record, phase: 'dispatching' }) + '\n')
       }
@@ -243,7 +260,7 @@ describe('production sidecar native checkpoint continuation', () => {
               ? { command: 'changed operation' } : scenario === 'current-missing-decision-input' ? undefined : card.tool.input } })
           expect((await worker.wait('sdk.permission.dispatch')).ok).toBe(false)
           expect(worker.frames.some((frame) => frame.type === 'sdk.tool.result')).toBe(false)
-          const parked = JSON.parse(await readFile(join(directory, '.freshell-checkpoint-' + root + '.json'), 'utf8'))
+          const parked = JSON.parse(await readFile(join(directory, '.freshell', 'native-checkpoints', 'claude', root + '.json'), 'utf8'))
           expect(parked.phase).toBe('approval_waiting')
           if (scenario === 'current-changed-profile') await rm(profile)
         }

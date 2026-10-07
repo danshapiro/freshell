@@ -77,7 +77,7 @@
 import { createInterface } from 'node:readline'
 import { createHash, randomBytes } from 'node:crypto'
 import { readFile, readdir, lstat } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
@@ -593,9 +593,10 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
       if (req.resumeSessionId && observation.nativeSessionId !== req.resumeSessionId) throw new Error('native exact resume changed root')
       if (await nativeProfileDigest(req, state.settings) !== state.nativeProfileDigest) throw new Error('selected native profile changed during startup')
       if (state.queryGeneration !== generation || abort.signal.aborted) return
+      if (!process.env.HOME || !isAbsolute(process.env.HOME)) throw new Error('managed native checkpoint HOME is unavailable')
       state.nativeStore = createNativeCheckpointStore({ nativeSessionId: observation.nativeSessionId,
         transcriptPath: observation.native.transcript_path,
-        recordPath: join(dirname(observation.native.transcript_path), '.freshell-checkpoint-' + observation.nativeSessionId + '.json'),
+        recordPath: join(process.env.HOME, '.freshell', 'native-checkpoints', 'claude', observation.nativeSessionId + '.json'),
         profileDigest: state.nativeProfileDigest, allowMissingTranscript: !req.resumeSessionId })
       state.nativeReady = true
       state.cliSessionId = observation.nativeSessionId
