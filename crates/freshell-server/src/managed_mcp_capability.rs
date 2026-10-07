@@ -4457,6 +4457,340 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
     }
 
     #[cfg(feature = "managed-provider-qualification")]
+    async fn stop_codex_source_child(child: &mut tokio::process::Child) {
+        let group = child.id().expect("owned native child PID") as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::getpgid(group) },
+            group,
+            "only stop the fixture's dedicated native process group"
+        );
+        assert_eq!(unsafe { libc::kill(-group, libc::SIGTERM) }, 0);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+            Ok(result) => {
+                result.unwrap();
+            }
+            Err(_) => {
+                assert_eq!(unsafe { libc::kill(-group, libc::SIGKILL) }, 0);
+                child.wait().await.unwrap();
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5),async {
+            loop {
+                // The disposable test executable is PID 1. If the installed
+                // Node launcher exits first, its native child is adopted here.
+                // Reap only this owned group, never unrelated children.
+                let mut status=0;
+                let reaped=unsafe {libc::waitpid(-group,&mut status,libc::WNOHANG)};
+                if reaped>0 { continue; }
+                if reaped<0 {
+                    assert!(matches!(std::io::Error::last_os_error().raw_os_error(),Some(libc::ECHILD)|Some(libc::EINTR)));
+                }
+                if unsafe {libc::kill(-group,0)}==-1 {
+                    assert_eq!(std::io::Error::last_os_error().raw_os_error(),Some(libc::ESRCH));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("native CLI launcher and its owned native descendants must all exit before the next consumer");
+    }
+
+    #[cfg(feature = "managed-provider-qualification")]
+    async fn qualify_codex_automatic_rules(base: &Path) {
+        use freshell_platform::provider_environment::{
+            copy_environment, CopyLimits, CopySelection,
+        };
+        use freshell_runtime_protocol::{
+            ProviderLaunchContext, ProviderPreparation, ProviderResourceKind,
+        };
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let physical = Path::new("/home/freshell/provider");
+        for (case, trust, project_config, poison) in [
+            ("trusted-config", Some("trusted"), true, "regular"),
+            ("trusted-rules-only", Some("trusted"), false, "regular"),
+            ("untrusted", Some("untrusted"), false, "regular"),
+            ("unknown", None, false, "regular"),
+            ("ignored-shapes", Some("trusted"), false, "ignored"),
+            ("optional-missing", Some("trusted"), false, "missing"),
+        ] {
+            let owned = base.join(format!("automatic-rules-{case}"));
+            let original = owned.join("original-home");
+            let workspace = owned.join("workspace");
+            let project = workspace.join(".codex");
+            let rule = project.join("rules/project-auto-probe.rules");
+            std::fs::create_dir_all(original.join(".codex")).unwrap();
+            std::fs::create_dir_all(workspace.join(".git")).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            let config = trust
+                .map(|trust| {
+                    format!(
+                        "[projects.{}]\ntrust_level={trust:?}\n",
+                        serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+                    )
+                })
+                .unwrap_or_default();
+            std::fs::write(original.join(".codex/config.toml"), &config).unwrap();
+            if project_config {
+                std::fs::write(
+                    project.join("config.toml"),
+                    "# synthetic native project layer\n",
+                )
+                .unwrap();
+            }
+            if poison != "missing" {
+                std::fs::create_dir_all(project.join("rules")).unwrap();
+                if poison == "regular" {
+                    std::fs::write(&rule, "prefix_rule(").unwrap();
+                } else {
+                    std::fs::create_dir_all(project.join("rules/nested")).unwrap();
+                    std::fs::write(project.join("rules/nested/ignored.rules"), "prefix_rule(")
+                        .unwrap();
+                    std::fs::write(project.join("rules/ignored.txt"), "prefix_rule(").unwrap();
+                    std::os::unix::fs::symlink("ignored.txt", &rule).unwrap();
+                }
+            }
+            for outside in [
+                owned.join(".codex/rules/above.rules"),
+                workspace.join("below/.codex/rules/below.rules"),
+            ] {
+                std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+                std::fs::write(outside, "prefix_rule(").unwrap();
+            }
+            let mcp = crate::managed_provider_bootstrap::managed_codex_mcp_args().unwrap();
+            let context = ProviderLaunchContext {
+                config: vec![],
+                mcp_capability: None,
+                prepared_inputs: None,
+                preparation: ProviderPreparation::Codex {
+                    tui_args: mcp.clone(),
+                    sidecar_args: mcp,
+                },
+            };
+            let directory = owned.join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let store = CapabilityStore::default();
+            let grant = store
+                .issue(
+                    SoulId::new(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("codex", &original, &[])),
+                    OpencodeEphemeralInput {
+                        launch_context: Some(&context),
+                        cwd: Some(&workspace),
+                        workspace: Some(&workspace),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let prepared = crate::fresh_agent_proxy::context_for_fresh_provider(Some(
+                read_prepared_context(&directory, &grant).unwrap(),
+            ))
+            .unwrap();
+            let inputs = prepared.prepared_inputs.as_ref().unwrap();
+            let stage = staged_provider_root_path(&directory, &grant.grant_id).unwrap();
+            let selections = inputs
+                .resource_mounts
+                .iter()
+                .map(|unit| CopySelection {
+                    source: stage.join(&unit.stage_relative_path),
+                    destination_relative: unit.provider_relative_path.clone().into(),
+                })
+                .collect::<Vec<_>>();
+            copy_environment(&selections, physical, &[], CopyLimits::default()).unwrap();
+            let archived_home = owned.join("archived-home");
+            let archived_project = owned.join("archived-project");
+            std::fs::rename(&original, &archived_home).unwrap();
+            std::fs::rename(&project, &archived_project).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            for bind in &inputs.config_binds {
+                let destination = Path::new(&bind.effective_destination);
+                std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                // This is the disposable fixture's own prior HOME projection,
+                // never a real provider home or another native worker's input.
+                if std::fs::symlink_metadata(destination).is_ok() {
+                    std::fs::remove_file(destination).unwrap();
+                }
+                std::os::unix::fs::symlink(stage.join(&bind.source_relative_path), destination)
+                    .unwrap();
+            }
+            for unit in &inputs.resource_mounts {
+                let destination = Path::new(&unit.effective_destination);
+                assert_eq!(unit.kind, ProviderResourceKind::File);
+                std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                // A real exact file bind has a regular inode. Native rule
+                // discovery deliberately excludes symlink-file adapters.
+                copy_environment(
+                    &[CopySelection {
+                        source: physical.join(&unit.provider_relative_path),
+                        destination_relative: destination.file_name().unwrap().into(),
+                    }],
+                    destination.parent().unwrap(),
+                    &[],
+                    CopyLimits::default(),
+                )
+                .unwrap();
+            }
+            if trust != Some("trusted") {
+                // Preserve negative control topology in the native namespace.
+                // Only positive cases may prove accepted transport; their
+                // selected originals remain archived and inaccessible here.
+                copy_environment(
+                    &[CopySelection {
+                        source: archived_project.clone(),
+                        destination_relative: ".codex".into(),
+                    }],
+                    &workspace,
+                    &[],
+                    CopyLimits::default(),
+                )
+                .unwrap();
+            } else if poison == "ignored" {
+                // The ordinary copier follows resource symlinks; restoring
+                // these native-unselected controls must preserve their type.
+                std::fs::create_dir_all(project.join("rules/nested")).unwrap();
+                for relative in ["rules/nested/ignored.rules", "rules/ignored.txt"] {
+                    std::fs::copy(archived_project.join(relative), project.join(relative)).unwrap();
+                }
+                std::os::unix::fs::symlink("ignored.txt", &rule).unwrap();
+                assert_eq!(
+                    std::fs::read_link(&rule).unwrap(),
+                    std::fs::read_link(archived_project.join("rules/project-auto-probe.rules"))
+                        .unwrap()
+                );
+            }
+            let mut child = tokio::process::Command::new("/usr/local/bin/codex")
+                .arg("app-server")
+                .process_group(0)
+                .current_dir(&workspace)
+                .env("HOME", physical)
+                .env("CODEX_HOME", physical.join(".codex"))
+                .env_remove("OPENAI_API_KEY")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+            let mut stderr = child.stderr.take().unwrap();
+            let mut warnings = Vec::new();
+            let mut layers = None;
+            for (id, method, params) in [
+                (
+                    1,
+                    "initialize",
+                    serde_json::json!({"clientInfo":{"name":"freshell-fixture","version":"1"},"capabilities":{"experimentalApi":true}}),
+                ),
+                (
+                    2,
+                    "config/read",
+                    serde_json::json!({"includeLayers":true,"cwd":workspace}),
+                ),
+            ] {
+                stdin
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            serde_json::json!({"id":id,"method":method,"params":params})
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let result = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+                    loop {
+                        let Some(line) = stdout.next_line().await.unwrap() else {
+                            let status=child.wait().await.unwrap();
+                            let mut bytes=Vec::new();
+                            (&mut stderr).take(64*1024).read_to_end(&mut bytes).await.unwrap();
+                            let text=String::from_utf8_lossy(&bytes);
+                            let classes=["Permission denied","No such file","MCP","config.toml","model_instructions_file","profile","unknown variant","failed to load configuration","invalid type","ENOENT","EACCES","panic","Failed to load","Error loading","rules","Parse error","not found","exists","agents","symlink","directory","Resource temporarily unavailable","OS can't spawn worker thread","WouldBlock","failed to spawn thread"].into_iter().filter(|class|text.contains(class)).collect::<Vec<_>>();
+                            println!("provider_source_diagnostic {}",serde_json::json!({"provider":"codex","operation":"automatic_rule_startup_failure","case":case,"exitCode":status.code(),"stderrBytes":bytes.len(),"classes":classes}));
+                            panic!("native automatic policy consumer ended before barrier");
+                        };
+                        assert!(
+                            line.len() <= 1024 * 1024,
+                            "finite native source fixture response limit"
+                        );
+                        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        if response["method"] == "configWarning" {
+                            assert!(
+                                warnings.len() < 16,
+                                "finite native source fixture warning limit"
+                            );
+                            warnings.push(response["params"].clone());
+                        }
+                        if response["id"].as_u64() == Some(id) {
+                            assert!(
+                                response.get("error").is_none(),
+                                "native automatic policy request failed"
+                            );
+                            break response["result"].clone();
+                        }
+                    }
+                })
+                .await
+                .expect("native automatic policy response deadline");
+                if id == 2 {
+                    layers = Some(result["layers"].clone());
+                }
+            }
+            // config/read is the ordered barrier after initialize warnings;
+            // no sleep or quiet-period inference establishes negative cases.
+            stop_codex_source_child(&mut child).await;
+            let layers = layers.unwrap();
+            let layer = layers
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|layer| {
+                    layer["name"]["type"] == "project"
+                        && layer["name"]["dotCodexFolder"].as_str() == project.to_str()
+                })
+                .expect("native project folder layer must survive missing config.toml");
+            assert_eq!(layer["disabledReason"].is_null(), trust == Some("trusted"));
+            let policy = warnings
+                .iter()
+                .filter(|warning| {
+                    warning["summary"] == "Error parsing rules; custom rules not applied."
+                })
+                .collect::<Vec<_>>();
+            let selected = trust == Some("trusted") && poison == "regular";
+            assert_eq!(
+                policy.len(),
+                usize::from(selected),
+                "automatic native rule selection case {case}"
+            );
+            if selected {
+                assert_eq!(policy[0]["path"].as_str(), rule.to_str());
+                assert!(policy[0]["details"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Parse error"));
+                assert_eq!(
+                    std::fs::read(archived_project.join("rules/project-auto-probe.rules")).unwrap(),
+                    b"prefix_rule("
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(archived_home.join(".codex/config.toml")).unwrap(),
+                config
+            );
+            assert_eq!(
+                archived_project.join("config.toml").exists(),
+                project_config
+            );
+            println!(
+                "provider_source_diagnostic {}",
+                serde_json::json!({"provider":"codex","operation":"automatic_rule_selection","case":case,"selected":selected,"qualified":true})
+            );
+        }
+    }
+
+    #[cfg(feature = "managed-provider-qualification")]
     #[tokio::test]
     async fn managed_provider_codex_native_typed_inputs_survive_transport() {
         use freshell_platform::provider_environment::{
@@ -4643,6 +4977,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         );
         let mut child = tokio::process::Command::new("/usr/local/bin/codex")
             .arg("app-server")
+            .process_group(0)
             .args(match &context.preparation {
                 ProviderPreparation::Codex { sidecar_args, .. } => sidecar_args.clone(),
                 _ => panic!("Codex context missing"),
@@ -4759,8 +5094,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         let installed_path = Path::new(installed["path"].as_str().unwrap());
         // The native catalog is complete. Join it before the independent
         // executable consumer, as for the existing project resource below.
-        child.kill().await.unwrap();
-        child.wait().await.unwrap();
+        stop_codex_source_child(&mut child).await;
         let pids_before = std::fs::read_to_string("/sys/fs/cgroup/pids.current")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok());
@@ -4810,6 +5144,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             std::fs::read_to_string(archived.join(".codex/config.toml")).unwrap(),
             config
         );
+        qualify_codex_automatic_rules(owned.path()).await;
         for (case, bytes) in [
             (
                 "native-config-read",
