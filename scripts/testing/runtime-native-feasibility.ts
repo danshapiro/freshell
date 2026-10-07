@@ -646,9 +646,17 @@ async function executeManagedNativeApproval(input: {
       || !recovery.data.view.nativeIdentityObservation) throw new Error('actual native edge replacement did not preserve its root/current gate')
     let refused
     if (input.decision !== 'effect-before-observation') {
+      await inspect(recovery.data.view.containerId, 'native-edge-after-death-before-input', true)
       refused = await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: { soulId,
         text: 'Do not perform any tools. Report whether the unfinished original operation is blocked.' } })
-      if (!refused.result?.Err) throw new Error('uncheckpointed native operation accepted automatic-replay input')
+      harness.writeArtifact(`${scenario}-native-edge-input-dispatch.json`, refused)
+      if (!refused.result?.Err) {
+        // The Admin reply acknowledges a sidecar write. Its actual native
+        // admission refusal arrives on the normalized provider event stream.
+        await wait((event) => event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.error'
+          && event.data.payload.event.message?.includes('ordinary input is blocked'), 'actual unfinished-operation input refusal')
+      }
+      await inspect(recovery.data.view.containerId, 'native-edge-after-refused-input', true)
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000))
     const current = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events', params: { soulId, afterSequence: cursor, maxEvents: 128 } })
@@ -711,7 +719,10 @@ async function executeManagedNativeApproval(input: {
         { behavior: 'allow', updatedInput: oldPayload.tool.input })))
       replies.push(await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: {
         soulId, text: 'Do not perform any tools. Report whether the interrupted original operation is blocked.' } }))
-      if (replies.some((reply) => !reply.result?.Err)) throw new Error('changed native source/profile accepted an orphan decision or ordinary replay input')
+      if (!replies[0]?.result?.Err) throw new Error('changed native source/profile accepted an orphan decision')
+      if (!replies[1]?.result?.Err) await wait((event) => event.kind === 'provider'
+        && event.data.payload.event?.type === 'freshAgent.error'
+        && event.data.payload.event.message?.includes('ordinary input is blocked'), 'actual changed-source input refusal')
     } else if (currentView?.recoveryState !== 'blocked') {
       throw new Error('changed native source/profile has no explicit recovery disposition')
     }
@@ -723,7 +734,9 @@ async function executeManagedNativeApproval(input: {
       throw new Error('changed native source/profile replayed or revived the original operation')
     }
     return [{ name: 'actual-native-checkpoint-before-source-fault', pass: oldPayload.nativeCheckpoint.toolUseID === oldPayload.toolUseID },
-      { name: 'changed-native-source-or-profile-refuses-original-operation', pass: replies.every((reply) => !!reply.result?.Err) },
+      { name: 'changed-native-source-or-profile-refuses-original-operation', pass: currentView?.recoveryState === 'blocked'
+        || (!!replies[0]?.result?.Err && (!!replies[1]?.result?.Err || observed.some((event) => event.kind === 'provider'
+          && event.data.payload.event?.type === 'freshAgent.error' && event.data.payload.event.message?.includes('ordinary input is blocked')))) },
       { name: 'no-resurrected-native-permission-callback', pass: currentView?.recoveryState !== 'live'
         || !batch?.data.events.some((row: any) => isCard(row.event)) },
       { name: 'independent-native-effect-count', pass: effectCount() === 0 }]
