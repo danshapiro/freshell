@@ -181,6 +181,14 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     await expect(runner.dispatchOwnedExternalBrowser({ spec: smokeSpec }, { FRESHELL_E2E_BACKEND: 'cloud' }, owned)).rejects.toThrow(/cloud dispatch/)
     expect(owned.abort).toHaveBeenCalledOnce()
   })
+  it('keeps a failed Cloud child failed when its exact case observations are recovered', async () => {
+    const { owned, child, cases } = lifecycle()
+    child.mockResolvedValue({ exitCode: 1, cases: cases.map(row => ({ ...row, status: 'failed' })) })
+    await expect(runner.dispatchOwnedExternalBrowser({ spec: smokeSpec }, { FRESHELL_E2E_BACKEND: 'cloud' }, owned))
+      .rejects.toThrow(/child|exit|failed/)
+    expect(owned.abort).toHaveBeenCalledOnce()
+    expect(owned.finish).not.toHaveBeenCalled()
+  })
   it('refuses receipt publication when owner finish reports cleanup failure', async () => {
     const { owned } = lifecycle()
     owned.finish.mockResolvedValue({ ok: false, errors: ['owned web remains'] })
@@ -1015,5 +1023,36 @@ describe('exact Cloud job cleanup authority', () => {
       JSON.stringify(args?.[3] === 'list' ? [observed] : { metadata: { ...observed.metadata, labels: {} } }))
     expect(() => runner.cleanupOwnedExternalCloudJob(cloud, foreign)).toThrow(/owned/)
     expect(foreign.mock.calls.some(call => call[1]?.includes('delete') || call[1]?.includes('cancel'))).toBe(false)
+  })
+  it('retains actual failed execution case observations after the launcher has exited without result events', () => {
+    const cloud = { ...context, project: 'owned-project', region: 'us-west1', account: 'owned-robot@example.invalid' }
+    const executionName = `${context.jobName}-failed`
+    const events = [
+      { event: 'managed_external_case', runId: context.runId, candidateSha: context.candidateSha,
+        id: 'failed-owned-case', file: smokeSpec, title: 'actual managed external topology and finite owner facts', status: 'failed' },
+      { event: 'managed_external_complete', runId: context.runId, candidateSha: context.candidateSha, cases: 1, status: 'failed' },
+    ]
+    const entries = events.map(jsonPayload => ({ resource: { type: 'cloud_run_job', labels: { job_name: context.jobName, location: cloud.region } },
+      labels: { 'run.googleapis.com/execution_name': executionName }, jsonPayload }))
+    const execute = vi.fn<typeof execFileSync>().mockReturnValue(JSON.stringify(entries))
+    const raw = runner.readOwnedExternalCloudCases(cloud, execute)
+    expect(raw).toEqual({ executionName, status: 'failed', cases: [{ id: 'failed-owned-case', file: smokeSpec,
+      title: 'actual managed external topology and finite owner facts', status: 'failed' }] })
+    expect(() => runner.parseExternalCloudExecutionEvents(events, context)).toThrow(/failed/)
+    const recovered = vi.fn().mockReturnValue(raw)
+    expect(runner.settleExternalCloudChildOutput(1, [], [cloud], recovered)).toEqual({ exitCode: 1, cases: raw.cases })
+    expect(recovered).toHaveBeenCalledExactlyOnceWith(cloud)
+    expect(() => runner.settleExternalCloudChildOutput(0, [], [cloud], recovered)).toThrow(/missing/)
+    expect(recovered).toHaveBeenCalledOnce()
+    expect(execute.mock.calls[0][0]).toBe('gcloud')
+    expect(execute.mock.calls[0][1]).toEqual(expect.arrayContaining(['logging', 'read', '--project=owned-project', '--account=owned-robot@example.invalid']))
+    execute.mockReturnValue(JSON.stringify(entries.map(row => ({ ...row, resource: { ...row.resource,
+      labels: { ...row.resource.labels, job_name: 'foreign-job' } } }))))
+    expect(() => runner.readOwnedExternalCloudCases(cloud, execute)).toThrow(/owned|job/)
+    execute.mockReturnValue(JSON.stringify(entries.map((row, index) => index === 0 ? row : { ...row,
+      labels: { 'run.googleapis.com/execution_name': `${context.jobName}-other` } })))
+    expect(() => runner.readOwnedExternalCloudCases(cloud, execute)).toThrow(/execution/)
+    execute.mockReturnValue(JSON.stringify(entries.slice(0, 1)))
+    expect(() => runner.readOwnedExternalCloudCases(cloud, execute)).toThrow(/missing|incomplete/)
   })
 })

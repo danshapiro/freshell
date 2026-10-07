@@ -1036,6 +1036,14 @@ export type ExternalBrowserCounts = {
 export function parseExternalCloudExecutionEvents(
   events: readonly unknown[], context: Pick<ManagedExternalDescriptor, 'runId' | 'candidateSha'>,
 ): ExternalBrowserCaseResult[] {
+  const observed = parseExternalCloudCaseObservations(events, context)
+  if (observed.status !== 'passed') throw new Error('Cloud execution completion failed')
+  return observed.cases
+}
+
+function parseExternalCloudCaseObservations(
+  events: readonly unknown[], context: Pick<ManagedExternalDescriptor, 'runId' | 'candidateSha'>,
+): { status: FullResult['status']; cases: ExternalBrowserCaseResult[] } {
   const cases: ExternalBrowserCaseResult[] = []
   let completion: Record<string, unknown> | undefined
   for (const input of events) {
@@ -1058,10 +1066,11 @@ export function parseExternalCloudExecutionEvents(
     if (cases.some(row => row.id === event.id)) throw new Error('duplicate Cloud execution case')
     cases.push({ id: event.id, title: event.title, file: event.file, status: event.status as ExternalBrowserCaseResult['status'] })
   }
-  if (!completion || completion.status !== 'passed' || !cases.length || completion.cases !== cases.length) {
+  const status = z.enum(['passed', 'failed', 'timedout', 'interrupted']).safeParse(completion?.status)
+  if (!completion || !status.success || !cases.length || completion.cases !== cases.length) {
     throw new Error('Cloud execution completion is missing, failed or incomplete')
   }
-  return cases
+  return { status: status.data, cases }
 }
 
 /** Body-free execution observations travel through the exact Cloud execution log. */
@@ -1280,6 +1289,46 @@ const ExternalCloudJobInventorySchema = z.array(z.object({ metadata: z.object({ 
 
 type OwnedExternalCloudJob = {
   jobName: string; runId: string; candidateSha: string; project: string; region: string; account: string
+}
+
+/** Read failed cases from the exact job even when its launcher's EXIT trap already deleted it. */
+export function readOwnedExternalCloudCases(context: OwnedExternalCloudJob, execute: typeof execFileSync = execFileSync) {
+  if (!/^[a-z][a-z0-9-]{0,62}$/.test(context.jobName) || !z.string().uuid().safeParse(context.runId).success
+    || !/^[a-f0-9]{40}$/.test(context.candidateSha)) throw new Error('exact owned Cloud observation context required')
+  const query = `resource.type="cloud_run_job" AND resource.labels.job_name=${JSON.stringify(context.jobName)} AND resource.labels.location=${JSON.stringify(context.region)} AND jsonPayload.runId=${JSON.stringify(context.runId)} AND jsonPayload.candidateSha=${JSON.stringify(context.candidateSha)} AND (jsonPayload.event="managed_external_case" OR jsonPayload.event="managed_external_complete")`
+  const output = execute('gcloud', ['--quiet', 'logging', 'read', query, `--project=${context.project}`,
+    `--account=${context.account}`, '--format=json', '--limit=1000'], {
+    encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, CLOUDSDK_CORE_DISABLE_PROMPTS: '1' },
+  })
+  const entries = z.array(z.object({ resource: z.object({ type: z.literal('cloud_run_job'), labels: z.object({
+    job_name: z.literal(context.jobName), location: z.literal(context.region),
+  }).passthrough() }).passthrough(), labels: z.object({ 'run.googleapis.com/execution_name': z.string().min(1) }).passthrough(),
+  jsonPayload: z.unknown() }).passthrough()).min(1).safeParse(JSON.parse(String(output)))
+  if (!entries.success) throw new Error('exact owned Cloud job observations are missing or invalid')
+  const executions = new Set(entries.data.map(row => row.labels['run.googleapis.com/execution_name']))
+  const executionName = [...executions][0]
+  if (executions.size !== 1 || !executionName.startsWith(`${context.jobName}-`)) throw new Error('Cloud observations do not belong to one exact owned execution')
+  return { executionName, ...parseExternalCloudCaseObservations(entries.data.map(row => row.jsonPayload), context) }
+}
+
+export function settleExternalCloudChildOutput(exitCode: number, records: readonly Record<string, unknown>[],
+  jobs: readonly OwnedExternalCloudJob[], recover = readOwnedExternalCloudCases): { exitCode: number; cases: ExternalBrowserCaseResult[] } {
+  const cases = records.filter(record => record.event === 'managed_external_cloud_cases')
+  const cleanup = records.filter(record => record.event === 'managed_external_job_cleanup')
+  if (exitCode !== 0 && cases.length === 0) {
+    if (jobs.length !== 1) throw new Error('failed Cloud observations require one exact owned job')
+    const observed = recover(jobs[0])
+    process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'managed_external_failed_execution_observed',
+      runId: jobs[0].runId, candidateSha: jobs[0].candidateSha, jobName: jobs[0].jobName,
+      executionName: observed.executionName, status: observed.status, cases: observed.cases })}\n`)
+    return { exitCode, cases: observed.cases }
+  }
+  if (cases.length !== 1 || cleanup.length !== 1 || cleanup[0].ok !== true || !Array.isArray(cases[0].cases)) {
+    throw new Error('exact Cloud execution cases or verified job cleanup are missing')
+  }
+  return { exitCode, cases: z.array(z.object({ id: z.string().min(1), file: z.string().min(1), title: z.string().min(1),
+    status: z.enum(['passed', 'failed', 'skipped', 'timedOut', 'interrupted']) }).strict()).parse(cases[0].cases) }
 }
 
 /** The launcher may vanish before its EXIT trap; cleanup remains with the owner. */
@@ -1514,14 +1563,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     }
     const exitCode = await this.cloud.wait()
     this.captureCloudEvents(events)
-    const records = [...events.values()]
-    const cases = records.filter(record => record.event === 'managed_external_cloud_cases')
-    const cleanup = records.filter(record => record.event === 'managed_external_job_cleanup')
-    if (cases.length !== 1 || cleanup.length !== 1 || cleanup[0].ok !== true || !Array.isArray(cases[0].cases)) {
-      throw new Error('exact Cloud execution cases or verified job cleanup are missing')
-    }
-    return { exitCode, cases: z.array(z.object({ id: z.string().min(1), file: z.string().min(1), title: z.string().min(1),
-      status: z.enum(['passed', 'failed', 'skipped', 'timedOut', 'interrupted']) }).strict()).parse(cases[0].cases) }
+    return settleExternalCloudChildOutput(exitCode, [...events.values()], [...this.cloudJobs.values()])
   }
   private captureCloudEvents(events: Map<string, Record<string, unknown>>): void {
     if (!this.cloud || !this.descriptor || !this.owner) return
