@@ -229,6 +229,7 @@ mod tests {
             }],
             frozen_inputs: vec!["INSERT".into()],
             user_owns_freshell_mcp: true,
+            rebind_enabled: true,
             native_source_flags: vec![NativeSourceFlag {
                 kind: NativeSourceFlagKind::Main,
                 runtime_destination: "/original-unavailable/project/opencode.json".into(),

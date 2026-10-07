@@ -11,6 +11,7 @@ pub(super) fn stage(
     plan: &[PlannedSourceOccurrence],
     frozen_inputs: &[String],
     native_source_flags: &[freshell_platform::opencode_recipe::NativeSourceFlag],
+    rebind_enabled: bool,
 ) -> Result<(), String> {
     let mut manifest = SourceManifest {
         version: 1,
@@ -21,6 +22,7 @@ pub(super) fn stage(
         frozen_inputs: frozen_inputs.to_vec(),
         user_owns_freshell_mcp: false,
         native_source_flags: native_source_flags.to_vec(),
+        rebind_enabled,
     };
     private_directory(&root.join(".freshell/source-views"))?;
     private_directory(&root.join(".freshell/templates"))?;

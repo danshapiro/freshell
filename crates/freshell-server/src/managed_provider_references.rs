@@ -715,6 +715,7 @@ pub(crate) struct OpencodePreparation<'a> {
     pub auth_authority: Option<&'a str>,
     pub selected_sources: Option<Vec<sources::SourceOccurrence>>,
     pub native_source_flags: Option<Vec<freshell_platform::opencode_recipe::NativeSourceFlag>>,
+    pub rebind_enabled: Option<bool>,
 }
 
 pub(crate) async fn prepare_managed_opencode(
@@ -748,7 +749,14 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         auth_authority,
         selected_sources,
         native_source_flags,
+        rebind_enabled,
     } = request;
+    let rebind_enabled = rebind_enabled.unwrap_or_else(|| {
+        !matches!(
+            original("FRESHELL_OPENCODE_REBIND").as_deref(),
+            Some("0" | "false")
+        )
+    });
     use sources::*;
     if original("OPENCODE_CONFIG_CONTENT").is_some_and(|value| !value.is_empty()) {
         return Err(
@@ -830,7 +838,8 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         .try_fold(0usize, |bytes, source| bytes.checked_add(source.view.len()))
         .ok_or("source-view byte count overflow")?;
     for source in &mut loaded {
-        if source.source.lane == SourceLane::Tui
+        if rebind_enabled
+            && source.source.lane == SourceLane::Tui
             && native_source_flags.iter().any(|flag| {
                 flag.kind == freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui
                     && Path::new(&flag.runtime_destination)
@@ -947,6 +956,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
             secret_references: Some(&references),
             frozen_inputs: Some(&frozen_names),
             native_source_flags: Some(&native_source_flags),
+            rebind_enabled: Some(rebind_enabled),
             ..Default::default()
         },
     )?;

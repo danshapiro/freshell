@@ -45,6 +45,7 @@ pub(crate) struct OpencodeEphemeralInput<'a> {
     pub launch_context: Option<&'a freshell_runtime_protocol::ProviderLaunchContext>,
     pub frozen_inputs: Option<&'a [String]>,
     pub native_source_flags: Option<&'a [freshell_platform::opencode_recipe::NativeSourceFlag]>,
+    pub rebind_enabled: Option<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,6 +406,9 @@ async fn apply_prepared_callback(
             native_source_flags: accepted_manifest
                 .as_ref()
                 .map(|manifest| manifest.native_source_flags.clone()),
+            rebind_enabled: accepted_manifest
+                .as_ref()
+                .map(|manifest| manifest.rebind_enabled),
         },
         |soul, home, context, input| {
             let input = OpencodeEphemeralInput {
@@ -1225,6 +1229,7 @@ fn stage_provider_root(
                 plan,
                 opencode_input.frozen_inputs.unwrap_or(&[]),
                 opencode_input.native_source_flags.unwrap_or(&[]),
+                opencode_input.rebind_enabled.unwrap_or(true),
             )?;
         }
         allow_controller_stage_read(&temporary)?;
@@ -3504,72 +3509,121 @@ except Exception as error:
         let directory = owned.path().join("control/mcp-capabilities");
         std::fs::create_dir_all(&directory).unwrap();
         let store = CapabilityStore::default();
-        let soul = SoulId::new();
         let client = freshell_runtime_client::RuntimeClient::new(
             owned.path().join("unused.sock"),
             "fixture-control",
         );
-        let prepared = crate::managed_provider_references::prepare_managed_opencode_with_publisher(
-            crate::managed_provider_references::OpencodePreparation {
-                client: &client,
-                soul: &soul,
-                creation_seed: "fixture-existing-soul",
-                home: &home,
-                cwd: &workspace,
-                workspace: &workspace,
-                original: &|name| {
-                    (name == "OPENCODE_TUI_CONFIG").then(|| "selected-tui.jsonc".into())
-                },
-                references: vec![],
-                auth_authority: Some("fixture-owned-attempt"),
-                selected_sources: None,
-                native_source_flags: None,
-            },
-            |soul, home, context, input| {
-                let capability = store.issue(
-                    soul.clone(),
-                    &directory,
-                    "http://host.docker.internal:4000".into(),
-                    Some(("opencode", home, &context.config)),
-                    OpencodeEphemeralInput {
-                        launch_context: Some(context),
-                        ..input
+        for disabled in [false, true] {
+            let soul = SoulId::new();
+            let prepared =
+                crate::managed_provider_references::prepare_managed_opencode_with_publisher(
+                    crate::managed_provider_references::OpencodePreparation {
+                        client: &client,
+                        soul: &soul,
+                        creation_seed: "fixture-existing-soul",
+                        home: &home,
+                        cwd: &workspace,
+                        workspace: &workspace,
+                        original: &|name| match name {
+                            "OPENCODE_TUI_CONFIG" => Some("selected-tui.jsonc".into()),
+                            "FRESHELL_OPENCODE_REBIND" if disabled => Some("0".into()),
+                            _ => None,
+                        },
+                        references: vec![],
+                        auth_authority: Some("fixture-owned-attempt"),
+                        selected_sources: None,
+                        native_source_flags: None,
+                        rebind_enabled: None,
                     },
-                    None,
-                )?;
-                read_prepared_context(&directory, &capability)
-            },
-        )
-        .await
-        .expect("selected TUI must remain supported through the shared managed producer");
-        let stage = staged_provider_root_path(
-            &directory,
-            &prepared.context.mcp_capability.as_ref().unwrap().grant_id,
-        )
-        .unwrap();
-        let manifest: freshell_platform::opencode_recipe::SourceManifest = serde_json::from_slice(
-            &std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(manifest.native_source_flags.len(), 1);
-        assert_eq!(
-            manifest.native_source_flags[0].kind.variable(),
-            "OPENCODE_TUI_CONFIG"
-        );
-        let effective =
-            std::fs::read_to_string(stage.join(&manifest.sources[0].unexpanded_relative_path))
+                    |soul, home, context, input| {
+                        let capability = store.issue(
+                            soul.clone(),
+                            &directory,
+                            "http://host.docker.internal:4000".into(),
+                            Some(("opencode", home, &context.config)),
+                            OpencodeEphemeralInput {
+                                launch_context: Some(context),
+                                ..input
+                            },
+                            None,
+                        )?;
+                        read_prepared_context(&directory, &capability)
+                    },
+                )
+                .await
+                .expect("selected TUI must remain supported through the shared managed producer");
+            let stage = staged_provider_root_path(
+                &directory,
+                &prepared.context.mcp_capability.as_ref().unwrap().grant_id,
+            )
+            .unwrap();
+            let manifest: freshell_platform::opencode_recipe::SourceManifest =
+                serde_json::from_slice(
+                    &std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+                )
                 .unwrap();
-        let effective: serde_json::Value = serde_json::from_str(&effective).unwrap();
-        assert_eq!(effective["theme"], "{file:./theme.txt}");
-        assert_eq!(
+            assert_eq!(manifest.rebind_enabled, !disabled);
+            assert_eq!(manifest.native_source_flags.len(), 1);
+            assert_eq!(
+                manifest.native_source_flags[0].kind.variable(),
+                "OPENCODE_TUI_CONFIG"
+            );
+            let effective =
+                std::fs::read_to_string(stage.join(&manifest.sources[0].unexpanded_relative_path))
+                    .unwrap();
+            let effective =
+                freshell_platform::opencode_config::parse_jsonc_object(&effective).unwrap();
+            assert_eq!(effective["theme"], "{file:./theme.txt}");
+            assert_eq!(
             effective["plugin"],
-            serde_json::json!([
+            if disabled { serde_json::json!([]) } else { serde_json::json!([
                 "file:///home/freshell/provider/.freshell/opencode/freshell-rebind-plugin.ts"
-            ]),
+            ]) },
             "selected rebind normalization must precede the source view used by reference recipes"
         );
-        assert_eq!(prepared.references[0].source_path, theme.to_str().unwrap());
-        assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+            assert_eq!(prepared.references[0].source_path, theme.to_str().unwrap());
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+            let callback = serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,
+                "provider":"opencode","workspace":workspace,"cwd":workspace,"priorContext":prepared.context,
+                "providerSecretReferences":prepared.references,"authLookupAuthority":"fixture-owned-attempt"})).unwrap();
+            let reissued = apply_prepared_callback(
+                &callback,
+                "fixture-control",
+                &store,
+                &directory,
+                "http://host.docker.internal:4000",
+                &home,
+                &client,
+            )
+            .await
+            .unwrap();
+            let reissued: PreparedProviderContext = serde_json::from_slice(&reissued).unwrap();
+            let stage = staged_provider_root_path(
+                &directory,
+                &reissued
+                    .provider_launch_context
+                    .mcp_capability
+                    .as_ref()
+                    .unwrap()
+                    .grant_id,
+            )
+            .unwrap();
+            let retained: freshell_platform::opencode_recipe::SourceManifest =
+                serde_json::from_slice(
+                    &std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                retained.rebind_enabled, !disabled,
+                "reissue must preserve request-only owned edits with current control absent"
+            );
+            let retained = freshell_platform::opencode_config::parse_jsonc_object(
+                &std::fs::read_to_string(stage.join(&retained.sources[0].unexpanded_relative_path))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(retained["plugin"], effective["plugin"]);
+        }
     }
 
     #[tokio::test]
@@ -3606,6 +3660,7 @@ except Exception as error:
                 auth_authority: Some("fixture-owned-attempt"),
                 selected_sources: None,
                 native_source_flags: None,
+                rebind_enabled: None,
             },
             |soul, home, context, input| {
                 let capability = store.issue(
@@ -3694,6 +3749,7 @@ except Exception as error:
                 auth_authority: Some("fixture-owned-attempt"),
                 selected_sources: None,
                 native_source_flags: None,
+                rebind_enabled: None,
             },
             |_, _, _, _| panic!("missing selected native source must fail before publication"),
         )

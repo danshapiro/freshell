@@ -38,6 +38,11 @@ pub struct SourceManifest {
     pub user_owns_freshell_mcp: bool,
     #[serde(default)]
     pub native_source_flags: Vec<NativeSourceFlag>,
+    #[serde(default = "default_rebind_enabled")]
+    pub rebind_enabled: bool,
+}
+fn default_rebind_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Serialize, Deserialize)]

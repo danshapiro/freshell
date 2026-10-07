@@ -212,6 +212,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                         auth_authority: None,
                         selected_sources: None,
                         native_source_flags: None,
+                        rebind_enabled: None,
                     },
                 )
                 .await?;
