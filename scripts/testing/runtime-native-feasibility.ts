@@ -263,7 +263,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'claude' && ['create', 'wrong-root', 'disabled-hooks', 'exact-resume', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'claude' && ['create', 'wrong-root', 'disabled-hooks', 'trust-refusal', 'timeout', 'exact-resume', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
   if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
@@ -418,7 +418,9 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
   const resumes = ['exact-resume', 'current-native-turn'].includes(caseId)
-  const hooksDisabled = caseId === 'disabled-hooks'
+  const nativeTimeout = caseId === 'timeout'
+  const trustRefusal = caseId === 'trust-refusal'
+  const hooksDisabled = caseId === 'disabled-hooks' || nativeTimeout
   if (resumes && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   const grants = (['env_file', 'ca_file'] as const).map((suffix) => {
     const file = sources.find((source) => source.name === `claude/grants/${suffix}`)
@@ -438,6 +440,12 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   fs.mkdirSync(userRoot, { recursive: true, mode: 0o700 })
   fs.copyFileSync(preferences.path, preferencePath)
   fs.chmodSync(preferencePath, 0o600)
+  if (trustRefusal) {
+    const profile = JSON.parse(fs.readFileSync(preferencePath, 'utf8'))
+    profile.projects ??= {}; profile.projects[workspace] ??= {}
+    profile.projects[workspace].hasTrustDialogAccepted = false
+    fs.writeFileSync(preferencePath, JSON.stringify(profile), { mode: 0o600 })
+  }
   if (hooksDisabled) fs.writeFileSync(path.join(userRoot, 'settings.json'), JSON.stringify({ disableAllHooks: true }), { mode: 0o600 })
   const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release',
     env: { HOME: home, FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude' } })
@@ -507,12 +515,17 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
         ...(hooksDisabled ? [{ root: 'user_provider', relativePath: 'settings.json', providerRelativePath: '.claude/settings.json', format: 'json' }] : [])] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
   const wrongRoot = caseId === 'wrong-root'
-  const startupRefusal = wrongRoot || hooksDisabled
+  const startupRefusal = wrongRoot || hooksDisabled || trustRefusal
+  const refusalReason = trustRefusal ? 'unaccepted native trust' : nativeTimeout ? 'native startup timeout'
+    : hooksDisabled ? 'disabled native hooks' : 'wrong current native root'
+  const launchStartedAt = Date.now()
   const result = startupRefusal ? await harness.adminRaw(supervisor, request) : await harness.adminOk(supervisor, request)
+  const launchElapsedMs = Date.now() - launchStartedAt
   harness.writeArtifact(`${scenario}-launch.json`, result)
+  harness.writeArtifact(`${scenario}-launch-timing.json`, { elapsedMs: launchElapsedMs })
   let view: any
   if (startupRefusal) {
-    const failure = hooksDisabled ? 'disabled native hooks published a running launch' : 'wrong current native root published a running launch'
+    const failure = `${refusalReason} published a running launch`
     if (result.result?.Err?.code !== 'RECOVERY_BLOCKED') throw new Error(failure)
     const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
     harness.writeArtifact(`${scenario}-inventory.json`, inventory)
@@ -561,12 +574,14 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     && observation.incarnationId === view.incarnationId
   if (startupRefusal ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-    ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : [])]))
+    ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : trustRefusal ? ['trust-refusal'] : [])]))
   harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
-  const selectedModel = hooksDisabled ? namespace.nativeArgv?.[namespace.nativeArgv.indexOf('--model') + 1] : namespace.loaded?.native?.model?.id
-  const selectedCwd = hooksDisabled ? namespace.nativeCwd : namespace.loaded?.native?.workspace?.current_dir
-  const loaderMatches = hooksDisabled
-    ? namespace.hook === null && namespace.loaded === null && namespace.hooksDisabled === true
+  const noCallbacks = hooksDisabled || trustRefusal
+  const selectedModel = noCallbacks ? namespace.nativeArgv?.[namespace.nativeArgv.indexOf('--model') + 1] : namespace.loaded?.native?.model?.id
+  const selectedCwd = noCallbacks ? namespace.nativeCwd : namespace.loaded?.native?.workspace?.current_dir
+  const loaderMatches = noCallbacks
+    ? namespace.hook === null && namespace.loaded === null
+      && (trustRefusal ? namespace.nativePreferences?.workspaceTrust === false : namespace.hooksDisabled === true)
     : namespace.loaded?.native?.version === '2.1.263' && namespace.loaded.native.session_id === actualRoot
       && JSON.stringify(namespace.loaded.launch) === JSON.stringify(namespace.hook.launch)
   if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
@@ -575,6 +590,7 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     || selectedModel !== 'claude-haiku-4-5-20251001' || selectedCwd !== workspace) {
     throw new Error('actual terminal Claude pin/profile/namespace/TLS differs')
   }
+  if (nativeTimeout && (launchElapsedMs < 8_000 || launchElapsedMs >= 50_000)) throw new Error('native startup timeout did not respect its bounded wait')
   if (!startupRefusal) {
     // Exercise the ordinary output/store path before starting a paid seed.
     // Input ACKs cannot hide a dispatcher or store failure at this boundary.
@@ -583,24 +599,32 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     harness.writeArtifact(`${scenario}-pre-input-store-probe.json`, await harness.adminOk(supervisor,
       harness.probeRecoveryBody(soulId)))
   }
-  const assertions = startupRefusal ? [{ name: hooksDisabled ? 'actual-disabled-native-hooks-refused-before-running-and-input' : 'wrong-current-native-root-refused-before-running-and-input', pass: false }]
+  const assertions = startupRefusal ? [{ name: trustRefusal ? 'actual-native-trust-refused-before-running-and-input'
+    : nativeTimeout ? 'bounded-actual-native-startup-timeout-before-running-and-input'
+      : hooksDisabled ? 'actual-disabled-native-hooks-refused-before-running-and-input' : 'wrong-current-native-root-refused-before-running-and-input', pass: false }]
     : [{ name: 'actual-terminal-current-native-post-load-observation-before-input', pass:
       observation.nativeSessionId === namespace.loaded.native.session_id && observation.incarnationId === view.incarnationId }]
   if (startupRefusal) {
+    if (trustRefusal) {
+      const output = await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId))
+      harness.writeArtifact(`${scenario}-native-trust-terminal-private.json`, output)
+      if (!/trust/i.test(output.data.frames.map((frame: any) => frame.data).join(''))) throw new Error('actual native trust prompt unavailable')
+    }
     const rejected = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned blocked startup probe. Do not use tools.\r'))
     harness.writeArtifact(`${scenario}-input-refusal.json`, rejected)
     const after = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-      ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : [])]))
+      ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : trustRefusal ? ['trust-refusal'] : [])]))
     harness.writeArtifact(`${scenario}-after-refused-input-native-private.json`, after)
     // No Running incarnation exists, so the ordinary input route has no
     // admissible target. Inspect actual provider state separately.
     assertions[0]!.pass = !observation
       && view.launchState === 'starting' && rejected.result?.Err?.code === 'UNKNOWN_SOUL'
       && JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
-      && (hooksDisabled ? (!after.hook && !after.loaded && after.hooksDisabled === true && after.completedTurns === 0 && after.toolEvents === 0)
+      && (noCallbacks ? (!after.hook && !after.loaded && (trustRefusal ? after.nativePreferences?.workspaceTrust === false : after.hooksDisabled === true)
+        && after.completedTurns === 0 && after.toolEvents === 0)
         : (actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
           && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0))
-    if (!assertions[0]!.pass) throw new Error(hooksDisabled ? 'disabled native hooks released ordinary input or changed native state' : 'wrong current native root released ordinary input or changed native state')
+    if (!assertions[0]!.pass) throw new Error(`${refusalReason} released ordinary input or changed native state`)
   }
   if (resumes) {
     const inspect = async (containerId: string, label: string) => {
@@ -674,7 +698,7 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace-native-private.json`],
     assertions: [...assertions,
     { name: 'actual-terminal-global-pin-distinct-from-sdk-child', pass: namespace.version.startsWith('2.1.263')
-      && (hooksDisabled || namespace.loaded.native.version === '2.1.263') },
+      && (noCallbacks || namespace.loaded.native.version === '2.1.263') },
     { name: 'actual-terminal-selected-model-workspace-profile', pass: selectedModel === 'claude-haiku-4-5-20251001' && selectedCwd === workspace }] }
   harness.writeArtifact(`${scenario}-original.json`, original)
   return original
@@ -1250,7 +1274,7 @@ print(json.dumps({'nativeRoot':root,'nativePid':int(p.name),'transcript':{'ident
 const claudeNativeInspection = String.raw`
 import pathlib,os,json,hashlib,ssl,urllib.parse,urllib.request,subprocess,sys,base64
 root=sys.argv[1];required=sys.argv[2]=='true';terminal=len(sys.argv)>3 and sys.argv[3]=='terminal'
-disabled_hooks=terminal and len(sys.argv)>4 and sys.argv[4]=='disabled-hooks'
+missing_callbacks=terminal and len(sys.argv)>4 and sys.argv[4] in ['disabled-hooks','trust-refusal']
 selected=pathlib.Path('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe' if terminal else '/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude')
 expected=hashlib.sha256(selected.read_bytes()).hexdigest();matches=[]
 for p in pathlib.Path('/proc').iterdir():
@@ -1261,9 +1285,9 @@ for p in pathlib.Path('/proc').iterdir():
  except (OSError,ValueError):continue
 assert len(matches)==1
 p,env=matches[0];signal_dir=pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR']);hook_file=signal_dir/'session-start.json';loaded_file=signal_dir/'statusline-loaded.json'
-hook=None if disabled_hooks and not hook_file.exists() else json.loads(hook_file.read_text())
-assert hook is None and disabled_hooks or hook['native']['session_id']==root
-loaded=None if not terminal or disabled_hooks and not loaded_file.exists() else json.loads(loaded_file.read_text())
+hook=None if missing_callbacks and not hook_file.exists() else json.loads(hook_file.read_text())
+assert hook is None and missing_callbacks or hook['native']['session_id']==root
+loaded=None if not terminal or missing_callbacks and not loaded_file.exists() else json.loads(loaded_file.read_text())
 ca=pathlib.Path(env.get('SSL_CERT_FILE') or env['NODE_EXTRA_CA_CERTS']);context=ssl.create_default_context(cafile=str(ca));proxy=env.get('HTTPS_PROXY') or env.get('https_proxy')
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),urllib.request.HTTPSHandler(context=context))
 with opener.open(urllib.request.Request('https://api.anthropic.com/v1/models',headers={'anthropic-version':'2023-06-01','authorization':'Bearer '+env['CLAUDE_CODE_OAUTH_TOKEN']}),timeout=20) as r:status=r.status;r.read()

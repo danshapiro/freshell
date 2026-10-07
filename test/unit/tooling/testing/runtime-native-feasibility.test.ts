@@ -103,7 +103,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       .rejects.toThrow('actual terminal recovery requires the owned real server artifact')
     expect(launch).not.toHaveBeenCalled()
   })
-  it.each(['create', 'wrong-root', 'disabled-hooks'])('sends terminal Claude %s through its real launch route with the selected profile', async (caseId) => {
+  it.each(['create', 'wrong-root', 'disabled-hooks', 'trust-refusal', 'timeout'])('sends terminal Claude %s through its real launch route with the selected profile', async (caseId) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-claude-route-'))
     let home: string
     const launch = vi.fn(async (_supervisor: unknown, request: any) => {
@@ -111,7 +111,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       const selected = request.params.terminal.providerLaunchContext.config.find((file: any) => file.providerRelativePath === '.claude/.claude.json')
       expect(selected.root).toBe('user_provider')
       const preferences = JSON.parse(fs.readFileSync(path.join(home, '.claude', selected.relativePath), 'utf8'))
-      expect(preferences.projects[request.params.terminal.cwd].hasTrustDialogAccepted).toBe(true)
+      expect(preferences.projects[request.params.terminal.cwd].hasTrustDialogAccepted).toBe(caseId !== 'trust-refusal')
       throw new Error('controlled terminal launch boundary')
     })
     const harness = { testRoot: directory, startSupervisor: async (options: any) => { home = options.env.HOME; return {} },
@@ -163,14 +163,20 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
   })
   it.each(['create', 'wrong-root', 'wrong-root-admitted', 'wrong-root-published', 'wrong-root-late-published',
-    'disabled-hooks', 'disabled-hooks-admitted', 'disabled-hooks-published'])('refreshes the current host and protects the terminal %s verdict', async (fault) => {
-    const caseId = fault === 'create' ? 'create' : fault.startsWith('disabled-hooks') ? 'disabled-hooks' : 'wrong-root'
+    'disabled-hooks', 'disabled-hooks-admitted', 'disabled-hooks-published',
+    'trust-refusal', 'trust-refusal-no-prompt', 'trust-refusal-admitted', 'trust-refusal-published',
+    'timeout', 'timeout-too-fast', 'timeout-admitted', 'timeout-published'])('refreshes the current host and protects the terminal %s verdict', async (fault) => {
+    const caseId = fault === 'create' ? 'create' : fault.startsWith('disabled-hooks') ? 'disabled-hooks'
+      : fault.startsWith('trust-refusal') ? 'trust-refusal' : fault.startsWith('timeout') ? 'timeout' : 'wrong-root'
+    const noCallbacks = ['disabled-hooks', 'trust-refusal', 'timeout'].includes(caseId)
+    const reason = caseId === 'disabled-hooks' ? 'disabled native hooks' : caseId === 'trust-refusal' ? 'unaccepted native trust'
+      : caseId === 'timeout' ? 'native startup timeout' : 'wrong current native root'
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-observation-refresh-'))
     const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
     let request: any
     let refreshed = false
     let now = 0
-    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now += 25_000)
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now += fault === 'timeout-too-fast' ? 1_000 : 25_000)
     const view = () => ({ soulId: request.params.soulId, containerId: 'owned-container', incarnationId: 'owned-incarnation',
       launchState: caseId === 'create' || fault.includes('published') ? 'running' : 'starting',
       recoveryState: 'live', nativeSessionId: request.params.nativeSessionId,
@@ -190,15 +196,17 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       adminOk: async (_supervisor: unknown, body: any) => {
         if (body.method === 'launch') { request = body; return { data: { view: view() } } }
         if (body.method === 'probe_recovery') { refreshed = true; return { data: { kind: 'unknown' } } }
+        if (body.method === 'terminal_read_output' && caseId === 'trust-refusal') return { data: { frames: fault === 'trust-refusal-no-prompt' ? [] : [{ data: 'Do you trust this folder?' }] } }
         return { data: body.method === 'inventory' ? [view()] : {} }
       },
       execOwnedContainerAsExact: async (_container: string, _uid: string, args: string[]) => JSON.stringify(args.includes('terminal')
         ? { uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200,
           tlsVerifyMode: 2, tlsCheckHostname: true, version: '2.1.263', executableSha256: 'f'.repeat(64), profileFiles: [],
-          transcript: null, hooksDisabled: caseId === 'disabled-hooks', completedTurns: 0, toolEvents: 0,
+          transcript: null, hooksDisabled: caseId === 'disabled-hooks' || caseId === 'timeout', completedTurns: 0, toolEvents: 0,
+          nativePreferences: { workspaceTrust: caseId !== 'trust-refusal' },
           nativeArgv: request.params.terminal.args, nativeCwd: request.params.terminal.cwd,
-          hook: caseId === 'disabled-hooks' ? null : { launch: {}, native: { session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1] } },
-          loaded: caseId === 'disabled-hooks' ? null : { launch: {}, native: { version: '2.1.263', session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1],
+          hook: noCallbacks ? null : { launch: {}, native: { session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1] } },
+          loaded: noCallbacks ? null : { launch: {}, native: { version: '2.1.263', session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1],
             context_window: { total_input_tokens: 0, total_output_tokens: 0 },
             model: { id: 'claude-haiku-4-5-20251001' }, workspace: { current_dir: request.params.terminal.cwd } } } }
         : { processes: [] }),
@@ -206,12 +214,16 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
     try {
       const execution = executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, caseId)
+      if (fault === 'trust-refusal-no-prompt' || fault === 'timeout-too-fast') {
+        await expect(execution).rejects.toThrow(fault === 'trust-refusal-no-prompt' ? 'actual native trust prompt unavailable' : 'native startup timeout did not respect its bounded wait')
+        return
+      }
       if (fault.includes('published')) {
-        await expect(execution).rejects.toThrow(caseId === 'disabled-hooks' ? 'disabled native hooks published a running launch' : 'wrong current native root published a running launch')
+        await expect(execution).rejects.toThrow(`${reason} published a running launch`)
         return
       }
       if (fault.endsWith('-admitted')) {
-        await expect(execution).rejects.toThrow(caseId === 'disabled-hooks' ? 'disabled native hooks released ordinary input' : 'wrong current native root released ordinary input')
+        await expect(execution).rejects.toThrow(`${reason} released ordinary input`)
         return
       }
       const original = await execution
