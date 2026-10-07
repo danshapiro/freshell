@@ -17,7 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 mod input_reservation;
 pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
 const ACTIVE_STATES: &str = "'prepared','created','starting','running','stopping'";
@@ -2415,6 +2415,16 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.commit()?;
         schema = 8;
     }
+    if schema == 8 {
+        let add_provider = !column_exists(conn, "provider_input_preparations", "provider")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if add_provider {
+            tx.execute_batch("ALTER TABLE provider_input_preparations ADD COLUMN provider TEXT NOT NULL DEFAULT 'opencode';")?;
+        }
+        tx.execute_batch("UPDATE installation SET schema_version=9 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 9;
+    }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
             "unsupported older schema {schema}"
@@ -2897,6 +2907,164 @@ mod tests {
             fresh_agent: None,
             view_intent: None,
             admission: AdmissionPolicy::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_initial_reservation_migration_retains_legacy_opencode_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("synthetic-host");
+        std::fs::write(&binary, "synthetic artifact").unwrap();
+        let root = dir.path().join("registry");
+        let registry = Registry::open(&root, None).unwrap();
+        let request = freshell_runtime_protocol::ReserveProviderInputsRequest {
+            expected_control_epoch: None,
+            soul_id: SoulId::new(),
+            provider: "opencode".into(),
+            creation_seed_ref: "seed".into(),
+        };
+        let image = format!("sha256:{}", "a".repeat(64));
+        let reservation = registry
+            .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
+            .await
+            .unwrap();
+        let observation = freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+            daemon_id: DockerDaemonId::new(),
+        };
+        let expected = registry
+            .record_initial_observation(reservation, observation.clone())
+            .await
+            .unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute_batch("ALTER TABLE provider_input_preparations DROP COLUMN provider; UPDATE installation SET schema_version=8;").unwrap();
+        drop(conn);
+        drop(registry);
+        let restored = Registry::open(&root, None).unwrap();
+        let reservation = restored
+            .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            restored
+                .record_initial_observation(reservation, observation)
+                .await
+                .unwrap(),
+            expected
+        );
+        let mut changed = request;
+        changed.provider = "codex".into();
+        assert!(
+            matches!(
+                restored
+                    .reserve_initial_inputs(changed, image, binary)
+                    .await,
+                Err(RegistryError::RequestConflict)
+            ),
+            "legacy OpenCode reservations retain exact provider identity on reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_ordinary_initial_reservation_preserves_provider_identity() {
+        for provider in ["codex", "claude", "amplifier"] {
+            let dir = tempfile::tempdir().unwrap();
+            let binary = dir.path().join("synthetic-host");
+            std::fs::write(&binary, "synthetic artifact").unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let request = freshell_runtime_protocol::ReserveProviderInputsRequest {
+                expected_control_epoch: Some(registry.control_epoch()),
+                soul_id: soul.clone(),
+                provider: provider.into(),
+                creation_seed_ref: "seed".into(),
+            };
+            let image = format!("sha256:{}", "a".repeat(64));
+            let reserved = registry
+                .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
+                .await
+                .expect("ordinary selected inputs require their own provider's creation authority");
+            let retry = registry
+                .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
+                .await
+                .unwrap();
+            assert_eq!(reserved.id, retry.id);
+            let mut foreign = request.clone();
+            foreign.provider = "opencode".into();
+            assert!(matches!(
+                registry
+                    .reserve_initial_inputs(foreign, image, binary)
+                    .await,
+                Err(RegistryError::RequestConflict)
+            ));
+            let receipt = registry
+                .record_initial_observation(
+                    reserved,
+                    freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+                        daemon_id: DockerDaemonId::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.provider, provider);
+            let mut launch = prep(soul.clone(), RequestId::new(), "ordinary-reserved-inputs");
+            launch.provider = provider.into();
+            // Reservation binding protects actual workload preparation, regardless
+            // of which finite provider's selected ordinary resources it owns.
+            launch.terminal = Some(serde_json::from_value(serde_json::json!({
+                "terminalId":"synthetic-terminal", "streamId":"synthetic-stream", "projectKey":"test-project", "mode":provider,
+                "program":provider,"args":[],"env":{}, "cwd":"/synthetic/workspace",
+                "workspacePath":"/synthetic/workspace","cols":80,"rows":24,"runAsUid":65534,"runAsGid":0,
+                "providerLaunchContext": {
+                    "preparation":match provider {
+                        "codex" => serde_json::json!({"codex":{"tui_args":[],"sidecar_args":[]}}),
+                        "claude" => serde_json::json!({"claude":{"mcp_args":[]}}),
+                        "amplifier" => serde_json::json!({"amplifier":{"bundle":"default","resume_args":[]}}),
+                        _ => unreachable!(),
+                    },
+                    "mcpCapability":{"grantId":"grant-ordinary", "endpoint":"http://host.docker.internal:3001/api/mcp", "providerRelativePath":".freshell/mcp-capability.json"},
+                    "preparedInputs":{"generationId":"grant-ordinary", "initialAuthReservation":receipt.reservation_id,
+                        "manifest":{"relativePath":".freshell/input-manifest.json","sha256":"a".repeat(64),"sourceCount":0,"aliasCount":0,"recipeCount":0}}
+                }
+            })).unwrap());
+            let mut wrong = launch.clone();
+            wrong.provider = "opencode".into();
+            let workload = wrong.terminal.as_mut().unwrap();
+            workload.mode = "opencode".into();
+            workload
+                .provider_launch_context
+                .as_mut()
+                .unwrap()
+                .preparation = freshell_runtime_protocol::ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            };
+            let wrong_result = registry.prepare_launch(wrong).await;
+            assert!(
+                matches!(wrong_result, Err(RegistryError::RequestConflict)),
+                "foreign provider bind outcome: {wrong_result:?}"
+            );
+            let prepared = registry.prepare_launch(launch.clone()).await.unwrap();
+            assert_eq!(
+                registry
+                    .prepare_launch(launch)
+                    .await
+                    .unwrap()
+                    .incarnation_id,
+                prepared.incarnation_id
+            );
+            let bound = registry
+                .bound_input_reservation(prepared.incarnation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(bound.reservation.soul_id, soul);
+            assert!(registry
+                .initial_input_reservation(soul, receipt.reservation_id)
+                .await
+                .unwrap()
+                .is_none());
         }
     }
 

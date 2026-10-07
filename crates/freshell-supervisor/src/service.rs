@@ -692,7 +692,8 @@ impl Supervisor {
             .await
             .map_err(map_registry)?
         {
-            if reservation.image_ref != self.config.image_ref
+            if reservation.provider != "opencode"
+                || reservation.image_ref != self.config.image_ref
                 || reservation.binary != self.config.host_binary_path
             {
                 return Err(denied());

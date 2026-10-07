@@ -13,6 +13,69 @@ use std::{
 struct AuthBackend(AtomicUsize);
 
 #[tokio::test]
+async fn provider_ordinary_initial_reservation_cannot_authorize_opencode_auth_lookup() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = temp.path().join("synthetic-host");
+    std::fs::write(&binary, "synthetic helper artifact").unwrap();
+    let registry = Registry::open(temp.path().join("registry"), None).unwrap();
+    let backend = Arc::new(AuthBackend(AtomicUsize::new(0)));
+    let secret = "synthetic-control-secret";
+    let supervisor = Supervisor::new(
+        registry,
+        backend.clone(),
+        SupervisorConfig {
+            runtime_root: temp.path().join("runtime"),
+            control_socket_path: temp.path().join("control.sock"),
+            host_binary_path: binary,
+            image_ref: format!("sha256:{}", "a".repeat(64)),
+            test_run_id: "ordinary-input-reservation".into(),
+            control_secret: secret.into(),
+            lifecycle_log: temp.path().join("lifecycle.jsonl"),
+            admission: crate::admission::AdmissionPolicy::default(),
+        },
+    )
+    .unwrap();
+    let soul = SoulId::new();
+    let mut envelope = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::ReserveProviderInputs(ReserveProviderInputsRequest {
+            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            soul_id: soul.clone(),
+            provider: "codex".into(),
+            creation_seed_ref: "synthetic-creation-seed".into(),
+        }),
+    );
+    envelope.auth = Some(secret.into());
+    let AdminResult::ProviderInputReservation(receipt) =
+        supervisor.dispatch(envelope).await.result.unwrap()
+    else {
+        panic!("unexpected reservation reply")
+    };
+    assert_eq!(receipt.provider, "codex");
+    let mut lookup = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::NativeAuthLookup(NativeAuthLookupRequest {
+            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            soul_id: soul,
+            attempt_authority: receipt.reservation_id,
+            keys: vec!["PATH_INPUT".into()],
+        }),
+    );
+    lookup.auth = Some(secret.into());
+    assert_eq!(
+        supervisor.dispatch(lookup).await.result.unwrap_err().code,
+        RuntimeErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        backend.0.load(Ordering::SeqCst),
+        1,
+        "ordinary creation authority must not perform or claim OpenCode auth lookup"
+    );
+}
+
+#[tokio::test]
 async fn provider_initial_auth_requires_creation_reservation_before_absence_receipt() {
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("synthetic-host");
