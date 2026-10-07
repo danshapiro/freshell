@@ -3,6 +3,17 @@ use super::ordinary_stage::{prepare_selected, Preparation};
 use freshell_platform::claude_inputs::{ClaudeInputManifest, ClaudeSettingSource};
 use std::path::{Path, PathBuf};
 
+const RESOURCE_DIRECTORIES: &[&str] = &[
+    "skills",
+    "commands",
+    "agents",
+    "hooks",
+    "plugins",
+    "output-styles",
+    "workflows",
+    "routines",
+];
+
 pub(super) fn prepare(
     home: &Path,
     cwd: &Path,
@@ -60,15 +71,10 @@ pub(super) fn prepare(
     if user_enabled && optional(&user_settings)? {
         configurations.push((user_settings.clone(), canonical(&user_settings)?));
     }
-    for relative in [
-        "CLAUDE.md",
-        "rules",
-        "skills",
-        "commands",
-        "agents",
-        "hooks",
-        "plugins",
-    ] {
+    for relative in ["CLAUDE.md", "rules"]
+        .into_iter()
+        .chain(RESOURCE_DIRECTORIES.iter().copied())
+    {
         if !user_enabled {
             continue;
         }
@@ -103,11 +109,6 @@ pub(super) fn prepare(
             (local_enabled, "CLAUDE.local.md"),
             (project_enabled, ".claude/CLAUDE.md"),
             (project_enabled, ".claude/rules"),
-            (project_enabled, ".claude/skills"),
-            (project_enabled, ".claude/commands"),
-            (project_enabled, ".claude/agents"),
-            (project_enabled, ".claude/hooks"),
-            (project_enabled, ".claude/plugins"),
         ] {
             if !enabled {
                 continue;
@@ -121,6 +122,16 @@ pub(super) fn prepare(
                     memory.push(logical.clone());
                 }
                 resources.push(logical);
+            }
+        }
+    }
+    if project_enabled {
+        for base in project_resource_bases(&manifest)? {
+            for relative in RESOURCE_DIRECTORIES {
+                let logical = base.join(".claude").join(relative);
+                if optional(&logical)? {
+                    resources.push(logical);
+                }
             }
         }
     }
@@ -143,6 +154,35 @@ pub(super) fn prepare(
         resources,
         |path| manifest.runtime_path(path),
     )
+}
+
+// The native Markdown resource loader searches upward only until HOME or the
+// nearest Git root. Memory has its own root-to-cwd search and must not share
+// this stopping rule. Startup cwd is the same accepted cwd for these loaders.
+fn project_resource_bases(manifest: &ClaudeInputManifest) -> Result<Vec<PathBuf>, String> {
+    let mut bases = Vec::new();
+    for base in manifest.cwd.ancestors() {
+        if base == manifest.original_home {
+            break;
+        }
+        bases.push(base.to_path_buf());
+        match std::fs::metadata(base.join(".git")) {
+            Ok(metadata) if metadata.is_dir() || metadata.is_file() => break,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Claude project resource discovery {} metadata failed: {error}",
+                    base.display()
+                ))
+            }
+        }
+    }
+    Ok(bases)
 }
 
 // Only append Freshell's two shipped hook groups. Native settings merging,
@@ -244,6 +284,101 @@ mod tests {
         claude_inputs::ClaudeSettingSource,
         provider_environment::{copy_environment, CopyLimits},
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_project_resources_stop_at_git_and_home_without_losing_memory() {
+        for git_boundary in [true, false] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let boundary = if git_boundary {
+                home.join("project")
+            } else {
+                home.clone()
+            };
+            let cwd = boundary.join("nested");
+            let commands = cwd.join(".claude/commands");
+            std::fs::create_dir_all(commands.join("node_modules/probe-dependency")).unwrap();
+            if git_boundary {
+                std::fs::create_dir(boundary.join(".git")).unwrap();
+            }
+            let unselected = if git_boundary {
+                home.clone()
+            } else {
+                boundary.clone()
+            };
+            std::fs::create_dir_all(unselected.join(".claude")).unwrap();
+            std::os::unix::fs::symlink(
+                "missing-unselected-commands",
+                unselected.join(".claude/commands"),
+            )
+            .unwrap();
+            std::fs::write(commands.join("resource"), "selected-command-resource").unwrap();
+            std::fs::write(
+                commands.join("node_modules/probe-dependency/index.js"),
+                "module.exports='selected-installed-dependency'",
+            )
+            .unwrap();
+            std::fs::write(commands.join("run.cjs"), "process.stdout.write(require('node:fs').readFileSync(__dirname+'/resource','utf8')+':'+require('probe-dependency'))").unwrap();
+            let ancestor_memory = unselected.join("CLAUDE.md");
+            std::fs::write(&ancestor_memory, "@./memory-resource.md\n").unwrap();
+            std::fs::write(
+                unselected.join("memory-resource.md"),
+                "separate-memory-resource",
+            )
+            .unwrap();
+            let manifest = ClaudeInputManifest {
+                version: 1,
+                original_home: home.clone(),
+                cwd: cwd.clone(),
+                workspace: cwd.clone(),
+                config_root: None,
+                settings_file: None,
+                settings_origin: None,
+                inline_settings_sha256: None,
+                setting_sources: vec![ClaudeSettingSource::Project],
+                plugin_dirs: vec![],
+            };
+            let selected = prepare(&home, &cwd, &cwd, Some(&manifest), &[])
+                .expect("native-unselected command roots must not block preparation");
+            let stage = owned.path().join("stage");
+            copy_environment(&selected.selections, &stage, &[], CopyLimits::default()).unwrap();
+            let mount = selected
+                .mounts
+                .iter()
+                .find(|mount| Path::new(&mount.logical_destination) == commands)
+                .unwrap();
+            let output = std::process::Command::new("node")
+                .arg(stage.join(&mount.stage_relative_path).join("run.cjs"))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout,
+                b"selected-command-resource:selected-installed-dependency"
+            );
+            let imported = selected
+                .mounts
+                .iter()
+                .find(|mount| {
+                    Path::new(&mount.logical_destination)
+                        == manifest.runtime_path(&unselected.join("memory-resource.md"))
+                })
+                .expect("the resource boundary must not truncate eager memory imports");
+            assert_eq!(
+                std::fs::read(stage.join(&imported.stage_relative_path)).unwrap(),
+                b"separate-memory-resource"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&ancestor_memory).unwrap(),
+                "@./memory-resource.md\n"
+            );
+            assert_eq!(
+                std::fs::read_link(unselected.join(".claude/commands")).unwrap(),
+                Path::new("missing-unselected-commands")
+            );
+        }
+    }
 
     #[test]
     fn managed_provider_claude_selected_user_rules_keep_external_imports() {

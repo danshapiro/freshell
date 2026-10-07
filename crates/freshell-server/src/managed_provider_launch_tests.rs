@@ -1280,6 +1280,47 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     std::fs::remove_file(&receipt).unwrap();
     std::fs::remove_file(&instructions_receipt).unwrap();
     std::fs::remove_file(&instructions_events).unwrap();
+    // Native project command discovery stops at this repository root. A
+    // dangling ancestor command root is deliberately outside that selection.
+    std::fs::create_dir_all(fixture.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(
+        "missing-unselected-command-root",
+        fixture.join(".claude/commands"),
+    )
+    .unwrap();
+    let project_commands = workspace.join(".claude/commands");
+    std::fs::create_dir_all(project_commands.join("scripts/node_modules/probe-dependency"))
+        .unwrap();
+    std::fs::write(project_commands.join("closed-project-command.md"), "---\ndescription: selected project command transport\n---\nUse the adjacent synthetic resources.\n").unwrap();
+    std::fs::write(
+        project_commands.join("scripts/resource"),
+        "closed-project-command-resource",
+    )
+    .unwrap();
+    std::fs::write(
+        project_commands.join("scripts/node_modules/probe-dependency/index.js"),
+        "module.exports='closed-project-command-dependency'",
+    )
+    .unwrap();
+    std::fs::write(
+        project_commands.join("scripts/run"),
+        "#!/bin/sh\ncat \"$(dirname \"$0\")/resource\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        project_commands.join("scripts/run"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let project_receipt = workspace.join("claude-project-command-consumed.json");
+    std::fs::write(project_commands.join("scripts/consume.cjs"), "const fs=require('node:fs'),crypto=require('node:crypto');const hash=v=>crypto.createHash('sha256').update(v).digest('hex');fs.writeFileSync(process.argv[2],JSON.stringify({resource:hash(require('node:child_process').execFileSync(__dirname+'/run')),dependency:hash(require('probe-dependency'))}));").unwrap();
+    let mut project_settings: Value = serde_json::from_str(settings).unwrap();
+    project_settings["hooks"] = json!({"SessionStart":[{"hooks":[{"type":"command","command":format!("node {} {}",serde_json::to_string(project_commands.join("scripts/consume.cjs").to_str().unwrap()).unwrap(),serde_json::to_string(project_receipt.to_str().unwrap()).unwrap()),"timeout":10}]}]});
+    std::fs::write(
+        workspace.join(".claude/settings.json"),
+        serde_json::to_vec(&project_settings).unwrap(),
+    )
+    .unwrap();
     let (broadcast, _) = tokio::sync::broadcast::channel(256);
     let mut events = broadcast.subscribe();
     std::env::set_var("HOME", &home);
@@ -1322,6 +1363,11 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         json!({"nativeImport":true,"digest":hash(&imported_bytes)})
     );
     imported_graph(&instructions_events, &expected_imports).await;
+    assert_eq!(consumed(&project_receipt).await.expect("native selected project command hook must execute its complete resource and installed dependency"), json!({"resource":hash(b"closed-project-command-resource"),"dependency":hash(b"closed-project-command-dependency")}));
+    assert_eq!(
+        std::fs::read_link(fixture.join(".claude/commands")).unwrap(),
+        Path::new("missing-unselected-command-root")
+    );
     println!(
         "provider_launch_consumer {}",
         json!({"provider":"claude","route":"fresh","digest":qualified_digest})
@@ -1334,11 +1380,99 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         std::fs::read_to_string(plugin.join("scripts/consume.cjs")).unwrap(),
         consumer
     );
+    let catalog_project = fixture.join("catalog-project");
+    let catalog_home = fixture.join("catalog-home");
+    std::fs::create_dir_all(catalog_project.join(".git")).unwrap();
+    std::fs::create_dir_all(&catalog_home).unwrap();
     for view in client.inventory().await.unwrap() {
         if view.desired_state == DesiredState::Running {
+            let handle = registry
+                .active_handle_for_soul(view.soul_id.clone())
+                .await
+                .unwrap();
+            let inputs = handle
+                .fresh_agent()
+                .unwrap()
+                .provider_launch_context
+                .as_ref()
+                .unwrap()
+                .prepared_inputs
+                .as_ref()
+                .unwrap();
+            let commands = inputs.resource_mounts.iter().find(|mount| Path::new(&mount.logical_destination) == project_commands).expect("accepted native project command root must be present in the complete preparation");
+            // The hosted SDK intentionally defers publishing its prefetched
+            // catalog until system/init. With no model turn, consume the real
+            // native supportedCommands API separately over this accepted copy.
+            // Stop the hosted process first to avoid overlapping native workers.
+            freshell_platform::provider_environment::copy_environment(
+                &[freshell_platform::provider_environment::CopySelection {
+                    source: control
+                        .join("provider-roots")
+                        .join(&inputs.generation_id)
+                        .join(&commands.stage_relative_path),
+                    destination_relative: ".claude/commands".into(),
+                }],
+                &catalog_project,
+                &[],
+                freshell_platform::provider_environment::CopyLimits::default(),
+            )
+            .unwrap();
             client.stop(view.soul_id).await.unwrap();
         }
     }
+    let catalog_script = fixture.join("catalog-probe.mjs");
+    std::fs::write(&catalog_script, r#"import {query} from '/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs';
+const abort = new AbortController();
+async function* emptyPrompt() { await new Promise(resolve => abort.signal.addEventListener('abort', resolve, {once:true})); }
+let q;
+try {
+ q=query({prompt:emptyPrompt(),options:{abortController:abort,cwd:process.argv[2],settingSources:['project'],env:{PATH:process.env.PATH,TMPDIR:process.env.TMPDIR,HOME:process.argv[3],CLAUDE_CONFIG_DIR:process.argv[3]+'/.claude',ANTHROPIC_API_KEY:'synthetic-catalog-only',ANTHROPIC_BASE_URL:'http://127.0.0.1:9'}}});
+ const commands=await q.supportedCommands();process.stdout.write(JSON.stringify({selected:commands.some(command=>command.name==='closed-project-command')}));
+} catch(error) {
+ const message=String(error?.message||'');
+ const classes=['EROFS','EACCES','ENOENT','Native CLI binary','spawn node','process exited','AbortError'].filter(value=>message.includes(value));
+ process.stdout.write(JSON.stringify({failed:true,classes}));process.exitCode=1;
+} finally { q?.close();abort.abort(); }
+"#).unwrap();
+    let catalog_output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new("node")
+            .kill_on_drop(true)
+            .arg(&catalog_script)
+            .arg(&catalog_project)
+            .arg(&catalog_home)
+            .output(),
+    )
+    .await
+    .expect("owned model-free native catalog probe deadline")
+    .unwrap();
+    if !catalog_output.status.success() {
+        let stderr = String::from_utf8_lossy(&catalog_output.stderr);
+        let probe = serde_json::from_slice::<Value>(&catalog_output.stdout).ok();
+        let classes: Vec<_> = [
+            "ERR_MODULE_NOT_FOUND",
+            "EACCES",
+            "ENOENT",
+            "AbortError",
+            "close is not a function",
+            "uv_thread_create",
+            "SIGABRT",
+            "Claude Code process exited",
+            "Unexpected token",
+        ]
+        .into_iter()
+        .filter(|class| stderr.contains(class))
+        .collect();
+        println!(
+            "provider_catalog_diagnostic {}",
+            json!({"code":catalog_output.status.code(),"stderrBytes":catalog_output.stderr.len(),"stdoutBytes":catalog_output.stdout.len(),"classes":classes,"caughtClasses":probe.as_ref().and_then(|value|value.get("classes")),"selectedWritten":catalog_output.stdout.windows(b"\"selected\":true".len()).any(|bytes|bytes==b"\"selected\":true")})
+        );
+    }
+    assert!(
+        catalog_output.status.success(),
+        "genuine SDK catalog probe must complete without a model turn"
+    );
+    assert_eq!(serde_json::from_slice::<Value>(&catalog_output.stdout).unwrap(), json!({"selected":true}), "the genuine default SDK must discover the selected project command through native bounded directory search");
     assert!(instruction_events(&instructions_events)
         .iter()
         .all(|event| event["ignored"] != json!(true)));
