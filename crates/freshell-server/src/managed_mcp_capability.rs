@@ -28,12 +28,14 @@ const CAPABILITY_PATH: &str = ".freshell/mcp-capability.json";
 const GRANT_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 const RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 mod amplifier_resources;
-mod codex_stage;
+mod claude_stage;
+mod ordinary_stage;
 mod source_stage;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct OpencodeEphemeralInput<'a> {
     pub codex_manifest: Option<&'a freshell_platform::codex_inputs::CodexInputManifest>,
+    pub claude_manifest: Option<&'a freshell_platform::claude_inputs::ClaudeInputManifest>,
     pub inline_config: Option<&'a str>,
     pub tui_config_path: Option<&'a str>,
     pub tui_source: Option<&'a ProviderConfigReference>,
@@ -1255,16 +1257,29 @@ fn stage_provider_root(
             .map_err(|_| "prepared resource descriptor exceeds control profile")?;
             write_private_bytes(&temporary.join(".freshell/resource-mounts.json"), &metadata)?;
         }
-        let codex_resources = if provider == "codex" && opencode_input.launch_context.is_some() {
-            Some(codex_stage::prepare(
-                home,
-                opencode_input.cwd.unwrap_or(home),
-                opencode_input.codex_manifest,
-            )?)
-        } else {
-            None
-        };
-        if let Some(resources) = &codex_resources {
+        let ordinary_resources =
+            if opencode_input.launch_context.is_some() && matches!(provider, "codex" | "claude") {
+                Some(if provider == "claude" {
+                    claude_stage::prepare(
+                        home,
+                        opencode_input.cwd.unwrap_or(home),
+                        opencode_input
+                            .workspace
+                            .or(opencode_input.cwd)
+                            .unwrap_or(home),
+                        opencode_input.claude_manifest,
+                    )?
+                } else {
+                    ordinary_stage::prepare(
+                        home,
+                        opencode_input.cwd.unwrap_or(home),
+                        opencode_input.codex_manifest,
+                    )?
+                })
+            } else {
+                None
+            };
+        if let Some(resources) = &ordinary_resources {
             selections.extend(resources.selections.iter().cloned());
         }
         let amplifier_resources = if provider == "amplifier" {
@@ -1280,7 +1295,7 @@ fn stage_provider_root(
             selections.extend(resources.selections.iter().cloned());
         }
         for reference in references {
-            if codex_resources.is_some() {
+            if ordinary_resources.is_some() {
                 continue;
             }
             if reference.root != ProviderConfigRoot::UserProvider {
@@ -1416,14 +1431,14 @@ fn stage_provider_root(
                 opencode_input,
             )?;
         }
-        if let Some(resources) = &codex_resources {
+        if let Some(resources) = &ordinary_resources {
             let capability = McpCapabilityReference {
                 grant_id: grant_id.into(),
                 endpoint: "http://host.docker.internal:1".into(),
                 provider_relative_path: CAPABILITY_PATH.into(),
                 host_gateway_address: None,
             };
-            let inputs = codex_stage::publish(
+            let inputs = ordinary_stage::publish(
                 &temporary,
                 resources,
                 &capability,
@@ -1435,7 +1450,7 @@ fn stage_provider_root(
                     &inputs,
                     freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
                 )
-                .map_err(|_| "Codex prepared context exceeds control profile")?,
+                .map_err(|_| "ordinary prepared context exceeds control profile")?,
             )?;
         }
         allow_controller_stage_read(&temporary)?;
@@ -2913,6 +2928,106 @@ except Exception as error:
             );
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_complete_stage_carries_project_resources_and_dependencies() {
+        use freshell_runtime_protocol::{
+            PreparedProviderInputs, ProviderLaunchContext, ProviderPreparation,
+        };
+        let control = tempfile::tempdir().unwrap();
+        let capabilities = control.path().join("capabilities");
+        std::fs::create_dir(&capabilities).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let skill = workspace.path().join(".claude/skills/probe");
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::create_dir_all(skill.join("node_modules/local-dependency")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"env":{"CLAUDE_SELECTED_NONCE":"settings-input"}}"#,
+        )
+        .unwrap();
+        std::fs::write(home.path().join(".claude/CLAUDE.md"), "global-memory-input").unwrap();
+        std::fs::write(skill.join("resource"), "adjacent-resource").unwrap();
+        std::fs::write(
+            skill.join("node_modules/local-dependency/index.js"),
+            "module.exports='installed-dependency'",
+        )
+        .unwrap();
+        std::fs::write(
+            skill.join("probe.mjs"),
+            r#"
+import {readFileSync} from 'node:fs';
+import dep from 'local-dependency';
+process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+':'+dep);
+"#,
+        )
+        .unwrap();
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+            mcp_capability: None,
+            config: vec![],
+            prepared_inputs: None,
+        };
+        let stage = stage_provider_root(
+            &capabilities,
+            "grant-claude-complete",
+            "claude",
+            home.path(),
+            &[],
+            OpencodeEphemeralInput {
+                cwd: Some(workspace.path()),
+                workspace: Some(workspace.path()),
+                launch_context: Some(&context),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let inputs: PreparedProviderInputs = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/prepared-inputs.json"))
+                .expect("complete Claude source context must be published"),
+        )
+        .unwrap();
+        let mount = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| {
+                mount.logical_destination
+                    == workspace.path().join(".claude/skills").to_str().unwrap()
+            })
+            .expect("project skills must be selected as a complete resource unit");
+        let consumed = std::process::Command::new("node")
+            .arg(
+                stage
+                    .join(&mount.stage_relative_path)
+                    .join("probe/probe.mjs"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            consumed.status.success(),
+            "transported project skill must load its installed dependency"
+        );
+        assert_eq!(consumed.stdout, b"adjacent-resource:installed-dependency");
+        assert!(
+            inputs
+                .resource_mounts
+                .iter()
+                .any(|mount| mount.logical_destination
+                    == home.path().join(".claude/CLAUDE.md").to_str().unwrap()),
+            "global memory remains selected"
+        );
+        assert!(
+            inputs
+                .config_binds
+                .iter()
+                .any(|bind| bind.logical_destination
+                    == home.path().join(".claude/settings.json").to_str().unwrap()),
+            "global settings retain declaring origin"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn native_state_aliases_are_excluded_without_filtering_dependency_basenames() {

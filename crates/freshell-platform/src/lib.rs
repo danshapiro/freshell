@@ -51,6 +51,7 @@
 //! injected source ([`Env`], [`FileProbe`], [`path::WslPathResolver`]). Thin `*_live`
 //! wrappers at the edges perform the real reads and delegate to the pure core.
 
+pub mod claude_inputs;
 pub mod cli_launch;
 pub mod clock;
 pub mod codex_inputs;
