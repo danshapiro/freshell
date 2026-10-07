@@ -431,6 +431,27 @@ describe('owned web process lifetime (Node process fixture only)', () => {
     })
     return { fixture, entry, home, setup }
   }
+  it.each([
+    { grep: 'P3-G10: pending native approval survives exact provider resurrection', permission: 'ask', delay: '7000' },
+    { grep: 'imports only the selected synthetic conversation and reopens under its native ID', permission: null, delay: null },
+  ])('launches the selected $grep with its existing fixed web preset', async ({ grep, permission, delay }) => {
+    const { fixture: directory, entry, setup } = await fixture()
+    await fsp.writeFile(entry, `require('node:http').createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({runtime:'rust',commit:'${'a'.repeat(40)}',buildDirty:false,permission:process.env.FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION??null,delay:process.env.FRESHELL_MANAGED_RECOVERY_TEST_DELAY_MS??null}))}).listen(Number(process.env.PORT),'127.0.0.1')`)
+    vi.stubEnv('FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION', undefined)
+    vi.stubEnv('FRESHELL_MANAGED_RECOVERY_TEST_DELAY_MS', undefined)
+    const factory = runner.createExternalManagedWebFactory({ spec: 'test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts', grep },
+      { FRESHELL_RUNTIME_PHASE3_LIVE: '1', FRESHELL_RUNTIME_SYNTHETIC_RESUME: '1' }, options => new runner.ManagedRuntimeWebServer(options))
+    const server = factory({ binary: process.execPath, repoRoot: process.cwd(), candidateSha: 'a'.repeat(40), buildDirty: false,
+      setupHome: setup, preserveHomeOnStop: false, env: { NODE_OPTIONS: `--require=${entry}` } })
+    let pid: number | undefined
+    try {
+      const info = await server.start()
+      pid = info.pid
+      expect(await (await fetch(`${info.baseUrl}/api/server-info`, { headers: { 'x-auth-token': info.token } })).json()).toMatchObject({ permission, delay })
+      await server.stop()
+      await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
+    } finally { await server.stop(); vi.unstubAllEnvs(); await fsp.rm(directory, { recursive: true }) }
+  })
   it('retains stopped owned output and records structured failure facts without credentials or bodies', async () => {
     const { fixture: directory, entry, setup } = await fixture()
     const line = { level: 'WARN', fields: { message: 'fresh_agent.hosted_snapshot_unavailable',

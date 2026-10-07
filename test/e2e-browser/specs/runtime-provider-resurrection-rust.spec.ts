@@ -9,7 +9,6 @@ import { expect, type Page } from '@playwright/test'
 
 import { test } from '../helpers/fixtures.js'
 import {
-  ManagedRuntimeBrowserRig,
   createManagedRuntimeBrowserRig,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
@@ -78,7 +77,7 @@ function waitForModeLeaf(
 }
 
 function waitForRunningView(
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   terminalId: string,
   predicate: (view: ManagedRuntimeView) => boolean,
   timeoutMs: number,
@@ -121,7 +120,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
     // lane; the step budgets below remain the correctness guards for this model.
     test.setTimeout(2_400_000)
 
-    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {
+    const rig = createManagedRuntimeBrowserRig(process.cwd(), 3, {
       FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION: 'ask',
       // Debug-only, bounded delay makes the input fence observable without
       // changing release timing or recovery semantics.

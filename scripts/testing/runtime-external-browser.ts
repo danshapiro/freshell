@@ -1594,6 +1594,22 @@ function selectsSyntheticSource(selection: ExternalBrowserSelection, environment
     && (!selection.grep || new RegExp(selection.grep).test(title))
 }
 
+function selectsPhase3Approval(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv): boolean {
+  const title = 'Phase 3 provider resurrection › P3-G10: pending native approval survives exact provider resurrection'
+  return path.basename(selection.spec) === 'runtime-provider-resurrection-rust.spec.ts'
+    && environment.FRESHELL_RUNTIME_PHASE3_LIVE === '1'
+    && (!selection.grep || new RegExp(selection.grep).test(title))
+}
+
+/** Preserve the existing fixed permission and observable-recovery preset on the owned web. */
+export function createExternalManagedWebFactory(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv,
+  webFactory: RuntimeWebFactory): RuntimeWebFactory {
+  const preset: Record<string, string> = selectsPhase3Approval(selection, environment) ? {
+    FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION: 'ask', FRESHELL_MANAGED_RECOVERY_TEST_DELAY_MS: '7000',
+  } : {}
+  return options => webFactory({ ...options, env: { ...options.env, ...preset } })
+}
+
 /** One owner registration for the selected browser case, with its existing fixed presets. */
 export function createExternalManagedRuntimeOwner(root: string, selection: ExternalBrowserSelection,
   environment: NodeJS.ProcessEnv, webFactory: RuntimeWebFactory, retainedArtifacts = false): ManagedRuntimeOwner {
@@ -1608,8 +1624,8 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
       : path.basename(selection.spec).includes('rehydrate') ? 4
         : /chaos|lost-soul/.test(selection.spec) ? 5 : 2
   const supervisorEnv: Record<string, string> = fixture ? { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '250' } : {}
-  return new ManagedRuntimeOwner(webFactory, root, phase,
-    {}, supervisorEnv, deterministic || sourceSelection ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
+  return new ManagedRuntimeOwner(createExternalManagedWebFactory(selection, environment, webFactory), root, phase,
+    {}, supervisorEnv, deterministic || sourceSelection || selectsPhase3Approval(selection, environment) ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
       fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
       bootstrapProviders: deterministic || retainedArtifacts ? [] : sourceSelection ? ['opencode']
         : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
