@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { execFileSync, spawnSync, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawnSync, spawn, type ChildProcess } from 'node:child_process'
 import { pipeline } from 'node:stream/promises'
 import fs from 'node:fs'
 import net from 'node:net'
@@ -2215,6 +2215,7 @@ export class ManagedRuntimeOwner {
   private stopSettlement?: Promise<{ ok: boolean; errors: string[] }>
   private readonly heldHosts = new Map<string, { handle: ExactRuntimeHandle; pid: number }>()
   private readonly nativeChallenges = new Map<string, { soulId: string; nativeSessionId: string; marker: string }>()
+  private readonly providerProbes = new Map<string, { child?: ChildProcess; settlement: Promise<string> }>()
 
   constructor(
     private readonly webFactory: RuntimeWebFactory,
@@ -2427,6 +2428,13 @@ export class ManagedRuntimeOwner {
 
   private async stopWebAndReleaseHeldHosts(): Promise<void> {
     const errors: unknown[] = []
+    const probes = [...this.providerProbes.values()]
+    for (const probe of probes) {
+      if (probe.child && probe.child.exitCode === null && probe.child.signalCode === null) {
+        try { probe.child.kill('SIGKILL') } catch (error) { errors.push(error) }
+      }
+    }
+    await Promise.allSettled(probes.map(probe => probe.settlement))
     for (const { handle } of this.heldHosts.values()) {
       try { await this.releaseRuntimeHost(handle) }
       catch (error) {
@@ -2635,12 +2643,39 @@ export class ManagedRuntimeOwner {
   }
 
   async ownedProviderExec(containerId: string, args: string[]): Promise<string> {
-    // docker exec starts a fresh process and does not inherit the managed PTY's HOME.
-    return this.runtime.execOwnedContainerAsExact(containerId, '65534:0', [
-      'env',
-      'HOME=/home/freshell/provider',
-      ...args,
-    ])
+    if (!this.runtime.broker.receiptIds().has(containerId)
+      && !this.runtime.transferOwnedIds().containers.includes(containerId)) throw new Error('exact owned provider probe container required')
+    const probeId = randomUUID()
+    let resolve!: (output: string) => void
+    let reject!: (error: Error) => void
+    const settlement = new Promise<string>((yes, no) => { resolve = yes; reject = no })
+    const record: { child?: ChildProcess; settlement: Promise<string> } = { settlement }
+    // Track before creation: outer cancellation can settle a probe even when
+    // its browser reply disappears. Removing the owned runtime removes its
+    // container-side exec; this child owns only the Docker transport process.
+    this.providerProbes.set(probeId, record)
+    try {
+      this.runtime.recordLifecycle('external.provider_probe_started', { severity: 'info', probeId, containerId })
+      record.child = execFile('docker', ['exec', '--user', '65534:0', containerId,
+        'env', 'HOME=/home/freshell/provider', ...args], {
+        cwd: this.repoRoot, encoding: 'utf8', timeout: 120_000, maxBuffer: 32 * 1024 * 1024,
+      }, (error, stdout, stderr) => {
+        this.providerProbes.delete(probeId)
+        try {
+          this.runtime.recordLifecycle('external.provider_probe_settled', { severity: error ? 'warn' : 'info',
+            probeId, containerId, code: error?.code ?? 0, stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr) })
+        } catch (evidenceError) {
+          reject(new Error('owned provider probe settlement evidence failed', { cause: evidenceError }))
+          return
+        }
+        if (error) reject(new Error('owned provider probe failed or timed out', { cause: error }))
+        else resolve(stdout)
+      })
+    } catch (error) {
+      this.providerProbes.delete(probeId)
+      reject(error instanceof Error ? error : new Error('owned provider probe did not start'))
+    }
+    return settlement
   }
 
   /** Read the actual session-host adoption gate for this exact owned incarnation. */

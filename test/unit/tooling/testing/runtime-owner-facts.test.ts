@@ -7,6 +7,7 @@ import path from 'node:path'
 import { runTask2RetainedFixture } from '../../../../scripts/testing/task002-config-legacy-fixtures.js'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import * as retained from '../../../../scripts/testing/task002-retained-fixture.js'
+import { RestrictedDockerBroker } from '../../../../scripts/testing/runtime-test-broker.js'
 
 const handle = {
   runId: 'run-owned', candidateSha: 'a'.repeat(40), soulId: 'soul-owned',
@@ -119,6 +120,60 @@ function fixture() {
 }
 
 describe('exact owned runtime facts', () => {
+  it('keeps owner control responsive while an actual owned probe child is running', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-probe-child-'))
+    const command = path.join(root, 'docker')
+    await fsp.writeFile(command, `#!${process.execPath}\nsetTimeout(()=>process.stdout.write(JSON.stringify({requestIds:['actual-probe-result'],resultIds:['actual-probe-result'],replayCount:0})),150)\n`, { mode: 0o700 })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(root, 'unused.sock'), proxySocketPath: path.join(root, 'unused-proxy.sock'),
+      runtimeRootPrefix: root, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId, logPath: path.join(root, 'broker.jsonl') })
+    vi.spyOn(rig.runtime.broker, 'receiptIds').mockReturnValue(new Set([current.containerId]))
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.stubEnv('PATH', `${root}${path.delimiter}${process.env.PATH}`)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const challenge = await rig.registerNativeChallenge(current, 'chaos-approval')
+      let heartbeat = false
+      timer = setTimeout(() => { heartbeat = true }, 20)
+      const result = await rig.nativeToolEvidence(current, challenge.challengeId)
+      expect(result.requestIds).toEqual(['actual-probe-result'])
+      expect(heartbeat).toBe(true)
+    } finally {
+      clearTimeout(timer)
+      vi.unstubAllEnvs()
+      await fsp.rm(root, { recursive: true })
+    }
+  })
+  it('settles an in-flight owned probe and verifies its PID is absent during owner cleanup', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-probe-cancel-'))
+    const pidFile = path.join(root, 'probe.pid')
+    const command = path.join(root, 'docker')
+    await fsp.writeFile(command, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setInterval(()=>{},1000)\n`, { mode: 0o700 })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') })
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(root, 'unused.sock'), proxySocketPath: path.join(root, 'unused-proxy.sock'),
+      runtimeRootPrefix: root, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId, logPath: path.join(root, 'broker.jsonl') })
+    vi.spyOn(rig.runtime.broker, 'receiptIds').mockReturnValue(new Set([handle.containerId]))
+    const cleanup = vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    vi.spyOn(rig.runtime, 'writeArtifact').mockReturnValue('/owned/cleanup.json')
+    vi.stubEnv('PATH', `${root}${path.delimiter}${process.env.PATH}`)
+    let observedFailure = false
+    const probe = rig.ownedProviderExec(handle.containerId, ['node', '--version']).catch(() => { observedFailure = true })
+    let pid: number | undefined
+    try {
+      await vi.waitFor(async () => { pid = Number(await fsp.readFile(pidFile, 'utf8')); expect(pid).toBeGreaterThan(1) })
+      await expect(rig.stop()).resolves.toEqual({ ok: true, errors: [] })
+      await probe
+      expect(observedFailure).toBe(true)
+      await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
+      expect(cleanup).toHaveBeenCalledOnce()
+    } finally {
+      await rig.stop()
+      await probe
+      vi.unstubAllEnvs()
+      await fsp.rm(root, { recursive: true })
+    }
+  })
   it('reads challenge IDs from actual SQLite rows while retaining transcript bytes on the owner', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-fixed-native-probe-'))
     const file = path.join(root, 'opencode.db')
