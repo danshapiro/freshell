@@ -187,6 +187,137 @@ async fn create_failure_trace_launch_rejection() {
     assert!(!event.fields.contains_key("error"));
 }
 
+#[tokio::test]
+async fn kilroy_create_uses_claude_native_dependencies_without_changing_runtime_identity() {
+    if create_failure_trace_child("kilroy-family", "fresh_agent_proxy::tests::kilroy_create_uses_claude_native_dependencies_without_changing_runtime_identity") { return; }
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("kilroy-supervisor.sock");
+    let secret = root.path().join("control-secret");
+    std::fs::write(&secret, "0123456789abcdef").unwrap();
+    crate::managed_mcp_capability::configure("0.0.0.0", 39482, &socket, &secret).unwrap();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(
+        home.join(".claude/settings.json"),
+        r#"{"permissions":{"deny":["Bash"]}}"#,
+    )
+    .unwrap();
+    let selected_environment = root.path().join("owned-provider.env");
+    std::fs::write(
+        &selected_environment,
+        "CLAUDE_CODE_OAUTH_TOKEN=owned-test-reference\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &selected_environment,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    std::env::set_var(
+        "FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE",
+        &selected_environment,
+    );
+    let listener = UnixListener::bind(&socket).unwrap();
+    let supervisor = tokio::spawn(async move {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health if index == 0 => Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+                AdminCommand::Launch(launch) if index == 1 => {
+                    assert_eq!(launch.provider, "kilroy");
+                    assert_eq!(
+                        launch.soul_id,
+                        stable_soul_id("kilroy", "owned-kilroy-create").unwrap()
+                    );
+                    let fresh = launch.fresh_agent.unwrap();
+                    assert_eq!(fresh.provider, FreshProvider::Kilroy);
+                    assert_eq!(fresh.session_type, "kilroy");
+                    assert_eq!(fresh.runtime_variant, "kilroy-claude-agent-sdk");
+                    assert_eq!(fresh.provider_secret_references.len(), 1);
+                    assert_eq!(
+                        fresh.provider_secret_references[0].source_path,
+                        selected_environment.to_string_lossy()
+                    );
+                    assert_eq!(
+                        fresh.provider_secret_references[0].profile,
+                        freshell_runtime_protocol::ProviderSecretProfile::ClaudeOnecliEnvironment
+                    );
+                    let context = fresh.provider_launch_context.unwrap();
+                    assert!(matches!(
+                        context.preparation,
+                        freshell_runtime_protocol::ProviderPreparation::Claude { .. }
+                    ));
+                    assert!(context.config.iter().any(|file| file.root
+                        == freshell_runtime_protocol::ProviderConfigRoot::UserProvider
+                        && file.relative_path == "settings.json"
+                        && file.provider_relative_path == ".claude/settings.json"));
+                    let capability = context.mcp_capability.unwrap();
+                    let directory =
+                        PathBuf::from(std::env::var_os("FRESHELL_RUNTIME_CAPABILITY_DIR").unwrap());
+                    let grant: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(directory.join(format!("{}.json", capability.grant_id)))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        grant["soulId"],
+                        stable_soul_id("kilroy", "owned-kilroy-create")
+                            .unwrap()
+                            .to_string()
+                    );
+                    let staged_settings: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(
+                            directory
+                                .parent()
+                                .unwrap()
+                                .join("provider-roots")
+                                .join(&capability.grant_id)
+                                .join("settings.json"),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        staged_settings["permissions"]["deny"],
+                        serde_json::json!(["Bash"])
+                    );
+                    Err(freshell_runtime_protocol::RuntimeError::new(
+                        RuntimeErrorCode::BackendUnavailable,
+                        "owned no-provider launch rejection",
+                    ))
+                }
+                other => panic!("unexpected Kilroy create request {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let proxy = snapshot_outage_proxy(&socket);
+    let message = serde_json::from_value(serde_json::json!({"requestId":"owned-kilroy-create", "provider":"claude", "sessionType":"kilroy", "cwd":root.path()})).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), proxy.create(message))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .expect("native-family Kilroy create must reach the typed Launch boundary")
+        .unwrap();
+}
+
 #[test]
 fn hosted_created_frame_uses_the_public_request_identity() {
     let (broadcast, mut receiver) = broadcast::channel(8);

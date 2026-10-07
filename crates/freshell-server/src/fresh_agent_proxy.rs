@@ -499,14 +499,14 @@ impl HostedFreshAgentProxy {
                 request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
         })?;
         let provider_secret_references =
-            crate::managed_provider_bootstrap::named_provider_onecli_references(provider.as_str())
+            crate::managed_provider_bootstrap::named_provider_onecli_references(provider.native_family())
                 .map_err(|_| {
                     tracing::warn!(event="fresh_agent.create.preparation_failed", reason="onecli_reference_unavailable",
                         request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
                 })?;
         let mcp_capability = crate::managed_mcp_capability::issue_mcp_capability(
             &soul,
-            provider.as_str(),
+            provider.native_family(),
             crate::managed_mcp_capability::OpencodeEphemeralInput {
                 cwd: Some(&cwd),
                 workspace: Some(&workspace),
@@ -519,7 +519,7 @@ impl HostedFreshAgentProxy {
         })?;
         let mut provider_launch_context =
             crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
-                provider.as_str(),
+                provider.native_family(),
                 &workspace,
                 &cwd,
                 Some(mcp_capability.clone()),
