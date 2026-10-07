@@ -225,6 +225,30 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     prepared.context.mcp_capability.clone(),
                     Some(prepared.context),
                 )
+            } else if request.mode == "codex" {
+                let home = request
+                    .env
+                    .get("HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+                    .ok_or("managed provider HOME unavailable")?;
+                let original = |name: &str| {
+                    request
+                        .env
+                        .get(name)
+                        .cloned()
+                        .or_else(|| std::env::var(name).ok())
+                };
+                let context = crate::managed_provider_references::codex::prepare_managed(
+                    &soul_id,
+                    &home,
+                    &cwd,
+                    &workspace,
+                    &original,
+                    &args,
+                    &provider_secret_references,
+                )?;
+                (context.mcp_capability.clone(), Some(context))
             } else {
                 let mcp_capability = matches!(
                     request.mode.as_str(),

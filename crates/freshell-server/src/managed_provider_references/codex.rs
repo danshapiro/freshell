@@ -7,7 +7,6 @@ pub enum InputKind {
     Instructions,
     CompactPrompt,
     ModelCatalog,
-    SkillSelector,
 }
 pub struct SelectedInput {
     pub logical_path: PathBuf,
@@ -153,12 +152,9 @@ impl Selection<'_> {
                     .as_array()
                     .ok_or("Codex skills config has an unsupported type")?;
                 for rule in rules {
-                    if let Some(path) = string_field(rule, "path")? {
-                        self.add(
-                            typed_path(path, parent, self.home),
-                            InputKind::SkillSelector,
-                        )?;
-                    }
+                    // Native paths are enable/disable selectors. They remain
+                    // in the transported TOML and confer no resource authority.
+                    string_field(rule, "path")?;
                 }
             }
             if kind != LayerKind::Role {
@@ -310,6 +306,305 @@ fn normalize(path: &Path) -> PathBuf {
     result
 }
 
+pub(crate) fn prepare_managed(
+    soul: &freshell_runtime_protocol::SoulId,
+    home: &Path,
+    cwd: &Path,
+    workspace: &Path,
+    original: &dyn Fn(&str) -> Option<String>,
+    args: &[String],
+    references: &[freshell_runtime_protocol::ProviderSecretReference],
+) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String> {
+    let codex_home =
+        if let Some(selected) = original("CODEX_HOME").filter(|value| !value.is_empty()) {
+            let selected = PathBuf::from(selected);
+            let path = std::fs::canonicalize(if selected.is_absolute() {
+                selected
+            } else {
+                cwd.join(selected)
+            })
+            .map_err(|_| {
+                "selected CODEX_HOME is unavailable; repair the selected directory and retry"
+            })?;
+            if !path.is_dir() {
+                return Err("selected CODEX_HOME must be a directory".into());
+            }
+            path
+        } else {
+            home.join(".codex")
+        };
+    let named_profile = args
+        .windows(2)
+        .filter(|pair| matches!(pair[0].as_str(), "--profile" | "-p"))
+        .map(|pair| pair[1].clone())
+        .next_back();
+    let manifest = freshell_platform::codex_inputs::CodexInputManifest {
+        version: 1,
+        original_home: home.into(),
+        cwd: cwd.into(),
+        codex_home,
+        named_profile,
+    };
+    let mcp = crate::managed_provider_bootstrap::managed_codex_mcp_args()
+        .ok_or("managed Codex MCP preparation unavailable")?;
+    let context = freshell_runtime_protocol::ProviderLaunchContext {
+        preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+            tui_args: mcp.clone(),
+            sidecar_args: mcp,
+        },
+        config: vec![],
+        mcp_capability: None,
+        prepared_inputs: None,
+    };
+    crate::managed_mcp_capability::issue_prepared_provider_context(
+        "codex",
+        soul,
+        home,
+        &context,
+        crate::managed_mcp_capability::OpencodeEphemeralInput {
+            codex_manifest: Some(&manifest),
+            cwd: Some(cwd),
+            workspace: Some(workspace),
+            secret_references: Some(references),
+            ..Default::default()
+        },
+    )
+}
+
+pub struct Discovery {
+    pub manifest: freshell_platform::codex_inputs::CodexInputManifest,
+    pub inputs: Vec<SelectedInput>,
+    pub resource_roots: Vec<PathBuf>,
+}
+
+pub fn discover(
+    manifest: freshell_platform::codex_inputs::CodexInputManifest,
+) -> Result<Discovery, &'static str> {
+    manifest.validate()?;
+    let mut layers = Vec::new();
+    let mut preceding = toml::Value::Table(Default::default());
+    let base = manifest.codex_home.join("config.toml");
+    if exists(&base)? {
+        let value = read_config(&base)?;
+        if let Some(name) = &manifest.named_profile {
+            if value.get("profile").and_then(toml::Value::as_str) == Some(name.as_str())
+                || value
+                    .get("profiles")
+                    .and_then(|profiles| profiles.get(name))
+                    .is_some()
+            {
+                return Err("Codex named profile conflicts with legacy profile settings");
+            }
+        }
+        merge(&mut preceding, value);
+        layers.push(SourceLayer {
+            logical_path: base,
+            enabled: true,
+            kind: LayerKind::User,
+        });
+    }
+    if let Some(name) = &manifest.named_profile {
+        let path = manifest.codex_home.join(format!("{name}.config.toml"));
+        // A selected named configuration is required, unlike an absent base.
+        merge(&mut preceding, read_config(&path)?);
+        layers.push(SourceLayer {
+            logical_path: path,
+            enabled: true,
+            kind: LayerKind::User,
+        });
+    }
+    let markers: Vec<String> = if let Some(value) = preceding.get("project_root_markers") {
+        value
+            .as_array()
+            .ok_or("Codex project markers must be an array")?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or("Codex project marker must be a string")
+            })
+            .collect::<Result<_, _>>()?
+    } else {
+        vec![".git".into()]
+    };
+    let root = manifest
+        .cwd
+        .ancestors()
+        .find(|directory| markers.iter().any(|marker| directory.join(marker).exists()))
+        .unwrap_or(&manifest.cwd);
+    let mut directories = manifest
+        .cwd
+        .ancestors()
+        .take_while(|directory| directory.starts_with(root))
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    directories.reverse();
+    let mut resources = Vec::new();
+    for path in [
+        manifest.codex_home.join("skills"),
+        manifest.original_home.join(".agents/skills"),
+    ] {
+        if exists(&path)? {
+            resources.push(path);
+        }
+    }
+    for directory in &directories {
+        let folder = directory.join(".codex");
+        if exists(&folder)?
+            && normalize(&folder) != normalize(&manifest.codex_home)
+            && std::fs::canonicalize(&folder).ok()
+                != std::fs::canonicalize(&manifest.codex_home).ok()
+        {
+            if !std::fs::metadata(&folder)
+                .map_err(|_| "Codex project root is unreadable")?
+                .is_dir()
+            {
+                return Err("Codex project config root must be a directory");
+            }
+            let skills = folder.join("skills");
+            if exists(&skills)? {
+                resources.push(skills);
+            }
+            let path = folder.join("config.toml");
+            if exists(&path)? {
+                layers.push(SourceLayer {
+                    logical_path: path,
+                    enabled: trusted(&preceding, directory, root),
+                    kind: LayerKind::Project,
+                });
+            }
+        }
+        let skills = directory.join(".agents/skills");
+        if exists(&skills)? {
+            resources.push(skills);
+        }
+    }
+    // User configuration alone selects installed plugins. Project tables do
+    // not change the selection. Copy complete installed package/data units.
+    if let Some(plugins) = preceding.get("plugins").and_then(toml::Value::as_table) {
+        for (identity, value) in plugins {
+            if value.get("enabled").and_then(toml::Value::as_bool) != Some(true) {
+                continue;
+            }
+            let (plugin, market) = identity
+                .split_once('@')
+                .ok_or("Codex installed plugin identity is invalid")?;
+            if [plugin, market].iter().any(|part| {
+                part.is_empty()
+                    || Path::new(part)
+                        .components()
+                        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            }) {
+                return Err("Codex installed plugin identity is invalid");
+            }
+            let cache = manifest
+                .codex_home
+                .join("plugins/cache")
+                .join(market)
+                .join(plugin);
+            if !exists(&cache)? {
+                return Err(
+                    "Codex selected installed plugin is unavailable; repair installation and retry",
+                );
+            }
+            resources.push(cache);
+            let data = manifest
+                .codex_home
+                .join("plugins/data")
+                .join(format!("{plugin}-{market}"));
+            if exists(&data)? {
+                resources.push(data);
+            }
+        }
+    }
+    let legacy = if manifest.named_profile.is_none() {
+        preceding.get("profile").and_then(toml::Value::as_str)
+    } else {
+        None
+    };
+    let inputs = select_inputs(&layers, &manifest.original_home, legacy)?;
+    resources.sort();
+    resources.dedup();
+    Ok(Discovery {
+        manifest,
+        inputs,
+        resource_roots: resources,
+    })
+}
+fn exists(path: &Path) -> Result<bool, &'static str> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("Codex selected resource is inaccessible; repair permissions and retry"),
+    }
+}
+fn read_config(path: &Path) -> Result<toml::Value, &'static str> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| "Codex selected configuration is unavailable")?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Codex selected configuration is unreadable")?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err("Codex selected configuration source view exceeded");
+    }
+    let raw =
+        std::str::from_utf8(&bytes).map_err(|_| "Codex selected configuration is not UTF-8")?;
+    toml::from_str(raw).map_err(|_| "Codex selected configuration TOML is invalid")
+}
+fn merge(target: &mut toml::Value, value: toml::Value) {
+    if let (Some(target), Some(value)) = (target.as_table_mut(), value.as_table()) {
+        for (key, value) in value {
+            if let Some(existing) = target.get_mut(key) {
+                merge(existing, value.clone());
+            } else {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    } else {
+        *target = value;
+    }
+}
+fn trusted(value: &toml::Value, directory: &Path, root: &Path) -> bool {
+    let Some(projects) = value.get("projects") else {
+        return false;
+    };
+    let mut paths = vec![directory.to_path_buf()];
+    if let Ok(canonical) = std::fs::canonicalize(directory) {
+        paths.push(canonical);
+    }
+    paths.push(root.to_path_buf());
+    if let Ok(canonical) = std::fs::canonicalize(root) {
+        paths.push(canonical);
+    }
+    // Linked worktrees share the root checkout's trust selection.
+    if let Ok(gitfile) = std::fs::read_to_string(root.join(".git")) {
+        if let Some(gitdir) = gitfile.trim().strip_prefix("gitdir: ") {
+            let path = normalize(&root.join(gitdir));
+            if let Some(checkout) = path
+                .ancestors()
+                .find(|path| path.file_name() == Some(std::ffi::OsStr::new(".git")))
+                .and_then(Path::parent)
+            {
+                paths.push(checkout.to_path_buf());
+            }
+        }
+    }
+    for path in paths {
+        if let Some(trust) = path
+            .to_str()
+            .and_then(|key| projects.get(key))
+            .and_then(|project| project.get("trust_level"))
+            .and_then(toml::Value::as_str)
+        {
+            return trust == "trusted";
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +619,22 @@ mod tests {
             kind: LayerKind::User,
         }
     }
+    #[test]
+    fn managed_provider_codex_skill_path_selectors_do_not_create_resource_authority() {
+        let owned = tempfile::tempdir().unwrap();
+        let config = owned.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[[skills.config]]\npath = 'absent-skill'\nenabled = false\n",
+        )
+        .unwrap();
+        let inputs = select_inputs(&[layer(config,true)],owned.path(),None).expect("native disabled path selectors do not require an existing file or grant a new skill discovery root");
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs
+            .iter()
+            .all(|input| input.kind == InputKind::Configuration));
+    }
+
     #[test]
     fn managed_provider_codex_discovered_roles_keep_nested_instruction_origins() {
         let fixture = tempfile::tempdir().unwrap();
@@ -468,10 +779,12 @@ enabled = false
             .iter()
             .any(|input| input.kind == InputKind::CompactPrompt
                 && digest(&input.canonical_source) == digest(&logical.join("profile.md"))));
-        assert!(selected
-            .iter()
-            .any(|input| input.kind == InputKind::SkillSelector
-                && input.logical_path == logical.join("skills/SKILL.md")));
+        assert!(
+            !selected
+                .iter()
+                .any(|input| input.logical_path == logical.join("skills/SKILL.md")),
+            "a skill path selector cannot grant ordinary file/resource authority"
+        );
         assert_eq!(
             std::fs::read_to_string(actual.join("role.toml")).unwrap(),
             "model_instructions_file='./instructions.md'"

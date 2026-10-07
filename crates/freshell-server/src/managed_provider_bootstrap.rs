@@ -323,7 +323,7 @@ impl freshell_platform::mcp_inject::McpRuntime for ManagedImageMcpRuntime {
     }
 }
 
-fn managed_codex_mcp_args() -> Option<Vec<String>> {
+pub(crate) fn managed_codex_mcp_args() -> Option<Vec<String>> {
     let renderings = freshell_platform::mcp_inject::build_managed_codex_mcp_renderings(
         &ManagedImageMcpRuntime,
         &freshell_platform::RealEnv,

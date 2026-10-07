@@ -28,10 +28,12 @@ const CAPABILITY_PATH: &str = ".freshell/mcp-capability.json";
 const GRANT_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 const RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 mod amplifier_resources;
+mod codex_stage;
 mod source_stage;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct OpencodeEphemeralInput<'a> {
+    pub codex_manifest: Option<&'a freshell_platform::codex_inputs::CodexInputManifest>,
     pub inline_config: Option<&'a str>,
     pub tui_config_path: Option<&'a str>,
     pub tui_source: Option<&'a ProviderConfigReference>,
@@ -296,6 +298,62 @@ async fn apply_prepared_callback(
         )
         .map_err(|_| "replacement provider context exceeds control metadata profile".into());
     }
+    if provider == "codex" {
+        let mut context = callback
+            .prior_context
+            .clone()
+            .ok_or("complete replacement requires prior provider context")?;
+        let manifest = if context.prepared_inputs.is_some() {
+            let bytes =
+                read_prior_manifest_bytes("codex", store, directory, &callback.soul_id, &context)?;
+            let manifest: freshell_platform::codex_inputs::CodexInputManifest =
+                serde_json::from_slice(&bytes)
+                    .map_err(|_| "prior Codex source manifest metadata invalid")?;
+            manifest.validate().map_err(str::to_string)?;
+            manifest
+        } else {
+            let cwd = callback
+                .cwd
+                .as_deref()
+                .or(callback.workspace.as_deref())
+                .ok_or("missing provider working directory")?;
+            freshell_platform::codex_inputs::CodexInputManifest {
+                version: 1,
+                original_home: home.into(),
+                cwd: cwd.into(),
+                codex_home: home.join(".codex"),
+                named_profile: None,
+            }
+        };
+        context.config.clear();
+        let references = callback.provider_secret_references.unwrap_or_default();
+        let capability = store.issue_replacement_with_inputs(
+            callback.soul_id,
+            directory,
+            endpoint.into(),
+            Some((provider, &manifest.original_home, &context.config)),
+            OpencodeEphemeralInput {
+                launch_context: Some(&context),
+                secret_references: Some(&references),
+                cwd: Some(&manifest.cwd),
+                workspace: callback.workspace.as_deref(),
+                codex_manifest: Some(&manifest),
+                ..Default::default()
+            },
+        )?;
+        let reply = freshell_runtime_protocol::PreparedProviderContext {
+            provider_launch_context: read_prepared_context(directory, &capability)?,
+            provider_secret_references: references,
+        };
+        reply
+            .validate(provider)
+            .map_err(|_| "replacement Codex context metadata invalid")?;
+        return freshell_runtime_protocol::bounded_json_bytes(
+            &reply,
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+        )
+        .map_err(|_| "replacement Codex context exceeds control metadata profile".into());
+    }
     if provider != "opencode" {
         let references = provider_source_references(provider, home)?;
         let mut context = callback
@@ -479,6 +537,56 @@ async fn apply_prepared_callback(
         freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
     )
     .map_err(|_| "replacement provider context exceeds control metadata profile".into())
+}
+
+fn read_prior_manifest_bytes(
+    provider: &str,
+    store: &CapabilityStore,
+    directory: &Path,
+    soul: &SoulId,
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+) -> Result<Vec<u8>, String> {
+    context
+        .validate(provider)
+        .map_err(|_| "prior provider source context metadata invalid")?;
+    let inputs = context
+        .prepared_inputs
+        .as_ref()
+        .ok_or("prior prepared provider inputs unavailable")?;
+    let capability = context
+        .mcp_capability
+        .as_ref()
+        .ok_or("prior source context lacks generation authority")?;
+    if !store
+        .grants
+        .lock()
+        .unwrap()
+        .get(&capability.grant_id)
+        .is_some_and(|grant| grant.soul_id == *soul)
+    {
+        return Err("prior provider source context belongs to another owner".into());
+    }
+    let root = staged_provider_root_path(directory, &capability.grant_id)?;
+    let path = root.join(&inputs.manifest.relative_path);
+    if !std::fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        || std::fs::canonicalize(&path).map_err(|_| "prior source manifest unavailable")? != path
+    {
+        return Err("prior source manifest must be a physical private file".into());
+    }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| "prior source manifest unavailable")?
+        .take(64 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "prior source manifest read failed")?;
+    if bytes.len() > 64 * 1024 * 1024
+        || format!("{:x}", sha2::Sha256::digest(&bytes)) != inputs.manifest.sha256
+    {
+        return Err("prior source manifest profile or identity changed".into());
+    }
+    Ok(bytes)
 }
 
 fn read_prior_source_manifest(
@@ -1155,6 +1263,18 @@ fn stage_provider_root(
             .map_err(|_| "prepared resource descriptor exceeds control profile")?;
             write_private_bytes(&temporary.join(".freshell/resource-mounts.json"), &metadata)?;
         }
+        let codex_resources = if provider == "codex" && opencode_input.launch_context.is_some() {
+            Some(codex_stage::prepare(
+                home,
+                opencode_input.cwd.unwrap_or(home),
+                opencode_input.codex_manifest,
+            )?)
+        } else {
+            None
+        };
+        if let Some(resources) = &codex_resources {
+            selections.extend(resources.selections.iter().cloned());
+        }
         let amplifier_resources = if provider == "amplifier" {
             Some(amplifier_resources::prepare(
                 home,
@@ -1168,6 +1288,9 @@ fn stage_provider_root(
             selections.extend(resources.selections.iter().cloned());
         }
         for reference in references {
+            if codex_resources.is_some() {
+                continue;
+            }
             if reference.root != ProviderConfigRoot::UserProvider {
                 return Err("managed provider selector is unsafe".into());
             }
@@ -1299,6 +1422,23 @@ fn stage_provider_root(
                 opencode_input.cwd.ok_or("source plan requires cwd")?,
                 plan,
                 opencode_input,
+            )?;
+        }
+        if let Some(resources) = &codex_resources {
+            let capability = McpCapabilityReference {
+                grant_id: grant_id.into(),
+                endpoint: "http://host.docker.internal:1".into(),
+                provider_relative_path: CAPABILITY_PATH.into(),
+                host_gateway_address: None,
+            };
+            let inputs = codex_stage::publish(&temporary, resources, &capability)?;
+            write_private_bytes(
+                &temporary.join(".freshell/prepared-inputs.json"),
+                &freshell_runtime_protocol::bounded_json_bytes(
+                    &inputs,
+                    freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+                )
+                .map_err(|_| "Codex prepared context exceeds control profile")?,
             )?;
         }
         allow_controller_stage_read(&temporary)?;
@@ -1649,6 +1789,15 @@ impl CapabilityStore {
                     provider_relative_path: CAPABILITY_PATH.into(),
                     host_gateway_address: routed_host_ipv4(),
                 });
+                if provider == "codex" {
+                    let bytes =
+                        source_stage::read_source_view(root, ".freshell/prepared-inputs.json")?;
+                    context.prepared_inputs = Some(
+                        serde_json::from_str(&bytes)
+                            .map_err(|_| "Codex prepared inputs unavailable")?,
+                    );
+                    context.config.clear();
+                }
                 let result = publish_prepared_context_metadata(
                     root,
                     provider,
@@ -2020,6 +2169,15 @@ pub(crate) fn issue_prepared_opencode_context(
     context: &freshell_runtime_protocol::ProviderLaunchContext,
     input: OpencodeEphemeralInput<'_>,
 ) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String> {
+    issue_prepared_provider_context("opencode", soul, home, context, input)
+}
+pub(crate) fn issue_prepared_provider_context(
+    provider: &str,
+    soul: &SoulId,
+    home: &Path,
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    input: OpencodeEphemeralInput<'_>,
+) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String> {
     let input = OpencodeEphemeralInput {
         launch_context: Some(context),
         ..input
@@ -2029,7 +2187,7 @@ pub(crate) fn issue_prepared_opencode_context(
         soul.clone(),
         &directory,
         endpoint()?,
-        Some(("opencode", home, &context.config)),
+        Some((provider, home, &context.config)),
         input,
         None,
     )?;
@@ -3475,6 +3633,355 @@ except Exception as error:
             .is_dir());
     }
 
+    #[cfg(feature = "managed-provider-qualification")]
+    #[tokio::test]
+    async fn managed_provider_codex_native_typed_inputs_survive_transport() {
+        use freshell_platform::provider_environment::{
+            copy_environment, CopyLimits, CopySelection,
+        };
+        use freshell_runtime_protocol::{ProviderLaunchContext, ProviderPreparation};
+        use sha2::{Digest, Sha256};
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let owned = executable_fixture_directory();
+        let original = owned.path().join("original-home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(original.join(".codex/agents/nested")).unwrap();
+        std::fs::create_dir_all(workspace.join(".codex/skills/probe/scripts")).unwrap();
+        std::fs::create_dir(workspace.join(".git")).unwrap();
+        let config = format!("model_instructions_file = 'user.md'\n[[skills.config]]\npath = 'absent-skill'\nenabled = false\n[projects.{}]\ntrust_level = 'trusted'\n[agents.reader]\nconfig_file = 'agents/nested/reader.toml'\n",serde_json::to_string(workspace.to_str().unwrap()).unwrap());
+        std::fs::write(original.join(".codex/config.toml"), &config).unwrap();
+        std::fs::write(original.join(".codex/user.md"), "user-instructions-nonce").unwrap();
+        std::fs::write(
+            original.join(".codex/agents/nested/reader.toml"),
+            "model_instructions_file = 'role.md'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            original.join(".codex/agents/nested/role.md"),
+            "role-instructions-nonce",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join(".codex/config.toml"),
+            "model_instructions_file = 'project.md'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join(".codex/project.md"),
+            "project-instructions-nonce",
+        )
+        .unwrap();
+        std::fs::write(workspace.join(".codex/skills/probe/SKILL.md"),"---\nname: transport-probe\ndescription: Synthetic executable resource fixture\n---\nRun scripts/run to read the adjacent complete resource.\n").unwrap();
+        std::fs::write(
+            workspace.join(".codex/skills/probe/resource.txt"),
+            "skill-resource-nonce",
+        )
+        .unwrap();
+        let script = workspace.join(".codex/skills/probe/scripts/run");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/../resource.txt\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mcp = crate::managed_provider_bootstrap::managed_codex_mcp_args().unwrap();
+        let context = ProviderLaunchContext {
+            config: vec![],
+            mcp_capability: None,
+            prepared_inputs: None,
+            preparation: ProviderPreparation::Codex {
+                tui_args: mcp.clone(),
+                sidecar_args: mcp,
+            },
+        };
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let grant = store
+            .issue(
+                SoulId::new(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("codex", &original, &[])),
+                OpencodeEphemeralInput {
+                    launch_context: Some(&context),
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let context = crate::fresh_agent_proxy::context_for_fresh_provider(Some(
+            read_prepared_context(&directory, &grant).unwrap(),
+        ))
+        .unwrap();
+        let inputs = context.prepared_inputs.as_ref().unwrap();
+        let stage = staged_provider_root_path(&directory, &grant.grant_id).unwrap();
+        let physical = Path::new("/home/freshell/provider");
+        assert!(physical.is_dir());
+        let selections = inputs
+            .resource_mounts
+            .iter()
+            .map(|unit| CopySelection {
+                source: stage.join(&unit.stage_relative_path),
+                destination_relative: unit.provider_relative_path.clone().into(),
+            })
+            .collect::<Vec<_>>();
+        copy_environment(&selections, physical, &[], CopyLimits::default()).unwrap();
+        // The original fixture remains preserved byte-for-byte. Native reads
+        // only descriptor projections at each accepted logical path.
+        let archived = owned.path().join("archived-home");
+        std::fs::rename(&original, &archived).unwrap();
+        let archived_project = owned.path().join("archived-project-config");
+        std::fs::rename(workspace.join(".codex"), &archived_project).unwrap();
+        for bind in &inputs.config_binds {
+            let destination = Path::new(&bind.effective_destination);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(stage.join(&bind.source_relative_path), destination)
+                .unwrap();
+        }
+        for unit in &inputs.resource_mounts {
+            let destination = Path::new(&unit.effective_destination);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(physical.join(&unit.provider_relative_path), destination)
+                .unwrap();
+        }
+        let version = std::process::Command::new("/usr/local/bin/codex")
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        assert_eq!(
+            String::from_utf8(version.stdout).unwrap().trim(),
+            "codex-cli 0.147.0"
+        );
+        let mut child = tokio::process::Command::new("/usr/local/bin/codex")
+            .arg("app-server")
+            .args(match &context.preparation {
+                ProviderPreparation::Codex { sidecar_args, .. } => sidecar_args.clone(),
+                _ => panic!("Codex context missing"),
+            })
+            .current_dir(&workspace)
+            .env("HOME", physical)
+            .env("CODEX_HOME", physical.join(".codex"))
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("FRESHELL_CLAUDE_SDK_QUERY_MODULE")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        async fn request(
+            stdin: &mut tokio::process::ChildStdin,
+            stdout: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+            id: u64,
+            method: &str,
+            params: serde_json::Value,
+        ) -> serde_json::Value {
+            stdin
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::json!({"id":id,"method":method,"params":params})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(25), async {
+                loop {
+                    let line = stdout
+                        .next_line()
+                        .await
+                        .unwrap()
+                        .expect("native Codex app-server ended before response");
+                    let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if response.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
+                        assert!(
+                            response.get("error").is_none(),
+                            "native Codex request {method} failed"
+                        );
+                        return response["result"].clone();
+                    }
+                }
+            })
+            .await
+            .expect("native Codex source consumer response deadline")
+        }
+        request(&mut stdin,&mut stdout,1,"initialize",serde_json::json!({"clientInfo":{"name":"freshell-fixture","version":"1"},"capabilities":{"experimentalApi":true}})).await;
+        stdin
+            .write_all(b"{\"method\":\"initialized\"}\n")
+            .await
+            .unwrap();
+        let resolved = request(
+            &mut stdin,
+            &mut stdout,
+            2,
+            "config/read",
+            serde_json::json!({"includeLayers":true,"cwd":workspace}),
+        )
+        .await;
+        assert_eq!(
+            resolved["config"]["model_instructions_file"].as_str(),
+            Some(workspace.join(".codex/project.md").to_str().unwrap())
+        );
+        assert_eq!(
+            resolved["config"]["mcp_servers"]["freshell"]["command"], "node",
+            "actual native app-server must consume the retained fresh provider argv"
+        );
+        assert_eq!(
+            resolved["config"]["mcp_servers"]["freshell"]["args"],
+            serde_json::json!(["/opt/freshell-mcp/server.js"])
+        );
+        let skills = request(
+            &mut stdin,
+            &mut stdout,
+            3,
+            "skills/list",
+            serde_json::json!({"cwds":[workspace],"forceReload":true}),
+        )
+        .await;
+        let found = skills["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|data| data["skills"].as_array().unwrap())
+            .any(|skill| skill["name"] == "transport-probe");
+        assert!(
+            found,
+            "native Codex must discover the transported project skill"
+        );
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        let resource =
+            std::process::Command::new(workspace.join(".codex/skills/probe/scripts/run"))
+                .output()
+                .unwrap();
+        assert!(resource.status.success());
+        assert_eq!(resource.stdout, b"skill-resource-nonce");
+        assert_eq!(
+            std::fs::read_to_string(archived.join(".codex/config.toml")).unwrap(),
+            config
+        );
+        for (case, bytes) in [
+            (
+                "native-config-read",
+                b"project-instructions-nonce".as_slice(),
+            ),
+            ("native-skills-list", b"transport-probe".as_slice()),
+            ("executable-resource", b"skill-resource-nonce".as_slice()),
+            (
+                "native-retained-mcp-args",
+                b"node:/opt/freshell-mcp/server.js".as_slice(),
+            ),
+        ] {
+            println!(
+                "provider_source_consumer {}",
+                serde_json::json!({"provider":"codex","case":case,"digest":format!("{:x}",Sha256::digest(bytes))})
+            );
+        }
+    }
+
+    #[test]
+    fn managed_provider_codex_selected_inputs_reach_private_generation() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex/agents/nested")).unwrap();
+        std::fs::create_dir_all(workspace.join(".codex/skills/fixture/scripts")).unwrap();
+        std::fs::create_dir(workspace.join(".git")).unwrap();
+        let raw = format!("model_instructions_file = 'instructions.md'\n[projects.{}]\ntrust_level = 'trusted'\n[agents.reader]\nconfig_file = 'agents/nested/reader.toml'\n", serde_json::to_string(workspace.to_str().unwrap()).unwrap());
+        std::fs::write(home.join(".codex/config.toml"), &raw).unwrap();
+        std::fs::write(home.join(".codex/instructions.md"), "home-input").unwrap();
+        std::fs::write(
+            home.join(".codex/agents/nested/reader.toml"),
+            "model_instructions_file = 'instructions.md'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".codex/agents/nested/instructions.md"),
+            "role-input",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join(".codex/config.toml"),
+            "model_instructions_file = 'instructions.md'\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join(".codex/instructions.md"), "project-input").unwrap();
+        std::fs::write(
+            workspace.join(".codex/skills/fixture/SKILL.md"),
+            "skill-resource",
+        )
+        .unwrap();
+        let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+            "codex", &workspace, &home, None,
+        )
+        .unwrap()
+        .unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let capability = store
+            .issue(
+                SoulId::new(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("codex", &home, &context.config)),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    launch_context: Some(&context),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let accepted = read_prepared_context(&directory, &capability).unwrap();
+        let inputs = accepted
+            .prepared_inputs
+            .expect("Codex selected layers and typed resources must be accepted as one generation");
+        let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+        for (logical, expected) in [
+            (home.join(".codex/instructions.md"), "home-input"),
+            (
+                home.join(".codex/agents/nested/instructions.md"),
+                "role-input",
+            ),
+            (workspace.join(".codex/instructions.md"), "project-input"),
+        ] {
+            let mount = inputs
+                .resource_mounts
+                .iter()
+                .find(|mount| mount.logical_destination == logical.to_str().unwrap())
+                .expect("ordinary selected resource must retain its original absolute alias");
+            assert_eq!(
+                std::fs::read_to_string(stage.join(&mount.stage_relative_path)).unwrap(),
+                expected
+            );
+        }
+        assert!(inputs
+            .resource_mounts
+            .iter()
+            .any(|mount| mount.logical_destination
+                == workspace.join(".codex/skills").to_str().unwrap()));
+        assert!(inputs
+            .config_binds
+            .iter()
+            .any(|bind| bind.logical_destination
+                == workspace.join(".codex/config.toml").to_str().unwrap()));
+        assert_eq!(
+            std::fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+            raw
+        );
+    }
+
     #[tokio::test]
     async fn managed_provider_replacement_complete_codex_metadata_replays_before_rescanning_roots()
     {
@@ -3504,11 +4011,17 @@ except Exception as error:
                 &directory,
                 "http://host.docker.internal:4000".into(),
                 Some(("codex", &home, &context.config)),
-                Default::default(),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    launch_context: Some(&context),
+                    ..Default::default()
+                },
                 None,
             )
             .unwrap();
-        context.mcp_capability = Some(prior);
+        context = read_prepared_context(&directory, &prior).unwrap();
+        assert!(context.prepared_inputs.is_some());
         let callback = serde_json::to_vec(
             &serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,
             "provider":"codex","workspace":workspace,"cwd":workspace,"priorContext":context,
@@ -3547,17 +4060,29 @@ except Exception as error:
             "a complete pending context must retain its exact selected root metadata in every provider route");
         let ready: freshell_runtime_protocol::PreparedProviderContext =
             serde_json::from_slice(&repeated).unwrap();
+        let resource = ready
+            .provider_launch_context
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .resource_mounts
+            .iter()
+            .find(|mount| mount.logical_destination == "/home/freshell/provider/.codex/skills")
+            .unwrap()
+            .stage_relative_path
+            .clone();
         let stage = staged_provider_root_path(
             &directory,
             &ready
                 .provider_launch_context
                 .mcp_capability
+                .as_ref()
                 .unwrap()
                 .grant_id,
         )
         .unwrap();
         assert_eq!(
-            std::fs::read_to_string(stage.join("skills/owned/runner.sh")).unwrap(),
+            std::fs::read_to_string(stage.join(resource).join("owned/runner.sh")).unwrap(),
             "synthetic retained resource"
         );
         assert_eq!(

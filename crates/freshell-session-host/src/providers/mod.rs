@@ -64,19 +64,8 @@ pub async fn prepare_terminal(
     prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
 ) -> Result<PreparedTerminal, String> {
     let mut child_env = child_secret_env.clone();
-    if let Some(context) = terminal.provider_launch_context.as_ref() {
-        if let Some(capability) = context.mcp_capability.as_ref() {
-            if capability.endpoint.is_empty() {
-                return Err("managed MCP endpoint is unavailable".into());
-            }
-            let grant = read_mcp_grant(std::path::Path::new("/run/freshell/mcp-capability.json"))?;
-            if grant.get("FRESHELL_URL") != Some(&capability.endpoint) {
-                return Err("managed MCP grant endpoint differs from launch context".into());
-            }
-            probe_managed_endpoint(&capability.endpoint).await?;
-            child_env.extend(grant);
-        }
-    }
+    prepare_scoped_mcp_environment(terminal.provider_launch_context.as_ref(), &mut child_env)
+        .await?;
     if terminal.mode == "claude"
         && terminal
             .provider_launch_context
@@ -192,6 +181,21 @@ pub async fn prepare_terminal(
     })
 }
 
+async fn prepare_scoped_mcp_environment(
+    context: Option<&freshell_runtime_protocol::ProviderLaunchContext>,
+    child_env: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    if let Some(capability) = context.and_then(|context| context.mcp_capability.as_ref()) {
+        let grant = read_mcp_grant(std::path::Path::new("/run/freshell/mcp-capability.json"))?;
+        if grant.get("FRESHELL_URL") != Some(&capability.endpoint) {
+            return Err("managed MCP grant endpoint differs from launch context".into());
+        }
+        probe_managed_endpoint(&capability.endpoint).await?;
+        child_env.extend(grant);
+    }
+    Ok(())
+}
+
 fn read_mcp_grant(
     path: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
@@ -266,12 +270,13 @@ fn prepare_provider_features_for_identity(uid: u32, gid: u32, args: &[&str]) -> 
     }
 }
 
-pub fn prepare_fresh_agent_child_environment(
+pub async fn prepare_fresh_agent_child_environment(
     launch: &freshell_runtime_protocol::FreshAgentLaunchSpec,
     child_env: &mut std::collections::BTreeMap<String, String>,
     prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
 ) -> Result<(), String> {
     use freshell_runtime_protocol::{FreshProvider, ProviderPreparation};
+    prepare_scoped_mcp_environment(launch.provider_launch_context.as_ref(), child_env).await?;
     if launch.provider != FreshProvider::Opencode {
         return Ok(());
     }
@@ -634,6 +639,18 @@ mod provider_secret_context_tests {
             String::from_utf8(receipt.stdout).unwrap(),
             format!("{:x}", Sha256::digest(b"sentinel-private-inline"))
         );
+    }
+
+    #[tokio::test]
+    async fn provider_secret_fresh_codex_requires_its_selected_scoped_mcp_grant() {
+        let launch: freshell_runtime_protocol::FreshAgentLaunchSpec=serde_json::from_value(serde_json::json!({"sessionId":"synthetic-fresh","provider":"codex","sessionType":"freshcodex","runtimeVariant":"codex-app-server","providerStoreId":"synthetic-store","cwd":"/synthetic-workspace","workspacePath":"/synthetic-workspace","runAsUid":65534,"runAsGid":0,"providerLaunchContext":{"preparation":{"codex":{"tui_args":[],"sidecar_args":[]}},"mcpCapability":{"grantId":"grant-synthetic","endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"}}})).unwrap();
+        let mut env = Default::default();
+        let error = prepare_fresh_agent_child_environment(&launch, &mut env, None)
+            .await
+            .expect_err(
+                "fresh native Codex must require the selected scoped grant before it starts",
+            );
+        assert!(error.contains("grant is unavailable"));
     }
 
     #[test]

@@ -886,7 +886,7 @@ async fn grant_execution(
                 format!("resolve managed provider credentials: {error}"),
             )
         })?;
-        if provider == "opencode" {
+        if matches!(provider, "opencode" | "codex") {
             let generated = provider_input_preparation::prepare(
                 context,
                 &mut secrets,
@@ -1165,6 +1165,7 @@ async fn grant_execution(
                 &mut resolved_secrets.environment,
                 resolved_secrets.opencode_plan.as_ref(),
             )
+            .await
             .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;

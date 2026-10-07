@@ -20,19 +20,21 @@ def docker(*args, check=True):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--provider",choices=["amplifier","codex"],default="amplifier")
     parser.add_argument("--test-binary", type=Path, required=True)
     parser.add_argument("--receipt-dir", type=Path, required=True)
     args = parser.parse_args()
+    selected_test = TEST if args.provider == "amplifier" else "managed_mcp_capability::tests::managed_provider_codex_native_typed_inputs_survive_transport"
     binary = args.test_binary.resolve(strict=True)
     if not binary.is_file() or not re.fullmatch(r"freshell_server-[0-9a-f]{16}", binary.name):
         raise RuntimeError("source fixture requires its compiled server test artifact")
     expected_directory = Path(__file__).resolve().parents[2] / "target/debug/deps"
     if binary.parent != expected_directory.resolve():
         raise RuntimeError("source fixture test artifact must belong to this worktree")
-    listing = subprocess.run([str(binary), "--exact", TEST, "--list"],
+    listing = subprocess.run([str(binary), "--exact", selected_test, "--list"],
                              env={"PATH": "/usr/bin:/bin"}, text=True,
                              capture_output=True, timeout=20, check=True)
-    if f"{TEST}: test" not in listing.stdout.splitlines():
+    if f"{selected_test}: test" not in listing.stdout.splitlines():
         raise RuntimeError("source fixture compiled artifact contains no exact selected test")
     if not args.receipt_dir.is_dir():
         raise RuntimeError("source fixture receipt directory must already exist")
@@ -44,7 +46,7 @@ def main():
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     name = "freshell-source-probe-" + uuid.uuid4().hex
     created = False
-    receipt = {"image": IMAGE, "testArtifactSha256": digest, "test": TEST,
+    receipt = {"image": IMAGE, "testArtifactSha256": digest, "test": selected_test,
                "runId": name, "rootless": True}
     try:
         docker("create", "--name", name, "--label", f"{LABEL}={name}",
@@ -52,13 +54,13 @@ def main():
                "--security-opt", "no-new-privileges:true", "--pids-limit", "128", "--memory", "2g",
                "--mount", f"type=bind,src={binary},dst=/runtime/source-consumer-tests,readonly",
                "--tmpfs", "/fixture:rw,exec,nosuid,nodev,size=512m,uid=65534,gid=0,mode=0700",
-               "--tmpfs", "/home/freshell/provider:rw,nosuid,nodev,size=512m,uid=65534,gid=0,mode=0700",
+               "--tmpfs", f"/home/freshell/provider:rw,{'exec' if args.provider == 'codex' else 'noexec'},nosuid,nodev,size=512m,uid=65534,gid=0,mode=0700",
                "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=256m,uid=65534,gid=0,mode=0700",
                "--env", "HOME=/home/freshell/provider",
                "--env", "AMPLIFIER_HOME=/home/freshell/provider/.amplifier",
                "--env", "FRESHELL_TEST_EXECUTABLE_TMP_DIR=/fixture",
                "--entrypoint", "/runtime/source-consumer-tests", IMAGE,
-               "--exact", TEST, "--nocapture", "--test-threads", "1")
+               "--exact", selected_test, "--nocapture", "--test-threads", "1")
         created = True
         result = docker("start", "--attach", name, check=False)
         receipt["exitCode"] = result.returncode
@@ -69,7 +71,7 @@ def main():
                 value = json.loads(line.split(marker, 1)[1])
                 cases.append({"provider": value["provider"], "case": value["case"], "digest": value["digest"]})
         receipt["consumedCases"] = cases
-        if result.returncode == 0 and (len(cases) != 18 or "test result: ok. 1 passed;" not in result.stdout):
+        if result.returncode == 0 and (len(cases) != (18 if args.provider == "amplifier" else 4) or "test result: ok. 1 passed;" not in result.stdout):
             receipt["exitCode"] = 2
             receipt["failureClass"] = "native_consumer_count_mismatch"
         # Only the Rust fixture's classified assertion/digest receipt is emitted.
@@ -84,7 +86,7 @@ def main():
                 raise RuntimeError("source fixture cleanup ownership changed")
             docker("rm", "--force", value["Id"])
         receipt["ownedCleanup"] = docker("container", "inspect", name, check=False).returncode != 0
-        (args.receipt_dir / "task002-native-source-consumers.json").write_text(json.dumps(receipt, sort_keys=True) + "\n")
+        (args.receipt_dir / ("task002-native-source-consumers.json" if args.provider == "amplifier" else "task002-native-codex-source-consumers.json")).write_text(json.dumps(receipt, sort_keys=True) + "\n")
     if not created or not receipt["ownedCleanup"]:
         raise RuntimeError("source fixture failed its owned cleanup proof")
     raise SystemExit(receipt["exitCode"])

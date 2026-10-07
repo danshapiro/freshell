@@ -7,6 +7,36 @@ use freshell_runtime_protocol::{
 use tokio::net::UnixListener;
 
 #[test]
+fn managed_provider_fresh_codex_retains_terminal_and_native_sidecar_arguments() {
+    let args = crate::managed_provider_bootstrap::managed_codex_mcp_args().unwrap();
+    let context = freshell_runtime_protocol::ProviderLaunchContext {
+        preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+            tui_args: args.clone(),
+            sidecar_args: args.clone(),
+        },
+        mcp_capability: None,
+        config: vec![],
+        prepared_inputs: None,
+    };
+    let context = context_for_fresh_provider(Some(context)).unwrap();
+    let freshell_runtime_protocol::ProviderPreparation::Codex {
+        tui_args,
+        sidecar_args,
+    } = context.preparation
+    else {
+        panic!("Codex preparation missing")
+    };
+    assert_eq!(
+        tui_args, args,
+        "terminal arguments must remain in accepted fresh context"
+    );
+    assert_eq!(
+        sidecar_args, args,
+        "the actual native app-server receives the retained configuration pairs"
+    );
+}
+
+#[test]
 fn hosted_created_frame_uses_the_public_request_identity() {
     let (broadcast, mut receiver) = broadcast::channel(8);
     let proxy = HostedFreshAgentProxy {

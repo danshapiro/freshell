@@ -53,6 +53,7 @@
 
 pub mod cli_launch;
 pub mod clock;
+pub mod codex_inputs;
 pub mod detect;
 pub mod git_meta;
 pub mod host_stats_readers;

@@ -1420,6 +1420,29 @@ mod provider_launch_context_tests {
     }
 
     #[test]
+    fn managed_codex_named_profile_control_reaches_durable_launch_arguments() {
+        for flag in ["--profile", "-p"] {
+            let original = vec![
+                flag.into(),
+                "selected_profile-1".into(),
+                "--model".into(),
+                "fixture-model".into(),
+            ];
+            assert_eq!(
+                durable_managed_terminal_args("codex", original.clone(), None)
+                    .expect("native named profile control must remain usable"),
+                original
+            );
+            assert!(durable_managed_terminal_args(
+                "codex",
+                vec![flag.into(), "../config".into()],
+                None
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn managed_codex_accepts_only_the_packaged_mcp_recipe_after_preparation() {
         let args = vec![
             "-c".into(), "mcp_servers.freshell.command=\"node\"".into(),
@@ -2146,6 +2169,7 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
                     .and_then(|part| part.strip_suffix('"'))
                     .is_some_and(safe_selector)
             }
+            ("codex", "--profile" | "-p") => freshell_platform::codex_inputs::valid_profile(value),
             ("codex", "--model" | "--sandbox") => safe_selector(value),
             ("codex", "--remote") => value
                 .strip_prefix("ws://127.0.0.1:")

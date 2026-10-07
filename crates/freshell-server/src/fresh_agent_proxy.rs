@@ -40,6 +40,19 @@ const FIXTURE_MODES_ENV: &str = "FRESHELL_MANAGED_FRESH_AGENT_FIXTURE_MODES";
 const PROVIDER_UID: u32 = 65_534;
 const PROVIDER_GID: u32 = 0;
 
+pub(crate) fn context_for_fresh_provider(
+    mut provider_launch_context: Option<freshell_runtime_protocol::ProviderLaunchContext>,
+) -> Option<freshell_runtime_protocol::ProviderLaunchContext> {
+    if let Some(freshell_runtime_protocol::ProviderLaunchContext {
+        preparation: freshell_runtime_protocol::ProviderPreparation::Claude { mcp_args },
+        ..
+    }) = provider_launch_context.as_mut()
+    {
+        mcp_args.clear();
+    }
+    provider_launch_context
+}
+
 pub(crate) struct HostedFreshAgentProxy {
     client: RuntimeClient,
     broadcast: Arc<broadcast::Sender<String>>,
@@ -486,6 +499,24 @@ impl HostedFreshAgentProxy {
             provider_secret_references = prepared.references;
             let capability = prepared.context.mcp_capability.clone().ok_or(())?;
             (capability, Some(prepared.context))
+        } else if provider == FreshProvider::Codex {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or(())?;
+            let original = |name: &str| std::env::var(name).ok();
+            let context = crate::managed_provider_references::codex::prepare_managed(
+                &soul,
+                &home,
+                &cwd,
+                &workspace,
+                &original,
+                &[],
+                &provider_secret_references,
+            )
+            .map_err(|error| {
+                tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
+            })?;
+            (context.mcp_capability.clone().ok_or(())?, Some(context))
         } else {
             let mcp_capability = crate::managed_mcp_capability::issue_mcp_capability(
                 &soul,
@@ -511,25 +542,7 @@ impl HostedFreshAgentProxy {
                 })?;
             (mcp_capability, provider_launch_context)
         };
-        // Fresh agents use the direct provider transports, which currently do
-        // not inject Freshell's terminal MCP server. Retain ordinary provider
-        // MCP/config files, plugins, and the staged user root; only remove
-        // terminal-specific Freshell injection to match the direct route.
-        if let Some(context) = provider_launch_context.as_mut() {
-            match &mut context.preparation {
-                freshell_runtime_protocol::ProviderPreparation::Claude { mcp_args } => {
-                    mcp_args.clear()
-                }
-                freshell_runtime_protocol::ProviderPreparation::Codex {
-                    tui_args,
-                    sidecar_args,
-                } => {
-                    tui_args.clear();
-                    sidecar_args.clear();
-                }
-                _ => {}
-            }
-        }
+        provider_launch_context = context_for_fresh_provider(provider_launch_context);
         let launch = FreshAgentLaunchSpec {
             session_id: public_session_id.clone(),
             provider: provider.clone(),
