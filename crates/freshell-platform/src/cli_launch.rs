@@ -241,6 +241,20 @@ pub const CLAUDE_SESSION_START_COMMAND_WINDOWS: &str = "powershell.exe -NoLogo -
 /// Built via `serde_json` (the workspace enables `preserve_order`, so key
 /// order is insertion order: `SessionStart` before `Stop`).
 pub fn claude_settings_json(target: ProviderTarget) -> String {
+    claude_settings_value(target).to_string()
+}
+
+/// Validate against the same shipped recipe used by launch construction.
+/// JSON key order is immaterial; additional settings or commands are rejected.
+pub fn is_owned_claude_settings(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw).is_ok_and(|value| {
+        [ProviderTarget::Unix, ProviderTarget::Windows]
+            .into_iter()
+            .any(|target| value == claude_settings_value(target))
+    })
+}
+
+fn claude_settings_value(target: ProviderTarget) -> serde_json::Value {
     let (session_start, bell) = match target {
         ProviderTarget::Windows => (
             CLAUDE_SESSION_START_COMMAND_WINDOWS,
@@ -254,7 +268,6 @@ pub fn claude_settings_json(target: ProviderTarget) -> String {
             "Stop": [{"hooks": [{"type": "command", "command": bell}]}],
         }
     })
-    .to_string()
 }
 
 /// Truthy env lookup (JS `env.X` truthiness: unset and `''` are both falsy).

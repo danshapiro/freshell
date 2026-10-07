@@ -2124,14 +2124,7 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
         }
         let value = args.get(index + 1).ok_or_else(invalid)?;
         let allowed = match (mode, flag) {
-            ("claude", "--settings") => {
-                let digest = format!("{:x}", sha2::Sha256::digest(value.as_bytes()));
-                matches!(
-                    digest.as_str(),
-                    "aa8900bab7bd9bcbb64634d60593a9217c1639b539cea23318122b3428d123c6"
-                        | "d2dcb96c036160b2469bcd732fdc8d767dd481f9c0c864ce47d58ed057652c4d"
-                )
-            }
+            ("claude", "--settings") => freshell_platform::cli_launch::is_owned_claude_settings(value),
             ("claude", "--mcp-config") => matches!(
                 value.as_str(),
                 ".claude/freshell-mcp.json" | "/home/freshell/provider/.claude/freshell-mcp.json"
@@ -3401,6 +3394,35 @@ mod tests {
             durable_managed_terminal_args("claude", args.clone(), None).unwrap(),
             args
         );
+    }
+
+    #[test]
+    fn managed_claude_shipped_hook_recipe_is_accepted_and_custom_hooks_are_rejected() {
+        use freshell_platform::cli_launch::{claude_settings_json, ProviderTarget};
+        for target in [ProviderTarget::Unix, ProviderTarget::Windows] {
+            let settings = claude_settings_json(target);
+            assert!(validate_managed_terminal_args(
+                "claude",
+                &["--settings".into(), settings.clone()]
+            )
+            .is_ok());
+            let mut changed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+            changed["hooks"]["Stop"][0]["hooks"][0]["command"] =
+                serde_json::json!("echo PRIVATE_UNAPPROVED_HOOK");
+            let error = validate_managed_terminal_args(
+                "claude",
+                &["--settings".into(), changed.to_string()],
+            )
+            .unwrap_err();
+            assert!(!error.message.contains("PRIVATE_UNAPPROVED_HOOK"));
+            changed = serde_json::from_str(&settings).unwrap();
+            changed["env"] = serde_json::json!({"API_KEY":"PRIVATE_UNAPPROVED_SETTING"});
+            assert!(validate_managed_terminal_args(
+                "claude",
+                &["--settings".into(), changed.to_string()]
+            )
+            .is_err());
+        }
     }
 
     #[test]
