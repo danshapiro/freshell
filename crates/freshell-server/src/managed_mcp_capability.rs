@@ -4509,7 +4509,24 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let plugin = original.join(".codex/plugins/cache/fixture/probe/1.0.0");
+        let cache = original.join(".codex/plugins/cache/fixture/probe");
+        for version in ["1.9.0", "1.10.0", "zzz"] {
+            let inactive = cache.join(version);
+            std::fs::create_dir_all(inactive.join(".codex-plugin")).unwrap();
+            std::fs::create_dir_all(inactive.join("skills/obsolete")).unwrap();
+            std::fs::write(
+                inactive.join(".codex-plugin/plugin.json"),
+                r#"{"name":"probe","skills":"./skills"}"#,
+            )
+            .unwrap();
+            std::fs::write(inactive.join("skills/obsolete/SKILL.md"), "---\nname: obsolete-probe\ndescription: Inactive version control\n---\nInactive resource.\n").unwrap();
+        }
+        std::os::unix::fs::symlink(
+            "absent-obsolete-target",
+            cache.join("1.9.0/obsolete-resource"),
+        )
+        .unwrap();
+        let plugin = cache.join("local");
         std::fs::create_dir_all(plugin.join(".codex-plugin")).unwrap();
         std::fs::create_dir_all(plugin.join("skills/probe/scripts/node_modules/probe-dependency"))
             .unwrap();
@@ -4592,8 +4609,28 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         for unit in &inputs.resource_mounts {
             let destination = Path::new(&unit.effective_destination);
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-            std::os::unix::fs::symlink(physical.join(&unit.provider_relative_path), destination)
+            if destination == plugin
+                || destination == physical.join(".codex/plugins/cache/fixture/probe/local")
+            {
+                // Real Docker directory mounts have directory inodes. Native
+                // Codex intentionally ignores version-directory symlinks.
+                copy_environment(
+                    &[CopySelection {
+                        source: physical.join(&unit.provider_relative_path),
+                        destination_relative: destination.file_name().unwrap().into(),
+                    }],
+                    destination.parent().unwrap(),
+                    &[],
+                    CopyLimits::default(),
+                )
                 .unwrap();
+            } else {
+                std::os::unix::fs::symlink(
+                    physical.join(&unit.provider_relative_path),
+                    destination,
+                )
+                .unwrap();
+            }
         }
         let version = std::process::Command::new("/usr/local/bin/codex")
             .arg("--version")
@@ -4702,6 +4739,15 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         assert!(
             found,
             "native Codex must discover the transported project skill"
+        );
+        assert!(
+            !skills["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|data| data["skills"].as_array().unwrap())
+                .any(|skill| skill["name"] == "probe:obsolete-probe"),
+            "native local installation must win over all inactive versions"
         );
         let installed = skills["data"]
             .as_array()

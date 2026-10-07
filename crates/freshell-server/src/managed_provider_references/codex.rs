@@ -548,7 +548,7 @@ pub fn discover(
                     "Codex selected installed plugin is unavailable; repair installation and retry",
                 );
             }
-            resources.push(cache);
+            resources.push(active_plugin_version(&cache)?);
             let data = manifest
                 .codex_home
                 .join("plugins/data")
@@ -571,6 +571,56 @@ pub fn discover(
         inputs,
         resource_roots: resources,
     })
+}
+fn active_plugin_version(cache: &Path) -> Result<PathBuf, &'static str> {
+    let entries = std::fs::read_dir(cache).map_err(|_| {
+        "Codex selected installed plugin versions are unreadable; repair installation and retry"
+    })?;
+    let mut versions = Vec::new();
+    let mut count = 0usize;
+    let mut metadata_bytes = 0usize;
+    for entry in entries {
+        count += 1;
+        if count > freshell_platform::provider_environment::CopyLimits::default().max_entries {
+            return Err("Codex installed plugin version entry budget exceeded");
+        }
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        metadata_bytes = metadata_bytes
+            .checked_add(name.len())
+            .ok_or("Codex installed plugin version metadata overflow")?;
+        if metadata_bytes > 64 * 1024 * 1024 {
+            return Err("Codex installed plugin version metadata budget exceeded");
+        }
+        if !name.is_empty()
+            && name != "."
+            && name != ".."
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".+_-".contains(&byte))
+        {
+            versions.push(name);
+        }
+    }
+    versions.sort_by(|left, right| {
+        match (semver::Version::parse(left), semver::Version::parse(right)) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            _ => left.cmp(right),
+        }
+    });
+    let selected = versions
+        .iter()
+        .find(|name| name.as_str() == "local")
+        .or_else(|| versions.last())
+        .ok_or(
+            "Codex selected installed plugin has no active version; repair installation and retry",
+        )?;
+    Ok(cache.join(selected))
 }
 fn exists(path: &Path) -> Result<bool, &'static str> {
     match std::fs::symlink_metadata(path) {
@@ -739,6 +789,81 @@ mod tests {
             .resource_roots
             .iter()
             .any(|root| root.starts_with(home.join(".codex/plugins"))));
+    }
+
+    #[test]
+    fn managed_provider_codex_active_plugin_version_excludes_obsolete_resources() {
+        use freshell_platform::{
+            codex_inputs::CodexInputManifest,
+            provider_environment::{copy_environment, CopyLimits, CopySelection},
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let cache = home.join(".codex/plugins/cache/fixture/probe");
+        std::fs::create_dir_all(&cwd).unwrap();
+        for version in ["1.9.0", "1.10.0", "local", "zzz"] {
+            let package = cache.join(version);
+            std::fs::create_dir_all(package.join("scripts/node_modules/probe-dependency")).unwrap();
+            std::fs::write(package.join("scripts/resource"), version).unwrap();
+            std::fs::write(
+                package.join("scripts/node_modules/probe-dependency/index.js"),
+                "module.exports='version-dependency'",
+            )
+            .unwrap();
+            std::fs::write(package.join("scripts/probe.cjs"), "process.stdout.write(require('node:fs').readFileSync(__dirname+'/resource')+'|'+require('probe-dependency'))").unwrap();
+        }
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"probe@fixture\"]\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "absent-obsolete-target",
+            cache.join("1.9.0/obsolete-resource"),
+        )
+        .unwrap();
+        for (index, expected) in ["local", "zzz", "1.10.0"].into_iter().enumerate() {
+            let found = discover(CodexInputManifest {
+                version: 1,
+                original_home: home.clone(),
+                cwd: cwd.clone(),
+                codex_home: home.join(".codex"),
+                named_profile: None,
+            })
+            .unwrap();
+            let stage = owned.path().join(format!("active-stage-{index}"));
+            let roots = found
+                .resource_roots
+                .iter()
+                .filter(|root| root.starts_with(&cache))
+                .collect::<Vec<_>>();
+            assert_eq!(roots.len(), 1);
+            copy_environment(
+                &[CopySelection {
+                    source: roots[0].clone(),
+                    destination_relative: "plugin".into(),
+                }],
+                &stage,
+                &[],
+                CopyLimits::default(),
+            )
+            .expect("inactive broken resource must not block the selected complete package");
+            let output = std::process::Command::new("node")
+                .arg(stage.join("plugin/scripts/probe.cjs"))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout,
+                format!("{expected}|version-dependency").as_bytes()
+            );
+            // Remove only this test's synthetic, read fixtures after each consumer.
+            if expected != "1.10.0" {
+                std::fs::remove_dir_all(cache.join(expected)).unwrap();
+            }
+        }
     }
 
     #[test]

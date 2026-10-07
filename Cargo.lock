@@ -1470,6 +1470,7 @@ dependencies = [
  "rusqlite",
  "saphyr",
  "saphyr-parser",
+ "semver",
  "serde",
  "serde_json",
  "sha1",
