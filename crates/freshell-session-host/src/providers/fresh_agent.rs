@@ -531,6 +531,11 @@ impl FreshAgentTransport for HostedTransport {
             }
             None => None,
         };
+        if matches!(self.provider, FreshProvider::Claude | FreshProvider::Kilroy) {
+            // The Claude adapter's live registration is indexed by the native
+            // UUID. The temporary SDK create key is not a live-session lookup.
+            *self.session_id.lock().await = native_session_id.clone();
+        }
         Ok(TransportStart { native_session_id })
     }
 
@@ -1709,10 +1714,11 @@ mod tests {
             let ProviderState::Claude(state) = &transport.state else {
                 unreachable!()
             };
-            state
-                .handle_create(create_request_for_profile(&profile), None)
-                .await;
+            let started = transport.start(&profile).await.unwrap();
             let created = transport.wait_created().await.unwrap();
+            assert_eq!(started.native_session_id, profile.native_session_id);
+            let observed_live = transport.is_live().await;
+            let observed_evidence = transport.native_identity_evidence().await;
             let mut receiver = transport.native_rx.lock().await;
             let native = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -1728,6 +1734,11 @@ mod tests {
             .unwrap_or(None);
             drop(receiver);
             state.shutdown().await;
+            assert!(
+                observed_live,
+                "the observed native session must remain a live host transport after startup"
+            );
+            assert!(observed_evidence.is_some());
             assert_ne!(
                 created,
                 profile.native_session_id.clone().unwrap(),
