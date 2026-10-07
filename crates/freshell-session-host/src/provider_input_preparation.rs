@@ -114,13 +114,32 @@ pub fn prepare(
     }
     for flag in &manifest.native_source_flags {
         let name = flag.kind.variable();
-        if !inputs
-            .config_binds
-            .iter()
-            .any(|bind| bind.logical_destination == flag.runtime_destination)
-            || generated.contains_key(name)
-            || secrets.environment.contains_key(name)
-        {
+        let has_bind = inputs.config_binds.iter().any(|bind| {
+            std::path::Path::new(&bind.logical_destination)
+                == freshell_platform::opencode_config::lexical_path(std::path::Path::new(
+                    &flag.runtime_destination,
+                ))
+        });
+        let approved = if let Some(ordinal) = flag.source_ordinal {
+            manifest
+                .sources
+                .get(usize::from(ordinal))
+                .is_some_and(|source| {
+                    source.native_destination.as_deref() == Some(flag.runtime_destination.as_str())
+                        && match flag.kind {
+                            freshell_platform::opencode_recipe::NativeSourceFlagKind::Main => {
+                                source.lane == SourceLane::Main
+                            }
+                            freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui => {
+                                source.lane == SourceLane::Tui
+                            }
+                        }
+                        && (source.original_form || has_bind)
+                })
+        } else {
+            has_bind
+        };
+        if !approved || generated.contains_key(name) || secrets.environment.contains_key(name) {
             return Err("prepared native source selector has no approved config bind or collides with child input".into());
         }
         budget
@@ -243,6 +262,7 @@ mod tests {
             original_home: "/original-unavailable/home".into(),
             sources: vec![SourceView {
                 logical_path: "/original-unavailable/project/opencode.json".into(),
+                native_destination: Some("/original-unavailable/project/opencode.json".into()),
                 lane: SourceLane::Main,
                 unexpanded_relative_path: ".freshell/source-views/source-0".into(),
                 template_relative_path: ".freshell/templates/source-0".into(),
@@ -263,6 +283,7 @@ mod tests {
             rebind_enabled: true,
             native_source_flags: vec![NativeSourceFlag {
                 kind: NativeSourceFlagKind::Main,
+                source_ordinal: Some(0),
                 runtime_destination: "/original-unavailable/project/opencode.json".into(),
             }],
             files: vec![SelectedSourceFile {
@@ -331,6 +352,47 @@ mod tests {
             Some("/original-unavailable/project/opencode.json"),
             "an explicitly selected native source must be delivered to the actual child environment");
         assert!(!generated.contains_key("INSERT"),"independent generated recipes do not forward an original ambient variable into the native child");
+        // Original-form shared configurations have approved native source
+        // identity but deliberately no replacement config bind.
+        manifest.sources[0].original_form = true;
+        manifest.sources[0].generated_name = None;
+        let binds = std::mem::take(&mut context.prepared_inputs.as_mut().unwrap().config_binds);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
+        let original = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+            .expect("native selection of an approved original-form source cannot require a replacement bind");
+        assert_eq!(
+            original.get("OPENCODE_CONFIG").map(String::as_str),
+            Some("/original-unavailable/project/opencode.json")
+        );
+        let approved_flag = manifest.native_source_flags[0].clone();
+        for invalid in [0, 1, 2] {
+            manifest.native_source_flags[0] = approved_flag.clone();
+            match invalid {
+                0 => {
+                    manifest.native_source_flags[0].runtime_destination =
+                        "/unapproved/source.json".into()
+                }
+                1 => manifest.native_source_flags[0].source_ordinal = Some(42),
+                _ => manifest.native_source_flags[0].kind = NativeSourceFlagKind::Tui,
+            }
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+            context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+                format!("{:x}", Sha256::digest(&bytes));
+            let error = prepare(Some(&context), &mut secrets, &frozen, &stage, &home).unwrap_err();
+            assert!(!error.contains("/unapproved/source.json"));
+        }
+        manifest.native_source_flags[0] = approved_flag;
+        manifest.sources[0].original_form = false;
+        manifest.sources[0].generated_name = Some("FRESHELL_CONFIG_REFERENCE_0".into());
+        context.prepared_inputs.as_mut().unwrap().config_binds = binds;
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
         std::fs::create_dir_all(stage.join(".freshell/templates")).unwrap();
         let inline_template = "{env:FRESHELL_CONFIG_REFERENCE_0}";
         std::fs::write(stage.join(".freshell/templates/source-0"), inline_template).unwrap();

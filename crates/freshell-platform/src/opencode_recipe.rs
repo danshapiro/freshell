@@ -52,6 +52,8 @@ fn default_rebind_enabled() -> bool {
 pub struct NativeSourceFlag {
     pub kind: NativeSourceFlagKind,
     pub runtime_destination: String,
+    #[serde(default)]
+    pub source_ordinal: Option<u16>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,6 +73,8 @@ impl NativeSourceFlagKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceView {
     pub logical_path: PathBuf,
+    #[serde(default)]
+    pub native_destination: Option<String>,
     pub lane: SourceLane,
     pub unexpanded_relative_path: String,
     pub template_relative_path: String,

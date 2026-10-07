@@ -106,8 +106,15 @@ pub(super) fn resolve_file_references_from_view(
         env,
         recipe_ordinal,
         allocate,
-        &std::collections::BTreeMap::new(),
+        ReferenceProjection {
+            relocated_files: &std::collections::BTreeMap::new(),
+            original_form: false,
+        },
     )
+}
+pub(super) struct ReferenceProjection<'a> {
+    pub relocated_files: &'a std::collections::BTreeMap<PathBuf, PathBuf>,
+    pub original_form: bool,
 }
 pub(super) fn resolve_file_references_from_view_relocated(
     raw: &str,
@@ -116,7 +123,7 @@ pub(super) fn resolve_file_references_from_view_relocated(
     env: &dyn Fn(&str) -> Option<String>,
     recipe_ordinal: usize,
     allocate: &mut dyn FnMut(&Path) -> Result<String, &'static str>,
-    relocated_files: &std::collections::BTreeMap<PathBuf, PathBuf>,
+    projection: ReferenceProjection<'_>,
 ) -> Result<ResolvedFileReferencePlan, ReferenceError> {
     use freshell_platform::opencode_config::{
         file_reference_path, transform_file_tokens, TokenTransformError,
@@ -171,7 +178,7 @@ pub(super) fn resolve_file_references_from_view_relocated(
             origin.cwd,
             origin.original_home,
         );
-        let physical_source = relocated_files.get(&path).unwrap_or(&path);
+        let physical_source = projection.relocated_files.get(&path).unwrap_or(&path);
         let canonical = std::fs::canonicalize(physical_source).map_err(|_| {
             fail(
                 token.ordinal,
@@ -263,7 +270,9 @@ pub(super) fn resolve_file_references_from_view_relocated(
     }
     let transformed_length = transformed.len();
     drop(transformed);
-    let (template, recipes) = if generated {
+    let (template, recipes) = if projection.original_form {
+        (raw.to_owned(), Vec::new())
+    } else if generated {
         let generated_name =
             freshell_platform::opencode_config::generated_config_reference_name(recipe_ordinal);
         if transformed_length > 64 * 1024 {
@@ -304,7 +313,7 @@ pub(super) fn resolve_file_references_from_view_relocated(
     };
     Ok(ResolvedFileReferencePlan {
         template,
-        unexpanded_direct_source: (!generated)
+        unexpanded_direct_source: (!generated || projection.original_form)
             .then(|| source_view.unwrap_or_else(|| std::sync::Arc::new(raw.to_owned()))),
         selections,
         referenced_variables: variables.into_inner().into_iter().collect(),
@@ -873,15 +882,19 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
                 } else {
                     cwd.join(path)
                 };
-                if !loaded
+                let source_ordinal = loaded
                     .iter()
-                    .any(|source| source.source.logical_path == path)
-                {
-                    return Err(format!("selected {name} source is missing or unavailable; repair it before dispatch"));
-                }
+                    .position(|source| source.source.logical_path == path && match kind {
+                        freshell_platform::opencode_recipe::NativeSourceFlagKind::Main => source.source.lane == SourceLane::Main,
+                        freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui => source.source.lane == SourceLane::Tui,
+                    }).ok_or_else(|| format!("selected {name} source is missing or unavailable; repair it before dispatch"))?;
                 let destination = sources::runtime_config_destination(home, &config_root, &path);
                 flags.push(freshell_platform::opencode_recipe::NativeSourceFlag {
                     kind,
+                    source_ordinal: Some(
+                        u16::try_from(source_ordinal)
+                            .map_err(|_| "native source ordinal overflow")?,
+                    ),
                     runtime_destination: destination
                         .to_str()
                         .ok_or("selected native source destination is not UTF-8")?

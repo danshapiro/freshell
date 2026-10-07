@@ -808,7 +808,7 @@ pub fn file_reference_path(
     lexical_path(&parent.join(path))
 }
 
-fn lexical_path(path: &Path) -> PathBuf {
+pub fn lexical_path(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut result = PathBuf::new();
     for component in path.components() {

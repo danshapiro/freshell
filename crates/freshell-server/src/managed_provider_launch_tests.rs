@@ -283,7 +283,49 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
         .await
         .unwrap()
         .unwrap();
-    let cwd = fixture.join("workspace").to_string_lossy().into_owned();
+    let nested = fixture.join("workspace/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(fixture.join("workspace"))
+        .status()
+        .unwrap()
+        .success());
+    let shared_source = fixture.join("workspace/shared.json");
+    let shared_receipt = fixture.join("workspace/shared-origin-consumed.json");
+    let shared_bytes = serde_json::to_vec(&json!({"agent":{"probe":{"prompt":"{env:OPENAI_API_KEY}"}}, "plugin":[["./shared-probe.mjs", {"receipt":shared_receipt}]]})).unwrap();
+    for (directory, label) in [
+        (fixture.join("workspace"), "root"),
+        (nested.clone(), "nested"),
+    ] {
+        let plugin = format!(
+            r#"import fs from 'node:fs';import crypto from 'node:crypto';
+export default {{id:'closed-shared-{label}',async server(input,options){{return {{async config(config){{
+ let receipt=fs.existsSync(options.receipt)?JSON.parse(fs.readFileSync(options.receipt,'utf8')):{{}};
+ receipt.{label}=crypto.createHash('sha256').update(fs.readFileSync(new URL('./rules.txt',import.meta.url))).digest('hex');
+ fs.writeFileSync(options.receipt,JSON.stringify(receipt));
+}}}}}}}};
+"#
+        );
+        std::fs::write(directory.join("shared-probe.mjs"), plugin).unwrap();
+    }
+    std::fs::write(&shared_source, &shared_bytes).unwrap();
+    std::os::unix::fs::symlink("shared.json", fixture.join("workspace/opencode.json")).unwrap();
+    std::os::unix::fs::symlink("../shared.json", nested.join("opencode.json")).unwrap();
+    for (path, bytes) in [
+        (
+            fixture.join("workspace/rules.txt"),
+            b"native-shared-root-rule".as_slice(),
+        ),
+        (
+            nested.join("rules.txt"),
+            b"native-shared-nested-rule".as_slice(),
+        ),
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let cwd = nested.to_string_lossy().into_owned();
     let original_config = fixture.join("source-home/.config/opencode/opencode.json");
     let original_bytes = std::fs::read(&original_config).unwrap();
     let explicit_config = fixture.join("workspace/selected-config.json");
@@ -307,11 +349,7 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
     let inline_source = r#"{ // inline instance origin
 "agent":{"probe":{"description":"{env:INLINE_VALUE}"}}}"#;
     let inline_value = "INLINE_PREFIX{file:./inline-rule}INLINE_SUFFIX";
-    std::fs::write(
-        fixture.join("workspace/inline-rule"),
-        "native-inline-selected-rule\n",
-    )
-    .unwrap();
+    std::fs::write(nested.join("inline-rule"), "native-inline-selected-rule\n").unwrap();
 
     let request: ManagedTerminalLaunch = ManagedTerminalLaunch {
         spec: freshell_platform::spawn::SpawnSpec {
@@ -323,8 +361,8 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
             rows: 30,
         },
         env: BTreeMap::from([
-            ("OPENCODE_CONFIG".into(), "selected-config.json".into()),
-            ("OPENCODE_TUI_CONFIG".into(), "selected-tui.jsonc".into()),
+            ("OPENCODE_CONFIG".into(), "../selected-config.json".into()),
+            ("OPENCODE_TUI_CONFIG".into(), "../selected-tui.jsonc".into()),
             ("OPENCODE_CONFIG_CONTENT".into(), inline_source.into()),
             ("INLINE_VALUE".into(), inline_value.into()),
         ]),
@@ -359,7 +397,7 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
         .await
         .map_err(|_| "actual pinned provider startup did not consume selected config and closure")
     }
-    let expected = json!({"prompt":format!("{:x}",Sha256::digest(b"AUTH_PREFIXnative-ruleAUTH_SUFFIX")),
+    let expected = json!({"prompt":format!("{:x}",Sha256::digest(b"AUTH_PREFIXnative-shared-nested-ruleAUTH_SUFFIX")),
         "description":format!("{:x}",Sha256::digest(b"INLINE_PREFIXnative-inline-selected-ruleINLINE_SUFFIX")),
         "references":(["third","fourth","fifth","sixth"].map(|ordinal|format!("{:x}",Sha256::digest(format!("native-{ordinal}-rule").as_bytes())))),
         "resource":format!("{:x}",Sha256::digest(b"plugin-relative-resource")),
@@ -406,6 +444,10 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
     };
     assert_eq!(terminal_receipt, expected);
     assert_eq!(
+        read_receipt(&shared_receipt).await.unwrap(),
+        json!({"root":format!("{:x}",Sha256::digest(b"native-shared-root-rule")),"nested":format!("{:x}",Sha256::digest(b"native-shared-nested-rule"))})
+    );
+    assert_eq!(
         read_receipt(&tui_receipt)
             .await
             .expect("actual TUI plugin must consume the selected effective TUI configuration"),
@@ -420,6 +462,17 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
         json!({"provider":"opencode","route":"terminal-tui","digest":format!("{:x}",Sha256::digest(b"dark"))})
     );
     assert_eq!(std::fs::read(&original_config).unwrap(), original_bytes);
+    assert_eq!(std::fs::read(&shared_source).unwrap(), shared_bytes);
+    assert!(
+        std::fs::symlink_metadata(fixture.join("workspace/opencode.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(std::fs::symlink_metadata(nested.join("opencode.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
     assert_eq!(std::fs::read(&explicit_config).unwrap(), explicit_bytes);
     println!(
         "provider_launch_consumer {}",
@@ -430,6 +483,7 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
         .await
         .unwrap();
     std::fs::remove_file(&receipt).unwrap();
+    std::fs::remove_file(&shared_receipt).unwrap();
     // Fresh launches use current server controls; the terminal exercised a
     // request-only relative control. Both must activate the explicit layer.
     std::env::set_var("OPENCODE_CONFIG", &explicit_config);
@@ -478,7 +532,22 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
         .dispatch(HostedFreshAgentCommand::Send(send))
         .await;
     assert_eq!(read_receipt(&receipt).await.unwrap(), fresh_expected);
+    assert_eq!(
+        read_receipt(&shared_receipt).await.unwrap(),
+        json!({"root":format!("{:x}",Sha256::digest(b"native-shared-root-rule")),"nested":format!("{:x}",Sha256::digest(b"native-shared-nested-rule"))})
+    );
     assert_eq!(std::fs::read(&original_config).unwrap(), original_bytes);
+    assert_eq!(std::fs::read(&shared_source).unwrap(), shared_bytes);
+    assert!(
+        std::fs::symlink_metadata(fixture.join("workspace/opencode.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(std::fs::symlink_metadata(nested.join("opencode.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
     assert_eq!(std::fs::read(&explicit_config).unwrap(), explicit_bytes);
     let stopped = fixture.join("workspace/native-consumed.json.stopped");
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -512,6 +581,8 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
                     b"native-rule".as_slice(),
                     b"native-explicit-selected-rule".as_slice(),
                     b"native-inline-selected-rule".as_slice(),
+                    b"native-shared-root-rule".as_slice(),
+                    b"native-shared-nested-rule".as_slice(),
                     b"INLINE_PREFIX".as_slice(),
                     b"AUTH_INLINE_SHADOW_NO_FILE".as_slice(),
                     b"synthetic-onecli-shadowed".as_slice(),

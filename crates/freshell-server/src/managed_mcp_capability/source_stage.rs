@@ -98,6 +98,16 @@ pub(super) fn stage(
         }
         manifest.sources.push(SourceView {
             logical_path: source.source.logical_path.clone(),
+            native_destination: Some(
+                crate::managed_provider_references::sources::runtime_config_destination(
+                    home,
+                    input.config_root.unwrap_or(&home.join(".config/opencode")),
+                    &source.source.logical_path,
+                )
+                .to_str()
+                .ok_or("native source destination is not UTF-8")?
+                .into(),
+            ),
             lane: match source.source.lane {
                 SourceLane::Main => freshell_platform::opencode_recipe::SourceLane::Main,
                 SourceLane::Tui => freshell_platform::opencode_recipe::SourceLane::Tui,
@@ -120,7 +130,7 @@ pub(super) fn stage(
             occurrences: source.references.occurrences.clone(),
             referenced_variables: source.references.referenced_variables.clone(),
             path_variables: source.references.path_variables.clone(),
-            original_form: false,
+            original_form: source.original_form,
         });
     }
     for (expected, (source_id, canonical_source)) in files.into_iter().enumerate() {
@@ -155,27 +165,16 @@ pub(super) fn describe(
     let mut sources = BTreeMap::new();
     let mut binds = Vec::new();
     let mut recipes = 0usize;
-    let mut canonical_occurrences = BTreeMap::<&Path, usize>::new();
-    for occurrence in plan {
-        *canonical_occurrences
-            .entry(&occurrence.source.canonical_source)
-            .or_default() += 1;
-    }
+    let mut aliases = Vec::new();
+    let mut alias_sources = BTreeMap::new();
     for (ordinal, occurrence) in plan.iter().enumerate() {
-        if occurrence.source.lane != SourceLane::Inline
-            && canonical_occurrences[occurrence.source.canonical_source.as_path()] > 1
-        {
-            return Err(
-                "shared source preparation requires its original-form aliases before publication"
-                    .into(),
-            );
-        }
-        if occurrence.source.lane != SourceLane::Inline {
+        if occurrence.source.lane != SourceLane::Inline && !occurrence.original_form {
             let logical = &occurrence.source.logical_path;
-            let destination =
-                crate::managed_provider_references::sources::runtime_config_destination(
+            let destination = freshell_platform::opencode_config::lexical_path(
+                &crate::managed_provider_references::sources::runtime_config_destination(
                     home, global, logical,
-                );
+                ),
+            );
             let effective = if let Ok(relative) = logical.strip_prefix(&global) {
                 let physical = std::fs::canonicalize(root.join(relative))
                     .map_err(|_| "selected global config is unavailable in its private stage")?;
@@ -224,6 +223,48 @@ pub(super) fn describe(
                 return Err("selected source identity changed under one index".into());
             }
         }
+        if occurrence.original_form {
+            for approved in &occurrence.references.occurrences {
+                let source_id = approved
+                    .runtime_destination
+                    .strip_prefix("/home/freshell/provider/.freshell/references/")
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .ok_or("original-form alias has no approved source index")?;
+                let selected = sources
+                    .get(&source_id)
+                    .ok_or("original-form alias index is unavailable")?;
+                let logical =
+                    crate::managed_provider_references::sources::runtime_config_destination(
+                        home,
+                        global,
+                        &approved.approved_alias,
+                    );
+                let effective =
+                    crate::managed_provider_references::sources::runtime_config_destination(
+                        home, global, selected,
+                    );
+                if let Some(prior) = alias_sources.insert(logical.clone(), source_id) {
+                    if prior != source_id {
+                        return Err("shared source has conflicting private alias selections; reprepare before dispatch".into());
+                    }
+                    continue;
+                }
+                if aliases.len() >= 256 {
+                    return Err("configuration alias count exceeds 256".into());
+                }
+                aliases.push(IndexedProviderFileAlias {
+                    source_id,
+                    logical_destination: logical
+                        .to_str()
+                        .ok_or("alias destination is not UTF-8")?
+                        .into(),
+                    effective_destination: effective
+                        .to_str()
+                        .ok_or("alias destination is not UTF-8")?
+                        .into(),
+                });
+            }
+        }
     }
     let mut file = std::fs::File::open(root.join(".freshell/input-manifest.json"))
         .map_err(|_| "prepared source manifest unavailable")?
@@ -254,14 +295,14 @@ pub(super) fn describe(
             sha256: format!("{:x}", hash.finalize()),
             source_count: u16::try_from(sources.len())
                 .map_err(|_| "selected source count overflow")?,
-            alias_count: 0,
+            alias_count: u16::try_from(aliases.len()).map_err(|_| "source alias count overflow")?,
             recipe_count: u16::try_from(recipes).map_err(|_| "recipe count overflow")?,
         },
         config_binds: binds,
         resource_mounts: Vec::new(),
         indexed_files: (!sources.is_empty()).then(|| IndexedProviderFiles {
             volume_name: indexed_provider_volume_name(soul, &capability.grant_id),
-            aliases: Vec::new(),
+            aliases,
         }),
     };
     inputs

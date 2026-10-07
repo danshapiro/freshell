@@ -200,6 +200,7 @@ fn add_source(
 pub struct PlannedSourceOccurrence {
     pub source: SourceOccurrence,
     pub references: super::ResolvedFileReferencePlan,
+    pub original_form: bool,
 }
 
 pub struct LoadedSourceOccurrence {
@@ -333,6 +334,12 @@ pub fn plan_loaded_opencode_sources_relocated(
     relocated_files: &std::collections::BTreeMap<PathBuf, PathBuf>,
 ) -> Result<Vec<PlannedSourceOccurrence>, super::ReferenceError> {
     let original_names = source_environment_names(&sources)?;
+    let mut canonical_occurrences = std::collections::BTreeMap::new();
+    for source in &sources {
+        *canonical_occurrences
+            .entry(source.source.canonical_source.clone())
+            .or_insert(0usize) += 1;
+    }
     let mut result = Vec::new();
     let mut selected = std::collections::BTreeMap::<PathBuf, String>::new();
     let mut selected_bytes = 0u64;
@@ -343,6 +350,8 @@ pub fn plan_loaded_opencode_sources_relocated(
     let mut retained_view_bytes = 0usize;
     for (ordinal, loaded) in sources.into_iter().enumerate() {
         let source = loaded.source;
+        let original_form = source.lane != SourceLane::Inline
+            && canonical_occurrences[&source.canonical_source] > 1;
         let fail = |cause| super::ReferenceError {
             operation: "read",
             field: "OpenCode source",
@@ -351,6 +360,19 @@ pub fn plan_loaded_opencode_sources_relocated(
             variables: vec![],
             cause,
         };
+        for index in 0..freshell_platform::opencode_config::MAX_GENERATED_CONFIG_REFERENCES {
+            if lookup(
+                source.lane,
+                &source.logical_path,
+                &freshell_platform::opencode_config::generated_config_reference_name(index),
+            )
+            .is_some()
+            {
+                return Err(fail(
+                    "original or source-specific input occupies the reserved generated namespace",
+                ));
+            }
+        }
         let mut allocate = |canonical: &Path| {
             if let Some(destination) = selected.get(canonical) {
                 return Ok(destination.clone());
@@ -386,7 +408,10 @@ pub fn plan_loaded_opencode_sources_relocated(
             &|name| lookup(source.lane, &source.logical_path, name),
             recipe_count,
             &mut allocate,
-            relocated_files,
+            super::ReferenceProjection {
+                relocated_files,
+                original_form,
+            },
         )?;
         if references
             .recipes
@@ -428,7 +453,11 @@ pub fn plan_loaded_opencode_sources_relocated(
                 "combined source recipe, alias, variable or event limit exceeded",
             ));
         }
-        result.push(PlannedSourceOccurrence { source, references });
+        result.push(PlannedSourceOccurrence {
+            source,
+            references,
+            original_form,
+        });
     }
     Ok(result)
 }
@@ -670,10 +699,20 @@ mod tests {
             plan[0].references.selections[0].runtime_destination,
             plan[1].references.selections[0].runtime_destination
         );
-        assert_ne!(
-            plan[0].references.recipes[0].generated_name,
-            plan[1].references.recipes[0].generated_name
-        );
+        for source in &plan {
+            assert!(
+                source.original_form,
+                "shared main/TUI source must retain native lane evaluation"
+            );
+            assert!(
+                source.references.recipes.is_empty(),
+                "one shared source cannot receive two lane-specific document wrappers"
+            );
+            assert_eq!(
+                source.references.unexpanded_source(),
+                "{\"instructions\":[\"{env:INSERT}\"]}"
+            );
+        }
         let collision = plan_opencode_sources(
             sources(),
             owned.path(),

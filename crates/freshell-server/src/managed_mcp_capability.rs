@@ -3793,6 +3793,110 @@ except Exception as error:
     }
 
     #[tokio::test]
+    async fn managed_provider_shared_workspace_sources_keep_original_form_and_private_aliases() {
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let cwd = workspace.join("nested");
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let raw = r#"{"agent":{"probe":{"prompt":"{file:./rules}"}}}"#;
+        let shared = workspace.join("shared.json");
+        std::fs::write(&shared, raw).unwrap();
+        std::os::unix::fs::symlink("shared.json", workspace.join("opencode.json")).unwrap();
+        std::os::unix::fs::symlink("../shared.json", cwd.join("opencode.json")).unwrap();
+        std::fs::write(workspace.join("rules"), "PRIVATE_ROOT_ORIGIN").unwrap();
+        std::fs::write(cwd.join("rules"), "PRIVATE_NESTED_ORIGIN").unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let prepared = crate::managed_provider_references::prepare_managed_opencode_with_publisher(
+            crate::managed_provider_references::OpencodePreparation {
+                client: &client,
+                soul: &soul,
+                creation_seed: "fixture-existing-soul",
+                home: &home,
+                cwd: &cwd,
+                workspace: &workspace,
+                original: &|_| None,
+                references: vec![],
+                auth_authority: Some("fixture-owned-attempt"),
+                selected_sources: None,
+                native_source_flags: None,
+                rebind_enabled: None,
+                inherited_inline: None,
+                inline_edits: None,
+            },
+            |soul, home, context, input| {
+                let capability = store.issue(
+                    soul.clone(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("opencode", home, &context.config)),
+                    OpencodeEphemeralInput {
+                        launch_context: Some(context),
+                        ..input
+                    },
+                    None,
+                )?;
+                read_prepared_context(&directory, &capability)
+            },
+        )
+        .await
+        .expect("representable shared source origins cannot be rejected or flattened");
+        let inputs = prepared.context.prepared_inputs.as_ref().unwrap();
+        assert!(
+            inputs.config_binds.is_empty(),
+            "two origin-dependent rewrites cannot bind over one shared source inode"
+        );
+        let aliases = &inputs.indexed_files.as_ref().unwrap().aliases;
+        assert_eq!(aliases.len(), 2);
+        assert_eq!(
+            aliases
+                .iter()
+                .map(|alias| alias.logical_destination.as_str())
+                .collect::<Vec<_>>(),
+            [
+                workspace.join("rules").to_str().unwrap(),
+                cwd.join("rules").to_str().unwrap()
+            ]
+        );
+        assert_ne!(aliases[0].source_id, aliases[1].source_id);
+        let stage = staged_provider_root_path(
+            &directory,
+            &prepared.context.mcp_capability.as_ref().unwrap().grant_id,
+        )
+        .unwrap();
+        let manifest: freshell_platform::opencode_recipe::SourceManifest = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.sources.len(), 2);
+        for source in manifest.sources {
+            assert!(source.original_form);
+            assert_eq!(
+                std::fs::read_to_string(stage.join(source.unexpanded_relative_path)).unwrap(),
+                raw
+            );
+        }
+        assert_eq!(std::fs::read_to_string(shared).unwrap(), raw);
+        assert!(std::fs::symlink_metadata(workspace.join("opencode.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(cwd.join("opencode.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[tokio::test]
     async fn managed_provider_explicit_native_source_selection_survives_preparation() {
         use freshell_runtime_protocol::*;
         let owned = tempfile::tempdir().unwrap();
