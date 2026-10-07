@@ -432,6 +432,43 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
     } finally { await server.stop(); await fsp.rm(directory, { recursive: true }) }
   })
+  it('captures the actual Rust JSONL msg and bound server PID before removing owned HOME', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    const logging = `const fs=require('node:fs'),path=require('node:path');fs.writeFileSync(path.join(process.env.FRESHELL_LOG_DIR,'rust-server.jsonl'),JSON.stringify({level:'WARN',msg:'fresh_agent.hosted_snapshot_unavailable',server_pid:process.pid,code:'CAPABILITY_PENDING',soul_id:'owned-file-soul',transcript:'file-body-must-not-persist'})+'\\n'+JSON.stringify({level:'WARN',msg:'fresh_agent.hosted_snapshot_unavailable',server_pid:process.pid-1,code:'FOREIGN_PID'})+'\\n');\n`
+    await fsp.writeFile(entry, `${logging}${await fsp.readFile(entry, 'utf8')}`)
+    const diagnostics = vi.fn()
+    const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
+      candidateSha: 'a'.repeat(40), buildDirty: false, setupHome: setup, preserveHomeOnStop: false,
+      env: { NODE_OPTIONS: `--require=${entry}` } }, diagnostics)
+    try {
+      const info = await server.start()
+      await server.stop()
+      const record = diagnostics.mock.calls[0][0]
+      expect(record).toMatchObject({ pid: info.pid, logReadState: 'read',
+        facts: [{ severity: 'warn', event: 'fresh_agent.hosted_snapshot_unavailable', fields: { code: 'CAPABILITY_PENDING', soul_id: 'owned-file-soul' } }] })
+      expect(JSON.stringify(record)).not.toContain('FOREIGN_PID')
+      expect(JSON.stringify(record)).not.toContain('file-body-must-not-persist')
+      await expect(fsp.stat(info.homeDir!)).rejects.toThrow()
+    } finally { await server.stop(); await fsp.rm(directory, { recursive: true }) }
+  })
+  it('surfaces an unreadable owned Rust log after stopping its PID and allows cleanup retry', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
+      candidateSha: 'a'.repeat(40), buildDirty: false, setupHome: setup, preserveHomeOnStop: false,
+      env: { NODE_OPTIONS: `--require=${entry}` } }, vi.fn())
+    let log: string | undefined
+    try {
+      const info = await server.start()
+      log = path.join(info.logsDir!, 'rust-server.jsonl')
+      await fsp.writeFile(log, '{}\n', { mode: 0o000 })
+      await expect(server.stop()).rejects.toMatchObject({ code: 'EACCES' })
+      await expect(fsp.stat(`/proc/${info.pid}`)).rejects.toThrow()
+    } finally {
+      if (log) await fsp.chmod(log, 0o600)
+      await server.stop()
+      await fsp.rm(directory, { recursive: true })
+    }
+  })
   it('reports diagnostic finalizer failure after stopping only its exact owned web child', async () => {
     const { fixture: directory, entry, setup } = await fixture()
     let failed = true

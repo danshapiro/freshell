@@ -197,20 +197,26 @@ export function validateManagedWebProvenance(observed: unknown, candidateSha: st
 
 export type OwnedWebDiagnosticRecord = {
   pid: number; bootAttemptCount: number; ignoredLineCount: number
+  logReadState: 'missing' | 'read'; logFiles: { name: string; bytes: number; sha256: string }[]
   facts: { severity: string; event: string; fields: Record<string, string | number | boolean> }[]
 }
 
-function ownedWebDiagnosticFacts(output: { stdout: string; stderr: string }): Pick<OwnedWebDiagnosticRecord, 'facts' | 'ignoredLineCount'> {
+function ownedWebDiagnosticFacts(output: { stdout: string; stderr: string }, nativeLog?: { text: string; pid: number }): Pick<OwnedWebDiagnosticRecord, 'facts' | 'ignoredLineCount'> {
   const facts: OwnedWebDiagnosticRecord['facts'] = []
   let ignoredLineCount = 0
-  for (const line of `${output.stdout}\n${output.stderr}`.split('\n').filter(value => value.trim())) {
+  const lines = [
+    ...`${output.stdout}\n${output.stderr}`.split('\n').map(line => ({ line, native: false })),
+    ...(nativeLog?.text ?? '').split('\n').map(line => ({ line, native: true })),
+  ].filter(value => value.line.trim())
+  for (const { line, native } of lines) {
     let body: unknown
     try { body = JSON.parse(line) } catch { ignoredLineCount++; continue }
     const parsed = z.object({ level: z.enum(['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']),
       fields: z.record(z.string(), z.unknown()).optional() }).passthrough().safeParse(body)
     if (!parsed.success) { ignoredLineCount++; continue }
     const values = { ...parsed.data, ...parsed.data.fields }
-    const event = values.message ?? values.event
+    if (native && values.server_pid !== nativeLog?.pid) { ignoredLineCount++; continue }
+    const event = values.event ?? values.msg ?? values.message
     if (typeof event !== 'string' || !/^(?:fresh_agent|freshagent|managed_runtime|runtime|server)\.[A-Za-z0-9_.]+$/.test(event)) {
       ignoredLineCount++; continue
     }
@@ -235,6 +241,7 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
   private bootCount = 0
   private homeConfigured = false
   private lastOutput = { stdout: '', stderr: '' }
+  private logsDir?: string
 
   constructor(private readonly options: RuntimeWebConstructOptions,
     private readonly diagnostics?: (record: OwnedWebDiagnosticRecord) => void | Promise<void>) {}
@@ -269,6 +276,7 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
       this.homeConfigured = true
     }
     const logsDir = path.join(configDir, 'logs')
+    this.logsDir = logsDir
     await fsp.mkdir(logsDir, { recursive: true })
     const env: NodeJS.ProcessEnv = {
       ...process.env, ...this.options.env, PORT: String(port), NODE_ENV: 'production', AUTH_TOKEN: token,
@@ -329,10 +337,27 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
     if (this.process) {
       await this.process.stop(signal)
       this.lastOutput = this.process.output()
+      const log = await this.readOwnedRustLogs()
       await this.diagnostics?.({ pid: this.process.identity.pid, bootAttemptCount: this.bootCount,
-        ...ownedWebDiagnosticFacts(this.lastOutput) })
+        logReadState: log.files.length ? 'read' : 'missing', logFiles: log.files,
+        ...ownedWebDiagnosticFacts(this.lastOutput, { text: log.text, pid: this.process.identity.pid }) })
     }
     this.process = undefined
+  }
+  private async readOwnedRustLogs(): Promise<{ text: string; files: OwnedWebDiagnosticRecord['logFiles'] }> {
+    if (!this.logsDir) return { text: '', files: [] }
+    const names = (await fsp.readdir(this.logsDir)).filter(name => /^rust-server\.jsonl(?:\.[1-9][0-9]*)?$/.test(name)).sort()
+    const files: OwnedWebDiagnosticRecord['logFiles'] = []
+    const chunks: string[] = []
+    for (const name of names) {
+      const target = path.join(this.logsDir, name)
+      const stat = await fsp.lstat(target)
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 32 * 1024 * 1024) throw new Error('owned Rust log is not a bounded regular file')
+      const bytes = await fsp.readFile(target)
+      files.push({ name, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') })
+      chunks.push(bytes.toString('utf8'))
+    }
+    return { text: chunks.join('\n'), files }
   }
   async stop(): Promise<void> {
     await this.kill('SIGTERM')
