@@ -7,6 +7,38 @@ import { describe, expect, it } from 'vitest'
 
 import { RestrictedDockerBroker } from '../../../../scripts/testing/runtime-test-broker.js'
 
+it('settles an owner request failure with a structured refusal and closes the exact socket', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'task008-broker-rejection-'))
+  const socket = path.join(root, 'broker.sock')
+  const instance = new RestrictedDockerBroker({
+    realSocketPath: path.join(root, 'unused-daemon.sock'), proxySocketPath: socket,
+    runtimeRootPrefix: path.join(root, 'r'), allowedHostBinaryPaths: new Set(),
+    allowedImageRefs: new Set(), testRunId: 'run-rejection', logPath: path.join(root, 'events.jsonl'),
+  })
+  const local = instance as unknown as { handle(): Promise<void> }
+  local.handle = async () => { throw new Error('private diagnostic must not enter the refusal') }
+  try {
+    await instance.start()
+    const result = await new Promise<string>((resolve) => {
+      const request = http.get({ socketPath: socket, path: '/_ping' })
+      request.on('response', response => {
+        response.resume()
+        response.on('end', () => resolve('unexpected response'))
+      })
+      request.on('error', (error: NodeJS.ErrnoException) => resolve(error.code ?? error.message))
+      request.setTimeout(500, () => request.destroy(new Error('probe timeout')))
+    })
+    expect(result).toBe('ECONNRESET')
+    expect(instance.eventsSnapshot()).toMatchObject([{
+      severity: 'warn', decision: 'block', reason: 'owner_request_failed', unsafeAttempt: false,
+    }])
+    expect(await fs.readFile(path.join(root, 'events.jsonl'), 'utf8')).not.toContain('private diagnostic')
+  } finally {
+    await instance.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 const runtimeDir = '/tmp/owned/r/scenario/x/incarnation-one'
 const actorKey = createHash('sha256').update('installation-one\0soul-one').digest('hex')
 const actorDir = `/tmp/owned/r/scenario/x/souls/${actorKey}/actor`

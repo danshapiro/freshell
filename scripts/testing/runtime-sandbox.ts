@@ -20,6 +20,114 @@ export type RuntimeLimits = {
   pidsMax: number
 }
 
+/** Current owned address; a saved native root alone never certifies LIVE. */
+export type ExactRuntimeHandle = {
+  runId: string
+  candidateSha: string
+  soulId: string
+  incarnationId: string
+  containerId: string
+  hostBootId: string
+  nativeSessionId: string
+}
+
+export type FixtureNativeState = {
+  nativeSessionId: string
+  pendingDecisionId: string | null
+  dispatchCount: number
+  completionCount: number
+}
+
+export type NativeToolEvidence = {
+  requestIds: string[]
+  resultIds: string[]
+  replayCount: number
+}
+
+export type RuntimeHostFacts = {
+  workerPid: number
+  workerLaunchCount: number
+  limits: { cpuMax: string; memoryMax: string; swapMax: string; pidsMax: string }
+  unsafeBrokerAttempts: number
+}
+
+export type RuntimeOwnerInventoryRow = Pick<ExactRuntimeHandle,
+  'soulId' | 'incarnationId' | 'containerId' | 'hostBootId' | 'nativeSessionId'> & { launchState: string }
+
+export interface RuntimeOwnerFactsAdapter {
+  readonly runId: string
+  readonly candidateSha: string
+  inventory(): Promise<readonly RuntimeOwnerInventoryRow[]>
+  receipts(): readonly Pick<BrokerReceipt, 'soulId' | 'incarnationId' | 'containerId'>[]
+  readHostFacts(handle: ExactRuntimeHandle): Promise<unknown>
+}
+
+export async function assertExactRuntimeHandle(
+  owner: Omit<RuntimeOwnerFactsAdapter, 'readHostFacts'>, handle: ExactRuntimeHandle,
+): Promise<void> {
+  if (handle.runId !== owner.runId || handle.candidateSha !== owner.candidateSha
+    || !/^[a-f0-9]{40}$/.test(handle.candidateSha) || !/^[a-f0-9]{64}$/.test(handle.containerId)
+    || ['runId', 'soulId', 'incarnationId', 'hostBootId', 'nativeSessionId'].some(
+      (key) => typeof handle[key as keyof ExactRuntimeHandle] !== 'string' || !handle[key as keyof ExactRuntimeHandle].trim(),
+    )) throw new Error('exact owned runtime handle required')
+  if (!owner.receipts().some((receipt) => receipt.containerId === handle.containerId
+    && receipt.soulId === handle.soulId && receipt.incarnationId === handle.incarnationId)) {
+    throw new Error('runtime handle has no exact owned broker receipt')
+  }
+  const rows = (await owner.inventory()).filter((row) => row.soulId === handle.soulId)
+  const row = rows[0]
+  if (rows.length !== 1 || row.launchState !== 'running'
+    || row.incarnationId !== handle.incarnationId || row.containerId !== handle.containerId
+    || row.hostBootId !== handle.hostBootId || row.nativeSessionId !== handle.nativeSessionId) {
+    throw new Error('runtime handle is not the current exact owned incarnation and root')
+  }
+}
+
+function objectFields(value: unknown, reason: string): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(reason)
+  return value as Record<string, unknown>
+}
+
+function nonnegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+export function decodeFixtureNativeState(value: unknown, nativeSessionId: string): FixtureNativeState {
+  const state = objectFields(value, 'invalid native fixture state')
+  if (!nativeSessionId || state.nativeSessionId !== nativeSessionId
+    || !(state.pendingDecisionId === null || (typeof state.pendingDecisionId === 'string' && state.pendingDecisionId.length > 0))
+    || !nonnegativeInteger(state.dispatchCount) || !nonnegativeInteger(state.completionCount)) {
+    throw new Error('invalid or conflicting native fixture state')
+  }
+  return {
+    nativeSessionId, pendingDecisionId: state.pendingDecisionId,
+    dispatchCount: state.dispatchCount, completionCount: state.completionCount,
+  }
+}
+
+export async function readExactRuntimeHostFacts(
+  owner: RuntimeOwnerFactsAdapter, handle: ExactRuntimeHandle,
+): Promise<RuntimeHostFacts> {
+  await assertExactRuntimeHandle(owner, handle)
+  const facts = objectFields(await owner.readHostFacts(handle), 'invalid observed owner facts')
+  const limits = objectFields(facts.limits, 'invalid observed owner facts limits')
+  if (!nonnegativeInteger(facts.workerPid) || facts.workerPid === 0
+    || !nonnegativeInteger(facts.workerLaunchCount) || facts.workerLaunchCount === 0
+    || !nonnegativeInteger(facts.unsafeBrokerAttempts)
+    || typeof limits.cpuMax !== 'string' || !/^(?:max|[1-9][0-9]*) [1-9][0-9]*$/.test(limits.cpuMax)
+    || ['memoryMax', 'swapMax', 'pidsMax'].some((key) => (
+      typeof limits[key] !== 'string' || !/^(?:max|[0-9]+)$/.test(limits[key] as string)
+    ))) throw new Error('invalid observed owner facts')
+  return {
+    workerPid: facts.workerPid, workerLaunchCount: facts.workerLaunchCount,
+    unsafeBrokerAttempts: facts.unsafeBrokerAttempts,
+    limits: {
+      cpuMax: limits.cpuMax, memoryMax: limits.memoryMax as string,
+      swapMax: limits.swapMax as string, pidsMax: limits.pidsMax as string,
+    },
+  }
+}
+
 export type SupervisorInstance = {
   scenarioId: string
   containerId: string

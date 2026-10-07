@@ -131,7 +131,20 @@ export class RestrictedDockerBroker {
     fs.chmodSync(path.dirname(this.policy.logPath), 0o700)
     fs.rmSync(this.policy.proxySocketPath, { force: true })
     this.server = http.createServer((request, response) => {
-      void this.handle(request, response)
+      this.handle(request, response).catch(() => {
+        try {
+          this.record({
+            method: request.method ?? 'GET', url: request.url ?? '/',
+            decision: 'block', reason: 'owner_request_failed', destructive: false, unsafeAttempt: false,
+          })
+        } catch {
+          process.stderr.write(`${JSON.stringify({
+            severity: 'error', event: 'runtime.broker.request_failure_logging_failed', runId: this.policy.testRunId,
+          })}\n`)
+        } finally {
+          response.destroy()
+        }
+      })
     })
     await new Promise<void>((resolve, reject) => {
       this.server!.once('error', reject)
