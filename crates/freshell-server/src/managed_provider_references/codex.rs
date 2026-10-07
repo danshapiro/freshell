@@ -474,6 +474,8 @@ pub fn discover(
         .collect::<Vec<_>>();
     directories.reverse();
     let mut resources = global_instruction_resources(&manifest.codex_home)?;
+    // Git trust fallback is independent of configurable project-root markers.
+    let git_root = git_trust_root(&manifest.cwd)?;
     add_rule_resources(&manifest.codex_home.join("rules"), &mut resources)?;
     for path in [
         manifest.codex_home.join("skills"),
@@ -500,7 +502,7 @@ pub fn discover(
             if exists(&skills)? {
                 resources.push(skills);
             }
-            let enabled = trusted(&preceding, directory, root);
+            let enabled = trusted(&preceding, directory, root, git_root.as_deref());
             if enabled {
                 // Even a missing project TOML leaves an enabled config folder
                 // from which native Codex discovers immediate rule files.
@@ -816,39 +818,94 @@ fn merge(target: &mut toml::Value, value: toml::Value) {
         *target = value;
     }
 }
-fn trusted(value: &toml::Value, directory: &Path, root: &Path) -> bool {
+fn git_trust_root(cwd: &Path) -> Result<Option<PathBuf>, &'static str> {
+    use std::io::Read;
+    let Some(root) = cwd.ancestors().find(|path| path.join(".git").exists()) else {
+        return Ok(None);
+    };
+    let marker = root.join(".git");
+    if std::fs::metadata(&marker).is_ok_and(|metadata| metadata.is_dir()) {
+        return Ok(Some(root.into()));
+    }
+    // Native lookup ignores unreadable/invalid Git markers. Bound the metadata
+    // read with the existing source-view profile before any full allocation.
+    let Ok(file) = std::fs::File::open(&marker) else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_SOURCE_VIEW_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    if bytes.len() as u64 > MAX_SOURCE_VIEW_BYTES {
+        return Err("Codex Git trust marker exceeds source-view limit; repair marker and retry");
+    }
+    let Some(gitdir) = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|raw| raw.trim().strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(None);
+    };
+    let path = normalize(&root.join(gitdir));
+    let Some(worktrees) = path
+        .parent()
+        .filter(|path| path.file_name() == Some(std::ffi::OsStr::new("worktrees")))
+    else {
+        return Ok(None);
+    };
+    Ok(worktrees
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf))
+}
+
+fn trust_lookup_key(path: &Path) -> String {
+    let key = path.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        key.to_ascii_lowercase()
+    } else {
+        key
+    }
+}
+
+fn project_trust<'a>(projects: &'a toml::Value, key: &str) -> Option<&'a str> {
+    projects
+        .get(key)
+        .or_else(|| {
+            if !cfg!(windows) {
+                return None;
+            }
+            projects
+                .as_table()?
+                .iter()
+                .filter(|(candidate, _)| candidate.to_ascii_lowercase() == key)
+                .min_by_key(|(candidate, _)| *candidate)
+                .map(|(_, value)| value)
+        })?
+        .get("trust_level")?
+        .as_str()
+}
+
+fn trusted(value: &toml::Value, directory: &Path, root: &Path, git_root: Option<&Path>) -> bool {
     let Some(projects) = value.get("projects") else {
         return false;
     };
-    let mut paths = vec![directory.to_path_buf()];
-    if let Ok(canonical) = std::fs::canonicalize(directory) {
-        paths.push(canonical);
-    }
-    paths.push(root.to_path_buf());
-    if let Ok(canonical) = std::fs::canonicalize(root) {
-        paths.push(canonical);
-    }
-    // Linked worktrees share the root checkout's trust selection.
-    if let Ok(gitfile) = std::fs::read_to_string(root.join(".git")) {
-        if let Some(gitdir) = gitfile.trim().strip_prefix("gitdir: ") {
-            let path = normalize(&root.join(gitdir));
-            if let Some(checkout) = path
-                .ancestors()
-                .find(|path| path.file_name() == Some(std::ffi::OsStr::new(".git")))
-                .and_then(Path::parent)
-            {
-                paths.push(checkout.to_path_buf());
+    for path in [Some(directory), Some(root), git_root]
+        .into_iter()
+        .flatten()
+    {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+        // Native gives canonical keys precedence, then logical keys, at each
+        // level. An explicit untrusted match ends the search at that level.
+        for key in [trust_lookup_key(&canonical), trust_lookup_key(path)] {
+            if let Some(trust) = project_trust(projects, &key) {
+                return trust == "trusted";
             }
-        }
-    }
-    for path in paths {
-        if let Some(trust) = path
-            .to_str()
-            .and_then(|key| projects.get(key))
-            .and_then(|project| project.get("trust_level"))
-            .and_then(toml::Value::as_str)
-        {
-            return trust == "trusted";
         }
     }
     false
@@ -866,6 +923,119 @@ mod tests {
             logical_path: path,
             enabled,
             kind: LayerKind::User,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_codex_trust_selects_native_canonical_and_git_fallback_resources() {
+        use freshell_platform::{
+            codex_inputs::CodexInputManifest,
+            provider_environment::{copy_environment, CopyLimits, CopySelection},
+        };
+        for (case, canonical_trust, logical_trust, git_shape, selected) in [
+            (
+                "canonical-first-positive",
+                Some("trusted"),
+                Some("untrusted"),
+                "directory",
+                true,
+            ),
+            (
+                "canonical-first-negative",
+                Some("untrusted"),
+                Some("trusted"),
+                "directory",
+                false,
+            ),
+            ("logical-fallback", None, Some("trusted"), "directory", true),
+            ("linked-standard", None, None, "worktrees", true),
+            ("linked-custom-common", None, None, "custom-common", true),
+            ("unrelated-git-dir", None, None, "unrelated", false),
+            ("git-above-project-marker", None, None, "ancestor", true),
+        ] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let canonical = owned.path().join("canonical-project");
+            let logical = owned.path().join("logical-project");
+            let main = owned.path().join("main-checkout");
+            let codex_home = home.join(".codex");
+            std::fs::create_dir_all(&codex_home).unwrap();
+            std::fs::create_dir_all(canonical.join("nested")).unwrap();
+            std::fs::create_dir_all(canonical.join(".codex/rules")).unwrap();
+            std::os::unix::fs::symlink(&canonical, &logical).unwrap();
+            let mut config = String::new();
+            for (path, trust) in [(&canonical, canonical_trust), (&logical, logical_trust)] {
+                if let Some(trust) = trust {
+                    config.push_str(&format!(
+                        "[projects.{}]\ntrust_level={trust:?}\n",
+                        serde_json::to_string(path.to_str().unwrap()).unwrap()
+                    ));
+                }
+            }
+            if git_shape == "ancestor" {
+                std::fs::create_dir_all(owned.path().join(".git")).unwrap();
+                std::fs::write(canonical.join(".native-project"), "selected marker").unwrap();
+                config.push_str(&format!("project_root_markers=[\".native-project\"]\n[projects.{}]\ntrust_level=\"trusted\"\n",serde_json::to_string(owned.path().to_str().unwrap()).unwrap()));
+            } else if git_shape == "directory" {
+                std::fs::create_dir_all(canonical.join(".git")).unwrap();
+            } else {
+                let gitdir = match git_shape {
+                    "worktrees" => main.join(".git/worktrees/linked"),
+                    "custom-common" => main.join("native-git-storage/worktrees/linked"),
+                    _ => main.join(".git/unrelated/linked"),
+                };
+                std::fs::create_dir_all(&gitdir).unwrap();
+                // Native accepts whitespace after gitdir:, independent of .git basename.
+                std::fs::write(
+                    canonical.join(".git"),
+                    format!("gitdir:\t{}\n", gitdir.display()),
+                )
+                .unwrap();
+                config.push_str(&format!(
+                    "[projects.{}]\ntrust_level=\"trusted\"\n",
+                    serde_json::to_string(main.to_str().unwrap()).unwrap()
+                ));
+            }
+            std::fs::write(codex_home.join("config.toml"), &config).unwrap();
+            let rule = canonical.join(".codex/rules/probe.rules");
+            std::fs::write(&rule, case).unwrap();
+            let found = discover(CodexInputManifest {
+                version: 1,
+                original_home: home,
+                cwd: logical.join("nested"),
+                codex_home,
+                named_profile: None,
+            })
+            .unwrap();
+            let stage = owned.path().join("stage");
+            let selections = found
+                .resource_roots
+                .iter()
+                .map(|source| CopySelection {
+                    source: source.clone(),
+                    destination_relative: source.strip_prefix(&logical).unwrap().into(),
+                })
+                .collect::<Vec<_>>();
+            copy_environment(&selections, &stage, &[], CopyLimits::default()).unwrap();
+            let output = std::process::Command::new("node")
+                .args(["-e", "const fs=require('node:fs');const p=process.argv[1];process.stdout.write(fs.existsSync(p)?fs.readFileSync(p,'utf8'):'unselected')"])
+                .arg(stage.join(".codex/rules/probe.rules")).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout,
+                if selected {
+                    case.as_bytes()
+                } else {
+                    b"unselected"
+                },
+                "native selection {case}"
+            );
+            assert_eq!(std::fs::read(&rule).unwrap(), case.as_bytes());
+            assert_eq!(
+                std::fs::read_to_string(found.manifest.codex_home.join("config.toml")).unwrap(),
+                config
+            );
         }
     }
 

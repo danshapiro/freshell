@@ -4505,13 +4505,67 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let physical = Path::new("/home/freshell/provider");
-        for (case, trust, project_config, poison) in [
-            ("trusted-config", Some("trusted"), true, "regular"),
-            ("trusted-rules-only", Some("trusted"), false, "regular"),
-            ("untrusted", Some("untrusted"), false, "regular"),
-            ("unknown", None, false, "regular"),
-            ("ignored-shapes", Some("trusted"), false, "ignored"),
-            ("optional-missing", Some("trusted"), false, "missing"),
+        for (case, trust, project_config, poison, topology) in [
+            ("trusted-config", Some("trusted"), true, "regular", "plain"),
+            (
+                "trusted-rules-only",
+                Some("trusted"),
+                false,
+                "regular",
+                "plain",
+            ),
+            ("untrusted", Some("untrusted"), false, "regular", "plain"),
+            ("unknown", None, false, "regular", "plain"),
+            ("ignored-shapes", Some("trusted"), false, "ignored", "plain"),
+            (
+                "optional-missing",
+                Some("trusted"),
+                false,
+                "missing",
+                "plain",
+            ),
+            (
+                "canonical-first-positive",
+                Some("trusted"),
+                false,
+                "regular",
+                "alias",
+            ),
+            (
+                "canonical-first-negative",
+                Some("untrusted"),
+                false,
+                "regular",
+                "alias",
+            ),
+            (
+                "linked-standard",
+                Some("trusted"),
+                false,
+                "regular",
+                "linked",
+            ),
+            (
+                "linked-custom-common",
+                Some("trusted"),
+                false,
+                "regular",
+                "custom-common",
+            ),
+            (
+                "linked-unrelated-negative",
+                Some("untrusted"),
+                false,
+                "regular",
+                "unrelated",
+            ),
+            (
+                "git-above-project-marker",
+                Some("trusted"),
+                false,
+                "regular",
+                "ancestor",
+            ),
         ] {
             let owned = base.join(format!("automatic-rules-{case}"));
             let original = owned.join("original-home");
@@ -4519,16 +4573,72 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             let project = workspace.join(".codex");
             let rule = project.join("rules/project-auto-probe.rules");
             std::fs::create_dir_all(original.join(".codex")).unwrap();
-            std::fs::create_dir_all(workspace.join(".git")).unwrap();
+            let canonical_workspace = owned.join("canonical-workspace");
+            if topology == "alias" {
+                std::fs::create_dir_all(&canonical_workspace).unwrap();
+                std::os::unix::fs::symlink(&canonical_workspace, &workspace).unwrap();
+            }
+            let main = owned.join("main-checkout");
+            if topology == "ancestor" {
+                std::fs::create_dir_all(owned.join(".git")).unwrap();
+                std::fs::create_dir_all(&workspace).unwrap();
+                std::fs::write(workspace.join(".native-project"), "selected marker").unwrap();
+            } else if matches!(topology, "linked" | "custom-common" | "unrelated") {
+                let gitdir = match topology {
+                    "linked" => main.join(".git/worktrees/linked"),
+                    "custom-common" => main.join("native-git-storage/worktrees/linked"),
+                    _ => main.join(".git/unrelated/linked"),
+                };
+                std::fs::create_dir_all(&gitdir).unwrap();
+                std::fs::create_dir_all(&workspace).unwrap();
+                std::fs::write(
+                    workspace.join(".git"),
+                    format!("gitdir:\t{}\n", gitdir.display()),
+                )
+                .unwrap();
+            } else {
+                std::fs::create_dir_all(workspace.join(".git")).unwrap();
+            }
             std::fs::create_dir_all(&project).unwrap();
-            let config = trust
+            let trust_path = if topology == "ancestor" {
+                &owned
+            } else if topology == "alias" {
+                &canonical_workspace
+            } else if matches!(topology, "linked" | "custom-common" | "unrelated") {
+                &main
+            } else {
+                &workspace
+            };
+            let mut config = trust
                 .map(|trust| {
                     format!(
                         "[projects.{}]\ntrust_level={trust:?}\n",
-                        serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+                        serde_json::to_string(trust_path.to_str().unwrap()).unwrap()
                     )
                 })
                 .unwrap_or_default();
+            if topology == "ancestor" {
+                config = format!("project_root_markers=[\".native-project\"]\n{config}");
+            }
+            if topology == "alias" {
+                let logical_trust = if trust == Some("trusted") {
+                    "untrusted"
+                } else {
+                    "trusted"
+                };
+                config.push_str(&format!(
+                    "[projects.{}]\ntrust_level={logical_trust:?}\n",
+                    serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+                ));
+            }
+            // The unrelated gitdir negative deliberately has a trusted main
+            // record; native rejects its hierarchy before considering that key.
+            if topology == "unrelated" {
+                config = format!(
+                    "[projects.{}]\ntrust_level=\"trusted\"\n",
+                    serde_json::to_string(main.to_str().unwrap()).unwrap()
+                );
+            }
             std::fs::write(original.join(".codex/config.toml"), &config).unwrap();
             if project_config {
                 std::fs::write(
@@ -4641,7 +4751,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                         source: archived_project.clone(),
                         destination_relative: ".codex".into(),
                     }],
-                    &workspace,
+                    &std::fs::canonicalize(&workspace).unwrap(),
                     &[],
                     CopyLimits::default(),
                 )
@@ -4765,7 +4875,10 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 "automatic native rule selection case {case}"
             );
             if selected {
-                assert_eq!(policy[0]["path"].as_str(), rule.to_str());
+                let native_rule = std::fs::canonicalize(&workspace)
+                    .unwrap()
+                    .join(".codex/rules/project-auto-probe.rules");
+                assert_eq!(policy[0]["path"].as_str(), native_rule.to_str());
                 assert!(policy[0]["details"]
                     .as_str()
                     .unwrap()
