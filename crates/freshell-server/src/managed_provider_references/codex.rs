@@ -473,9 +473,8 @@ pub fn discover(
         .map(Path::to_path_buf)
         .collect::<Vec<_>>();
     directories.reverse();
-    let mut resources = Vec::new();
+    let mut resources = global_instruction_resources(&manifest.codex_home)?;
     for path in [
-        manifest.codex_home.join("AGENTS.md"),
         manifest.codex_home.join("rules"),
         manifest.codex_home.join("skills"),
         manifest.original_home.join(".agents/skills"),
@@ -585,6 +584,66 @@ pub fn discover(
         inputs,
         resource_roots: resources,
     })
+}
+
+// Native global instructions try the override before the default and skip
+// nonfiles/empty text. Keep attempted empty files so a refresh can replace an
+// older nonempty override, but never make an unread fallback a copy dependency.
+fn global_instruction_resources(home: &Path) -> Result<Vec<PathBuf>, &'static str> {
+    use std::io::{BufReader, Read};
+    let mut resources = Vec::new();
+    let limit = freshell_platform::provider_environment::CopyLimits::default().max_file_bytes;
+    for filename in ["AGENTS.override.md", "AGENTS.md"] {
+        let path = home.join(filename);
+        if !exists(&path)? {
+            continue;
+        }
+        let metadata = std::fs::metadata(&path)
+            .map_err(|_| "Codex global AGENTS instruction source metadata is unavailable")?;
+        if !metadata.is_file() {
+            continue;
+        }
+        if metadata.len() > limit {
+            return Err("Codex global AGENTS instruction source exceeds ordinary per-file limit");
+        }
+        let file = std::fs::File::open(&path)
+            .map_err(|_| "Codex global AGENTS instruction source is unreadable")?;
+        // Check trim/UTF-8-lossy emptiness with at most one Unicode scalar in
+        // memory. A non-whitespace prefix selects the file; the common copier
+        // subsequently enforces complete reads and all shared byte budgets.
+        let mut scalar = [0_u8; 4];
+        let mut length = 0;
+        let mut nonempty = false;
+        for (index, byte) in BufReader::new(file.take(limit + 1)).bytes().enumerate() {
+            if index as u64 >= limit {
+                return Err(
+                    "Codex global AGENTS instruction source grew beyond ordinary per-file limit",
+                );
+            }
+            scalar[length] =
+                byte.map_err(|_| "Codex global AGENTS instruction source read failed")?;
+            length += 1;
+            match std::str::from_utf8(&scalar[..length]) {
+                Ok(text) => {
+                    if text.chars().any(|character| !character.is_whitespace()) {
+                        nonempty = true;
+                        break;
+                    }
+                    length = 0;
+                }
+                Err(error) if error.error_len().is_some() || length == scalar.len() => {
+                    nonempty = true;
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        resources.push(path);
+        if nonempty || length != 0 {
+            break;
+        }
+    }
+    Ok(resources)
 }
 fn active_plugin_version(cache: &Path) -> Result<PathBuf, &'static str> {
     let entries = std::fs::read_dir(cache).map_err(|_| {
@@ -759,6 +818,98 @@ mod tests {
             logical_path: path,
             enabled,
             kind: LayerKind::User,
+        }
+    }
+
+    #[test]
+    fn managed_provider_codex_global_instruction_override_survives_transport_and_fallback() {
+        use freshell_platform::{
+            codex_inputs::CodexInputManifest,
+            provider_environment::{copy_environment, CopyLimits, CopySelection},
+        };
+        for (override_bytes, nonfile_override) in [
+            (Some(b"selected-override".as_slice()), false),
+            (Some(b" \n\xe2\x80\x83".as_slice()), false),
+            (Some(b"\xff".as_slice()), false),
+            (None, false),
+            (None, true),
+        ] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let cwd = owned.path().join("workspace");
+            let codex_home = home.join("selected-codex");
+            std::fs::create_dir_all(&codex_home).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+            std::fs::write(codex_home.join("AGENTS.md"), "selected-fallback").unwrap();
+            if let Some(bytes) = override_bytes {
+                std::fs::write(codex_home.join("AGENTS.override.md"), bytes).unwrap();
+            } else if nonfile_override {
+                // A native nonfile override must not activate or traverse an
+                // otherwise unused resource tree before default fallback.
+                std::fs::create_dir(codex_home.join("AGENTS.override.md")).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(
+                    "unselected-missing-resource",
+                    codex_home.join("AGENTS.override.md/unused"),
+                )
+                .unwrap();
+            }
+            let manifest = CodexInputManifest {
+                version: 1,
+                original_home: home,
+                cwd,
+                codex_home: codex_home.clone(),
+                named_profile: None,
+            };
+            let found = discover(manifest.clone()).unwrap();
+            let selections: Vec<_> = found
+                .resource_roots
+                .iter()
+                .filter(|path| path.starts_with(&codex_home))
+                .map(|path| CopySelection {
+                    source: path.clone(),
+                    destination_relative: path.strip_prefix(&codex_home).unwrap().into(),
+                })
+                .collect();
+            let stage = owned.path().join("stage");
+            copy_environment(&selections, &stage, &[], CopyLimits::default()).unwrap();
+            let output = std::process::Command::new("node").args(["-e", "const fs=require('node:fs'),path=require('node:path');for(const name of ['AGENTS.override.md','AGENTS.md']){const file=path.join(process.argv[1],name);if(fs.existsSync(file)&&fs.statSync(file).isFile()){const raw=fs.readFileSync(file,'utf8').trim();if(raw){process.stdout.write(raw);break}}}"]).arg(&stage).output().unwrap();
+            assert!(output.status.success());
+            let expected = match override_bytes {
+                Some(bytes) if !String::from_utf8_lossy(bytes).trim().is_empty() => {
+                    String::from_utf8_lossy(bytes).trim().to_string()
+                }
+                _ => "selected-fallback".into(),
+            };
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                expected,
+                "copied global instructions must retain the native override/fallback order"
+            );
+            assert_eq!(
+                std::fs::read(codex_home.join("AGENTS.md")).unwrap(),
+                b"selected-fallback"
+            );
+            #[cfg(unix)]
+            if override_bytes == Some(b"selected-override".as_slice()) {
+                std::fs::remove_file(codex_home.join("AGENTS.md")).unwrap();
+                std::os::unix::fs::symlink(
+                    "unselected-missing-fallback",
+                    codex_home.join("AGENTS.md"),
+                )
+                .unwrap();
+                let found = discover(manifest).unwrap();
+                let selections: Vec<_> = found
+                    .resource_roots
+                    .iter()
+                    .filter(|path| path.starts_with(&codex_home))
+                    .map(|path| CopySelection {
+                        source: path.clone(),
+                        destination_relative: path.strip_prefix(&codex_home).unwrap().into(),
+                    })
+                    .collect();
+                copy_environment(&selections,&owned.path().join("next-stage"),&[],CopyLimits::default()).expect("an effective override must not make the native-unread default file a selected copy dependency");
+            }
         }
     }
 
