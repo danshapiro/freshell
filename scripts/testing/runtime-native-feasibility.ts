@@ -548,7 +548,13 @@ async function executeManagedNativeApproval(input: {
     || oldPayload.nativeCheckpoint.toolUseID !== oldPayload.toolUseID || effectCount() !== 0) {
     throw new Error('original native solo checkpoint/effect oracle differs')
   }
+  const captureCheckpointState = async (containerId: string, label: string) => {
+    const source = await harness.execOwnedContainerAsExact(containerId, '0:0', ['python3', '-c',
+      "import pathlib,json,base64,hashlib,sys;root=sys.argv[1];assert len(root)==36 and all(c in '0123456789abcdef-' for c in root);files=[]\nfor p in [pathlib.Path('/run/freshell-host-actor/fresh-agent-state.json'),pathlib.Path('/home/freshell/provider/.freshell/native-checkpoints/claude')/(root+'.json')]:\n raw=p.read_bytes();assert len(raw)<=32*1024*1024;json.loads(raw);files.append({'path':str(p),'sha256':hashlib.sha256(raw).hexdigest(),'bytesBase64':base64.b64encode(raw).decode()})\nprint(json.dumps({'nativeRoot':root,'files':files}))", view.nativeSessionId])
+    harness.writeArtifact(`${scenario}-${label}-checkpoint-state-private.json`, JSON.parse(source))
+  }
   const before = await inspect(view.containerId, 'checkpoint-before-death', true)
+  await captureCheckpointState(view.containerId, 'before-death')
   const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
   harness.writeArtifact(`${scenario}-approval-store-probe.json`, probe)
   if (probe.data.kind !== 'reattach_ready') throw new Error('native checkpoint store not readable before death')
@@ -560,6 +566,7 @@ async function executeManagedNativeApproval(input: {
   if (recovery.data.outcome !== 'replaced' || currentView.incarnationId === view.incarnationId
     || currentView.nativeSessionId !== view.nativeSessionId || currentView.recoveryState !== 'live'
     || currentView.nativeIdentityObservation?.nativeSessionId !== view.nativeSessionId) throw new Error('native approval replacement not currently live on same root')
+  await captureCheckpointState(currentView.containerId, 'after-replacement')
   const current = (await wait(isCard, 'rebound current native ask')).data
   harness.writeArtifact(`${scenario}-current-card-private.json`, current)
   const currentPayload = current.payload
