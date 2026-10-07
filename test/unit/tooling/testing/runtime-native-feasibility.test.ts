@@ -52,6 +52,50 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       fs.rmSync(directory, { recursive: true, force: true })
     }
   })
+  it.each(['freshclaude', 'kilroy'] as const)('sends the logical %s workload and Claude native grants to the actual launch route', async (mode) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-logical-mode-'))
+    const manifest = path.join(directory, 'artifacts.json')
+    const previous = process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
+    fs.writeFileSync(manifest, JSON.stringify({ candidateSha, imageDigest,
+      artifacts: { supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
+        host: { path: '/fixture/host', sha256: 'd'.repeat(64) } }, sourceFiles: [] }), { mode: 0o600 })
+    process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = manifest
+    let scratch: string | undefined
+    const requests: any[] = []
+    const prepare = vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function () {
+      scratch = this.testRoot
+      fs.mkdirSync(scratch, { recursive: true, mode: 0o700 })
+      this.imageRef = imageDigest
+      return { supervisorPath: '/fixture/supervisor', hostPath: '/fixture/host', files:
+        ['env_file', 'ca_file'].map((suffix) => ({ name: 'claude/grants/' + suffix,
+          path: path.join(directory, suffix), sha256: 'e'.repeat(64) })) }
+    })
+    const start = vi.spyOn(RuntimeHarness.prototype, 'startSupervisor').mockResolvedValue({} as never)
+    const write = vi.spyOn(RuntimeHarness.prototype, 'writeArtifact').mockReturnValue('fixture-artifact')
+    const admin = vi.spyOn(RuntimeHarness.prototype, 'adminOk').mockImplementation(async (_supervisor, body) => {
+      requests.push(body)
+      throw new Error('controlled stop after actual launch request')
+    })
+    const cleanup = vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    try {
+      await expect(runNativeFeasibility(['--mode', mode, '--case', 'approval-checkpoint'])).rejects.toThrow('native experiment cases failed')
+      expect(requests).toHaveLength(1)
+      const launch = requests[0].params
+      const logical = mode === 'kilroy' ? 'kilroy' : 'claude'
+      expect(launch.provider).toBe(logical)
+      expect(launch.freshAgent.provider).toBe(logical)
+      expect(launch.freshAgent.sessionType).toBe(mode)
+      expect(launch.freshAgent.providerSecretReferences.map((reference: any) => reference.profile))
+        .toEqual(['claude_onecli_environment', 'claude_onecli_ca_file'])
+      expect(cleanup).toHaveBeenCalledOnce()
+    } finally {
+      for (const spy of [prepare, start, write, admin, cleanup]) spy.mockRestore()
+      if (previous === undefined) delete process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
+      else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = previous
+      if (scratch) fs.rmSync(scratch, { recursive: true, force: true })
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
   it('prepares only exact private native artifacts and selected source copies without ambient mounts', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-artifact-unit-'))
     execFileSync('git', ['init', '-q', directory])

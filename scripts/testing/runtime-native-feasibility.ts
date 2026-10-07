@@ -219,6 +219,7 @@ async function executeManagedNativeCase(harness: RuntimeHarness,
     throw new Error(`actual native case has no qualified execution path: ${selection.mode ?? selection.provider}/${caseId}`)
   }
   const mode = selection.mode!
+  const logicalProvider = mode === 'kilroy' ? 'kilroy' : 'claude'
   const family = 'claude'
   const references = (['env_file', 'ca_file'] as const).map((suffix) => {
     const source = sources.find((file) => file.name === `${family}/grants/${suffix}`)
@@ -232,10 +233,10 @@ async function executeManagedNativeCase(harness: RuntimeHarness,
   const soulId = 'soul-' + randomUUID()
   const storeId = 'store-' + randomUUID()
   const settings = { model: 'claude-haiku-4-5-20251001', effort: 'low', permissionMode: 'default' }
-  const request = { method: 'launch', params: { soulId, provider: family, providerStoreId: storeId,
+  const request = { method: 'launch', params: { soulId, provider: logicalProvider, providerStoreId: storeId,
     creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: scenario,
     limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
-    freshAgent: { sessionId: 'native-fresh-' + randomUUID(), provider: mode === 'kilroy' ? 'kilroy' : family,
+    freshAgent: { sessionId: 'native-fresh-' + randomUUID(), provider: logicalProvider,
       sessionType: mode, runtimeVariant: 'claude-sdk-sidecar', providerStoreId: storeId,
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, ...settings,
       providerSecretReferences: references, providerLaunchContext: { preparation: { claude: { mcp_args: [] } }, config: [] } } } }
