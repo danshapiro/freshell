@@ -444,7 +444,7 @@ pub fn plan_loaded_opencode_sources_relocated(
             .entry(source.source.canonical_source.clone())
             .or_insert(0usize) += 1;
     }
-    let mut result = Vec::new();
+    let mut result: Vec<PlannedSourceOccurrence> = Vec::new();
     let mut selected = std::collections::BTreeMap::<PathBuf, String>::new();
     let mut selected_bytes = 0u64;
     let mut recipe_count = 0usize;
@@ -517,6 +517,16 @@ pub fn plan_loaded_opencode_sources_relocated(
                 original_form,
             },
         )?;
+        if original_form {
+            if let Some(prior) = result
+                .iter()
+                .find(|prior| prior.source.canonical_source == source.canonical_source)
+            {
+                if prior.references.template != references.template {
+                    return Err(fail("shared source requires incompatible native lane edits; retain its inputs and reprepare before dispatch"));
+                }
+            }
+        }
         if references
             .recipes
             .iter()

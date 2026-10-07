@@ -44,6 +44,13 @@ pub struct FileReferenceSelection {
 
 pub use freshell_platform::opencode_recipe::{ApprovedFileOccurrence, GeneratedFileRecipe};
 
+#[derive(Clone, Copy)]
+pub(crate) enum NativeAliasKind {
+    Relative,
+    Absolute,
+    Home,
+}
+
 pub struct ResolvedFileReferencePlan {
     pub template: String,
     // Generated recipes already own the raw view. Keep one raw view for
@@ -55,6 +62,7 @@ pub struct ResolvedFileReferencePlan {
     pub recipes: Vec<GeneratedFileRecipe>,
     pub occurrences: Vec<ApprovedFileOccurrence>,
     pub substitution_events: usize,
+    pub native_alias_kinds: std::collections::BTreeMap<usize, NativeAliasKind>,
 }
 impl ResolvedFileReferencePlan {
     pub fn unexpanded_source(&self) -> &str {
@@ -130,6 +138,7 @@ pub(super) fn resolve_file_references_from_view_relocated(
     };
     let mut selections: Vec<FileReferenceSelection> = Vec::new();
     let mut rewritten = Vec::new();
+    let mut native_alias_kinds = std::collections::BTreeMap::new();
     let mut occurrences = Vec::new();
     let mut path_variables = std::collections::BTreeSet::new();
     let mut generated = false;
@@ -254,7 +263,24 @@ pub(super) fn resolve_file_references_from_view_relocated(
             runtime_destination: destination.clone(),
         });
         let replacement = format!("{{file:{destination}}}");
-        rewritten.push((token.original_span, replacement.clone()));
+        let kind = if token.path.starts_with("~/") {
+            NativeAliasKind::Home
+        } else if Path::new(token.path).is_absolute() {
+            NativeAliasKind::Absolute
+        } else {
+            NativeAliasKind::Relative
+        };
+        // Only literal source-independent paths can receive an identical edit
+        // at a shared inode. Relative paths and loader-specific interpolation
+        // retain native evaluation and their approved occurrence aliases.
+        let selective = token.direct_expression
+            && token.variables.is_empty()
+            && !matches!(kind, NativeAliasKind::Relative);
+        if !projection.original_form || selective {
+            rewritten.push((token.original_span, replacement.clone()));
+        } else {
+            native_alias_kinds.insert(token.ordinal, kind);
+        }
         Ok(replacement)
     })
     .map_err(|error| match error {
@@ -270,9 +296,7 @@ pub(super) fn resolve_file_references_from_view_relocated(
     }
     let transformed_length = transformed.len();
     drop(transformed);
-    let (template, recipes) = if projection.original_form {
-        (raw.to_owned(), Vec::new())
-    } else if generated {
+    let (template, recipes) = if generated && !projection.original_form {
         let generated_name =
             freshell_platform::opencode_config::generated_config_reference_name(recipe_ordinal);
         if transformed_length > 64 * 1024 {
@@ -321,6 +345,7 @@ pub(super) fn resolve_file_references_from_view_relocated(
         recipes,
         occurrences,
         substitution_events: substitution_events.get(),
+        native_alias_kinds,
     })
 }
 

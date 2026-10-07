@@ -4053,6 +4053,128 @@ except Exception as error:
     }
 
     #[test]
+    fn managed_provider_shared_source_rewrites_only_home_and_absolute_file_tokens() {
+        use crate::managed_provider_references::sources::*;
+        use freshell_runtime_protocol::*;
+        for native_home_in_auth in [false, true] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let workspace = owned.path().join("workspace");
+            let left = workspace.join("left");
+            let right = workspace.join("right");
+            std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+            for directory in [&left, &right] {
+                std::fs::create_dir_all(directory).unwrap();
+                std::fs::write(
+                    directory.join("relative"),
+                    directory.file_name().unwrap().as_encoded_bytes(),
+                )
+                .unwrap();
+            }
+            let absolute = home.join("absolute-rule");
+            let home_rule = home.join("home-rule");
+            std::fs::write(&absolute, "absolute-private-rule").unwrap();
+            std::fs::write(&home_rule, "home-private-rule").unwrap();
+            let shared = workspace.join("shared.json");
+            let raw = serde_json::to_string(&serde_json::json!({"instructions":["{file:./relative}",format!("{{file:{}}}",absolute.display()),"{file:~/home-rule}"],"agent":{"probe":{"prompt":"{env:AUTH}"}}})).unwrap();
+            std::fs::write(&shared, &raw).unwrap();
+            let sources = [&left, &right]
+                .into_iter()
+                .map(|directory| {
+                    let logical = directory.join("opencode.json");
+                    std::os::unix::fs::symlink("../shared.json", &logical).unwrap();
+                    SourceOccurrence {
+                        logical_path: logical,
+                        canonical_source: shared.clone(),
+                        lane: SourceLane::Main,
+                        role: DiscoveryRole::Workspace,
+                    }
+                })
+                .collect();
+            let plan = plan_opencode_sources(sources, &workspace, &home, &|_, source, name| {
+                (name == "AUTH").then(|| {
+                    let file = if native_home_in_auth {
+                        if source.parent() == Some(left.as_path()) {
+                            "~/home-rule".to_string()
+                        } else {
+                            absolute.display().to_string()
+                        }
+                    } else {
+                        "./relative".to_string()
+                    };
+                    format!("AUTH_PREFIX{{file:{file}}}_END")
+                })
+            })
+            .unwrap();
+            let directory = owned.path().join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let capability = CapabilityStore::default()
+                .issue(
+                    SoulId::new(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("opencode", &home, &[])),
+                    OpencodeEphemeralInput {
+                        cwd: Some(&workspace),
+                        workspace: Some(&workspace),
+                        source_plan: Some(&plan),
+                        secret_references: Some(&[]),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+            let inputs: PreparedProviderInputs = serde_json::from_slice(
+                &std::fs::read(stage.join(".freshell/prepared-inputs.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                inputs.config_binds.len(),
+                1,
+                "one physical shared source must receive one uniform selective template"
+            );
+            assert_eq!(
+                Path::new(&inputs.config_binds[0].effective_destination),
+                shared
+            );
+            let template =
+                std::fs::read_to_string(stage.join(&inputs.config_binds[0].source_relative_path))
+                    .unwrap();
+            assert!(
+                template.contains("{file:./relative}"),
+                "logical declaring parents must retain their distinct relative meanings"
+            );
+            assert!(
+                template.contains("{env:AUTH}"),
+                "native loader-specific auth must remain native, without flattening source values"
+            );
+            assert!(
+            !template.contains("{file:~/") && !template.contains(absolute.to_str().unwrap()),
+            "shared HOME and absolute file tokens must point directly to approved indexed payloads"
+        );
+            assert_eq!(
+                inputs.indexed_files.as_ref().unwrap().aliases.len(),
+                if native_home_in_auth { 4 } else { 2 },
+                "relative and interpolated native file expressions retain their exact aliases"
+            );
+            if native_home_in_auth {
+                for logical in [
+                    PathBuf::from("/home/freshell/provider/home-rule"),
+                    absolute.clone(),
+                ] {
+                    assert!(inputs.indexed_files.as_ref().unwrap().aliases.iter().any(|alias| Path::new(&alias.logical_destination) == logical && Path::new(&alias.effective_destination) == logical),
+                    "native interpolated HOME/absolute aliases must mount at the actual runtime path, not the controller source path");
+                }
+            }
+            assert_eq!(std::fs::read_to_string(&shared).unwrap(), raw);
+            assert!(plan
+                .iter()
+                .all(|source| source.original_form && source.references.recipes.is_empty()));
+        }
+    }
+
+    #[test]
     fn managed_provider_ancestor_root_has_its_own_native_mount_location() {
         use crate::managed_provider_references::sources::*;
         let owned = tempfile::tempdir().unwrap();

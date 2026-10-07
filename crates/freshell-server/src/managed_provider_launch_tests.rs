@@ -251,10 +251,10 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
     let inline_auth_url = format!("{well_known_url}/inline-auth");
     std::fs::write(
         fixture.join("grants/auth.json"),
-        serde_json::to_vec(&json!({well_known_url: {
+        serde_json::to_vec(&json!({well_known_url.clone(): {
             "type": "wellknown", "key": "OPENAI_API_KEY",
-            "token": "AUTH_PREFIX{file:./rules.txt}AUTH_SUFFIX"
-        }, inline_auth_url: {"type":"wellknown","key":"INLINE_VALUE","token":"AUTH_INLINE_SHADOW_NO_FILE"}}))
+            "token": format!("AUTH_PREFIX{{file:{}}}AUTH_SUFFIX", fixture.join("workspace/home rule with spaces.txt").display())
+        }, inline_auth_url.clone(): {"type":"wellknown","key":"INLINE_VALUE","token":"AUTH_INLINE_SHADOW_NO_FILE"}}))
         .unwrap(),
     )
     .unwrap();
@@ -293,7 +293,16 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
         .success());
     let shared_source = fixture.join("workspace/shared.json");
     let shared_receipt = fixture.join("workspace/shared-origin-consumed.json");
-    let shared_bytes = serde_json::to_vec(&json!({"agent":{"probe":{"prompt":"{env:OPENAI_API_KEY}"}}, "plugin":[["./shared-probe.mjs", {"receipt":shared_receipt}]]})).unwrap();
+    let shared_home_rule = fixture.join("workspace/home rule with spaces.txt");
+    std::fs::write(&shared_home_rule, "shared-home-sensitive-file\n").unwrap();
+    std::fs::set_permissions(&shared_home_rule, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let shared_bytes = serde_json::to_vec(&json!({"agent":{
+        "probe":{"prompt":"{env:OPENAI_API_KEY}"},
+        "sharedRelative":{"prompt":"{file:./rules.txt}"},
+        "sharedAbsolute":{"prompt":format!("{{file:{}}}", shared_home_rule.display())},
+        "sharedHome":{"prompt":"{file:~/home rule with spaces.txt}"}
+    }, "plugin":[["./shared-probe.mjs", {"receipt":shared_receipt}]]}))
+    .unwrap();
     for (directory, label) in [
         (fixture.join("workspace"), "root"),
         (nested.clone(), "nested"),
@@ -302,7 +311,7 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
             r#"import fs from 'node:fs';import crypto from 'node:crypto';
 export default {{id:'closed-shared-{label}',async server(input,options){{return {{async config(config){{
  let receipt=fs.existsSync(options.receipt)?JSON.parse(fs.readFileSync(options.receipt,'utf8')):{{}};
- receipt.{label}=crypto.createHash('sha256').update(fs.readFileSync(new URL('./rules.txt',import.meta.url))).digest('hex');
+ receipt.{label}={{relative:crypto.createHash('sha256').update(fs.readFileSync(new URL('./rules.txt',import.meta.url))).digest('hex'),absolute:crypto.createHash('sha256').update(config.agent.sharedAbsolute.prompt).digest('hex'),home:crypto.createHash('sha256').update(config.agent.sharedHome.prompt).digest('hex')}};
  fs.writeFileSync(options.receipt,JSON.stringify(receipt));
 }}}}}}}};
 "#
@@ -520,7 +529,7 @@ export default {{id:'closed-directory-discovery',async server(){{
         .await
         .map_err(|_| "actual pinned provider startup did not consume selected config and closure")
     }
-    let expected = json!({"prompt":format!("{:x}",Sha256::digest(b"AUTH_PREFIXnative-shared-nested-ruleAUTH_SUFFIX")),
+    let expected = json!({"prompt":format!("{:x}",Sha256::digest(b"AUTH_PREFIXshared-home-sensitive-fileAUTH_SUFFIX")),
         "description":format!("{:x}",Sha256::digest(b"INLINE_PREFIXnative-inline-selected-ruleINLINE_SUFFIX")),
         "references":(["third","fourth","fifth","sixth"].map(|ordinal|format!("{:x}",Sha256::digest(format!("native-{ordinal}-rule").as_bytes())))),
         "resource":format!("{:x}",Sha256::digest(b"plugin-relative-resource")),
@@ -596,7 +605,7 @@ export default {{id:'closed-directory-discovery',async server(){{
     );
     assert_eq!(
         read_receipt(&shared_receipt).await.unwrap(),
-        json!({"root":format!("{:x}",Sha256::digest(b"native-shared-root-rule")),"nested":format!("{:x}",Sha256::digest(b"native-shared-nested-rule"))})
+        json!({"root":{"relative":format!("{:x}",Sha256::digest(b"native-shared-root-rule")),"absolute":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file")),"home":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file"))},"nested":{"relative":format!("{:x}",Sha256::digest(b"native-shared-nested-rule")),"absolute":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file")),"home":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file"))}})
     );
     assert_eq!(
         read_receipt(&tui_receipt)
@@ -643,6 +652,11 @@ export default {{id:'closed-directory-discovery',async server(){{
     // The fresh route has a workspace beneath original HOME. Both role
     // topologies consume the same independently retained synthetic fixtures.
     std::os::unix::fs::symlink(&resource_root, fixture.join(".opencode")).unwrap();
+    std::os::unix::fs::symlink(&shared_home_rule, fixture.join("home rule with spaces.txt"))
+        .unwrap();
+    std::fs::write(fixture.join("grants/auth.json"), serde_json::to_vec(&json!({well_known_url: {
+        "type":"wellknown", "key":"OPENAI_API_KEY", "token":"AUTH_PREFIX{file:~/home rule with spaces.txt}AUTH_SUFFIX"
+    }, inline_auth_url: {"type":"wellknown", "key":"INLINE_VALUE", "token":"AUTH_INLINE_SHADOW_NO_FILE"}})).unwrap()).unwrap();
     std::env::set_var("HOME", &fixture);
     std::env::set_var("OPENCODE_CONFIG", &explicit_config);
     std::env::set_var("OPENCODE_CONFIG_DIR", &explicit_directory);
@@ -710,7 +724,7 @@ export default {{id:'closed-directory-discovery',async server(){{
     );
     assert_eq!(
         read_receipt(&shared_receipt).await.unwrap(),
-        json!({"root":format!("{:x}",Sha256::digest(b"native-shared-root-rule")),"nested":format!("{:x}",Sha256::digest(b"native-shared-nested-rule"))})
+        json!({"root":{"relative":format!("{:x}",Sha256::digest(b"native-shared-root-rule")),"absolute":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file")),"home":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file"))},"nested":{"relative":format!("{:x}",Sha256::digest(b"native-shared-nested-rule")),"absolute":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file")),"home":format!("{:x}",Sha256::digest(b"shared-home-sensitive-file"))}})
     );
     assert_eq!(std::fs::read(&original_config).unwrap(), original_bytes);
     assert_eq!(std::fs::read(&shared_source).unwrap(), shared_bytes);
@@ -760,6 +774,7 @@ export default {{id:'closed-directory-discovery',async server(){{
                     b"native-shared-root-rule".as_slice(),
                     b"native-shared-nested-rule".as_slice(),
                     b"shared-home-private-rule".as_slice(),
+                    b"shared-home-sensitive-file".as_slice(),
                     b"INLINE_PREFIX".as_slice(),
                     b"AUTH_INLINE_SHADOW_NO_FILE".as_slice(),
                     b"synthetic-onecli-shadowed".as_slice(),

@@ -263,11 +263,15 @@ pub(super) fn describe(
     };
     let mut sources = BTreeMap::new();
     let mut binds = Vec::new();
+    let mut bind_sources = BTreeMap::<std::path::PathBuf, &str>::new();
     let mut recipes = 0usize;
     let mut aliases = Vec::new();
     let mut alias_sources = BTreeMap::new();
     for (ordinal, occurrence) in plan.iter().enumerate() {
-        if occurrence.source.lane != SourceLane::Inline && !occurrence.original_form {
+        if occurrence.source.lane != SourceLane::Inline
+            && (!occurrence.original_form
+                || occurrence.references.template != occurrence.references.unexpanded_source())
+        {
             let logical = &occurrence.source.logical_path;
             let destination = freshell_platform::opencode_config::lexical_path(
                 &crate::managed_provider_references::sources::runtime_config_destination(
@@ -315,17 +319,25 @@ pub(super) fn describe(
                     occurrence.source.role,
                 )
             };
-            binds.push(ProviderConfigBind {
-                source_relative_path: format!(".freshell/templates/source-{ordinal}"),
-                logical_destination: destination
-                    .to_str()
-                    .ok_or("config destination is not UTF-8")?
-                    .into(),
-                effective_destination: effective
-                    .to_str()
-                    .ok_or("config destination is not UTF-8")?
-                    .into(),
-            });
+            let relative = format!(".freshell/templates/source-{ordinal}");
+            let prior = bind_sources.get(&effective);
+            if prior.is_some_and(|template| *template != occurrence.references.template) {
+                return Err("shared effective config target has incompatible templates; retain prior inputs and reprepare".into());
+            }
+            if prior.is_none() {
+                bind_sources.insert(effective.clone(), &occurrence.references.template);
+                binds.push(ProviderConfigBind {
+                    source_relative_path: relative,
+                    logical_destination: destination
+                        .to_str()
+                        .ok_or("config destination is not UTF-8")?
+                        .into(),
+                    effective_destination: effective
+                        .to_str()
+                        .ok_or("config destination is not UTF-8")?
+                        .into(),
+                });
+            }
         }
         recipes = recipes
             .checked_add(occurrence.references.recipes.len())
@@ -346,6 +358,13 @@ pub(super) fn describe(
         }
         if occurrence.original_form {
             for approved in &occurrence.references.occurrences {
+                let Some(kind) = occurrence
+                    .references
+                    .native_alias_kinds
+                    .get(&approved.ordinal)
+                else {
+                    continue;
+                };
                 let source_id = approved
                     .runtime_destination
                     .strip_prefix("/home/freshell/provider/.freshell/references/")
@@ -354,13 +373,27 @@ pub(super) fn describe(
                 let selected = sources
                     .get(&source_id)
                     .ok_or("original-form alias index is unavailable")?;
-                let logical =
-                    crate::managed_provider_references::sources::runtime_config_destination(
-                        home,
-                        global,
-                        &approved.approved_alias,
-                        occurrence.source.role,
-                    );
+                let logical = match kind {
+                    crate::managed_provider_references::NativeAliasKind::Absolute => {
+                        approved.approved_alias.clone()
+                    }
+                    crate::managed_provider_references::NativeAliasKind::Home => {
+                        crate::managed_provider_references::sources::runtime_config_destination(
+                            home,
+                            global,
+                            &approved.approved_alias,
+                            crate::managed_provider_references::sources::DiscoveryRole::Home,
+                        )
+                    }
+                    crate::managed_provider_references::NativeAliasKind::Relative => {
+                        crate::managed_provider_references::sources::runtime_config_destination(
+                            home,
+                            global,
+                            &approved.approved_alias,
+                            occurrence.source.role,
+                        )
+                    }
+                };
                 let effective = if let Some(unit) = resource_mounts.iter().find(|unit| {
                     unit.kind == ProviderResourceKind::Directory
                         && logical.starts_with(&unit.logical_destination)
@@ -373,12 +406,13 @@ pub(super) fn describe(
                             })?,
                     )
                 } else {
-                    crate::managed_provider_references::sources::runtime_config_destination(
-                        home,
-                        global,
-                        selected,
-                        occurrence.source.role,
-                    )
+                    match kind {
+                        crate::managed_provider_references::NativeAliasKind::Absolute if logical.starts_with(workspace) => selected.as_path().to_path_buf(),
+                        crate::managed_provider_references::NativeAliasKind::Relative
+                            if occurrence.source.role == crate::managed_provider_references::sources::DiscoveryRole::Workspace
+                                && occurrence.source.logical_path.starts_with(workspace) => selected.as_path().to_path_buf(),
+                        _ => logical.clone(),
+                    }
                 };
                 if let Some(prior) = alias_sources.insert(logical.clone(), source_id) {
                     if prior != source_id {
