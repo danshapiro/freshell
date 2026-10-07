@@ -79,6 +79,7 @@ import { configureSession, userMessageContent, resultErrorMessage } from './sess
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
 import { managedSdkSpawn } from './exec-profile.mjs'
+import { hostedMcpServers } from './hosted-mcp.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -419,6 +420,7 @@ function handleCreate(req) {
         plugins: Array.isArray(req.plugins)
           ? req.plugins.map(path => ({ type: 'local', path }))
           : undefined,
+        mcpServers: hostedMcpServers(req.hostedMcp),
         pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
         includePartialMessages: true,
         abortController: abort,
@@ -448,8 +450,7 @@ function handleCreate(req) {
       }).catch((error) => logerr(`session commands unavailable: ${error?.message || error}`))
     }
 
-    // Placeholder returns IMMEDIATELY (the SDK query is lazy) — exactly as
-    // SdkBridge.createSession returns the nanoid before system/init arrives.
+    // Return the placeholder before the native system/init identity arrives.
     emit({ type: 'created', requestId, sessionId })
     consumeStream(sessionId, sdkQuery).catch((err) => logerr(`consume error: ${err?.message}`))
   } catch (err) {

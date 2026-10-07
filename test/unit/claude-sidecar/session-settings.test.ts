@@ -105,6 +105,21 @@ function sidecar(extraEnv: Record<string, string> = {}) {
 }
 
 describe('Claude sidecar OneCLI child environment', () => {
+  it('passes the fixed selected hosted MCP recipe through the supported SDK option', async () => {
+    const bridge = sidecar({ FRESHELL_HOSTED_FRESH_AGENT: 'claude' })
+    bridge.send({ type: 'create', requestId: 'hosted-mcp', cwd: '/tmp', hostedMcp: true })
+    expect(await bridge.waitFor('probe.hosted-mcp')).toMatchObject({ selected: true, fixedRecipe: true })
+  })
+
+  it('keeps unselected and ordinary Claude SDK sessions free of the hosted recipe', async () => {
+    const hosted = sidecar({ FRESHELL_HOSTED_FRESH_AGENT: 'claude' })
+    hosted.send({ type: 'create', requestId: 'unselected-mcp', cwd: '/tmp', hostedMcp: false })
+    expect(await hosted.waitFor('probe.hosted-mcp')).toMatchObject({ selected: false })
+    const ordinary = sidecar({ FRESHELL_HOSTED_FRESH_AGENT: '' })
+    ordinary.send({ type: 'create', requestId: 'ordinary-mcp', cwd: '/tmp', hostedMcp: true })
+    expect(await ordinary.waitFor('probe.hosted-mcp')).toMatchObject({ selected: false })
+  })
+
   it('passes a managed OneCLI API key to the SDK child without inheriting ambient keys', async () => {
     const unmanaged = sidecar({ ANTHROPIC_API_KEY: 'onecli-test-key' })
     unmanaged.send({ type: 'create', requestId: 'unmanaged', cwd: '/tmp' })

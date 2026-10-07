@@ -41,15 +41,8 @@ const PROVIDER_UID: u32 = 65_534;
 const PROVIDER_GID: u32 = 0;
 
 pub(crate) fn context_for_fresh_provider(
-    mut provider_launch_context: Option<freshell_runtime_protocol::ProviderLaunchContext>,
+    provider_launch_context: Option<freshell_runtime_protocol::ProviderLaunchContext>,
 ) -> Option<freshell_runtime_protocol::ProviderLaunchContext> {
-    if let Some(freshell_runtime_protocol::ProviderLaunchContext {
-        preparation: freshell_runtime_protocol::ProviderPreparation::Claude { mcp_args },
-        ..
-    }) = provider_launch_context.as_mut()
-    {
-        mcp_args.clear();
-    }
     provider_launch_context
 }
 

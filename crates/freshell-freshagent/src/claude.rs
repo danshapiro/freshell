@@ -100,6 +100,9 @@ const MID_ROLLBACK_PARK_TICK: Duration = Duration::from_millis(10);
 /// Shared, cheaply-cloneable freshclaude WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
 pub struct FreshClaudeState {
+    /// Host-only selection of the fixed Freshell stdio MCP recipe. Its endpoint
+    /// and grant remain in the child environment, never in create IPC.
+    hosted_mcp: bool,
     /// The shared WS broadcast bus (pre-serialized frames), fanned out by every
     /// `freshell-ws` connection so the oracle's capture socket records
     /// `freshAgent.created` / `freshAgent.send.accepted` / `freshAgent.event`.
@@ -763,6 +766,7 @@ impl FreshClaudeState {
     /// Build the state around the shared broadcast bus.
     pub fn new(broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>) -> Self {
         Self {
+            hosted_mcp: false,
             broadcast_tx,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             cli_index: Arc::new(TokioMutex::new(HashMap::new())),
@@ -794,6 +798,11 @@ impl FreshClaudeState {
             #[cfg(test)]
             kill_close_failure_pause: None,
         }
+    }
+
+    pub fn with_hosted_mcp(mut self, selected: bool) -> Self {
+        self.hosted_mcp = selected;
+        self
     }
 
     /// b8ke focused episode-2 round-3 F3: crate-visible session-key resolver
@@ -2294,6 +2303,7 @@ impl FreshClaudeState {
             "permissionMode": msg.permission_mode,
             "effort": msg.effort,
             "plugins": msg.plugins,
+            "hostedMcp": self.hosted_mcp,
             "modelSelection": msg.model_selection,
             "resumeSessionId": resume_sid,
         });

@@ -1,6 +1,8 @@
 // Controlled SDK implementation used through the production sidecar import seam.
 let generations = 0
 export function query({ prompt, options }) {
+  const mcp = options.mcpServers?.freshell
+  process.stdout.write(`${JSON.stringify({ type: 'probe.hosted-mcp', selected: !!mcp, fixedRecipe: mcp?.command === 'node' && JSON.stringify(mcp?.args) === JSON.stringify(['/opt/freshell-mcp/server.js']) && mcp?.env === undefined })}\n`)
   process.stdout.write(`${JSON.stringify({ type: 'probe.auth-env', apiKeyVisible: options.env.ANTHROPIC_API_KEY === 'onecli-test-key', oauthVisible: options.env.CLAUDE_CODE_OAUTH_TOKEN === 'onecli-test-oauth' })}\n`)
   const generation = ++generations
   const durable = options.resume ?? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'

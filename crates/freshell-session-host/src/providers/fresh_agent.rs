@@ -155,7 +155,15 @@ impl HostedTransport {
         let broadcast_tx = Arc::new(broadcast_tx);
         let state = match provider {
             FreshProvider::Claude | FreshProvider::Kilroy => {
-                ProviderState::Claude(FreshClaudeState::new(Arc::clone(&broadcast_tx)))
+                let hosted_mcp = context.is_some_and(|context| {
+                    matches!(
+                        &context.preparation,
+                        ProviderPreparation::Claude { mcp_args } if !mcp_args.is_empty()
+                    )
+                });
+                ProviderState::Claude(
+                    FreshClaudeState::new(Arc::clone(&broadcast_tx)).with_hosted_mcp(hosted_mcp),
+                )
             }
             FreshProvider::Codex => {
                 let sidecar_args = context
@@ -1115,7 +1123,7 @@ fn spawn_broadcast_bridge(
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if event_type == "sdk.session.init" {
+                if matches!(event_type, "sdk.session.init" | "freshAgent.session.init") {
                     if let Some(session_id) = event
                         .get("cliSessionId")
                         .or_else(|| event.get("sessionId"))
@@ -1311,6 +1319,43 @@ mod tests {
 
     static OPENCODE_SNAPSHOT_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
+    #[tokio::test]
+    async fn managed_provider_claude_native_identity_uses_actual_adapter_event_name() {
+        let (bus, rx) = broadcast::channel(8);
+        let (created, _) = watch::channel(None);
+        let (native, mut identity) = watch::channel(None);
+        let (events, mut event_rx) = mpsc::channel(8);
+        let (send_outcomes, _) = broadcast::channel(8);
+        let (kill_outcomes, _) = broadcast::channel(8);
+        spawn_broadcast_bridge(
+            FreshProvider::Claude,
+            rx,
+            BroadcastBridgeOutputs {
+                created,
+                native,
+                events,
+                send_outcomes,
+                kill_outcomes,
+                suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            },
+        );
+        bus.send(json!({"type":"freshAgent.event","sessionId":"owned-placeholder",
+            "event":{"type":"freshAgent.session.init","cliSessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}}).to_string()).unwrap();
+        let received = tokio::time::timeout(Duration::from_millis(250), identity.changed()).await;
+        assert!(
+            received.is_ok(),
+            "the actual Claude adapter identity must reach the host"
+        );
+        assert_eq!(
+            identity.borrow().as_deref(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        );
+        assert!(
+            matches!(event_rx.recv().await, Some(AgentEvent::Started { native_session_id })
+            if native_session_id == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        );
+    }
+
     struct SnapshotProviderEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
     impl Drop for SnapshotProviderEnv {
         fn drop(&mut self) {
@@ -1320,6 +1365,84 @@ mod tests {
                     None => std::env::remove_var(key),
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_provider_fresh_claude_sends_only_fixed_hosted_mcp_selection() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("sidecar.mjs");
+        let receipt = dir.path().join("create.json");
+        std::fs::write(&script, r#"
+import {createInterface} from 'node:readline';
+import {writeFileSync} from 'node:fs';
+const lines=createInterface({input:process.stdin});
+lines.on('line', line=>{
+  const req=JSON.parse(line);
+  if(req.type==='create'){
+    writeFileSync(process.env.FRESHELL_TEST_MCP_RECEIPT,JSON.stringify(req));
+    process.stdout.write(JSON.stringify({type:'created',requestId:req.requestId,sessionId:'owned-mcp-fixture'})+'\n');
+    process.stdout.write(JSON.stringify({type:'sdk.session.init',sessionId:'owned-mcp-fixture',cliSessionId:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',model:'fixture',cwd:req.cwd,tools:[],slashCommands:[]})+'\n');
+  }
+  if(req.type==='shutdown')process.exit(0);
+});
+"#).unwrap();
+        let keys = [
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_NODE",
+            "FRESHELL_TEST_MCP_RECEIPT",
+        ];
+        let _env = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+        std::env::set_var("FRESHELL_TEST_MCP_RECEIPT", &receipt);
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude {
+                mcp_args: vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()],
+            },
+            mcp_capability: None,
+            config: vec![],
+            prepared_inputs: None,
+        };
+        for selected in [true, false] {
+            let transport = HostedTransport::new_with_context(
+                FreshProvider::Claude,
+                selected.then_some(&context),
+            )
+            .await;
+            let profile = FreshAgentProfile {
+                provider: FreshProvider::Claude,
+                runtime_variant: "freshclaude".into(),
+                cwd: dir.path().to_string_lossy().into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "owned-store".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: selected.then_some(context.clone()),
+                provider_secret_references: vec![],
+            };
+            transport.start(&profile).await.unwrap();
+            let observed: Value =
+                serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+            transport.stop().await.unwrap();
+            assert_eq!(
+                observed["hostedMcp"], selected,
+                "only accepted hosted selection enables the SDK recipe"
+            );
+            assert!(
+                observed.get("mcpServers").is_none(),
+                "arbitrary MCP maps are never sent over private create IPC"
+            );
         }
     }
 
