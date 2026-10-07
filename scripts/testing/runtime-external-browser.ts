@@ -1673,6 +1673,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
   private relay?: OwnedManagedRuntimeRelay
   private tunnel?: OwnedManagedRuntimeTunnel
   private cloud?: OwnedRuntimeChild
+  private cloudDiagnosticFingerprint?: string
   private descriptor?: ManagedExternalDescriptor
   private retained?: OwnedRetainedBrowserFixtures
   private readonly cloudJobs = new Map<string, OwnedExternalCloudJob>()
@@ -1753,7 +1754,22 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     }
     const exitCode = await this.cloud.wait()
     this.captureCloudEvents(events)
+    await this.captureCloudDiagnostics()
     return settleExternalCloudChildOutput(exitCode, [...events.values()], [...this.cloudJobs.values()])
+  }
+  private async captureCloudDiagnostics(): Promise<void> {
+    if (!this.cloud || !this.owner) return
+    const output = this.cloud.output()
+    const fingerprint = createHash('sha256').update(JSON.stringify(output)).digest('hex')
+    if (fingerprint === this.cloudDiagnosticFingerprint) return
+    const artifact = this.owner.runtime.writeArtifact('cloud-launcher-output.json', output)
+    const bytes = await fsp.readFile(artifact)
+    this.owner.runtime.recordLifecycle('external.cloud_diagnostics', {
+      severity: 'info', artifactRef: 'cloud-launcher-output.json',
+      sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length,
+      tailLimitCharactersPerStream: 1024 * 1024,
+    })
+    this.cloudDiagnosticFingerprint = fingerprint
   }
   private captureCloudEvents(events: Map<string, Record<string, unknown>>): void {
     if (!this.cloud || !this.descriptor || !this.owner) return
@@ -1785,6 +1801,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
           this.captureCloudEvents(new Map())
           await this.cloud.stop()
           this.captureCloudEvents(new Map())
+          await this.captureCloudDiagnostics()
         }
       }],
       ['Cloud jobs', async () => { for (const job of this.cloudJobs.values()) cleanupOwnedExternalCloudJob(job) }],

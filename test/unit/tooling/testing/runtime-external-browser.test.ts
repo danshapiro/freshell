@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { spawnSync, type execFileSync } from 'node:child_process'
 
 const execute = vi.fn()
@@ -257,6 +258,44 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     cancellation.abort(new Error('owned run cancelled'))
     await expect(pending).rejects.toThrow(/cancelled/)
     expect(owned.abort).toHaveBeenCalledOnce()
+  })
+})
+
+describe('owned Cloud launcher diagnostics', () => {
+  it('retains a failed actual child output privately before cleanup without publishing its body', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-cloud-output-'))
+    const owner = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd())
+    const artifactPath = path.join(owner.runtime.evidenceDir, 'cloud-launcher-output.json')
+    const privateBody = 'private-cloud-command-body'
+    await fsp.writeFile(path.join(directory, 'pnpm'), `#!${process.execPath}\nif(process.argv.includes('--version'))console.log('10.34.5');else{console.log('${privateBody}');console.error('exact execution image observation is unavailable');process.exitCode=73}`, { mode: 0o700 })
+    const lifecycle = new runner.ManagedExternalBrowserLifecycle(process.cwd(), { PATH: directory })
+    Object.assign(lifecycle, { owner, descriptor: { ...runner.resolveManagedExternalDescriptor(descriptor)!,
+      runId: owner.runtime.runId, candidateSha: owner.runtime.candidateSha }, tunnel: { assertAlive() {}, async stop() {} } })
+    const stop = vi.spyOn(owner, 'stop').mockImplementation(async () => {
+      expect(JSON.parse(await fsp.readFile(artifactPath, 'utf8'))).toMatchObject({
+        stdout: `${privateBody}\n`, stderr: 'exact execution image observation is unavailable\n',
+      })
+      return { ok: true, errors: [] }
+    })
+    const record = vi.spyOn(owner.runtime, 'recordLifecycle')
+    try {
+      await expect(lifecycle.child('pnpm', ['fixture-cloud'], {})).rejects.toThrow(/Cloud|missing/)
+      await expect(lifecycle.finish()).resolves.toEqual({ ok: true, errors: [] })
+      expect(stop).toHaveBeenCalledOnce()
+      expect((await fsp.stat(artifactPath)).mode & 0o777).toBe(0o600)
+      const bytes = await fsp.readFile(artifactPath)
+      expect(record).toHaveBeenCalledWith('external.cloud_diagnostics', {
+        severity: 'info', artifactRef: 'cloud-launcher-output.json',
+        sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length,
+        tailLimitCharactersPerStream: 1024 * 1024,
+      })
+      expect(record.mock.calls.filter(([event]) => event === 'external.cloud_diagnostics')).toHaveLength(1)
+      expect(JSON.stringify(record.mock.calls)).not.toContain(privateBody)
+    } finally {
+      await lifecycle.finish()
+      await fsp.rm(directory, { recursive: true, force: true })
+      await fsp.rm(owner.runtime.evidenceDir, { recursive: true, force: true })
+    }
   })
 })
 
