@@ -89,7 +89,8 @@ pub fn prepare(
                         .map_err(|_| "prepared Claude inline settings is not UTF-8")?,
                 );
             }
-            if let Some(selected) = &manifest.settings_file {
+            if manifest.settings_file.is_some() {
+                let selected = manifest.settings_origin.as_ref().ok_or("selected Claude settings declaring origin is unrecorded; retain inputs and reprepare before dispatch")?;
                 let destination = manifest.runtime_path(selected);
                 if !inputs
                     .config_binds
@@ -347,6 +348,7 @@ mod tests {
             workspace: "/absent-cwd".into(),
             config_root: None,
             settings_file: None,
+            settings_origin: None,
             inline_settings_sha256: Some(format!("{:x}", Sha256::digest(raw))),
             setting_sources: vec![],
             plugin_dirs: vec![],
@@ -441,6 +443,7 @@ mod tests {
             workspace: "/absent-original-workspace".into(),
             config_root: None,
             settings_file: None,
+            settings_origin: None,
             inline_settings_sha256: None,
             setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec!["/absent-original-plugin".into()],
@@ -496,6 +499,52 @@ mod tests {
             )
             .is_err(),
             "foreign source recipes cannot enter ordinary Claude metadata"
+        );
+        context
+            .prepared_inputs
+            .as_mut()
+            .unwrap()
+            .manifest
+            .source_count = 0;
+        let mut selected = manifest;
+        selected.settings_file = Some("/absent-original-home/selected-settings.json".into());
+        let bytes = serde_json::to_vec(&selected).unwrap();
+        std::fs::write(owned.path().join(".freshell/input-manifest.json"), &bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
+        let error = prepare(
+            Some(&context),
+            &mut secrets,
+            &ProviderPathInputs::default(),
+            owned.path(),
+            owned.path(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("declaring origin is unrecorded"));
+        assert!(error.contains("retain inputs"));
+        assert!(secrets.claude_settings_argument.is_none());
+        selected.settings_origin = Some("/absent-original-home/declaring-settings.json".into());
+        let bytes = serde_json::to_vec(&selected).unwrap();
+        std::fs::write(owned.path().join(".freshell/input-manifest.json"), &bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
+        context
+            .prepared_inputs
+            .as_mut()
+            .unwrap()
+            .config_binds
+            .push(ProviderConfigBind {
+                source_relative_path: ".freshell/templates/claude-0".into(),
+                logical_destination: "/home/freshell/provider/declaring-settings.json".into(),
+                effective_destination: "/home/freshell/provider/declaring-settings.json".into(),
+            });
+        std::fs::create_dir(owned.path().join(".freshell/templates")).unwrap();
+        std::fs::write(owned.path().join(".freshell/templates/claude-0"), b"{}").unwrap();
+        prepare(Some(&context), &mut secrets, &ProviderPathInputs::default(), owned.path(), owned.path()).expect("a recorded native declaring origin is consumed without reading the unavailable original controller tree");
+        assert_eq!(
+            secrets.claude_settings_argument.as_deref(),
+            Some("/home/freshell/provider/declaring-settings.json")
         );
     }
 

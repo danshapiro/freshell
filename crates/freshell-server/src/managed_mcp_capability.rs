@@ -1596,7 +1596,6 @@ fn stage_provider_root(
                 claude_stage::stage_settings(
                     &temporary,
                     resources,
-                    opencode_input.claude_manifest,
                     opencode_input.claude_inline_settings,
                 )?;
             }
@@ -3366,6 +3365,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             workspace: cwd.clone(),
             config_root: Some(selected.clone()),
             settings_file: None,
+            settings_origin: None,
             inline_settings_sha256: None,
             setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec![],
@@ -3451,7 +3451,8 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             cwd: cwd.clone(),
             workspace: cwd.clone(),
             config_root: None,
-            settings_file: Some(std::fs::canonicalize(&alias).unwrap()),
+            settings_file: Some(alias.clone()),
+            settings_origin: None,
             inline_settings_sha256: None,
             setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec![],
@@ -3494,12 +3495,15 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             .iter()
             .find(|mount| Path::new(&mount.logical_destination) == commands)
             .unwrap();
+        let consumer_script = "import {readFileSync} from 'node:fs';import {execSync} from 'node:child_process';const s=JSON.parse(readFileSync(process.argv[1]));const r=execSync(s.hooks.SessionStart[0].hooks[0].command,{cwd:process.argv[2]});process.stdout.write([s.env.SELECTED_NONCE,r.toString(),s.hooks.SessionStart.length,s.hooks.Stop.length].join(':'))";
         let output = std::process::Command::new("node")
-            .arg("--input-type=module").arg("-e")
-            .arg("import {readFileSync} from 'node:fs';import {execSync} from 'node:child_process';const s=JSON.parse(readFileSync(process.argv[1]));const r=execSync(s.hooks.SessionStart[0].hooks[0].command,{cwd:process.argv[2]});process.stdout.write([s.env.SELECTED_NONCE,r.toString(),s.hooks.SessionStart.length,s.hooks.Stop.length].join(':'))")
+            .arg("--input-type=module")
+            .arg("-e")
+            .arg(consumer_script)
             .arg(stage.join(&settings.source_relative_path))
             .arg(stage.join(&resources.stage_relative_path))
-            .output().unwrap();
+            .output()
+            .unwrap();
         assert!(
             output.status.success(),
             "{}",
@@ -3508,6 +3512,64 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         assert_eq!(output.stdout, b"selected-explicit:transported-resource:2:1");
         assert_eq!(std::fs::read(&selected).unwrap(), raw.as_bytes());
         assert_eq!(std::fs::read_link(&alias).unwrap(), selected);
+        let accepted: ClaudeInputManifest = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let next_source = declaring.join("next-settings.json");
+        std::fs::write(
+            &next_source,
+            raw.replace("selected-explicit", "selected-next"),
+        )
+        .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&next_source, &alias).unwrap();
+        let next_stage = stage_provider_root(
+            &capabilities,
+            "grant-claude-explicit-next",
+            "claude",
+            &home,
+            &[],
+            OpencodeEphemeralInput {
+                launch_context: Some(&context),
+                claude_manifest: Some(&accepted),
+                cwd: Some(&cwd),
+                workspace: Some(&cwd),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let next_inputs: PreparedProviderInputs = serde_json::from_slice(
+            &std::fs::read(next_stage.join(".freshell/prepared-inputs.json")).unwrap(),
+        )
+        .unwrap();
+        let next_settings = next_inputs.config_binds.iter().find(|bind| Path::new(&bind.logical_destination)==next_source).expect("new preparation must use the changed original alias and its new native declaring file");
+        let next_resources = next_inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| Path::new(&mount.logical_destination) == commands)
+            .unwrap();
+        let output = std::process::Command::new("node")
+            .args(["--input-type=module", "-e", consumer_script])
+            .arg(next_stage.join(&next_settings.source_relative_path))
+            .arg(next_stage.join(&next_resources.stage_relative_path))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"selected-next:transported-resource:2:1");
+        let previous = std::process::Command::new("node")
+            .args(["--input-type=module", "-e", consumer_script])
+            .arg(stage.join(&settings.source_relative_path))
+            .arg(stage.join(&resources.stage_relative_path))
+            .output()
+            .unwrap();
+        assert!(previous.status.success());
+        assert_eq!(
+            previous.stdout,
+            b"selected-explicit:transported-resource:2:1"
+        );
+        assert_eq!(std::fs::read(&selected).unwrap(), raw.as_bytes());
     }
 
     #[test]
@@ -3536,6 +3598,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             workspace: cwd.clone(),
             config_root: None,
             settings_file: None,
+            settings_origin: None,
             inline_settings_sha256: None,
             setting_sources: vec![],
             plugin_dirs: vec![],
@@ -4886,6 +4949,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             workspace: workspace.clone(),
             config_root: Some(selected.clone()),
             settings_file: None,
+            settings_origin: None,
             inline_settings_sha256: Some(format!(
                 "{:x}",
                 sha2::Sha256::digest(inline_settings.as_bytes())

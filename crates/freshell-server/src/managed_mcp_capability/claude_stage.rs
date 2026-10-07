@@ -10,13 +10,14 @@ pub(super) fn prepare(
     accepted: Option<&ClaudeInputManifest>,
     excluded: &[PathBuf],
 ) -> Result<Preparation, String> {
-    let manifest = accepted.cloned().unwrap_or_else(|| ClaudeInputManifest {
+    let mut manifest = accepted.cloned().unwrap_or_else(|| ClaudeInputManifest {
         version: 1,
         original_home: home.into(),
         cwd: cwd.into(),
         workspace: workspace.into(),
         config_root: None,
         settings_file: None,
+        settings_origin: None,
         inline_settings_sha256: None,
         setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
         plugin_dirs: vec![],
@@ -26,7 +27,15 @@ pub(super) fn prepare(
     let mut resources = Vec::new();
     let mut memory = Vec::new();
     if let Some(selected) = &manifest.settings_file {
-        configurations.push((selected.clone(), canonical(selected)?));
+        let origin = canonical(selected)?;
+        if !std::fs::metadata(&origin).is_ok_and(|metadata| metadata.is_file()) {
+            return Err(format!(
+                "Claude --settings {} must select a regular file",
+                selected.display()
+            ));
+        }
+        manifest.settings_origin = Some(origin.clone());
+        configurations.push((origin.clone(), origin));
     }
     let mut bases: Vec<PathBuf> = manifest
         .cwd
@@ -138,16 +147,14 @@ pub(super) fn prepare(
 pub(super) fn stage_settings(
     root: &Path,
     preparation: &Preparation,
-    manifest: Option<&ClaudeInputManifest>,
     inline_settings: Option<&str>,
 ) -> Result<(), String> {
     use freshell_platform::claude_inputs::{
         settings_with_owned_hooks, INLINE_SETTINGS_SOURCE, MAX_NATIVE_SETTINGS_BYTES,
     };
     use std::io::Read;
-    let Some(manifest) = manifest else {
-        return Ok(());
-    };
+    let manifest: ClaudeInputManifest = serde_json::from_slice(preparation.manifest_bytes())
+        .map_err(|_| "accepted Claude discovery metadata invalid")?;
     if let Some(digest) = &manifest.inline_settings_sha256 {
         let result: Result<(), String> = (|| {
             use sha2::{Digest, Sha256};
@@ -175,7 +182,7 @@ pub(super) fn stage_settings(
             );
         });
     }
-    let Some(selected) = &manifest.settings_file else {
+    let Some(selected) = &manifest.settings_origin else {
         return Ok(());
     };
     let destination = manifest.runtime_path(selected);
@@ -260,6 +267,7 @@ mod tests {
             workspace: cwd.clone(),
             config_root: Some(user.clone()),
             settings_file: None,
+            settings_origin: None,
             inline_settings_sha256: None,
             setting_sources: vec![ClaudeSettingSource::Project],
             plugin_dirs: vec![],

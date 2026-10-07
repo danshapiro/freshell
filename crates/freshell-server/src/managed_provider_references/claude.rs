@@ -69,6 +69,7 @@ pub(crate) async fn prepare_managed(
             request.original,
         )?),
         settings_file: selected_settings_file(request.cwd, request.selected_settings)?,
+        settings_origin: None,
         inline_settings_sha256: inline_settings.map(|value| {
             use sha2::{Digest, Sha256};
             format!("{:x}", Sha256::digest(value.as_bytes()))
@@ -140,15 +141,15 @@ fn selected_settings_file(
         return Err("Claude selected settings path profile is invalid".into());
     }
     let path = Path::new(value);
-    let logical = if path.is_absolute() {
+    let logical = freshell_platform::opencode_config::lexical_path(&if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
-    };
-    std::fs::canonicalize(&logical).map(Some).map_err(|error| {
-        tracing::warn!(event="provider.inputs.preparation.blocked",provider="claude",stage="controller",operation="select_explicit_settings",path=%logical.display(),cause=%error,
+    });
+    std::fs::canonicalize(&logical).map(|_| Some(logical.clone())).map_err(|error| {
+        tracing::warn!(event="provider.inputs.preparation.blocked",provider="claude",stage="controller",operation="select_explicit_settings",field="--settings",cwd=%cwd.display(),cause=%error,
             "Selected Claude settings source is unavailable");
-        format!("Claude --settings {} is unavailable: {error}", logical.display())
+        format!("Claude --settings selected file is unavailable: {error}; select an existing settings file or valid inline JSON")
     })
 }
 
@@ -187,6 +188,102 @@ fn selected_config_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_provider_claude_settings_lookup_failure_keeps_private_document_out_of_errors_and_logs(
+    ) {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<std::collections::BTreeMap<String, String>>>);
+        impl tracing::field::Visit for Capture {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert(field.name().into(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert(field.name().into(), value.into());
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                event.record(&mut self.clone());
+            }
+        }
+        let owned = tempfile::tempdir().unwrap();
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let dispatcher = tracing::Dispatch::new(subscriber);
+        let raw = r#"{"env":{"PRIVATE_KEY":"synthetic-private-settings-value"}} trailing"#;
+        let error = tracing::dispatcher::with_default(&dispatcher, || {
+            selected_settings_file(owned.path(), Some(raw))
+        })
+        .err()
+        .unwrap();
+        assert!(
+            !error.contains("synthetic-private-settings-value"),
+            "failed settings selection must not return raw private input"
+        );
+        let fields = capture.0.lock().unwrap();
+        assert!(
+            !fields.is_empty(),
+            "selection failure must emit its structured diagnostic"
+        );
+        assert!(
+            !fields
+                .values()
+                .any(|value| value.contains("synthetic-private-settings-value")),
+            "selection failure must not log raw private input"
+        );
+        assert_eq!(
+            fields.get("operation").map(String::as_str),
+            Some("select_explicit_settings")
+        );
+        assert!(fields.contains_key("cause"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_settings_selector_resolves_updated_alias_for_next_preparation() {
+        let owned = tempfile::tempdir().unwrap();
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let first = cwd.join("first-settings.json");
+        let second = cwd.join("second-settings.json");
+        let alias = cwd.join("selected-settings.json");
+        std::fs::write(&first, b"first-source-nonce").unwrap();
+        std::fs::write(&second, b"next-source-nonce").unwrap();
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let selected = selected_settings_file(&cwd, Some("selected-settings.json"))
+            .unwrap()
+            .unwrap();
+        let accepted_snapshot = owned.path().join("accepted-snapshot");
+        std::fs::copy(
+            std::fs::canonicalize(&selected).unwrap(),
+            &accepted_snapshot,
+        )
+        .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&second, &alias).unwrap();
+        // Reissuing from accepted original selectors must resolve the next
+        // original choice, while the accepted prior generation stays intact.
+        let next_origin = std::fs::canonicalize(&selected).unwrap();
+        assert_eq!(std::fs::read(next_origin).unwrap(), b"next-source-nonce");
+        assert_eq!(
+            std::fs::read(&accepted_snapshot).unwrap(),
+            b"first-source-nonce"
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), b"first-source-nonce");
+    }
 
     #[test]
     fn managed_provider_claude_config_root_keeps_native_cwd_empty_tilde_and_unicode_selection() {

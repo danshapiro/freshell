@@ -15,6 +15,11 @@ pub(super) struct Preparation {
     pub binds: Vec<ProviderConfigBind>,
     pub mounts: Vec<ProviderResourceMount>,
 }
+impl Preparation {
+    pub(super) fn manifest_bytes(&self) -> &[u8] {
+        &self.manifest_bytes
+    }
+}
 pub(super) fn prepare(
     home: &Path,
     cwd: &Path,

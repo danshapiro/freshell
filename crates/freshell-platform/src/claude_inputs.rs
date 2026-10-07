@@ -81,6 +81,8 @@ pub struct ClaudeInputManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_origin: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inline_settings_sha256: Option<String>,
     #[serde(default = "default_setting_sources")]
     pub setting_sources: Vec<ClaudeSettingSource>,
@@ -139,6 +141,7 @@ pub fn default_setting_sources() -> Vec<ClaudeSettingSource> {
 impl ClaudeInputManifest {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.version != 1
+            || (self.settings_origin.is_some() && self.settings_file.is_none())
             || self.inline_settings_sha256.as_ref().is_some_and(|digest| {
                 self.settings_file.is_some()
                     || digest.len() != 64
@@ -158,6 +161,7 @@ impl ClaudeInputManifest {
             .into_iter()
             .chain(self.config_root.iter())
             .chain(self.settings_file.iter())
+            .chain(self.settings_origin.iter())
             .chain(&self.plugin_dirs)
         {
             if !path.is_absolute()
