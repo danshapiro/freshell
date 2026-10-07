@@ -61,7 +61,7 @@ struct HostedTransport {
     profile: std::sync::Mutex<Option<FreshAgentProfile>>,
     session_id: Mutex<Option<String>>,
     prepared_native_checkpoints: std::sync::Mutex<Option<Vec<Value>>>,
-    created_rx: Mutex<watch::Receiver<Option<Result<String, ()>>>>,
+    created_rx: Mutex<watch::Receiver<Option<Result<String, String>>>>,
     native_rx: Mutex<watch::Receiver<Option<String>>>,
     native_evidence_rx: Mutex<watch::Receiver<Option<Value>>>,
     send_outcomes: broadcast::Sender<(String, bool)>,
@@ -264,7 +264,7 @@ impl HostedTransport {
         tokio::time::timeout(CREATE_TIMEOUT, async {
             loop {
                 if let Some(result) = receiver.borrow().clone() {
-                    return result.map_err(|_| "provider create rejected".to_string());
+                    return result;
                 }
                 receiver
                     .changed()
@@ -1123,7 +1123,7 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
 }
 
 struct BroadcastBridgeOutputs {
-    created: watch::Sender<Option<Result<String, ()>>>,
+    created: watch::Sender<Option<Result<String, String>>>,
     native: watch::Sender<Option<String>>,
     native_evidence: watch::Sender<Option<Value>>,
     events: mpsc::Sender<AgentEvent>,
@@ -1185,7 +1185,15 @@ fn spawn_broadcast_bridge(
                 }
             }
             if value.get("type").and_then(Value::as_str) == Some("freshAgent.create.failed") {
-                let _ = created.send(Some(Err(())));
+                let code = value
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("PROVIDER_CREATE_FAILED");
+                let message = value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider create rejected");
+                let _ = created.send(Some(Err(format!("{code}: {message}"))));
             }
             if value.get("type").and_then(Value::as_str) == Some("freshAgent.created") {
                 if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
@@ -1615,6 +1623,45 @@ mod tests {
         .unwrap();
         assert_eq!(native_rx.borrow().as_deref(), Some(root));
         assert_eq!(evidence_rx.borrow().as_ref().unwrap()["queryGeneration"], 2);
+    }
+
+    #[tokio::test]
+    async fn native_provider_create_failure_keeps_the_existing_typed_diagnostic() {
+        let (sender, receiver) = broadcast::channel(16);
+        let (created, mut created_rx) = watch::channel(None);
+        let (native, _) = watch::channel(None);
+        let (native_evidence, _) = watch::channel(None);
+        let (events, _events_rx) = mpsc::channel(16);
+        let (send_outcomes, _) = broadcast::channel(16);
+        let (kill_outcomes, _) = broadcast::channel(16);
+        spawn_broadcast_bridge(
+            FreshProvider::Claude,
+            receiver,
+            BroadcastBridgeOutputs {
+                created,
+                native,
+                native_evidence,
+                events,
+                send_outcomes,
+                kill_outcomes,
+                suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            },
+        );
+        sender
+            .send(
+                json!({"type":"freshAgent.create.failed", "code":"CLAUDE_CREATE_FAILED",
+            "message":"current native launch signal is unwritable"})
+                .to_string(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), created_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(created_rx.borrow().clone()).unwrap(),
+            json!({"Err":"CLAUDE_CREATE_FAILED: current native launch signal is unwritable"})
+        );
     }
 
     #[tokio::test]
