@@ -273,6 +273,23 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 )
                 .await?;
                 (context.mcp_capability.clone(), Some(context))
+            } else if request.mode == "amplifier" {
+                let home = std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .ok_or("original Amplifier HOME is unavailable")?;
+                let context = crate::managed_provider_references::amplifier::prepare_managed(
+                    crate::managed_provider_references::amplifier::AmplifierPreparation {
+                        client: &self.client,
+                        soul: &soul_id,
+                        creation_seed: create_key,
+                        home: &home,
+                        cwd: &cwd,
+                        workspace: &workspace,
+                        references: &provider_secret_references,
+                    },
+                )
+                .await?;
+                (context.mcp_capability.clone(), Some(context))
             } else {
                 let mcp_capability = matches!(
                     request.mode.as_str(),
@@ -775,7 +792,26 @@ fn managed_provider_env(
     let mut env = managed_env_allowlist(source);
     // Never persist the web host's PATH into a pinned workload image. It may
     // contain host-only homes, version-manager shims, or credential helpers.
-    env.insert("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into());
+    let runtime_path = if mode == "amplifier" {
+        // The pinned image installs Amplifier's native module installer here.
+        "/opt/uv/bin:/usr/local/bin:/usr/bin:/bin"
+    } else {
+        "/usr/local/bin:/usr/bin:/bin"
+    };
+    env.insert("PATH".into(), runtime_path.into());
+    if mode == "amplifier" {
+        // Native module activation may install package dependencies. Its
+        // interpreter stays in the pinned image; new packages belong to this
+        // soul's writable HOME and are visible to that same interpreter.
+        env.insert(
+            "UV_CONFIG_FILE".into(),
+            "/home/freshell/provider/.freshell/amplifier/uv.toml".into(),
+        );
+        env.insert(
+            "PYTHONPATH".into(),
+            "/home/freshell/provider/.freshell/amplifier/python-packages".into(),
+        );
+    }
     // Provider state belongs to this soul's Docker volume, not the web
     // server's inherited HOME. These paths are inside the workload.
     env.insert("HOME".into(), "/home/freshell/provider".into());

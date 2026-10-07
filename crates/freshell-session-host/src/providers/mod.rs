@@ -58,6 +58,108 @@ pub fn prepare_provider_state_before_bootstrap(
     Ok(ensured.created_paths)
 }
 
+/// Prepared inputs already have a private, provider-owned HOME. Create native
+/// session state as that owner rather than transferring pre-existing inodes.
+pub fn prepare_amplifier_state_as_owner(
+    terminal: &mut freshell_runtime_protocol::TerminalLaunchSpec,
+) -> Result<(), String> {
+    let session_id = terminal
+        .resume_session_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or("managed Amplifier launch requires one exact launcher-assigned session id")?;
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let output = std::process::Command::new("/usr/bin/setpriv")
+        .args(crate::provider_identity_args(
+            terminal.run_as_uid,
+            terminal.run_as_gid,
+        ))
+        .arg(exe)
+        .arg("prepare-amplifier-state")
+        .args([session_id, &terminal.cwd, &terminal.terminal_id])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|_| "prepare Amplifier session state helper failed")?;
+    if !output.status.success() || output.stdout.len() > 256 * 1024 {
+        return Err("prepare Amplifier session state helper failed".into());
+    }
+    let recorded_cwd: Option<String> = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "prepare Amplifier session state response is invalid")?;
+    if let Some(cwd) = recorded_cwd {
+        validate_amplifier_state_cwd(&cwd)?;
+        terminal.cwd = cwd;
+    }
+    Ok(())
+}
+
+fn validate_amplifier_state_cwd(cwd: &str) -> Result<(), String> {
+    if cwd.len() > 64 * 1024
+        || !std::path::Path::new(cwd).is_absolute()
+        || cwd.chars().any(char::is_control)
+    {
+        return Err("Amplifier session working directory is invalid".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn run_amplifier_state_worker(args: &[String]) -> Result<(), String> {
+    let [session_id, cwd, terminal_id] = args else {
+        return Err("invalid Amplifier state preparation arguments".into());
+    };
+    validate_amplifier_state_cwd(cwd)?;
+    let ensured = freshell_sessions::amplifier_stub::ensure_session(
+        std::path::Path::new("/home/freshell/provider/.amplifier"),
+        session_id,
+        cwd,
+        terminal_id,
+    )
+    .map_err(|error| format!("prepare Amplifier session stub: {error}"))?;
+    if let Some(recorded_cwd) = ensured.working_dir_of_existing.as_deref() {
+        validate_amplifier_state_cwd(recorded_cwd)?;
+    }
+    let response = serde_json::to_vec(&ensured.working_dir_of_existing)
+        .map_err(|_| "encode Amplifier state response failed")?;
+    std::io::Write::write_all(&mut std::io::stdout(), &response)
+        .map_err(|_| "write Amplifier state response failed".into())
+}
+
+fn prepare_amplifier_package_target() -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let root = std::path::Path::new("/home/freshell/provider/.freshell/amplifier");
+    let config = root.join("uv.toml");
+    let bytes =
+        b"[pip]\ntarget = \"/home/freshell/provider/.freshell/amplifier/python-packages\"\n";
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(root)
+        .map_err(|_| "create managed Amplifier package configuration directory failed")?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&config)
+    {
+        Ok(mut file) => std::io::Write::write_all(&mut file, bytes)
+            .map_err(|_| "write managed Amplifier package configuration failed".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&config)
+                .map_err(|_| "inspect managed Amplifier package configuration failed")?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() != bytes.len() as u64
+                || std::fs::read(&config)
+                    .map_err(|_| "read managed Amplifier package configuration failed")?
+                    != bytes
+            {
+                return Err("managed Amplifier package configuration conflicts with its fixed native target".into());
+            }
+            Ok(())
+        }
+        Err(_) => Err("create managed Amplifier package configuration failed".into()),
+    }
+}
+
 pub async fn prepare_terminal(
     mut terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     child_secret_env: &std::collections::BTreeMap<String, String>,
@@ -66,6 +168,9 @@ pub async fn prepare_terminal(
     let mut child_env = child_secret_env.clone();
     prepare_scoped_mcp_environment(terminal.provider_launch_context.as_ref(), &mut child_env)
         .await?;
+    if terminal.mode == "amplifier" {
+        prepare_provider_features(&terminal, "amplifier-packages")?;
+    }
     if terminal.mode == "claude"
         && terminal
             .provider_launch_context
@@ -391,6 +496,7 @@ fn opencode_plan(
 pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String> {
     let provider_home = std::path::Path::new("/home/freshell/provider");
     match args {
+        [operation] if operation == "amplifier-packages" => prepare_amplifier_package_target(),
         [operation] if operation == "claude-mcp" => {
             use std::os::unix::fs::OpenOptionsExt;
             let destination = provider_home.join(".claude/freshell-mcp.json");

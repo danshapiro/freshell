@@ -28,6 +28,7 @@ const CAPABILITY_PATH: &str = ".freshell/mcp-capability.json";
 const GRANT_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 const RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 mod amplifier_resources;
+mod amplifier_stage;
 mod claude_memory;
 mod claude_stage;
 mod ordinary_stage;
@@ -37,6 +38,7 @@ mod source_stage;
 pub(crate) struct OpencodeEphemeralInput<'a> {
     pub codex_manifest: Option<&'a freshell_platform::codex_inputs::CodexInputManifest>,
     pub claude_manifest: Option<&'a freshell_platform::claude_inputs::ClaudeInputManifest>,
+    pub amplifier_manifest: Option<&'a freshell_platform::amplifier_inputs::AmplifierInputManifest>,
     pub inline_config: Option<&'a str>,
     pub tui_config_path: Option<&'a str>,
     pub tui_source: Option<&'a ProviderConfigReference>,
@@ -301,7 +303,7 @@ async fn apply_prepared_callback(
         )
         .map_err(|_| "replacement provider context exceeds control metadata profile".into());
     }
-    if matches!(provider, "codex" | "claude") {
+    if matches!(provider, "codex" | "claude" | "amplifier") {
         let mut context = callback
             .prior_context
             .clone()
@@ -310,65 +312,83 @@ async fn apply_prepared_callback(
             tracing::warn!(event="provider.inputs.preparation.blocked",stage="controller_callback",operation="select_original_sources",provider,
                 soul_id=%callback.soul_id,reason="origin_unknown",
                 "Original source origins are unrecorded; retained inputs were preserved");
-            let name = if provider == "codex" {
-                "Codex"
-            } else {
-                "Claude"
+            let name = match provider {
+                "codex" => "Codex",
+                "claude" => "Claude",
+                _ => "Amplifier",
             };
             return Err(format!("original {name} source origins are unrecorded; retain the existing inputs and reprepare from their original source before dispatch"));
         }
         let bytes =
             read_prior_manifest_bytes(provider, store, directory, &callback.soul_id, &context)?;
-        let codex_manifest: Option<freshell_platform::codex_inputs::CodexInputManifest> =
-            if provider == "codex" {
+        enum AcceptedOrigins {
+            Codex(freshell_platform::codex_inputs::CodexInputManifest),
+            Claude(freshell_platform::claude_inputs::ClaudeInputManifest),
+            Amplifier(freshell_platform::amplifier_inputs::AmplifierInputManifest),
+        }
+        let origins = match provider {
+            "codex" => {
                 let manifest: freshell_platform::codex_inputs::CodexInputManifest =
                     serde_json::from_slice(&bytes)
                         .map_err(|_| "prior Codex source manifest metadata invalid")?;
                 manifest.validate().map_err(str::to_string)?;
-                Some(manifest)
-            } else {
-                None
-            };
-        let claude_manifest: Option<freshell_platform::claude_inputs::ClaudeInputManifest> =
-            if provider == "claude" {
+                AcceptedOrigins::Codex(manifest)
+            }
+            "claude" => {
                 let manifest: freshell_platform::claude_inputs::ClaudeInputManifest =
                     serde_json::from_slice(&bytes)
                         .map_err(|_| "prior Claude source manifest metadata invalid")?;
                 manifest.validate().map_err(str::to_string)?;
-                Some(manifest)
-            } else {
-                None
-            };
-        let (original_home, original_cwd, original_workspace) =
-            match (&codex_manifest, &claude_manifest) {
-                (Some(manifest), None) => (
-                    &manifest.original_home,
-                    &manifest.cwd,
-                    callback.workspace.as_deref(),
-                ),
-                (None, Some(manifest)) => (
-                    &manifest.original_home,
-                    &manifest.cwd,
-                    Some(manifest.workspace.as_path()),
-                ),
-                _ => return Err("replacement ordinary source manifest selection invalid".into()),
-            };
+                AcceptedOrigins::Claude(manifest)
+            }
+            "amplifier" => {
+                let manifest: freshell_platform::amplifier_inputs::AmplifierInputManifest =
+                    serde_json::from_slice(&bytes)
+                        .map_err(|_| "prior Amplifier source manifest metadata invalid")?;
+                manifest.validate().map_err(str::to_string)?;
+                AcceptedOrigins::Amplifier(manifest)
+            }
+            _ => return Err("replacement ordinary source provider invalid".into()),
+        };
+        let (original_home, mut input) = match &origins {
+            AcceptedOrigins::Codex(manifest) => (
+                &manifest.original_home,
+                OpencodeEphemeralInput {
+                    cwd: Some(&manifest.cwd),
+                    workspace: callback.workspace.as_deref(),
+                    codex_manifest: Some(manifest),
+                    ..Default::default()
+                },
+            ),
+            AcceptedOrigins::Claude(manifest) => (
+                &manifest.original_home,
+                OpencodeEphemeralInput {
+                    cwd: Some(&manifest.cwd),
+                    workspace: Some(&manifest.workspace),
+                    claude_manifest: Some(manifest),
+                    ..Default::default()
+                },
+            ),
+            AcceptedOrigins::Amplifier(manifest) => (
+                &manifest.original_home,
+                OpencodeEphemeralInput {
+                    cwd: Some(&manifest.cwd),
+                    workspace: Some(&manifest.workspace),
+                    amplifier_manifest: Some(manifest),
+                    ..Default::default()
+                },
+            ),
+        };
         context.config.clear();
         let references = callback.provider_secret_references.unwrap_or_default();
+        input.launch_context = Some(&context);
+        input.secret_references = Some(&references);
         let capability = store.issue_replacement_with_inputs(
             callback.soul_id,
             directory,
             endpoint.into(),
             Some((provider, original_home, &context.config)),
-            OpencodeEphemeralInput {
-                launch_context: Some(&context),
-                secret_references: Some(&references),
-                cwd: Some(original_cwd),
-                workspace: original_workspace,
-                codex_manifest: codex_manifest.as_ref(),
-                claude_manifest: claude_manifest.as_ref(),
-                ..Default::default()
-            },
+            input,
         )?;
         let reply = freshell_runtime_protocol::PreparedProviderContext {
             provider_launch_context: read_prepared_context(directory, &capability)?,
@@ -1292,29 +1312,40 @@ fn stage_provider_root(
             .map_err(|_| "prepared resource descriptor exceeds control profile")?;
             write_private_bytes(&temporary.join(".freshell/resource-mounts.json"), &metadata)?;
         }
-        let ordinary_resources =
-            if opencode_input.launch_context.is_some() && matches!(provider, "codex" | "claude") {
-                Some(if provider == "claude" {
-                    claude_stage::prepare(
-                        home,
-                        opencode_input.cwd.unwrap_or(home),
-                        opencode_input
-                            .workspace
-                            .or(opencode_input.cwd)
-                            .unwrap_or(home),
-                        opencode_input.claude_manifest,
-                        &excluded,
-                    )?
-                } else {
-                    ordinary_stage::prepare(
-                        home,
-                        opencode_input.cwd.unwrap_or(home),
-                        opencode_input.codex_manifest,
-                    )?
-                })
+        let ordinary_resources = if opencode_input.launch_context.is_some()
+            && matches!(provider, "codex" | "claude" | "amplifier")
+        {
+            Some(if provider == "amplifier" {
+                amplifier_stage::prepare(
+                    home,
+                    opencode_input.cwd.unwrap_or(home),
+                    opencode_input
+                        .workspace
+                        .or(opencode_input.cwd)
+                        .unwrap_or(home),
+                    opencode_input.amplifier_manifest,
+                )?
+            } else if provider == "claude" {
+                claude_stage::prepare(
+                    home,
+                    opencode_input.cwd.unwrap_or(home),
+                    opencode_input
+                        .workspace
+                        .or(opencode_input.cwd)
+                        .unwrap_or(home),
+                    opencode_input.claude_manifest,
+                    &excluded,
+                )?
             } else {
-                None
-            };
+                ordinary_stage::prepare(
+                    home,
+                    opencode_input.cwd.unwrap_or(home),
+                    opencode_input.codex_manifest,
+                )?
+            })
+        } else {
+            None
+        };
         if let Some(resources) = &ordinary_resources {
             selections.extend(resources.selections.iter().cloned());
         }
@@ -1328,7 +1359,22 @@ fn stage_provider_root(
             None
         };
         if let Some(resources) = &amplifier_resources {
-            selections.extend(resources.selections.iter().cloned());
+            for selection in &resources.selections {
+                let mut selection = selection.clone();
+                if ordinary_resources.is_some() {
+                    selection.destination_relative =
+                        amplifier_stage::projected_path(&selection.destination_relative)?;
+                }
+                selections.push(selection);
+            }
+            if ordinary_resources.is_some() {
+                let projected = temporary.join(amplifier_stage::PROJECTED);
+                private_directory(&projected)?;
+                selections.push(CopySelection {
+                    source: projected,
+                    destination_relative: amplifier_stage::PROJECTED.into(),
+                });
+            }
         }
         for reference in references {
             if ordinary_resources.is_some() {
@@ -1449,12 +1495,27 @@ fn stage_provider_root(
         );
         if let Some(resources) = amplifier_resources {
             if let Some(settings) = resources.rewritten_settings {
-                replace_staged_private_bytes(
-                    &temporary.join("settings.yaml"),
-                    settings.as_bytes(),
-                )?;
+                let relative = if let Some(prepared) = &ordinary_resources {
+                    prepared
+                        .binds
+                        .iter()
+                        .find(|bind| {
+                            bind.logical_destination
+                                == "/home/freshell/provider/.amplifier/settings.yaml"
+                        })
+                        .map(|bind| bind.source_relative_path.as_str())
+                        .ok_or("Amplifier projected settings source unavailable")?
+                } else {
+                    "settings.yaml"
+                };
+                replace_staged_private_bytes(&temporary.join(relative), settings.as_bytes())?;
             }
             for (relative, template) in resources.rewritten_resources {
+                let relative = if ordinary_resources.is_some() {
+                    amplifier_stage::projected_path(&relative)?
+                } else {
+                    relative
+                };
                 replace_staged_private_bytes(&temporary.join(relative), template.as_bytes())?;
             }
         }
@@ -1837,7 +1898,7 @@ impl CapabilityStore {
                     provider_relative_path: CAPABILITY_PATH.into(),
                     host_gateway_address: routed_host_ipv4(),
                 });
-                if matches!(provider, "codex" | "claude") {
+                if matches!(provider, "codex" | "claude" | "amplifier") {
                     let bytes =
                         source_stage::read_source_view(root, ".freshell/prepared-inputs.json")?;
                     context.prepared_inputs = Some(
@@ -2964,6 +3025,117 @@ except Exception as error:
             );
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_amplifier_complete_context_records_origins_and_resource_projection() {
+        use freshell_runtime_protocol::{
+            ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let bundle = owned.path().join("selected-bundle");
+        let directory = owned.path().join("control/mcp-capabilities");
+        for path in [
+            &home.join(".amplifier"),
+            &workspace,
+            &bundle.join("node_modules/native-dependency"),
+            &directory,
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            home.join(".amplifier/settings.yaml"),
+            format!("bundle:\n  active: file://{}\n", bundle.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            "bundle:\n  name: selected-native-bundle\n",
+        )
+        .unwrap();
+        std::fs::write(bundle.join("resource"), "selected-resource").unwrap();
+        std::fs::write(
+            bundle.join("node_modules/native-dependency/index.js"),
+            "module.exports='installed-native-dependency'",
+        )
+        .unwrap();
+        std::fs::write(bundle.join("consume.mjs"),"import {readFileSync} from 'node:fs'; import dep from 'native-dependency'; process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+':'+dep);").unwrap();
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Amplifier {
+                bundle: "default".into(),
+                resume_args: vec![],
+            },
+            config: vec![ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "settings.yaml".into(),
+                provider_relative_path: ".amplifier/settings.yaml".into(),
+                format: "yaml".into(),
+            }],
+            mcp_capability: None,
+            prepared_inputs: None,
+        };
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let capability = store
+            .issue(
+                soul,
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("amplifier", &home, &context.config)),
+                OpencodeEphemeralInput {
+                    launch_context: Some(&context),
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    secret_references: Some(&[]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let ready = read_prepared_context(&directory, &capability).unwrap();
+        let inputs = ready
+            .prepared_inputs
+            .as_ref()
+            .expect("Amplifier initial issuance must publish a complete ordinary descriptor");
+        let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(stage.join(&inputs.manifest.relative_path)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["originalHome"], home.to_str().unwrap());
+        assert_eq!(manifest["cwd"], workspace.to_str().unwrap());
+        assert!(
+            ready.config.is_empty(),
+            "one accepted descriptor replaces the shallow independent selection"
+        );
+        let resources = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| {
+                mount.logical_destination == "/home/freshell/provider/.freshell/resources"
+            })
+            .expect("projected native bundle must be a complete owned resource root");
+        let probe = std::fs::read_dir(stage.join(&resources.stage_relative_path))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.join("consume.mjs").exists())
+            .expect("selected complete bundle projection");
+        let output = std::process::Command::new("node")
+            .arg(probe.join("consume.mjs"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            b"selected-resource:installed-native-dependency"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join(".amplifier/settings.yaml")).unwrap(),
+            format!("bundle:\n  active: file://{}\n", bundle.display())
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn managed_provider_claude_complete_stage_carries_project_resources_and_dependencies() {
@@ -4395,6 +4567,132 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             .resource_mounts
             .iter()
             .find(|mount| mount.logical_destination == "/home/freshell/provider/.claude/skills")
+            .unwrap();
+        let stage = staged_provider_root_path(
+            &directory,
+            &ready
+                .provider_launch_context
+                .mcp_capability
+                .as_ref()
+                .unwrap()
+                .grant_id,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(
+                stage
+                    .join(&mount.stage_relative_path)
+                    .join("probe/resource")
+            )
+            .unwrap(),
+            b"retained-original-resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_provider_amplifier_replacement_retains_original_sources_and_pending_replay() {
+        use freshell_runtime_protocol::{
+            PreparedProviderContext, ProviderLaunchContext, ProviderPreparation,
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("original-home");
+        let wrong = owned.path().join("current-home");
+        let workspace = owned.path().join("workspace");
+        for path in [
+            &home.join(".amplifier/skills/probe"),
+            &wrong.join(".amplifier"),
+            &workspace,
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            home.join(".amplifier/settings.yaml"),
+            r#"{"env":{"CLAUDE_SELECTED":"original"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".amplifier/skills/probe/resource"),
+            b"retained-original-resource",
+        )
+        .unwrap();
+        std::fs::write(
+            wrong.join(".amplifier/settings.yaml"),
+            r#"{"env":{"CLAUDE_SELECTED":"wrong"}}"#,
+        )
+        .unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Amplifier {
+                bundle: "default".into(),
+                resume_args: vec![],
+            },
+            mcp_capability: None,
+            config: vec![],
+            prepared_inputs: None,
+        };
+        let prior = store
+            .issue(
+                soul.clone(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("amplifier", &home, &context.config)),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    launch_context: Some(&context),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let context = read_prepared_context(&directory, &prior).unwrap();
+        assert!(context.prepared_inputs.is_some());
+        let callback=serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,"provider":"amplifier","workspace":workspace,"cwd":workspace,"priorContext":context,"providerSecretReferences":[]})).unwrap();
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let first = apply_prepared_callback(
+            &callback,
+            "fixture-control",
+            &store,
+            &directory,
+            "http://host.docker.internal:4000",
+            &wrong,
+            &client,
+        )
+        .await
+        .expect("replacement must select recorded original Amplifier sources");
+        std::fs::remove_file(home.join(".amplifier/settings.yaml")).unwrap();
+        let repeated = apply_prepared_callback(
+            &callback,
+            "fixture-control",
+            &store,
+            &directory,
+            "http://host.docker.internal:4000",
+            &wrong,
+            &client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&first).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&repeated).unwrap(),
+            "pending generation replay must precede original rescanning"
+        );
+        let ready: PreparedProviderContext = serde_json::from_slice(&repeated).unwrap();
+        let inputs = ready
+            .provider_launch_context
+            .prepared_inputs
+            .as_ref()
+            .unwrap();
+        let mount = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| mount.logical_destination == "/home/freshell/provider/.amplifier/skills")
             .unwrap();
         let stage = staged_provider_root_path(
             &directory,

@@ -12,7 +12,7 @@ const configuration=JSON.parse(fs.readFileSync(path.join(root,'broker-configurat
 const image=configuration.provider==='claude'
   ? 'sha256:b09595b8f02dae505e6719d7617305ab8f5ad53a7138b3b1580ac553c0f2663a'
   : 'sha256:967627e41734aa903e824e4be22849c7f22ce0e69487ce61bb72004c4817f89c'
-if (configuration.imageRef!==image || !['opencode','codex','claude'].includes(configuration.provider) || !Array.isArray(configuration.initialVolumes) || configuration.initialVolumes.length!==2) {
+if (configuration.imageRef!==image || !['opencode','codex','claude','amplifier'].includes(configuration.provider) || !Array.isArray(configuration.initialVolumes) || configuration.initialVolumes.length!==(configuration.provider==='amplifier'?1:2)) {
   throw new Error('closed provider startup image or finite source set changed')
 }
 const gateways=new Set<string>()
@@ -25,6 +25,8 @@ const broker=new RestrictedDockerBroker({
     ? ['/home/freshell/provider',path.join(root,'source-home/.claude'),path.join(root,'source-home/selected-plugin'),path.join(root,'source-home/imported-memory.md')]
     : configuration.provider==='codex'
     ? ['/home/freshell/provider',path.join(root,'source-home/.codex')]
+    : configuration.provider==='amplifier'
+    ? ['/home/freshell/provider',path.join(root,'source-home/.amplifier')]
     : ['/home/freshell/provider',path.join(root,'.opencode')]),
   allowedBootstrapFiles:new Set([path.join(root,'grants/environment.env'),path.join(root,'grants/auth.json'),path.join(root,'grants/ca.pem')]),
   allowedHostGatewayAddresses:gateways,
@@ -43,7 +45,7 @@ const timer=setInterval(()=>{
     }
     const directory=path.join(root,'handoff')
     const entries=fs.readdirSync(directory).filter((name)=>name.endsWith('.json'))
-    if (entries.length>2) throw new Error('closed provider fixture exceeds its finite two launch attempts')
+    if (entries.length>(configuration.provider==='amplifier'?1:2)) throw new Error('closed provider fixture exceeds its finite two launch attempts')
     for (const name of entries) {
       if (accepted.has(name)) continue
       if (!/^[a-zA-Z0-9_-]{1,128}\.json$/.test(name)) throw new Error('closed provider fixture handoff name invalid')

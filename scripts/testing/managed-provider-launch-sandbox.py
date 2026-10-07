@@ -13,6 +13,7 @@ import uuid
 IMAGE="sha256:967627e41734aa903e824e4be22849c7f22ce0e69487ce61bb72004c4817f89c"
 TEST="managed_provider_launch_tests::managed_provider_opencode_terminal_and_fresh_native_startup_consumes_prepared_inputs"
 CODEX_TEST="managed_provider_launch_tests::managed_provider_codex_terminal_and_fresh_native_startup_consumes_prepared_inputs"
+AMPLIFIER_TEST="managed_provider_launch_tests::managed_provider_amplifier_terminal_native_startup_consumes_prepared_inputs"
 CLAUDE_TEST="managed_provider_launch_tests::managed_provider_claude_terminal_and_fresh_native_startup_consumes_prepared_inputs"
 CLAUDE_IMAGE="sha256:b09595b8f02dae505e6719d7617305ab8f5ad53a7138b3b1580ac553c0f2663a"
 LABEL="com.freshell.provider-launch-probe"
@@ -31,9 +32,9 @@ def main():
     parser.add_argument("--host-binary",type=Path,required=True)
     parser.add_argument("--broker-binary",type=Path,required=True)
     parser.add_argument("--receipt-dir",type=Path,required=True)
-    parser.add_argument("--provider",choices=["opencode","codex","claude"],default="opencode")
+    parser.add_argument("--provider",choices=["opencode","codex","claude","amplifier"],default="opencode")
     args=parser.parse_args()
-    selected_test={"opencode":TEST,"codex":CODEX_TEST,"claude":CLAUDE_TEST}[args.provider]
+    selected_test={"opencode":TEST,"codex":CODEX_TEST,"claude":CLAUDE_TEST,"amplifier":AMPLIFIER_TEST}[args.provider]
     if args.provider=="claude": IMAGE=CLAUDE_IMAGE
     repo=Path(__file__).resolve().parents[2]
     test=args.test_binary.resolve(strict=True);host=args.host_binary.resolve(strict=True);broker=args.broker_binary.resolve(strict=True)
@@ -87,7 +88,9 @@ def main():
             for name in ["workspace","source-home/.config/opencode","grants","handoff","tmp","scenarios"]:
                 (root/name).mkdir(parents=True,exist_ok=True)
             initial=[]
-            for soul in ["soul-terminal-"+hashlib.sha256(b"closed-native-terminal-create").hexdigest()[:32],"soul-fresh-"+args.provider+"-"+hashlib.sha256(b"closed-native-fresh-create").hexdigest()[:32]]:
+            souls=["soul-terminal-"+hashlib.sha256(b"closed-native-terminal-create").hexdigest()[:32]]
+            if args.provider!="amplifier": souls.append("soul-fresh-"+args.provider+"-"+hashlib.sha256(b"closed-native-fresh-create").hexdigest()[:32])
+            for soul in souls:
                 volume="freshell-provider-"+hashlib.sha256((installation+"\0"+soul).encode()).hexdigest()[:24]
                 volumes.add(volume)
                 initial.append({"installationId":installation,"soulId":soul,"providerVolumeName":volume,"imageRef":IMAGE,"hostBinaryPath":str(host),"binarySha256":digest(host),"daemonId":info["ID"]})
@@ -178,7 +181,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
             receipt["exitCode"]=exit_code
             receipt["consumedRoutes"]=[json.loads(line.split("provider_launch_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_launch_consumer " in line]
             print(outcome.stdout,end="",flush=True);print(outcome.stderr,end="",flush=True)
-            expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")} if args.provider=="opencode" else {(args.provider,"terminal"),(args.provider,"fresh")}
+            expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")} if args.provider=="opencode" else ({(args.provider,"terminal")} if args.provider=="amplifier" else {(args.provider,"terminal"),(args.provider,"fresh")})
             observed_routes={(item.get("provider"),item.get("route")) for item in receipt["consumedRoutes"]}
             if exit_code==0 and (len(receipt["consumedRoutes"])!=len(expected_routes) or observed_routes!=expected_routes or "test result: ok. 1 passed;" not in outcome.stdout):
                 receipt["exitCode"]=2;receipt["failureClass"]="native_startup_count_mismatch"

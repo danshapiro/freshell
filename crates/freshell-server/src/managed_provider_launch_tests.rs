@@ -216,6 +216,437 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_provider_amplifier_terminal_native_startup_consumes_prepared_inputs() {
+    use freshell_supervisor::{
+        admission::AdmissionPolicy,
+        registry::Registry,
+        service::{serve_control, Supervisor, SupervisorConfig},
+    };
+    use freshell_terminal::registry::{ManagedTerminalController, ManagedTerminalLaunch};
+    use sha2::{Digest, Sha256};
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    let fixture = PathBuf::from(std::env::var_os("FRESHELL_PROVIDER_LAUNCH_FIXTURE").unwrap());
+    assert_eq!(fixture.parent(), Some(Path::new("/tmp")));
+    assert!(fixture
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("fln-"));
+    let home = fixture.join("source-home");
+    let workspace = fixture.join("workspace");
+    let bundle = home.join(".amplifier/bundles/selected");
+    let skill = home.join(".amplifier/skills/probe");
+    let control = fixture.join("scenarios/native/control");
+    let runtime = fixture.join("scenarios/n/r");
+    let receipt = workspace.join("amplifier-consumed.json");
+    for path in [
+        &control,
+        &runtime,
+        &bundle.join("modules/context-probe/amplifier_module_context_probe"),
+        &bundle.join("modules/loop-probe/amplifier_module_loop_probe"),
+        &bundle.join("modules/hooks-probe/amplifier_module_hooks_probe"),
+        &skill.join("node_modules/probe-dependency"),
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    assert!(std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&workspace)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(skill.join("resource"), b"closed-amplifier-resource").unwrap();
+    std::fs::write(
+        skill.join("node_modules/probe-dependency/index.js"),
+        "module.exports='closed-amplifier-dependency'",
+    )
+    .unwrap();
+    std::fs::write(skill.join("run"),"#!/usr/bin/env node\nconst fs=require('node:fs'),path=require('node:path');process.stdout.write(fs.readFileSync(path.join(__dirname,'resource'),'utf8')+':'+require('probe-dependency'));").unwrap();
+    std::fs::set_permissions(skill.join("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let context_module = r#"__amplifier_module_type__='context'
+class Context:
+    def __init__(self): self.messages=[]; self.factory=None
+    async def add_message(self,message): self.messages.append(message)
+    async def get_messages(self): return list(self.messages)
+    async def get_messages_for_request(self,**kwargs): return list(self.messages)
+    async def set_messages(self,messages): self.messages=list(messages)
+    async def clear(self): self.messages=[]
+    async def set_system_prompt_factory(self,factory): self.factory=factory
+    def get_context_info(self): return {'message_count':len(self.messages),'token_count':0}
+async def mount(coordinator,config=None): await coordinator.mount('context',Context())
+"#;
+    let loop_module = r#"__amplifier_module_type__='orchestrator'
+class Loop:
+    async def execute(self,prompt,context,providers,tools,hooks,**kwargs): raise RuntimeError('model turns are outside this closed startup fixture')
+async def mount(coordinator,config=None): await coordinator.mount('orchestrator',Loop())
+"#;
+    let hook_module = r#"__amplifier_module_type__='hook'
+import hashlib,json,os,subprocess,urllib.request
+from pathlib import Path
+from amplifier_core import HookResult
+_consumer=None
+async def mount(coordinator,config=None):
+    global _consumer
+    config=config or {}
+    async def consume(event,data):
+        uv=subprocess.check_output(['uv','--version'],text=True).strip()
+        output=subprocess.check_output([str(Path.home()/'.amplifier/skills/probe/run')])
+        request=urllib.request.Request(os.environ['FRESHELL_URL']+'/api/mcp',data=b'{}',headers={'x-auth-token':os.environ['FRESHELL_TOKEN']})
+        with urllib.request.urlopen(request,timeout=5) as response: authenticated=response.status==200
+        result={'nativeCallback':event=='on_session_ready','exactIdentity':data.get('session_id')==config['session_id'],'physicalHome':str(Path.home()),'authenticated':authenticated,'scopedAlias':os.environ.get('FRESHELL')=='1','onecli':hashlib.sha256(os.environ.get('OPENAI_API_KEY','').encode()).hexdigest()==config['key_digest'],'nativeModuleInstaller':uv.startswith('uv 0.8.22'),'resourceAndDependency':hashlib.sha256(output).hexdigest()}
+        Path(config['receipt']).write_text(json.dumps(result))
+        return HookResult(action='continue')
+    _consumer=consume
+    for event in ['session:start','session:resume']: coordinator.hooks.register(event,consume,name='closed-native-probe')
+async def on_session_ready(coordinator):
+    await _consumer('on_session_ready',{'session_id':coordinator.session_id})
+"#;
+    for (name, module) in [
+        ("context-probe", context_module),
+        ("loop-probe", loop_module),
+        ("hooks-probe", hook_module),
+    ] {
+        std::fs::write(
+            bundle.join(format!(
+                "modules/{name}/amplifier_module_{}/__init__.py",
+                name.replace('-', "_")
+            )),
+            module,
+        )
+        .unwrap();
+    }
+    let native_id = "41a04bb3-86f0-463d-97c5-f085e8a9ea4b";
+    let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let bundle_document=format!("bundle:\n  name: closed-native-bundle\nsession:\n  orchestrator:\n    module: loop-probe\n    source: ./modules/loop-probe\n  context:\n    module: context-probe\n    source: ./modules/context-probe\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\nhooks:\n  - module: hooks-probe\n    source: ./modules/hooks-probe\n    config:\n      receipt: {}\n      session_id: {}\n      key_digest: {}\n",serde_json::to_string(receipt.to_str().unwrap()).unwrap(),native_id,hash(b"synthetic-amplifier-onecli-value"));
+    std::fs::write(bundle.join("bundle.yaml"), &bundle_document).unwrap();
+    let settings=format!("bundle:\n  active: file://{}\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\n",bundle.display());
+    std::fs::write(home.join(".amplifier/settings.yaml"), &settings).unwrap();
+    let env_file = fixture.join("grants/environment.env");
+    std::fs::write(
+        &env_file,
+        "OPENAI_API_KEY=synthetic-amplifier-onecli-value\nOPENAI_BASE_URL=http://127.0.0.1:9\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::env::set_var("FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE", &env_file);
+    let registry = Registry::open(
+        fixture.join("registry"),
+        Some(
+            InstallationId::parse(std::env::var("FRESHELL_PROVIDER_LAUNCH_INSTALLATION").unwrap())
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    std::env::set_var("FRESHELL_MANAGED_PROVIDER_QUALIFICATION", "amplifier");
+    let socket = control.join("control.sock");
+    let secret_file = control.join("secret");
+    std::fs::write(&secret_file, "closed-synthetic-control-secret").unwrap();
+    std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    freshell_supervisor::backend::docker::configure_capability_dir(&socket).unwrap();
+    let supervisor = Supervisor::new(
+        registry.clone(),
+        Arc::new(BrokerAuthorizedBackend {
+            real: DockerEngineBackend::new(fixture.join("broker.sock")),
+            control: control.clone(),
+            handoff: fixture.join("handoff"),
+            certificate_sentinel: b"synthetic-amplifier-onecli-value".to_vec(),
+        }),
+        SupervisorConfig {
+            runtime_root: runtime,
+            control_socket_path: socket.clone(),
+            host_binary_path: PathBuf::from(
+                std::env::var_os("FRESHELL_PROVIDER_LAUNCH_HOST_BINARY").unwrap(),
+            ),
+            image_ref: std::env::var("FRESHELL_PROVIDER_LAUNCH_IMAGE").unwrap(),
+            test_run_id: std::env::var("FRESHELL_PROVIDER_LAUNCH_RUN_ID").unwrap(),
+            control_secret: "closed-synthetic-control-secret".into(),
+            lifecycle_log: fixture.join("lifecycle.jsonl"),
+            admission: AdmissionPolicy::default(),
+        },
+    )
+    .unwrap();
+    let control_task = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            serve_control(supervisor, &socket).await.unwrap();
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let web = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = web.local_addr().unwrap().port();
+    let app = axum::Router::new()
+        .route("/api/health", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/api/mcp",
+            axum::routing::post(|headers: axum::http::HeaderMap| async move {
+                if headers
+                    .get("x-auth-token")
+                    .is_some_and(|token| token == "closed-synthetic-web-token")
+                {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::UNAUTHORIZED
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new("closed-synthetic-web-token".to_string()),
+            crate::managed_mcp_capability::scoped_auth_middleware,
+        ));
+    let web_task = tokio::spawn(async move { axum::serve(web, app).await.unwrap() });
+    crate::managed_mcp_capability::configure("0.0.0.0", port, &socket, &secret_file).unwrap();
+    crate::managed_mcp_capability::spawn_callback_server()
+        .await
+        .unwrap();
+    for name in [
+        "FRESHELL_MANAGED_RUNTIME_V1",
+        "FRESHELL_MANAGED_FRESH_AGENT_V1",
+    ] {
+        std::env::set_var(name, "1");
+    }
+    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SOCKET", &socket);
+    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SECRET_FILE", &secret_file);
+    std::env::set_var("HOME", &home);
+    let controller = crate::managed_runtime::ServerManagedRuntimeController::from_env()
+        .await
+        .unwrap()
+        .unwrap();
+    let cwd = workspace.to_str().unwrap().to_string();
+    let terminal = controller
+        .launch(ManagedTerminalLaunch {
+            spec: freshell_platform::spawn::SpawnSpec {
+                program: "amplifier".into(),
+                args: vec![
+                    "session".into(),
+                    "resume".into(),
+                    "--full-history".into(),
+                    native_id.into(),
+                ],
+                env_overrides: BTreeMap::new(),
+                cwd: Some(cwd),
+                cols: 120,
+                rows: 30,
+            },
+            env: BTreeMap::new(),
+            terminal_id: "closed-native-terminal".into(),
+            stream_id: "closed-native-stream".into(),
+            mode: "amplifier".into(),
+            resume_session_id: Some(native_id.into()),
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            view_tab_id: None,
+            view_pane_id: None,
+            create_request_id: Some("closed-native-terminal-create".into()),
+        })
+        .await
+        .expect("complete native Amplifier terminal startup");
+    let client = controller.runtime_client();
+    let observed = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(&receipt) {
+                if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                    break value;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .ok();
+    if observed.is_some() {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let output = client
+        .read_output(
+            SoulId::parse(terminal.soul_id.clone()).unwrap(),
+            0,
+            64 * 1024,
+        )
+        .await
+        .unwrap();
+    if observed.is_none() || output.exited {
+        let text = crate::ai_title::strip_ansi(
+            &output
+                .frames
+                .iter()
+                .map(|frame| frame.data.as_str())
+                .collect::<String>(),
+        );
+        let classes = [
+            "ENOENT",
+            "EACCES",
+            "Module",
+            "module",
+            "provider",
+            "Provider",
+            "orchestrator",
+            "context",
+            "Error",
+            "Error:",
+            "failed",
+            "Traceback",
+            "installed",
+            "Installing",
+            "dependency",
+            "missing",
+            "Permission",
+            "session",
+            "Session",
+            "bundle",
+            "Bundle",
+            "setup",
+            "configure",
+            "No module named",
+            "ModuleNotFoundError",
+            "ImportError",
+            "TypeError",
+            "AttributeError",
+            "ValidationError",
+            "RuntimeError",
+            "FileNotFoundError",
+            "PermissionError",
+            "ModuleLoadError",
+            "ModuleValidationError",
+            "Failed to install",
+            "Failed to load",
+            "Failed to mount",
+            "Failed to initialize",
+            "Failed to resolve",
+            "not found",
+            "not installed",
+            "pyproject.toml",
+            "No solution found",
+            "network",
+            "Connection",
+            "loop-probe",
+            "context-probe",
+            "hooks-probe",
+            "provider-vllm",
+            "orchestrator missing",
+            "context missing",
+            "required",
+            "abstract",
+            "signature",
+            "source",
+            "not found in prepared bundle",
+            "no source hint",
+            "activation failed",
+            "Failed to activate",
+            "Failed to lazy-activate",
+            "does not exist",
+            "entry points or filesystem",
+            "has no valid Python package",
+            "failed validation",
+            "Mount function",
+            "must be async",
+            "No pyproject.toml",
+            "Could not find",
+            "Cannot find",
+            "Could not load",
+            "Module source",
+            "Source path",
+            "All configured",
+            "not available",
+            "not mounted",
+            "install dependencies",
+            "dependency installation",
+            "No context module",
+            "No orchestrator module",
+            "not a valid",
+            "parse",
+            "activate",
+            "resolve",
+            "validate",
+            "uv is not installed",
+            "File not found:",
+            "No such file or directory",
+            "Read-only file system",
+            "Permission denied",
+            "Failed to install module",
+            "No providers",
+            "No context",
+            "No orchestrator",
+            "Failed to initialize session",
+            "validation",
+            "mount",
+            "uv",
+            "pip",
+            "base_url",
+            "session_id",
+            "attribute",
+            "await",
+            "Context",
+            "dict",
+            "Prompt",
+            "factory",
+        ]
+        .into_iter()
+        .filter(|class| text.contains(class))
+        .collect::<Vec<_>>();
+        // Emit only finite diagnostic labels; paths, credentials, arbitrary
+        // exception payloads and provider output never enter the test log.
+        let labels = "error failed unable cannot could not create remove write read only readonly filesystem permission denied temporary directory file path uv pip install installed package build backend fetch download resolve git clone network connection certificate tls ssl python virtual environment target source module cache lock resource unavailable no such system command subprocess status exit stdout stderr caused by requires version dependency dependencies hooks-mode modes hatchling setuptools attribute object dict await coroutine context set_system_prompt_factory get_context_info config keys data serialize tuple type callable required schema factory prompt"
+            .split_whitespace().collect::<Vec<_>>();
+        let classified_errors = text
+            .lines()
+            .filter(|line| {
+                let line = line.to_ascii_lowercase();
+                line.contains("error") || line.contains("failed") || line.contains("caused by")
+            })
+            .take(16)
+            .map(|line| {
+                line.split(|ch: char| !ch.is_ascii_alphabetic() && ch != '-')
+                    .filter_map(|word| {
+                        labels
+                            .iter()
+                            .copied()
+                            .find(|label| word.eq_ignore_ascii_case(label))
+                    })
+                    .take(80)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "provider_launch_diagnostic {}",
+            json!({"provider":"amplifier","route":"terminal","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"classes":classes,"classifiedErrors":classified_errors})
+        );
+    }
+    let expected = json!({"nativeCallback":true,"exactIdentity":true,"physicalHome":"/home/freshell/provider","authenticated":true,"scopedAlias":true,"onecli":true,"nativeModuleInstaller":true,"resourceAndDependency":hash(b"closed-amplifier-resource:closed-amplifier-dependency")});
+    assert_eq!(observed.expect("real Amplifier must activate selected local module and executable skill before a model turn"),expected);
+    assert!(
+        !output.exited,
+        "native Amplifier must remain usable after the initialization consumer"
+    );
+    println!(
+        "provider_launch_consumer {}",
+        json!({"provider":"amplifier","route":"terminal","digest":hash(serde_json::to_vec(&expected).unwrap().as_slice())})
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".amplifier/settings.yaml")).unwrap(),
+        settings
+    );
+    assert_eq!(
+        std::fs::read_to_string(bundle.join("bundle.yaml")).unwrap(),
+        bundle_document
+    );
+    client
+        .stop(SoulId::parse(terminal.soul_id).unwrap())
+        .await
+        .unwrap();
+    web_task.abort();
+    control_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prepared_inputs() {
     use freshell_supervisor::{
         admission::AdmissionPolicy,

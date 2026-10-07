@@ -56,7 +56,7 @@ pub fn prepare(
         return Err("prepared source manifest changed before dispatch".into());
     }
     let provider = context.unwrap().preparation.provider();
-    if matches!(provider, "codex" | "claude") {
+    if matches!(provider, "codex" | "claude" | "amplifier") {
         if !frozen.is_empty()
             || inputs.manifest.source_count != 0
             || inputs.manifest.alias_count != 0
@@ -69,6 +69,13 @@ pub fn prepare(
             let manifest: freshell_platform::claude_inputs::ClaudeInputManifest =
                 serde_json::from_slice(&metadata)
                     .map_err(|_| "prepared Claude discovery metadata invalid")?;
+            manifest.validate().map_err(str::to_string)?;
+            return Ok(BTreeMap::new());
+        }
+        if provider == "amplifier" {
+            let manifest: freshell_platform::amplifier_inputs::AmplifierInputManifest =
+                serde_json::from_slice(&metadata)
+                    .map_err(|_| "prepared Amplifier discovery metadata invalid")?;
             manifest.validate().map_err(str::to_string)?;
             return Ok(BTreeMap::new());
         }
@@ -353,6 +360,73 @@ mod tests {
             )
             .is_err(),
             "foreign source recipes cannot enter ordinary Claude metadata"
+        );
+    }
+
+    #[test]
+    fn provider_secret_amplifier_prepared_manifest_validates_without_original_controller_tree() {
+        let owned = tempfile::tempdir().unwrap();
+        std::fs::create_dir(owned.path().join(".freshell")).unwrap();
+        let manifest = freshell_platform::amplifier_inputs::AmplifierInputManifest {
+            version: 1,
+            original_home: "/absent-original-home".into(),
+            cwd: "/absent-original-workspace".into(),
+            workspace: "/absent-original-workspace".into(),
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(owned.path().join(".freshell/input-manifest.json"), &bytes).unwrap();
+        let capability = McpCapabilityReference {
+            grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
+            endpoint: "http://host.docker.internal:4000".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let mut context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Amplifier {
+                bundle: "default".into(),
+                resume_args: vec![],
+            },
+            config: vec![],
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: format!("{:x}", Sha256::digest(&bytes)),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                resource_mounts: vec![],
+                indexed_files: None,
+            }),
+            mcp_capability: Some(capability),
+        };
+        let mut secrets = ResolvedProviderSecrets::default();
+        let generated=prepare(Some(&context),&mut secrets,&ProviderPathInputs::default(),owned.path(),owned.path())
+            .expect("Amplifier source origins validate from accepted private metadata, without rescanning controller paths");
+        assert!(generated.is_empty());
+        assert!(
+            secrets.opencode_plan.is_none(),
+            "ordinary Amplifier cannot gain OpenCode source/auth semantics"
+        );
+        context
+            .prepared_inputs
+            .as_mut()
+            .unwrap()
+            .manifest
+            .source_count = 1;
+        assert!(
+            prepare(
+                Some(&context),
+                &mut secrets,
+                &ProviderPathInputs::default(),
+                owned.path(),
+                owned.path()
+            )
+            .is_err(),
+            "foreign source recipes cannot enter ordinary Amplifier metadata"
         );
     }
 

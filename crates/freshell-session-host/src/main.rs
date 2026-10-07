@@ -164,6 +164,7 @@ async fn run() -> Result<(), String> {
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
         Some("prepare-provider-features") => providers::run_provider_features_worker(&args[2..]),
+        Some("prepare-amplifier-state") => providers::run_amplifier_state_worker(&args[2..]),
         _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker|refresh-provider-config> ...".into()),
     }
 }
@@ -886,7 +887,7 @@ async fn grant_execution(
                 format!("resolve managed provider credentials: {error}"),
             )
         })?;
-        if matches!(provider, "opencode" | "codex" | "claude") {
+        if matches!(provider, "opencode" | "codex" | "claude" | "amplifier") {
             let generated = provider_input_preparation::prepare(
                 context,
                 &mut secrets,
@@ -1215,6 +1216,33 @@ async fn grant_execution(
 fn prepare_provider_state_for_fresh_launch(
     terminal: &mut TerminalLaunchSpec,
 ) -> Result<(), RuntimeError> {
+    if terminal.mode == "amplifier"
+        && terminal.provider_bootstrap_files.is_empty()
+        && terminal
+            .provider_launch_context
+            .as_ref()
+            .is_some_and(|context| context.prepared_inputs.is_some())
+    {
+        // Selected configuration must be available before the native stub
+        // records the active bundle. All new state is born under the provider
+        // identity; no pre-existing HOME ownership is acquired by the host.
+        verify_initialized_provider_home(
+            Path::new("/home/freshell/provider"),
+            terminal.run_as_uid,
+            terminal.run_as_gid,
+        )
+        .and_then(|_| {
+            prepare_provider_context_for_fresh_launch(terminal, &ProviderConfigPaths::default())
+        })
+        .and_then(|_| providers::prepare_amplifier_state_as_owner(terminal))
+        .map_err(|error| {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                format!("prepare managed Amplifier state: {error}"),
+            )
+        })?;
+        return Ok(());
+    }
     prepare_provider_state_before_bootstrap_with(
         terminal,
         |terminal| {

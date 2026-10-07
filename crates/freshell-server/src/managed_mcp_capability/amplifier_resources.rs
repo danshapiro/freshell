@@ -83,6 +83,7 @@ struct BundleSelection {
     view_bytes: usize,
     metadata_bytes: usize,
     completed: BTreeMap<PathBuf, String>,
+    modules: BTreeMap<PathBuf, String>,
 }
 fn select_local_bundle(
     source: &str,
@@ -245,6 +246,44 @@ fn select_local_bundle(
                 return Err("Amplifier selected bundle requires one YAML document".into());
             }
             let mut bundle_replacements = Vec::new();
+            let module_origin = ModuleSourceOrigin {
+                yaml,
+                header_offset,
+                declaring_root: root,
+                bundle_destination: &relative,
+                complete_bundle_directory: metadata.is_dir(),
+                excluded,
+            };
+            if let Some(session) = native_mapping_value(&bundle_documents[0], "session", 0)? {
+                for kind in ["orchestrator", "context"] {
+                    if let Some(module) = native_mapping_value(session, kind, 0)? {
+                        project_module_source(
+                            module,
+                            &module_origin,
+                            result,
+                            state,
+                            &mut bundle_replacements,
+                        )?;
+                    }
+                }
+            }
+            for kind in ["providers", "tools", "hooks"] {
+                if let Some(modules) = native_mapping_value(&bundle_documents[0], kind, 0)? {
+                    for module in modules
+                        .data
+                        .as_sequence()
+                        .ok_or("Amplifier selected module list must be a sequence")?
+                    {
+                        project_module_source(
+                            module,
+                            &module_origin,
+                            result,
+                            state,
+                            &mut bundle_replacements,
+                        )?;
+                    }
+                }
+            }
             if let Some(includes) = bundle_documents[0].data.as_mapping_get("includes") {
                 for item in includes
                     .data
@@ -390,6 +429,124 @@ fn select_local_bundle(
     Ok(Some(runtime_uri))
 }
 
+#[derive(Clone, Copy)]
+struct ModuleSourceOrigin<'a> {
+    yaml: &'a str,
+    header_offset: usize,
+    declaring_root: &'a Path,
+    bundle_destination: &'a Path,
+    complete_bundle_directory: bool,
+    excluded: &'a [PathBuf],
+}
+
+fn project_module_source(
+    module: &MarkedYamlOwned,
+    origin: &ModuleSourceOrigin<'_>,
+    result: &mut ResourcePreparation,
+    state: &mut BundleSelection,
+    replacements: &mut Vec<(usize, usize, String)>,
+) -> Result<(), String> {
+    let ModuleSourceOrigin {
+        yaml,
+        header_offset,
+        declaring_root,
+        bundle_destination,
+        complete_bundle_directory,
+        excluded,
+    } = *origin;
+    let Some(node) = native_mapping_value(module, "source", 0)? else {
+        return Ok(());
+    };
+    let Some(source) = node.data.as_str() else {
+        return Ok(());
+    };
+    let local = if let Some(path) = source.strip_prefix("file://") {
+        path
+    } else if source.starts_with("./")
+        || source.starts_with("../")
+        || Path::new(source).is_absolute()
+    {
+        source
+    } else {
+        return Ok(());
+    };
+    if local.is_empty() || local.len() > 64 * 1024 || local.chars().any(char::is_control) {
+        return Err("Amplifier selected module source path is invalid".into());
+    }
+    let selected = if Path::new(local).is_absolute() {
+        PathBuf::from(local)
+    } else {
+        declaring_root.join(local)
+    };
+    let canonical = std::fs::canonicalize(&selected).map_err(|error| {
+        format!(
+            "Amplifier selected module source {} is unavailable: {error}",
+            selected.display()
+        )
+    })?;
+    if excluded.iter().any(|path| canonical.starts_with(path)) {
+        return Err("Amplifier selected module aliases credentials or native state; use the approved private grant source".into());
+    }
+    if !std::fs::metadata(&canonical)
+        .map_err(|error| format!("Amplifier selected module source metadata failed: {error}"))?
+        .is_dir()
+    {
+        return Err(
+            "Amplifier selected local module source must be a complete package directory".into(),
+        );
+    }
+    let runtime = if let Some(runtime) = state.modules.get(&canonical) {
+        runtime.clone()
+    } else {
+        if state.next_id >= 8192 {
+            return Err("Amplifier selected module event budget exceeded".into());
+        }
+        state.metadata_bytes = state
+            .metadata_bytes
+            .checked_add(canonical.as_os_str().len())
+            .and_then(|size| size.checked_add(selected.as_os_str().len()))
+            .ok_or("Amplifier selected module metadata size overflow")?;
+        if state.metadata_bytes > 8 * 1024 * 1024 {
+            return Err("Amplifier selected module metadata budget exceeded".into());
+        }
+        let destination = if complete_bundle_directory && canonical.starts_with(declaring_root) {
+            bundle_destination.join(canonical.strip_prefix(declaring_root).unwrap())
+        } else {
+            let destination = PathBuf::from(format!(
+                ".freshell/resources/amplifier-module-{}",
+                state.next_id
+            ));
+            result.selections.push(CopySelection {
+                source: canonical.clone(),
+                destination_relative: destination.clone(),
+            });
+            destination
+        };
+        state.next_id += 1;
+        let runtime = format!(
+            "file://{}",
+            Path::new("/home/freshell/provider")
+                .join(destination)
+                .to_str()
+                .ok_or("Amplifier projected module path is not UTF-8")?
+        );
+        state.modules.insert(canonical, runtime.clone());
+        runtime
+    };
+    let start = header_offset
+        .checked_add(source_offset(yaml, node.span.start)?)
+        .ok_or("Amplifier module source offset overflow")?;
+    let end = header_offset
+        .checked_add(source_offset(yaml, node.span.end)?)
+        .ok_or("Amplifier module source offset overflow")?;
+    replacements.push((
+        start,
+        end,
+        serde_json::to_string(&runtime).map_err(|_| "Amplifier module source cannot be encoded")?,
+    ));
+    Ok(())
+}
+
 fn markdown_frontmatter(raw: &str) -> Option<(&str, usize)> {
     static HEADER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let expression = HEADER.get_or_init(|| {
@@ -398,6 +555,89 @@ fn markdown_frontmatter(raw: &str) -> Option<(&str, usize)> {
     });
     let header = expression.captures(raw)?.get(1)?;
     Some((header.as_str(), header.start()))
+}
+
+#[cfg(test)]
+mod module_source_tests {
+    use super::*;
+
+    #[test]
+    fn amplifier_local_module_source_executes_after_projection_from_unrelated_cwd() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let bundle = owned.path().join("bundle");
+        let module = bundle.join("modules/loop-probe");
+        let cwd = owned.path().join("unrelated-workspace");
+        let stage = owned.path().join("stage");
+        for path in [
+            &home.join(".amplifier"),
+            &module.join("node_modules/dep"),
+            &cwd,
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            home.join(".amplifier/settings.yaml"),
+            format!("bundle:\n  active: file://{}\n", bundle.display()),
+        )
+        .unwrap();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle:\n  name: selected\nsession:\n  orchestrator:\n    module: loop-probe\n    source: ./modules/loop-probe\n").unwrap();
+        std::fs::write(module.join("resource"), "module-resource").unwrap();
+        std::fs::write(
+            module.join("node_modules/dep/index.js"),
+            "module.exports='installed-dependency'",
+        )
+        .unwrap();
+        std::fs::write(module.join("consume.cjs"), "const fs=require('node:fs'),path=require('node:path');process.stdout.write(fs.readFileSync(path.join(__dirname,'resource'),'utf8')+':'+require('dep'));").unwrap();
+        let prepared = prepare(&home, &cwd, &[]).unwrap();
+        freshell_platform::provider_environment::copy_environment(
+            &prepared.selections,
+            &stage,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        for (path, bytes) in prepared.rewritten_resources {
+            std::fs::write(stage.join(path), bytes).unwrap();
+        }
+        let document = std::fs::read_to_string(
+            stage.join(".freshell/resources/amplifier-local-0/bundle.yaml"),
+        )
+        .unwrap();
+        let parsed = MarkedYamlOwned::load_from_str(&document).unwrap();
+        let source = parsed[0]
+            .data
+            .as_mapping_get("session")
+            .unwrap()
+            .data
+            .as_mapping_get("orchestrator")
+            .unwrap()
+            .data
+            .as_mapping_get("source")
+            .unwrap()
+            .data
+            .as_str()
+            .unwrap();
+        let selected = if let Some(path) = source.strip_prefix("file://") {
+            stage.join(
+                Path::new(path)
+                    .strip_prefix("/home/freshell/provider")
+                    .unwrap(),
+            )
+        } else {
+            cwd.join(source)
+        };
+        let output = std::process::Command::new("node")
+            .arg(selected.join("consume.cjs"))
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "selected local module must execute independently of launch cwd"
+        );
+        assert_eq!(output.stdout, b"module-resource:installed-dependency");
+    }
 }
 
 fn native_mapping_value<'a>(
