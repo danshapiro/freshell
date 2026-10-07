@@ -130,6 +130,17 @@ fn native_census(evidence: &[String]) -> Option<NativeAbsenceCensus> {
     Some(receipt)
 }
 
+/// Canonical body-free serialization for an already qualified reader receipt.
+/// Parsing alone is not absence proof; callers must validate the exact tuple,
+/// environment and current storage before relying on this reference.
+pub fn canonical_native_absence_census_reference(evidence: &[String]) -> Option<String> {
+    let census = native_census(evidence)?;
+    Some(format!(
+        "{NATIVE_CENSUS_PREFIX}{}",
+        serde_json::to_string(&census).ok()?
+    ))
+}
+
 fn native_environment_fingerprint(spec: &ResumeSpec) -> String {
     NativeStoreSelection::from_spec(spec).fingerprint(&spec.provider_home)
 }

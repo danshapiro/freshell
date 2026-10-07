@@ -3544,6 +3544,16 @@ impl Supervisor {
             let (reason_code, evidence_refs) =
                 normalized_negative_evidence(row.path, row.store_state, &row.evidence_refs);
             row.reason_code = reason_code;
+            // NativeResume was qualified above against the exact context and
+            // current reader generation. Persist its typed receipt rather than
+            // raw transient JSON, which can carry private diagnostic payloads.
+            let native_census = (row.path == RecoveryPath::NativeResume)
+                .then(|| {
+                    freshell_agent_runtime::canonical_native_absence_census_reference(
+                        &row.evidence_refs,
+                    )
+                })
+                .flatten();
             let qualified_refs: Vec<_> = row
                 .evidence_refs
                 .iter()
@@ -3551,7 +3561,7 @@ impl Supervisor {
                     reference
                         .split_once("=sha256:")
                         .is_some_and(|(kind, digest)| {
-                            matches!(kind, "nativeAbsenceCensus" | "nativeStoreCensus")
+                            kind == "nativeStoreCensus"
                                 && digest.len() == 64
                                 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
                         })
@@ -3560,6 +3570,7 @@ impl Supervisor {
                 .collect();
             row.evidence_refs = evidence_refs;
             row.evidence_refs.extend(qualified_refs);
+            row.evidence_refs.extend(native_census);
             evidence.push(row);
         }
         Ok(evidence)
