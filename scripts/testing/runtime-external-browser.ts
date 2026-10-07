@@ -707,6 +707,12 @@ export class ExternalManagedRuntimeRig {
   async crashRuntimeHost(handle: ExactRuntimeHandle): Promise<void> {
     await this.rpc('crash-host', CompletedOwnerOperationSchema, { handle })
   }
+  async holdRuntimeHost(handle: ExactRuntimeHandle): Promise<{ pid: number }> {
+    return this.rpc('hold-host', z.object({ pid: z.number().int().positive() }).strict(), { handle })
+  }
+  async releaseRuntimeHost(handle: ExactRuntimeHandle): Promise<void> {
+    await this.rpc('release-host', CompletedOwnerOperationSchema, { handle })
+  }
   async crashFixtureWorker(handle: ExactRuntimeHandle): Promise<void> {
     await this.rpc('crash-provider', CompletedOwnerOperationSchema, { handle })
   }
@@ -904,6 +910,8 @@ export function createExternalRuntimeControl(
         result = { completed: true }
         break
       case 'crash-host': await owner.crashRuntimeHost(handle()); result = { completed: true }; break
+      case 'hold-host': result = await owner.holdRuntimeHost(handle()); break
+      case 'release-host': await owner.releaseRuntimeHost(handle()); result = { completed: true }; break
       case 'crash-provider': await owner.crashFixtureWorker(handle()); result = { completed: true }; break
       case 'replace-web':
         await owner.crashAndRestartWeb()

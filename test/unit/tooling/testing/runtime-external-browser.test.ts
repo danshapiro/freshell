@@ -653,6 +653,23 @@ describe('closed external owner control', () => {
     await control({ ...request, operationId: 'legacy-begin', action: 'retained-start', challengeId: 'legacy' })
     expect(retained.start).toHaveBeenCalledWith('legacy')
   })
+  it('holds and releases only the exact current host, retaining the held PID for cleanup', async () => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'held-owned-soul',
+      incarnationId: 'held-owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'held-owned-boot', nativeSessionId: 'held-owned-native' }
+    const validate = vi.spyOn(owned, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const signal = vi.spyOn(owned, 'signalOwnedSessionHostExact').mockReturnValue(1234)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    await expect(control({ ...request, action: 'hold-host', handle })).resolves.toMatchObject({ result: { pid: 1234 } })
+    expect(validate).toHaveBeenCalledWith(handle)
+    expect(signal).toHaveBeenCalledExactlyOnceWith(handle.containerId, handle.incarnationId, 'SIGSTOP')
+    await expect(control({ ...request, operationId: 'foreign-release', action: 'release-host', handle: { ...handle, hostBootId: 'foreign-boot' } })).rejects.toThrow(/held/)
+    expect(signal).toHaveBeenCalledOnce()
+    await control({ ...request, operationId: 'owned-release', action: 'release-host', handle })
+    expect(signal).toHaveBeenLastCalledWith(handle.containerId, handle.incarnationId, 'SIGCONT', 1234)
+    await expect(control({ ...request, operationId: 'duplicate-release', action: 'release-host', handle })).rejects.toThrow(/held/)
+    expect(signal).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('external finite fixture client', () => {

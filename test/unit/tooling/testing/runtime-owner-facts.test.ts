@@ -180,6 +180,30 @@ describe('registered fresh fixture state decoder', () => {
 })
 
 describe('owned rig cleanup settlement', () => {
+  it('attempts every held host release, web stop and runtime cleanup after a release failure', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') })
+    const first = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    const second = { ...first, soulId: 'second-owned-soul', incarnationId: 'second-owned-incarnation', containerId: 'd'.repeat(64) }
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const signal = vi.spyOn(rig, 'signalOwnedSessionHostExact').mockImplementation((_container, incarnation, signal) => {
+      if (signal === 'SIGCONT' && incarnation === first.incarnationId) throw new Error('owned release failed')
+      return incarnation === first.incarnationId ? 1234 : 1235
+    })
+    const web = new RustServer()
+    rig.web = web
+    const stopWeb = vi.spyOn(web, 'stop').mockResolvedValue(undefined)
+    const cleanup = vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    vi.spyOn(rig.runtime, 'writeArtifact').mockReturnValue('/owned/cleanup.json')
+    await rig.holdRuntimeHost(first)
+    await rig.holdRuntimeHost(second)
+    const result = await rig.stop()
+    expect(result.ok).toBe(false)
+    expect(result.errors.join(' ')).toMatch(/held|release/)
+    expect(signal).toHaveBeenCalledWith(first.containerId, first.incarnationId, 'SIGCONT', 1234)
+    expect(signal).toHaveBeenCalledWith(second.containerId, second.incarnationId, 'SIGCONT', 1235)
+    expect(stopWeb).toHaveBeenCalledOnce()
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
   it('retains web stop failure and still cleans its runtime resources', async () => {
     const stopWeb = vi.fn().mockRejectedValue(new Error('owned web did not stop'))
     const cleanupRuntime = vi.fn().mockResolvedValue({ ok: true, errors: [] })

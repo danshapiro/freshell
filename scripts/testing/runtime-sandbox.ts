@@ -1995,6 +1995,7 @@ export class ManagedRuntimeOwner {
   private readonly fixtureFreshAgentModes: string[]
   private qualificationSupervisorBin: string | undefined
   private stopSettlement?: Promise<{ ok: boolean; errors: string[] }>
+  private readonly heldHosts = new Map<string, { handle: ExactRuntimeHandle; pid: number }>()
 
   constructor(
     private readonly webFactory: RuntimeWebFactory,
@@ -2185,7 +2186,7 @@ export class ManagedRuntimeOwner {
   async stop(): Promise<{ ok: boolean; errors: string[] }> {
     if (this.stopSettlement) return this.stopSettlement
     this.stopSettlement = (async () => {
-      const result = await settleOwnedRuntimeCleanup(async () => { await this.web?.stop() }, () => this.runtime.cleanup())
+      const result = await settleOwnedRuntimeCleanup(() => this.stopWebAndReleaseHeldHosts(), () => this.runtime.cleanup())
       const cleanupPath = path.join(this.runtime.evidenceDir, 'cleanup.json')
       let runtimeCleanup: Record<string, unknown> = {}
       try { runtimeCleanup = objectFields(JSON.parse(fs.readFileSync(cleanupPath, 'utf8')), 'invalid owner cleanup artifact') }
@@ -2203,6 +2204,19 @@ export class ManagedRuntimeOwner {
       if (!result.ok) this.stopSettlement = undefined
       return result
     } catch (error) { this.stopSettlement = undefined; throw error }
+  }
+
+  private async stopWebAndReleaseHeldHosts(): Promise<void> {
+    const errors: unknown[] = []
+    for (const { handle } of this.heldHosts.values()) {
+      try { await this.releaseRuntimeHost(handle) }
+      catch (error) {
+        errors.push(error)
+        this.runtime.recordLifecycle('external.host_release_failed', { severity: 'error', ...handle })
+      }
+    }
+    try { await this.web?.stop() } catch (error) { errors.push(error) }
+    if (errors.length) throw new AggregateError(errors, 'held host release or web cleanup failed')
   }
 
   async destroyTestRig(): Promise<{ ok: boolean; errors: string[] }> {
@@ -2278,6 +2292,29 @@ export class ManagedRuntimeOwner {
   async crashRuntimeHost(handle: ExactRuntimeHandle): Promise<void> {
     await this.assertCurrentHandle(handle)
     this.runtime.killOwnedRuntimeExact(handle.containerId)
+  }
+
+  private heldHostKey(handle: ExactRuntimeHandle): string {
+    return JSON.stringify([handle.runId, handle.candidateSha, handle.soulId, handle.incarnationId,
+      handle.containerId, handle.hostBootId, handle.nativeSessionId])
+  }
+
+  async holdRuntimeHost(handle: ExactRuntimeHandle): Promise<{ pid: number }> {
+    await this.assertCurrentHandle(handle)
+    const key = this.heldHostKey(handle)
+    if (this.heldHosts.has(key)) throw new Error('exact owned host is already held')
+    const pid = this.signalOwnedSessionHostExact(handle.containerId, handle.incarnationId, 'SIGSTOP')
+    this.heldHosts.set(key, { handle: { ...handle }, pid })
+    this.runtime.recordLifecycle('external.host_held', { severity: 'info', ...handle, pid })
+    return { pid }
+  }
+
+  async releaseRuntimeHost(handle: ExactRuntimeHandle): Promise<void> {
+    const key = this.heldHostKey(handle), held = this.heldHosts.get(key)
+    if (!held) throw new Error('exact recorded held host required')
+    this.signalOwnedSessionHostExact(handle.containerId, handle.incarnationId, 'SIGCONT', held.pid)
+    this.heldHosts.delete(key)
+    this.runtime.recordLifecycle('external.host_released', { severity: 'info', ...handle, pid: held.pid })
   }
 
   async providerVolumeFacts(handle: ExactRuntimeHandle): Promise<{ providerVolumeName: string }> {
