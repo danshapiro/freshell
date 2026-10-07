@@ -55,16 +55,22 @@ pub fn prepare(
     if format!("{:x}", Sha256::digest(&metadata)) != inputs.manifest.sha256 {
         return Err("prepared source manifest changed before dispatch".into());
     }
-    if context.unwrap().preparation.provider() == "codex" {
+    let provider = context.unwrap().preparation.provider();
+    if matches!(provider, "codex" | "claude") {
         if !frozen.is_empty()
             || inputs.manifest.source_count != 0
             || inputs.manifest.alias_count != 0
             || inputs.manifest.recipe_count != 0
             || inputs.indexed_files.is_some()
         {
-            return Err(
-                "Codex ordinary source context carries foreign private reference inputs".into(),
-            );
+            return Err("ordinary source context carries foreign private reference inputs".into());
+        }
+        if provider == "claude" {
+            let manifest: freshell_platform::claude_inputs::ClaudeInputManifest =
+                serde_json::from_slice(&metadata)
+                    .map_err(|_| "prepared Claude discovery metadata invalid")?;
+            manifest.validate().map_err(str::to_string)?;
+            return Ok(BTreeMap::new());
         }
         let manifest: freshell_platform::codex_inputs::CodexInputManifest =
             serde_json::from_slice(&metadata)
@@ -285,6 +291,71 @@ mod tests {
     use freshell_platform::opencode_recipe::*;
     use freshell_runtime_protocol::*;
     use sha2::{Digest, Sha256};
+    #[test]
+    fn provider_secret_claude_prepared_manifest_validates_without_original_controller_tree() {
+        let owned = tempfile::tempdir().unwrap();
+        std::fs::create_dir(owned.path().join(".freshell")).unwrap();
+        let manifest = freshell_platform::claude_inputs::ClaudeInputManifest {
+            version: 1,
+            original_home: "/absent-original-home".into(),
+            cwd: "/absent-original-workspace".into(),
+            workspace: "/absent-original-workspace".into(),
+            plugin_dirs: vec!["/absent-original-plugin".into()],
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(owned.path().join(".freshell/input-manifest.json"), &bytes).unwrap();
+        let capability = McpCapabilityReference {
+            grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
+            endpoint: "http://host.docker.internal:4000".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let mut context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+            config: vec![],
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: format!("{:x}", Sha256::digest(&bytes)),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                resource_mounts: vec![],
+                indexed_files: None,
+            }),
+            mcp_capability: Some(capability),
+        };
+        let mut secrets = ResolvedProviderSecrets::default();
+        let generated=prepare(Some(&context),&mut secrets,&ProviderPathInputs::default(),owned.path(),owned.path())
+            .expect("Claude source origins validate from accepted private metadata, without rescanning controller paths");
+        assert!(generated.is_empty());
+        assert!(
+            secrets.opencode_plan.is_none(),
+            "ordinary Claude cannot gain OpenCode source/auth semantics"
+        );
+        context
+            .prepared_inputs
+            .as_mut()
+            .unwrap()
+            .manifest
+            .source_count = 1;
+        assert!(
+            prepare(
+                Some(&context),
+                &mut secrets,
+                &ProviderPathInputs::default(),
+                owned.path(),
+                owned.path()
+            )
+            .is_err(),
+            "foreign source recipes cannot enter ordinary Claude metadata"
+        );
+    }
+
     #[test]
     fn provider_secret_codex_prepared_manifest_retains_native_home_without_original_tree() {
         let owned = tempfile::tempdir().unwrap();

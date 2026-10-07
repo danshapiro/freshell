@@ -2,6 +2,7 @@
 //! Plans retain approved source metadata and unexpanded templates, never payload bytes.
 use std::path::{Path, PathBuf};
 
+pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod environment;
 pub(crate) mod sources;

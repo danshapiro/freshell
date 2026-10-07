@@ -216,6 +216,368 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prepared_inputs() {
+    use freshell_supervisor::{
+        admission::AdmissionPolicy,
+        registry::Registry,
+        service::{serve_control, Supervisor, SupervisorConfig},
+    };
+    use freshell_terminal::registry::{ManagedTerminalController, ManagedTerminalLaunch};
+    use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
+    use sha2::{Digest, Sha256};
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    let fixture = PathBuf::from(
+        std::env::var_os("FRESHELL_PROVIDER_LAUNCH_FIXTURE").expect("closed Claude launch fixture"),
+    );
+    assert_eq!(fixture.parent(), Some(Path::new("/tmp")));
+    assert!(fixture
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("fln-"));
+    let home = fixture.join("source-home");
+    let workspace = fixture.join("workspace");
+    let plugin = home.join("selected-plugin");
+    let control = fixture.join("scenarios/native/control");
+    let runtime = fixture.join("scenarios/n/r");
+    for path in [
+        &control,
+        &runtime,
+        &home.join(".claude"),
+        &plugin.join(".claude-plugin"),
+        &plugin.join("hooks"),
+        &plugin.join("scripts/node_modules/probe-dependency"),
+        &plugin.join("skills/probe"),
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    assert!(std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&workspace)
+        .status()
+        .unwrap()
+        .success());
+    let receipt = workspace.join("claude-consumed.json");
+    std::fs::write(
+        home.join(".claude/CLAUDE.md"),
+        b"closed-claude-global-memory",
+    )
+    .unwrap();
+    let settings = r#"{"env":{"CLAUDE_SELECTED_NONCE":"closed-selected-settings"}}"#;
+    std::fs::write(home.join(".claude/settings.json"), settings).unwrap();
+    std::fs::write(plugin.join("skills/probe/SKILL.md"),"---\nname: closed-plugin-probe\ndescription: selected complete native plugin\n---\nUse the adjacent resources.\n").unwrap();
+    std::fs::write(plugin.join("scripts/resource"), b"closed-claude-resource").unwrap();
+    std::fs::write(
+        plugin.join("scripts/node_modules/probe-dependency/index.js"),
+        "module.exports='closed-claude-dependency'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("scripts/run"),
+        "#!/bin/sh\ncat \"$(dirname \"$0\")/resource\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        plugin.join("scripts/run"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let consumer = r#"const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),http=require('node:http');
+const hash=v=>crypto.createHash('sha256').update(v).digest('hex');
+let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
+ const input=JSON.parse(raw),root=path.resolve(__dirname,'..');
+ const endpoint=process.env.FRESHELL_URL,token=process.env.FRESHELL_TOKEN;
+ const authenticated=await new Promise(resolve=>{if(!endpoint||!token)return resolve(false);const req=http.request(new URL('/api/mcp',endpoint),{method:'POST',headers:{'x-auth-token':token}},res=>{res.resume();resolve(res.statusCode===200)});req.on('error',()=>resolve(false));req.end('{}')});
+ const record={hook:input.hook_event_name==='SessionStart',physicalHome:process.env.HOME,settings:process.env.CLAUDE_SELECTED_NONCE==='closed-selected-settings',authenticated,scopedAlias:process.env.FRESHELL==='1',onecli:hash(process.env.ANTHROPIC_API_KEY||'')===process.argv[3],
+ memory:hash(fs.readFileSync(path.join(process.env.HOME,'.claude/CLAUDE.md'))),skill:hash(fs.readFileSync(path.join(root,'skills/probe/SKILL.md'))),resource:hash(require('node:child_process').execFileSync(path.join(__dirname,'run'))),dependency:hash(require('probe-dependency'))};
+ fs.writeFileSync(process.argv[2],JSON.stringify(record));
+});
+"#;
+    std::fs::write(plugin.join("scripts/consume.cjs"), consumer).unwrap();
+    let manifest = json!({"name":"closed-selected-plugin","version":"1.0.0","skills":"./skills","hooks":"./hooks/hooks.json"});
+    std::fs::write(
+        plugin.join(".claude-plugin/plugin.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let key_digest = format!("{:x}", Sha256::digest(b"synthetic-claude-onecli-value"));
+    let hooks = json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":format!("node \"${{CLAUDE_PLUGIN_ROOT}}/scripts/consume.cjs\" {} {}",serde_json::to_string(receipt.to_str().unwrap()).unwrap(),key_digest),"timeout":10}]}]}});
+    std::fs::write(
+        plugin.join("hooks/hooks.json"),
+        serde_json::to_vec(&hooks).unwrap(),
+    )
+    .unwrap();
+    let validated = std::process::Command::new("claude")
+        .args(["plugin", "validate"])
+        .arg(&plugin)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        validated.status.success(),
+        "native terminal plugin schema prerequisite failed"
+    );
+    let env_file = fixture.join("grants/environment.env");
+    std::fs::write(
+        &env_file,
+        "ANTHROPIC_API_KEY=synthetic-claude-onecli-value\nANTHROPIC_BASE_URL=http://127.0.0.1:9\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::env::set_var("FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE", &env_file);
+    let registry = Registry::open(
+        fixture.join("registry"),
+        Some(
+            InstallationId::parse(std::env::var("FRESHELL_PROVIDER_LAUNCH_INSTALLATION").unwrap())
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    std::env::set_var("FRESHELL_MANAGED_PROVIDER_QUALIFICATION", "claude");
+    let socket = control.join("control.sock");
+    let secret_file = control.join("secret");
+    std::fs::write(&secret_file, "closed-synthetic-control-secret").unwrap();
+    std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    freshell_supervisor::backend::docker::configure_capability_dir(&socket).unwrap();
+    let supervisor = Supervisor::new(
+        registry.clone(),
+        Arc::new(BrokerAuthorizedBackend {
+            real: DockerEngineBackend::new(fixture.join("broker.sock")),
+            control: control.clone(),
+            handoff: fixture.join("handoff"),
+            certificate_sentinel: b"synthetic-claude-onecli-value".to_vec(),
+        }),
+        SupervisorConfig {
+            runtime_root: runtime,
+            control_socket_path: socket.clone(),
+            host_binary_path: PathBuf::from(
+                std::env::var_os("FRESHELL_PROVIDER_LAUNCH_HOST_BINARY").unwrap(),
+            ),
+            image_ref: std::env::var("FRESHELL_PROVIDER_LAUNCH_IMAGE").unwrap(),
+            test_run_id: std::env::var("FRESHELL_PROVIDER_LAUNCH_RUN_ID").unwrap(),
+            control_secret: "closed-synthetic-control-secret".into(),
+            lifecycle_log: fixture.join("lifecycle.jsonl"),
+            admission: AdmissionPolicy::default(),
+        },
+    )
+    .unwrap();
+    let control_task = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            serve_control(supervisor, &socket).await.unwrap();
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let web = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = web.local_addr().unwrap().port();
+    let app = axum::Router::new()
+        .route("/api/health", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/api/mcp",
+            axum::routing::post(|headers: axum::http::HeaderMap| async move {
+                if headers
+                    .get("x-auth-token")
+                    .is_some_and(|token| token == "closed-synthetic-web-token")
+                {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::UNAUTHORIZED
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new("closed-synthetic-web-token".to_string()),
+            crate::managed_mcp_capability::scoped_auth_middleware,
+        ));
+    let web_task = tokio::spawn(async move { axum::serve(web, app).await.unwrap() });
+    crate::managed_mcp_capability::configure("0.0.0.0", port, &socket, &secret_file).unwrap();
+    crate::managed_mcp_capability::spawn_callback_server()
+        .await
+        .unwrap();
+    for name in [
+        "FRESHELL_MANAGED_RUNTIME_V1",
+        "FRESHELL_MANAGED_FRESH_AGENT_V1",
+    ] {
+        std::env::set_var(name, "1");
+    }
+    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SOCKET", &socket);
+    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SECRET_FILE", &secret_file);
+    std::env::set_var("HOME", &home);
+    let controller = crate::managed_runtime::ServerManagedRuntimeController::from_env()
+        .await
+        .unwrap()
+        .unwrap();
+    let cwd = workspace.to_str().unwrap().to_string();
+    let terminal = controller
+        .launch(ManagedTerminalLaunch {
+            spec: freshell_platform::spawn::SpawnSpec {
+                program: "claude".into(),
+                args: vec![
+                    "--init-only".into(),
+                    "--plugin-dir".into(),
+                    plugin.to_str().unwrap().into(),
+                ],
+                env_overrides: BTreeMap::new(),
+                cwd: Some(cwd.clone()),
+                cols: 120,
+                rows: 30,
+            },
+            env: BTreeMap::new(),
+            terminal_id: "closed-native-terminal".into(),
+            stream_id: "closed-native-stream".into(),
+            mode: "claude".into(),
+            resume_session_id: None,
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            view_tab_id: None,
+            view_pane_id: None,
+            create_request_id: Some("closed-native-terminal-create".into()),
+        })
+        .await
+        .expect("complete native Claude terminal startup");
+    let client = controller.runtime_client();
+    async fn consumed(path: &Path) -> Option<Value> {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(value) = serde_json::from_slice(&bytes) {
+                        break value;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .ok()
+    }
+    let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let expected = json!({"hook":true,"physicalHome":"/home/freshell/provider","settings":true,"authenticated":true,"scopedAlias":true,"onecli":true,"memory":hash(b"closed-claude-global-memory"),"skill":hash(std::fs::read(plugin.join("skills/probe/SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")});
+    let observed = consumed(&receipt).await;
+    if observed.is_none() {
+        let output = client
+            .read_output(
+                SoulId::parse(terminal.soul_id.clone()).unwrap(),
+                0,
+                64 * 1024,
+            )
+            .await
+            .unwrap();
+        let text = output
+            .frames
+            .iter()
+            .map(|frame| frame.data.as_str())
+            .collect::<String>();
+        let text = crate::ai_title::strip_ansi(&text);
+        let classes = [
+            "ENOENT",
+            "EACCES",
+            "trust",
+            "Trust",
+            "onboarding",
+            "Sign in",
+            "API key",
+            "plugin",
+            "Plugin",
+            "settings",
+            "MCP",
+            "Permission denied",
+            "text style",
+            "theme",
+            "Theme",
+            "Welcome",
+            "Let's",
+            "Enter",
+            "Continue",
+            "terms",
+            "Token",
+            "Authentication",
+            "Setup",
+            "select",
+            "Select",
+        ]
+        .into_iter()
+        .filter(|class| text.contains(class))
+        .collect::<Vec<_>>();
+        println!(
+            "provider_launch_diagnostic {}",
+            json!({"provider":"claude","route":"terminal","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"classes":classes})
+        );
+    }
+    assert_eq!(
+        observed.expect("native Claude selected plugin must execute its startup hook"),
+        expected
+    );
+    println!(
+        "provider_launch_consumer {}",
+        json!({"provider":"claude","route":"terminal","digest":hash(serde_json::to_vec(&expected).unwrap().as_slice())})
+    );
+    client
+        .stop(SoulId::parse(terminal.soul_id).unwrap())
+        .await
+        .unwrap();
+    std::fs::remove_file(&receipt).unwrap();
+    let (broadcast, _) = tokio::sync::broadcast::channel(256);
+    let mut events = broadcast.subscribe();
+    let proxy = crate::fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
+        Some(client.clone()),
+        Arc::new(broadcast),
+    )
+    .unwrap()
+    .unwrap();
+    Arc::clone(&proxy).dispatch(HostedFreshAgentCommand::Create(serde_json::from_value(json!({"requestId":"closed-native-fresh-create","sessionType":"freshclaude","provider":"claude","cwd":cwd,"plugins":[plugin.to_str().unwrap()]})).unwrap())).await;
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let frame: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
+            if frame["type"] == "freshAgent.create.failed" {
+                panic!(
+                    "fresh Claude startup failed classification: {}",
+                    frame["message"]
+                );
+            }
+            if frame["type"] == "freshAgent.created" {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        consumed(&receipt)
+            .await
+            .expect("genuine default SDK selected plugin must execute its startup hook"),
+        expected
+    );
+    println!(
+        "provider_launch_consumer {}",
+        json!({"provider":"claude","route":"fresh","digest":hash(serde_json::to_vec(&expected).unwrap().as_slice())})
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        settings
+    );
+    assert_eq!(
+        std::fs::read_to_string(plugin.join("scripts/consume.cjs")).unwrap(),
+        consumer
+    );
+    for view in client.inventory().await.unwrap() {
+        if view.desired_state == DesiredState::Running {
+            client.stop(view.soul_id).await.unwrap();
+        }
+    }
+    web_task.abort();
+    control_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_provider_codex_terminal_and_fresh_native_startup_consumes_prepared_inputs() {
     use freshell_supervisor::{
         admission::AdmissionPolicy,

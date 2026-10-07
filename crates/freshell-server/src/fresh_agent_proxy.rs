@@ -515,6 +515,28 @@ impl HostedFreshAgentProxy {
                 tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
             })?;
             (context.mcp_capability.clone().ok_or(())?, Some(context))
+        } else if provider == FreshProvider::Claude {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or(())?;
+            let context = crate::managed_provider_references::claude::prepare_managed(
+                crate::managed_provider_references::claude::ClaudePreparation {
+                    client: &self.client,
+                    soul: &soul,
+                    creation_seed: &message.request_id,
+                    home: &home,
+                    cwd: &cwd,
+                    workspace: &workspace,
+                    args: &[],
+                    plugins: message.plugins.as_deref().unwrap_or_default(),
+                    references: &provider_secret_references,
+                },
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
+            })?;
+            (context.mcp_capability.clone().ok_or(())?, Some(context))
         } else {
             let mcp_capability = crate::managed_mcp_capability::issue_mcp_capability(
                 &soul,

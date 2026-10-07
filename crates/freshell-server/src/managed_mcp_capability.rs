@@ -300,38 +300,72 @@ async fn apply_prepared_callback(
         )
         .map_err(|_| "replacement provider context exceeds control metadata profile".into());
     }
-    if provider == "codex" {
+    if matches!(provider, "codex" | "claude") {
         let mut context = callback
             .prior_context
             .clone()
             .ok_or("complete replacement requires prior provider context")?;
-        let manifest = if context.prepared_inputs.is_some() {
-            let bytes =
-                read_prior_manifest_bytes("codex", store, directory, &callback.soul_id, &context)?;
-            let manifest: freshell_platform::codex_inputs::CodexInputManifest =
-                serde_json::from_slice(&bytes)
-                    .map_err(|_| "prior Codex source manifest metadata invalid")?;
-            manifest.validate().map_err(str::to_string)?;
-            manifest
-        } else {
+        if context.prepared_inputs.is_none() {
             tracing::warn!(event="provider.inputs.preparation.blocked",stage="controller_callback",operation="select_original_sources",provider,
                 soul_id=%callback.soul_id,reason="origin_unknown",
                 "Original source origins are unrecorded; retained inputs were preserved");
-            return Err("original Codex source origins are unrecorded; retain the existing inputs and reprepare from their original source before dispatch".into());
-        };
+            let name = if provider == "codex" {
+                "Codex"
+            } else {
+                "Claude"
+            };
+            return Err(format!("original {name} source origins are unrecorded; retain the existing inputs and reprepare from their original source before dispatch"));
+        }
+        let bytes =
+            read_prior_manifest_bytes(provider, store, directory, &callback.soul_id, &context)?;
+        let codex_manifest: Option<freshell_platform::codex_inputs::CodexInputManifest> =
+            if provider == "codex" {
+                let manifest: freshell_platform::codex_inputs::CodexInputManifest =
+                    serde_json::from_slice(&bytes)
+                        .map_err(|_| "prior Codex source manifest metadata invalid")?;
+                manifest.validate().map_err(str::to_string)?;
+                Some(manifest)
+            } else {
+                None
+            };
+        let claude_manifest: Option<freshell_platform::claude_inputs::ClaudeInputManifest> =
+            if provider == "claude" {
+                let manifest: freshell_platform::claude_inputs::ClaudeInputManifest =
+                    serde_json::from_slice(&bytes)
+                        .map_err(|_| "prior Claude source manifest metadata invalid")?;
+                manifest.validate().map_err(str::to_string)?;
+                Some(manifest)
+            } else {
+                None
+            };
+        let (original_home, original_cwd, original_workspace) =
+            match (&codex_manifest, &claude_manifest) {
+                (Some(manifest), None) => (
+                    &manifest.original_home,
+                    &manifest.cwd,
+                    callback.workspace.as_deref(),
+                ),
+                (None, Some(manifest)) => (
+                    &manifest.original_home,
+                    &manifest.cwd,
+                    Some(manifest.workspace.as_path()),
+                ),
+                _ => return Err("replacement ordinary source manifest selection invalid".into()),
+            };
         context.config.clear();
         let references = callback.provider_secret_references.unwrap_or_default();
         let capability = store.issue_replacement_with_inputs(
             callback.soul_id,
             directory,
             endpoint.into(),
-            Some((provider, &manifest.original_home, &context.config)),
+            Some((provider, original_home, &context.config)),
             OpencodeEphemeralInput {
                 launch_context: Some(&context),
                 secret_references: Some(&references),
-                cwd: Some(&manifest.cwd),
-                workspace: callback.workspace.as_deref(),
-                codex_manifest: Some(&manifest),
+                cwd: Some(original_cwd),
+                workspace: original_workspace,
+                codex_manifest: codex_manifest.as_ref(),
+                claude_manifest: claude_manifest.as_ref(),
                 ..Default::default()
             },
         )?;
@@ -341,12 +375,12 @@ async fn apply_prepared_callback(
         };
         reply
             .validate(provider)
-            .map_err(|_| "replacement Codex context metadata invalid")?;
+            .map_err(|_| "replacement ordinary context metadata invalid")?;
         return freshell_runtime_protocol::bounded_json_bytes(
             &reply,
             freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
         )
-        .map_err(|_| "replacement Codex context exceeds control metadata profile".into());
+        .map_err(|_| "replacement ordinary context exceeds control metadata profile".into());
     }
     if provider != "opencode" {
         let references = provider_source_references(provider, home)?;
@@ -1801,12 +1835,12 @@ impl CapabilityStore {
                     provider_relative_path: CAPABILITY_PATH.into(),
                     host_gateway_address: routed_host_ipv4(),
                 });
-                if provider == "codex" {
+                if matches!(provider, "codex" | "claude") {
                     let bytes =
                         source_stage::read_source_view(root, ".freshell/prepared-inputs.json")?;
                     context.prepared_inputs = Some(
                         serde_json::from_str(&bytes)
-                            .map_err(|_| "Codex prepared inputs unavailable")?,
+                            .map_err(|_| "ordinary prepared inputs unavailable")?,
                     );
                     context.config.clear();
                 }
@@ -4178,6 +4212,129 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 .unwrap()
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_provider_claude_replacement_retains_original_sources_and_pending_replay() {
+        use freshell_runtime_protocol::{
+            PreparedProviderContext, ProviderLaunchContext, ProviderPreparation,
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("original-home");
+        let wrong = owned.path().join("current-home");
+        let workspace = owned.path().join("workspace");
+        for path in [
+            &home.join(".claude/skills/probe"),
+            &wrong.join(".claude"),
+            &workspace,
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"env":{"CLAUDE_SELECTED":"original"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".claude/skills/probe/resource"),
+            b"retained-original-resource",
+        )
+        .unwrap();
+        std::fs::write(
+            wrong.join(".claude/settings.json"),
+            r#"{"env":{"CLAUDE_SELECTED":"wrong"}}"#,
+        )
+        .unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+            mcp_capability: None,
+            config: vec![],
+            prepared_inputs: None,
+        };
+        let prior = store
+            .issue(
+                soul.clone(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("claude", &home, &context.config)),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    launch_context: Some(&context),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let context = read_prepared_context(&directory, &prior).unwrap();
+        assert!(context.prepared_inputs.is_some());
+        let callback=serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,"provider":"claude","workspace":workspace,"cwd":workspace,"priorContext":context,"providerSecretReferences":[]})).unwrap();
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let first = apply_prepared_callback(
+            &callback,
+            "fixture-control",
+            &store,
+            &directory,
+            "http://host.docker.internal:4000",
+            &wrong,
+            &client,
+        )
+        .await
+        .expect("replacement must select recorded original Claude sources");
+        std::fs::remove_file(home.join(".claude/settings.json")).unwrap();
+        let repeated = apply_prepared_callback(
+            &callback,
+            "fixture-control",
+            &store,
+            &directory,
+            "http://host.docker.internal:4000",
+            &wrong,
+            &client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&first).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&repeated).unwrap(),
+            "pending generation replay must precede original rescanning"
+        );
+        let ready: PreparedProviderContext = serde_json::from_slice(&repeated).unwrap();
+        let inputs = ready
+            .provider_launch_context
+            .prepared_inputs
+            .as_ref()
+            .unwrap();
+        let mount = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| mount.logical_destination == "/home/freshell/provider/.claude/skills")
+            .unwrap();
+        let stage = staged_provider_root_path(
+            &directory,
+            &ready
+                .provider_launch_context
+                .mcp_capability
+                .as_ref()
+                .unwrap()
+                .grant_id,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(
+                stage
+                    .join(&mount.stage_relative_path)
+                    .join("probe/resource")
+            )
+            .unwrap(),
+            b"retained-original-resource"
         );
     }
 

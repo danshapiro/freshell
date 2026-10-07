@@ -2124,6 +2124,10 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
+        if mode == "claude" && flag == "--init-only" {
+            index += 1;
+            continue;
+        }
         if mode == "codex" && flag == "resume" && index + 1 < args.len() {
             if !safe_selector(&args[index + 1]) {
                 return Err(invalid());
@@ -3418,6 +3422,30 @@ mod tests {
             durable_managed_terminal_args("claude", args.clone(), None).unwrap(),
             args
         );
+    }
+
+    #[test]
+    fn claude_native_initialization_argument_retains_selected_plugin_and_rejects_credentials() {
+        let args = vec![
+            "--init-only".into(),
+            "--plugin-dir".into(),
+            "/workspace/plugin".into(),
+        ];
+        assert_eq!(
+            durable_managed_terminal_args("claude", args.clone(), None).unwrap(),
+            args
+        );
+        assert!(durable_managed_terminal_args(
+            "claude",
+            vec![
+                "--init-only".into(),
+                "--api-key".into(),
+                "private-value".into()
+            ],
+            None
+        )
+        .is_err());
+        assert!(durable_managed_terminal_args("codex", vec!["--init-only".into()], None).is_err());
     }
 
     #[test]

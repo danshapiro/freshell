@@ -254,6 +254,25 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 )
                 .await?;
                 (context.mcp_capability.clone(), Some(context))
+            } else if request.mode == "claude" {
+                let home = std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .ok_or("original Claude HOME is unavailable")?;
+                let context = crate::managed_provider_references::claude::prepare_managed(
+                    crate::managed_provider_references::claude::ClaudePreparation {
+                        client: &self.client,
+                        soul: &soul_id,
+                        creation_seed: create_key,
+                        home: &home,
+                        cwd: &cwd,
+                        workspace: &workspace,
+                        args: &args,
+                        plugins: &[],
+                        references: &provider_secret_references,
+                    },
+                )
+                .await?;
+                (context.mcp_capability.clone(), Some(context))
             } else {
                 let mcp_capability = matches!(
                     request.mode.as_str(),

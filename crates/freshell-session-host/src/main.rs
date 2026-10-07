@@ -886,7 +886,7 @@ async fn grant_execution(
                 format!("resolve managed provider credentials: {error}"),
             )
         })?;
-        if matches!(provider, "opencode" | "codex") {
+        if matches!(provider, "opencode" | "codex" | "claude") {
             let generated = provider_input_preparation::prepare(
                 context,
                 &mut secrets,
