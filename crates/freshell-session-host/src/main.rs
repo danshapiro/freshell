@@ -1038,7 +1038,7 @@ async fn grant_execution(
                 terminal,
                 &resolved_secrets.environment,
                 resolved_secrets.opencode_plan.as_ref(),
-                resolved_secrets.claude_settings_path.as_deref(),
+                resolved_secrets.claude_settings_argument.as_deref(),
             )
             .await
             .map_err(|error| {

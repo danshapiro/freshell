@@ -93,8 +93,8 @@ impl HostedPty {
         });
         let mut provider_args = crate::provider_identity_args(launch.run_as_uid, launch.run_as_gid);
         provider_args.push(launch.program.clone());
-        for argument in &launch.args {
-            provider_args.push(if launch.mode == "claude" && argument == freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT {
+        for (index, argument) in launch.args.iter().enumerate() {
+            provider_args.push(if launch.mode == "claude" && index > 0 && launch.args[index - 1] == "--settings" && argument == freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT {
                 claude_settings.as_ref().ok_or("selected Claude settings origin is unavailable; retain inputs and reprepare before dispatch")?.clone()
             } else { argument.clone() });
         }

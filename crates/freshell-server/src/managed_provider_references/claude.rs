@@ -24,6 +24,15 @@ pub(crate) async fn prepare_managed(
     if !matches!(request.reservation_provider, "claude" | "kilroy") {
         return Err("Claude source preparation requires its exact supported runtime flavor".into());
     }
+    let inline_settings = request.selected_settings.filter(|value| {
+        freshell_platform::claude_inputs::is_inline_settings(value)
+            && !freshell_platform::cli_launch::is_owned_claude_settings(value)
+    });
+    if inline_settings.is_some_and(|value| {
+        value.len() > freshell_platform::claude_inputs::MAX_NATIVE_SETTINGS_BYTES
+    }) {
+        return Err("Claude inline --settings exceeds native 2 MiB limit".into());
+    }
     let mut plugin_dirs = Vec::new();
     let mut path_bytes = 0usize;
     let cli = request
@@ -60,6 +69,10 @@ pub(crate) async fn prepare_managed(
             request.original,
         )?),
         settings_file: selected_settings_file(request.cwd, request.selected_settings)?,
+        inline_settings_sha256: inline_settings.map(|value| {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(value.as_bytes()))
+        }),
         setting_sources: request
             .args
             .windows(2)
@@ -101,6 +114,7 @@ pub(crate) async fn prepare_managed(
         &context,
         crate::managed_mcp_capability::OpencodeEphemeralInput {
             claude_manifest: Some(&manifest),
+            claude_inline_settings: inline_settings,
             cwd: Some(request.cwd),
             workspace: Some(request.workspace),
             secret_references: Some(request.references),
@@ -119,8 +133,11 @@ fn selected_settings_file(
     else {
         return Ok(None);
     };
-    if value.trim_start().starts_with('{') {
-        return Err("Claude inline --settings requires private prepared source transport".into());
+    if freshell_platform::claude_inputs::is_inline_settings(value) {
+        return Ok(None);
+    }
+    if value.len() > 64 * 1024 || value.chars().any(char::is_control) {
+        return Err("Claude selected settings path profile is invalid".into());
     }
     let path = Path::new(value);
     let logical = if path.is_absolute() {

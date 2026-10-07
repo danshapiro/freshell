@@ -34,9 +34,12 @@ def main():
     parser.add_argument("--receipt-dir",type=Path,required=True)
     parser.add_argument("--provider",choices=["opencode","codex","claude","amplifier"],default="opencode")
     parser.add_argument("--claude-flavor",choices=["freshclaude","kilroy"],default="freshclaude")
+    parser.add_argument("--claude-settings-form",choices=["file","inline"],default="file")
     args=parser.parse_args()
     if args.provider!="claude" and args.claude_flavor!="freshclaude":
         parser.error("the finite Claude flavor requires --provider claude")
+    if args.provider!="claude" and args.claude_settings_form!="file":
+        parser.error("the finite Claude settings form requires --provider claude")
     selected_test={"opencode":TEST,"codex":CODEX_TEST,"claude":CLAUDE_TEST,"amplifier":AMPLIFIER_TEST}[args.provider]
     if args.provider=="claude": IMAGE=CLAUDE_IMAGE
     repo=Path(__file__).resolve().parents[2]
@@ -170,6 +173,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                    "--env",f"FRESHELL_PROVIDER_LAUNCH_HOST_BINARY={host}","--env",f"FRESHELL_PROVIDER_LAUNCH_IMAGE={IMAGE}",
                    "--env",f"FRESHELL_PROVIDER_LAUNCH_INSTALLATION={installation}","--env",f"FRESHELL_PROVIDER_LAUNCH_RUN_ID={run}",
                    "--env",f"FRESHELL_PROVIDER_LAUNCH_CLAUDE_FLAVOR={args.claude_flavor}",
+                   "--env",f"FRESHELL_PROVIDER_LAUNCH_CLAUDE_SETTINGS_FORM={args.claude_settings_form}",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE={root}/grants/environment.env",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE={root}/grants/auth.json",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE={root}/grants/ca.pem",
@@ -184,7 +188,9 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
             exit_code=int(waited.stdout.strip())
             outcome=docker("logs",controller,check=False)
             receipt["exitCode"]=exit_code
-            if args.provider=="claude": receipt["claudeFlavor"]=args.claude_flavor
+            if args.provider=="claude":
+                receipt["claudeFlavor"]=args.claude_flavor
+                receipt["claudeSettingsForm"]=args.claude_settings_form
             receipt["consumedRoutes"]=[json.loads(line.split("provider_launch_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_launch_consumer " in line]
             print(outcome.stdout,end="",flush=True);print(outcome.stderr,end="",flush=True)
             expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")} if args.provider=="opencode" else ({(args.provider,"terminal")} if args.provider=="amplifier" else {(args.provider,"terminal"),(args.provider,"fresh")})

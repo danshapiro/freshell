@@ -181,9 +181,18 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             let selected_claude_settings = (request.mode == "claude")
                 .then(|| {
                     freshell_platform::claude_inputs::selected_settings_argument(&request.spec.args)
-                        .map(str::to_owned)
+                        .map(|value| {
+                            if value.len()
+                                > freshell_platform::claude_inputs::MAX_NATIVE_SETTINGS_BYTES
+                            {
+                                Err("Claude --settings exceeds native 2 MiB limit")
+                            } else {
+                                Ok(value.to_owned())
+                            }
+                        })
                 })
-                .flatten();
+                .flatten()
+                .transpose()?;
             let args = managed_provider_args(&request.mode, request.spec.args)?;
             let request_id = stable_request_id(create_key)?;
             let opencode_input = crate::managed_mcp_capability::OpencodeEphemeralInput {

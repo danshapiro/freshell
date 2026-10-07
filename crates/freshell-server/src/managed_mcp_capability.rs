@@ -38,6 +38,7 @@ mod source_stage;
 pub(crate) struct OpencodeEphemeralInput<'a> {
     pub codex_manifest: Option<&'a freshell_platform::codex_inputs::CodexInputManifest>,
     pub claude_manifest: Option<&'a freshell_platform::claude_inputs::ClaudeInputManifest>,
+    pub claude_inline_settings: Option<&'a str>,
     pub amplifier_manifest: Option<&'a freshell_platform::amplifier_inputs::AmplifierInputManifest>,
     pub inline_config: Option<&'a str>,
     pub tui_config_path: Option<&'a str>,
@@ -350,6 +351,14 @@ async fn apply_prepared_callback(
             }
             _ => return Err("replacement ordinary source provider invalid".into()),
         };
+        let inline_settings = match &origins {
+            AcceptedOrigins::Claude(manifest) => manifest
+                .inline_settings_sha256
+                .as_ref()
+                .map(|digest| read_prior_claude_inline_settings(directory, &context, digest))
+                .transpose()?,
+            _ => None,
+        };
         let (original_home, mut input) = match &origins {
             AcceptedOrigins::Codex(manifest) => (
                 &manifest.original_home,
@@ -366,6 +375,7 @@ async fn apply_prepared_callback(
                     cwd: Some(&manifest.cwd),
                     workspace: Some(&manifest.workspace),
                     claude_manifest: Some(manifest),
+                    claude_inline_settings: inline_settings.as_deref(),
                     ..Default::default()
                 },
             ),
@@ -636,6 +646,45 @@ fn read_prior_manifest_bytes(
         return Err("prior source manifest profile or identity changed".into());
     }
     Ok(bytes)
+}
+
+// Called only after read_prior_manifest_bytes has validated this generation's
+// exact soul ownership. Read the one finite accepted private source, never an
+// arbitrary path or the controller's present HOME/configuration.
+fn read_prior_claude_inline_settings(
+    directory: &Path,
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    digest: &str,
+) -> Result<String, String> {
+    use freshell_platform::claude_inputs::{INLINE_SETTINGS_SOURCE, MAX_NATIVE_SETTINGS_BYTES};
+    use std::io::Read;
+    let capability = context
+        .mcp_capability
+        .as_ref()
+        .ok_or("prior Claude settings generation authority unavailable")?;
+    let path =
+        staged_provider_root_path(directory, &capability.grant_id)?.join(INLINE_SETTINGS_SOURCE);
+    if !std::fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        || std::fs::canonicalize(&path).map_err(|_| {
+            "prior Claude inline settings unavailable; retain inputs and reprepare before dispatch"
+        })? != path
+    {
+        return Err("prior Claude inline settings unavailable or not a physical private source; retain inputs and reprepare before dispatch".into());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| "prior Claude inline settings unavailable")?
+        .take(MAX_NATIVE_SETTINGS_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "prior Claude inline settings read failed")?;
+    if bytes.len() > MAX_NATIVE_SETTINGS_BYTES {
+        return Err("prior Claude inline --settings exceeds native 2 MiB limit; retain inputs and reprepare before dispatch".into());
+    }
+    if format!("{:x}", sha2::Sha256::digest(&bytes)) != digest {
+        return Err("prior Claude inline settings identity changed; retain inputs and reprepare before dispatch".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "prior Claude inline settings is not UTF-8".into())
 }
 
 fn read_prior_source_manifest(
@@ -1548,6 +1597,7 @@ fn stage_provider_root(
                     &temporary,
                     resources,
                     opencode_input.claude_manifest,
+                    opencode_input.claude_inline_settings,
                 )?;
             }
             let capability = McpCapabilityReference {
@@ -3316,6 +3366,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             workspace: cwd.clone(),
             config_root: Some(selected.clone()),
             settings_file: None,
+            inline_settings_sha256: None,
             setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec![],
         };
@@ -3401,6 +3452,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             workspace: cwd.clone(),
             config_root: None,
             settings_file: Some(std::fs::canonicalize(&alias).unwrap()),
+            inline_settings_sha256: None,
             setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec![],
         };
@@ -3456,6 +3508,115 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         assert_eq!(output.stdout, b"selected-explicit:transported-resource:2:1");
         assert_eq!(std::fs::read(&selected).unwrap(), raw.as_bytes());
         assert_eq!(std::fs::read_link(&alias).unwrap(), selected);
+    }
+
+    #[test]
+    fn managed_provider_claude_inline_native_limit_and_failure_cleanup_preserve_prior_stage() {
+        use freshell_platform::claude_inputs::{
+            ClaudeInputManifest, INLINE_SETTINGS_SOURCE, MAX_NATIVE_SETTINGS_BYTES,
+        };
+        use freshell_runtime_protocol::{ProviderLaunchContext, ProviderPreparation};
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let directory = owned.path().join("capabilities");
+        for path in [&home, &cwd, &directory] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+            config: vec![],
+            mcp_capability: None,
+            prepared_inputs: None,
+        };
+        let mut manifest = ClaudeInputManifest {
+            version: 1,
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            workspace: cwd.clone(),
+            config_root: None,
+            settings_file: None,
+            inline_settings_sha256: None,
+            setting_sources: vec![],
+            plugin_dirs: vec![],
+        };
+        let body = r#"{"env":{"SELECTED_NONCE":"bounded-selected"}}"#;
+        let maximum = format!(
+            "{}{}",
+            " ".repeat(MAX_NATIVE_SETTINGS_BYTES - body.len()),
+            body
+        );
+        manifest.inline_settings_sha256 =
+            Some(format!("{:x}", sha2::Sha256::digest(maximum.as_bytes())));
+        let prior = stage_provider_root(
+            &directory,
+            "grant-inline-bounded",
+            "claude",
+            &home,
+            &[],
+            OpencodeEphemeralInput {
+                launch_context: Some(&context),
+                claude_manifest: Some(&manifest),
+                claude_inline_settings: Some(&maximum),
+                cwd: Some(&cwd),
+                workspace: Some(&cwd),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let stage_names = || {
+            std::fs::read_dir(prior.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let accepted_stages = stage_names();
+        let consume = || {
+            let output=std::process::Command::new("node").args(["-e","const s=JSON.parse(require('node:fs').readFileSync(process.argv[1]));process.stdout.write(s.env.SELECTED_NONCE)"]).arg(prior.join(INLINE_SETTINGS_SOURCE)).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"bounded-selected");
+        };
+        consume();
+        let oversized = format!(" {maximum}");
+        for (id, raw, reason) in [
+            ("grant-inline-oversized", oversized.as_str(), "2 MiB"),
+            (
+                "grant-inline-malformed",
+                "{private-malformed-nonce}",
+                "not valid JSON",
+            ),
+        ] {
+            manifest.inline_settings_sha256 =
+                Some(format!("{:x}", sha2::Sha256::digest(raw.as_bytes())));
+            let error = stage_provider_root(
+                &directory,
+                id,
+                "claude",
+                &home,
+                &[],
+                OpencodeEphemeralInput {
+                    launch_context: Some(&context),
+                    claude_manifest: Some(&manifest),
+                    claude_inline_settings: Some(raw),
+                    cwd: Some(&cwd),
+                    workspace: Some(&cwd),
+                    ..Default::default()
+                },
+                None,
+            )
+            .err()
+            .unwrap();
+            assert!(error.contains(reason), "{error}");
+            assert!(!error.contains("private-malformed-nonce"));
+            assert!(!staged_provider_root_path(&directory, id).unwrap().exists());
+            consume();
+        }
+        assert_eq!(
+            stage_names(),
+            accepted_stages,
+            "failed attempt temporary stages must be removed without removing prior inputs"
+        );
     }
 
     #[cfg(unix)]
@@ -4670,6 +4831,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
 
     #[tokio::test]
     async fn managed_provider_claude_replacement_retains_original_sources_and_pending_replay() {
+        use freshell_platform::claude_inputs::INLINE_SETTINGS_SOURCE;
         use freshell_runtime_protocol::{
             PreparedProviderContext, ProviderLaunchContext, ProviderPreparation,
         };
@@ -4697,6 +4859,12 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         )
         .unwrap();
         std::fs::write(
+            selected.join("skills/probe/consume.cjs"),
+            "process.stdout.write(require('node:fs').readFileSync(__dirname+'/resource'))",
+        )
+        .unwrap();
+        let inline_settings = r#"{"env":{"INLINE_NONCE":"retained-inline"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node consume.cjs"}]}]}}"#;
+        std::fs::write(
             wrong.join(".claude/settings.json"),
             r#"{"env":{"CLAUDE_SELECTED":"wrong"}}"#,
         )
@@ -4718,6 +4886,10 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             workspace: workspace.clone(),
             config_root: Some(selected.clone()),
             settings_file: None,
+            inline_settings_sha256: Some(format!(
+                "{:x}",
+                sha2::Sha256::digest(inline_settings.as_bytes())
+            )),
             setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec![],
         };
@@ -4729,6 +4901,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 Some(("claude", &home, &context.config)),
                 OpencodeEphemeralInput {
                     claude_manifest: Some(&manifest),
+                    claude_inline_settings: Some(inline_settings),
                     cwd: Some(&workspace),
                     workspace: Some(&workspace),
                     launch_context: Some(&context),
@@ -4756,6 +4929,10 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         .await
         .expect("replacement must select recorded original Claude sources");
         std::fs::remove_file(selected.join("settings.json")).unwrap();
+        let prior_source = staged_provider_root_path(&directory, &prior.grant_id)
+            .unwrap()
+            .join(INLINE_SETTINGS_SOURCE);
+        std::fs::remove_file(&prior_source).unwrap();
         let repeated = apply_prepared_callback(
             &callback,
             "fixture-control",
@@ -4793,6 +4970,56 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 .grant_id,
         )
         .unwrap();
+        assert_eq!(
+            std::fs::read(
+                stage
+                    .join(&mount.stage_relative_path)
+                    .join("probe/resource")
+            )
+            .unwrap(),
+            b"retained-original-resource"
+        );
+        let output = std::process::Command::new("node").args(["-e", "const fs=require('node:fs'),s=JSON.parse(fs.readFileSync(process.argv[1]));const r=require('node:child_process').execSync(s.hooks.SessionStart[0].hooks[0].command,{cwd:process.argv[2]});process.stdout.write(s.env.INLINE_NONCE+':'+r)"])
+            .arg(stage.join(INLINE_SETTINGS_SOURCE)).arg(stage.join(&mount.stage_relative_path).join("probe")).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"retained-inline:retained-original-resource");
+        let accepted = ready
+            .provider_launch_context
+            .mcp_capability
+            .as_ref()
+            .unwrap();
+        let incarnation = IncarnationId::new();
+        store
+            .activate(
+                &accepted.grant_id,
+                soul.clone(),
+                incarnation.clone(),
+                &directory,
+                &accepted.endpoint,
+            )
+            .unwrap();
+        store
+            .commit_preparation(&accepted.grant_id, &soul, &incarnation, &directory)
+            .unwrap();
+        // A new generation cannot invent an inline source after its accepted
+        // private file is lost. Preserve the other accepted data and return a
+        // reason before creating another grant/stage.
+        std::fs::remove_file(stage.join(INLINE_SETTINGS_SOURCE)).unwrap();
+        let unavailable = serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,"provider":"claude","workspace":workspace,"cwd":workspace,"priorContext":ready.provider_launch_context,"providerSecretReferences":[]})).unwrap();
+        let error = apply_prepared_callback(
+            &unavailable,
+            "fixture-control",
+            &store,
+            &directory,
+            "http://host.docker.internal:4000",
+            &wrong,
+            &client,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("inline settings unavailable"), "{error}");
+        assert!(!error.contains("retained-inline"));
         assert_eq!(
             std::fs::read(
                 stage

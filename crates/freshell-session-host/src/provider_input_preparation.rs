@@ -70,6 +70,25 @@ pub fn prepare(
                 serde_json::from_slice(&metadata)
                     .map_err(|_| "prepared Claude discovery metadata invalid")?;
             manifest.validate().map_err(str::to_string)?;
+            if let Some(digest) = &manifest.inline_settings_sha256 {
+                use freshell_platform::claude_inputs::{
+                    settings_with_owned_hooks, INLINE_SETTINGS_SOURCE, MAX_NATIVE_SETTINGS_BYTES,
+                };
+                let raw = read_private(stage, INLINE_SETTINGS_SOURCE, MAX_NATIVE_SETTINGS_BYTES).map_err(|reason| format!("Claude inline --settings private source (native 2 MiB limit): {reason}"))?;
+                if format!("{:x}", Sha256::digest(&raw)) != *digest {
+                    return Err("selected Claude inline settings source changed; retain inputs and reprepare before dispatch".into());
+                }
+                let settings = settings_with_owned_hooks(&raw).map_err(str::to_string)?;
+                let bytes = freshell_runtime_protocol::bounded_json_bytes(
+                    &settings,
+                    MAX_NATIVE_SETTINGS_BYTES,
+                )
+                .map_err(|_| "combined Claude inline settings exceeds native 2 MiB limit")?;
+                secrets.claude_settings_argument = Some(
+                    String::from_utf8(bytes)
+                        .map_err(|_| "prepared Claude inline settings is not UTF-8")?,
+                );
+            }
             if let Some(selected) = &manifest.settings_file {
                 let destination = manifest.runtime_path(selected);
                 if !inputs
@@ -79,7 +98,7 @@ pub fn prepare(
                 {
                     return Err("selected Claude settings has no accepted config bind".into());
                 }
-                secrets.claude_settings_path = Some(
+                secrets.claude_settings_argument = Some(
                     destination
                         .to_str()
                         .ok_or("selected Claude settings destination is not UTF-8")?
@@ -315,6 +334,103 @@ mod tests {
     use freshell_runtime_protocol::*;
     use sha2::{Digest, Sha256};
     #[test]
+    fn provider_secret_claude_inline_settings_consumes_accepted_private_source() {
+        use freshell_platform::claude_inputs::{ClaudeInputManifest, INLINE_SETTINGS_SOURCE};
+        let owned = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(owned.path().join(".freshell/source-views")).unwrap();
+        let raw = br#"{"env":{"FLAG_NONCE":"inline-selected"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo configured"}]}]}}"#;
+        std::fs::write(owned.path().join(INLINE_SETTINGS_SOURCE), raw).unwrap();
+        let manifest = ClaudeInputManifest {
+            version: 1,
+            original_home: "/absent-home".into(),
+            cwd: "/absent-cwd".into(),
+            workspace: "/absent-cwd".into(),
+            config_root: None,
+            settings_file: None,
+            inline_settings_sha256: Some(format!("{:x}", Sha256::digest(raw))),
+            setting_sources: vec![],
+            plugin_dirs: vec![],
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(owned.path().join(".freshell/input-manifest.json"), &bytes).unwrap();
+        let capability = McpCapabilityReference {
+            grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
+            endpoint: "http://host.docker.internal:4000".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+            config: vec![],
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: format!("{:x}", Sha256::digest(&bytes)),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                resource_mounts: vec![],
+                indexed_files: None,
+            }),
+            mcp_capability: Some(capability),
+        };
+        let mut secrets = ResolvedProviderSecrets::default();
+        prepare(
+            Some(&context),
+            &mut secrets,
+            &ProviderPathInputs::default(),
+            owned.path(),
+            owned.path(),
+        )
+        .unwrap();
+        let argument = secrets.claude_settings_argument.as_deref().expect("accepted inline settings must reach the native child argument without a guessed file origin");
+        let output = std::process::Command::new("node").args(["-e", "const s=JSON.parse(process.argv[1]);process.stdout.write([s.env.FLAG_NONCE,s.hooks.SessionStart[0].hooks[0].command,s.hooks.SessionStart.length,s.hooks.Stop.length].join(':'))", argument]).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"inline-selected:echo configured:2:1");
+        assert!(!serde_json::to_string(&context)
+            .unwrap()
+            .contains("inline-selected"));
+        assert!(secrets.environment.is_empty());
+        std::fs::write(
+            owned.path().join(INLINE_SETTINGS_SOURCE),
+            b"{\"env\":{\"FLAG_NONCE\":\"changed-private-source\"}}",
+        )
+        .unwrap();
+        let mut changed = ResolvedProviderSecrets::default();
+        let error = prepare(
+            Some(&context),
+            &mut changed,
+            &ProviderPathInputs::default(),
+            owned.path(),
+            owned.path(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("source changed"));
+        assert!(!error.contains("changed-private-source"));
+        assert!(changed.claude_settings_argument.is_none());
+        std::fs::write(
+            owned.path().join(INLINE_SETTINGS_SOURCE),
+            vec![b' '; freshell_platform::claude_inputs::MAX_NATIVE_SETTINGS_BYTES + 1],
+        )
+        .unwrap();
+        let mut oversized = ResolvedProviderSecrets::default();
+        assert!(prepare(
+            Some(&context),
+            &mut oversized,
+            &ProviderPathInputs::default(),
+            owned.path(),
+            owned.path()
+        )
+        .is_err());
+        assert!(oversized.claude_settings_argument.is_none());
+    }
+
+    #[test]
     fn provider_secret_claude_prepared_manifest_validates_without_original_controller_tree() {
         let owned = tempfile::tempdir().unwrap();
         std::fs::create_dir(owned.path().join(".freshell")).unwrap();
@@ -325,6 +441,7 @@ mod tests {
             workspace: "/absent-original-workspace".into(),
             config_root: None,
             settings_file: None,
+            inline_settings_sha256: None,
             setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec!["/absent-original-plugin".into()],
         };

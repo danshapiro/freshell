@@ -859,14 +859,35 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
     std::fs::write(plugin.join("scripts/consume.cjs"), consumer).unwrap();
     let flag_receipt = workspace.join("claude-flag-receipt.json");
     std::fs::write(plugin.join("scripts/flag.cjs"), "const fs=require('node:fs'),crypto=require('node:crypto');const hash=v=>crypto.createHash('sha256').update(v).digest('hex');let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{const input=JSON.parse(raw);fs.writeFileSync(process.argv[2],JSON.stringify({flag:input.hook_event_name==='SessionStart'&&process.env.CLAUDE_SELECTED_NONCE==='closed-explicit-settings',resource:hash(require('node:child_process').execFileSync(__dirname+'/run')),dependency:hash(require('probe-dependency'))}))})").unwrap();
+    let flag_commands = selected_config.join("commands");
+    std::fs::create_dir_all(flag_commands.join("node_modules/probe-dependency")).unwrap();
+    for relative in [
+        "flag.cjs",
+        "run",
+        "resource",
+        "node_modules/probe-dependency/index.js",
+    ] {
+        std::fs::copy(
+            plugin.join("scripts").join(relative),
+            flag_commands.join(relative),
+        )
+        .unwrap();
+    }
     let flag_origin = selected_config.join("explicit-origin");
     std::fs::create_dir(&flag_origin).unwrap();
     let flag_settings = flag_origin.join("settings.json");
-    let flag_value = json!({"env":{"CLAUDE_SELECTED_NONCE":"closed-explicit-settings"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":format!("node {} {}",serde_json::to_string(plugin.join("scripts/flag.cjs").to_str().unwrap()).unwrap(),serde_json::to_string(flag_receipt.to_str().unwrap()).unwrap()),"timeout":10}]}]}});
+    let flag_value = json!({"env":{"CLAUDE_SELECTED_NONCE":"closed-explicit-settings"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":format!("node \"../source-home/selected-config/commands/flag.cjs\" {}",serde_json::to_string(flag_receipt.to_str().unwrap()).unwrap()),"timeout":10}]}]}});
     let flag_bytes = serde_json::to_vec(&flag_value).unwrap();
     std::fs::write(&flag_settings, &flag_bytes).unwrap();
     let flag_alias = selected_config.join("selected-settings.json");
     std::os::unix::fs::symlink(&flag_settings, &flag_alias).unwrap();
+    let settings_form = std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_SETTINGS_FORM")
+        .unwrap_or_else(|_| "file".into());
+    let flag_argument = match settings_form.as_str() {
+        "file" => "../source-home/selected-config/selected-settings.json".into(),
+        "inline" => String::from_utf8(flag_bytes.clone()).unwrap(),
+        _ => panic!("closed fixture settings form must be file or inline"),
+    };
     let instructions_consumer = r#"const fs=require('node:fs'),crypto=require('node:crypto'),path=require('node:path');
 let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
  const input=JSON.parse(raw),name=path.basename(input.file_path||''),event=input.hook_event_name==='InstructionsLoaded';
@@ -1013,7 +1034,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
                     "--setting-sources".into(),
                     "user".into(),
                     "--settings".into(),
-                    "../source-home/selected-config/selected-settings.json".into(),
+                    flag_argument,
                     "--plugin-dir".into(),
                     plugin.to_str().unwrap().into(),
                 ],

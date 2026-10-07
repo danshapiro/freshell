@@ -5,6 +5,52 @@ use std::path::{Path, PathBuf};
 /// Durable argv names this owned selection; its source and declaring origin
 /// are recorded in the private accepted manifest, never as raw settings JSON.
 pub const MANAGED_SETTINGS_ARGUMENT: &str = ".freshell/claude-selected-settings";
+pub const INLINE_SETTINGS_SOURCE: &str = ".freshell/source-views/claude-inline-settings.json";
+pub const MAX_NATIVE_SETTINGS_BYTES: usize = 2 * 1024 * 1024;
+
+pub fn is_inline_settings(value: &str) -> bool {
+    let value =
+        value.trim_matches(|character: char| character.is_whitespace() || character == '\u{feff}');
+    value.starts_with('{') && value.ends_with('}')
+}
+
+/// Append only the shipped hook groups; retain provider source/tier semantics.
+/// Errors never carry configured commands, environment values or JSON snippets.
+pub fn settings_with_owned_hooks(raw: &[u8]) -> Result<serde_json::Value, &'static str> {
+    if raw.len() > MAX_NATIVE_SETTINGS_BYTES {
+        return Err("selected settings exceeds native 2 MiB limit");
+    }
+    let mut settings: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|_| "selected settings is not valid JSON")?;
+    let object = settings
+        .as_object_mut()
+        .ok_or("selected settings must be a JSON object")?;
+    let hooks = object
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("selected hooks must be an object")?;
+    let shipped: serde_json::Value = serde_json::from_str(
+        &crate::cli_launch::claude_settings_json(crate::cli_launch::ProviderTarget::Unix),
+    )
+    .map_err(|_| "shipped settings recipe invalid")?;
+    for (event, groups) in shipped["hooks"]
+        .as_object()
+        .ok_or("shipped hooks invalid")?
+    {
+        let selected = hooks
+            .entry(event)
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or("selected hook groups must be arrays")?;
+        for group in groups.as_array().ok_or("shipped hook groups invalid")? {
+            if !selected.contains(group) {
+                selected.push(group.clone());
+            }
+        }
+    }
+    Ok(settings)
+}
 
 pub fn selected_settings_argument(args: &[String]) -> Option<&str> {
     let mut selected = None;
@@ -34,6 +80,8 @@ pub struct ClaudeInputManifest {
     pub config_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_settings_sha256: Option<String>,
     #[serde(default = "default_setting_sources")]
     pub setting_sources: Vec<ClaudeSettingSource>,
     pub plugin_dirs: Vec<PathBuf>,
@@ -91,6 +139,11 @@ pub fn default_setting_sources() -> Vec<ClaudeSettingSource> {
 impl ClaudeInputManifest {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.version != 1
+            || self.inline_settings_sha256.as_ref().is_some_and(|digest| {
+                self.settings_file.is_some()
+                    || digest.len() != 64
+                    || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
             || self.plugin_dirs.len() > crate::provider_input_profiles::MAX_SOURCE_EVENTS
             || self.setting_sources.len() > 3
             || self

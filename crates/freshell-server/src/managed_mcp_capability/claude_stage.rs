@@ -17,6 +17,7 @@ pub(super) fn prepare(
         workspace: workspace.into(),
         config_root: None,
         settings_file: None,
+        inline_settings_sha256: None,
         setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
         plugin_dirs: vec![],
     });
@@ -138,11 +139,42 @@ pub(super) fn stage_settings(
     root: &Path,
     preparation: &Preparation,
     manifest: Option<&ClaudeInputManifest>,
+    inline_settings: Option<&str>,
 ) -> Result<(), String> {
+    use freshell_platform::claude_inputs::{
+        settings_with_owned_hooks, INLINE_SETTINGS_SOURCE, MAX_NATIVE_SETTINGS_BYTES,
+    };
     use std::io::Read;
     let Some(manifest) = manifest else {
         return Ok(());
     };
+    if let Some(digest) = &manifest.inline_settings_sha256 {
+        let result: Result<(), String> = (|| {
+            use sha2::{Digest, Sha256};
+            let raw = inline_settings.ok_or("accepted Claude inline settings source is unavailable; retain inputs and reprepare before dispatch")?;
+            if raw.len() > MAX_NATIVE_SETTINGS_BYTES {
+                return Err("Claude inline --settings exceeds native 2 MiB limit".into());
+            }
+            if format!("{:x}", Sha256::digest(raw.as_bytes())) != *digest {
+                return Err("accepted Claude inline settings source identity changed".into());
+            }
+            let merged = settings_with_owned_hooks(raw.as_bytes()).map_err(str::to_string)?;
+            freshell_runtime_protocol::bounded_json_bytes(&merged, MAX_NATIVE_SETTINGS_BYTES)
+                .map_err(|_| "combined Claude inline settings exceeds native 2 MiB limit")?;
+            super::private_directory(&root.join(".freshell/source-views"))?;
+            super::write_private_bytes(&root.join(INLINE_SETTINGS_SOURCE), raw.as_bytes())
+        })();
+        return result.inspect_err(|reason| {
+            tracing::warn!(
+                event = "provider.inputs.preparation.blocked",
+                provider = "claude",
+                stage = "controller",
+                operation = "stage_inline_settings",
+                reason,
+                "Selected Claude inline settings could not be prepared"
+            );
+        });
+    }
     let Some(selected) = &manifest.settings_file else {
         return Ok(());
     };
@@ -153,49 +185,17 @@ pub(super) fn stage_settings(
         .find(|bind| Path::new(&bind.logical_destination) == destination)
         .ok_or("Claude explicit settings source has no accepted config bind")?;
     let path = root.join(&bind.source_relative_path);
-    let result = (|| {
-        const LIMIT: usize = 2 * 1024 * 1024;
+    let result: Result<(), &'static str> = (|| {
         let mut bytes = Vec::new();
         std::fs::File::open(&path)
             .map_err(|_| "read selected settings")?
-            .take(LIMIT as u64 + 1)
+            .take(MAX_NATIVE_SETTINGS_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| "read selected settings")?;
-        if bytes.len() > LIMIT {
-            return Err("selected settings exceeds native 2 MiB limit");
-        }
-        let mut settings: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|_| "selected settings is not valid JSON")?;
-        let object = settings
-            .as_object_mut()
-            .ok_or("selected settings must be a JSON object")?;
-        let hooks = object
-            .entry("hooks")
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-            .ok_or("selected hooks must be an object")?;
-        let shipped: serde_json::Value =
-            serde_json::from_str(&freshell_platform::cli_launch::claude_settings_json(
-                freshell_platform::cli_launch::ProviderTarget::Unix,
-            ))
-            .map_err(|_| "shipped settings recipe invalid")?;
-        for (event, groups) in shipped["hooks"]
-            .as_object()
-            .ok_or("shipped hooks invalid")?
-        {
-            let selected = hooks
-                .entry(event)
-                .or_insert_with(|| serde_json::json!([]))
-                .as_array_mut()
-                .ok_or("selected hook groups must be arrays")?;
-            for group in groups.as_array().ok_or("shipped hook groups invalid")? {
-                if !selected.contains(group) {
-                    selected.push(group.clone());
-                }
-            }
-        }
-        let bytes = freshell_runtime_protocol::bounded_json_bytes(&settings, LIMIT)
-            .map_err(|_| "combined settings exceeds native 2 MiB limit")?;
+        let settings = settings_with_owned_hooks(&bytes)?;
+        let bytes =
+            freshell_runtime_protocol::bounded_json_bytes(&settings, MAX_NATIVE_SETTINGS_BYTES)
+                .map_err(|_| "combined settings exceeds native 2 MiB limit")?;
         // The copier made this private, physical file in a not-yet-published
         // attempt. Writing it retains its executable bits and failed attempts
         // are removed by the existing stage transaction.
@@ -260,6 +260,7 @@ mod tests {
             workspace: cwd.clone(),
             config_root: Some(user.clone()),
             settings_file: None,
+            inline_settings_sha256: None,
             setting_sources: vec![ClaudeSettingSource::Project],
             plugin_dirs: vec![],
         };
