@@ -145,6 +145,13 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     })
     harness.writeArtifact('native-originals.json', originals)
   } finally {
+    const containers = new Set([...harness.transferOwnedIds().containers,
+      ...(harness.broker?.receipts() ?? []).map((receipt) => receipt.containerId)])
+    for (const containerId of containers) {
+      try { fs.writeFileSync(path.join(harness.evidenceDir, `native-container-${containerId}.log`),
+        await harness.containerLogs(containerId), { mode: 0o600 }) }
+      catch { /* Cleanup still joins when an already-owned enclosure exited. */ }
+    }
     const cleanup = await harness.cleanup()
     if (!cleanup.ok) throw new Error(`native owned cleanup failed: ${cleanup.errors.join('; ')}`)
   }
@@ -153,6 +160,9 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
 async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string): Promise<NativeExperimentOriginal> {
+  if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
+    return executeManagedAmplifier(harness, sources, caseId)
+  }
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
     || !['create', 'current-native-turn', 'allow', 'deny'].includes(caseId)) {
     throw new Error(`actual native case has no qualified execution path: ${selection.mode ?? selection.provider}/${caseId}`)
@@ -277,6 +287,155 @@ async function executeManagedNativeCase(harness: RuntimeHarness,
   return original
 }
 
+async function executeManagedAmplifier(harness: RuntimeHarness,
+  sources: { name: string; path: string; sha256: string }[], caseId: string): Promise<NativeExperimentOriginal> {
+  const grants = (['env_file', 'ca_file'] as const).map((suffix) => {
+    const file = sources.find((source) => source.name === `amplifier/grants/${suffix}`)
+    if (!file) throw new Error(`selected Amplifier ${suffix} reference missing`)
+    return { sourcePath: file.path, profile: suffix === 'env_file' ? 'amplifier_onecli_environment' : 'amplifier_onecli_ca_file' }
+  })
+  const profile = ['settings.yaml', 'bundles/default.yaml'].map((relative) => {
+    const file = sources.find((source) => source.name === `amplifier/.amplifier/${relative}`)
+    if (!file) throw new Error('selected ordinary Amplifier profile missing')
+    return { relative, ...file }
+  })
+  const home = path.dirname(path.dirname(profile[0]!.path))
+  const workspace = path.join(harness.testRoot, 'amplifier-create-workspace')
+  fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
+  const supervisor = await harness.startSupervisor({ scenarioId: 'amplifier-create', binaryKind: 'release',
+    env: { HOME: home, FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'amplifier' } })
+  const soulId = 'soul-' + randomUUID()
+  const nativeRoot = randomUUID()
+  const request = { method: 'launch', params: { soulId, provider: 'amplifier', providerStoreId: 'store-' + randomUUID(),
+    nativeSessionId: nativeRoot,
+    creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: 'amplifier-native-create',
+    limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
+    terminal: { terminalId: 'native-terminal-' + randomUUID(), streamId: 'native-stream-' + randomUUID(),
+      mode: 'amplifier', program: 'amplifier', args: ['session', 'resume', '--full-history', nativeRoot],
+      resumeSessionId: nativeRoot, env: { HOME: '/home/freshell/provider', PROMPT_TOOLKIT_NO_CPR: '1' },
+      cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30,
+      projectKey: 'amplifier-native-create', providerModel: 'glm-5.3', providerReasoningEffort: 'low',
+      providerSecretReferences: grants,
+      providerLaunchContext: { preparation: { amplifier: { bundle: 'default', resume_args: [] } },
+        config: profile.map((file) => ({ root: 'user_provider', relativePath: file.relative,
+          providerRelativePath: '.amplifier/' + file.relative, format: 'yaml' })) } } } }
+  harness.writeArtifact('amplifier-create-request.json', request)
+  const result = await harness.adminOk(supervisor, request)
+  harness.writeArtifact('amplifier-create-launch.json', result)
+  let view = result.data.view
+  const deadline = Date.now() + 50_000
+  while (!view.nativeIdentityObservation && Date.now() < deadline) {
+    harness.writeArtifact('amplifier-create-terminal-private.json',
+      await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId)))
+    harness.writeArtifact('amplifier-create-store-probe.json',
+      await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId)))
+    try {
+      const signal = await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c',
+        "import pathlib,json; signals=[]\nfor p in pathlib.Path('/proc').iterdir():\n if not p.name.isdigit():continue\n try:\n  env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(bytes([0])) if b'=' in v)\n  if 'FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR' in env:signals.append(pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'])/'amplifier-loaded-context.json')\n except (OSError,ValueError):continue\nassert len(set(signals))==1\nprint(next(iter(set(signals))).read_text())"])
+      fs.writeFileSync(path.join(harness.evidenceDir, 'amplifier-create-native-signal-original.json'), signal, { mode: 0o600 })
+    } catch { /* The producer may not yet have completed load/context restore. */ }
+    const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+    harness.writeArtifact('amplifier-create-inventory.json', inventory)
+    view = inventory.data.find((row: any) => row.soulId === soulId)
+    if (!view) throw new Error('owned Amplifier view disappeared')
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  const observation = view.nativeIdentityObservation
+  harness.writeArtifact('amplifier-create-current-view.json', view)
+  if (!observation || !view.nativeSessionId || view.recoveryState !== 'live'
+    || observation.nativeSessionId !== view.nativeSessionId || observation.incarnationId !== view.incarnationId
+    || observation.source !== 'amplifier_native_loaded_context') throw new Error('current managed Amplifier no-input acknowledgement missing')
+  const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+    ['/opt/amplifier-src/.venv/bin/python', '-c',
+      "import os,json,pathlib,hashlib,importlib.metadata as m; p=pathlib.Path('/opt/amplifier-src/.venv/bin/amplifier'); producer=pathlib.Path('/opt/amplifier-src/amplifier_app_cli/freshell_native_resume.py'); print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'executableSha256':hashlib.sha256(p.read_bytes()).hexdigest(),'producerSha256':hashlib.sha256(producer.read_bytes()).hexdigest(),'cliVersion':m.version('amplifier-app-cli'),'coreVersion':m.version('amplifier-core')}))"]))
+  harness.writeArtifact('amplifier-create-namespace.json', namespace)
+  if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
+    || !namespace.readOnlyRoot || namespace.cliVersion !== '0.1.1' || namespace.coreVersion !== '1.6.0') {
+    throw new Error('actual managed Amplifier namespace/package differs')
+  }
+  const assertions = [{ name: 'actual-native-loaded-context-before-zero-input', pass: observation.source === 'amplifier_native_loaded_context'
+    && observation.nativeSessionId === view.nativeSessionId && observation.incarnationId === view.incarnationId }]
+  if (caseId === 'current-native-turn') {
+    const signalFile = path.join(harness.evidenceDir, 'amplifier-create-native-signal-original.json')
+    const signal = JSON.parse(fs.readFileSync(signalFile, 'utf8'))
+    const transcriptPath = signal.native.load.transcript.path
+    const inspect = async (containerId: string, label: string) => {
+      const snapshot = JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
+        ['/opt/amplifier-src/.venv/bin/python', '-c', amplifierNativeInspection, transcriptPath, nativeRoot, String(label === 'startup')]))
+      harness.writeArtifact(`amplifier-${label}-native-private.json`, snapshot)
+      return snapshot
+    }
+    const startup = await inspect(view.containerId, 'startup')
+    if (startup.httpsStatus !== 200 || startup.tlsVerifyMode !== 2 || !startup.tlsCheckHostname) {
+      throw new Error('current native Amplifier selected grant/TLS check failed')
+    }
+    const marker = 'owned-memory-' + randomUUID()
+    const turn = async (containerId: string, text: string, label: string) => {
+      let before = await inspect(containerId, label + '-before-input')
+      const readyDeadline = Date.now() + 15_000
+      const inputReady = () => harness.execOwnedContainerAsExact(containerId, '0:0', ['python3', '-c',
+        "import pathlib,os,sys,termios; p=pathlib.Path('/proc')/sys.argv[1]; fields=(p/'stat').read_text().rsplit(')',1)[1].split(); device=int(fields[4]); assert os.major(device)==136; fd=os.open('/dev/pts/'+str(os.minor(device)),os.O_RDONLY|os.O_NONBLOCK)\ntry:print(str(not bool(termios.tcgetattr(fd)[3]&termios.ICANON)).lower())\nfinally:os.close(fd)", String(before.nativePid)]).trim() === 'true'
+      while (!inputReady() && Date.now() < readyDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        before = await inspect(containerId, label + '-before-input')
+      }
+      if (!inputReady()) throw new Error('ordinary Amplifier REPL not ready after native gate')
+      const receipt = await harness.adminOk(supervisor, harness.terminalInputBody(soulId, text + '\r'))
+      harness.writeArtifact(`amplifier-${label}-dispatch.json`, receipt)
+      const deadline = Date.now() + 90_000
+      while (Date.now() < deadline) {
+        const current = await inspect(containerId, label)
+        harness.writeArtifact(`amplifier-${label}-terminal-private.json`,
+          await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId)))
+        if (current.completedTurns > before.completedTurns) {
+          if (current.nativeRoot !== nativeRoot || current.toolEvents !== before.toolEvents
+            || current.responses.length <= before.responses.length) throw new Error('native Amplifier completed turn/root/tools differ')
+          return current
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200))
+      }
+      throw new Error('bounded ordinary Amplifier native turn deadline exceeded')
+    }
+    const seed = await turn(view.containerId,
+      `Remember this private marker: ${marker}. Reply stored. Do not use tools.`, 'seed')
+    const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
+    harness.writeArtifact('amplifier-turn-store-probe.json', probe)
+    if (probe.data.kind !== 'reattach_ready') throw new Error('completed Amplifier native store not readable before death')
+    await harness.killOwnedRuntimeExact(view.containerId)
+    await harness.waitForContainerExit(view.containerId)
+    const recovery = await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+    harness.writeArtifact('amplifier-turn-recovery.json', recovery)
+    const replacement = recovery.data.view
+    if (recovery.data.outcome !== 'replaced' || replacement.incarnationId === view.incarnationId
+      || replacement.nativeSessionId !== nativeRoot || replacement.recoveryState !== 'live'
+      || replacement.nativeIdentityObservation?.source !== 'amplifier_native_loaded_context'
+      || replacement.nativeIdentityObservation?.nativeSessionId !== nativeRoot) throw new Error('Amplifier exact-root replacement failed')
+    const restored = await inspect(replacement.containerId, 'after-death')
+    if (seed.transcript.sha256 !== restored.transcript.sha256
+      || seed.transcript.identity[0] !== restored.transcript.identity[0]
+      || seed.transcript.identity[1] !== restored.transcript.identity[1]) throw new Error('original Amplifier owned transcript continuity lost')
+    const recalled = await turn(replacement.containerId,
+      'Reply with only the private marker from before. Do not use tools.', 'recall')
+    if (recalled.lastAssistantText.trim() !== marker) throw new Error('native Amplifier restored context did not recall private marker')
+    assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
+      { name: 'replacement-new-incarnation-same-native-root', pass: replacement.incarnationId !== view.incarnationId && replacement.nativeSessionId === nativeRoot },
+      { name: 'original-owned-volume-transcript-continuity', pass: seed.transcript.sha256 === restored.transcript.sha256
+        && seed.transcript.identity[0] === restored.transcript.identity[0] && seed.transcript.identity[1] === restored.transcript.identity[1] },
+      { name: 'same-workspace-selected-native-profile', pass: JSON.stringify(seed.profileFiles) === JSON.stringify(restored.profileFiles)
+        && recalled.metadata.model === 'glm-5.3' },
+      { name: 'actual-restored-context-private-marker-recall', pass: recalled.lastAssistantText.trim() === marker },
+      { name: 'native-turns-requested-no-tools', pass: seed.toolEvents === 0 && recalled.toolEvents === 0 })
+  }
+  const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
+    nativeVersion: `amplifier-app-cli ${namespace.cliVersion}; amplifier-core ${namespace.coreVersion}`,
+    executableSha256: namespace.executableSha256,
+    profileSha256: createHash('sha256').update(JSON.stringify(profile.map((file) => ({ relative: file.relative, sha256: file.sha256 })))).digest('hex'),
+    artifactReferences: ['amplifier-create-current-view.json', 'amplifier-create-native-signal-original.json', 'amplifier-create-namespace.json'],
+    assertions }
+  harness.writeArtifact(`amplifier-${caseId}-original.json`, original)
+  return original
+}
+
 async function executeManagedNativeApproval(input: {
   harness: RuntimeHarness; supervisor: any; soulId: string; workspace: string; view: any; scenario: string
   decision: string; inspect: (containerId: string, label: string, requireTranscript: boolean) => Promise<any>
@@ -370,6 +529,41 @@ async function executeManagedNativeApproval(input: {
       && toolResult.is_error === (input.decision === 'deny') },
     { name: 'independent-native-effect-count', pass: count === (input.decision === 'allow' ? 1 : 0) }]
 }
+
+const amplifierNativeInspection = String.raw`
+import pathlib,os,json,hashlib,sys,base64,ssl,urllib.request
+file=pathlib.Path(sys.argv[1]);root=sys.argv[2];check_tls=sys.argv[3]=='true';assert file.name=='transcript.jsonl' and file.parent.name==root
+with file.open('rb') as f:
+ before=os.fstat(f.fileno());raw=f.read();after=os.fstat(f.fileno())
+identity=lambda s:[str(s.st_dev),str(s.st_ino),str(s.st_size),str(s.st_mtime_ns),str(s.st_ctime_ns)]
+assert identity(before)==identity(after)==identity(file.stat()) and (not raw or raw.endswith(b'\n'))
+messages=[json.loads(line) for line in raw.splitlines() if line.strip()]
+meta=json.loads((file.parent/'metadata.json').read_text());assert meta['session_id']==root and meta.get('parent_id') is None
+events_file=file.parent/'events.jsonl';event_raw=events_file.read_bytes() if events_file.exists() else b''
+events=[json.loads(line) for line in event_raw.split(b'\n')[:-1] if line.strip()]
+matches=[]
+for p in pathlib.Path('/proc').iterdir():
+ if not p.name.isdigit():continue
+ try:
+  env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(b'\0') if b'=' in v)
+  cmd=(p/'cmdline').read_bytes().split(b'\0')
+  if 'FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR' in env and any(x.endswith(b'/amplifier') or x==b'amplifier' for x in cmd):matches.append((p,env))
+ except (OSError,ValueError):continue
+assert len(matches)==1
+p,env=matches[0]
+status=None;context=ssl.create_default_context(cafile=env['SSL_CERT_FILE'])
+if check_tls:
+ proxy=env.get('HTTPS_PROXY') or env.get('https_proxy');opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),urllib.request.HTTPSHandler(context=context))
+ request=urllib.request.Request(env['LUNAROUTE_BASE_URL'].rstrip('/')+'/models',headers={'Authorization':'Bearer '+env['LUNAROUTE_API_KEY']})
+ with opener.open(request,timeout=20) as response:status=response.status;response.read()
+profile=[]
+for relative in ['.amplifier/settings.yaml','.amplifier/bundles/default.yaml','.amplifier/keys.env']:
+ source=pathlib.Path(env['HOME'])/relative;profile.append({'relative':relative,'sha256':hashlib.sha256(source.read_bytes()).hexdigest() if source.exists() else None})
+assistants=[m for m in messages if m.get('role')=='assistant']
+def text(m):
+ c=m.get('content');return c if isinstance(c,str) else ''.join(p.get('text','') for p in (c or []) if isinstance(p,dict) and p.get('type')=='text')
+print(json.dumps({'nativeRoot':root,'nativePid':int(p.name),'transcript':{'identity':identity(after),'sha256':hashlib.sha256(raw).hexdigest(),'completeEof':not raw or raw.endswith(b'\n'),'bytesBase64':base64.b64encode(raw).decode()},'eventsBytesBase64':base64.b64encode(event_raw).decode(),'metadata':meta,'completedTurns':sum(e.get('event')=='cleanup:store_end' for e in events),'toolEvents':sum(str(e.get('event','')).startswith('tool:') for e in events),'responses':[e.get('data') for e in events if e.get('event')=='llm:response'],'lastAssistantText':text(assistants[-1]) if assistants else '', 'profileFiles':profile,'httpsStatus':status,'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname}))
+`
 
 // Reads the currently owned native child and its exact hook-selected transcript.
 // Raw bytes are saved only in the run's private artifact; reports use metadata.
