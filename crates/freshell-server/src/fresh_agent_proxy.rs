@@ -505,14 +505,19 @@ impl HostedFreshAgentProxy {
                 .ok_or(())?;
             let original = |name: &str| std::env::var(name).ok();
             let context = crate::managed_provider_references::codex::prepare_managed(
-                &soul,
-                &home,
-                &cwd,
-                &workspace,
-                &original,
-                &[],
-                &provider_secret_references,
+                crate::managed_provider_references::codex::CodexPreparation {
+                    client: &self.client,
+                    soul: &soul,
+                    creation_seed: &message.request_id,
+                    home: &home,
+                    cwd: &cwd,
+                    workspace: &workspace,
+                    original: &original,
+                    args: &[],
+                    references: &provider_secret_references,
+                },
             )
+            .await
             .map_err(|error| {
                 tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
             })?;

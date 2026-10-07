@@ -216,6 +216,326 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_provider_codex_terminal_and_fresh_native_startup_consumes_prepared_inputs() {
+    use freshell_supervisor::{
+        admission::AdmissionPolicy,
+        registry::Registry,
+        service::{serve_control, Supervisor, SupervisorConfig},
+    };
+    use freshell_terminal::registry::{ManagedTerminalController, ManagedTerminalLaunch};
+    use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
+    use sha2::{Digest, Sha256};
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    let fixture = PathBuf::from(
+        std::env::var_os("FRESHELL_PROVIDER_LAUNCH_FIXTURE")
+            .expect("run the closed --provider-launches --provider codex sandbox"),
+    );
+    assert_eq!(fixture.parent(), Some(Path::new("/tmp")));
+    assert!(fixture
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("fln-"));
+    let home = fixture.join("source-home");
+    let workspace = fixture.join("workspace");
+    let control = fixture.join("scenarios/native/control");
+    let runtime = fixture.join("scenarios/n/r");
+    let skill = home.join(".codex/skills/probe");
+    for path in [
+        &control,
+        &runtime,
+        &skill.join("scripts/node_modules/probe-dependency"),
+        &workspace.join(".codex/agents"),
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    assert!(std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&workspace)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(skill.join("SKILL.md"), "---\nname: transport-probe\ndescription: complete launch fixture\n---\nExecute the adjacent synthetic resource.\n").unwrap();
+    std::fs::write(skill.join("scripts/resource"), b"closed-codex-resource").unwrap();
+    std::fs::write(
+        skill.join("scripts/node_modules/probe-dependency/index.js"),
+        "module.exports='closed-codex-dependency'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        skill.join("scripts/run"),
+        "#!/bin/sh\ncat \"$(dirname \"$0\")/resource\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        skill.join("scripts/run"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let receipt = workspace.join("codex-consumed.json");
+    let server = r#"const fs=require('node:fs'),crypto=require('node:crypto'),http=require('node:http'),path=require('node:path');
+const digest=v=>crypto.createHash('sha256').update(v).digest('hex');
+const readline=require('node:readline').createInterface({input:process.stdin});
+readline.on('line',async line=>{let message;try{message=JSON.parse(line)}catch{return}if(message.id===undefined)return;
+let result={};if(message.method==='initialize'){
+ const endpoint=process.env.FRESHELL_URL,token=process.env.FRESHELL_TOKEN;
+ const authenticated=await new Promise(resolve=>{if(!endpoint||!token)return resolve(false);const req=http.request(new URL('/api/mcp',endpoint),{method:'POST',headers:{'x-auth-token':token}},res=>{res.resume();resolve(res.statusCode===200)});req.on('error',()=>resolve(false));req.end('{}')});
+ const nativeArgv=fs.readFileSync('/proc/'+process.ppid+'/cmdline','utf8').split('\0');
+ const retainedMcpRecipe=nativeArgv.includes('mcp_servers.freshell.command="node"')&&nativeArgv.includes('mcp_servers.freshell.args=["/opt/freshell-mcp/server.js"]')&&nativeArgv.some(arg=>arg.startsWith('mcp_servers.freshell.env_vars='));
+ const record={physicalHome:process.env.HOME,initialized:true,authenticated,retainedMcpRecipe,scopedAlias:process.env.FRESHELL==='1',endpointPresent:!!endpoint,tokenPresent:!!token,
+   user:digest(fs.readFileSync(path.join(process.env.CODEX_HOME,'user.md'))),project:digest(fs.readFileSync(path.join(process.cwd(),'.codex/project.md'))),
+   role:digest(fs.readFileSync(path.join(process.cwd(),'.codex/agents/role.md'))),skill:digest(fs.readFileSync(path.join(__dirname,'../SKILL.md'))),
+   resource:digest(require('node:child_process').execFileSync(path.join(__dirname,'run'))),dependency:digest(require('probe-dependency'))};
+ fs.writeFileSync(process.argv[2],JSON.stringify(record));result={protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'closed-managed-source-consumer',version:'1'}};
+}else if(message.method==='tools/list')result={tools:[]};else if(message.method==='resources/list')result={resources:[]};else if(message.method==='prompts/list')result={prompts:[]};
+process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\n');});
+"#;
+    std::fs::write(skill.join("scripts/server.cjs"), server).unwrap();
+    let config = format!("model='synthetic-model'\nmodel_provider='fixture'\nmodel_instructions_file='./user.md'\n[model_providers.fixture]\nname='Closed fixture'\nbase_url='http://127.0.0.1:9'\nwire_api='responses'\nrequires_openai_auth=false\n[projects.{}]\ntrust_level='trusted'\n[mcp_servers.probe]\ncommand='node'\nenv_vars=['FRESHELL_URL','FRESHELL_TOKEN','FRESHELL','CODEX_HOME']\nargs=[{},{}]\n", serde_json::to_string(workspace.to_str().unwrap()).unwrap(), serde_json::to_string(skill.join("scripts/server.cjs").to_str().unwrap()).unwrap(), serde_json::to_string(receipt.to_str().unwrap()).unwrap());
+    std::fs::write(home.join(".codex/config.toml"), &config).unwrap();
+    std::fs::write(home.join(".codex/user.md"), b"closed-user-input").unwrap();
+    let project_config = "model_instructions_file='./project.md'\n[agents.worker]\nconfig_file='./agents/worker.toml'\n";
+    std::fs::write(workspace.join(".codex/config.toml"), project_config).unwrap();
+    std::fs::write(workspace.join(".codex/project.md"), b"closed-project-input").unwrap();
+    std::fs::write(workspace.join(".codex/agents/worker.toml"), "name='worker'\ndescription='synthetic role'\ndeveloper_instructions='synthetic developer'\nmodel_instructions_file='./role.md'\n").unwrap();
+    std::fs::write(
+        workspace.join(".codex/agents/role.md"),
+        b"closed-role-input",
+    )
+    .unwrap();
+    let registry = Registry::open(
+        fixture.join("registry"),
+        Some(
+            InstallationId::parse(std::env::var("FRESHELL_PROVIDER_LAUNCH_INSTALLATION").unwrap())
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    std::env::set_var("FRESHELL_MANAGED_PROVIDER_QUALIFICATION", "codex");
+    let socket = control.join("control.sock");
+    let secret_file = control.join("secret");
+    std::fs::write(&secret_file, "closed-synthetic-control-secret").unwrap();
+    std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    freshell_supervisor::backend::docker::configure_capability_dir(&socket).unwrap();
+    let supervisor = Supervisor::new(
+        registry.clone(),
+        Arc::new(BrokerAuthorizedBackend {
+            real: DockerEngineBackend::new(fixture.join("broker.sock")),
+            control: control.clone(),
+            handoff: fixture.join("handoff"),
+            certificate_sentinel: b"unselected-private-sentinel".to_vec(),
+        }),
+        SupervisorConfig {
+            runtime_root: runtime,
+            control_socket_path: socket.clone(),
+            host_binary_path: PathBuf::from(
+                std::env::var_os("FRESHELL_PROVIDER_LAUNCH_HOST_BINARY").unwrap(),
+            ),
+            image_ref: std::env::var("FRESHELL_PROVIDER_LAUNCH_IMAGE").unwrap(),
+            test_run_id: std::env::var("FRESHELL_PROVIDER_LAUNCH_RUN_ID").unwrap(),
+            control_secret: "closed-synthetic-control-secret".into(),
+            lifecycle_log: fixture.join("lifecycle.jsonl"),
+            admission: AdmissionPolicy::default(),
+        },
+    )
+    .unwrap();
+    let control_task = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            serve_control(supervisor, &socket).await.unwrap();
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let web = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = web.local_addr().unwrap().port();
+    let web_token = Arc::new("closed-synthetic-web-token".to_string());
+    let app = axum::Router::new()
+        .route("/api/health", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/api/mcp",
+            axum::routing::post(|headers: axum::http::HeaderMap| async move {
+                if headers
+                    .get("x-auth-token")
+                    .is_some_and(|token| token == "closed-synthetic-web-token")
+                {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::UNAUTHORIZED
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            web_token,
+            crate::managed_mcp_capability::scoped_auth_middleware,
+        ));
+    let web_task = tokio::spawn(async move { axum::serve(web, app).await.unwrap() });
+    crate::managed_mcp_capability::configure("0.0.0.0", port, &socket, &secret_file).unwrap();
+    crate::managed_mcp_capability::spawn_callback_server()
+        .await
+        .unwrap();
+    for (name, value) in [
+        ("FRESHELL_MANAGED_RUNTIME_V1", "1"),
+        ("FRESHELL_MANAGED_FRESH_AGENT_V1", "1"),
+    ] {
+        std::env::set_var(name, value);
+    }
+    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SOCKET", &socket);
+    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SECRET_FILE", &secret_file);
+    std::env::set_var("HOME", &home);
+    let controller = crate::managed_runtime::ServerManagedRuntimeController::from_env()
+        .await
+        .unwrap()
+        .unwrap();
+    let cwd = workspace.to_str().unwrap().to_owned();
+    let terminal = controller
+        .launch(ManagedTerminalLaunch {
+            spec: freshell_platform::spawn::SpawnSpec {
+                program: "codex".into(),
+                args: vec![],
+                env_overrides: BTreeMap::new(),
+                cwd: Some(cwd.clone()),
+                cols: 120,
+                rows: 30,
+            },
+            env: BTreeMap::new(),
+            terminal_id: "closed-native-terminal".into(),
+            stream_id: "closed-native-stream".into(),
+            mode: "codex".into(),
+            resume_session_id: None,
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            view_tab_id: None,
+            view_pane_id: None,
+            create_request_id: Some("closed-native-terminal-create".into()),
+        })
+        .await
+        .expect("actual Codex controller/supervisor/session-host terminal startup");
+    let client = controller.runtime_client();
+    async fn consumed(path: &Path) -> Result<Value, &'static str> {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(value) = serde_json::from_slice(&bytes) {
+                        break value;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .map_err(|_| "native Codex must initialize its configured MCP consumer")
+    }
+    let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let expected = json!({"physicalHome":"/home/freshell/provider","initialized":true,"authenticated":true,"retainedMcpRecipe":true,"scopedAlias":true,"endpointPresent":true,"tokenPresent":true,"user":hash(b"closed-user-input"),"project":hash(b"closed-project-input"),"role":hash(b"closed-role-input"),"skill":hash(std::fs::read(skill.join("SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-codex-resource"),"dependency":hash(b"closed-codex-dependency")});
+    let consumed_terminal = consumed(&receipt).await;
+    if consumed_terminal.is_err() {
+        let output = client
+            .read_output(
+                SoulId::parse(terminal.soul_id.clone()).unwrap(),
+                0,
+                64 * 1024,
+            )
+            .await
+            .unwrap();
+        let text = output
+            .frames
+            .iter()
+            .map(|frame| frame.data.as_str())
+            .collect::<String>();
+        let classes = [
+            "ERR_INVALID_ARG_TYPE",
+            "ENOENT",
+            "EACCES",
+            "onboarding",
+            "Sign in",
+            "trust",
+            "API key",
+            "MCP",
+            "mcp",
+            "initialize",
+            "failed",
+            "Permission denied",
+            "Terminal",
+            "TERM",
+            "user.md",
+            "project.md",
+            "role.md",
+            "server.cjs",
+            "node",
+            "config.toml",
+        ]
+        .into_iter()
+        .filter(|class| text.contains(class))
+        .collect::<Vec<_>>();
+        println!(
+            "provider_launch_diagnostic {}",
+            json!({"provider":"codex","route":"terminal","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"classes":classes})
+        );
+    }
+    assert_eq!(consumed_terminal.unwrap(), expected);
+    println!(
+        "provider_launch_consumer {}",
+        json!({"provider":"codex","route":"terminal","digest":hash(serde_json::to_vec(&expected).unwrap().as_slice())})
+    );
+    client
+        .stop(SoulId::parse(terminal.soul_id).unwrap())
+        .await
+        .unwrap();
+    std::fs::remove_file(&receipt).unwrap();
+    let (broadcast, _) = tokio::sync::broadcast::channel(256);
+    let mut events = broadcast.subscribe();
+    let proxy = crate::fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
+        Some(client.clone()),
+        Arc::new(broadcast),
+    )
+    .unwrap()
+    .unwrap();
+    Arc::clone(&proxy).dispatch(HostedFreshAgentCommand::Create(serde_json::from_value(json!({"requestId":"closed-native-fresh-create","sessionType":"freshcodex","provider":"codex","cwd":cwd})).unwrap())).await;
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let frame: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
+            if frame["type"] == "freshAgent.create.failed" {
+                panic!("actual fresh Codex failed: {}", frame["message"]);
+            }
+            if frame["type"] == "freshAgent.created" {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(consumed(&receipt).await.unwrap(), expected);
+    println!(
+        "provider_launch_consumer {}",
+        json!({"provider":"codex","route":"fresh","digest":hash(serde_json::to_vec(&expected).unwrap().as_slice())})
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+        config
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join(".codex/config.toml")).unwrap(),
+        project_config
+    );
+    for view in client.inventory().await.unwrap() {
+        if view.desired_state == DesiredState::Running {
+            client.stop(view.soul_id).await.unwrap();
+        }
+    }
+    web_task.abort();
+    control_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_prepared_inputs() {
     use freshell_supervisor::{
         admission::AdmissionPolicy,

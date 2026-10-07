@@ -149,6 +149,7 @@ pub(super) fn publish(
     root: &Path,
     preparation: &Preparation,
     capability: &McpCapabilityReference,
+    initial_reservation: Option<&str>,
 ) -> Result<PreparedProviderInputs, String> {
     use sha2::{Digest, Sha256};
     private_directory(&root.join(".freshell"))?;
@@ -157,7 +158,7 @@ pub(super) fn publish(
     write_private_bytes(&root.join(".freshell/input-manifest.json"), &bytes)?;
     let inputs = PreparedProviderInputs {
         generation_id: capability.grant_id.clone(),
-        initial_auth_reservation: None,
+        initial_auth_reservation: initial_reservation.map(str::to_string),
         manifest: ProviderInputManifestReference {
             relative_path: ".freshell/input-manifest.json".into(),
             sha256: format!("{:x}", Sha256::digest(&bytes)),

@@ -10,7 +10,7 @@ if (path.dirname(root)!=='/tmp' || !/^fln-[a-f0-9]{16}$/.test(path.basename(root
 }
 const configuration=JSON.parse(fs.readFileSync(path.join(root,'broker-configuration.json'),'utf8'))
 const image='sha256:967627e41734aa903e824e4be22849c7f22ce0e69487ce61bb72004c4817f89c'
-if (configuration.imageRef!==image || !Array.isArray(configuration.initialVolumes) || configuration.initialVolumes.length!==2) {
+if (configuration.imageRef!==image || !['opencode','codex'].includes(configuration.provider) || !Array.isArray(configuration.initialVolumes) || configuration.initialVolumes.length!==2) {
   throw new Error('closed provider startup image or finite source set changed')
 }
 const gateways=new Set<string>()
@@ -19,7 +19,9 @@ const broker=new RestrictedDockerBroker({
   runtimeRootPrefix:path.join(root,'scenarios'),allowedHostBinaryPaths:new Set([configuration.hostBinaryPath]),
   allowedImageRefs:new Set([image]),allowTerminalWorkloads:true,
   allowedWorkspaceRoots:new Set([path.join(root,'workspace')]),
-  allowedProviderUserRoots:new Set(['/home/freshell/provider',path.join(root,'.opencode')]),
+  allowedProviderUserRoots:new Set(configuration.provider==='codex'
+    ? ['/home/freshell/provider',path.join(root,'source-home/.codex')]
+    : ['/home/freshell/provider',path.join(root,'.opencode')]),
   allowedBootstrapFiles:new Set([path.join(root,'grants/environment.env'),path.join(root,'grants/auth.json'),path.join(root,'grants/ca.pem')]),
   allowedHostGatewayAddresses:gateways,
   testRunId:configuration.runId,logPath:path.join(root,'broker.jsonl'),

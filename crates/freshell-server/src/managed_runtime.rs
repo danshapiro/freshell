@@ -240,14 +240,19 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                         .or_else(|| std::env::var(name).ok())
                 };
                 let context = crate::managed_provider_references::codex::prepare_managed(
-                    &soul_id,
-                    &home,
-                    &cwd,
-                    &workspace,
-                    &original,
-                    &args,
-                    &provider_secret_references,
-                )?;
+                    crate::managed_provider_references::codex::CodexPreparation {
+                        client: &self.client,
+                        soul: &soul_id,
+                        creation_seed: create_key,
+                        home: &home,
+                        cwd: &cwd,
+                        workspace: &workspace,
+                        original: &original,
+                        args: &args,
+                        references: &provider_secret_references,
+                    },
+                )
+                .await?;
                 (context.mcp_capability.clone(), Some(context))
             } else {
                 let mcp_capability = matches!(

@@ -1431,7 +1431,12 @@ fn stage_provider_root(
                 provider_relative_path: CAPABILITY_PATH.into(),
                 host_gateway_address: None,
             };
-            let inputs = codex_stage::publish(&temporary, resources, &capability)?;
+            let inputs = codex_stage::publish(
+                &temporary,
+                resources,
+                &capability,
+                opencode_input.initial_auth_reservation,
+            )?;
             write_private_bytes(
                 &temporary.join(".freshell/prepared-inputs.json"),
                 &freshell_runtime_protocol::bounded_json_bytes(

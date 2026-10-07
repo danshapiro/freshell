@@ -306,15 +306,32 @@ fn normalize(path: &Path) -> PathBuf {
     result
 }
 
-pub(crate) fn prepare_managed(
-    soul: &freshell_runtime_protocol::SoulId,
-    home: &Path,
-    cwd: &Path,
-    workspace: &Path,
-    original: &dyn Fn(&str) -> Option<String>,
-    args: &[String],
-    references: &[freshell_runtime_protocol::ProviderSecretReference],
+pub(crate) struct CodexPreparation<'a> {
+    pub client: &'a freshell_runtime_client::RuntimeClient,
+    pub soul: &'a freshell_runtime_protocol::SoulId,
+    pub creation_seed: &'a str,
+    pub home: &'a Path,
+    pub cwd: &'a Path,
+    pub workspace: &'a Path,
+    pub original: &'a (dyn Fn(&str) -> Option<String> + Sync),
+    pub args: &'a [String],
+    pub references: &'a [freshell_runtime_protocol::ProviderSecretReference],
+}
+
+pub(crate) async fn prepare_managed(
+    request: CodexPreparation<'_>,
 ) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String> {
+    let CodexPreparation {
+        client,
+        soul,
+        creation_seed,
+        home,
+        cwd,
+        workspace,
+        original,
+        args,
+        references,
+    } = request;
     let codex_home =
         if let Some(selected) = original("CODEX_HOME").filter(|value| !value.is_empty()) {
             let selected = PathBuf::from(selected);
@@ -356,6 +373,18 @@ pub(crate) fn prepare_managed(
         mcp_capability: None,
         prepared_inputs: None,
     };
+    // Ordinary Codex resource roots require exact first-volume authority.
+    // This reservation makes no OpenCode native-auth or recovery-loss claim.
+    let reservation = client
+        .reserve_provider_inputs(soul.clone(), "codex".into(), creation_seed.into())
+        .await
+        .map_err(|error| error.to_string())?;
+    if reservation.provider != "codex"
+        || &reservation.soul_id != soul
+        || reservation.creation_seed_ref != creation_seed
+    {
+        return Err("Codex selected resource reservation does not match this creation".into());
+    }
     crate::managed_mcp_capability::issue_prepared_provider_context(
         "codex",
         soul,
@@ -366,6 +395,7 @@ pub(crate) fn prepare_managed(
             cwd: Some(cwd),
             workspace: Some(workspace),
             secret_references: Some(references),
+            initial_auth_reservation: Some(&reservation.reservation_id),
             ..Default::default()
         },
     )

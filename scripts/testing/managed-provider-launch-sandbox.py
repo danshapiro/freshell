@@ -12,6 +12,7 @@ import uuid
 
 IMAGE="sha256:967627e41734aa903e824e4be22849c7f22ce0e69487ce61bb72004c4817f89c"
 TEST="managed_provider_launch_tests::managed_provider_opencode_terminal_and_fresh_native_startup_consumes_prepared_inputs"
+CODEX_TEST="managed_provider_launch_tests::managed_provider_codex_terminal_and_fresh_native_startup_consumes_prepared_inputs"
 LABEL="com.freshell.provider-launch-probe"
 
 def docker(*args,check=True,timeout=180):
@@ -27,13 +28,15 @@ def main():
     parser.add_argument("--host-binary",type=Path,required=True)
     parser.add_argument("--broker-binary",type=Path,required=True)
     parser.add_argument("--receipt-dir",type=Path,required=True)
+    parser.add_argument("--provider",choices=["opencode","codex"],default="opencode")
     args=parser.parse_args()
+    selected_test=CODEX_TEST if args.provider=="codex" else TEST
     repo=Path(__file__).resolve().parents[2]
     test=args.test_binary.resolve(strict=True);host=args.host_binary.resolve(strict=True);broker=args.broker_binary.resolve(strict=True)
     if test.parent!=repo/"target/debug/deps" or not re.fullmatch(r"freshell_server-[a-f0-9]{16}",test.name) or host!=repo/"target/debug/freshell-session-host" or broker!=repo/"target/managed-provider-launch-broker.mjs" or not args.receipt_dir.is_dir():
         raise RuntimeError("closed startup requires this worktree's exact compiled artifacts and existing receipts")
-    listing=subprocess.run([str(test),"--exact",TEST,"--list"],env={"PATH":"/usr/bin:/bin"},text=True,capture_output=True,timeout=20,check=True)
-    if f"{TEST}: test" not in listing.stdout.splitlines():
+    listing=subprocess.run([str(test),"--exact",selected_test,"--list"],env={"PATH":"/usr/bin:/bin"},text=True,capture_output=True,timeout=20,check=True)
+    if f"{selected_test}: test" not in listing.stdout.splitlines():
         raise RuntimeError("closed startup compiled test is missing")
     info=json.loads(docker("info","--format","{{json .}}").stdout)
     if "name=rootless" not in info["SecurityOptions"] or docker("image","inspect","--format","{{.Id}}",IMAGE).stdout.strip()!=IMAGE:
@@ -42,7 +45,7 @@ def main():
     if not endpoint.startswith("unix://"):
         raise RuntimeError("closed startup requires the existing local rootless daemon IPC")
     run="freshell-launch-"+uuid.uuid4().hex;installation=str(uuid.uuid4());owned=[]
-    receipt={"runId":run,"image":IMAGE,"test":TEST,"rootless":True,"testArtifactSha256":digest(test),"hostArtifactSha256":digest(host),"brokerArtifactSha256":digest(broker)}
+    receipt={"runId":run,"image":IMAGE,"test":selected_test,"provider":args.provider,"rootless":True,"testArtifactSha256":digest(test),"hostArtifactSha256":digest(host),"brokerArtifactSha256":digest(broker)}
     volumes=set()
     def remove(name):
         result=docker("container","inspect",name,check=False)
@@ -80,22 +83,23 @@ def main():
             for name in ["workspace","source-home/.config/opencode","grants","handoff","tmp","scenarios"]:
                 (root/name).mkdir(parents=True,exist_ok=True)
             initial=[]
-            for soul in ["soul-terminal-"+hashlib.sha256(b"closed-native-terminal-create").hexdigest()[:32],"soul-fresh-opencode-"+hashlib.sha256(b"closed-native-fresh-create").hexdigest()[:32]]:
+            for soul in ["soul-terminal-"+hashlib.sha256(b"closed-native-terminal-create").hexdigest()[:32],"soul-fresh-"+args.provider+"-"+hashlib.sha256(b"closed-native-fresh-create").hexdigest()[:32]]:
                 volume="freshell-provider-"+hashlib.sha256((installation+"\0"+soul).encode()).hexdigest()[:24]
                 volumes.add(volume)
                 initial.append({"installationId":installation,"soulId":soul,"providerVolumeName":volume,"imageRef":IMAGE,"hostBinaryPath":str(host),"binarySha256":digest(host),"daemonId":info["ID"]})
-            (root/"broker-configuration.json").write_text(json.dumps({"imageRef":IMAGE,"hostBinaryPath":str(host),"runId":run,"initialVolumes":initial}))
+            (root/"broker-configuration.json").write_text(json.dumps({"imageRef":IMAGE,"hostBinaryPath":str(host),"runId":run,"provider":args.provider,"initialVolumes":initial}))
             setup=run+"-dependencies"
             # Install the actual exact published SDK tree into synthetic config
             # storage. No read-only install bypass, fake SDK or model call.
-            create(setup,"--network","bridge","--user","0:0","--cap-drop","ALL",
-                   "--mount",f"type=bind,src={root},dst={root}","--tmpfs","/tmp:rw,nosuid,nodev,size=128m",
-                   "--env",f"HOME={root}/source-home","--entrypoint","/usr/local/bin/npm",IMAGE,
-                   "install","--prefix",str(root/"source-home/.config/opencode"),"@opencode-ai/plugin@1.18.21")
-            outcome=docker("start","--attach",setup,check=False)
-            if outcome.returncode:
-                raise RuntimeError("closed startup actual SDK dependency preparation failed")
-            remove(setup)
+            if args.provider=="opencode":
+                create(setup,"--network","bridge","--user","0:0","--cap-drop","ALL",
+                       "--mount",f"type=bind,src={root},dst={root}","--tmpfs","/tmp:rw,nosuid,nodev,size=128m",
+                       "--env",f"HOME={root}/source-home","--entrypoint","/usr/local/bin/npm",IMAGE,
+                       "install","--prefix",str(root/"source-home/.config/opencode"),"@opencode-ai/plugin@1.18.21")
+                outcome=docker("start","--attach",setup,check=False)
+                if outcome.returncode:
+                    raise RuntimeError("closed startup actual SDK dependency preparation failed")
+                remove(setup)
             writable=run+"-workspace-mode"
             create(writable,"--network","none","--user","0:0","--cap-drop","ALL",
                    "--mount",f"type=bind,src={root},dst={root}","--entrypoint","/usr/bin/chmod",IMAGE,
@@ -157,7 +161,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE={root}/grants/environment.env",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE={root}/grants/auth.json",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE={root}/grants/ca.pem",
-                   "--entrypoint","/runtime/startup-tests",IMAGE,"--exact",TEST,"--nocapture","--test-threads","1")
+                   "--entrypoint","/runtime/startup-tests",IMAGE,"--exact",selected_test,"--nocapture","--test-threads","1")
             docker("start",controller)
             controller_metadata=json.loads(docker("container","inspect",controller).stdout)[0]
             gateway=controller_metadata["NetworkSettings"]["Networks"]["bridge"]["IPAddress"]
@@ -170,9 +174,9 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
             receipt["exitCode"]=exit_code
             receipt["consumedRoutes"]=[json.loads(line.split("provider_launch_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_launch_consumer " in line]
             print(outcome.stdout,end="",flush=True);print(outcome.stderr,end="",flush=True)
-            expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")}
+            expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")} if args.provider=="opencode" else {("codex","terminal"),("codex","fresh")}
             observed_routes={(item.get("provider"),item.get("route")) for item in receipt["consumedRoutes"]}
-            if exit_code==0 and (len(receipt["consumedRoutes"])!=3 or observed_routes!=expected_routes or "test result: ok. 1 passed;" not in outcome.stdout):
+            if exit_code==0 and (len(receipt["consumedRoutes"])!=len(expected_routes) or observed_routes!=expected_routes or "test result: ok. 1 passed;" not in outcome.stdout):
                 receipt["exitCode"]=2;receipt["failureClass"]="native_startup_count_mismatch"
             (root/"broker-complete").write_text("ok")
             deadline=time.monotonic()+10
@@ -208,7 +212,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                                 "freshell.input.reservation":prepared["initialAuthReservation"],"freshell.input.incarnation":prepared["incarnationId"],
                                 "freshell.input.intent":"1","freshell.input.daemon":source["daemonId"],"freshell.input.image":IMAGE,
                                 "freshell.input.binary-sha256":source["binarySha256"]}
-                    elif prepared.get("indexedFiles",{}).get("volumeName")==volume:
+                    elif (prepared.get("indexedFiles") or {}).get("volumeName")==volume:
                         labels={"com.freshell.managed-inputs":"true","com.freshell.installation-id":installation,
                                 "com.freshell.soul-id":prepared["soulId"],"com.freshell.incarnation-id":prepared["incarnationId"],
                                 "com.freshell.input-generation":prepared["generationId"]}
@@ -216,7 +220,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                     raise RuntimeError("closed startup volume cleanup ownership changed")
                 docker("volume","rm",volume)
             receipt["ownedCleanup"]=all(docker("container","inspect",name,check=False).returncode!=0 for name in owned) and all(docker("volume","inspect",volume,check=False).returncode!=0 for volume in volumes)
-            (args.receipt_dir/"task002-native-opencode-launch.json").write_text(json.dumps(receipt,sort_keys=True)+"\n")
+            (args.receipt_dir/f"task002-native-{args.provider}-launch.json").write_text(json.dumps(receipt,sort_keys=True)+"\n")
             # Rename back so TemporaryDirectory removes only its owned scratch.
             root.rename(temporary)
     if not receipt.get("ownedCleanup"):
