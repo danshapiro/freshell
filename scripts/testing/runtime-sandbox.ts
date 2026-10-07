@@ -2985,9 +2985,9 @@ export class ManagedRuntimeOwner {
         && row.soulId === handle.soulId && row.incarnationId === handle.incarnationId)) {
       throw new Error('writer observation requires an exact owned address')
     }
-    const rows = (await this.inventory()).filter(row => row.soulId === handle.soulId)
-    const row = rows[0]
-    if (rows.length !== 1 || !row.provider || row.incarnationId !== handle.incarnationId
+    const matchingRows = (await this.inventory()).filter(row => row.soulId === handle.soulId && row.incarnationId === handle.incarnationId)
+    const row = matchingRows[0]
+    if (matchingRows.length !== 1 || !row.provider || row.incarnationId !== handle.incarnationId
       || row.containerId !== handle.containerId || row.hostBootId !== handle.hostBootId
       || row.nativeSessionId !== handle.nativeSessionId) throw new Error('writer address is not the current owned incarnation and root')
     return this.qualificationWriterClaim({ provider: row.provider, nativeSessionId: row.nativeSessionId,

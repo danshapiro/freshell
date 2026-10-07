@@ -784,6 +784,30 @@ describe('current handle admission before owner mutation', () => {
     await expect(rig.providerVolumeFacts(current)).resolves.toEqual({ providerVolumeName: 'volume-owned' })
     await expect(rig.providerVolumeFacts({ ...current, nativeSessionId: 'foreign-root' })).rejects.toThrow(/current/)
   })
+  it('queries only the exact writer incarnation while retaining its stopped zero-claim observation', async () => {
+    const { rig, current, row } = rigFixture()
+    const prior = { ...row, incarnationId: 'prior-incarnation', containerId: 'c'.repeat(64), hostBootId: 'prior-boot',
+      launchState: 'stopped', provider: 'claude' }
+    const inventory = vi.mocked(rig.inventory).mockResolvedValue([prior, row])
+    const facts = { provider: row.provider, providerStoreId: 'owned-store', nativeSessionId: current.nativeSessionId,
+      soulId: current.soulId, incarnationId: current.incarnationId, activeClaimCount: 1, globalConflictingClaimCount: 0 }
+    const claim = vi.spyOn(rig, 'qualificationWriterClaim').mockResolvedValue(facts)
+    await expect(rig.writerClaimFacts(current)).resolves.toEqual(facts)
+    expect(claim).toHaveBeenCalledExactlyOnceWith({ provider: row.provider, nativeSessionId: current.nativeSessionId,
+      soulId: current.soulId, incarnationId: current.incarnationId })
+    row.launchState = 'stopped'
+    claim.mockResolvedValue({ ...facts, activeClaimCount: 0 })
+    await expect(rig.writerClaimFacts(current)).resolves.toMatchObject({ activeClaimCount: 0 })
+    claim.mockClear()
+    for (const changed of [{ hostBootId: 'foreign-boot' }, { nativeSessionId: 'foreign-root' },
+      { runId: 'foreign-run' }, { candidateSha: 'f'.repeat(40) }]) {
+      await expect(rig.writerClaimFacts({ ...current, ...changed })).rejects.toThrow(/writer|owned|root/)
+    }
+    expect(claim).not.toHaveBeenCalled()
+    inventory.mockResolvedValue([prior, row, row])
+    await expect(rig.writerClaimFacts(current)).rejects.toThrow(/writer|current/)
+    expect(claim).not.toHaveBeenCalled()
+  })
   it('observes and crashes the registered fixture worker using owner-derived PID only', async () => {
     const { rig, current } = rigFixture()
     const read = vi.spyOn(rig.runtime, 'execOwnedContainerExact').mockReturnValue('PID COMMAND\n42 node fresh-agent-fixture-worker.mjs --provider codex\n')
