@@ -6,7 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, nativeCheckpointTranscriptRetained, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -264,6 +264,26 @@ describe('original native checkpoint byte continuity (fixtures do not qualify pr
   const snapshot = (raw: Buffer, device = '2065', inode = '42') => ({ nativeRoot: root,
     transcript: { bytesBase64: raw.toString('base64'), sha256: createHash('sha256').update(raw).digest('hex'),
       completeEof: raw.at(-1) === 10, identity: [device, inode, String(raw.length)] } })
+  it('recognizes two actual native tool rows sharing one model message without combining unrelated turns', () => {
+    const commands = ['first independent command', 'second independent command']
+    const row = (command: string, id: string, messageId = 'msg_actual_batch', name = 'Bash') => ({
+      type: 'assistant', sessionId: root, message: { id: messageId,
+        content: [{ type: 'tool_use', id, name, input: { command } }] } })
+    const native = (rows: unknown[]) => snapshot(Buffer.from(rows.map((r) => JSON.stringify(r)).join('\n') + '\n'))
+    const first = row(commands[0]!, 'toolu_first1'); const second = row(commands[1]!, 'toolu_second1')
+    expect(nativeTwoToolBatchMatches(native([first, second]), commands)).toBe(true)
+    expect(nativeTwoToolBatchMatches(native([{ ...first, message: { ...first.message,
+      content: [...first.message.content, ...second.message.content] } }]), commands)).toBe(true)
+    expect(nativeTwoToolBatchMatches(native([first, row(commands[1]!, 'toolu_second1', 'msg_next_turn')]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, row(commands[0]!, 'toolu_second1')]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, row(commands[1]!, 'toolu_first1')]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, row(commands[1]!, 'toolu_second1', '', 'Bash')]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, row(commands[1]!, 'toolu_second1', 'msg_actual_batch', 'Read')]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, { ...second, sessionId: 'other-root' }]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches({ ...native([first, second]), transcript: {
+      ...native([first, second]).transcript, sha256: 'f'.repeat(64) } }, commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, second]), [commands[0]!, commands[0]!])).toBe(false)
+  })
   const lifecycle = Buffer.from(JSON.stringify({ type: 'queue-operation', operation: 'enqueue', sessionId: root }) + '\n'
     + JSON.stringify({ type: 'attachment', sessionId: root, attachment: { type: 'hook_success' } }) + '\n')
   it('retains the original EOF bytes and inode when native resume appends only lifecycle rows', () => {

@@ -97,6 +97,27 @@ export function nativeCheckpointTranscriptRetained(before: NativeCheckpointSnaps
   } catch { return false }
 }
 
+export function nativeTwoToolBatchMatches(snapshot: NativeCheckpointSnapshot, commands: readonly string[]): boolean {
+  try {
+    const distinctCommands = new Set(commands)
+    if (!snapshot.nativeRoot || !snapshot.transcript.completeEof || commands.length !== 2 || distinctCommands.size !== 2) return false
+    const bytes = Buffer.from(snapshot.transcript.bytesBase64, 'base64')
+    if (bytes.at(-1) !== 10 || createHash('sha256').update(bytes).digest('hex') !== snapshot.transcript.sha256) return false
+    const batches = new Map<string, any[]>()
+    for (const row of bytes.toString('utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))) {
+      if (row.type !== 'assistant') continue
+      const tools = (Array.isArray(row.message?.content) ? row.message.content : []).filter((part: any) => part.type === 'tool_use')
+      if (!tools.length) continue
+      if (row.sessionId !== snapshot.nativeRoot || typeof row.message.id !== 'string' || !row.message.id
+        || tools.some((tool: any) => typeof tool.id !== 'string' || !tool.id)) return false
+      batches.set(row.message.id, [...(batches.get(row.message.id) ?? []), ...tools])
+    }
+    return [...batches.values()].some((tools) => tools.length === 2 && new Set(tools.map((tool) => tool.id)).size === 2
+      && tools.every((tool) => tool.name === 'Bash' && distinctCommands.has(tool.input?.command))
+      && new Set(tools.map((tool) => tool.input.command)).size === 2)
+  } catch { return false }
+}
+
 type AmplifierProfileSnapshot = { nativeCwd: string; nativeSettingsSha256: string;
   profileFiles: { relative: string; sha256: string | null; bytesBase64?: string | null }[] }
 export function amplifierNativeProfileRetained(before: AmplifierProfileSnapshot,
@@ -570,14 +591,16 @@ async function executeManagedNativeApproval(input: {
 }): Promise<{ name: string; pass: boolean }[]> {
   const { harness, supervisor, soulId, workspace, view, scenario, inspect } = input
   const effectPath = path.join(workspace, 'owned-native-effect.jsonl')
-  if (fs.existsSync(effectPath)) throw new Error('native effect oracle must be new')
+  const effectPaths = input.decision === 'multiple-tools' ? [effectPath, path.join(workspace, 'second-owned-native-effect.jsonl')] : [effectPath]
+  if (effectPaths.some((file) => fs.existsSync(file))) throw new Error('native effect oracle must be new')
   const command = `printf 'effect\\n' >> '${effectPath}'`
-  const effectCount = () => {
-    if (!fs.existsSync(effectPath)) return 0
-    const bytes = fs.readFileSync(effectPath, 'utf8')
+  const commands = effectPaths.map((file) => `printf 'effect\\n' >> '${file}'`)
+  const effectCount = () => effectPaths.reduce((count, file) => {
+    if (!fs.existsSync(file)) return count
+    const bytes = fs.readFileSync(file, 'utf8')
     if (!/^(effect\n)+$/.test(bytes)) throw new Error('native effect oracle contains unexpected bytes')
-    return bytes.split('\n').length - 1
-  }
+    return count + bytes.split('\n').length - 1
+  }, 0)
   let cursor = 0
   const batches: unknown[] = []
   const observed: any[] = []
@@ -592,6 +615,9 @@ async function executeManagedNativeApproval(input: {
       observed.push(...events)
       const found = events.find(select)
       if (found) return found
+      if (events.some((event: any) => event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.result')) {
+        throw new Error(`native turn completed without required ${label}`)
+      }
       await new Promise((resolve) => setTimeout(resolve, 100))
     }
     throw new Error(`bounded native ${label} deadline exceeded`)
@@ -600,7 +626,7 @@ async function executeManagedNativeApproval(input: {
   harness.writeArtifact(`${scenario}-operation.json`, { command, effectPath })
   await harness.adminOk(supervisor, { method: 'fresh_agent_send', params: { soulId,
     text: input.decision === 'multiple-tools'
-      ? `Issue exactly two Bash tool calls together in ONE parallel assistant tool batch, BOTH using this exact command: ${command}. Do not run sequential calls, do not use other tools, and wait for approval.`
+      ? `Run these two independent harmless Bash commands in parallel, using one Bash tool call for each command: ${commands[0]} and ${commands[1]}. Send both tool calls together in the same assistant message. Do not combine commands, ask questions, or use other tools. After both results, reply done.`
       : `Use the Bash tool exactly once with this exact command: ${command}. Do not use other tools or another command. After its result, reply done.` } })
   if (['crash-before-checkpoint', 'multiple-tools', 'effect-before-observation'].includes(input.decision)) {
     let originalOperation: any
@@ -613,12 +639,15 @@ async function executeManagedNativeApproval(input: {
         throw new Error('real native pre-checkpoint hook did not park the intended operation')
       }
     } else if (input.decision === 'multiple-tools') {
-      originalOperation = await wait((event) => event.kind === 'provider'
-        && event.data.payload.event?.type === 'freshAgent.assistant'
-        && event.data.payload.event.content?.filter((part: any) => part.type === 'tool_use').length === 2, 'actual two-tool native batch')
-      const tools = originalOperation.data.payload.event.content.filter((part: any) => part.type === 'tool_use')
-      if (tools.some((tool: any) => tool.name !== 'Bash' || tool.input.command !== command)) throw new Error('actual native multi-tool batch differs')
-      await wait((event) => event.kind === 'permission_requested' && !event.data.payload.nativeCheckpoint, 'ordinary native multi-tool permission')
+      originalOperation = await wait((event) => event.kind === 'permission_requested'
+        && !event.data.payload.nativeCheckpoint, 'ordinary native multi-tool permission')
+      const deadline = Date.now() + 3_000
+      let native = await inspect(view.containerId, 'actual-two-tool-batch', true)
+      while (!nativeTwoToolBatchMatches(native, commands) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        native = await inspect(view.containerId, 'actual-two-tool-batch', true)
+      }
+      if (!nativeTwoToolBatchMatches(native, commands)) throw new Error('actual native multi-tool batch differs')
     } else {
       originalOperation = (await wait((event) => event.kind === 'provider'
         && event.data.payload.event?.type === 'freshAgent.result', 'ordinary native allow-policy result')).data.payload.event
