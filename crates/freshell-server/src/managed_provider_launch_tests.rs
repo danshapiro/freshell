@@ -283,7 +283,8 @@ let result={};if(message.method==='initialize'){
  const authenticated=await new Promise(resolve=>{if(!endpoint||!token)return resolve(false);const req=http.request(new URL('/api/mcp',endpoint),{method:'POST',headers:{'x-auth-token':token}},res=>{res.resume();resolve(res.statusCode===200)});req.on('error',()=>resolve(false));req.end('{}')});
  const nativeArgv=fs.readFileSync('/proc/'+process.ppid+'/cmdline','utf8').split('\0');
  const retainedMcpRecipe=nativeArgv.includes('mcp_servers.freshell.command="node"')&&nativeArgv.includes('mcp_servers.freshell.args=["/opt/freshell-mcp/server.js"]')&&nativeArgv.some(arg=>arg.startsWith('mcp_servers.freshell.env_vars='));
- const record={physicalHome:process.env.HOME,initialized:true,authenticated,retainedMcpRecipe,scopedAlias:process.env.FRESHELL==='1',endpointPresent:!!endpoint,tokenPresent:!!token,
+ const policy=JSON.parse(require('node:child_process').execFileSync('codex',['execpolicy','check','--rules',path.join(process.env.CODEX_HOME,'rules/probe.rules'),'closed-fixture-never-run'],{encoding:'utf8'}));
+ const record={globalInstructions:digest(fs.readFileSync(path.join(process.env.CODEX_HOME,'AGENTS.md'))),nativeRuleForbidden:policy.decision==='forbidden',physicalHome:process.env.HOME,initialized:true,authenticated,retainedMcpRecipe,scopedAlias:process.env.FRESHELL==='1',endpointPresent:!!endpoint,tokenPresent:!!token,
    user:digest(fs.readFileSync(path.join(process.env.CODEX_HOME,'user.md'))),project:digest(fs.readFileSync(path.join(process.cwd(),'.codex/project.md'))),
    role:digest(fs.readFileSync(path.join(process.cwd(),'.codex/agents/role.md'))),skill:digest(fs.readFileSync(path.join(__dirname,'../SKILL.md'))),
    resource:digest(require('node:child_process').execFileSync(path.join(__dirname,'run'))),dependency:digest(require('probe-dependency'))};
@@ -292,6 +293,13 @@ let result={};if(message.method==='initialize'){
 process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\n');});
 "#;
     std::fs::write(skill.join("scripts/server.cjs"), server).unwrap();
+    std::fs::create_dir_all(home.join(".codex/rules")).unwrap();
+    std::fs::write(home.join(".codex/AGENTS.md"), b"closed-global-instructions").unwrap();
+    std::fs::write(
+        home.join(".codex/rules/probe.rules"),
+        "prefix_rule(pattern=['closed-fixture-never-run'], decision='forbidden')\n",
+    )
+    .unwrap();
     let config = format!("model='synthetic-model'\nmodel_provider='fixture'\nmodel_instructions_file='./user.md'\n[model_providers.fixture]\nname='Closed fixture'\nbase_url='http://127.0.0.1:9'\nwire_api='responses'\nrequires_openai_auth=false\n[projects.{}]\ntrust_level='trusted'\n[mcp_servers.probe]\ncommand='node'\nenv_vars=['FRESHELL_URL','FRESHELL_TOKEN','FRESHELL','CODEX_HOME']\nargs=[{},{}]\n", serde_json::to_string(workspace.to_str().unwrap()).unwrap(), serde_json::to_string(skill.join("scripts/server.cjs").to_str().unwrap()).unwrap(), serde_json::to_string(receipt.to_str().unwrap()).unwrap());
     std::fs::write(home.join(".codex/config.toml"), &config).unwrap();
     std::fs::write(home.join(".codex/user.md"), b"closed-user-input").unwrap();
@@ -435,7 +443,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\n');
         .map_err(|_| "native Codex must initialize its configured MCP consumer")
     }
     let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-    let expected = json!({"physicalHome":"/home/freshell/provider","initialized":true,"authenticated":true,"retainedMcpRecipe":true,"scopedAlias":true,"endpointPresent":true,"tokenPresent":true,"user":hash(b"closed-user-input"),"project":hash(b"closed-project-input"),"role":hash(b"closed-role-input"),"skill":hash(std::fs::read(skill.join("SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-codex-resource"),"dependency":hash(b"closed-codex-dependency")});
+    let expected = json!({"globalInstructions":hash(b"closed-global-instructions"),"nativeRuleForbidden":true,"physicalHome":"/home/freshell/provider","initialized":true,"authenticated":true,"retainedMcpRecipe":true,"scopedAlias":true,"endpointPresent":true,"tokenPresent":true,"user":hash(b"closed-user-input"),"project":hash(b"closed-project-input"),"role":hash(b"closed-role-input"),"skill":hash(std::fs::read(skill.join("SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-codex-resource"),"dependency":hash(b"closed-codex-dependency")});
     let consumed_terminal = consumed(&receipt).await;
     if consumed_terminal.is_err() {
         let output = client

@@ -472,6 +472,8 @@ pub fn discover(
     directories.reverse();
     let mut resources = Vec::new();
     for path in [
+        manifest.codex_home.join("AGENTS.md"),
+        manifest.codex_home.join("rules"),
         manifest.codex_home.join("skills"),
         manifest.original_home.join(".agents/skills"),
     ] {
