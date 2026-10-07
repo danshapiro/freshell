@@ -83,6 +83,11 @@ export async function dispatchNativeFeasibility(input: {
     input.selection.mode ?? input.selection.provider!, '--case', input.selection.case])
   const originals: NativeExperimentOriginal[] = []
   const failures: string[] = []
+  const requiredAssertions = input.selection.case === 'native-turn' ? [
+    'readable-completed-native-store-before-death', 'replacement-new-incarnation-same-native-root',
+    'original-owned-volume-transcript-continuity', 'same-workspace-selected-native-profile',
+    'actual-restored-context-private-marker-recall', 'native-turns-requested-no-tools',
+  ] : []
   try {
     for (const caseId of nativeFeasibilityCases(input.selection)) {
       try {
@@ -92,7 +97,8 @@ export async function dispatchNativeFeasibility(input: {
           || original.imageDigest !== input.imageDigest || original.candidateSha !== input.candidateSha
           || !original.nativeVersion || !/^[a-f0-9]{64}$/.test(original.executableSha256)
           || !/^[a-f0-9]{64}$/.test(original.profileSha256) || original.artifactReferences.length === 0
-          || original.assertions.length === 0 || original.assertions.some((assertion) => !assertion.pass)) {
+          || original.assertions.length === 0 || original.assertions.some((assertion) => !assertion.pass)
+          || requiredAssertions.some((name) => !original.assertions.some((assertion) => assertion.name === name && assertion.pass))) {
           failures.push(caseId)
         }
       } catch {
@@ -148,7 +154,7 @@ async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string): Promise<NativeExperimentOriginal> {
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
-    || !['create', 'current-native-turn'].includes(caseId)) {
+    || !['create', 'current-native-turn', 'allow', 'deny'].includes(caseId)) {
     throw new Error(`actual native case has no qualified execution path: ${selection.mode ?? selection.provider}/${caseId}`)
   }
   const mode = selection.mode!
@@ -177,6 +183,9 @@ async function executeManagedNativeCase(harness: RuntimeHarness,
   harness.writeArtifact(`${scenario}-launch.json`, launch)
   const view = launch.data.view
   const observation = view.nativeIdentityObservation
+  const assertions: { name: string; pass: boolean }[] = [{ name: 'actual-current-native-observation-before-input',
+    pass: view.recoveryState === 'live' && !!observation && observation.nativeSessionId === view.nativeSessionId
+      && observation.incarnationId === view.incarnationId && observation.source === 'fresh_provider_handshake' }]
   if (view.recoveryState !== 'live' || !observation || observation.nativeSessionId !== view.nativeSessionId
     || observation.incarnationId !== view.incarnationId || observation.source !== 'fresh_provider_handshake') {
     throw new Error('current managed native startup observation missing')
@@ -204,11 +213,13 @@ async function executeManagedNativeCase(harness: RuntimeHarness,
       const receipt = await harness.adminOk(supervisor, { method: 'fresh_agent_send', params: { soulId, text } })
       harness.writeArtifact(`${scenario}-${label}-dispatch.json`, receipt)
       const events: any[] = []
+      const batches: unknown[] = []
       const deadline = Date.now() + 90_000
       while (Date.now() < deadline) {
         const batch = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events',
           params: { soulId, afterSequence: cursor, maxEvents: 100 } })
-        harness.writeArtifact(`${scenario}-${label}-events-private.json`, [...events, ...batch.data.events])
+        batches.push(batch)
+        harness.writeArtifact(`${scenario}-${label}-events-private.json`, batches)
         for (const row of batch.data.events) {
           cursor = Math.max(cursor, row.sequence)
           const event = row.event?.data?.payload?.event
@@ -242,16 +253,122 @@ async function executeManagedNativeCase(harness: RuntimeHarness,
     const text = recalled.flatMap((event) => event.content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('').trim()
     if (text !== marker) throw new Error('native restored context did not recall the private marker')
     if (recalled.some((event) => (event.content ?? []).some((part: any) => part.type === 'tool_use'))) throw new Error('native recall unexpectedly requested a tool')
+    assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
+      { name: 'replacement-new-incarnation-same-native-root', pass: recovery.data.outcome === 'replaced'
+        && recovery.data.view.incarnationId !== view.incarnationId && recovery.data.view.nativeSessionId === view.nativeSessionId
+        && recovery.data.view.nativeIdentityObservation.nativeSessionId === view.nativeSessionId },
+      { name: 'original-owned-volume-transcript-continuity', pass: before.transcript.sha256 === after.transcript.sha256
+        && before.transcript.identity[0] === after.transcript.identity[0] && before.transcript.identity[1] === after.transcript.identity[1] },
+      { name: 'same-workspace-selected-native-profile', pass: JSON.stringify(before.profileFiles) === JSON.stringify(after.profileFiles) },
+      { name: 'actual-restored-context-private-marker-recall', pass: text === marker },
+      { name: 'native-turns-requested-no-tools', pass: ![...seedEvents, ...recalled].some((event) =>
+        (event.content ?? []).some((part: any) => part.type === 'tool_use')) })
+  }
+  if (selection.case === 'approval-checkpoint' && ['allow', 'deny'].includes(caseId)) {
+    assertions.push(...await executeManagedNativeApproval({ harness, supervisor, soulId, workspace,
+      view, scenario, decision: caseId, inspect }))
   }
   const profileSha256 = createHash('sha256').update(JSON.stringify({ settings, nativeProfile: namespace.profileFiles })).digest('hex')
   const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha,
     imageDigest: harness.imageRef, nativeVersion: namespace.version, executableSha256: namespace.executableSha256,
     profileSha256, artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace.json`],
-    assertions: [{ name: 'actual-current-native-observation-before-input',
-      pass: observation.nativeSessionId === view.nativeSessionId && observation.incarnationId === view.incarnationId
-        && observation.source === 'fresh_provider_handshake' && view.recoveryState === 'live' }] }
+    assertions }
   harness.writeArtifact(`${scenario}-original.json`, original)
   return original
+}
+
+async function executeManagedNativeApproval(input: {
+  harness: RuntimeHarness; supervisor: any; soulId: string; workspace: string; view: any; scenario: string
+  decision: string; inspect: (containerId: string, label: string, requireTranscript: boolean) => Promise<any>
+}): Promise<{ name: string; pass: boolean }[]> {
+  const { harness, supervisor, soulId, workspace, view, scenario, inspect } = input
+  const effectPath = path.join(workspace, 'owned-native-effect.jsonl')
+  if (fs.existsSync(effectPath)) throw new Error('native effect oracle must be new')
+  const command = `printf 'effect\\n' >> '${effectPath}'`
+  const effectCount = () => {
+    if (!fs.existsSync(effectPath)) return 0
+    const bytes = fs.readFileSync(effectPath, 'utf8')
+    if (!/^(effect\n)+$/.test(bytes)) throw new Error('native effect oracle contains unexpected bytes')
+    return bytes.split('\n').length - 1
+  }
+  let cursor = 0
+  const batches: unknown[] = []
+  const observed: any[] = []
+  const wait = async (select: (event: any) => boolean, label: string) => {
+    const deadline = Date.now() + 90_000
+    while (Date.now() < deadline) {
+      const batch = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events',
+        params: { soulId, afterSequence: cursor, maxEvents: 128 } })
+      batches.push(batch); cursor = batch.data.head
+      harness.writeArtifact(`${scenario}-approval-events-private.json`, batches)
+      const events = batch.data.events.map((row: any) => row.event)
+      observed.push(...events)
+      const found = events.find(select)
+      if (found) return found
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    throw new Error(`bounded native ${label} deadline exceeded`)
+  }
+  const isCard = (event: any) => event.kind === 'permission_requested' && !!event.data.payload.nativeCheckpoint
+  harness.writeArtifact(`${scenario}-operation.json`, { command, effectPath })
+  await harness.adminOk(supervisor, { method: 'fresh_agent_send', params: { soulId,
+    text: `Use the Bash tool exactly once with this exact command: ${command}. Do not use other tools or another command. After its result, reply done.` } })
+  const old = (await wait(isCard, 'durable checkpoint/current ask')).data
+  harness.writeArtifact(`${scenario}-old-card-private.json`, old)
+  const oldPayload = old.payload
+  if (oldPayload.tool?.name !== 'Bash' || oldPayload.tool.input?.command !== command
+    || oldPayload.nativeCheckpoint.nativeSessionId !== view.nativeSessionId
+    || oldPayload.nativeCheckpoint.toolUseID !== oldPayload.toolUseID || effectCount() !== 0) {
+    throw new Error('original native solo checkpoint/effect oracle differs')
+  }
+  const before = await inspect(view.containerId, 'checkpoint-before-death', true)
+  const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
+  harness.writeArtifact(`${scenario}-approval-store-probe.json`, probe)
+  if (probe.data.kind !== 'reattach_ready') throw new Error('native checkpoint store not readable before death')
+  await harness.killOwnedRuntimeExact(view.containerId)
+  await harness.waitForContainerExit(view.containerId)
+  const recovery = await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+  harness.writeArtifact(`${scenario}-approval-recovery.json`, recovery)
+  const currentView = recovery.data.view
+  if (recovery.data.outcome !== 'replaced' || currentView.incarnationId === view.incarnationId
+    || currentView.nativeSessionId !== view.nativeSessionId || currentView.recoveryState !== 'live'
+    || currentView.nativeIdentityObservation?.nativeSessionId !== view.nativeSessionId) throw new Error('native approval replacement not currently live on same root')
+  const current = (await wait(isCard, 'rebound current native ask')).data
+  harness.writeArtifact(`${scenario}-current-card-private.json`, current)
+  const currentPayload = current.payload
+  if (current.decision_id !== old.decision_id || currentPayload.nativeRequestId === oldPayload.nativeRequestId
+    || JSON.stringify(currentPayload.nativeCheckpoint) !== JSON.stringify(oldPayload.nativeCheckpoint)
+    || currentPayload.nativeBinding?.launch.incarnationId !== currentView.incarnationId
+    || effectCount() !== 0) throw new Error('same native operation did not rebind to a fresh current request')
+  const after = await inspect(currentView.containerId, 'checkpoint-after-death', true)
+  if (before.transcript.sha256 !== after.transcript.sha256
+    || before.transcript.identity[0] !== after.transcript.identity[0]
+    || before.transcript.identity[1] !== after.transcript.identity[1]) throw new Error('original native checkpoint changed across owned enclosure death')
+  const decision = input.decision === 'allow' ? { behavior: 'allow', updatedInput: currentPayload.tool.input }
+    : { behavior: 'deny', message: 'Denied this original owned operation' }
+  const receipt = await harness.adminOk(supervisor, harness.freshAgentResolveBody(soulId, current.decision_id, decision))
+  harness.writeArtifact(`${scenario}-approval-dispatch.json`, receipt)
+  const result = (await wait((event) => event.kind === 'provider'
+    && event.data.payload.event?.type === 'freshAgent.result', 'native completion')).data.payload.event
+  const toolResults = observed.filter((event) => event.kind === 'provider'
+    && event.data.payload.event?.type === 'freshAgent.tool.result').flatMap((event) => event.data.payload.event.content ?? [])
+  const toolResult = toolResults.find((part: any) => part.tool_use_id === oldPayload.toolUseID)
+  const count = effectCount()
+  harness.writeArtifact(`${scenario}-approval-outcome.json`, { nativeRoot: result.nativeSessionId,
+    originalToolUseId: oldPayload.toolUseID, inputDigest: oldPayload.nativeCheckpoint.inputDigest,
+    oldNativeRequestId: oldPayload.nativeRequestId, currentNativeRequestId: currentPayload.nativeRequestId,
+    nativeToolResultIsError: toolResult?.is_error, nativeResultIsError: result.isError, effectCount: count })
+  if (result.nativeSessionId !== view.nativeSessionId || !toolResult
+    || toolResult.is_error !== (input.decision === 'deny') || count !== (input.decision === 'allow' ? 1 : 0)) {
+    throw new Error('correlated original native outcome/effect differs from decision')
+  }
+  return [{ name: 'same-native-operation-new-current-request-after-death',
+    pass: currentPayload.nativeRequestId !== oldPayload.nativeRequestId && current.decision_id === old.decision_id },
+    { name: 'native-checkpoint-original-volume-continuity', pass: before.transcript.sha256 === after.transcript.sha256
+      && before.transcript.identity[1] === after.transcript.identity[1] },
+    { name: 'correlated-native-tool-result', pass: toolResult.tool_use_id === oldPayload.toolUseID
+      && toolResult.is_error === (input.decision === 'deny') },
+    { name: 'independent-native-effect-count', pass: count === (input.decision === 'allow' ? 1 : 0) }]
 }
 
 // Reads the currently owned native child and its exact hook-selected transcript.

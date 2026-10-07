@@ -140,6 +140,15 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     expect(cleaned).toBe(true)
   })
 
+  it('refuses startup-only evidence for a native continuity turn', async () => {
+    let cleaned = false
+    await expect(dispatchNativeFeasibility({ selection: { mode: 'freshclaude', case: 'native-turn' },
+      imageDigest, candidateSha, ownerId, execute: async (caseId) => child(caseId),
+      cleanup: async () => { cleaned = true },
+    })).rejects.toThrow()
+    expect(cleaned).toBe(true)
+  })
+
   it.each(['failed-assertion', 'child-timeout', 'foreign-owner', 'incomplete-provenance'])(
     'refuses %s without reporting success and still cleans owned resources', async (fault) => {
       let cleaned = false
