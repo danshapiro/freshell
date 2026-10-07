@@ -247,13 +247,17 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   const workspace = path.join(harness.testRoot, scenario + '-workspace')
   fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
   if (caseId === 'crash-before-checkpoint' || caseId === 'effect-before-observation') {
-    const directory = path.join(workspace, '.claude'); fs.mkdirSync(directory, { mode: 0o770 })
+    const directory = path.join(workspace, '.claude'); fs.mkdirSync(directory, { mode: 0o770 }); fs.chmodSync(directory, 0o770)
     const settings = caseId === 'effect-before-observation' ? { permissions: { allow: ['Bash'] } }
       : { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command',
         command: `python3 '${path.join(directory, 'pause-before-checkpoint.py')}' '${path.join(workspace, 'native-before-checkpoint.json')}'`, timeout: 60 }] }] } }
-    if (caseId === 'crash-before-checkpoint') fs.writeFileSync(path.join(directory, 'pause-before-checkpoint.py'),
-      "import sys,json,pathlib,time\nvalue=json.load(sys.stdin)\np=pathlib.Path(sys.argv[1])\np.write_text(json.dumps(value))\ntime.sleep(45)\nprint('{}')\n", { mode: 0o660 })
+    if (caseId === 'crash-before-checkpoint') {
+      const hook = path.join(directory, 'pause-before-checkpoint.py')
+      fs.writeFileSync(hook, "import sys,json,pathlib,time\nvalue=json.load(sys.stdin)\np=pathlib.Path(sys.argv[1])\np.write_text(json.dumps(value))\ntime.sleep(45)\nprint('{}')\n", { mode: 0o660 })
+      fs.chmodSync(hook, 0o660)
+    }
     fs.writeFileSync(path.join(directory, 'settings.json'), JSON.stringify(settings), { mode: 0o660 })
+    fs.chmodSync(path.join(directory, 'settings.json'), 0o660)
   }
   const soulId = 'soul-' + randomUUID()
   const storeId = 'store-' + randomUUID()
@@ -685,7 +689,9 @@ async function executeManagedNativeApproval(input: {
   if (sourceFault) {
     if (input.decision === 'changed-profile') {
       const directory = path.join(workspace, '.claude'); fs.mkdirSync(directory, { recursive: true, mode: 0o770 })
+      fs.chmodSync(directory, 0o770)
       fs.writeFileSync(path.join(directory, 'settings.json'), JSON.stringify({ permissions: { deny: ['Bash'] } }), { mode: 0o660 })
+      fs.chmodSync(path.join(directory, 'settings.json'), 0o660)
     } else {
       const mutation = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
         ['python3', '-c', claudeCheckpointSourceFault, before.hook.native.transcript_path,
