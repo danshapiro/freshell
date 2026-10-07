@@ -6,7 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, nativeCheckpointTranscriptRetained, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, nativeCheckpointTranscriptRetained, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -25,6 +25,23 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['changed-tool', 'missing-tool', 'changed-input', 'changed-profile', 'changed-root', 'stale-callback',
+    'crash-before-checkpoint', 'multiple-tools', 'effect-before-observation'])(
+    'dispatches %s through the managed native launch boundary', async (caseId) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-negative-route-'))
+      const launch = vi.fn(async (_supervisor: unknown, _body: any) => { throw new Error('controlled native launch boundary') })
+      const harness = { testRoot: directory, startSupervisor: async () => ({}),
+        writeArtifact: () => '', adminOk: launch } as unknown as RuntimeHarness
+      try {
+        await expect(executeManagedNativeCase(harness,
+          ['env_file', 'ca_file'].map((suffix) => ({ name: 'claude/grants/' + suffix,
+            path: path.join(directory, suffix), sha256: 'e'.repeat(64) })),
+          { mode: 'freshclaude', case: 'approval-checkpoint' }, caseId))
+          .rejects.toThrow('controlled native launch boundary')
+        expect(launch).toHaveBeenCalledOnce()
+        expect(launch.mock.calls[0]![1].params.freshAgent.sessionType).toBe('freshclaude')
+      } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+    })
   it('actual entrypoint prepares finite phase-one artifacts and joins cleanup on preparation failure', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-entry-unit-'))
     const manifest = path.join(directory, 'artifacts.json')
