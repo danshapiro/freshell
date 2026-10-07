@@ -29,6 +29,7 @@
     "test/unit/server/testing/runtime-soak-evidence.test.ts",
     "test/runtime/**/*.ts",
     "shared/**/*.ts",
-    "scripts/testing/task002-config-legacy-fixtures.ts"
+    "scripts/testing/task002-config-legacy-fixtures.ts",
+    "scripts/testing/task002-retained-fixture.ts"
   ]
 }

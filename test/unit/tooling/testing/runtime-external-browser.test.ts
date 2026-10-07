@@ -359,13 +359,32 @@ describe('owned web process lifetime (Node process fixture only)', () => {
     const fixture = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-owned-process-'))
     const entry = path.join(fixture, 'owned-server.cjs')
     const home = path.join(fixture, 'home')
-    await fsp.writeFile(entry, `require('node:http').createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({runtime:'rust',commit:'${'a'.repeat(40)}',buildDirty:false}))}).listen(Number(process.env.PORT),'127.0.0.1')`)
+    await fsp.writeFile(entry, `require('node:http').createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({runtime:'rust',commit:'${'a'.repeat(40)}',buildDirty:false,environmentKeys:Object.keys(process.env)}))}).listen(Number(process.env.PORT),'127.0.0.1')`)
     const setup = vi.fn(async (directory: string) => {
       await fsp.mkdir(path.join(directory, '.freshell'), { recursive: true })
       await fsp.writeFile(path.join(directory, '.freshell/config.json'), JSON.stringify({ version: 1, settings: {} }))
     })
     return { fixture, entry, home, setup }
   }
+  it('strips inherited provider environment after overrides while preserving owned controller references', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
+      candidateSha: 'a'.repeat(40), buildDirty: false, setupHome: setup, preserveHomeOnStop: false,
+      stripEnvPrefixes: ['OPENAI_', 'FRESHELL_MANAGED_CODEX_'], env: { NODE_OPTIONS: `--require=${entry}`,
+        OPENAI_UNIT_REFERENCE: 'synthetic-fixture-reference', FRESHELL_MANAGED_CODEX_UNIT_REFERENCE: 'synthetic-fixture-reference',
+        FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/unit/control.sock' } })
+    try {
+      const info = await server.start()
+      const response = await fetch(`${info.baseUrl}/api/server-info`, { headers: { 'x-auth-token': info.token } })
+      const observed = await response.json()
+      expect(observed.environmentKeys).not.toContain('OPENAI_UNIT_REFERENCE')
+      expect(observed.environmentKeys).not.toContain('FRESHELL_MANAGED_CODEX_UNIT_REFERENCE')
+      expect(observed.environmentKeys).toContain('FRESHELL_RUNTIME_CONTROL_SOCKET')
+    } finally {
+      await server.stop()
+      await fsp.rm(directory, { recursive: true })
+    }
+  })
   it('removes its own temporary home after verified process cleanup', async () => {
     const { fixture: directory, entry, setup } = await fixture()
     const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),

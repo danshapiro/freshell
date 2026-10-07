@@ -4,12 +4,40 @@ import { execFileSync } from 'node:child_process'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { runTask2RetainedFixture } from '../../../../scripts/testing/task002-config-legacy-fixtures.js'
+import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 
 const handle = {
   runId: 'run-owned', candidateSha: 'a'.repeat(40), soulId: 'soul-owned',
   incarnationId: 'incarnation-owned', containerId: 'b'.repeat(64),
   hostBootId: 'boot-owned', nativeSessionId: 'native-owned',
 }
+
+describe('retained fixture owner web injection', () => {
+  it('uses the injected owner factory rather than launching its browser fixture dependency', async () => {
+    const h = new owner.RuntimeHarness(process.cwd(), undefined, 3)
+    const supervisor: owner.SupervisorInstance = { scenarioId: 'task2-config-jsonc', containerId: 'c'.repeat(64),
+      controlSocket: path.join(h.testRoot, 'control.sock'), controlSecret: 'owned-unit-secret',
+      controlSecretFile: path.join(h.testRoot, 'control-secret'), runtimeRoot: h.testRoot,
+      volumeName: 'owned-unit-volume', binaryKind: 'test' }
+    vi.spyOn(h, 'startSupervisor').mockResolvedValue(supervisor)
+    vi.spyOn(h, 'adminOk').mockResolvedValue({ kind: 'health', data: { controlEpoch: 1 } })
+    vi.spyOn(h, 'assert').mockImplementation(() => {})
+    const browserStart = vi.spyOn(RustServer.prototype, 'start').mockRejectedValue(new Error('old browser web dependency entered'))
+    const factory = vi.fn<owner.RuntimeWebFactory>().mockImplementation(() => { throw new Error('injected owner web entered') })
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    await fsp.mkdir(h.testRoot, { recursive: true, mode: 0o700 })
+    try {
+      await expect(runTask2RetainedFixture(h, false, undefined, 'jsonc', factory)).rejects.toThrow('injected owner web entered')
+      expect(factory).toHaveBeenCalledOnce()
+      expect(browserStart).not.toHaveBeenCalled()
+    } finally {
+      browserStart.mockRestore()
+      vi.unstubAllEnvs()
+      await fsp.rm(h.testRoot, { recursive: true, force: true })
+    }
+  })
+})
 
 function fixture() {
   const row = { ...handle, launchState: 'running' }

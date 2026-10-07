@@ -236,6 +236,9 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
       XDG_DATA_HOME: path.join(home, '.local/share'), XDG_CONFIG_HOME: path.join(home, '.config'),
       LOCALAPPDATA: path.join(home, 'AppData/Local'), APPDATA: path.join(home, 'AppData/Roaming'),
     }
+    for (const key of Object.keys(env)) {
+      if (this.options.stripEnvPrefixes?.some(prefix => key.startsWith(prefix))) delete env[key]
+    }
     delete env.VITE_PORT
     this.process = await OwnedRuntimeChild.create(this.options.binary, [], this.options.repoRoot, env)
     this.bootCount += 1

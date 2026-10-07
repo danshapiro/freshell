@@ -1900,6 +1900,7 @@ export type RuntimeWebConstructOptions = {
   binary: string; repoRoot: string; preserveHomeOnStop: boolean; homeDir?: string
   candidateSha: string; buildDirty: boolean
   env: Record<string, string>; setupHome: (homeDir: string) => Promise<void>
+  stripEnvPrefixes?: string[]
 }
 export interface RuntimeWebHandle {
   readonly info: RuntimeWebInfo
