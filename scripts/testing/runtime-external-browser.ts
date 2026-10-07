@@ -288,6 +288,11 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
   async stop(): Promise<void> {
     await this.kill('SIGTERM')
     this.current = undefined
+    if (this.homeDir && !this.options.homeDir && !this.options.preserveHomeOnStop) {
+      await fsp.rm(this.homeDir, { recursive: true, force: true })
+      this.homeDir = undefined
+      this.homeConfigured = false
+    }
   }
 }
 
@@ -594,12 +599,25 @@ export class ExternalManagedRuntimeRig {
     params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'challengeId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
-    const response = await this.transport(`${this.descriptor.baseUrl}/__managed_runtime`, {
+    const request = {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-auth-token': this.descriptor.token },
       body: JSON.stringify({ runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha,
         scenarioId: 'browser-managed-runtime', operationId, action, ...params }),
-      signal: AbortSignal.timeout(90_000),
-    })
+    }
+    let response: Response | undefined
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        response = await this.transport(`${this.descriptor.baseUrl}/__managed_runtime`, {
+          ...request, signal: AbortSignal.timeout(90_000),
+        })
+        break
+      } catch {
+        if (attempt === 1) throw new Error(`closed owner ${action} transport did not settle`)
+        process.stderr.write(`${JSON.stringify({ severity: 'warn', event: 'managed_external_owner_transport_retry',
+          runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, operationId, action })}\n`)
+      }
+    }
+    if (!response) throw new Error('closed owner transport produced no response')
     if (!response.ok) throw new Error(`closed owner operation refused: ${response.status}`)
     let body: unknown
     try { body = await response.json() } catch { throw new Error('closed owner reply is not valid JSON') }
@@ -1156,7 +1174,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
       : path.basename(selection.spec).includes('resurrection') ? 3
         : path.basename(selection.spec).includes('rehydrate') ? 4
           : /chaos|lost-soul/.test(selection.spec) ? 5 : 2
-    this.owner = new ManagedRuntimeOwner(options => new ManagedRuntimeWebServer(options), root, phase,
+    this.owner = new ManagedRuntimeOwner(options => new ManagedRuntimeWebServer({ ...options, preserveHomeOnStop: false }), root, phase,
       {}, {}, fixture ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
         fixtureFreshAgentModes: fixture ? modes : [] }, undefined, {
         bootstrapProviders: fixture ? [] : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],

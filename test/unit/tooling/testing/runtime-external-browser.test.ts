@@ -355,7 +355,7 @@ describe('owned pinned Quick Tunnel endpoint', () => {
 })
 
 describe('owned web process lifetime (Node process fixture only)', () => {
-  it('preserves scratch config and token/port across exact owned replacement, then verifies PID absence', async () => {
+  async function fixture() {
     const fixture = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-owned-process-'))
     const entry = path.join(fixture, 'owned-server.cjs')
     const home = path.join(fixture, 'home')
@@ -364,6 +364,29 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       await fsp.mkdir(path.join(directory, '.freshell'), { recursive: true })
       await fsp.writeFile(path.join(directory, '.freshell/config.json'), JSON.stringify({ version: 1, settings: {} }))
     })
+    return { fixture, entry, home, setup }
+  }
+  it('removes its own temporary home after verified process cleanup', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
+      candidateSha: 'a'.repeat(40), buildDirty: false, setupHome: setup, preserveHomeOnStop: false,
+      env: { NODE_OPTIONS: `--require=${entry}` } })
+    let home: string | undefined
+    try {
+      const info = await server.start()
+      home = info.homeDir
+      await expect(fsp.stat(home)).resolves.toBeDefined()
+      await server.stop()
+      await expect(fsp.stat(`/proc/${info.pid}`)).rejects.toThrow()
+      await expect(fsp.stat(home)).rejects.toThrow()
+    } finally {
+      await server.stop()
+      if (home) await fsp.rm(home, { recursive: true, force: true })
+      await fsp.rm(directory, { recursive: true })
+    }
+  })
+  it('preserves scratch config and token/port across exact owned replacement, then verifies PID absence', async () => {
+    const { fixture: directory, entry, home, setup } = await fixture()
     const server = new runner.ManagedRuntimeWebServer({
       binary: process.execPath, repoRoot: process.cwd(), candidateSha: 'a'.repeat(40), buildDirty: false,
       setupHome: setup, homeDir: home, preserveHomeOnStop: true,
@@ -387,7 +410,7 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       await server.stop()
       if (firstPid) await expect(fsp.stat(`/proc/${firstPid}`)).rejects.toThrow()
       if (nextPid) await expect(fsp.stat(`/proc/${nextPid}`)).rejects.toThrow()
-      await fsp.rm(fixture, { recursive: true })
+      await fsp.rm(directory, { recursive: true })
     }
   })
 })
@@ -431,6 +454,25 @@ describe('closed external owner control', () => {
 })
 
 describe('external finite fixture client', () => {
+  it('retries a lost mutation reply with the same operation ID and settles owner cleanup once', async () => {
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('web factory unused in RPC unit') })
+    const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
+    const stop = vi.spyOn(owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const operationIds: string[] = []
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      const request = JSON.parse(String(init.body))
+      operationIds.push(request.operationId)
+      const result = await control(request)
+      if (operationIds.length === 1) throw new Error('lost owned cleanup reply')
+      return new Response(JSON.stringify(result), { status: 200 })
+    })
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.stop()).resolves.toEqual({ ok: true, errors: [] })
+    expect(operationIds).toHaveLength(2)
+    expect(new Set(operationIds).size).toBe(1)
+    expect(stop).toHaveBeenCalledOnce()
+  })
   it('sends a closed bound request and refuses an otherwise successful stale reply', async () => {
     const child = vi.fn(async (_url: string, init: RequestInit) => {
       const request = JSON.parse(String(init.body))
