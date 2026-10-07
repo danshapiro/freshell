@@ -436,22 +436,20 @@ impl FreshAgentTransport for HostedTransport {
             Some(expected) => Some(self.wait_exact_native(expected).await?),
             None if matches!(self.provider, FreshProvider::Codex) => Some(session_id),
             None if matches!(self.provider, FreshProvider::Claude | FreshProvider::Kilroy) => {
-                let mut receiver = self.native_rx.lock().await;
-                Some(
-                    tokio::time::timeout(CREATE_TIMEOUT, async {
-                        loop {
-                            if let Some(observed) = receiver.borrow().clone() {
-                                return Ok::<_, String>(observed);
-                            }
-                            receiver
-                                .changed()
-                                .await
-                                .map_err(|_| "provider identity channel closed".to_string())?;
-                        }
-                    })
-                    .await
-                    .map_err(|_| "provider did not materialize native identity".to_string())??,
-                )
+                // The real SDK starts MCP/configuration before its first user
+                // turn but publishes system/init identity only with that turn.
+                // The bridge captures the native identity when it arrives.
+                let observed = self.native_rx.lock().await.borrow().clone();
+                if observed.is_none() {
+                    tracing::info!(
+                        event = "provider.identity.awaiting_first_turn",
+                        stage = "host_create",
+                        runtime_variant = %profile.runtime_variant,
+                        native_identity = "unrecorded",
+                        "provider started before native identity materialization"
+                    );
+                }
+                observed
             }
             None => None,
         };
@@ -1383,7 +1381,7 @@ lines.on('line', line=>{
   if(req.type==='create'){
     writeFileSync(process.env.FRESHELL_TEST_MCP_RECEIPT,JSON.stringify(req));
     process.stdout.write(JSON.stringify({type:'created',requestId:req.requestId,sessionId:'owned-mcp-fixture'})+'\n');
-    process.stdout.write(JSON.stringify({type:'sdk.session.init',sessionId:'owned-mcp-fixture',cliSessionId:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',model:'fixture',cwd:req.cwd,tools:[],slashCommands:[]})+'\n');
+    if(req.model!=='deferred-identity')process.stdout.write(JSON.stringify({type:'sdk.session.init',sessionId:'owned-mcp-fixture',cliSessionId:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',model:'fixture',cwd:req.cwd,tools:[],slashCommands:[]})+'\n');
   }
   if(req.type==='shutdown')process.exit(0);
 });
@@ -1409,7 +1407,12 @@ lines.on('line', line=>{
             config: vec![],
             prepared_inputs: None,
         };
-        for selected in [true, false] {
+        for (selected, deferred_identity, expected_identity) in [
+            (true, false, None),
+            (false, false, None),
+            (true, true, None),
+            (true, false, Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")),
+        ] {
             let transport = HostedTransport::new_with_context(
                 FreshProvider::Claude,
                 selected.then_some(&context),
@@ -1419,22 +1422,38 @@ lines.on('line', line=>{
                 provider: FreshProvider::Claude,
                 runtime_variant: "freshclaude".into(),
                 cwd: dir.path().to_string_lossy().into(),
-                model: None,
+                model: deferred_identity.then(|| "deferred-identity".into()),
                 effort: None,
                 permission_mode: None,
                 sandbox: None,
                 provider_store_id: "owned-store".into(),
-                native_session_id: None,
+                native_session_id: expected_identity.map(str::to_owned),
                 plugins: None,
                 model_selection: None,
                 session_ref: None,
                 provider_launch_context: selected.then_some(context.clone()),
                 provider_secret_references: vec![],
             };
-            transport.start(&profile).await.unwrap();
+            let started =
+                tokio::time::timeout(Duration::from_secs(1), transport.start(&profile)).await;
             let observed: Value =
                 serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
             transport.stop().await.unwrap();
+            let started = started.expect("Claude create cannot wait for the first model turn");
+            if expected_identity.is_some() {
+                assert!(
+                    started.is_err(),
+                    "an exact resume must reject a different actual native identity"
+                );
+                continue;
+            }
+            let started = started.unwrap();
+            if deferred_identity {
+                assert!(
+                    started.native_session_id.is_none(),
+                    "unrecorded native identity must remain unknown"
+                );
+            }
             assert_eq!(
                 observed["hostedMcp"], selected,
                 "only accepted hosted selection enables the SDK recipe"
