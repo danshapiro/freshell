@@ -193,7 +193,8 @@ describe('owner-side synthetic OpenCode source preparation', () => {
       const source = await rig.prepareSyntheticOpenCodeSource()
       const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha, nativeSessionId: source.rootId }
       const view = { ...current, terminalId: 'owned-source-terminal', launchState: 'running', intentRevision: 1 }
-      vi.spyOn(rig, 'inventory').mockResolvedValue([view])
+      vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...view, incarnationId: 'prior-source-incarnation',
+        containerId: 'c'.repeat(64), hostBootId: 'prior-source-boot', launchState: 'stopped' }, view])
       const observation = { terminalId: view.terminalId, rootSessionId: source.rootId, tailMessageId: source.lastMessageId,
         evidenceGeneration: 'a'.repeat(64), incarnationId: view.incarnationId, launchNonce: 'owned-launch',
         hydrated: true, messagesRead: 'success' as const }

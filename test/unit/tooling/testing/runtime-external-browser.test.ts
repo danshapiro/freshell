@@ -935,7 +935,8 @@ describe('closed external owner control', () => {
       launchState: 'running', intentRevision: 7, provider: 'opencode', cleanupState: 'none',
       executionGeneration: 1, desiredState: 'running', recoveryState: 'live', durabilityState: 'resume_captured',
       allocationState: 'verified_durable', evidenceRevision: 1, successfulRecoveriesInWindow: 0 }
-    inventory.mockResolvedValue([view])
+    inventory.mockResolvedValue([{ ...view, incarnationId: 'prior-stop-incarnation', containerId: 'c'.repeat(64),
+      hostBootId: 'prior-stop-boot', launchState: 'stopped', desiredState: 'stopped', intentRevision: 6 }, view])
     owned.runtime.broker = { receipts: () => [{ ...handle }] } as unknown as typeof owned.runtime.broker
     vi.spyOn(owned, 'controlEpoch').mockResolvedValue(4)
     const stopped = { outcome: 'verified_empty', view: { ...view, launchState: 'stopped', desiredState: 'stopped',

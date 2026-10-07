@@ -2711,7 +2711,7 @@ export class ManagedRuntimeOwner {
 
   async syntheticOpenCodeAdoptionStatus(handle: ExactRuntimeHandle): Promise<ManagedOpenCodeAdoptionStatus> {
     await this.assertSyntheticOpenCodeSourceHandle(handle)
-    const view = (await this.inventory()).find(row => row.soulId === handle.soulId)
+    const view = (await this.inventory()).find(row => row.soulId === handle.soulId && row.incarnationId === handle.incarnationId)
     if (!view || view.incarnationId !== handle.incarnationId || view.containerId !== handle.containerId
       || view.hostBootId !== handle.hostBootId || view.nativeSessionId !== handle.nativeSessionId) {
       throw new Error('registered source adoption address changed before its probe')
@@ -2896,7 +2896,7 @@ export class ManagedRuntimeOwner {
   async stopRuntimeSoul(handle: ExactRuntimeHandle, expectedControlEpoch: number, expectedIntentRevision: number): Promise<ManagedStopResult> {
     await this.assertCurrentHandle(handle)
     if (expectedControlEpoch !== await this.controlEpoch()) throw new Error('exact Stop controller epoch is stale')
-    const current = (await this.inventory()).find(row => row.soulId === handle.soulId)
+    const current = (await this.inventory()).find(row => row.soulId === handle.soulId && row.incarnationId === handle.incarnationId)
     if (!current || current.intentRevision !== expectedIntentRevision) throw new Error('exact Stop intent revision is stale')
     const result = await this.runtime.adminOk(this.supervisor,
       this.runtime.stopBody(handle.soulId, expectedControlEpoch, expectedIntentRevision))
