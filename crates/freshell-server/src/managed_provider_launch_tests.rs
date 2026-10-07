@@ -285,6 +285,12 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
     let cwd = fixture.join("workspace").to_string_lossy().into_owned();
     let original_config = fixture.join("source-home/.config/opencode/opencode.json");
     let original_bytes = std::fs::read(&original_config).unwrap();
+    let explicit_config = fixture.join("workspace/selected-config.json");
+    let explicit_bytes = br#"{"agent":{"probe":{"description":"{file:./selected-rule}"}}}"#;
+    std::fs::write(&explicit_config, explicit_bytes).unwrap();
+    let explicit_rule = fixture.join("workspace/selected-rule");
+    std::fs::write(&explicit_rule, "native-explicit-selected-rule").unwrap();
+    std::fs::set_permissions(&explicit_rule, std::fs::Permissions::from_mode(0o600)).unwrap();
     let request: ManagedTerminalLaunch = ManagedTerminalLaunch {
         spec: freshell_platform::spawn::SpawnSpec {
             program: "opencode".into(),
@@ -294,7 +300,7 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
             cols: 120,
             rows: 30,
         },
-        env: BTreeMap::new(),
+        env: BTreeMap::from([("OPENCODE_CONFIG".into(), "selected-config.json".into())]),
         terminal_id: "closed-native-terminal".into(),
         stream_id: "closed-native-stream".into(),
         mode: "opencode".into(),
@@ -327,7 +333,7 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
         .map_err(|_| "actual pinned provider startup did not consume selected config and closure")
     }
     let expected = json!({"prompt":format!("{:x}",Sha256::digest(b"AUTH_PREFIXnative-ruleAUTH_SUFFIX")),
-        "description":format!("{:x}",Sha256::digest(b"native-second-rule")),
+        "description":format!("{:x}",Sha256::digest(b"native-explicit-selected-rule")),
         "references":(["third","fourth","fifth","sixth"].map(|ordinal|format!("{:x}",Sha256::digest(format!("native-{ordinal}-rule").as_bytes())))),
         "resource":format!("{:x}",Sha256::digest(b"plugin-relative-resource")),
         "dependency":format!("{:x}",Sha256::digest(b"plugin-actual-local-dependency")),"sdk":format!("{:x}",Sha256::digest(b"function"))});
@@ -373,6 +379,7 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
     };
     assert_eq!(terminal_receipt, expected);
     assert_eq!(std::fs::read(&original_config).unwrap(), original_bytes);
+    assert_eq!(std::fs::read(&explicit_config).unwrap(), explicit_bytes);
     println!(
         "provider_launch_consumer {}",
         json!({"provider":"opencode","route":"terminal","digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&expected).unwrap()))})
@@ -382,6 +389,9 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
         .await
         .unwrap();
     std::fs::remove_file(&receipt).unwrap();
+    // Fresh launches use current server controls; the terminal exercised a
+    // request-only relative control. Both must activate the explicit layer.
+    std::env::set_var("OPENCODE_CONFIG", &explicit_config);
     let (broadcast, _) = tokio::sync::broadcast::channel(256);
     let mut events = broadcast.subscribe();
     let proxy = crate::fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
@@ -423,6 +433,7 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
         .await;
     assert_eq!(read_receipt(&receipt).await.unwrap(), expected);
     assert_eq!(std::fs::read(&original_config).unwrap(), original_bytes);
+    assert_eq!(std::fs::read(&explicit_config).unwrap(), explicit_bytes);
     let stopped = fixture.join("workspace/native-consumed.json.stopped");
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -453,6 +464,7 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
                 for sentinel in [
                     b"AUTH_PREFIX".as_slice(),
                     b"native-rule".as_slice(),
+                    b"native-explicit-selected-rule".as_slice(),
                     b"synthetic-onecli-shadowed".as_slice(),
                 ] {
                     assert!(
