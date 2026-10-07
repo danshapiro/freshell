@@ -20,7 +20,7 @@ import {
 import { FRESH_AGENT_QUALIFICATION_LIVE_ENV } from '../../../scripts/testing/runtime-fresh-agent-qualification.js'
 import { executeAction } from '../../../tools/freshell-mcp/freshell-tool.js'
 import { test } from '../helpers/fixtures.js'
-import { ManagedRuntimeBrowserRig, type ManagedRuntimeView } from '../helpers/managed-runtime.js'
+import { ManagedRuntimeBrowserRig, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
 type Definition = {
@@ -93,16 +93,24 @@ async function sendNoToolTurn(page: Page, paneId: string, sessionId: string, ins
   })
 }
 
-async function replacement(rig: ManagedRuntimeBrowserRig, sessionId: string, prior: string): Promise<ManagedRuntimeView> {
+async function replacement(rig: ManagedFixtureRig, sessionId: string, prior: string): Promise<ManagedRuntimeView> {
   return waitFor('replacement incarnation', async () => {
     const view = await rig.runningViewForFreshSession(sessionId)
     return view?.containerId && view.incarnationId !== prior ? view : null
   })
 }
 
+async function crashCurrentHost(rig: ManagedFixtureRig, sessionId: string, incarnationId: string): Promise<void> {
+  const current = await waitFor('current provider-native host', async () => {
+    const view = await rig.runningViewForFreshSession(sessionId)
+    return view?.incarnationId === incarnationId && view.nativeSessionId ? view : null
+  })
+  await rig.crashRuntimeHost(rig.exactRuntimeHandle(current))
+}
+
 async function qualify(
   page: Page,
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   definition: Definition,
 ): Promise<FreshAgentQualificationRow> {
   const created = dataOf(await executeAction('new-tab', {
@@ -153,7 +161,7 @@ async function qualify(
     await page.goto(`${rig.info.baseUrl}/?token=${rig.info.token}&e2e=1`)
     await new TestHarness(page).waitForConnection()
     expect(await sessionFor(page, sessionId)).toBeTruthy()
-    rig.runtime.killOwnedRuntimeExact(initial.containerId)
+    await crashCurrentHost(rig, sessionId, initial.incarnationId)
     const recovered = await replacement(rig, sessionId, initial.incarnationId)
     await page.getByRole('button', { name: 'Allow tool use', exact: true }).click()
     pendingApproval = {
@@ -164,7 +172,7 @@ async function qualify(
       decisionIdHash: createHash('sha256').update(decisionId).digest('hex'),
     }
   } else {
-    rig.runtime.killOwnedRuntimeExact(initial.containerId)
+    await crashCurrentHost(rig, sessionId, initial.incarnationId)
   }
   const afterHost = await replacement(rig, sessionId, initial.incarnationId)
   if (!afterHost.containerId) throw new Error('host replacement has no enclosure')
@@ -186,11 +194,9 @@ async function qualify(
   }))
   expect(split?.paneId).toBeTruthy()
 
-  const broker = rig.runtime.broker.receipts().find((receipt) => receipt.soulId === afterProvider.soulId)
-  if (!broker?.providerVolumeName) throw new Error('provider volume receipt is absent')
-  const limits = JSON.parse(rig.ownedContainerExec(afterProvider.containerId!, [
-    'sh', '-lc', `printf '{"cpuMax":"%s","memoryMax":"%s","swapMax":"%s","pidsMax":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/memory.swap.max)" "$(cat /sys/fs/cgroup/pids.max)"`,
-  ]))
+  const address = rig.exactRuntimeHandle(afterProvider)
+  const { providerVolumeName } = await rig.providerVolumeFacts(address)
+  const { limits } = await rig.chaosHostFacts(address)
   return {
     mode: definition.mode,
     provider: definition.provider,
@@ -214,7 +220,7 @@ async function qualify(
     pendingApproval,
     writerProof: { activeWriterCount: 1, conflictingWriterCount: 0, dispatchCountForPrompt: 1, completionCountForPrompt: 1 },
     isolation: {
-      providerVolumeNameHash: createHash('sha256').update(broker.providerVolumeName).digest('hex'),
+      providerVolumeNameHash: createHash('sha256').update(providerVolumeName).digest('hex'),
       enclosureIdHash: createHash('sha256').update(afterProvider.containerId!).digest('hex'),
       independentProviderStore: true,
       independentEnclosure: true,
