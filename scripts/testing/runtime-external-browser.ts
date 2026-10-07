@@ -16,11 +16,11 @@ import os from 'node:os'
 import path from 'node:path'
 import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
-  ManagedMigrationFactsSchema } from './runtime-sandbox.js'
+  ManagedMigrationFactsSchema, ManagedStopResultSchema } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
 import { ManagedRuntimeInventorySnapshotSchema, type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
-import type { RuntimeWriterClaimFacts, ManagedMigrationFacts } from './runtime-sandbox.js'
+import type { RuntimeWriterClaimFacts, ManagedMigrationFacts, ManagedStopResult } from './runtime-sandbox.js'
 import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
@@ -691,6 +691,11 @@ export class ExternalManagedRuntimeRig {
       nativeSessionId: z.literal(handle.nativeSessionId), soulId: z.literal(handle.soulId), incarnationId: z.literal(handle.incarnationId),
       activeClaimCount: z.number().int().nonnegative(), globalConflictingClaimCount: z.number().int().nonnegative() }).strict(), { handle })
   }
+  async stopRuntimeSoul(handle: ExactRuntimeHandle, expectedControlEpoch: number, expectedIntentRevision: number): Promise<ManagedStopResult> {
+    return this.rpc('stop-soul', ManagedStopResultSchema.refine(result => result.view.soulId === handle.soulId
+      && result.view.incarnationId === handle.incarnationId, 'Stop result differs from the exact address'),
+    { handle, expectedControlEpoch, expectedIntentRevision })
+  }
   async runningViewForTerminal(terminalId: string): Promise<ManagedRuntimeView | null> {
     return (await this.inventory()).find(row => row.terminalId === terminalId && row.launchState === 'running') ?? null
   }
@@ -919,6 +924,12 @@ export function createExternalRuntimeControl(
         result = await owner.applyManagedOptIn(request.expectedControlEpoch)
         break
       case 'writer-claim': result = await owner.writerClaimFacts(handle()); break
+      case 'stop-soul':
+        if (request.expectedControlEpoch === undefined || request.expectedIntentRevision === undefined) {
+          throw new Error('exact Stop controller epoch and intent revision required')
+        }
+        result = await owner.stopRuntimeSoul(handle(), request.expectedControlEpoch, request.expectedIntentRevision)
+        break
       case 'retained-start':
         if (!retained || (request.challengeId !== 'config' && request.challengeId !== 'legacy')) throw new Error('registered retained fixture required')
         retained.start(request.challengeId)

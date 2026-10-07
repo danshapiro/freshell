@@ -6,7 +6,7 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
-import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchema,
+import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchema, ManagedRuntimeSoulSchema,
   type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
 
 
@@ -332,6 +332,12 @@ export type RuntimeWriterClaimFacts = {
 
 export const ManagedMigrationFactsSchema = ManagedRuntimeMigrationPlanSchema.omit({ registryBackupPath: true }).strip()
 export type ManagedMigrationFacts = z.infer<typeof ManagedMigrationFactsSchema>
+
+export const ManagedStopResultSchema = z.object({
+  outcome: z.enum(['verified_empty', 'blocked_ownership', 'backend_unavailable', 'termination_unconfirmed']),
+  view: ManagedRuntimeSoulSchema,
+}).strict()
+export type ManagedStopResult = z.infer<typeof ManagedStopResultSchema>
 
 /** A run keeps operation settlements until teardown so a lost reply cannot repeat a mutation. */
 export class RuntimeOwnerOperationQueue {
@@ -2449,6 +2455,16 @@ export class ManagedRuntimeOwner {
     const epoch = await this.controlEpoch()
     const result = await this.runtime.adminOk(this.supervisor, this.runtime.stopBody(soulId, epoch))
     return this.dataOf(result, 'stop')
+  }
+
+  async stopRuntimeSoul(handle: ExactRuntimeHandle, expectedControlEpoch: number, expectedIntentRevision: number): Promise<ManagedStopResult> {
+    await this.assertCurrentHandle(handle)
+    if (expectedControlEpoch !== await this.controlEpoch()) throw new Error('exact Stop controller epoch is stale')
+    const current = (await this.inventory()).find(row => row.soulId === handle.soulId)
+    if (!current || current.intentRevision !== expectedIntentRevision) throw new Error('exact Stop intent revision is stale')
+    const result = await this.runtime.adminOk(this.supervisor,
+      this.runtime.stopBody(handle.soulId, expectedControlEpoch, expectedIntentRevision))
+    return ManagedStopResultSchema.parse(this.dataOf(result, 'stop'))
   }
 
   async stop(): Promise<{ ok: boolean; errors: string[] }> {

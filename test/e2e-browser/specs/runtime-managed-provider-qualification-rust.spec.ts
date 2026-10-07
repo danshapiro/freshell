@@ -34,7 +34,7 @@ import { ExternalManagedRuntimeRig, resolveManagedExternalDescriptor } from '../
 import { task2RetainedPublicContext, type Task2RetainedPublicContext } from '../../../scripts/testing/task002-retained-fixture.js'
 import { managedRecoveryBlockedMessage } from '../../../src/lib/managed-runtime-recovery-message.js'
 import {
-  ManagedRuntimeBrowserRig,
+  ManagedRuntimeBrowserRig, stopManagedRuntimeSoul,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
@@ -418,8 +418,9 @@ async function qualifyProvider(
   ))
   expect(notices.kind).toBe('pending_notices')
   expect(notices.data).toHaveLength(0)
-  const stopped = await rig.stopSoul(created.view.soulId)
+  const stopped = await stopManagedRuntimeSoul(rig, created.view.soulId)
   expect(stopped.outcome).toBe('verified_empty')
+  if (stopped.outcome !== 'verified_empty') throw new Error('provider qualification Stop did not verify empty')
   const claimAfterStop = await rig.writerClaimFacts(writerHandle)
   expect(claimAfterStop.activeClaimCount).toBe(0)
   expect(claimAfterStop.globalConflictingClaimCount).toBe(0)

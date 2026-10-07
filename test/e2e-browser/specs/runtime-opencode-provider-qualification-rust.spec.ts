@@ -17,7 +17,7 @@ import { expect, type Page } from '@playwright/test'
 
 import { test } from '../helpers/fixtures.js'
 import {
-  ManagedRuntimeBrowserRig,
+  ManagedRuntimeBrowserRig, stopManagedRuntimeSoul,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
@@ -697,10 +697,13 @@ test.describe.serial('OpenCode provider qualification', () => {
       ), 'pending_notices')
       expect(notices).toHaveLength(0)
 
-      const firstStop = await rig.stopSoul(first.view.soulId)
-      const secondStop = await rig.stopSoul(second.view.soulId)
+      const firstStop = await stopManagedRuntimeSoul(rig, first.view.soulId)
+      const secondStop = await stopManagedRuntimeSoul(rig, second.view.soulId)
       expect(firstStop.outcome).toBe('verified_empty')
       expect(secondStop.outcome).toBe('verified_empty')
+      if (firstStop.outcome !== 'verified_empty' || secondStop.outcome !== 'verified_empty') {
+        throw new Error('OpenCode qualification Stop did not verify both enclosures empty')
+      }
       const claimAfterStop = await rig.writerClaimFacts(writerHandle)
       expect(claimAfterStop.activeClaimCount).toBe(0)
       expect(claimAfterStop.globalConflictingClaimCount).toBe(0)

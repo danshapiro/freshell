@@ -684,6 +684,38 @@ describe('closed external owner control', () => {
     expect(web).toHaveBeenCalledOnce()
     expect(supervisor).toHaveBeenCalledOnce()
   })
+  it('stops only the exact owned incarnation with its observed intent and controller revisions', async () => {
+    const { owned, context, request, inventory } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'stop-owned-soul',
+      incarnationId: 'stop-owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'stop-owned-boot', nativeSessionId: 'stop-owned-native' }
+    const view = { soulId: handle.soulId, incarnationId: handle.incarnationId, containerId: handle.containerId,
+      hostBootId: handle.hostBootId, nativeSessionId: handle.nativeSessionId,
+      launchState: 'running', intentRevision: 7, provider: 'opencode', cleanupState: 'none',
+      executionGeneration: 1, desiredState: 'running', recoveryState: 'live', durabilityState: 'resume_captured',
+      allocationState: 'verified_durable', evidenceRevision: 1, successfulRecoveriesInWindow: 0 }
+    inventory.mockResolvedValue([view])
+    owned.runtime.broker = { receipts: () => [{ ...handle }] } as unknown as typeof owned.runtime.broker
+    vi.spyOn(owned, 'controlEpoch').mockResolvedValue(4)
+    const stopped = { outcome: 'verified_empty', view: { ...view, launchState: 'stopped', desiredState: 'stopped',
+      recoveryState: 'stopped', cleanupState: 'verified_empty', intentRevision: 8 } }
+    const admin = vi.spyOn(owned.runtime, 'adminOk').mockResolvedValue({ kind: 'stop', data: stopped })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.stopRuntimeSoul(handle, 4, 7)).resolves.toMatchObject({ outcome: 'verified_empty',
+      view: { soulId: handle.soulId, intentRevision: 8, desiredState: 'stopped' } })
+    expect(admin).toHaveBeenCalledExactlyOnceWith(owned.supervisor, owned.runtime.stopBody(handle.soulId, 4, 7))
+    await expect(control({ ...request, action: 'stop-soul', handle })).rejects.toThrow(/revision|epoch/)
+    await expect(control({ ...request, operationId: 'stale-intent', action: 'stop-soul', handle,
+      expectedControlEpoch: 4, expectedIntentRevision: 6 })).rejects.toThrow(/revision/)
+    await expect(control({ ...request, operationId: 'stale-epoch', action: 'stop-soul', handle,
+      expectedControlEpoch: 3, expectedIntentRevision: 7 })).rejects.toThrow(/epoch/)
+    inventory.mockResolvedValue([{ ...view, incarnationId: 'replacement-incarnation' }])
+    await expect(control({ ...request, operationId: 'stale-address', action: 'stop-soul', handle,
+      expectedControlEpoch: 4, expectedIntentRevision: 7 })).rejects.toThrow(/current/)
+    expect(admin).toHaveBeenCalledOnce()
+  })
   it('refuses arbitrary commands, foreign metadata and absent current handles before owner work', async () => {
     const { owned, context, inventory, request } = fixture()
     const control = runner.createExternalRuntimeControl(owned, context)
