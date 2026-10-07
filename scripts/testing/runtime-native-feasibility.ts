@@ -263,7 +263,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'claude' && ['create', 'wrong-root', 'disabled-hooks', 'trust-refusal', 'timeout', 'exact-resume', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'claude' && ['create', 'wrong-root', 'disabled-hooks', 'trust-refusal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
   if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
@@ -420,7 +420,10 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   const resumes = ['exact-resume', 'current-native-turn'].includes(caseId)
   const nativeTimeout = caseId === 'timeout'
   const trustRefusal = caseId === 'trust-refusal'
-  const hooksDisabled = caseId === 'disabled-hooks' || nativeTimeout
+  const providerExit = caseId === 'provider-exit'
+  const stopCancellation = caseId === 'stop-cancellation'
+  const startupFault = providerExit || stopCancellation
+  const hooksDisabled = caseId === 'disabled-hooks' || nativeTimeout || startupFault
   if (resumes && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   const grants = (['env_file', 'ca_file'] as const).map((suffix) => {
     const file = sources.find((source) => source.name === `claude/grants/${suffix}`)
@@ -514,23 +517,80 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
         relativePath: '.claude.json', providerRelativePath: '.claude/.claude.json', format: 'json' },
         ...(hooksDisabled ? [{ root: 'user_provider', relativePath: 'settings.json', providerRelativePath: '.claude/settings.json', format: 'json' }] : [])] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
+  const inspectTerminalNative = async (containerId: string) => JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
+    ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : trustRefusal ? ['trust-refusal'] : [])]))
   const wrongRoot = caseId === 'wrong-root'
   const startupRefusal = wrongRoot || hooksDisabled || trustRefusal
   const refusalReason = trustRefusal ? 'unaccepted native trust' : nativeTimeout ? 'native startup timeout'
-    : hooksDisabled ? 'disabled native hooks' : 'wrong current native root'
+    : providerExit ? 'exited native provider' : stopCancellation ? 'cancelled native startup'
+      : hooksDisabled ? 'disabled native hooks' : 'wrong current native root'
   const launchStartedAt = Date.now()
-  const result = startupRefusal ? await harness.adminRaw(supervisor, request) : await harness.adminOk(supervisor, request)
+  let beforeFault: any
+  let faultResult: any
+  let result: any
+  if (startupFault) {
+    let finished = false
+    let launchError: unknown
+    const launch = harness.adminRaw(supervisor, request).then(
+      (reply) => { result = reply; finished = true },
+      (error) => { launchError = error; finished = true },
+    )
+    await Promise.resolve()
+    if (finished && launchError) throw launchError
+    const deadline = Date.now() + 6_000
+    let receipt: ReturnType<typeof harness.broker.receipts>[number] | undefined
+    const captureErrors: string[] = []
+    while (!finished && Date.now() < deadline) {
+      receipt = harness.broker.receipts().find((owned) => owned.soulId === soulId)
+      if (receipt) {
+        try {
+          beforeFault = await inspectTerminalNative(receipt.containerId)
+          break
+        } catch (error) { captureErrors.push(String(error)) }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    harness.writeArtifact(`${scenario}-before-fault-attempts-private.json`, captureErrors)
+    if (!beforeFault || !receipt || finished || beforeFault.hook || beforeFault.loaded
+      || !Number.isSafeInteger(beforeFault.nativePid) || beforeFault.nativePid <= 1
+      || beforeFault.uid !== 65534 || beforeFault.gid !== 0 || beforeFault.caps !== '0000000000000000'
+      || !beforeFault.readOnlyRoot || beforeFault.httpsStatus !== 200 || beforeFault.tlsVerifyMode !== 2 || !beforeFault.tlsCheckHostname
+      || beforeFault.hooksDisabled !== true || !beforeFault.version.startsWith('2.1.263')
+      || beforeFault.nativeCwd !== workspace || beforeFault.nativeArgv?.[beforeFault.nativeArgv.indexOf('--model') + 1] !== 'claude-haiku-4-5-20251001') {
+      await launch
+      harness.writeArtifact(`${scenario}-unexpected-launch-private.json`, { result, error: String(launchError ?? '') })
+      throw new Error('actual unobserved native child unavailable before startup fault')
+    }
+    harness.writeArtifact(`${scenario}-before-fault-native-private.json`, beforeFault)
+    if (providerExit) harness.killOwnedRuntimePidExact(receipt.containerId, beforeFault.nativePid, 'TERM')
+    else {
+      faultResult = await harness.adminOk(supervisor, harness.stopBody(soulId))
+      harness.writeArtifact(`${scenario}-ordinary-stop.json`, faultResult)
+    }
+    await launch
+    if (launchError) throw launchError
+    if (providerExit) {
+      const deadline = Date.now() + 3_000
+      do {
+        faultResult = JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId, '65534:0',
+          ['python3', '-c', "import pathlib,json,sys;print(json.dumps({'nativeExited':not (pathlib.Path('/proc')/sys.argv[1]/'exe').exists()}))", String(beforeFault.nativePid)]))
+        if (faultResult.nativeExited) break
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      } while (Date.now() < deadline)
+      harness.writeArtifact(`${scenario}-native-exit.json`, faultResult)
+    }
+  } else result = startupRefusal ? await harness.adminRaw(supervisor, request) : await harness.adminOk(supervisor, request)
   const launchElapsedMs = Date.now() - launchStartedAt
   harness.writeArtifact(`${scenario}-launch.json`, result)
   harness.writeArtifact(`${scenario}-launch-timing.json`, { elapsedMs: launchElapsedMs })
   let view: any
   if (startupRefusal) {
     const failure = `${refusalReason} published a running launch`
-    if (result.result?.Err?.code !== 'RECOVERY_BLOCKED') throw new Error(failure)
+    if (result.result?.Err?.code !== (stopCancellation ? 'STALE_INTENT_REVISION' : 'RECOVERY_BLOCKED')) throw new Error(failure)
     const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
     harness.writeArtifact(`${scenario}-inventory.json`, inventory)
     view = inventory.data.find((row: any) => row.soulId === soulId)
-    if (view?.launchState !== 'starting' || view.nativeIdentityObservation) throw new Error(failure)
+    if (view?.launchState !== (stopCancellation ? 'stopped' : 'starting') || view.nativeIdentityObservation) throw new Error(failure)
   } else view = result.data.view
   const deadline = Date.now() + 50_000
   while (!startupRefusal && !view.nativeIdentityObservation && Date.now() < deadline) {
@@ -545,7 +605,7 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   harness.writeArtifact(`${scenario}-current-view.json`, view)
-  const nativeSignals = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId,
+  const nativeSignals = startupFault ? { beforeFault, faultResult } : JSON.parse(await harness.execOwnedContainerAsExact(view.containerId,
     '65534:0', ['python3', '-c', String.raw`
 import pathlib,json,os,hashlib,base64
 selected=pathlib.Path('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe')
@@ -573,8 +633,7 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     && observation.nativeSessionId === nativeRoot && view.nativeSessionId === nativeRoot
     && observation.incarnationId === view.incarnationId
   if (startupRefusal ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
-  const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-    ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : trustRefusal ? ['trust-refusal'] : [])]))
+  const namespace = beforeFault ?? await inspectTerminalNative(view.containerId)
   harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
   const noCallbacks = hooksDisabled || trustRefusal
   const selectedModel = noCallbacks ? namespace.nativeArgv?.[namespace.nativeArgv.indexOf('--model') + 1] : namespace.loaded?.native?.model?.id
@@ -601,7 +660,9 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
   }
   const assertions = startupRefusal ? [{ name: trustRefusal ? 'actual-native-trust-refused-before-running-and-input'
     : nativeTimeout ? 'bounded-actual-native-startup-timeout-before-running-and-input'
-      : hooksDisabled ? 'actual-disabled-native-hooks-refused-before-running-and-input' : 'wrong-current-native-root-refused-before-running-and-input', pass: false }]
+      : providerExit ? 'actual-native-provider-exit-refused-before-running-and-input'
+        : stopCancellation ? 'ordinary-stop-cancels-native-startup-before-running-and-input'
+          : hooksDisabled ? 'actual-disabled-native-hooks-refused-before-running-and-input' : 'wrong-current-native-root-refused-before-running-and-input', pass: false }]
     : [{ name: 'actual-terminal-current-native-post-load-observation-before-input', pass:
       observation.nativeSessionId === namespace.loaded.native.session_id && observation.incarnationId === view.incarnationId }]
   if (startupRefusal) {
@@ -612,19 +673,26 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     }
     const rejected = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned blocked startup probe. Do not use tools.\r'))
     harness.writeArtifact(`${scenario}-input-refusal.json`, rejected)
-    const after = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-      ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : trustRefusal ? ['trust-refusal'] : [])]))
+    const after = startupFault ? namespace : await inspectTerminalNative(view.containerId)
     harness.writeArtifact(`${scenario}-after-refused-input-native-private.json`, after)
     // No Running incarnation exists, so the ordinary input route has no
     // admissible target. Inspect actual provider state separately.
+    const nativeStateSafe = startupFault ? namespace.completedTurns === 0 && namespace.toolEvents === 0
+      : JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
+        && (noCallbacks ? (!after.hook && !after.loaded && (trustRefusal ? after.nativePreferences?.workspaceTrust === false : after.hooksDisabled === true)
+          && after.completedTurns === 0 && after.toolEvents === 0)
+          : (actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
+            && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0))
     assertions[0]!.pass = !observation
-      && view.launchState === 'starting' && rejected.result?.Err?.code === 'UNKNOWN_SOUL'
-      && JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
-      && (noCallbacks ? (!after.hook && !after.loaded && (trustRefusal ? after.nativePreferences?.workspaceTrust === false : after.hooksDisabled === true)
-        && after.completedTurns === 0 && after.toolEvents === 0)
-        : (actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
-          && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0))
+      && view.launchState === (stopCancellation ? 'stopped' : 'starting') && rejected.result?.Err?.code === 'UNKNOWN_SOUL'
+      && nativeStateSafe
     if (!assertions[0]!.pass) throw new Error(`${refusalReason} released ordinary input or changed native state`)
+    if (startupFault) {
+      const closed = providerExit ? faultResult.nativeExited === true
+        : faultResult.data.outcome === 'verified_empty' && view.recoveryState === 'stopped' && view.desiredState === 'stopped'
+      if (!closed) throw new Error('owned native startup fault did not close its process or Stop transaction')
+      assertions.push({ name: providerExit ? 'exact-owned-native-pid-exited' : 'ordinary-stop-verified-empty-and-stopped-intent', pass: closed })
+    }
   }
   if (resumes) {
     const inspect = async (containerId: string, label: string) => {

@@ -103,7 +103,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       .rejects.toThrow('actual terminal recovery requires the owned real server artifact')
     expect(launch).not.toHaveBeenCalled()
   })
-  it.each(['create', 'wrong-root', 'disabled-hooks', 'trust-refusal', 'timeout'])('sends terminal Claude %s through its real launch route with the selected profile', async (caseId) => {
+  it.each(['create', 'wrong-root', 'disabled-hooks', 'trust-refusal', 'timeout', 'provider-exit', 'stop-cancellation'])('sends terminal Claude %s through its real launch route with the selected profile', async (caseId) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-claude-route-'))
     let home: string
     const launch = vi.fn(async (_supervisor: unknown, request: any) => {
@@ -162,6 +162,59 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(records.get('claude-create-signal-native-private.json')).toEqual({ processes: [{ pid: 7, signals: [] }] })
     } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it.each(['provider-exit', 'stop-cancellation', 'provider-exit-not-exited', 'stop-cancellation-not-empty'])(
+    'uses the owned native PID or ordinary Stop before initial publication (%s)', async (fault) => {
+      const caseId = fault.startsWith('provider-exit') ? 'provider-exit' : 'stop-cancellation'
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-startup-fault-'))
+      const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
+      let request: any
+      let reply: (value: any) => void
+      let now = 0
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => now += 250)
+      const view = () => ({ soulId: request.params.soulId, containerId: 'owned-container', incarnationId: 'owned-incarnation',
+        launchState: caseId === 'provider-exit' ? 'starting' : 'stopped',
+        desiredState: caseId === 'provider-exit' ? 'running' : 'stopped',
+        recoveryState: caseId === 'provider-exit' ? 'live' : 'stopped', nativeIdentityObservation: null })
+      const kill = vi.fn((_container: string, _pid: number, _signal: string) => reply({ result: { Err: { code: 'RECOVERY_BLOCKED' } } }))
+      const methods: string[] = []
+      const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '',
+        broker: { receipts: () => [{ soulId: request.params.soulId, containerId: 'owned-container' }] },
+        inventoryBody: () => ({ method: 'inventory' }), stopBody: () => ({ method: 'stop' }),
+        terminalInputBody: () => ({ method: 'terminal_input' }), killOwnedRuntimePidExact: kill,
+        adminRaw: async (_supervisor: unknown, body: any) => {
+          methods.push(body.method)
+          if (body.method === 'launch') { request = body; return new Promise((resolve) => { reply = resolve }) }
+          return { result: { Err: { code: 'UNKNOWN_SOUL' } } }
+        },
+        adminOk: async (_supervisor: unknown, body: any) => {
+          methods.push(body.method)
+          if (body.method === 'stop') {
+            reply({ result: { Err: { code: 'STALE_INTENT_REVISION' } } })
+            return { data: { outcome: fault.endsWith('not-empty') ? 'termination_unconfirmed' : 'verified_empty' } }
+          }
+          return { data: [view()] }
+        },
+        execOwnedContainerAsExact: async (_container: string, uid: string, args: string[]) => {
+          expect(uid).toBe('65534:0')
+          if (!args.includes('terminal')) return JSON.stringify({ nativeExited: !fault.endsWith('not-exited') })
+          return JSON.stringify({ uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+            httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, version: '2.1.263', nativePid: 21,
+            nativeArgv: request.params.terminal.args, nativeCwd: request.params.terminal.cwd, hooksDisabled: true,
+            hook: null, loaded: null, nativeRoot: null, completedTurns: 0, toolEvents: 0, transcript: null, profileFiles: [] })
+        },
+      } as unknown as RuntimeHarness
+      const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json']
+        .map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
+      try {
+        const result = executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, caseId)
+        if (fault.includes('not-')) await expect(result).rejects.toThrow('did not close its process or Stop transaction')
+        else expect((await result).assertions.every((assertion) => assertion.pass)).toBe(true)
+        if (caseId === 'provider-exit') expect(kill).toHaveBeenCalledWith('owned-container', 21, 'TERM')
+        else { expect(methods).toContain('stop'); expect(kill).not.toHaveBeenCalled() }
+        expect(methods).toContain('terminal_input')
+      } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
+    },
+  )
   it.each(['create', 'wrong-root', 'wrong-root-admitted', 'wrong-root-published', 'wrong-root-late-published',
     'disabled-hooks', 'disabled-hooks-admitted', 'disabled-hooks-published',
     'trust-refusal', 'trust-refusal-no-prompt', 'trust-refusal-admitted', 'trust-refusal-published',
