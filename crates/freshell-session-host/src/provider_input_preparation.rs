@@ -307,6 +307,7 @@ mod tests {
             original_home: "/absent-original-home".into(),
             cwd: "/absent-original-workspace".into(),
             workspace: "/absent-original-workspace".into(),
+            config_root: None,
             plugin_dirs: vec!["/absent-original-plugin".into()],
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();

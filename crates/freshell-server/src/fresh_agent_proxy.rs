@@ -521,6 +521,7 @@ impl HostedFreshAgentProxy {
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .ok_or(())?;
+            let original = |name: &str| std::env::var(name).ok();
             let context = crate::managed_provider_references::claude::prepare_managed(
                 crate::managed_provider_references::claude::ClaudePreparation {
                     reservation_provider: provider.as_str(),
@@ -530,6 +531,7 @@ impl HostedFreshAgentProxy {
                     home: &home,
                     cwd: &cwd,
                     workspace: &workspace,
+                    original: &original,
                     args: &[],
                     plugins: message.plugins.as_deref().unwrap_or_default(),
                     references: &provider_secret_references,

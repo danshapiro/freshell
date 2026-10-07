@@ -26,7 +26,7 @@ const broker=new RestrictedDockerBroker({
   allowedImageRefs:new Set([image]),allowTerminalWorkloads:true,
   allowedWorkspaceRoots:new Set([path.join(root,'workspace')]),
   allowedProviderUserRoots:new Set(configuration.provider==='claude'
-    ? ['/home/freshell/provider',path.join(root,'source-home/.claude'),path.join(root,'source-home/selected-plugin'),path.join(root,'source-home/imported-memory.md')]
+    ? ['/home/freshell/provider',path.join(root,'source-home/.claude'),path.join(root,'source-home/selected-config'),path.join(root,'source-home/selected-plugin'),path.join(root,'source-home/imported-memory.md')]
     : configuration.provider==='codex'
     ? ['/home/freshell/provider',path.join(root,'source-home/.codex')]
     : configuration.provider==='amplifier'

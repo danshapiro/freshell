@@ -135,6 +135,7 @@ tower = { version = "0.5", features = ["util"] }
 # `tracing-subscriber`'s own `env-filter` via `matchers`); declared directly
 # here because `logging.rs` uses it explicitly, not just transitively.
 regex = "1"
+unicode-normalization = "=0.1.25"
 
 [target.'cfg(unix)'.dependencies]
 # `flock(2)` for `settings_store.rs`'s advisory cross-process config lock

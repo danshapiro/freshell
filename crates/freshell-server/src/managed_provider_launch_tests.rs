@@ -760,6 +760,7 @@ async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prep
         .unwrap()
         .starts_with("fln-"));
     let home = fixture.join("source-home");
+    let selected_config = home.join("selected-config");
     let workspace = fixture.join("workspace");
     let plugin = home.join("selected-plugin");
     let control = fixture.join("scenarios/native/control");
@@ -768,6 +769,7 @@ async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prep
         &control,
         &runtime,
         &home.join(".claude"),
+        &selected_config,
         &plugin.join(".claude-plugin"),
         &plugin.join("hooks"),
         &plugin.join("scripts/node_modules/probe-dependency"),
@@ -792,7 +794,12 @@ async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prep
         b"closed-claude-imported-memory\n@./selected-plugin/nested-memory.md\n",
     )
     .unwrap();
-    std::fs::write(home.join(".claude/CLAUDE.md"), &memory).unwrap();
+    std::fs::write(selected_config.join("CLAUDE.md"), &memory).unwrap();
+    std::fs::write(
+        home.join(".claude/CLAUDE.md"),
+        "@../missing-unselected-default.md\n",
+    )
+    .unwrap();
     for name in [
         "relative-memory.md",
         "home-memory.md",
@@ -806,7 +813,12 @@ async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prep
         std::fs::write(plugin.join(name), format!("closed-native-{name}")).unwrap();
     }
     let settings = r#"{"env":{"CLAUDE_SELECTED_NONCE":"closed-selected-settings"}}"#;
-    std::fs::write(home.join(".claude/settings.json"), settings).unwrap();
+    std::fs::write(selected_config.join("settings.json"), settings).unwrap();
+    std::fs::write(
+        home.join(".claude/settings.json"),
+        r#"{"env":{"CLAUDE_SELECTED_NONCE":"unselected-default"}}"#,
+    )
+    .unwrap();
     std::fs::write(plugin.join("skills/probe/SKILL.md"),"---\nname: closed-plugin-probe\ndescription: selected complete native plugin\n---\nUse the adjacent resources.\n").unwrap();
     std::fs::write(plugin.join("scripts/resource"), b"closed-claude-resource").unwrap();
     std::fs::write(
@@ -883,6 +895,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     .unwrap();
     std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::env::set_var("FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE", &env_file);
+    std::env::set_var("CLAUDE_CONFIG_DIR", &selected_config);
     let registry = Registry::open(
         fixture.join("registry"),
         Some(
@@ -986,7 +999,10 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
                 cols: 120,
                 rows: 30,
             },
-            env: BTreeMap::new(),
+            env: BTreeMap::from([(
+                "CLAUDE_CONFIG_DIR".into(),
+                "../source-home/selected-config".into(),
+            )]),
             terminal_id: "closed-native-terminal".into(),
             stream_id: "closed-native-stream".into(),
             mode: "claude".into(),
@@ -1201,7 +1217,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         json!({"provider":"claude","route":"fresh","digest":qualified_digest})
     );
     assert_eq!(
-        std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        std::fs::read_to_string(selected_config.join("settings.json")).unwrap(),
         settings
     );
     assert_eq!(

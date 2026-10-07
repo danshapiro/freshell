@@ -1221,6 +1221,13 @@ fn stage_provider_root(
                 .ok_or("managed config root parent unavailable")?
                 .to_owned();
             (root, boundary)
+        } else if let ("claude", Some(manifest)) = (provider, opencode_input.claude_manifest) {
+            manifest.validate().map_err(str::to_string)?;
+            let root = manifest.config_root();
+            // This is the accepted explicit source root; native permits a
+            // symlinked config directory outside the original HOME.
+            let boundary = root.clone();
+            (root, boundary)
         } else {
             (home.join(provider_dir), home.to_path_buf())
         };
@@ -1247,6 +1254,13 @@ fn stage_provider_root(
             destination_relative: ".freshell/resources".into(),
         }];
         let mut excluded = provider_credential_sources(&source);
+        if provider == "claude" {
+            for relative in ["projects", "history.jsonl", "debug"] {
+                if let Ok(canonical) = std::fs::canonicalize(source.join(relative)) {
+                    excluded.push(canonical);
+                }
+            }
+        }
         for path in [
             ".claude/.credentials.json",
             ".codex/auth.json",
@@ -3258,6 +3272,98 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
 
     #[cfg(unix)]
     #[test]
+    fn managed_provider_claude_selected_config_root_consumes_resources_and_excludes_default_decoys()
+    {
+        use freshell_platform::claude_inputs::ClaudeInputManifest;
+        use freshell_runtime_protocol::{
+            PreparedProviderInputs, ProviderLaunchContext, ProviderPreparation,
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let selected = owned.path().join("selected-config");
+        let capabilities = owned.path().join("capabilities");
+        for root in [
+            &home.join(".claude"),
+            &cwd,
+            &selected.join("commands"),
+            &capabilities,
+        ] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        std::fs::write(home.join(".claude/settings.json"), "default-decoy").unwrap();
+        std::fs::write(home.join(".claude/CLAUDE.md"), "@../missing-decoy.md").unwrap();
+        std::fs::write(
+            selected.join("settings.json"),
+            r#"{"env":{"ROOT_NONCE":"selected"}}"#,
+        )
+        .unwrap();
+        std::fs::write(selected.join("CLAUDE.md"), "selected-memory").unwrap();
+        std::fs::write(selected.join("commands/resource"), "selected-resource").unwrap();
+        // Use an ESM consumer, independent of the original cwd and HOME.
+        std::fs::write(selected.join("commands/probe.mjs"), "import {readFileSync} from 'node:fs';process.stdout.write(readFileSync(new URL('./resource',import.meta.url)))").unwrap();
+        let manifest = ClaudeInputManifest {
+            version: 1,
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            workspace: cwd.clone(),
+            config_root: Some(selected.clone()),
+            plugin_dirs: vec![],
+        };
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+            mcp_capability: None,
+            config: vec![],
+            prepared_inputs: None,
+        };
+        let stage = stage_provider_root(
+            &capabilities,
+            "grant-claude-selected-root",
+            "claude",
+            &home,
+            &[],
+            OpencodeEphemeralInput {
+                launch_context: Some(&context),
+                claude_manifest: Some(&manifest),
+                cwd: Some(&cwd),
+                workspace: Some(&cwd),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("unselected default HOME memory must not be traversed");
+        let inputs: PreparedProviderInputs = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/prepared-inputs.json")).unwrap(),
+        )
+        .unwrap();
+        let commands = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| mount.logical_destination == "/home/freshell/provider/.claude/commands")
+            .expect("the selected user commands must enter native writable config HOME");
+        let output = std::process::Command::new("node")
+            .current_dir(&cwd)
+            .arg(stage.join(&commands.stage_relative_path).join("probe.mjs"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"selected-resource");
+        assert!(inputs.config_binds.iter().any(
+            |bind| bind.logical_destination == "/home/freshell/provider/.claude/settings.json"
+        ));
+        assert!(!inputs
+            .config_binds
+            .iter()
+            .any(|bind| bind.logical_destination
+                == home.join(".claude/settings.json").to_str().unwrap()));
+        assert_eq!(
+            std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+            "default-decoy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn managed_provider_claude_memory_private_alias_is_rejected_before_publication() {
         use freshell_runtime_protocol::{ProviderLaunchContext, ProviderPreparation};
         let owned = tempfile::tempdir().unwrap();
@@ -4473,22 +4579,24 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         };
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("original-home");
+        let selected = owned.path().join("selected-config");
         let wrong = owned.path().join("current-home");
         let workspace = owned.path().join("workspace");
         for path in [
-            &home.join(".claude/skills/probe"),
+            &selected.join("skills/probe"),
+            &home,
             &wrong.join(".claude"),
             &workspace,
         ] {
             std::fs::create_dir_all(path).unwrap();
         }
         std::fs::write(
-            home.join(".claude/settings.json"),
+            selected.join("settings.json"),
             r#"{"env":{"CLAUDE_SELECTED":"original"}}"#,
         )
         .unwrap();
         std::fs::write(
-            home.join(".claude/skills/probe/resource"),
+            selected.join("skills/probe/resource"),
             b"retained-original-resource",
         )
         .unwrap();
@@ -4507,6 +4615,14 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             config: vec![],
             prepared_inputs: None,
         };
+        let manifest = freshell_platform::claude_inputs::ClaudeInputManifest {
+            version: 1,
+            original_home: home.clone(),
+            cwd: workspace.clone(),
+            workspace: workspace.clone(),
+            config_root: Some(selected.clone()),
+            plugin_dirs: vec![],
+        };
         let prior = store
             .issue(
                 soul.clone(),
@@ -4514,6 +4630,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 "http://host.docker.internal:4000".into(),
                 Some(("claude", &home, &context.config)),
                 OpencodeEphemeralInput {
+                    claude_manifest: Some(&manifest),
                     cwd: Some(&workspace),
                     workspace: Some(&workspace),
                     launch_context: Some(&context),
@@ -4540,7 +4657,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         )
         .await
         .expect("replacement must select recorded original Claude sources");
-        std::fs::remove_file(home.join(".claude/settings.json")).unwrap();
+        std::fs::remove_file(selected.join("settings.json")).unwrap();
         let repeated = apply_prepared_callback(
             &callback,
             "fixture-control",

@@ -9,6 +9,8 @@ pub struct ClaudeInputManifest {
     pub original_home: PathBuf,
     pub cwd: PathBuf,
     pub workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_root: Option<PathBuf>,
     pub plugin_dirs: Vec<PathBuf>,
 }
 impl ClaudeInputManifest {
@@ -20,6 +22,7 @@ impl ClaudeInputManifest {
         }
         for path in [&self.original_home, &self.cwd, &self.workspace]
             .into_iter()
+            .chain(self.config_root.iter())
             .chain(&self.plugin_dirs)
         {
             if !path.is_absolute()
@@ -32,6 +35,16 @@ impl ClaudeInputManifest {
         Ok(())
     }
     pub fn runtime_path(&self, logical: &Path) -> PathBuf {
+        if let Some(root) = &self.config_root {
+            if let Ok(relative) = logical.strip_prefix(root) {
+                return Path::new("/home/freshell/provider/.claude").join(relative);
+            }
+        }
         crate::codex_inputs::runtime_path(&self.original_home, logical)
+    }
+    pub fn config_root(&self) -> PathBuf {
+        self.config_root
+            .clone()
+            .unwrap_or_else(|| self.original_home.join(".claude"))
     }
 }

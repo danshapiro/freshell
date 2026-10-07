@@ -15,6 +15,7 @@ pub(super) fn prepare(
         original_home: home.into(),
         cwd: cwd.into(),
         workspace: workspace.into(),
+        config_root: None,
         plugin_dirs: vec![],
     });
     manifest.validate().map_err(str::to_string)?;
@@ -22,14 +23,31 @@ pub(super) fn prepare(
     let mut resources = Vec::new();
     let mut memory = Vec::new();
     let mut bases: Vec<PathBuf> = manifest.cwd.ancestors().map(Path::to_path_buf).collect();
-    bases.push(manifest.original_home.clone());
     bases.sort();
     bases.dedup();
-    let mut settings_bases = vec![
-        manifest.original_home.clone(),
-        manifest.cwd.clone(),
-        manifest.workspace.clone(),
-    ];
+    let config_root = manifest.config_root();
+    let user_settings = config_root.join("settings.json");
+    if optional(&user_settings)? {
+        configurations.push((user_settings.clone(), canonical(&user_settings)?));
+    }
+    for relative in [
+        "CLAUDE.md",
+        "rules",
+        "skills",
+        "commands",
+        "agents",
+        "hooks",
+        "plugins",
+    ] {
+        let logical = config_root.join(relative);
+        if optional(&logical)? {
+            if relative == "CLAUDE.md" {
+                memory.push(logical.clone());
+            }
+            resources.push(logical);
+        }
+    }
+    let mut settings_bases = vec![manifest.cwd.clone(), manifest.workspace.clone()];
     settings_bases.sort();
     settings_bases.dedup();
     for base in settings_bases {

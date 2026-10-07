@@ -258,6 +258,13 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 let home = std::env::var_os("HOME")
                     .map(std::path::PathBuf::from)
                     .ok_or("original Claude HOME is unavailable")?;
+                let original = |name: &str| {
+                    request
+                        .env
+                        .get(name)
+                        .cloned()
+                        .or_else(|| std::env::var(name).ok())
+                };
                 let context = crate::managed_provider_references::claude::prepare_managed(
                     crate::managed_provider_references::claude::ClaudePreparation {
                         reservation_provider: "claude",
@@ -267,6 +274,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                         home: &home,
                         cwd: &cwd,
                         workspace: &workspace,
+                        original: &original,
                         args: &args,
                         plugins: &[],
                         references: &provider_secret_references,

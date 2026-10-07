@@ -11,6 +11,7 @@ pub(crate) struct ClaudePreparation<'a> {
     pub home: &'a Path,
     pub cwd: &'a Path,
     pub workspace: &'a Path,
+    pub original: &'a (dyn Fn(&str) -> Option<String> + Sync),
     pub args: &'a [String],
     pub plugins: &'a [String],
     pub references: &'a [ProviderSecretReference],
@@ -52,6 +53,11 @@ pub(crate) async fn prepare_managed(
         original_home: request.home.into(),
         cwd: request.cwd.into(),
         workspace: request.workspace.into(),
+        config_root: Some(selected_config_root(
+            request.home,
+            request.cwd,
+            request.original,
+        )?),
         plugin_dirs,
     };
     manifest.validate().map_err(str::to_string)?;
@@ -92,4 +98,81 @@ pub(crate) async fn prepare_managed(
             ..Default::default()
         },
     )
+}
+
+fn selected_config_root(
+    home: &Path,
+    cwd: &Path,
+    original: &dyn Fn(&str) -> Option<String>,
+) -> Result<std::path::PathBuf, String> {
+    use unicode_normalization::UnicodeNormalization;
+    let selected = original("CLAUDE_CONFIG_DIR").map(Ok).unwrap_or_else(|| {
+        home.join(".claude")
+            .to_str()
+            .map(str::to_owned)
+            .ok_or("Claude original configuration directory is not UTF-8")
+    })?;
+    if selected.len() > 64 * 1024 || selected.chars().any(char::is_control) {
+        return Err("Claude selected configuration directory profile is invalid".into());
+    }
+    let mut normalized = String::new();
+    for character in selected.nfc() {
+        if normalized.len() + character.len_utf8() > 64 * 1024 {
+            return Err("Claude normalized configuration directory profile exceeded".into());
+        }
+        normalized.push(character);
+    }
+    let path = Path::new(&normalized);
+    Ok(freshell_platform::opencode_config::lexical_path(
+        &if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        },
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_provider_claude_config_root_keeps_native_cwd_empty_tilde_and_unicode_selection() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let selected = cwd.join("caf\u{e9}");
+        for root in [
+            &home.join(".claude"),
+            &cwd,
+            &selected,
+            &cwd.join("~/literal"),
+        ] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("resource"), "native-selected-resource").unwrap();
+        }
+        for selector in [
+            None,
+            Some(""),
+            Some("./caf\u{65}\u{301}"),
+            Some("~/literal"),
+        ] {
+            let original = |_: &str| selector.map(str::to_string);
+            let root = selected_config_root(&home, &cwd, &original).unwrap();
+            assert_eq!(
+                std::fs::read(root.join("resource")).unwrap(),
+                b"native-selected-resource"
+            );
+            if selector == Some("") {
+                assert_eq!(root, cwd);
+            }
+            if selector == Some("~/literal") {
+                assert_eq!(root, cwd.join("~/literal"));
+            }
+        }
+        let invalid = |_: &str| Some("bad\npath".into());
+        assert!(selected_config_root(&home, &cwd, &invalid).is_err());
+        let oversized = |_: &str| Some("a".repeat(64 * 1024 + 1));
+        assert!(selected_config_root(&home, &cwd, &oversized).is_err());
+    }
 }
