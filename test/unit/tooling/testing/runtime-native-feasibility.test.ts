@@ -51,6 +51,34 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(request.params.fixture).toBeUndefined()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it('captures current provider-owned terminal signals before a startup refusal tears down the enclosure', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-signal-failure-'))
+    const source = path.join(directory, 'preferences.json')
+    fs.writeFileSync(source, '{}')
+    const records = new Map<string, unknown>()
+    const capture = vi.fn(async (_container: string, uid: string) => {
+      expect(uid).toBe('65534:0')
+      return JSON.stringify({ processes: [{ pid: 7, signals: [] }] })
+    })
+    let now = 0
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now += 60_000)
+    const harness = { testRoot: directory, startSupervisor: async () => ({}),
+      writeArtifact: (name: string, value: unknown) => records.set(name, value),
+      adminOk: async (_supervisor: unknown, request: any) => {
+        if (request.method === 'launch') return { data: { view: { containerId: 'owned-native-container', recoveryState: 'live' } } }
+        if (request.method === 'inventory') return { data: [] }
+        return { data: {} }
+      }, execOwnedContainerAsExact: capture,
+    } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
+    try {
+      await expect(executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, 'create'))
+        .rejects.toThrow('terminal Claude current post-load observation missing')
+      expect(capture).toHaveBeenCalledOnce()
+      expect(capture.mock.calls[0]?.[0]).toBe('owned-native-container')
+      expect(records.get('claude-create-signal-native-private.json')).toEqual({ processes: [{ pid: 7, signals: [] }] })
+    } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['death', 'published', 'cached', 'redispatch'])('protects the native post-effect observation boundary (%s)', async (fault) => {
     const publishedOutcome = fault === 'published'
     const recover = fault === 'cached' || fault === 'redispatch'

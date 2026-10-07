@@ -461,6 +461,29 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   harness.writeArtifact(`${scenario}-current-view.json`, view)
+  const nativeSignals = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId,
+    '65534:0', ['python3', '-c', String.raw`
+import pathlib,json,os,hashlib,base64
+selected=pathlib.Path('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe')
+expected=hashlib.sha256(selected.read_bytes()).hexdigest();processes=[]
+for p in pathlib.Path('/proc').iterdir():
+ if not p.name.isdigit():continue
+ try:
+  if hashlib.sha256((p/'exe').read_bytes()).hexdigest()!=expected:continue
+  env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(b'\0') if b'=' in v)
+  directory=env.get('FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR');signals=[]
+  for name in ['session-start.json','statusline-loaded.json']:
+   try:
+    f=pathlib.Path(directory)/name if directory else None
+    raw=f.read_bytes() if f else None
+    if raw is not None and len(raw)>65536:signals.append({'name':name,'error':'oversized'});continue
+    signals.append({'name':name,'bytesBase64':base64.b64encode(raw).decode() if raw is not None else None,'sha256':hashlib.sha256(raw).hexdigest() if raw is not None else None})
+   except OSError as e:signals.append({'name':name,'errno':e.errno})
+  processes.append({'pid':int(p.name),'executableSha256':expected,'launch':json.loads(env['FRESHELL_NATIVE_IDENTITY_LAUNCH']) if env.get('FRESHELL_NATIVE_IDENTITY_LAUNCH') else None,'signalDir':directory,'signals':signals})
+ except (OSError,ValueError):continue
+print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':processes}))
+`]))
+  harness.writeArtifact(`${scenario}-signal-native-private.json`, nativeSignals)
   const observation = view.nativeIdentityObservation
   if (!observation || view.recoveryState !== 'live' || observation.source !== 'claude_native_event'
     || observation.nativeSessionId !== nativeRoot || view.nativeSessionId !== nativeRoot
