@@ -37,7 +37,7 @@ export function createManagedRuntimeBrowserRig(...args: ConstructorParameters<ty
 
 /** Observe the exact current address and revisions before sending the finite Stop request. */
 export async function stopManagedRuntimeSoul(rig: ManagedFixtureRig, soulId: string) {
-  const rows = (await rig.inventory()).filter(row => row.soulId === soulId)
+  const rows = (await rig.inventory()).filter(row => row.soulId === soulId && row.launchState !== 'stopped')
   if (rows.length !== 1) throw new Error('exact Stop soul is absent or ambiguous')
   const current = rows[0]
   return rig.stopRuntimeSoul(rig.exactRuntimeHandle(current), await rig.controlEpoch(), current.intentRevision)

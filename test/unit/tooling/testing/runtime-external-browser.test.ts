@@ -17,6 +17,7 @@ import { playwright, campaignGate } from '../../../../scripts/testing/runtime-la
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
 import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type SupervisorInstance, type Phase3BrowserObservation } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
+import { stopManagedRuntimeSoul } from '../../../e2e-browser/helpers/managed-runtime.js'
 
 beforeEach(() => execute.mockReset())
 
@@ -985,7 +986,7 @@ describe('closed external owner control', () => {
     const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
       await control(JSON.parse(String(init.body)))), { status: 200 }))
     const rig = new runner.ExternalManagedRuntimeRig(context, transport)
-    await expect(rig.stopRuntimeSoul(handle, 4, 7)).resolves.toMatchObject({ outcome: 'verified_empty',
+    await expect(stopManagedRuntimeSoul(rig, handle.soulId)).resolves.toMatchObject({ outcome: 'verified_empty',
       view: { soulId: handle.soulId, intentRevision: 8, desiredState: 'stopped' } })
     expect(admin).toHaveBeenCalledExactlyOnceWith(owned.supervisor, owned.runtime.stopBody(handle.soulId, 4, 7))
     await expect(control({ ...request, action: 'stop-soul', handle })).rejects.toThrow(/revision|epoch/)
@@ -993,6 +994,12 @@ describe('closed external owner control', () => {
       expectedControlEpoch: 4, expectedIntentRevision: 6 })).rejects.toThrow(/revision/)
     await expect(control({ ...request, operationId: 'stale-epoch', action: 'stop-soul', handle,
       expectedControlEpoch: 3, expectedIntentRevision: 7 })).rejects.toThrow(/epoch/)
+    for (const launchState of ['running', 'starting', 'prepared', 'unknown']) {
+      inventory.mockResolvedValue([{ ...view, incarnationId: 'uncertain-peer', launchState }, view])
+      await expect(stopManagedRuntimeSoul(rig, handle.soulId)).rejects.toThrow(/ambiguous/)
+    }
+    inventory.mockResolvedValue([{ ...view, launchState: 'stopped', desiredState: 'stopped' }])
+    await expect(stopManagedRuntimeSoul(rig, handle.soulId)).rejects.toThrow(/absent/)
     inventory.mockResolvedValue([{ ...view, incarnationId: 'replacement-incarnation' }])
     await expect(control({ ...request, operationId: 'stale-address', action: 'stop-soul', handle,
       expectedControlEpoch: 4, expectedIntentRevision: 7 })).rejects.toThrow(/current/)
