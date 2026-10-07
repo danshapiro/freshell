@@ -881,6 +881,16 @@ rl.on('line', (line) => {
       // Unknown requestId: reject without resolving any callback.
       st.controlChain = (st.controlChain ?? Promise.resolve()).then(async () => {
         const current = st.pendingPermissions?.get(String(req.requestId))
+        if (current?.nativeCheckpoint && (!st.nativeReady
+          || current.nativeBinding.queryGeneration !== st.queryGeneration
+          || await nativeProfileDigest(st.createRequest, st.settings) !== current.nativeCheckpoint.profileDigest
+          || (req.decision.behavior === 'allow'
+            && (req.decision.updatedInput == null
+              || nativeInputDigest(req.decision.updatedInput) !== current.nativeCheckpoint.inputDigest)))) {
+          emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId,
+            ok: false, message: 'current checkpoint input or profile changed' })
+          return
+        }
         if (current?.nativeCheckpoint && !await st.nativeStore.beginDecision(current.nativeBinding.nativeRequestId)) {
           emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'current checkpoint decision is unavailable' })
           return

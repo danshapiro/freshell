@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createNativeSessionChannel, inspectNativeDeferredCheckpoint } from '../../../crates/freshell-claude-sidecar/native-session-channel.mjs'
@@ -152,7 +152,7 @@ describe('native solo deferred checkpoint inspection', () => {
 })
 
 describe('production sidecar native checkpoint continuation', () => {
-  it.each(['current', 'current-reordered', 'wrong-input', 'dispatching'])('releases only a trusted recoverable checkpoint after explicit current control (%s)', async (scenario) => {
+  it.each(['current', 'current-reordered', 'current-changed-decision-input', 'current-missing-decision-input', 'current-changed-profile', 'wrong-input', 'dispatching'])('releases only a trusted recoverable checkpoint after explicit current control (%s)', async (scenario) => {
     const directory = await mkdtemp(join(tmpdir(), 'sidecar-explicit-resume-'))
     await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
     let worker = checkpointSidecar(directory, 'native-old')
@@ -190,6 +190,21 @@ describe('production sidecar native checkpoint continuation', () => {
         expect(card.nativeCheckpoint).toEqual(oldCard.nativeCheckpoint)
         expect(card.nativeRequestId).toBe('native-new')
         expect(card.nativeBinding.queryGeneration).toBe(1)
+        if (scenario.startsWith('current-') && scenario !== 'current-reordered') {
+          const profile = join(directory, '.claude', 'settings.json')
+          if (scenario === 'current-changed-profile') {
+            await mkdir(join(directory, '.claude'), { recursive: true })
+            await writeFile(profile, JSON.stringify({ permissions: { allow: ['Bash'] } }))
+          }
+          worker.send({ type: 'permission.respond', sessionId: current.sessionId, requestId: card.requestId,
+            decision: { behavior: 'allow', updatedInput: scenario === 'current-changed-decision-input'
+              ? { command: 'changed operation' } : scenario === 'current-missing-decision-input' ? undefined : card.tool.input } })
+          expect((await worker.wait('sdk.permission.dispatch')).ok).toBe(false)
+          expect(worker.frames.some((frame) => frame.type === 'sdk.tool.result')).toBe(false)
+          const parked = JSON.parse(await readFile(join(directory, '.freshell-checkpoint-' + root + '.json'), 'utf8'))
+          expect(parked.phase).toBe('approval_waiting')
+          if (scenario === 'current-changed-profile') await rm(profile)
+        }
         worker.send({ type: 'permission.respond', sessionId: current.sessionId, requestId: card.requestId,
           decision: { behavior: 'deny', message: 'owned denial after recovery' } })
         expect((await worker.wait('sdk.tool.result')).content[0].is_error).toBe(true)
