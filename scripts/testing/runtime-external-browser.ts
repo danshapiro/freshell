@@ -380,6 +380,7 @@ export class OwnedManagedRuntimeRelay {
 
   constructor(private readonly options: {
     token: string; backend: () => string; control: (request: unknown) => Promise<unknown>
+    retryResponse?: (observed: { soulId: string; requestId: string; response: unknown }) => void
   }) {}
 
   get localUrl(): string {
@@ -422,15 +423,24 @@ export class OwnedManagedRuntimeRelay {
     return pathname === '/' || pathname === '/index.html' || pathname === '/favicon.ico'
       || pathname === '/__managed_runtime' || pathname === '/ws'
       || ['/assets/', '/icons/', '/fonts/'].some((prefix) => pathname.startsWith(prefix))
-      || ['/api/health', '/api/server-info', '/api/settings', '/api/tabs', '/api/panes', '/api/sessions',
-        '/api/terminals', '/api/fresh-agent', '/api/runtime', '/api/providers', '/api/layout', '/api/auth',
-      ].some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`) || pathname.startsWith(`${prefix}?`))
+      || pathname.startsWith('/api/')
   }
 
   private proxyHeaders(request: IncomingMessage, target: URL): http.OutgoingHttpHeaders {
     const headers = { ...request.headers, host: target.host }
     if (headers.origin) headers.origin = target.origin
     return headers
+  }
+
+  private async readOwnerRequest(request: IncomingMessage): Promise<Buffer> {
+    const chunks: Buffer[] = []
+    let length = 0
+    for await (const chunk of request) {
+      length += Buffer.byteLength(chunk)
+      if (length > 64 * 1024) throw new Error('owned request exceeds its bound')
+      chunks.push(Buffer.from(chunk))
+    }
+    return Buffer.concat(chunks)
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -440,15 +450,9 @@ export class OwnedManagedRuntimeRelay {
     if (!this.admittedPath(pathname)) { response.writeHead(404); response.end(); return }
     if (pathname === '/__managed_runtime') {
       if (request.method !== 'POST') { response.writeHead(405); response.end(); return }
-      const chunks: Buffer[] = []
-      let length = 0
-      for await (const chunk of request) {
-        length += Buffer.byteLength(chunk)
-        if (length > 64 * 1024) throw new Error('closed owner request exceeds its bound')
-        chunks.push(Buffer.from(chunk))
-      }
+      const body = await this.readOwnerRequest(request)
       let result: unknown
-      try { result = await this.options.control(JSON.parse(Buffer.concat(chunks).toString('utf8'))) }
+      try { result = await this.options.control(JSON.parse(body.toString('utf8'))) }
       catch {
         response.writeHead(409, { 'content-type': 'application/json' })
         response.end(JSON.stringify({ reason: 'owner_operation_refused' }))
@@ -458,6 +462,16 @@ export class OwnedManagedRuntimeRelay {
       response.end(JSON.stringify(result))
       return
     }
+    const retryPath = request.method === 'POST' && this.options.retryResponse
+      ? /^\/api\/runtime\/souls\/([^/]+)\/retry$/.exec(pathname) : null
+    let retryBody: Buffer | undefined
+    let requestId: string | undefined
+    if (retryPath) {
+      retryBody = await this.readOwnerRequest(request)
+      const parsed = z.object({ requestId: z.string().min(1) }).passthrough().safeParse(JSON.parse(retryBody.toString('utf8')))
+      if (!parsed.success) throw new Error('owned Retry request lacks its exact request ID')
+      requestId = parsed.data.requestId
+    }
     const target = new URL(this.options.backend())
     await new Promise<void>((resolve, reject) => {
       const upstream = http.request(target, {
@@ -465,11 +479,27 @@ export class OwnedManagedRuntimeRelay {
       }, (result) => {
         response.writeHead(result.statusCode ?? 502, result.headers)
         result.once('error', reject)
-        result.once('end', resolve)
+        if (retryPath && requestId && result.statusCode === 200) {
+          const chunks: Buffer[] = []
+          let length = 0
+          result.on('data', (chunk: Buffer) => {
+            length += chunk.length
+            if (length > 1024 * 1024) result.destroy(new Error('owned Retry response exceeds its bound'))
+            else chunks.push(chunk)
+          })
+          result.once('end', () => {
+            try {
+              this.options.retryResponse!({ soulId: decodeURIComponent(retryPath[1]), requestId,
+                response: JSON.parse(Buffer.concat(chunks).toString('utf8')) })
+              resolve()
+            } catch { reject(new Error('owned Retry response observation failed')) }
+          })
+        } else result.once('end', resolve)
         result.pipe(response)
       })
       upstream.once('error', reject)
-      request.pipe(upstream)
+      if (retryBody) upstream.end(retryBody)
+      else request.pipe(upstream)
     })
   }
 

@@ -329,6 +329,7 @@ describe('owned stable relay admission and lifetime (transport unit coverage onl
       relay.setOrigin('https://owned.trycloudflare.com')
       const valid = { 'x-auth-token': 'owned-token', Origin: 'https://owned.trycloudflare.com' }
       expect((await get(valid)).body).toContain('first-owned-fixture')
+      expect((await get(valid, '/api/search')).body).toContain('first-owned-fixture')
       expect((await get({})).status).toBe(401)
       expect((await get({ ...valid, Origin: 'https://another.trycloudflare.com' })).status).toBe(403)
       expect((await get(valid, '/.freshell/config.json')).status).toBe(404)
@@ -341,6 +342,36 @@ describe('owned stable relay admission and lifetime (transport unit coverage onl
     } finally {
       await relay.stop()
       await Promise.all(servers.map(server => new Promise<void>((resolve) => server.close(() => resolve()))))
+    }
+  })
+  it('observes one real browser Retry response without issuing another transaction', async () => {
+    let transactions = 0
+    const backend = http.createServer(async (request, response) => {
+      for await (const _chunk of request) { /* drain the actual submitted body */ }
+      transactions++
+      response.setHeader('content-type', 'application/json')
+      response.end(JSON.stringify({ view: { soulId: 'owned-retry-soul' }, outcome: 'blocked' }))
+    })
+    await new Promise<void>(resolve => backend.listen(0, '127.0.0.1', resolve))
+    const observed = vi.fn()
+    const relay = new runner.OwnedManagedRuntimeRelay({ token: 'owned-token',
+      backend: () => `http://127.0.0.1:${(backend.address() as AddressInfo).port}`,
+      control: async () => ({}), retryResponse: observed })
+    try {
+      await relay.start()
+      relay.setOrigin('https://owned.trycloudflare.com')
+      const response = await fetch(`${relay.localUrl}/api/runtime/souls/owned-retry-soul/retry`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-auth-token': 'owned-token', Origin: 'https://owned.trycloudflare.com' },
+        body: JSON.stringify({ requestId: 'actual-ui-request', expectedIntentRevision: 3 }),
+      })
+      expect(response.status).toBe(200)
+      await response.json()
+      expect(observed).toHaveBeenCalledExactlyOnceWith({ soulId: 'owned-retry-soul', requestId: 'actual-ui-request',
+        response: { view: { soulId: 'owned-retry-soul' }, outcome: 'blocked' } })
+      expect(transactions).toBe(1)
+    } finally {
+      await relay.stop()
+      await new Promise<void>(resolve => backend.close(() => resolve()))
     }
   })
 })
