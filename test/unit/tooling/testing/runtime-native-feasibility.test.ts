@@ -27,10 +27,19 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
   it('sends terminal Claude through its own real launch route with the selected profile', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-claude-route-'))
-    const launch = vi.fn(async () => { throw new Error('controlled terminal launch boundary') })
+    const launch = vi.fn(async (_supervisor: unknown, request: any) => {
+      expect(request.params.terminal.providerBootstrapFiles).toBeUndefined()
+      const selected = request.params.terminal.providerLaunchContext.config.find((file: any) => file.providerRelativePath === '.claude.json')
+      expect(selected.root).toBe('workspace')
+      const preferences = JSON.parse(fs.readFileSync(path.join(request.params.terminal.cwd, selected.relativePath), 'utf8'))
+      expect(preferences.projects[request.params.terminal.cwd].hasTrustDialogAccepted).toBe(true)
+      throw new Error('controlled terminal launch boundary')
+    })
     const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '', adminOk: launch } as unknown as RuntimeHarness
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({
       name: 'claude/' + name, path: path.join(directory, path.basename(name)), sha256: 'e'.repeat(64) }))
+    fs.writeFileSync(sources[2]!.path, JSON.stringify({ theme: 'dark', hasCompletedOnboarding: true,
+      projects: { [path.join(directory, 'claude-create-workspace')]: { hasTrustDialogAccepted: true } } }))
     try {
       await expect(executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, 'create'))
         .rejects.toThrow('controlled terminal launch boundary')
@@ -38,7 +47,6 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       const request = (launch.mock.calls[0] as any)[1]
       expect(request.params.provider).toBe('claude')
       expect(request.params.terminal.mode).toBe('claude')
-      expect(request.params.terminal.providerBootstrapFiles[0].providerRelativePath).toBe('.claude.json')
       expect(request.params.terminal.resumeSessionId).toBeUndefined()
       expect(request.params.fixture).toBeUndefined()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }

@@ -423,21 +423,30 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   const scenario = `claude-${caseId}`
   const workspace = path.join(harness.testRoot, `${scenario}-workspace`)
   fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
+  // UI preferences are ordinary non-secret configuration. Named Claude
+  // launches project them through the existing configuration copier.
+  const preferencesName = 'native-startup-user.json'
+  fs.copyFileSync(preferences.path, path.join(workspace, preferencesName))
+  fs.chmodSync(path.join(workspace, preferencesName), 0o660)
   const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release',
     env: { FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude' } })
   const soulId = 'soul-' + randomUUID()
   const nativeRoot = randomUUID()
+  const settings = JSON.stringify({ hooks: {
+    SessionStart: [{ hooks: [{ type: 'command', command: 'sh -lc \'d="$HOME/.freshell/session-signals/claude"; n=$(date +%s%N 2>/dev/null); case "$n" in *[!0-9]*|"") n="$(date +%s)000000000";; esac; f="$d/${FRESHELL_TERMINAL_ID:-unknown}__$n-$$"; mkdir -p "$d" && cat > "$f.tmp" && mv "$f.tmp" "$f.json"\' 2>/dev/null || true' }] }],
+    Stop: [{ hooks: [{ type: 'command', command: "printf '%s\\n' '{\"terminalSequence\":\"\\u0007\"}'" }] }],
+  } })
   const request = { method: 'launch', params: { soulId, provider: 'claude', providerStoreId: 'store-' + randomUUID(),
     nativeSessionId: nativeRoot, creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: scenario,
     limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
     terminal: { terminalId: 'native-terminal-' + randomUUID(), streamId: 'native-stream-' + randomUUID(),
-      mode: 'claude', program: 'claude', args: ['--settings', '{}', '--session-id', nativeRoot,
+      mode: 'claude', program: 'claude', args: ['--settings', settings, '--session-id', nativeRoot,
         '--model', 'claude-haiku-4-5-20251001', '--effort', 'low'],
       env: { HOME: '/home/freshell/provider', TERM: 'xterm-256color' },
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
       providerModel: 'claude-haiku-4-5-20251001', providerReasoningEffort: 'low', providerSecretReferences: grants,
-      providerBootstrapFiles: [{ sourcePath: preferences.path, providerRelativePath: '.claude.json' }],
-      providerLaunchContext: { preparation: { claude: { mcp_args: [] } }, config: [] } } } }
+      providerLaunchContext: { preparation: { claude: { mcp_args: [] } }, config: [{ root: 'workspace',
+        relativePath: preferencesName, providerRelativePath: '.claude.json', format: 'json' }] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
   const result = await harness.adminOk(supervisor, request)
   harness.writeArtifact(`${scenario}-launch.json`, result)
