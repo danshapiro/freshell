@@ -19,6 +19,37 @@ const handle = {
 }
 
 describe('owner-side synthetic OpenCode source preparation', () => {
+  it.each(['history', 'excluded'] as const)('reads actual SQLite %s facts only for the registered source root', async mode => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    const lifecycle = vi.spyOn(rig.runtime, 'recordLifecycle')
+    vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    try {
+      const source = await rig.prepareSyntheticOpenCodeSource()
+      const detail = lifecycle.mock.calls.find(([event]) => event === 'source-fixture.prepared')?.[1]
+      const reference = Object.getOwnPropertyDescriptor(detail ?? {}, 'sourceReference')?.value
+      if (typeof reference !== 'string') throw new Error('actual source path required')
+      const database = path.join(reference, 'web-home', '.local/share/opencode/opencode.db')
+      const probe = vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (_container, args) =>
+        execFileSync(process.execPath, args.slice(1).map(arg => arg === '/home/freshell/provider/.local/share/opencode/opencode.db' ? database : arg),
+          { encoding: 'utf8' }))
+      const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha, nativeSessionId: source.rootId }
+      const read = (address: owner.ExactRuntimeHandle) => mode === 'history'
+        ? rig.syntheticOpenCodeHistoryFacts(address) : rig.syntheticOpenCodeExcludedSentinels(address)
+      const facts = await read(current)
+      if (mode === 'history') {
+        expect(facts).toEqual({ sessions: [source.childId, source.grandchildId, source.rootId].sort(),
+          messages: source.baselineMessages, parts: source.baselineParts })
+      } else {
+        expect(facts).toEqual([...owner.EXCLUDED_SOURCE_SENTINELS].sort())
+      }
+      probe.mockClear()
+      await expect(read({ ...current, nativeSessionId: 'foreign-root' })).rejects.toThrow(/registered.*source|source.*root/)
+      expect(probe).not.toHaveBeenCalled()
+    } finally { vi.unstubAllEnvs(); await rig.stop() }
+  })
+
   it('owns source setup and teardown while returning only IDs, digests and observed counts', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
     const lifecycle = vi.spyOn(rig.runtime, 'recordLifecycle')

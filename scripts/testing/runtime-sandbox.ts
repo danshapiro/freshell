@@ -533,6 +533,51 @@ try {
 }
 `
 
+const PROVIDER_HISTORY_DIGESTS = String.raw`
+const { DatabaseSync } = require('node:sqlite');
+const { createHash } = require('node:crypto');
+const db = new DatabaseSync(process.argv[1], { readOnly: true });
+const root = process.argv[2];
+const hash = (value) => createHash('sha256').update(value).digest('hex');
+try {
+  db.exec('PRAGMA query_only = ON; BEGIN;');
+  const descendants = db.prepare('WITH RECURSIVE ids(id) AS (SELECT id FROM session WHERE id = ? UNION ALL SELECT child.id FROM session child JOIN ids ON child.parent_id = ids.id) SELECT id FROM ids ORDER BY id').all(root).map((row) => row.id);
+  const messages = db.prepare('SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created, id');
+  const parts = db.prepare('SELECT id, data FROM part WHERE session_id = ? ORDER BY time_created, id');
+  const output = { sessions: descendants, messages: {}, parts: {} };
+  for (const id of descendants) {
+    for (const row of messages.all(id)) output.messages[row.id] = hash(row.data);
+    for (const row of parts.all(id)) output.parts[row.id] = hash(row.data);
+  }
+  db.exec('COMMIT;');
+  process.stdout.write(JSON.stringify(output));
+} finally { db.close(); }
+`
+
+const PROVIDER_SENTINEL_SCAN = String.raw`
+const { DatabaseSync } = require('node:sqlite');
+const sentinels = JSON.parse(process.argv[2]);
+const quote = (value) => '"' + value.replaceAll('"', '""') + '"';
+const db = new DatabaseSync(process.argv[1], { readOnly: true });
+const matches = new Set();
+try {
+  db.exec('PRAGMA query_only = ON; BEGIN;');
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all();
+  for (const { name } of tables) {
+    const columns = db.prepare('PRAGMA table_info(' + quote(name) + ')').all();
+    const rows = db.prepare('SELECT * FROM ' + quote(name)).all();
+    for (const row of rows) {
+      for (const value of Object.values(row)) {
+        if (typeof value !== 'string') continue;
+        for (const sentinel of sentinels) if (value.includes(sentinel)) matches.add(sentinel);
+      }
+    }
+  }
+  db.exec('COMMIT;');
+  process.stdout.write(JSON.stringify([...matches].sort()));
+} finally { db.close(); }
+`
+
 export type RuntimeHostFacts = {
   workerPid: number
   workerLaunchCount: number
@@ -549,6 +594,13 @@ export const SyntheticOpenCodeSourceFactsSchema = z.object({
 }).strict()
 export type SyntheticOpenCodeSourceFacts = z.infer<typeof SyntheticOpenCodeSourceFactsSchema>
 
+export const SyntheticOpenCodeHistoryFactsSchema = z.object({
+  sessions: z.array(z.string().min(1)),
+  messages: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/)),
+  parts: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/)),
+}).strict()
+export type SyntheticOpenCodeHistoryFacts = z.infer<typeof SyntheticOpenCodeHistoryFactsSchema>
+
 const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
@@ -562,6 +614,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'native-challenge-register',
     'synthetic-history-challenge',
     'synthetic-source-facts',
+    'synthetic-source-history', 'synthetic-source-exclusions',
     'retained-start', 'retained-status', 'retained-observed', 'retained-finish',
   ]),
   handle: z.object({
@@ -2604,6 +2657,27 @@ export class ManagedRuntimeOwner {
         nonce, baselineMessages: Object.fromEntries(source.baselineMessages), baselineParts: Object.fromEntries(source.baselineParts),
         rootMessageCount })
     } finally { db.close() }
+  }
+
+  private async assertSyntheticOpenCodeSourceHandle(handle: ExactRuntimeHandle): Promise<void> {
+    await this.assertCurrentHandle(handle)
+    if (!this.syntheticSource || handle.nativeSessionId !== this.syntheticSource.source.rootId) {
+      throw new Error('registered synthetic source root differs from the exact runtime')
+    }
+  }
+
+  async syntheticOpenCodeHistoryFacts(handle: ExactRuntimeHandle): Promise<SyntheticOpenCodeHistoryFacts> {
+    await this.assertSyntheticOpenCodeSourceHandle(handle)
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', PROVIDER_HISTORY_DIGESTS,
+      '/home/freshell/provider/.local/share/opencode/opencode.db', handle.nativeSessionId])
+    return SyntheticOpenCodeHistoryFactsSchema.parse(JSON.parse(raw))
+  }
+
+  async syntheticOpenCodeExcludedSentinels(handle: ExactRuntimeHandle): Promise<string[]> {
+    await this.assertSyntheticOpenCodeSourceHandle(handle)
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', PROVIDER_SENTINEL_SCAN,
+      '/home/freshell/provider/.local/share/opencode/opencode.db', JSON.stringify(EXCLUDED_SOURCE_SENTINELS)])
+    return z.array(z.enum(EXCLUDED_SOURCE_SENTINELS)).parse(JSON.parse(raw))
   }
 
   async start(): Promise<RuntimeWebInfo> {

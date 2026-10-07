@@ -629,6 +629,24 @@ describe('closed external owner control', () => {
     read.mockResolvedValue({ ...facts, rootMessageCount: -1 })
     await expect(rig.syntheticOpenCodeSourceFacts()).rejects.toThrow(/invalid/)
   })
+  it('transports fixed source history and exclusions using the exact current native address', async () => {
+    const { owned, context } = fixture()
+    const address = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-source-soul',
+      incarnationId: 'owned-source-incarnation', containerId: 'c'.repeat(64), hostBootId: 'owned-source-boot', nativeSessionId: 'owned-source-root' }
+    const history = { sessions: [address.nativeSessionId], messages: { 'owned-message': 'a'.repeat(64) }, parts: { 'owned-part': 'b'.repeat(64) } }
+    const readHistory = vi.spyOn(owned, 'syntheticOpenCodeHistoryFacts').mockResolvedValue(history)
+    const readExcluded = vi.spyOn(owned, 'syntheticOpenCodeExcludedSentinels').mockResolvedValue([])
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.syntheticOpenCodeHistoryFacts(address)).resolves.toEqual(history)
+    await expect(rig.syntheticOpenCodeExcludedSentinels(address)).resolves.toEqual([])
+    expect(readHistory).toHaveBeenCalledWith(address)
+    expect(readExcluded).toHaveBeenCalledWith(address)
+    readHistory.mockResolvedValue({ ...history, messages: { 'owned-message': 'truncated-digest' } })
+    await expect(rig.syntheticOpenCodeHistoryFacts(address)).rejects.toThrow(/invalid/)
+  })
   it('routes exact inventory observations and binds the reply to run, candidate and operation', async () => {
     const { owned, context, inventory, request } = fixture()
     const control = runner.createExternalRuntimeControl(owned, context)

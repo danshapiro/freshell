@@ -8,6 +8,7 @@ export {
   P2_OPENCODE_VERSION, P2_OPENCODE_MODEL,
   type ManagedRuntimeView, type ManagedOpenCodeAdoptionStatus,
   type ExactRuntimeHandle, type FixtureNativeState, type RuntimeHostFacts, type NativeToolEvidence,
+  type SyntheticOpenCodeSourceFacts,
 } from '../../../scripts/testing/runtime-sandbox.js'
 
 /** The browser fixture supplies its owned web process to the shared owner. */
