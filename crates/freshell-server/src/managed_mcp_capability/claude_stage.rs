@@ -8,6 +8,7 @@ pub(super) fn prepare(
     cwd: &Path,
     workspace: &Path,
     accepted: Option<&ClaudeInputManifest>,
+    excluded: &[PathBuf],
 ) -> Result<Preparation, String> {
     let manifest = accepted.cloned().unwrap_or_else(|| ClaudeInputManifest {
         version: 1,
@@ -19,6 +20,7 @@ pub(super) fn prepare(
     manifest.validate().map_err(str::to_string)?;
     let mut configurations = Vec::new();
     let mut resources = Vec::new();
+    let mut memory = Vec::new();
     let mut bases: Vec<PathBuf> = manifest.cwd.ancestors().map(Path::to_path_buf).collect();
     bases.push(manifest.original_home.clone());
     bases.sort();
@@ -52,6 +54,12 @@ pub(super) fn prepare(
         ] {
             let logical = base.join(relative);
             if optional(&logical)? {
+                if matches!(
+                    relative,
+                    "CLAUDE.md" | "CLAUDE.local.md" | ".claude/CLAUDE.md"
+                ) {
+                    memory.push(logical.clone());
+                }
                 resources.push(logical);
             }
         }
@@ -59,6 +67,13 @@ pub(super) fn prepare(
     for plugin in &manifest.plugin_dirs {
         canonical(plugin)?; // Explicit selections may never be silently omitted.
         resources.push(plugin.clone());
+    }
+    for imported in super::claude_memory::imports(&manifest.original_home, &memory, excluded).inspect_err(|error| {
+        tracing::warn!(event="provider.inputs.preparation.blocked",provider="claude",stage="controller",operation="select_memory_imports",reason=%error,"Selected Claude memory imports could not be prepared");
+    })? {
+        if !resources.iter().any(|root| imported.starts_with(root)) {
+            resources.push(imported);
+        }
     }
     prepare_selected(
         "claude",

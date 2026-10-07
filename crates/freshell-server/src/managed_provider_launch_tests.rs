@@ -259,11 +259,29 @@ async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prep
         .unwrap()
         .success());
     let receipt = workspace.join("claude-consumed.json");
+    let instructions_receipt = workspace.join("claude-import-consumed.json");
+    let memory = format!(
+        "closed-claude-global-memory\n@../imported-memory.md\n@../selected-plugin/relative-memory.md\n@~/selected-plugin/home-memory.md\n@{}/absolute-memory.md\n@../selected-plugin/spaced\\ memory.md\n`@../selected-plugin/ignored-inline.md`\n```\n@../selected-plugin/ignored-fence.md\n```\n@\"../selected-plugin/ignored-quoted.md\"\n",
+        plugin.display()
+    ).into_bytes();
     std::fs::write(
-        home.join(".claude/CLAUDE.md"),
-        b"closed-claude-global-memory",
+        home.join("imported-memory.md"),
+        b"closed-claude-imported-memory\n@./selected-plugin/nested-memory.md\n",
     )
     .unwrap();
+    std::fs::write(home.join(".claude/CLAUDE.md"), &memory).unwrap();
+    for name in [
+        "relative-memory.md",
+        "home-memory.md",
+        "absolute-memory.md",
+        "spaced memory.md",
+        "nested-memory.md",
+        "ignored-inline.md",
+        "ignored-fence.md",
+        "ignored-quoted.md",
+    ] {
+        std::fs::write(plugin.join(name), format!("closed-native-{name}")).unwrap();
+    }
     let settings = r#"{"env":{"CLAUDE_SELECTED_NONCE":"closed-selected-settings"}}"#;
     std::fs::write(home.join(".claude/settings.json"), settings).unwrap();
     std::fs::write(plugin.join("skills/probe/SKILL.md"),"---\nname: closed-plugin-probe\ndescription: selected complete native plugin\n---\nUse the adjacent resources.\n").unwrap();
@@ -295,6 +313,20 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
 });
 "#;
     std::fs::write(plugin.join("scripts/consume.cjs"), consumer).unwrap();
+    let instructions_consumer = r#"const fs=require('node:fs'),crypto=require('node:crypto'),path=require('node:path');
+let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
+ const input=JSON.parse(raw),name=path.basename(input.file_path||''),event=input.hook_event_name==='InstructionsLoaded';
+ const names=['imported-memory.md','relative-memory.md','home-memory.md','absolute-memory.md','spaced memory.md','nested-memory.md'];
+ const selected=event&&names.includes(name)?{name,digest:crypto.createHash('sha256').update(fs.readFileSync(input.file_path)).digest('hex')}:null;
+ fs.appendFileSync(process.argv[2]+'.events',JSON.stringify({event,global:input.file_path===process.env.HOME+'/.claude/CLAUDE.md',ignored:event&&name.startsWith('ignored-'),selected})+'\n');
+ if(event&&input.file_path===process.env.HOME+'/imported-memory.md')fs.writeFileSync(process.argv[2],JSON.stringify({nativeImport:true,digest:selected.digest}));
+});
+"#;
+    std::fs::write(
+        plugin.join("scripts/instructions.cjs"),
+        instructions_consumer,
+    )
+    .unwrap();
     let manifest = json!({"name":"closed-selected-plugin","version":"1.0.0","skills":"./skills","hooks":"./hooks/hooks.json"});
     std::fs::write(
         plugin.join(".claude-plugin/plugin.json"),
@@ -303,6 +335,8 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
     .unwrap();
     let key_digest = format!("{:x}", Sha256::digest(b"synthetic-claude-onecli-value"));
     let hooks = json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":format!("node \"${{CLAUDE_PLUGIN_ROOT}}/scripts/consume.cjs\" {} {}",serde_json::to_string(receipt.to_str().unwrap()).unwrap(),key_digest),"timeout":10}]}]}});
+    let mut hooks = hooks;
+    hooks["hooks"]["InstructionsLoaded"] = json!([{"hooks":[{"type":"command","command":format!("node \"${{CLAUDE_PLUGIN_ROOT}}/scripts/instructions.cjs\" {}",serde_json::to_string(instructions_receipt.to_str().unwrap()).unwrap()),"timeout":10}]}]);
     std::fs::write(
         plugin.join("hooks/hooks.json"),
         serde_json::to_vec(&hooks).unwrap(),
@@ -460,7 +494,63 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
         .ok()
     }
     let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-    let expected = json!({"hook":true,"physicalHome":"/home/freshell/provider","settings":true,"authenticated":true,"scopedAlias":true,"onecli":true,"memory":hash(b"closed-claude-global-memory"),"skill":hash(std::fs::read(plugin.join("skills/probe/SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")});
+    let expected = json!({"hook":true,"physicalHome":"/home/freshell/provider","settings":true,"authenticated":true,"scopedAlias":true,"onecli":true,"memory":hash(&memory),"skill":hash(std::fs::read(plugin.join("skills/probe/SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")});
+    let imported_bytes = std::fs::read(home.join("imported-memory.md")).unwrap();
+    let mut expected_imports = serde_json::Map::new();
+    expected_imports.insert("imported-memory.md".into(), json!(hash(&imported_bytes)));
+    for name in [
+        "relative-memory.md",
+        "home-memory.md",
+        "absolute-memory.md",
+        "spaced memory.md",
+        "nested-memory.md",
+    ] {
+        expected_imports.insert(
+            name.into(),
+            json!(hash(std::fs::read(plugin.join(name)).unwrap().as_slice())),
+        );
+    }
+    let expected_imports = Value::Object(expected_imports);
+    let instructions_events = instructions_receipt.with_extension("json.events");
+    fn instruction_events(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("complete native instruction event"))
+            .collect()
+    }
+    async fn imported_graph(path: &Path, expected: &Value) {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let mut loaded = serde_json::Map::new();
+                for event in instruction_events(path) {
+                    assert_ne!(
+                        event["ignored"],
+                        json!(true),
+                        "native code spans/fences/quoted tokens must remain unselected"
+                    );
+                    if let Some(name) = event["selected"]["name"].as_str() {
+                        loaded.insert(name.into(), event["selected"]["digest"].clone());
+                    }
+                }
+                if Value::Object(loaded.clone()) == *expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "native must load the complete original-form Markdown import graph; observed {:?}",
+            instruction_events(path)
+        );
+    }
+    let qualified_digest = hash(
+        serde_json::to_vec(&json!({"startup":expected,"nativeImports":expected_imports}))
+            .unwrap()
+            .as_slice(),
+    );
     let observed = consumed(&receipt).await;
     if observed.is_none() {
         let output = client
@@ -516,15 +606,32 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
         observed.expect("native Claude selected plugin must execute its startup hook"),
         expected
     );
+    let native_import = consumed(&instructions_receipt).await;
+    if native_import.is_none() {
+        println!(
+            "provider_memory_diagnostic {}",
+            json!({"route":"terminal","hookEvents":std::fs::read_to_string(instructions_receipt.with_extension("json.events")).unwrap_or_default().lines().filter_map(|line|serde_json::from_str::<Value>(line).ok()).collect::<Vec<_>>() })
+        );
+    }
+    assert_eq!(
+        native_import.expect("native Claude must load selected memory import"),
+        json!({"nativeImport":true,"digest":hash(&imported_bytes)})
+    );
+    imported_graph(&instructions_events, &expected_imports).await;
     println!(
         "provider_launch_consumer {}",
-        json!({"provider":"claude","route":"terminal","digest":hash(serde_json::to_vec(&expected).unwrap().as_slice())})
+        json!({"provider":"claude","route":"terminal","digest":qualified_digest})
     );
     client
         .stop(SoulId::parse(terminal.soul_id).unwrap())
         .await
         .unwrap();
+    assert!(instruction_events(&instructions_events)
+        .iter()
+        .all(|event| event["ignored"] != json!(true)));
     std::fs::remove_file(&receipt).unwrap();
+    std::fs::remove_file(&instructions_receipt).unwrap();
+    std::fs::remove_file(&instructions_events).unwrap();
     let (broadcast, _) = tokio::sync::broadcast::channel(256);
     let mut events = broadcast.subscribe();
     let proxy = crate::fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
@@ -556,9 +663,16 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
             .expect("genuine default SDK selected plugin must execute its startup hook"),
         expected
     );
+    assert_eq!(
+        consumed(&instructions_receipt)
+            .await
+            .expect("native default SDK must load selected memory import"),
+        json!({"nativeImport":true,"digest":hash(&imported_bytes)})
+    );
+    imported_graph(&instructions_events, &expected_imports).await;
     println!(
         "provider_launch_consumer {}",
-        json!({"provider":"claude","route":"fresh","digest":hash(serde_json::to_vec(&expected).unwrap().as_slice())})
+        json!({"provider":"claude","route":"fresh","digest":qualified_digest})
     );
     assert_eq!(
         std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
@@ -573,6 +687,9 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
             client.stop(view.soul_id).await.unwrap();
         }
     }
+    assert!(instruction_events(&instructions_events)
+        .iter()
+        .all(|event| event["ignored"] != json!(true)));
     web_task.abort();
     control_task.abort();
 }

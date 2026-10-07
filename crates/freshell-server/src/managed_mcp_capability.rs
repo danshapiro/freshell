@@ -28,6 +28,7 @@ const CAPABILITY_PATH: &str = ".freshell/mcp-capability.json";
 const GRANT_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 const RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 mod amplifier_resources;
+mod claude_memory;
 mod claude_stage;
 mod ordinary_stage;
 mod source_stage;
@@ -1302,6 +1303,7 @@ fn stage_provider_root(
                             .or(opencode_input.cwd)
                             .unwrap_or(home),
                         opencode_input.claude_manifest,
+                        &excluded,
                     )?
                 } else {
                     ordinary_stage::prepare(
@@ -2981,7 +2983,10 @@ except Exception as error:
             r#"{"env":{"CLAUDE_SELECTED_NONCE":"settings-input"}}"#,
         )
         .unwrap();
-        std::fs::write(home.path().join(".claude/CLAUDE.md"), "global-memory-input").unwrap();
+        std::fs::create_dir_all(home.path().join("memory")).unwrap();
+        std::fs::write(home.path().join(".claude/CLAUDE.md"), "global-memory-input\n@../first.md\n`@../missing-inline.md`\n```text\n@../missing-fenced.md\n```\n").unwrap();
+        std::fs::write(home.path().join("first.md"), "@./memory/final.md\n").unwrap();
+        std::fs::write(home.path().join("memory/final.md"), "imported-memory-input").unwrap();
         std::fs::write(skill.join("resource"), "adjacent-resource").unwrap();
         std::fs::write(
             skill.join("node_modules/local-dependency/index.js"),
@@ -3044,6 +3049,23 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             "transported project skill must load its installed dependency"
         );
         assert_eq!(consumed.stdout, b"adjacent-resource:installed-dependency");
+        let imported = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| {
+                mount.logical_destination == home.path().join("memory/final.md").to_str().unwrap()
+            })
+            .expect("recursive imports must retain their declaring Markdown origin");
+        let imported = std::process::Command::new("node")
+            .args([
+                "-e",
+                "process.stdout.write(require(\"node:fs\").readFileSync(process.argv[1]))",
+            ])
+            .arg(stage.join(&imported.stage_relative_path))
+            .output()
+            .unwrap();
+        assert!(imported.status.success());
+        assert_eq!(imported.stdout, b"imported-memory-input");
         assert!(
             inputs
                 .resource_mounts
@@ -3059,6 +3081,63 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 .any(|bind| bind.logical_destination
                     == home.path().join(".claude/settings.json").to_str().unwrap()),
             "global settings retain declaring origin"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_memory_private_alias_is_rejected_before_publication() {
+        use freshell_runtime_protocol::{ProviderLaunchContext, ProviderPreparation};
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let capabilities = owned.path().join("capabilities");
+        for path in [&home.join(".claude"), &workspace, &capabilities] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let private = home.join(".claude/.credentials.json");
+        std::fs::write(&private, "synthetic-private-credential-nonce").unwrap();
+        std::os::unix::fs::symlink(&private, home.join("ordinary.md")).unwrap();
+        std::fs::write(home.join(".claude/CLAUDE.md"), "@../ordinary.md\n").unwrap();
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+            config: vec![],
+            mcp_capability: None,
+            prepared_inputs: None,
+        };
+        let error = stage_provider_root(
+            &capabilities,
+            "grant-claude-private-alias",
+            "claude",
+            &home,
+            &[],
+            OpencodeEphemeralInput {
+                cwd: Some(&workspace),
+                workspace: Some(&workspace),
+                launch_context: Some(&context),
+                secret_references: Some(&[]),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect_err("selected ordinary memory cannot expose a credential alias");
+        assert!(error.contains("private") && error.contains("ordinary.md"));
+        assert!(!error.contains("synthetic-private-credential-nonce"));
+        assert_eq!(
+            std::fs::read_to_string(private).unwrap(),
+            "synthetic-private-credential-nonce"
+        );
+        assert!(
+            !staged_provider_root_path(&capabilities, "grant-claude-private-alias")
+                .unwrap()
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_dir(owned.path().join("provider-roots"))
+                .unwrap()
+                .count(),
+            0,
+            "failed selection must remove its temporary stage"
         );
     }
 
