@@ -45,10 +45,24 @@ async function readNativeTranscript(path, allowMissing = false) {
   } finally { await file?.close() }
 }
 
-/** Whether the pinned native loader could replay an existing marker on first
+/** Whether the pinned native loader has an unfinished operation on first
  * input. This never qualifies a checkpoint or proves an effect outcome. */
 export async function nativeTranscriptHasDeferredOperation({ path, allowMissing = false }) {
   const { rows, lines } = await readNativeTranscript(path, allowMissing)
+  // A crash or a batch can leave native tool requests without the supported
+  // solo checkpoint. Ordinary input must not ask the loader to replay them.
+  const pending = new Set()
+  for (const row of rows) {
+    for (const block of Array.isArray(row.message?.content) ? row.message.content : []) {
+      if (row.type === 'assistant' && block.type === 'tool_use') {
+        if (typeof block.id !== 'string' || !block.id) return true
+        pending.add(block.id)
+      } else if (row.type === 'user' && block.type === 'tool_result') {
+        pending.delete(block.tool_use_id)
+      }
+    }
+  }
+  if (pending.size) return true
   const index = rows.findLastIndex((row) => row.type === 'attachment' && row.attachment?.type === 'hook_deferred_tool')
   if (index < 0) return false
   const toolUseID = rows[index].attachment.toolUseID

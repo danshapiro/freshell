@@ -30,6 +30,27 @@ async function scenario(run: (store: any, reopen: (profile?: string) => any, pat
 }
 
 describe('restricted native checkpoint durable phases', () => {
+  it.each([1, 2])('blocks %i unfinished native tools without a checkpoint or callback to replay', async (count) => scenario(async (store, reopen, paths) => {
+    const tools = Array.from({ length: count }, (_, index) => ({ type: 'tool_use', id: 'toolu_unfinished' + index, name: 'Bash', input }))
+    const assistant = { type: 'assistant', sessionId: root, message: { content: tools } }
+    await writeFile(paths.transcriptPath, JSON.stringify(assistant) + '\n')
+    expect(await store.inputState()).toBe('blocked')
+    expect(await reopen().readRecoverable()).toBeNull()
+    for (const tool of tools) {
+      expect(await reopen().inputState()).toBe('blocked')
+      await writeFile(paths.transcriptPath, JSON.stringify({ type: 'user', sessionId: root,
+        message: { content: [{ type: 'tool_result', tool_use_id: tool.id, content: 'native refusal', is_error: true }] } }) + '\n', { flag: 'a' })
+    }
+    expect(await reopen().inputState()).toBe('clear')
+  }))
+  it('keeps a later unfinished native tool blocked after an earlier checkpoint was consumed', async () => scenario(async (store, reopen, paths) => {
+    await store.publish(toolUseID, inputDigest)
+    await writeFile(paths.transcriptPath, JSON.stringify({ type: 'user', sessionId: root,
+      message: { content: [{ type: 'tool_result', tool_use_id: toolUseID, is_error: false }] } }) + '\n'
+      + JSON.stringify({ type: 'assistant', sessionId: root,
+        message: { content: [{ type: 'tool_use', id: 'toolu_later1', name: 'Bash', input }] } }) + '\n', { flag: 'a' })
+    expect(await reopen().inputState()).toBe('blocked')
+  }))
   it('publishes only the inspected native checkpoint and keeps its record body-free', async () => scenario(async (store, reopen, paths) => {
     const checkpoint = await store.publish(toolUseID, inputDigest)
     expect(checkpoint).toMatchObject({ nativeSessionId: root, toolUseID, inputDigest, profileDigest, phase: 'checkpointed' })
