@@ -242,6 +242,18 @@ pub(super) fn describe(
     let runtime_home = Path::new("/home/freshell/provider");
     let default_global = home.join(".config/opencode");
     let global = config_root.unwrap_or(&default_global);
+    let resource_mounts: Vec<ProviderResourceMount> = {
+        let mut bytes = Vec::new();
+        std::fs::File::open(root.join(".freshell/resource-mounts.json"))
+            .map_err(|_| "prepared resource manifest unavailable")?
+            .take(MAX_CONTROL_FRAME_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "prepared resource manifest read failed")?;
+        if bytes.len() > MAX_CONTROL_FRAME_BYTES {
+            return Err("prepared resource descriptor exceeds control profile".into());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| "prepared resource descriptors invalid")?
+    };
     let mut sources = BTreeMap::new();
     let mut binds = Vec::new();
     let mut recipes = 0usize;
@@ -319,10 +331,22 @@ pub(super) fn describe(
                         global,
                         &approved.approved_alias,
                     );
-                let effective =
+                let effective = if let Some(unit) = resource_mounts.iter().find(|unit| {
+                    unit.kind == ProviderResourceKind::Directory
+                        && logical.starts_with(&unit.logical_destination)
+                }) {
+                    Path::new(&unit.effective_destination).join(
+                        logical
+                            .strip_prefix(&unit.logical_destination)
+                            .map_err(|_| {
+                                "selected private alias lost its approved resource origin"
+                            })?,
+                    )
+                } else {
                     crate::managed_provider_references::sources::runtime_config_destination(
                         home, global, selected,
-                    );
+                    )
+                };
                 if let Some(prior) = alias_sources.insert(logical.clone(), source_id) {
                     if prior != source_id {
                         return Err("shared source has conflicting private alias selections; reprepare before dispatch".into());
@@ -379,18 +403,7 @@ pub(super) fn describe(
             recipe_count: u16::try_from(recipes).map_err(|_| "recipe count overflow")?,
         },
         config_binds: binds,
-        resource_mounts: {
-            let mut bytes = Vec::new();
-            std::fs::File::open(root.join(".freshell/resource-mounts.json"))
-                .map_err(|_| "prepared resource manifest unavailable")?
-                .take(MAX_CONTROL_FRAME_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| "prepared resource manifest read failed")?;
-            if bytes.len() > MAX_CONTROL_FRAME_BYTES {
-                return Err("prepared resource descriptor exceeds control profile".into());
-            }
-            serde_json::from_slice(&bytes).map_err(|_| "prepared resource descriptors invalid")?
-        },
+        resource_mounts,
         indexed_files: (!sources.is_empty()).then(|| IndexedProviderFiles {
             volume_name: indexed_provider_volume_name(soul, &capability.grant_id),
             aliases,

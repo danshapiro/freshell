@@ -4100,6 +4100,98 @@ except Exception as error:
     }
 
     #[tokio::test]
+    async fn managed_provider_shared_home_root_private_references_mount_at_each_native_origin() {
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let shared = owned.path().join("shared-root");
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let raw = r#"{"agent":{"probe":{"prompt":"{file:./rules}"}}}"#;
+        std::fs::write(shared.join("opencode.json"), raw).unwrap();
+        std::fs::write(shared.join("rules"), "PRIVATE_SHARED_HOME_ROOT_NONCE").unwrap();
+        std::os::unix::fs::symlink(&shared, home.join(".opencode")).unwrap();
+        std::os::unix::fs::symlink(&shared, workspace.join(".opencode")).unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let prepared = crate::managed_provider_references::prepare_managed_opencode_with_publisher(
+            crate::managed_provider_references::OpencodePreparation {
+                client: &client,
+                soul: &soul,
+                creation_seed: "existing-fixture",
+                home: &home,
+                cwd: &workspace,
+                workspace: &workspace,
+                original: &|_| None,
+                references: vec![],
+                auth_authority: Some("existing-owned-attempt"),
+                selected_sources: None,
+                selected_resource_roots: None,
+                native_source_flags: None,
+                rebind_enabled: None,
+                inherited_inline: None,
+                inline_edits: None,
+            },
+            |soul, home, context, input| {
+                let capability = store.issue(
+                    soul.clone(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("opencode", home, &context.config)),
+                    OpencodeEphemeralInput {
+                        launch_context: Some(context),
+                        ..input
+                    },
+                    None,
+                )?;
+                read_prepared_context(&directory, &capability)
+            },
+        )
+        .await
+        .unwrap();
+        let inputs = prepared.context.prepared_inputs.as_ref().unwrap();
+        let files = inputs.indexed_files.as_ref().unwrap();
+        let home_alias = files
+            .aliases
+            .iter()
+            .find(|alias| alias.logical_destination == "/home/freshell/provider/.opencode/rules")
+            .unwrap();
+        assert_eq!(home_alias.effective_destination, "/home/freshell/provider/.opencode/rules", "private child mounts do not propagate between two volume aliases; HOME needs its own exact file mount");
+        let workspace_alias = files
+            .aliases
+            .iter()
+            .find(|alias| {
+                alias.logical_destination == workspace.join(".opencode/rules").to_str().unwrap()
+            })
+            .unwrap();
+        assert_eq!(
+            workspace_alias.effective_destination,
+            shared.join("rules").to_str().unwrap()
+        );
+        assert_eq!(home_alias.source_id, workspace_alias.source_id);
+        let stage = staged_provider_root_path(&directory, &inputs.generation_id).unwrap();
+        assert!(
+            !stage
+                .join(&inputs.resource_mounts[0].stage_relative_path)
+                .join("rules")
+                .exists(),
+            "sensitive referenced bytes cannot enter ordinary resource units"
+        );
+        assert_eq!(
+            std::fs::read_to_string(shared.join("opencode.json")).unwrap(),
+            raw
+        );
+    }
+
+    #[tokio::test]
     async fn managed_provider_shared_workspace_sources_keep_original_form_and_private_aliases() {
         use freshell_runtime_protocol::*;
         let owned = tempfile::tempdir().unwrap();

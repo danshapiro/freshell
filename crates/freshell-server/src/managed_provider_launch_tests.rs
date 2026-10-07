@@ -375,14 +375,24 @@ const home=import.meta.url.startsWith('file:///home/freshell/provider/.opencode/
 export default {id:'closed-writable-selected-root-'+(home?'home':'workspace'),async server(input,options){return {async config(config){
  const root=new URL('../../',import.meta.url); const path=new URL('provider-owned-write',root);
  fs.writeFileSync(path,'selected-root-write');
- fs.writeFileSync(home?options.homeReceipt:options.receipt,JSON.stringify({dependency:crypto.createHash('sha256').update(dependency).digest('hex'),resource:crypto.createHash('sha256').update(fs.readFileSync(new URL('./resource',import.meta.url))).digest('hex'),write:crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex')}));
+ fs.writeFileSync(home?options.homeReceipt:options.receipt,JSON.stringify({privateRule:crypto.createHash('sha256').update(config.agent.rootScope.prompt).digest('hex'),dependency:crypto.createHash('sha256').update(dependency).digest('hex'),resource:crypto.createHash('sha256').update(fs.readFileSync(new URL('./resource',import.meta.url))).digest('hex'),write:crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex')}));
 }}}};
 "#).unwrap();
     let root_config = serde_json::to_vec(
-        &json!({"plugin":[["./plugins/selected/index.mjs", {"receipt":root_receipt, "homeReceipt":home_root_receipt}]]}),
+        &json!({"agent":{"rootScope":{"prompt":"{file:./private-root-rule}"}}, "plugin":[["./plugins/selected/index.mjs", {"receipt":root_receipt, "homeReceipt":home_root_receipt}]]}),
     )
     .unwrap();
     std::fs::write(resource_root.join("opencode.json"), &root_config).unwrap();
+    std::fs::write(
+        resource_root.join("private-root-rule"),
+        "shared-home-private-rule\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        resource_root.join("private-root-rule"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     for name in ["package.json", "package-lock.json"] {
         std::fs::copy(
             fixture.join("source-home/.config/opencode").join(name),
@@ -558,7 +568,7 @@ export default {{id:'closed-directory-discovery',async server(){{
         }
     };
     assert_eq!(terminal_receipt, expected);
-    let expected_root = json!({"dependency":format!("{:x}",Sha256::digest(b"selected-root-dependency")),"resource":format!("{:x}",Sha256::digest(b"selected-root-resource")),"write":format!("{:x}",Sha256::digest(b"selected-root-write"))});
+    let expected_root = json!({"privateRule":format!("{:x}",Sha256::digest(b"shared-home-private-rule")),"dependency":format!("{:x}",Sha256::digest(b"selected-root-dependency")),"resource":format!("{:x}",Sha256::digest(b"selected-root-resource")),"write":format!("{:x}",Sha256::digest(b"selected-root-write"))});
     assert_eq!(read_receipt(&root_receipt).await.unwrap(), expected_root);
     assert_eq!(
         read_receipt(&home_root_receipt).await.unwrap(),
@@ -742,6 +752,7 @@ export default {{id:'closed-directory-discovery',async server(){{
                     b"native-inline-selected-rule".as_slice(),
                     b"native-shared-root-rule".as_slice(),
                     b"native-shared-nested-rule".as_slice(),
+                    b"shared-home-private-rule".as_slice(),
                     b"INLINE_PREFIX".as_slice(),
                     b"AUTH_INLINE_SHADOW_NO_FILE".as_slice(),
                     b"synthetic-onecli-shadowed".as_slice(),
