@@ -64,7 +64,7 @@ export function createNativeCheckpointStore({ recordPath, transcriptPath, native
       try {
         const record = await read()
         if (!record) return await nativeTranscriptHasDeferredOperation({ path: transcriptPath, allowMissing: allowMissingTranscript }) ? 'blocked' : 'clear'
-        if (await consumed(record)) return 'clear'
+        if (await consumed(record)) return await nativeTranscriptHasDeferredOperation({ path: transcriptPath }) ? 'blocked' : 'clear'
         return recoverable.has(record.phase) && await current(record) ? 'recoverable' : 'blocked'
       } catch { return 'blocked' }
     }),

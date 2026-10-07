@@ -77,7 +77,7 @@
 import { createInterface } from 'node:readline'
 import { createHash, randomBytes } from 'node:crypto'
 import { readFile, readdir, lstat } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
@@ -161,8 +161,47 @@ async function nativeProfileDigest(req, settings) {
   return digest.digest('hex')
 }
 
+// Hold an original operation that reaches its native hook or permission
+// callback during exact resume behind the current managed release fence.
+// The native permission resolver retains its ordinary policy afterward.
+async function waitForNativeCheckpointRelease(state, input, generation, hookSignal) {
+  if (state.nativePendingOperation) return false
+  let release
+  const released = new Promise((resolve) => { release = resolve })
+  const pending = { generation, toolUseID: input.tool_use_id,
+    inputDigest: nativeInputDigest(input.tool_input), release }
+  state.nativePendingOperation = pending
+  const cancelled = () => release(false)
+  state.abort.signal.addEventListener('abort', cancelled, { once: true })
+  hookSignal?.addEventListener('abort', cancelled, { once: true })
+  try {
+    const record = await state.nativeStore.readRecoverable()
+    if (state.nativeContinuation) {
+      const original = state.nativeContinuation.checkpoint
+      return original.toolUseID === pending.toolUseID && original.inputDigest === pending.inputDigest
+    }
+    if (!record) return await state.nativeStore.inputState() === 'clear' ? null : false
+    if (record.toolUseID !== pending.toolUseID || record.inputDigest !== pending.inputDigest) return false
+    if (state.abort.signal.aborted || hookSignal?.aborted) return false
+    return await released && state.queryGeneration === generation && state.nativeReady
+      && state.nativeContinuation?.toolUseID === pending.toolUseID
+      && state.nativeContinuation?.inputDigest === pending.inputDigest
+  } catch {
+    return false
+  } finally {
+    state.abort.signal.removeEventListener('abort', cancelled)
+    hookSignal?.removeEventListener('abort', cancelled)
+    if (state.nativePendingOperation === pending) state.nativePendingOperation = undefined
+  }
+}
+
 async function routeNativePermission({ session, sessionId, req, launch, generation, toolName, input, options }) {
   let currentOptions = options
+  if (session.nativeStore && req.resumeSessionId && !session.nativeContinuation) {
+    const resumed = await waitForNativeCheckpointRelease(session,
+      { tool_use_id: options?.toolUseID, tool_input: input }, generation, options?.signal)
+    if (resumed === false) return { behavior: 'deny', message: 'Original native checkpoint has no current fenced release' }
+  }
   const record = session.nativeContinuation
   if (record) {
     const binding = { launch, queryGeneration: generation, nativeRequestId: options?.requestId }
@@ -511,7 +550,7 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
       abortController: abort,
       env: { ...createClaudeSdkCleanEnv(process.env), ...state.nativeChannel?.env },
       settings: state.nativeChannel?.settings,
-      hooks: state.nativeChannel ? { PreToolUse: [{ matcher: 'Bash', hooks: [async (input) => {
+      hooks: state.nativeChannel ? { PreToolUse: [{ matcher: 'Bash', hooks: [async (input, _toolUseID, hookOptions) => {
         const deny = (reason) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse',
           permissionDecision: 'deny', permissionDecisionReason: reason } })
         if (state.queryGeneration !== generation || !state.nativeReady || input.session_id !== state.cliSessionId) {
@@ -523,6 +562,10 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
             return deny('Native continuation changed its original operation')
           }
           return {}
+        }
+        if (req.resumeSessionId && state.nativeStore) {
+          const resumed = await waitForNativeCheckpointRelease(state, input, generation, hookOptions?.signal)
+          if (resumed !== null) return resumed ? {} : deny('Original native checkpoint has no current fenced release')
         }
         // SDK control callbacks and the output iterator have independent
         // consumers. Wait briefly for the actual assistant batch; never infer
@@ -541,18 +584,22 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
         return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'defer',
           permissionDecisionReason: 'Managed native no-effect continuation checkpoint' } }
       }] }] } : undefined,
-      spawnClaudeCodeProcess: state.nativeChannel ? (options) => spawnObservedNative(options, {
-        onStderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
-        onControlWrite: (frame, error) => {
-          if (state.queryGeneration !== generation) return
-          const binding = state.nativeRequests?.get(frame.response.request_id)
-          if (!binding) return
-          state.nativeRequests.delete(frame.response.request_id)
-          emit({ type: `sdk.${binding.kind}.dispatch`, sessionId, requestId: binding.requestId,
-            nativeRequestId: frame.response.request_id, ok: !error && frame.response.subtype === 'success',
-            acceptanceAmbiguous: !!error, message: error?.message ?? frame.response.error })
-        },
-      }) : undefined,
+      spawnClaudeCodeProcess: state.nativeChannel ? (options) => {
+        const child = spawnObservedNative(options, {
+          onStderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
+          onControlWrite: (frame, error) => {
+            if (state.queryGeneration !== generation) return
+            const binding = state.nativeRequests?.get(frame.response.request_id)
+            if (!binding) return
+            state.nativeRequests.delete(frame.response.request_id)
+            emit({ type: `sdk.${binding.kind}.dispatch`, sessionId, requestId: binding.requestId,
+              nativeRequestId: frame.response.request_id, ok: !error && frame.response.subtype === 'success',
+              acceptanceAmbiguous: !!error, message: error?.message ?? frame.response.error })
+          },
+        })
+        state.nativeChildClosed = new Promise((resolve) => child.once('close', resolve))
+        return child
+      } : undefined,
       settingSources: ['user', 'project', 'local'],
       stderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
       canUseTool: async (toolName, input, options) => {
@@ -589,9 +636,10 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
       if (req.resumeSessionId && observation.nativeSessionId !== req.resumeSessionId) throw new Error('native exact resume changed root')
       if (await nativeProfileDigest(req, state.settings) !== state.nativeProfileDigest) throw new Error('selected native profile changed during startup')
       if (state.queryGeneration !== generation || abort.signal.aborted) return
+      if (!process.env.HOME || !isAbsolute(process.env.HOME)) throw new Error('managed native checkpoint HOME is unavailable')
       state.nativeStore = createNativeCheckpointStore({ nativeSessionId: observation.nativeSessionId,
         transcriptPath: observation.native.transcript_path,
-        recordPath: join(dirname(observation.native.transcript_path), '.freshell-checkpoint-' + observation.nativeSessionId + '.json'),
+        recordPath: join(process.env.HOME, '.freshell', 'native-checkpoints', 'claude', observation.nativeSessionId + '.json'),
         profileDigest: state.nativeProfileDigest, allowMissingTranscript: !req.resumeSessionId })
       state.nativeReady = true
       state.cliSessionId = observation.nativeSessionId
@@ -610,6 +658,7 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
 async function continueNativeCheckpoint(sessionId, state, record) {
   const previousQuery = state.query
   const previousAbort = state.abort
+  const previousNativeClosed = state.nativeChildClosed
   state.query = undefined
   state.nativeContinuation = record
   state.nativeReady = false
@@ -618,6 +667,15 @@ async function continueNativeCheckpoint(sessionId, state, record) {
   state.abort = new AbortController()
   previousQuery.close?.()
   previousAbort.abort()
+  if (previousNativeClosed) {
+    let timeout
+    try {
+      await Promise.race([previousNativeClosed, new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('original native writer did not close')), 5_000)
+      })])
+    } finally { clearTimeout(timeout) }
+  }
+  if (sessions.get(sessionId) !== state || state.abort.signal.aborted) throw new Error('native continuation cancelled before exact resume')
   await openSessionQuery(sessionId, state, { ...state.createRequest, resumeSessionId: record.nativeSessionId }, state.launch, false)
   await state.nativeReadyPromise
   await deliverNativeContinuation(sessionId, state, record)
@@ -625,11 +683,20 @@ async function continueNativeCheckpoint(sessionId, state, record) {
 
 async function deliverNativeContinuation(sessionId, state, record) {
   const generation = state.queryGeneration
-  if (!state.nativeReady || !await state.nativeStore.beginContinuation()) throw new Error('current native continuation could not be claimed')
+  const matchesOperation = (hook) => !hook || (hook.generation === generation
+    && hook.toolUseID === record.toolUseID && hook.inputDigest === record.inputDigest)
+  if (!state.nativeReady || !matchesOperation(state.nativePendingOperation)
+    || !await state.nativeStore.beginContinuation()) throw new Error('current native continuation could not be claimed')
   if (sessions.get(sessionId) !== state || state.queryGeneration !== generation || !state.nativeReady || state.abort.signal.aborted) {
     throw new Error('native continuation query changed before delivery')
   }
   state.nativeContinuation = record
+  const pendingOperation = state.nativePendingOperation
+  if (!matchesOperation(pendingOperation)) throw new Error('current native operation changed before release')
+  if (pendingOperation) {
+    pendingOperation.release(true)
+    return
+  }
   state.inputStream.push({ type: 'user', message: { role: 'user', content: 'Continue only the original pending native operation. Do not select another tool.' },
     parent_tool_use_id: null, session_id: record.nativeSessionId })
 }

@@ -2104,6 +2104,14 @@ mod double_optional {
 }
 
 impl FreshProvider {
+    /// Native context and credential family, preserving the selected mode.
+    pub fn native_family(&self) -> &'static str {
+        match self {
+            Self::Kilroy => "claude",
+            _ => self.as_str(),
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -2261,9 +2269,12 @@ impl FreshAgentLaunchSpec {
             }
         }
         if let Some(context) = &self.provider_launch_context {
-            context.validate(self.provider.as_str())?;
+            context.validate(self.provider.native_family())?;
         }
-        validate_provider_secrets(self.provider.as_str(), &self.provider_secret_references)?;
+        validate_provider_secrets(
+            self.provider.native_family(),
+            &self.provider_secret_references,
+        )?;
         if self.provider != FreshProvider::Kilroy && !self.provider_bootstrap_files.is_empty() {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -4673,6 +4684,50 @@ mod tests {
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
         }
+    }
+
+    #[test]
+    fn kilroy_accepts_only_its_native_claude_context_and_grants_without_changing_mode() {
+        let mut launch = fresh_agent_launch(FreshProvider::Kilroy, "kilroy");
+        launch.provider_launch_context = Some(ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude {
+                mcp_args: Vec::new(),
+            },
+            mcp_capability: None,
+            config: Vec::new(),
+        });
+        launch.provider_secret_references = vec![
+            ProviderSecretReference {
+                source_path: "/private/claude.env".into(),
+                profile: ProviderSecretProfile::ClaudeOnecliEnvironment,
+            },
+            ProviderSecretReference {
+                source_path: "/private/claude-ca.pem".into(),
+                profile: ProviderSecretProfile::ClaudeOnecliCaFile,
+            },
+        ];
+        assert!(launch.validate().is_ok());
+        assert_eq!(launch.provider.as_str(), "kilroy");
+        assert_eq!(launch.session_type, "kilroy");
+        let mut wrong = launch.clone();
+        wrong.provider_secret_references[0].profile = ProviderSecretProfile::CodexOnecliEnvironment;
+        assert!(wrong.validate().is_err());
+        wrong = launch.clone();
+        wrong.provider_launch_context.as_mut().unwrap().preparation = ProviderPreparation::Codex {
+            tui_args: Vec::new(),
+            sidecar_args: Vec::new(),
+        };
+        assert!(wrong.validate().is_err());
+        launch.provider_bootstrap_files.push(ProviderBootstrapFile {
+            source_path: "/private/legacy-auth".into(),
+            provider_relative_path: ".claude/.credentials.json".into(),
+        });
+        assert!(launch.validate().is_ok());
+        launch.provider = FreshProvider::Claude;
+        launch.session_type = "freshclaude".into();
+        assert!(launch.validate().is_err());
+        launch.provider_bootstrap_files.clear();
+        assert!(launch.validate().is_ok());
     }
 
     #[test]

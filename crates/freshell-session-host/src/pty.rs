@@ -158,6 +158,20 @@ impl HostedPty {
         };
         let mut provider_env = launch.env.clone();
         provider_env.extend(child_secret_env);
+        // The PTY replaces inherited environment. setpriv must retain the
+        // runtime image's command search path, including installed CLIs in
+        // /usr/local/bin, while preserving an explicit launch PATH.
+        if let Ok(image_path) = std::env::var("PATH") {
+            provider_env.entry("PATH".into()).or_insert(image_path);
+        }
+        if matches!(
+            launch.mode.as_str(),
+            "claude" | "codex" | "opencode" | "amplifier"
+        ) {
+            provider_env
+                .entry("HOME".into())
+                .or_insert_with(|| freshell_agent_runtime::PROVIDER_HOME.into());
+        }
         let native_signal = if matches!(launch.mode.as_str(), "claude" | "amplifier") {
             native_identity_launch
                 .as_ref()

@@ -1393,9 +1393,10 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
             }
         }
     }
-    let stub = matches
-        .first()
-        .and_then(|session_dir| qualified_amplifier_stub(session_dir, expected));
+    let stub = matches.first().and_then(|session_dir| {
+        qualified_amplifier_stub(session_dir, expected)
+            .or_else(|| completed_amplifier_store(session_dir, expected).then_some(false))
+    });
     if unresolved_candidates && matches.len() <= 1 && stub != Some(false) {
         return blocked(
             RecoveryBlockReason::StoreUnreadable,
@@ -1738,6 +1739,121 @@ fn qualified_amplifier_stub(session_dir: &Path, expected: &str) -> Option<bool> 
         }
     }
     Some(!materialized)
+}
+
+// A native save has ordinary execution events and atomic-write backups. Those
+// are positive history evidence, while pristine-stub absence keeps its stricter
+// exhaustive census above.
+fn completed_amplifier_store(session_dir: &Path, expected: &str) -> bool {
+    let inspect = || -> Option<()> {
+        let mut files = BTreeMap::new();
+        for entry in fs::read_dir(session_dir).ok()? {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?.to_owned();
+            if !matches!(
+                name.as_str(),
+                "metadata.json"
+                    | "metadata.json.backup"
+                    | "transcript.jsonl"
+                    | "transcript.jsonl.backup"
+                    | "events.jsonl"
+            ) {
+                return None;
+            }
+            let before = fs::symlink_metadata(&path).ok()?;
+            if !before.is_file() || before.len() > 64 * 1024 * 1024 {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if before.permissions().mode() & 0o444 == 0 {
+                    return None;
+                }
+            }
+            let bytes = fs::read(&path).ok()?;
+            let after = fs::symlink_metadata(&path).ok()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if before.dev() != after.dev() || before.ino() != after.ino() {
+                    return None;
+                }
+            }
+            if before.len() != after.len()
+                || before.modified().ok()? != after.modified().ok()?
+                || bytes.len() as u64 != after.len()
+            {
+                return None;
+            }
+            files.insert(name, bytes);
+        }
+        for name in ["metadata.json", "metadata.json.backup"] {
+            if let Some(bytes) = files.get(name) {
+                let metadata: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+                if metadata["session_id"].as_str() != Some(expected) {
+                    return None;
+                }
+                if name == "metadata.json"
+                    && (metadata["turn_count"].as_u64()? == 0
+                        || !["created", "working_dir"].iter().all(|key| {
+                            metadata[key].as_str().is_some_and(|v| !v.trim().is_empty())
+                        }))
+                {
+                    return None;
+                }
+            } else if name == "metadata.json" {
+                return None;
+            }
+        }
+        let mut user = false;
+        let mut assistant = false;
+        let mut completed = false;
+        for name in [
+            "transcript.jsonl",
+            "transcript.jsonl.backup",
+            "events.jsonl",
+        ] {
+            let Some(bytes) = files.get(name) else {
+                if name.ends_with(".backup") {
+                    continue;
+                }
+                return None;
+            };
+            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                return None;
+            }
+            for line in bytes
+                .split(|b| *b == b'\n')
+                .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+            {
+                let row: serde_json::Value = serde_json::from_slice(line).ok()?;
+                if name == "events.jsonl" {
+                    let event = row["event"].as_str().filter(|v| !v.is_empty())?;
+                    if row["session_id"].as_str() != Some(expected) {
+                        return None;
+                    }
+                    completed |= event == "cleanup:store_end";
+                } else {
+                    let role = row["role"].as_str()?;
+                    if !matches!(role, "user" | "assistant" | "tool")
+                        || !row["content"].is_string() && !row["content"].is_array()
+                        || row
+                            .get("session_id")
+                            .is_some_and(|id| id.as_str() != Some(expected))
+                    {
+                        return None;
+                    }
+                    if name == "transcript.jsonl" {
+                        user |= role == "user";
+                        assistant |= role == "assistant";
+                    }
+                }
+            }
+        }
+        (user && assistant && completed).then_some(())
+    };
+    inspect().is_some()
 }
 
 fn blocked(
@@ -2908,6 +3024,89 @@ mod tests {
             allocation_state: AllocationState::VerifiedDurable,
             evidence_revision: 1,
             never_dispatched: false,
+        }
+    }
+
+    #[test]
+    fn amplifier_completed_native_store_with_backups_is_ready() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let expected = "owned-completed-native-root";
+        let ensured = freshell_sessions::amplifier_stub::ensure_session(
+            &home.path().join(".amplifier"),
+            expected,
+            cwd.to_str().unwrap(),
+            "owned-terminal",
+        )
+        .unwrap();
+        let metadata_path = ensured.session_dir.join("metadata.json");
+        let original = fs::read(&metadata_path).unwrap();
+        let mut metadata: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        metadata["turn_count"] = serde_json::json!(1);
+        metadata["model"] = serde_json::json!("glm-5.3");
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        fs::write(ensured.session_dir.join("metadata.json.backup"), original).unwrap();
+        fs::write(ensured.session_dir.join("transcript.jsonl.backup"), b"").unwrap();
+        fs::write(ensured.session_dir.join("transcript.jsonl"),
+            b"{\"role\":\"user\",\"content\":\"owned seed\"}\n{\"role\":\"assistant\",\"content\":\"stored\"}\n").unwrap();
+        let events = [
+            "session:resume",
+            "prompt:submit",
+            "provider:request",
+            "llm:request",
+            "llm:response",
+            "provider:response",
+            "orchestrator:complete",
+            "cleanup:store_end",
+        ]
+        .into_iter()
+        .map(|event| serde_json::json!({"event":event,"session_id":expected}).to_string() + "\n")
+        .collect::<String>();
+        fs::write(ensured.session_dir.join("events.jsonl"), events).unwrap();
+        let spec = resume_spec_for_test("amplifier", expected, home.path());
+        assert!(matches!(probe_provider_store(home.path(), &spec), ProviderStoreProbe::Ready { .. }),
+            "a completed ordinary native save must not be classified using pristine-stub-only file/event rules");
+        let original_files = fs::read_dir(&ensured.session_dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        for fault in [
+            "wrong-metadata-root",
+            "wrong-event-root",
+            "truncated-transcript",
+            "partial-events",
+            "corrupt-backup",
+            "unknown-child",
+        ] {
+            for (path, bytes) in &original_files {
+                fs::write(path, bytes).unwrap();
+            }
+            match fault {
+                "wrong-metadata-root" => {
+                    let mut wrong = metadata.clone(); wrong["session_id"] = "another-root".into();
+                    fs::write(&metadata_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+                }
+                "wrong-event-root" => fs::write(ensured.session_dir.join("events.jsonl"),
+                    b"{\"event\":\"llm:response\",\"session_id\":\"another-root\"}\n").unwrap(),
+                "truncated-transcript" => fs::write(ensured.session_dir.join("transcript.jsonl"),
+                    b"{\"role\":\"user\",\"content\":\"seed\"}\n{\"role\":\"assistant\",\"content\":\"stored\"}").unwrap(),
+                "partial-events" => fs::write(ensured.session_dir.join("events.jsonl"), b"{\"event\":").unwrap(),
+                "corrupt-backup" => fs::write(ensured.session_dir.join("metadata.json.backup"), b"null").unwrap(),
+                "unknown-child" => fs::write(ensured.session_dir.join("uninspected"), b"retained").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "{fault}"
+            );
         }
     }
 

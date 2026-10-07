@@ -4322,6 +4322,101 @@ fn validate_recovery_context_fence(
     Ok(())
 }
 
+pub(crate) fn deterministic_fresh_agent_fixture(
+    provider: &str,
+    agent: &FreshAgentLaunchSpec,
+) -> bool {
+    agent.fixture_transport
+        == Some(freshell_runtime_protocol::FreshAgentFixtureTransport::Deterministic)
+        && agent.provider.as_str() == provider
+        && matches!(
+            (&agent.provider, agent.session_type.as_str()),
+            (
+                freshell_runtime_protocol::FreshProvider::Claude,
+                "freshclaude"
+            ) | (freshell_runtime_protocol::FreshProvider::Kilroy, "kilroy")
+                | (
+                    freshell_runtime_protocol::FreshProvider::Codex,
+                    "freshcodex"
+                )
+                | (
+                    freshell_runtime_protocol::FreshProvider::Opencode,
+                    "freshopencode"
+                )
+        )
+}
+
+#[cfg(test)]
+mod deterministic_fixture_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fixture_live_admission_requires_exact_supported_transport_and_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Registry::open(directory.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared = tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let connection =
+            Connection::open(directory.path().join("registry/runtime.sqlite3")).unwrap();
+        for (provider, mode) in [
+            ("claude", "freshclaude"),
+            ("kilroy", "kilroy"),
+            ("codex", "freshcodex"),
+            ("opencode", "freshopencode"),
+        ] {
+            let spec = serde_json::json!({"sessionId":"owned-fixture","provider":provider,"sessionType":mode,
+                "runtimeVariant":"fixture-test","providerStoreId":"owned-store","cwd":"/owned","workspacePath":"/owned",
+                "runAsUid":65534,"runAsGid":0,"fixtureTransport":"deterministic"});
+            connection
+                .execute(
+                    "UPDATE souls SET provider=?1 WHERE soul_id=?2",
+                    params![provider, soul.as_str()],
+                )
+                .unwrap();
+            connection.execute("UPDATE incarnations SET fixture_kind=NULL,fresh_agent_spec=?1,native_identity_observation=NULL WHERE incarnation_id=?2",
+                params![spec.to_string(),prepared.incarnation_id.as_str()]).unwrap();
+            validate_live_native_observation(&connection, &soul, &prepared.incarnation_id).unwrap();
+            for fault in [
+                "genuine",
+                "wrong-mode",
+                "wrong-provider",
+                "unknown-transport",
+            ] {
+                let mut changed = spec.clone();
+                match fault {
+                    "genuine" => {
+                        changed.as_object_mut().unwrap().remove("fixtureTransport");
+                    }
+                    "wrong-mode" => changed["sessionType"] = "unregistered-mode".into(),
+                    "wrong-provider" => {
+                        changed["provider"] = if provider == "claude" {
+                            "codex"
+                        } else {
+                            "claude"
+                        }
+                        .into()
+                    }
+                    "unknown-transport" => {
+                        changed["fixtureTransport"] = "unregistered-fixture".into()
+                    }
+                    _ => unreachable!(),
+                }
+                connection
+                    .execute(
+                        "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+                        params![changed.to_string(), prepared.incarnation_id.as_str()],
+                    )
+                    .unwrap();
+                assert!(
+                    validate_live_native_observation(&connection, &soul, &prepared.incarnation_id)
+                        .is_err(),
+                    "{provider}/{fault}"
+                );
+            }
+        }
+    }
+}
+
 fn validate_live_native_observation(
     conn: &Connection,
     soul: &SoulId,
@@ -4331,7 +4426,14 @@ fn validate_live_native_observation(
         (String,Option<String>,Option<String>,Option<String>,Option<String>,Option<String>,u64,String)=conn.query_row(
         "SELECT s.provider,s.native_session_id,i.fresh_agent_spec,i.fixture_kind,i.native_identity_launch,i.native_identity_observation,i.execution_generation,i.launch_nonce FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id WHERE s.soul_id=?1 AND i.incarnation_id=?2",
         params![soul.as_str(),incarnation.as_str()],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))?;
+    let deterministic_fresh = fresh
+        .as_deref()
+        .map(serde_json::from_str::<FreshAgentLaunchSpec>)
+        .transpose()?
+        .as_ref()
+        .is_some_and(|agent| deterministic_fresh_agent_fixture(&provider, agent));
     if fixture.is_some()
+        || deterministic_fresh
         || !matches!(
             provider.as_str(),
             "claude" | "kilroy" | "codex" | "opencode" | "amplifier"
