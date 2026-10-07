@@ -74,27 +74,53 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     }
     const supervisor = artifact('fixture-supervisor', 'fixture-only-supervisor')
     const host = artifact('fixture-host', 'fixture-only-host')
+    const server = artifact('fixture-server', '#!' + process.execPath + '\nprocess.stdout.write("owned-native-server-fixture");\n')
     const profile = artifact('selected-profile', 'owned-selected-profile-bytes')
     fs.chmodSync(profile.path, 0o600)
     const harness = new RuntimeHarness(directory, randomUUID(), 1)
     try {
       const prepared = await harness.prepareNativeArtifacts({ candidateSha: fixtureCommit, imageDigest, supervisor, host,
+        ...{ server },
         sourceFiles: [{ name: 'claude/settings.json', ...profile }] })
       expect(harness.imageRef).toBe(imageDigest)
       expect(fs.readFileSync(harness.testHostBinary, 'utf8')).toBe('fixture-only-host')
       expect(fs.readFileSync(harness.testSupervisorBinary, 'utf8')).toBe('fixture-only-supervisor')
+      expect(execFileSync(path.join(harness.buildDir, 'freshell-server-native'), [], { encoding: 'utf8' }))
+        .toBe('owned-native-server-fixture')
       expect(prepared.sourceRoot.startsWith(harness.testRoot + path.sep)).toBe(true)
       expect(prepared.files[0]?.path).toBe(path.join(prepared.sourceRoot, 'claude/settings.json'))
       expect(fs.readFileSync(prepared.files[0]!.path, 'utf8')).toBe('owned-selected-profile-bytes')
       expect(fs.statSync(prepared.files[0]!.path).mode & 0o777).toBe(0o600)
       expect(prepared.files.map((file) => file.path)).not.toContain(path.join(os.homedir(), '.claude/settings.json'))
-      for (const fault of ['candidate', 'image', 'phase', 'writable-binary', 'changed-source', 'escaped-name', 'duplicate-name']) {
+      const withoutServer = new RuntimeHarness(directory, randomUUID(), 1)
+      try {
+        await withoutServer.prepareNativeArtifacts({ candidateSha: fixtureCommit, imageDigest, supervisor, host,
+          sourceFiles: [{ name: 'claude/settings.json', ...profile }] })
+        expect(fs.existsSync(path.join(withoutServer.buildDir, 'freshell-server-native'))).toBe(false)
+      } finally {
+        await withoutServer.cleanup()
+        fs.rmSync(withoutServer.testRoot, { recursive: true, force: true })
+      }
+      await expect(harness.prepareNativeArtifacts({ candidateSha: fixtureCommit, imageDigest, supervisor, host,
+        ...{ server }, sourceFiles: [] })).rejects.toThrow('native run already exists')
+      for (const fault of ['candidate', 'image', 'phase', 'writable-binary', 'changed-source', 'escaped-name', 'duplicate-name', 'writable-server', 'changed-server', 'missing-server', 'symlink-server']) {
         const denied = new RuntimeHarness(directory, randomUUID(), fault === 'phase' ? 2 : 1)
-        const input = { candidateSha: fixtureCommit, imageDigest, supervisor, host,
+        const input = { candidateSha: fixtureCommit, imageDigest, supervisor, host, server: { ...server },
           sourceFiles: [{ name: 'claude/settings.json', ...profile }] }
         if (fault === 'candidate') input.candidateSha = 'c'.repeat(40)
         if (fault === 'image') input.imageDigest = `sha256:${'b'.repeat(64)}`
         if (fault === 'writable-binary') fs.chmodSync(host.path, 0o700)
+        if (fault === 'writable-server') fs.chmodSync(server.path, 0o700)
+        if (fault === 'changed-server') {
+          fs.chmodSync(server.path, 0o700)
+          fs.writeFileSync(server.path, 'changed-server')
+          fs.chmodSync(server.path, 0o500)
+        }
+        if (fault === 'missing-server') input.server.path = path.join(directory, 'missing-server')
+        if (fault === 'symlink-server') {
+          input.server.path = path.join(directory, 'server-link')
+          fs.symlinkSync(server.path, input.server.path)
+        }
         if (fault === 'changed-source') fs.writeFileSync(profile.path, 'changed-source')
         if (fault === 'escaped-name') input.sourceFiles[0]!.name = 'claude/../escaped.json'
         if (fault === 'duplicate-name') input.sourceFiles.push({ ...input.sourceFiles[0]! })
@@ -104,6 +130,9 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
           expect(fs.existsSync(denied.buildDir), fault).toBe(false)
         } finally {
           fs.chmodSync(host.path, 0o500)
+          fs.chmodSync(server.path, 0o700)
+          fs.writeFileSync(server.path, '#!' + process.execPath + '\nprocess.stdout.write("owned-native-server-fixture");\n')
+          fs.chmodSync(server.path, 0o500)
           fs.writeFileSync(profile.path, 'owned-selected-profile-bytes')
           await denied.cleanup()
           fs.rmSync(denied.testRoot, { recursive: true, force: true })

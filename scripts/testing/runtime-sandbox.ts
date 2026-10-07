@@ -118,6 +118,7 @@ type NativeArtifacts = {
   imageDigest: string
   supervisor: Task2FixtureArtifact
   host: Task2FixtureArtifact
+  server?: Task2FixtureArtifact
   sourceFiles: { name: string; path: string; sha256: string }[]
 }
 type Task2FixtureArtifacts = {
@@ -251,7 +252,7 @@ export class RuntimeHarness {
     this.recordLifecycle('gate.prepare.completed', { imageRef: this.imageRef, brokerSocket: proxySocketPath })
   }
 
-  async prepareNativeArtifacts(input: NativeArtifacts): Promise<{ sourceRoot: string; files: { name: string; path: string; sha256: string }[] }> {
+  async prepareNativeArtifacts(input: NativeArtifacts): Promise<{ sourceRoot: string; files: { name: string; path: string; sha256: string }[]; serverPath?: string }> {
     // Phase one avoids the existing broad qualification home/bootstrap mounts.
     // The explicit immutable image, actual binaries and native selectors define
     // this experiment; no phase label establishes provider qualification.
@@ -274,6 +275,7 @@ export class RuntimeHarness {
     }
     const binaries = [input.supervisor, input.host]
     for (const binary of binaries) fileBytes(binary, true)
+    if (input.server) fileBytes(input.server, true)
     const names = new Set<string>()
     for (const file of input.sourceFiles) {
       if (!/^(claude|kilroy|codex|opencode|amplifier)\/[a-zA-Z0-9._/-]+$/.test(file.name)
@@ -290,6 +292,11 @@ export class RuntimeHarness {
       const destination = path.join(this.buildDir, destinations[index]!)
       fs.writeFileSync(destination, fileBytes(binary, true), { flag: 'wx', mode: index === 1 ? 0o550 : 0o500 })
       if (createHash('sha256').update(fs.readFileSync(destination)).digest('hex') !== binary.sha256) throw new Error('native executable copy changed')
+    }
+    const serverPath = input.server ? path.join(this.buildDir, 'freshell-server-native') : undefined
+    if (input.server && serverPath) {
+      fs.writeFileSync(serverPath, fileBytes(input.server, true), { flag: 'wx', mode: 0o500 })
+      if (createHash('sha256').update(fs.readFileSync(serverPath)).digest('hex') !== input.server.sha256) throw new Error('native server executable copy changed')
     }
     const sourceRoot = path.join(this.testRoot, 'native-source')
     ensurePrivateDirectory(sourceRoot)
@@ -314,7 +321,7 @@ export class RuntimeHarness {
     await this.broker.start()
     this.brokerStarted = true
     this.writeArtifact('native-artifacts.json', { ...input, preparedSources: files })
-    return { sourceRoot, files }
+    return { sourceRoot, files, ...(serverPath ? { serverPath } : {}) }
   }
 
   async prepareTask2FixtureArtifacts(input: Task2FixtureArtifacts): Promise<void> {
