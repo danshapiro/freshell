@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
-import type { ManagedRuntimeBrowserRig, ManagedRuntimeView, ManagedFixtureRig } from './managed-runtime.js'
+import type { ManagedRuntimeView, ManagedFixtureRig } from './managed-runtime.js'
 
 
 
@@ -34,7 +34,7 @@ export type StructuredChaosLog = {
 }
 
 export async function captureChaosRuntimeObservation(
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   expected: Pick<ManagedRuntimeView, 'soulId' | 'incarnationId' | 'containerId' | 'hostBootId' | 'nativeSessionId'>,
 ): Promise<ChaosRuntimeObservation> {
   if (!expected.containerId || !expected.hostBootId || !expected.nativeSessionId) {
@@ -46,12 +46,7 @@ export async function captureChaosRuntimeObservation(
   ))
   if (rows.length !== 1) throw new Error(`chaos expected exactly one running incarnation, observed ${rows.length}`)
   const row = rows[0]
-  const claim = await rig.qualificationWriterClaim({
-    provider: 'opencode',
-    nativeSessionId: expected.nativeSessionId,
-    soulId: expected.soulId,
-    incarnationId: expected.incarnationId,
-  })
+  const claim = await rig.writerClaimFacts(rig.exactRuntimeHandle(expected))
   if (claim.activeClaimCount !== 1 || claim.globalConflictingClaimCount !== 0) {
     throw new Error('chaos writer claim is not uniquely owned')
   }

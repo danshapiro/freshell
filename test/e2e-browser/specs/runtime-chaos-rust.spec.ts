@@ -444,6 +444,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
 
       const finalSnapshot = await rig.inventorySnapshot()
       const finalView = finalSnapshot.souls.filter((row: any) => row.soulId === initial.soulId).at(-1)
+      if (!finalView) throw new Error('final chaos inventory has no exact soul')
       expect(finalView.incarnationId).toBe(initial.incarnationId)
       expect(finalView.containerId).toBe(initial.containerId)
       expect(finalView.hostBootId).toBe(initial.hostBootId)

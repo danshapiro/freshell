@@ -181,12 +181,7 @@ async function qualify(
   rig.runtime.killOwnedRuntimePidExact(afterHost.containerId, childPid)
   const afterProvider = await replacement(rig, sessionId, afterHost.incarnationId)
   expect(afterProvider.nativeSessionId).toBe(nativeSessionId)
-  const claim = await rig.qualificationWriterClaim({
-    provider: afterProvider.provider!,
-    nativeSessionId,
-    soulId: afterProvider.soulId,
-    incarnationId: afterProvider.incarnationId,
-  })
+  const claim = await rig.writerClaimFacts(rig.exactRuntimeHandle(afterProvider))
   expect(claim.activeClaimCount).toBe(1)
   expect(claim.globalConflictingClaimCount).toBe(0)
 

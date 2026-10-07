@@ -660,6 +660,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       const firstSoul = snapshot.souls
         .filter((candidate: any) => candidate.soulId === first.view.soulId)
         .at(-1)
+      if (!firstSoul) throw new Error('OpenCode qualification inventory has no exact first soul')
       dataOf(await rig.runtime.adminOk(
         rig.supervisor,
         rig.runtime.upsertViewIntentBody({
@@ -687,12 +688,8 @@ test.describe.serial('OpenCode provider qualification', () => {
       ))
       expect(firstRunning).toHaveLength(1)
       expect(firstViews).toHaveLength(2)
-      const writerClaim = await rig.qualificationWriterClaim({
-        provider: 'opencode',
-        nativeSessionId,
-        soulId: first.view.soulId,
-        incarnationId: afterProviderCrash.incarnationId,
-      })
+      const writerHandle = rig.exactRuntimeHandle(afterProviderCrash)
+      const writerClaim = await rig.writerClaimFacts(writerHandle)
       expect(writerClaim.activeClaimCount).toBe(1)
       expect(writerClaim.globalConflictingClaimCount).toBe(0)
 
@@ -710,12 +707,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       const secondStop = await rig.stopSoul(second.view.soulId)
       expect(firstStop.outcome).toBe('verified_empty')
       expect(secondStop.outcome).toBe('verified_empty')
-      const claimAfterStop = await rig.qualificationWriterClaim({
-        provider: 'opencode',
-        nativeSessionId,
-        soulId: first.view.soulId,
-        incarnationId: afterProviderCrash.incarnationId,
-      })
+      const claimAfterStop = await rig.writerClaimFacts(writerHandle)
       expect(claimAfterStop.activeClaimCount).toBe(0)
       expect(claimAfterStop.globalConflictingClaimCount).toBe(0)
       const oldContainerRunningAfterStop = rig.runtime.isContainerRunning(afterProviderCrash.containerId!)

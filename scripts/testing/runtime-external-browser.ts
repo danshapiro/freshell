@@ -18,6 +18,8 @@ import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, R
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
+import { ManagedRuntimeInventorySnapshotSchema, type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
+import type { RuntimeWriterClaimFacts } from './runtime-sandbox.js'
 import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
@@ -676,6 +678,15 @@ export class ExternalManagedRuntimeRig {
     return description.info
   }
   async inventory(): Promise<ManagedRuntimeView[]> { return this.rpc('inventory', z.array(ExternalRuntimeViewSchema)) }
+  async inventorySnapshot(): Promise<ManagedRuntimeInventorySnapshot> {
+    return this.rpc('inventory-snapshot', ManagedRuntimeInventorySnapshotSchema)
+  }
+  async controlEpoch(): Promise<number> { return this.rpc('control-epoch', z.number().int().nonnegative()) }
+  async writerClaimFacts(handle: ExactRuntimeHandle): Promise<RuntimeWriterClaimFacts> {
+    return this.rpc('writer-claim', z.object({ provider: z.string().min(1), providerStoreId: z.string().min(1),
+      nativeSessionId: z.literal(handle.nativeSessionId), soulId: z.literal(handle.soulId), incarnationId: z.literal(handle.incarnationId),
+      activeClaimCount: z.number().int().nonnegative(), globalConflictingClaimCount: z.number().int().nonnegative() }).strict(), { handle })
+  }
   async runningViewForTerminal(terminalId: string): Promise<ManagedRuntimeView | null> {
     return (await this.inventory()).find(row => row.terminalId === terminalId && row.launchState === 'running') ?? null
   }
@@ -895,6 +906,9 @@ export function createExternalRuntimeControl(
           registration: owner.fixtureRegistrationFacts() }
         break
       case 'inventory': result = await owner.inventory(); break
+      case 'inventory-snapshot': result = await owner.inventorySnapshot(); break
+      case 'control-epoch': result = await owner.controlEpoch(); break
+      case 'writer-claim': result = await owner.writerClaimFacts(handle()); break
       case 'retained-start':
         if (!retained || (request.challengeId !== 'config' && request.challengeId !== 'legacy')) throw new Error('registered retained fixture required')
         retained.start(request.challengeId)

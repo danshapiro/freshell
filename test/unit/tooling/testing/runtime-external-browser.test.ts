@@ -608,6 +608,44 @@ describe('closed external owner control', () => {
       operationId: request.operationId, result: [] })
     expect(inventory).toHaveBeenCalledOnce()
   })
+  it('returns the actual inventory snapshot and epoch without a remotely supplied admin request', async () => {
+    const { owned, context, request } = fixture()
+    const snapshot = { revision: 7, souls: [], viewIntents: [], pendingProjectionCount: 2,
+      readiness: { inventoryRevision: 7, initialScanState: 'complete', blockedSubsystems: [],
+        startupRecoveryConcurrencyLimit: 4, startupRecoveryPeak: 0 } }
+    vi.spyOn(owned, 'inventorySnapshot').mockResolvedValue(snapshot)
+    vi.spyOn(owned, 'controlEpoch').mockResolvedValue(3)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.inventorySnapshot()).resolves.toEqual(snapshot)
+    await expect(rig.controlEpoch()).resolves.toBe(3)
+    await expect(control({ ...request, action: 'inventory-snapshot', params: { method: 'launch' } })).rejects.toThrow(/operation/)
+    vi.spyOn(owned, 'inventorySnapshot').mockResolvedValue({ ...snapshot, readiness: undefined })
+    await expect(rig.inventorySnapshot()).rejects.toThrow(/invalid/)
+  })
+  it('reads exact owned writer counts after Stop and refuses a replaced native root before the private read', async () => {
+    const { owned, context, request, inventory } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'claim-owned-soul',
+      incarnationId: 'claim-owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'claim-owned-boot', nativeSessionId: 'claim-owned-native' }
+    inventory.mockResolvedValue([{ ...handle, launchState: 'stopped', intentRevision: 2, provider: 'opencode' }])
+    owned.runtime.broker = { receipts: () => [{ ...handle }] } as unknown as typeof owned.runtime.broker
+    const evidence = { provider: 'opencode', providerStoreId: 'owned-store', nativeSessionId: handle.nativeSessionId,
+      soulId: handle.soulId, incarnationId: handle.incarnationId, activeClaimCount: 0, globalConflictingClaimCount: 0 }
+    const read = vi.spyOn(owned, 'qualificationWriterClaim').mockResolvedValue(evidence)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.writerClaimFacts(handle)).resolves.toEqual(evidence)
+    expect(read).toHaveBeenCalledExactlyOnceWith({ provider: 'opencode', soulId: handle.soulId,
+      incarnationId: handle.incarnationId, nativeSessionId: handle.nativeSessionId })
+    await expect(control({ ...request, action: 'writer-claim', handle: { ...handle, nativeSessionId: 'foreign-root' } })).rejects.toThrow(/owned|current/)
+    expect(read).toHaveBeenCalledOnce()
+    read.mockResolvedValue({ ...evidence, nativeSessionId: 'foreign-root' })
+    await expect(rig.writerClaimFacts(handle)).rejects.toThrow(/invalid/)
+  })
   it('refuses arbitrary commands, foreign metadata and absent current handles before owner work', async () => {
     const { owned, context, inventory, request } = fixture()
     const control = runner.createExternalRuntimeControl(owned, context)

@@ -6,6 +6,7 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
+import { ManagedRuntimeInventorySnapshotSchema, type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
 
 
 import fsp from 'node:fs/promises'
@@ -301,7 +302,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-supervisor', 'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
@@ -321,6 +322,11 @@ const RuntimeOwnerOperationRequestSchema = z.object({
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
+
+export type RuntimeWriterClaimFacts = {
+  provider: string; providerStoreId: string; nativeSessionId: string; soulId: string; incarnationId: string
+  activeClaimCount: number; globalConflictingClaimCount: number
+}
 
 /** A run keeps operation settlements until teardown so a lost reply cannot repeat a mutation. */
 export class RuntimeOwnerOperationQueue {
@@ -2498,9 +2504,25 @@ export class ManagedRuntimeOwner {
     return this.dataOf(result, 'inventory') as ManagedRuntimeView[]
   }
 
-  async inventorySnapshot(): Promise<any> {
+  async inventorySnapshot(): Promise<ManagedRuntimeInventorySnapshot> {
     const result = await this.runtime.adminOk(this.supervisor, { method: 'inventory_snapshot' })
-    return this.dataOf(result, 'inventory_snapshot')
+    return ManagedRuntimeInventorySnapshotSchema.parse(this.dataOf(result, 'inventory_snapshot'))
+  }
+
+  /** Saved addresses fence read-only writer evidence, including a stopped claim's zero count. */
+  async writerClaimFacts(handle: ExactRuntimeHandle): Promise<RuntimeWriterClaimFacts> {
+    if (handle.runId !== this.runtime.runId || handle.candidateSha !== this.runtime.candidateSha
+      || !this.runtime.broker.receipts().some(row => row.containerId === handle.containerId
+        && row.soulId === handle.soulId && row.incarnationId === handle.incarnationId)) {
+      throw new Error('writer observation requires an exact owned address')
+    }
+    const rows = (await this.inventory()).filter(row => row.soulId === handle.soulId)
+    const row = rows[0]
+    if (rows.length !== 1 || !row.provider || row.incarnationId !== handle.incarnationId
+      || row.containerId !== handle.containerId || row.hostBootId !== handle.hostBootId
+      || row.nativeSessionId !== handle.nativeSessionId) throw new Error('writer address is not the current owned incarnation and root')
+    return this.qualificationWriterClaim({ provider: row.provider, nativeSessionId: row.nativeSessionId,
+      soulId: row.soulId, incarnationId: row.incarnationId })
   }
 
   async qualificationWriterClaim(input: {

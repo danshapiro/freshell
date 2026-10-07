@@ -406,12 +406,8 @@ async function qualifyProvider(
     row.soulId === created.view.soulId && row.launchState === 'running'
   ))
   expect(runningWriters).toHaveLength(1)
-  const writerClaim = await rig.qualificationWriterClaim({
-    provider: definition.provider,
-    nativeSessionId,
-    soulId: created.view.soulId,
-    incarnationId: afterProviderLoss.incarnationId,
-  })
+  const writerHandle = rig.exactRuntimeHandle(afterProviderLoss)
+  const writerClaim = await rig.writerClaimFacts(writerHandle)
   expect(writerClaim.activeClaimCount).toBe(1)
   expect(writerClaim.globalConflictingClaimCount).toBe(0)
   const notices = await rig.runtime.adminOk(rig.supervisor, rig.runtime.pendingNoticesBody(
@@ -423,12 +419,7 @@ async function qualifyProvider(
   expect(notices.data).toHaveLength(0)
   const stopped = await rig.stopSoul(created.view.soulId)
   expect(stopped.outcome).toBe('verified_empty')
-  const claimAfterStop = await rig.qualificationWriterClaim({
-    provider: definition.provider,
-    nativeSessionId,
-    soulId: created.view.soulId,
-    incarnationId: afterProviderLoss.incarnationId,
-  })
+  const claimAfterStop = await rig.writerClaimFacts(writerHandle)
   expect(claimAfterStop.activeClaimCount).toBe(0)
   expect(claimAfterStop.globalConflictingClaimCount).toBe(0)
   const oldContainerRunningAfterStop = rig.runtime.isContainerRunning(afterProviderLoss.containerId!)
