@@ -4,16 +4,49 @@ import { execFileSync } from 'node:child_process'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { createRequire } from 'node:module'
 import { runTask2RetainedFixture } from '../../../../scripts/testing/task002-config-legacy-fixtures.js'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import * as retained from '../../../../scripts/testing/task002-retained-fixture.js'
 import { RestrictedDockerBroker } from '../../../../scripts/testing/runtime-test-broker.js'
+
+const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
 const handle = {
   runId: 'run-owned', candidateSha: 'a'.repeat(40), soulId: 'soul-owned',
   incarnationId: 'incarnation-owned', containerId: 'b'.repeat(64),
   hostBootId: 'boot-owned', nativeSessionId: 'native-owned',
 }
+
+describe('owner-side synthetic OpenCode source preparation', () => {
+  it('seeds the actual default conversation graph and keeps unrelated history outside its baselines', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-source-owner-'))
+    const databasePath = path.join(root, 'opencode.db')
+    try {
+      const source = owner.seedManagedOpenCodeSource({ repoRoot: process.cwd(), databasePath,
+        workspace: root, nonce: 'owner-source-default' })
+      const db = new DatabaseSync(databasePath, { readOnly: true })
+      try {
+        const count = db.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?')
+        expect(count.get(source.rootId)).toEqual({ count: 106 })
+        expect(count.get(source.unrelatedId)).toEqual({ count: 1 })
+        expect(db.prepare('SELECT parent_id FROM session WHERE id = ?').get(source.childId))
+          .toEqual({ parent_id: source.rootId })
+        expect(db.prepare('SELECT parent_id FROM session WHERE id = ?').get(source.grandchildId))
+          .toEqual({ parent_id: source.childId })
+        expect(source.baselineMessages.size).toBe(108)
+        expect(source.baselineMessages.has(source.lastMessageId)).toBe(true)
+        const unrelated = db.prepare('SELECT id FROM message WHERE session_id = ?').get(source.unrelatedId)
+        expect(unrelated).toBeDefined()
+        expect(source.baselineMessages.has(String(unrelated?.id))).toBe(false)
+      } finally { db.close() }
+      const invalidPath = path.join(root, 'invalid.db')
+      expect(() => owner.seedManagedOpenCodeSource({ repoRoot: process.cwd(), databasePath: invalidPath,
+        workspace: root, nonce: 'invalid', messageCount: 3 })).toThrow('even integer of at least two')
+      await expect(fsp.stat(invalidPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally { await fsp.rm(root, { recursive: true, force: true }) }
+  })
+})
 
 describe('retained fixture owner web injection', () => {
   it('uses the injected owner factory rather than launching its browser fixture dependency', async () => {
