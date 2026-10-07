@@ -1563,6 +1563,35 @@ async function verifyExternalManagedTransport(descriptor: ManagedExternalDescrip
   throw new Error('owned HTTPS/WSS provenance and admission readiness failed')
 }
 
+function selectsSyntheticSource(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv): boolean {
+  const title = 'managed OpenCode source-to-soul resume › imports only the selected synthetic conversation and reopens under its native ID'
+  return path.basename(selection.spec) === 'runtime-provider-resurrection-rust.spec.ts'
+    && environment.FRESHELL_RUNTIME_SYNTHETIC_RESUME === '1'
+    && (!selection.grep || new RegExp(selection.grep).test(title))
+}
+
+/** One owner registration for the selected browser case, with its existing fixed presets. */
+export function createExternalManagedRuntimeOwner(root: string, selection: ExternalBrowserSelection,
+  environment: NodeJS.ProcessEnv, webFactory: RuntimeWebFactory, retainedArtifacts = false): ManagedRuntimeOwner {
+  const fixture = path.basename(selection.spec) === 'runtime-fresh-agent-fixture-rust.spec.ts'
+  const smoke = path.basename(selection.spec) === 'runtime-external-target-smoke-rust.spec.ts'
+  const deterministic = fixture || smoke
+  const sourceSelection = selectsSyntheticSource(selection, environment)
+  const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : smoke ? ['freshopencode'] : selection.mode ? [selection.mode] : []
+  const providers = deterministic || selection.mode ? [] : selection.provider ? [selection.provider] : ['opencode']
+  const phase = deterministic ? 3 : selection.provider || selection.mode ? 5
+    : path.basename(selection.spec).includes('resurrection') ? 3
+      : path.basename(selection.spec).includes('rehydrate') ? 4
+        : /chaos|lost-soul/.test(selection.spec) ? 5 : 2
+  const supervisorEnv: Record<string, string> = fixture ? { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '250' } : {}
+  return new ManagedRuntimeOwner(webFactory, root, phase,
+    {}, supervisorEnv, deterministic || sourceSelection ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
+      fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
+      bootstrapProviders: deterministic || retainedArtifacts ? [] : sourceSelection ? ['opencode']
+        : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
+    })
+}
+
 /** Production lifecycle; its callbacks own only this run's local resources. */
 export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle {
   private owner?: ManagedRuntimeOwner
@@ -1587,32 +1616,15 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     process.env.DOCKER_HOST = `unix://${socket}`
     const security = JSON.parse(execFileSync('docker', ['info', '--format', '{{json .SecurityOptions}}'], { encoding: 'utf8' }))
     if (!Array.isArray(security) || !security.includes('name=rootless')) throw new Error('owned runtime Docker daemon is not rootless')
-    const fixture = path.basename(selection.spec) === 'runtime-fresh-agent-fixture-rust.spec.ts'
-    const smoke = path.basename(selection.spec) === 'runtime-external-target-smoke-rust.spec.ts'
-    const deterministic = fixture || smoke
-    const sourceTitle = 'managed OpenCode source-to-soul resume › imports only the selected synthetic conversation and reopens under its native ID'
-    const sourceSelection = path.basename(selection.spec) === 'runtime-provider-resurrection-rust.spec.ts'
-      && this.environment.FRESHELL_RUNTIME_SYNTHETIC_RESUME === '1'
-      && (!selection.grep || new RegExp(selection.grep).test(sourceTitle))
+    const sourceSelection = selectsSyntheticSource(selection, this.environment)
     const retainedSelection = path.basename(selection.spec) === 'runtime-managed-provider-qualification-rust.spec.ts'
       && this.environment.FRESHELL_RUNTIME_SYNTHETIC_RESUME === '1'
     const retainedArtifacts = retainedSelection ? readRetainedArtifacts(this.environment.FRESHELL_TASK002_FIXTURE_ARTIFACT_MANIFEST,
       root, execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()) : undefined
-    const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : smoke ? ['freshopencode'] : selection.mode ? [selection.mode] : []
-    const providers = deterministic || selection.mode ? [] : selection.provider ? [selection.provider] : ['opencode']
-    const phase = deterministic ? 3 : selection.provider || selection.mode ? 5
-      : path.basename(selection.spec).includes('resurrection') ? 3
-        : path.basename(selection.spec).includes('rehydrate') ? 4
-          : /chaos|lost-soul/.test(selection.spec) ? 5 : 2
-    this.owner = new ManagedRuntimeOwner(options => new ManagedRuntimeWebServer({ ...options, preserveHomeOnStop: false }, record => {
+    this.owner = createExternalManagedRuntimeOwner(root, selection, this.environment, options => new ManagedRuntimeWebServer({ ...options, preserveHomeOnStop: false }, record => {
       if (!this.owner) throw new Error('owned web diagnostic sink is unavailable')
       this.owner.runtime.recordLifecycle('external.web_diagnostics', { severity: 'info', ...record })
-    }), root, phase,
-      {}, {}, deterministic || sourceSelection ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
-        fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
-        bootstrapProviders: deterministic || retainedArtifacts ? [] : sourceSelection ? ['opencode']
-          : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
-      })
+    }), Boolean(retainedArtifacts))
     if (sourceSelection) await this.owner.prepareSyntheticOpenCodeSource()
     execFileSync('pnpm', ['run', 'build:client'], { cwd: root, stdio: 'inherit' })
     execFileSync('pnpm', ['run', 'build:tools'], { cwd: root, stdio: 'inherit' })

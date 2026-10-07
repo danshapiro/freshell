@@ -73,6 +73,27 @@ const descriptor = {
 }
 const smokeSpec = 'test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts'
 
+describe('selected production owner registration', () => {
+  it('preserves the all-mode fixture observer interval on an actual supervisor replacement', async () => {
+    const owner = runner.createExternalManagedRuntimeOwner(process.cwd(), {
+      spec: 'test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts',
+    }, { FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST: '1' }, () => { throw new Error('web unused') })
+    const previous: SupervisorInstance = { scenarioId: 'fixture-owner', containerId: 'b'.repeat(64),
+      volumeName: 'owned-fixture-volume', controlSocket: '/owned/control.sock', controlSecret: 'fixture-test-secret',
+      controlSecretFile: '/owned/control-secret', runtimeRoot: '/owned/runtime', binaryKind: 'test' }
+    owner.supervisor = previous
+    vi.spyOn(owner.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+    vi.spyOn(owner.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    const launch = vi.spyOn(owner.runtime, 'startSupervisor').mockResolvedValue({ ...previous, containerId: 'c'.repeat(64) })
+    await owner.restartSupervisor()
+    expect(launch).toHaveBeenCalledWith(expect.objectContaining({ binaryKind: 'test',
+      env: { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '250' } }))
+    expect(owner.fixtureRegistrationFacts()).toEqual({ phase: 3, enabledProviders: [],
+      freshAgentModes: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'],
+      fixtureFreshAgentModes: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] })
+  })
+})
+
 describe('owned external descriptor and explicit selection', () => {
   it('preserves default selection when no external descriptor is present', () => {
     expect(runner.resolveManagedExternalDescriptor({})).toBeNull()
