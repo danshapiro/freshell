@@ -260,7 +260,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'claude' && caseId === 'create') {
+  if (selection.provider === 'claude' && ['create', 'wrong-root'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId)
   }
   if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
@@ -432,6 +432,7 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
     env: { FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude' } })
   const soulId = 'soul-' + randomUUID()
   const nativeRoot = randomUUID()
+  const actualRoot = caseId === 'wrong-root' ? randomUUID() : nativeRoot
   const settings = JSON.stringify({ hooks: {
     SessionStart: [{ hooks: [{ type: 'command', command: 'sh -lc \'d="$HOME/.freshell/session-signals/claude"; n=$(date +%s%N 2>/dev/null); case "$n" in *[!0-9]*|"") n="$(date +%s)000000000";; esac; f="$d/${FRESHELL_TERMINAL_ID:-unknown}__$n-$$"; mkdir -p "$d" && cat > "$f.tmp" && mv "$f.tmp" "$f.json"\' 2>/dev/null || true' }] }],
     Stop: [{ hooks: [{ type: 'command', command: "printf '%s\\n' '{\"terminalSequence\":\"\\u0007\"}'" }] }],
@@ -440,7 +441,7 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
     nativeSessionId: nativeRoot, creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: scenario,
     limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
     terminal: { terminalId: 'native-terminal-' + randomUUID(), streamId: 'native-stream-' + randomUUID(),
-      mode: 'claude', program: 'claude', args: ['--settings', settings, '--session-id', nativeRoot,
+      mode: 'claude', program: 'claude', args: ['--settings', settings, '--session-id', actualRoot,
         '--model', 'claude-haiku-4-5-20251001', '--effort', 'low'],
       env: { HOME: '/home/freshell/provider', TERM: 'xterm-256color' },
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
@@ -488,27 +489,42 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
 `]))
   harness.writeArtifact(`${scenario}-signal-native-private.json`, nativeSignals)
   const observation = view.nativeIdentityObservation
-  if (!observation || view.recoveryState !== 'live' || observation.source !== 'claude_native_event'
-    || observation.nativeSessionId !== nativeRoot || view.nativeSessionId !== nativeRoot
-    || observation.incarnationId !== view.incarnationId) throw new Error('terminal Claude current post-load observation missing')
+  const currentObservation = !!observation && view.recoveryState === 'live' && observation.source === 'claude_native_event'
+    && observation.nativeSessionId === nativeRoot && view.nativeSessionId === nativeRoot
+    && observation.incarnationId === view.incarnationId
+  if (caseId === 'wrong-root' ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-    ['python3', '-c', claudeNativeInspection, nativeRoot, 'false', 'terminal']))
+    ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
   harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
   if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
     || !namespace.readOnlyRoot || namespace.httpsStatus !== 200 || namespace.tlsVerifyMode !== 2 || !namespace.tlsCheckHostname
     || !namespace.version.startsWith('2.1.263') || namespace.loaded?.native?.version !== '2.1.263'
-    || namespace.loaded.native.session_id !== nativeRoot || namespace.loaded.native.model?.id !== 'claude-haiku-4-5-20251001'
+    || namespace.loaded.native.session_id !== actualRoot || namespace.loaded.native.model?.id !== 'claude-haiku-4-5-20251001'
     || namespace.loaded.native.workspace?.current_dir !== workspace
     || JSON.stringify(namespace.loaded.launch) !== JSON.stringify(namespace.hook.launch)) {
     throw new Error('actual terminal Claude pin/profile/namespace/TLS differs')
+  }
+  const assertions = caseId === 'wrong-root' ? [{ name: 'wrong-current-native-root-refused-before-input', pass: false }]
+    : [{ name: 'actual-terminal-current-native-post-load-observation-before-input', pass:
+      observation.nativeSessionId === namespace.loaded.native.session_id && observation.incarnationId === view.incarnationId }]
+  if (caseId === 'wrong-root') {
+    const rejected = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned blocked startup probe. Do not use tools.\r'))
+    harness.writeArtifact(`${scenario}-input-refusal.json`, rejected)
+    const after = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+      ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
+    harness.writeArtifact(`${scenario}-after-refused-input-native-private.json`, after)
+    assertions[0]!.pass = !observation && actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
+      && rejected.result?.Err?.code === 'RECOVERY_WRONG_IDENTITY'
+      && JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
+      && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0
+    if (!assertions[0]!.pass) throw new Error('wrong current native root released ordinary input or changed native state')
   }
   const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
     nativeVersion: namespace.version, executableSha256: namespace.executableSha256,
     profileSha256: createHash('sha256').update(JSON.stringify({ preferences: preferences.sha256, profileFiles: namespace.profileFiles,
       model: namespace.loaded.native.model.id, workspace })).digest('hex'),
     artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace-native-private.json`],
-    assertions: [{ name: 'actual-terminal-current-native-post-load-observation-before-input', pass:
-      observation.nativeSessionId === namespace.loaded.native.session_id && observation.incarnationId === view.incarnationId },
+    assertions: [...assertions,
     { name: 'actual-terminal-global-pin-distinct-from-sdk-child', pass: namespace.version.startsWith('2.1.263')
       && namespace.loaded.native.version === '2.1.263' },
     { name: 'actual-terminal-selected-model-workspace-profile', pass: namespace.loaded.native.model.id === 'claude-haiku-4-5-20251001'
