@@ -308,6 +308,7 @@ mod tests {
             cwd: "/absent-original-workspace".into(),
             workspace: "/absent-original-workspace".into(),
             config_root: None,
+            setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec!["/absent-original-plugin".into()],
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();

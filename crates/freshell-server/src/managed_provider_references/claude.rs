@@ -58,6 +58,14 @@ pub(crate) async fn prepare_managed(
             request.cwd,
             request.original,
         )?),
+        setting_sources: request
+            .args
+            .windows(2)
+            .rfind(|pair| pair[0] == "--setting-sources")
+            .map(|pair| freshell_platform::claude_inputs::parse_setting_sources(&pair[1]))
+            .transpose()
+            .map_err(str::to_string)?
+            .unwrap_or_else(freshell_platform::claude_inputs::default_setting_sources),
         plugin_dirs,
     };
     manifest.validate().map_err(str::to_string)?;

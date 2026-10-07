@@ -11,12 +11,70 @@ pub struct ClaudeInputManifest {
     pub workspace: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_root: Option<PathBuf>,
+    #[serde(default = "default_setting_sources")]
+    pub setting_sources: Vec<ClaudeSettingSource>,
     pub plugin_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaudeSettingSource {
+    User,
+    Project,
+    Local,
+}
+
+impl ClaudeSettingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Local => "local",
+        }
+    }
+}
+
+pub fn parse_setting_sources(value: &str) -> Result<Vec<ClaudeSettingSource>, &'static str> {
+    if value.len() > 1024 * 1024 || value.chars().any(char::is_control) {
+        return Err("Claude setting-sources argument profile exceeded");
+    }
+    let mut enabled = [false; 3];
+    if !value.is_empty() {
+        for source in value.split(',') {
+            match source.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}') {
+                "user" => enabled[0] = true,
+                "project" => enabled[1] = true,
+                "local" => enabled[2] = true,
+                _ => return Err(
+                    "Claude setting-sources accepts only user, project, local or an empty selector",
+                ),
+            }
+        }
+    }
+    Ok(default_setting_sources()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, source)| enabled[index].then_some(source))
+        .collect())
+}
+
+pub fn default_setting_sources() -> Vec<ClaudeSettingSource> {
+    vec![
+        ClaudeSettingSource::User,
+        ClaudeSettingSource::Project,
+        ClaudeSettingSource::Local,
+    ]
 }
 impl ClaudeInputManifest {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.version != 1
             || self.plugin_dirs.len() > crate::provider_input_profiles::MAX_SOURCE_EVENTS
+            || self.setting_sources.len() > 3
+            || self
+                .setting_sources
+                .iter()
+                .enumerate()
+                .any(|(index, source)| self.setting_sources[..index].contains(source))
         {
             return Err("accepted Claude discovery context profile exceeded");
         }

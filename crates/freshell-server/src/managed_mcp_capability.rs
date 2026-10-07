@@ -3308,6 +3308,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             cwd: cwd.clone(),
             workspace: cwd.clone(),
             config_root: Some(selected.clone()),
+            setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec![],
         };
         let context = ProviderLaunchContext {
@@ -4621,6 +4622,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             cwd: workspace.clone(),
             workspace: workspace.clone(),
             config_root: Some(selected.clone()),
+            setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
             plugin_dirs: vec![],
         };
         let prior = store

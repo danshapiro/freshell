@@ -2171,6 +2171,7 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
             ("claude", "--session-id" | "--resume") => safe_selector(value),
             ("claude", "--model" | "--effort" | "--permission-mode") => safe_selector(value),
             ("claude", "--plugin-dir") => safe_selector(value),
+            ("claude", "--setting-sources") => freshell_platform::claude_inputs::parse_setting_sources(value).is_ok(),
             ("codex", "-c") => {
                 matches!(
                     value.as_str(),
@@ -2252,6 +2253,26 @@ pub fn durable_managed_terminal_args(
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            flag if flag == "--setting-sources" || flag.starts_with("--setting-sources=") => {
+                let value = if let Some(value) = flag.strip_prefix("--setting-sources=") {
+                    index += 1;
+                    value
+                } else {
+                    let value = args.get(index + 1).ok_or_else(invalid)?;
+                    index += 2;
+                    value.as_str()
+                };
+                let selected = freshell_platform::claude_inputs::parse_setting_sources(value)
+                    .map_err(|_| invalid())?;
+                out.push("--setting-sources".into());
+                out.push(
+                    selected
+                        .into_iter()
+                        .map(|source| source.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
             "--mcp-config" => {
                 args.get(index + 1).ok_or_else(invalid)?;
                 index += 2;
@@ -3424,6 +3445,33 @@ mod tests {
                     "{provider}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn managed_claude_source_selector_survives_native_argument_recipe_and_rejects_unknown_sources()
+    {
+        for (input, selected) in [
+            ("project,local", "project,local"),
+            ("", ""),
+            ("local, user,local", "user,local"),
+        ] {
+            let args = vec!["--setting-sources".into(), input.into()];
+            let retained = durable_managed_terminal_args("claude", args, None).unwrap();
+            assert_eq!(retained, vec!["--setting-sources", selected]);
+            validate_managed_terminal_args("claude", &retained).unwrap();
+        }
+        let retained =
+            durable_managed_terminal_args("claude", vec!["--setting-sources=project".into()], None)
+                .unwrap();
+        assert_eq!(retained, vec!["--setting-sources", "project"]);
+        for input in ["unknown", "project,", "user,secret=value"] {
+            assert!(durable_managed_terminal_args(
+                "claude",
+                vec!["--setting-sources".into(), input.into()],
+                None
+            )
+            .is_err());
         }
     }
 
