@@ -88,19 +88,6 @@ function waitForRunningView(
   }, timeoutMs)
 }
 
-async function markerLineCount(rig: ManagedRuntimeBrowserRig, containerId: string): Promise<number> {
-  const raw = (await rig.ownedProviderExec(containerId, [
-    'sh',
-    '-lc',
-    'if test -f "$HOME/p3-tool-effect-count"; then wc -l < "$HOME/p3-tool-effect-count"; else printf 0; fi',
-  ])).trim()
-  return /^\d+$/.test(raw) ? Number(raw) : -1
-}
-
-
-
-
-
 type NativeDigests = {
   sessions: string[]
   messages: Record<string, string>
@@ -185,7 +172,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       )
       if (!before.containerId || !before.hostBootId) throw new Error('managed OpenCode view lacks container/host identity')
       expect((await rig.openCodeVersionFacts(rig.runtimeEnclosureHandle(before))).version).toBe(P2_OPENCODE_VERSION)
-      await rig.ownedProviderExec(before.containerId, ['sh', '-lc', 'rm -f "$HOME/p3-tool-effect-count"'])
+      await rig.resetPhase3ApprovalEffect(rig.runtimeEnclosureHandle(before))
 
       // Phrase this as the ordinary file-edit task it is. The earlier
       // anonymous model refused the prior wording outright, producing no tool
@@ -201,7 +188,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
           ? text
           : null
       }, 180_000)
-      expect((await markerLineCount(rig, before.containerId))).toBe(0)
+      expect(await rig.phase3ApprovalEffectCount(rig.runtimeEnclosureHandle(before))).toBe(0)
 
       // OpenCode writes its session row on the FIRST turn, never at TUI start
       // -- that IS the capability manifest's `session-row-must-materialize`
@@ -239,7 +226,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       }, 90_000)
       expect(leafAfterWebRestart.id).toBe(paneId)
       expect(approvalSurvivedWebRestart).toBe(true)
-      expect((await markerLineCount(rig, before.containerId))).toBe(0)
+      expect(await rig.phase3ApprovalEffectCount(rig.runtimeEnclosureHandle(before))).toBe(0)
 
       rig.runtime.killOwnedRuntimeExact(before.containerId)
       await new Promise((resolve) => setTimeout(resolve, 1_500))
@@ -273,14 +260,14 @@ test.describe.serial('Phase 3 provider resurrection', () => {
         return text.includes('Permission required') && text.includes('Allow once') ? text : null
       }, 180_000)
       const visibleRecoveryState = rejectedInputWhileRecovering && after.incarnationId !== before.incarnationId
-      const accidentalApproval = (await markerLineCount(rig, after.containerId)) !== 0
+      const accidentalApproval = await rig.phase3ApprovalEffectCount(rig.runtimeEnclosureHandle(after)) !== 0
       expect(promptAfterRecovery).toContain('Permission required')
       expect(accidentalApproval).toBe(false)
 
       // "Allow once" is the provider-native default selected action.
       await terminal.pressKey('Enter', 1)
       const toolEffectCount = await waitForValue('exactly one provider tool side effect', async () => {
-        const count = (await markerLineCount(rig, after.containerId!))
+        const count = await rig.phase3ApprovalEffectCount(rig.runtimeEnclosureHandle(after))
         return count === 1 ? count : null
       }, 180_000)
       expect(toolEffectCount).toBe(1)
@@ -291,7 +278,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
         timeout: 180_000,
       })
       const followUpText = await terminal.getVisibleText(terminalId)
-      expect((await markerLineCount(rig, after.containerId))).toBe(1)
+      expect(await rig.phase3ApprovalEffectCount(rig.runtimeEnclosureHandle(after))).toBe(1)
 
       const receipt = {
         schemaVersion: 1,

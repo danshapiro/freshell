@@ -813,6 +813,12 @@ export class ExternalManagedRuntimeRig {
   runtimeEnclosureHandle(view: Pick<ManagedRuntimeView, 'soulId' | 'incarnationId' | 'containerId' | 'hostBootId'>): RuntimeEnclosureHandle {
     return createRuntimeEnclosureHandle(this.descriptor, view)
   }
+  async resetPhase3ApprovalEffect(enclosure: RuntimeEnclosureHandle): Promise<void> {
+    await this.rpc('phase3-effect-reset', CompletedOwnerOperationSchema, { enclosure })
+  }
+  async phase3ApprovalEffectCount(enclosure: RuntimeEnclosureHandle): Promise<number> {
+    return this.rpc('phase3-effect-count', z.number().int().min(-1), { enclosure })
+  }
   async openCodeVersionFacts(handle: RuntimeEnclosureHandle): Promise<{ provider: 'opencode'; version: string }> {
     return this.rpc('opencode-version', z.object({ provider: z.literal('opencode'),
       version: z.string().regex(/^\d+\.\d+\.\d+$/) }).strict(), { enclosure: this.runtimeEnclosureHandle(handle) })
@@ -1056,6 +1062,15 @@ export function createExternalRuntimeControl(
       case 'opencode-version':
         if (!request.enclosure) throw new Error('exact current runtime enclosure address required')
         result = await owner.openCodeVersionFacts(request.enclosure)
+        break
+      case 'phase3-effect-reset':
+        if (!request.enclosure) throw new Error('exact current runtime enclosure address required')
+        await owner.resetPhase3ApprovalEffect(request.enclosure)
+        result = { completed: true }
+        break
+      case 'phase3-effect-count':
+        if (!request.enclosure) throw new Error('exact current runtime enclosure address required')
+        result = await owner.phase3ApprovalEffectCount(request.enclosure)
         break
       case 'crash-provider-worker': await owner.crashProviderWorker(handle()); result = { completed: true }; break
       case 'fixture-state': result = await owner.fixtureNativeState(handle()); break

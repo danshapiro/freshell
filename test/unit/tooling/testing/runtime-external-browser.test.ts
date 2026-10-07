@@ -921,6 +921,25 @@ describe('closed external owner control', () => {
     expect(version).toHaveBeenCalledTimes(2)
     expect(kill).toHaveBeenCalledOnce()
   })
+  it('runs the closed Phase3 effect operations over the same pre-native enclosure', async () => {
+    const { owned, context, request } = fixture()
+    const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',
+      incarnationId: 'p3-incarnation', containerId: 'b'.repeat(64), hostBootId: 'p3-boot' }
+    const reset = vi.spyOn(owned, 'resetPhase3ApprovalEffect').mockResolvedValue(undefined)
+    const count = vi.spyOn(owned, 'phase3ApprovalEffectCount').mockResolvedValue(1)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await rig.resetPhase3ApprovalEffect(enclosure)
+    await expect(rig.phase3ApprovalEffectCount(enclosure)).resolves.toBe(1)
+    expect(reset).toHaveBeenCalledExactlyOnceWith(enclosure)
+    expect(count).toHaveBeenCalledExactlyOnceWith(enclosure)
+    await expect(control({ ...request, action: 'phase3-effect-count' })).rejects.toThrow(/enclosure/)
+    await expect(control({ ...request, operationId: 'forged-effect', action: 'phase3-effect-reset', enclosure,
+      path: '/arbitrary' })).rejects.toThrow(/operation/)
+    expect(reset).toHaveBeenCalledOnce()
+  })
   it('refuses arbitrary commands, foreign metadata and absent current handles before owner work', async () => {
     const { owned, context, inventory, request } = fixture()
     const control = runner.createExternalRuntimeControl(owned, context)

@@ -608,7 +608,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt',
-    'managed-opt-in', 'opencode-version', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
     'native-challenge-register',
@@ -3035,7 +3035,7 @@ export class ManagedRuntimeOwner {
     return createRuntimeEnclosureHandle(this.runtime, view)
   }
 
-  async openCodeVersionFacts(handle: RuntimeEnclosureHandle): Promise<{ provider: 'opencode'; version: string }> {
+  private async assertCurrentOpenCodeEnclosure(handle: RuntimeEnclosureHandle): Promise<void> {
     const rows = (await this.inventory()).filter(view => view.soulId === handle.soulId)
     const row = rows[0]
     if (handle.runId !== this.runtime.runId || handle.candidateSha !== this.runtime.candidateSha || rows.length !== 1
@@ -3043,9 +3043,27 @@ export class ManagedRuntimeOwner {
       || row.containerId !== handle.containerId || row.hostBootId !== handle.hostBootId
       || !this.runtime.broker.receipts().some(receipt => receipt.soulId === handle.soulId
         && receipt.incarnationId === handle.incarnationId && receipt.containerId === handle.containerId)) {
-      throw new Error('version address is not the exact current owned enclosure')
+      throw new Error('address is not the exact current owned enclosure')
     }
     if (row?.provider !== 'opencode') throw new Error('exact OpenCode runtime required')
+  }
+
+  async resetPhase3ApprovalEffect(handle: RuntimeEnclosureHandle): Promise<void> {
+    if (this.runtime.phase !== 3) throw new Error('Phase 3 approval fixture required')
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    await this.ownedProviderExec(handle.containerId, ['sh', '-lc', 'rm -f "$HOME/p3-tool-effect-count"'])
+  }
+
+  async phase3ApprovalEffectCount(handle: RuntimeEnclosureHandle): Promise<number> {
+    if (this.runtime.phase !== 3) throw new Error('Phase 3 approval fixture required')
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    const raw = (await this.ownedProviderExec(handle.containerId, ['sh', '-lc',
+      'if test -f "$HOME/p3-tool-effect-count"; then wc -l < "$HOME/p3-tool-effect-count"; else printf 0; fi'])).trim()
+    return /^\d+$/.test(raw) ? Number(raw) : -1
+  }
+
+  async openCodeVersionFacts(handle: RuntimeEnclosureHandle): Promise<{ provider: 'opencode'; version: string }> {
+    await this.assertCurrentOpenCodeEnclosure(handle)
     const version = (await this.ownedProviderExec(handle.containerId, ['opencode', '--version'])).trim()
     if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('OpenCode version reply is invalid')
     return { provider: 'opencode', version }

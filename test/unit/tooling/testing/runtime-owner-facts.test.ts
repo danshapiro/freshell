@@ -18,6 +18,38 @@ const handle = {
   hostBootId: 'boot-owned', nativeSessionId: 'native-owned',
 }
 
+describe('finite Phase 3 approval effect operations', () => {
+  it('resets and counts only the existing owned marker file before native identity materializes', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-p3-effect-'))
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    const enclosure = rig.runtimeEnclosureHandle(handle)
+    const row = { ...enclosure, provider: 'opencode', nativeSessionId: undefined, launchState: 'running', intentRevision: 1 }
+    const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([row])
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(root, 'unused.sock'), proxySocketPath: path.join(root, 'proxy.sock'),
+      runtimeRootPrefix: root, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId, logPath: path.join(root, 'broker.jsonl') })
+    vi.spyOn(rig.runtime.broker, 'receipts').mockReturnValue([{ ...enclosure, imageRef: 'owned-image', runtimeDir: root,
+      createdAt: new Date().toISOString(), requestDigest: 'd'.repeat(64) }])
+    const probe = vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (containerId, args) => {
+      expect(containerId).toBe(enclosure.containerId)
+      return execFileSync(args[0], [...args.slice(1)], { env: { ...process.env, HOME: root }, encoding: 'utf8' })
+    })
+    try {
+      await fsp.writeFile(path.join(root, 'p3-tool-effect-count'), 'old\nold\n')
+      await expect(rig.phase3ApprovalEffectCount(enclosure)).resolves.toBe(2)
+      await rig.resetPhase3ApprovalEffect(enclosure)
+      await expect(rig.phase3ApprovalEffectCount(enclosure)).resolves.toBe(0)
+      await fsp.writeFile(path.join(root, 'p3-tool-effect-count'), 'P3_APPROVAL_EFFECT\n')
+      await expect(rig.phase3ApprovalEffectCount(enclosure)).resolves.toBe(1)
+      probe.mockClear()
+      await expect(rig.resetPhase3ApprovalEffect({ ...enclosure, hostBootId: 'foreign' })).rejects.toThrow(/current|enclosure/)
+      expect(probe).not.toHaveBeenCalled()
+      inventory.mockResolvedValue([{ ...row, provider: 'codex' }])
+      await expect(rig.phase3ApprovalEffectCount(enclosure)).rejects.toThrow(/OpenCode/)
+      expect(probe).not.toHaveBeenCalled()
+    } finally { await fsp.rm(root, { recursive: true, force: true }) }
+  })
+})
+
 describe('owner-side synthetic OpenCode source preparation', () => {
   it('returns only a new matching no-tool follow-up ID from the existing private native history', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
