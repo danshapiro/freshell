@@ -53,16 +53,208 @@ pub fn unverified_native_probe() -> RecoveryProbe {
     }
 }
 
-/// Body-free binding for a complete exact-store negative captured by a reader.
-pub fn native_absence_reference(
+const NATIVE_CENSUS_PREFIX: &str = "nativeAbsenceCensus=v2:";
+
+/// Body-free evidence emitted only after a complete provider reader negative.
+/// The storage generation is independent of the registry evidence revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeAbsenceCensus {
+    provider: String,
+    store: String,
+    native_id: String,
+    evidence_revision: u64,
+    provider_home: String,
+    environment_fingerprint: String,
+    inspected_home: String,
+    generation: String,
+    store_state: EvidenceStoreState,
+}
+
+fn native_census(evidence: &[String]) -> Option<NativeAbsenceCensus> {
+    let mut receipts = evidence
+        .iter()
+        .filter_map(|reference| reference.strip_prefix(NATIVE_CENSUS_PREFIX));
+    let receipt = serde_json::from_str(receipts.next()?).ok()?;
+    if receipts.next().is_some() {
+        return None;
+    }
+    Some(receipt)
+}
+
+fn native_environment_fingerprint(spec: &ResumeSpec) -> String {
+    let selection: BTreeMap<_, _> = spec
+        .environment
+        .iter()
+        .filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "HOME"
+                    | "CLAUDE_CONFIG_DIR"
+                    | "CODEX_HOME"
+                    | "AMPLIFIER_HOME"
+                    | "XDG_DATA_HOME"
+                    | "OPENCODE_DB"
+            )
+        })
+        .collect();
+    format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(spec.provider_home.as_str(), selection))
+                .expect("store selection serializes")
+        )
+    )
+}
+
+pub fn native_absence_census_environment_matches(spec: &ResumeSpec, evidence: &[String]) -> bool {
+    native_census(evidence).is_some_and(|census| {
+        census.provider_home == spec.provider_home
+            && census.environment_fingerprint == native_environment_fingerprint(spec)
+    })
+}
+
+pub fn native_absence_census_matches(
     provider: &str,
     store: &str,
     native_id: &str,
-    evidence_revision: u64,
-) -> String {
-    let fields = serde_json::to_vec(&(provider, store, native_id, evidence_revision))
-        .expect("census fields serialize");
-    format!("nativeAbsenceCensus=sha256:{:x}", Sha256::digest(fields))
+    revision: u64,
+    store_state: EvidenceStoreState,
+    evidence: &[String],
+) -> bool {
+    let Some(census) = native_census(evidence) else {
+        return false;
+    };
+    census.provider == provider
+        && census.store == store
+        && census.native_id == native_id
+        && census.evidence_revision == revision
+        && census.store_state == store_state
+        && !native_id.trim().is_empty()
+        && !census.provider_home.is_empty()
+        && [&census.environment_fingerprint, &census.generation]
+            .iter()
+            .all(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        && (census.inspected_home == PROVIDER_HOME || native_absence_census_current(evidence))
+}
+
+/// Reinspect a directly accessible capture before registry commit or cleanup.
+/// Container-home receipts instead require a new owned-volume reader result.
+pub fn native_absence_census_current(evidence: &[String]) -> bool {
+    native_census(evidence).is_some_and(|census| {
+        let home = Path::new(&census.inspected_home);
+        let before = native_store_generation(home, &census.provider).ok();
+        before.as_deref() == Some(&census.generation)
+            && matches!(probe_selected_provider_identity(home, &census.provider, &census.native_id),
+                ProviderStoreProbe::DefinitivelyUnavailable { store_state, .. } if store_state == census.store_state)
+            && native_store_generation(home, &census.provider).ok() == before
+    })
+}
+
+pub fn native_absence_census_is_container(evidence: &[String]) -> bool {
+    native_census(evidence).is_some_and(|census| census.inspected_home == PROVIDER_HOME)
+}
+
+pub fn same_native_absence_census(captured: &[String], current: &[String]) -> bool {
+    match (native_census(captured), native_census(current)) {
+        (Some(captured), Some(current)) => captured == current,
+        _ => false,
+    }
+}
+
+fn native_store_generation(home: &Path, provider: &str) -> Result<String, ()> {
+    let canonical = fs::canonicalize(home).map_err(|_| ())?;
+    if canonical != home {
+        return Err(());
+    }
+    let root = home.join(match provider {
+        "claude" | "kilroy" => ".claude/projects",
+        "codex" => ".codex/sessions",
+        "amplifier" => ".amplifier/projects",
+        "opencode" => ".local/share/opencode",
+        "phase1-fixture" | "native-session-fixture" => ".",
+        _ => return Err(()),
+    });
+    inspect_native_path(home, &root).map_err(|_| ())?;
+    let mut hash = Sha256::new();
+    hash.update(b"freshell-native-store-generation-v2\0");
+    let mut queue = VecDeque::from([(root, 0_u8)]);
+    let mut visited = 0_usize;
+    let mut total_bytes = 0_u64;
+    while let Some((path, depth)) = queue.pop_front() {
+        visited += 1;
+        if visited > 50_000 || depth > 8 {
+            return Err(());
+        }
+        hash.update(
+            path.strip_prefix(home)
+                .map_err(|_| ())?
+                .as_os_str()
+                .as_encoded_bytes(),
+        );
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && depth == 0 => {
+                hash.update(b"missing");
+                continue;
+            }
+            Err(_) => return Err(()),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode();
+            hash.update(mode.to_le_bytes());
+            if mode & 0o444 == 0 || (metadata.is_dir() && mode & 0o111 == 0) {
+                return Err(());
+            }
+        }
+        if metadata.is_dir() {
+            hash.update(b"directory\0");
+            let mut children = fs::read_dir(&path)
+                .map_err(|_| ())?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ())?;
+            children.sort();
+            for child in children {
+                queue.push_back((child, depth + 1));
+            }
+        } else if metadata.is_file() {
+            total_bytes = total_bytes.checked_add(metadata.len()).ok_or(())?;
+            if total_bytes > 512 * 1024 * 1024 {
+                return Err(());
+            }
+            hash.update(b"file\0");
+            hash.update(metadata.len().to_le_bytes());
+            use std::io::Read;
+            let mut file = fs::File::open(&path).map_err(|_| ())?;
+            let mut buffer = [0_u8; 64 * 1024];
+            let mut read_bytes = 0_u64;
+            loop {
+                let count = file.read(&mut buffer).map_err(|_| ())?;
+                if count == 0 {
+                    break;
+                }
+                read_bytes = read_bytes.checked_add(count as u64).ok_or(())?;
+                if read_bytes > metadata.len() {
+                    return Err(());
+                }
+                hash.update(&buffer[..count]);
+            }
+            if read_bytes != metadata.len() {
+                return Err(());
+            }
+        } else {
+            return Err(());
+        }
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 /// Whether a provider's durable-soul behavior has actually been proven by a
@@ -646,7 +838,7 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
         );
     }
     let home = &spec.provider_home;
-    let canonical_overrides = match spec.provider_session.provider.as_str() {
+    let mut canonical_overrides = match spec.provider_session.provider.as_str() {
         "claude" | "kilroy" => vec![("CLAUDE_CONFIG_DIR", format!("{home}/.claude"))],
         "codex" => vec![("CODEX_HOME", format!("{home}/.codex"))],
         "amplifier" => vec![("AMPLIFIER_HOME", format!("{home}/.amplifier"))],
@@ -659,6 +851,7 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
         ],
         _ => Vec::new(),
     };
+    canonical_overrides.push(("HOME", home.clone()));
     if canonical_overrides.iter().any(|(key, canonical)| {
         spec.environment
             .get(*key)
@@ -671,19 +864,89 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
             None,
         );
     }
-    let mut result = match spec.provider_session.provider.as_str() {
+    let mut result = probe_selected_provider_store(provider_home, spec);
+    let captured_result = result.clone();
+    if let ProviderStoreProbe::DefinitivelyUnavailable {
+        evidence,
+        store_state,
+        ..
+    } = &mut result
+    {
+        let generation_before =
+            native_store_generation(provider_home, &spec.provider_session.provider);
+        // Repeat the semantic reader inside the storage-generation window.
+        // Positive resume probes need no negative census.
+        if probe_selected_provider_store(provider_home, spec) != captured_result {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "native storage classification changed during inspection",
+                Vec::new(),
+                None,
+            );
+        }
+        let generation_after =
+            native_store_generation(provider_home, &spec.provider_session.provider);
+        let (Ok(before), Ok(after)) = (generation_before, generation_after) else {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "complete native storage generation could not be inspected",
+                Vec::new(),
+                None,
+            );
+        };
+        if before != after {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "native storage changed during inspection",
+                Vec::new(),
+                None,
+            );
+        }
+        let census = NativeAbsenceCensus {
+            provider: spec.provider_session.provider.clone(),
+            store: spec.provider_session.provider_store_id.clone(),
+            native_id: expected.into(),
+            evidence_revision: spec.evidence_revision,
+            provider_home: spec.provider_home.clone(),
+            environment_fingerprint: native_environment_fingerprint(spec),
+            inspected_home: provider_home.display().to_string(),
+            generation: after,
+            store_state: *store_state,
+        };
+        evidence.push(format!(
+            "{NATIVE_CENSUS_PREFIX}{}",
+            serde_json::to_string(&census).expect("census serializes")
+        ));
+    }
+    result
+}
+
+fn probe_selected_provider_store(provider_home: &Path, spec: &ResumeSpec) -> ProviderStoreProbe {
+    probe_selected_provider_identity(
+        provider_home,
+        &spec.provider_session.provider,
+        &spec.provider_session.native_session_id,
+    )
+}
+
+fn probe_selected_provider_identity(
+    provider_home: &Path,
+    provider: &str,
+    expected: &str,
+) -> ProviderStoreProbe {
+    match provider {
         "phase1-fixture" | "native-session-fixture" => {
             probe_native_fixture(provider_home, expected)
         }
         "claude" | "kilroy" => probe_bounded_tree(
             &provider_home.join(".claude/projects"),
             expected,
-            ArtifactMatch::FileNameOrJsonText,
+            ArtifactMatch::Claude,
         ),
         "codex" => probe_bounded_tree(
             &provider_home.join(".codex/sessions"),
             expected,
-            ArtifactMatch::FileNameOrJsonText,
+            ArtifactMatch::Codex,
         ),
         "amplifier" => probe_amplifier(provider_home, expected),
         "opencode" => probe_opencode(provider_home, expected),
@@ -693,16 +956,7 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
             vec![format!("provider={other}")],
             None,
         ),
-    };
-    if let ProviderStoreProbe::DefinitivelyUnavailable { evidence, .. } = &mut result {
-        evidence.push(native_absence_reference(
-            &spec.provider_session.provider,
-            &spec.provider_session.provider_store_id,
-            expected,
-            spec.evidence_revision,
-        ));
     }
-    result
 }
 
 fn probe_native_fixture(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
@@ -1039,6 +1293,7 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
     }
     let mut queue = VecDeque::from([(root.clone(), 0_u8)]);
     let mut matches = Vec::new();
+    let mut unresolved_candidates = false;
     let mut visited = 0_usize;
     while let Some((path, depth)) = queue.pop_front() {
         visited += 1;
@@ -1084,6 +1339,16 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
             matches.push(path.clone());
             continue;
         }
+        if path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "sessions")
+        {
+            unresolved_candidates |= path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|identity| qualified_amplifier_stub(&path, identity).is_none());
+        }
         if depth >= 8 {
             return blocked(
                 RecoveryBlockReason::StoreUnreadable,
@@ -1117,13 +1382,24 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
             }
         }
     }
+    let stub = matches
+        .first()
+        .and_then(|session_dir| qualified_amplifier_stub(session_dir, expected));
+    if unresolved_candidates && matches.len() <= 1 && stub != Some(false) {
+        return blocked(
+            RecoveryBlockReason::StoreUnreadable,
+            "Amplifier store contains a candidate without complete native identity evidence",
+            vec![root.display().to_string()],
+            None,
+        );
+    }
     match matches.as_slice() {
         [] => ProviderStoreProbe::DefinitivelyUnavailable {
             reason: format!("Amplifier store has no exact session {expected}"),
             evidence: vec![root.display().to_string()],
             store_state: EvidenceStoreState::PresentReadable,
         },
-        [session_dir] if freshell_sessions::amplifier_stub::stub_is_unused(session_dir) => {
+        [session_dir] if stub == Some(true) => {
             ProviderStoreProbe::DefinitivelyUnavailable {
                 reason: format!(
                     "Amplifier session {expected} is a pristine launcher stub, not a durable conversation"
@@ -1132,9 +1408,12 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                 store_state: EvidenceStoreState::PresentReadable,
             }
         }
-        [session_dir] => ProviderStoreProbe::Ready {
+        [session_dir] if stub == Some(false) => ProviderStoreProbe::Ready {
             evidence: vec![session_dir.display().to_string(), format!("sessionId={expected}")],
         },
+        [_] => blocked(RecoveryBlockReason::StoreUnreadable,
+            "Amplifier exact candidate identity or complete launcher-stub census is unresolved",
+            vec![root.display().to_string()], None),
         many => blocked(
             RecoveryBlockReason::AmbiguousIdentity,
             &format!(
@@ -1149,7 +1428,8 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
 
 #[derive(Debug, Clone, Copy)]
 enum ArtifactMatch {
-    FileNameOrJsonText,
+    Claude,
+    Codex,
 }
 
 fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> ProviderStoreProbe {
@@ -1243,7 +1523,7 @@ fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> Provi
             }
             continue;
         }
-        if matches!(mode, ArtifactMatch::FileNameOrJsonText) {
+        {
             let filename_match = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -1272,7 +1552,7 @@ fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> Provi
                 .any(|w| w == expected.as_bytes());
             if filename_match || content_match {
                 matches.push(path.display().to_string());
-            } else if !native_artifact_excludes_identity(&bytes, expected) {
+            } else if !native_artifact_excludes_identity(&bytes, expected, &mode) {
                 return blocked(
                     RecoveryBlockReason::StoreUnreadable,
                     "provider artifact is partial or its encoded identity is unresolved",
@@ -1300,8 +1580,8 @@ fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> Provi
 
 // A text-search miss cannot certify absence from malformed or encoded JSONL.
 // Encoded matches stay unresolved; this never selects another native session.
-fn native_artifact_excludes_identity(bytes: &[u8], expected: &str) -> bool {
-    let mut inspected = false;
+fn native_artifact_excludes_identity(bytes: &[u8], expected: &str, mode: &ArtifactMatch) -> bool {
+    let mut identity: Option<String> = None;
     for line in bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
@@ -1321,9 +1601,132 @@ fn native_artifact_excludes_identity(bytes: &[u8], expected: &str) -> bool {
         {
             return false;
         }
-        inspected = true;
+        let candidate = match mode {
+            ArtifactMatch::Claude => {
+                let kind = value.get("type").and_then(serde_json::Value::as_str);
+                let complete = match kind {
+                    Some("user" | "assistant") => value.get("message").is_some_and(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str) == kind
+                            && message
+                                .get("content")
+                                .is_some_and(|content| content.is_string() || content.is_array())
+                    }),
+                    Some("system") => value
+                        .get("subtype")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|subtype| !subtype.is_empty()),
+                    Some("custom-title") => value
+                        .get("customTitle")
+                        .is_some_and(serde_json::Value::is_string),
+                    _ => false,
+                };
+                if !complete {
+                    return false;
+                }
+                value.get("sessionId").and_then(serde_json::Value::as_str)
+            }
+            ArtifactMatch::Codex => {
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
+                    value
+                        .get("payload")
+                        .and_then(|payload| payload.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                } else if identity.is_some()
+                    && value
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| {
+                            matches!(kind, "event_msg" | "response_item" | "turn_context")
+                        })
+                    && value
+                        .get("payload")
+                        .is_some_and(serde_json::Value::is_object)
+                {
+                    continue;
+                } else {
+                    return false;
+                }
+            }
+        };
+        let Some(candidate) = candidate.filter(|id| !id.trim().is_empty() && *id != expected)
+        else {
+            return false;
+        };
+        if identity.as_deref().is_some_and(|id| id != candidate) {
+            return false;
+        }
+        identity = Some(candidate.into());
     }
-    inspected
+    identity.is_some()
+}
+
+// Loss evidence is stricter than the independent best-effort stub GC policy.
+// Every canonical child must be inspected; partial candidates remain unknown.
+fn qualified_amplifier_stub(session_dir: &Path, expected: &str) -> Option<bool> {
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(session_dir).ok()? {
+        let path = entry.ok()?.path();
+        let name = path.file_name()?.to_str()?.to_owned();
+        if !matches!(
+            name.as_str(),
+            "metadata.json" | "transcript.jsonl" | "events.jsonl"
+        ) {
+            return None;
+        }
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o444 == 0 {
+                return None;
+            }
+        }
+        files.insert(name, fs::read(path).ok()?);
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(files.get("metadata.json")?).ok()?;
+    if metadata
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected)
+        || !["created", "working_dir"].iter().all(|key| {
+            metadata
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    {
+        return None;
+    }
+    let transcript = files.get("transcript.jsonl")?;
+    let events = files.get("events.jsonl")?;
+    let mut materialized = !transcript.is_empty();
+    if let Some(turn_count) = metadata.get("turn_count") {
+        if turn_count.as_u64().is_none_or(|count| count == 0) {
+            return None;
+        }
+        materialized = true;
+    }
+    for line in events
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+    {
+        let event: serde_json::Value = serde_json::from_slice(line).ok()?;
+        match event.get("event").and_then(serde_json::Value::as_str)? {
+            "session:start" | "session:end" | "session:resume" => {}
+            "prompt:submit" => materialized = true,
+            _ => return None,
+        }
+        if event
+            .get("session_id")
+            .is_some_and(|id| id.as_str() != Some(expected))
+        {
+            return None;
+        }
+    }
+    Some(!materialized)
 }
 
 fn blocked(
@@ -1717,6 +2120,181 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn native_artifact_semantic_identity_is_required_for_absence() {
+        for provider in ["claude", "kilroy", "codex"] {
+            for bytes in [
+                br#"{}"#.as_slice(),
+                br#"{"sessionId":null}"#.as_slice(),
+                br#"{"type":"session_meta","payload":{}}"#.as_slice(),
+                br#"{"type":"session_meta","payload":{"id":null}}"#.as_slice(),
+                br#"{"type":"session_meta","payload":{"id":"other"}}"#.as_slice(),
+                br#"{"sessionId":"other"}"#.as_slice(),
+                br#"{"type":"user","sessionId":"other"}"#.as_slice(),
+                br#"{"type":"user","sessionId":"other","message":{"role":"user","content":"synthetic"}}"#.as_slice(),
+            ] {
+                let home = tempfile::tempdir().unwrap();
+                let root = home.path().join(if provider == "codex" {
+                    ".codex/sessions"
+                } else {
+                    ".claude/projects"
+                });
+                fs::create_dir_all(&root).unwrap();
+                fs::write(root.join("unknown.jsonl"), bytes).unwrap();
+                let spec = resume_spec_for_test(provider, "saved-exact-root", home.path());
+                let probe = probe_provider_store(home.path(), &spec);
+                let complete_other = if provider == "codex" {
+                    bytes == br#"{"type":"session_meta","payload":{"id":"other"}}"#
+                } else {
+                    bytes == br#"{"type":"user","sessionId":"other","message":{"role":"user","content":"synthetic"}}"#
+                };
+                assert_eq!(
+                    matches!(probe, ProviderStoreProbe::DefinitivelyUnavailable { .. }),
+                    complete_other,
+                    "{provider}: semantically unresolved artifacts must stay blocked: {probe:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alternate_home_cannot_certify_native_absence_from_the_canonical_store() {
+        for provider in ["claude", "kilroy", "codex", "opencode", "amplifier"] {
+            let home = tempfile::tempdir().unwrap();
+            let mut spec = resume_spec_for_test(provider, "saved-exact-root", home.path());
+            spec.environment
+                .insert("HOME".into(), "/uninspected/provider-home".into());
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "{provider}: selected HOME must match the inspected provider home"
+            );
+        }
+    }
+
+    #[test]
+    fn amplifier_absence_requires_complete_exact_stub() {
+        for fault in [
+            "null",
+            "empty",
+            "missing_id",
+            "conflicting_id",
+            "partial_events",
+            "unknown_events",
+            "child_symlink",
+            "missing_transcript",
+            "extra_child",
+            "unreadable_child",
+            "null_turn_count",
+            "materialized_partial_events",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let cwd = home.path().join("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let session = freshell_sessions::amplifier_stub::ensure_session(
+                &home.path().join(".amplifier"),
+                "amp-exact-session",
+                cwd.to_str().unwrap(),
+                "terminal-one",
+            )
+            .unwrap();
+            let metadata = session.session_dir.join("metadata.json");
+            match fault {
+                "null" => fs::write(&metadata, "null").unwrap(),
+                "empty" => fs::write(&metadata, "{}").unwrap(),
+                "missing_id" | "conflicting_id" => {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+                    if fault == "missing_id" {
+                        value.as_object_mut().unwrap().remove("session_id");
+                    } else {
+                        value["session_id"] = "different-session".into();
+                    }
+                    fs::write(&metadata, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "null_turn_count" | "materialized_partial_events" => {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+                    value["turn_count"] = if fault == "null_turn_count" {
+                        serde_json::Value::Null
+                    } else {
+                        1.into()
+                    };
+                    fs::write(&metadata, serde_json::to_vec(&value).unwrap()).unwrap();
+                    if fault == "materialized_partial_events" {
+                        fs::write(
+                            session.session_dir.join("events.jsonl"),
+                            "{\"event\":\"session:sta",
+                        )
+                        .unwrap();
+                    }
+                }
+                "unreadable_child" => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&metadata, fs::Permissions::from_mode(0o000)).unwrap();
+                    }
+                }
+                "partial_events" => fs::write(
+                    session.session_dir.join("events.jsonl"),
+                    "{\"event\":\"session:sta",
+                )
+                .unwrap(),
+                "unknown_events" => {
+                    fs::write(session.session_dir.join("events.jsonl"), "{}\n").unwrap()
+                }
+                "missing_transcript" => {
+                    fs::remove_file(session.session_dir.join("transcript.jsonl")).unwrap()
+                }
+                "extra_child" => {
+                    fs::write(session.session_dir.join("uninspected"), "retained").unwrap()
+                }
+                "child_symlink" => {
+                    fs::remove_file(&metadata).unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(home.path().join("missing"), &metadata).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let spec = resume_spec_for_test("amplifier", "amp-exact-session", home.path());
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "{fault}: incomplete stub cannot certify absence"
+            );
+            assert!(session.session_dir.is_dir());
+        }
+    }
+
+    #[test]
+    fn amplifier_other_candidate_identity_must_be_resolved_before_absence() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = home.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let other = freshell_sessions::amplifier_stub::ensure_session(
+            &home.path().join(".amplifier"),
+            "other-session",
+            workspace.to_str().unwrap(),
+            "terminal",
+        )
+        .unwrap();
+        fs::write(other.session_dir.join("metadata.json"), "{}").unwrap();
+        let spec = resume_spec_for_test("amplifier", "saved-exact-root", home.path());
+        assert!(
+            matches!(
+                probe_provider_store(home.path(), &spec),
+                ProviderStoreProbe::Blocked { .. }
+            ),
+            "an identity-incomplete candidate cannot exclude the requested exact Amplifier root"
+        );
+        assert!(other.session_dir.is_dir());
     }
 
     #[test]

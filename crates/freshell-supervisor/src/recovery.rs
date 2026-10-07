@@ -2937,48 +2937,64 @@ impl Supervisor {
             preventive_action: "retain and continuously verify at least one independent native-store or checkpoint recovery artifact".into(),
             regression_case: "P5-G02".into(),
         };
-        let decision = match LostDecision::try_new(LossDecisionInput {
-            installation_id: self.registry.installation_id(),
-            context: &context,
-            cleanup_handle: &context.prior_handle,
-            path_evidence,
-            builds: LossBuildEvidence {
-                web_commit: option_env!("FRESHELL_BUILD_COMMIT")
-                    .unwrap_or("unknown")
-                    .into(),
-                supervisor_commit: option_env!("FRESHELL_BUILD_COMMIT")
-                    .unwrap_or("unknown")
-                    .into(),
-                host_image_digest: self.config.image_ref.clone(),
-                provider_version,
-                protocol_version: CONTROL_PROTOCOL_VERSION,
-                registry_schema_version: crate::registry::SCHEMA_VERSION,
+        let current_native_census = self
+            .current_native_census_for_paths(&context, &path_evidence)
+            .await;
+        if current_native_census.is_none() {
+            return self
+                .preserve_nonloss_probe(
+                    soul_id,
+                    trigger,
+                    freshell_agent_runtime::unverified_native_probe(),
+                    context.write_fence(),
+                )
+                .await;
+        }
+        let decision = match LostDecision::try_new_with_current_census(
+            LossDecisionInput {
+                installation_id: self.registry.installation_id(),
+                context: &context,
+                cleanup_handle: &context.prior_handle,
+                path_evidence,
+                builds: LossBuildEvidence {
+                    web_commit: option_env!("FRESHELL_BUILD_COMMIT")
+                        .unwrap_or("unknown")
+                        .into(),
+                    supervisor_commit: option_env!("FRESHELL_BUILD_COMMIT")
+                        .unwrap_or("unknown")
+                        .into(),
+                    host_image_digest: self.config.image_ref.clone(),
+                    provider_version,
+                    protocol_version: CONTROL_PROTOCOL_VERSION,
+                    registry_schema_version: crate::registry::SCHEMA_VERSION,
+                },
+                timeline: vec![
+                    IncidentTimelineEvent {
+                        seq: 1,
+                        at: now.clone(),
+                        event: format!("recovery_trigger:{trigger:?}"),
+                        evidence_ref: Some(format!(
+                            "registry://soul/{}/incarnation/{}",
+                            soul_id,
+                            context.prior_handle.incarnation_id()
+                        )),
+                        exit_code: None,
+                        oom_killed: None,
+                    },
+                    IncidentTimelineEvent {
+                        seq: 2,
+                        at: now.clone(),
+                        event: "all_applicable_recovery_paths_definitively_negative".into(),
+                        evidence_ref: Some("capability-manifest://recoveryPaths".into()),
+                        exit_code: None,
+                        oom_killed: None,
+                    },
+                ],
+                analysis,
+                created_at: Some(now.clone()),
             },
-            timeline: vec![
-                IncidentTimelineEvent {
-                    seq: 1,
-                    at: now.clone(),
-                    event: format!("recovery_trigger:{trigger:?}"),
-                    evidence_ref: Some(format!(
-                        "registry://soul/{}/incarnation/{}",
-                        soul_id,
-                        context.prior_handle.incarnation_id()
-                    )),
-                    exit_code: None,
-                    oom_killed: None,
-                },
-                IncidentTimelineEvent {
-                    seq: 2,
-                    at: now.clone(),
-                    event: "all_applicable_recovery_paths_definitively_negative".into(),
-                    evidence_ref: Some("capability-manifest://recoveryPaths".into()),
-                    exit_code: None,
-                    oom_killed: None,
-                },
-            ],
-            analysis,
-            created_at: Some(now.clone()),
-        }) {
+            current_native_census.as_deref(),
+        ) {
             Ok(decision) => decision,
             Err(error) => {
                 let message = format!("loss certification blocked: {error}");
@@ -3025,6 +3041,21 @@ impl Supervisor {
                 .preserve_nonloss_probe(soul_id, trigger, probe, context.write_fence())
                 .await;
         }
+        if self
+            .current_loss_native_census(&context, decision.certificate())
+            .await
+            .is_none()
+        {
+            drop(staging_guard);
+            return self
+                .preserve_nonloss_probe(
+                    soul_id,
+                    trigger,
+                    freshell_agent_runtime::unverified_native_probe(),
+                    context.write_fence(),
+                )
+                .await;
+        }
         // The SQLite transaction below is the destructive-action gate. If it
         // cannot durably commit the incident and export intent, no stop signal
         // is sent and the caller receives an explicit persistence failure.
@@ -3064,6 +3095,21 @@ impl Supervisor {
         crate::service::crash_if("after_loss_incident_commit");
         self.export_pending_incidents().await?;
 
+        let current_context = self
+            .registry
+            .recovery_context(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if self
+            .current_loss_native_census(&current_context, &prepared.certificate)
+            .await
+            .is_none()
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::LossCertificationBlocked,
+                "native storage changed before loss cleanup",
+            ));
+        }
         let preexisting_empty = self
             .backend
             .verify_empty(&prepared.handle)
@@ -3092,9 +3138,17 @@ impl Supervisor {
         };
         crate::service::crash_if("after_loss_cleanup_before_finalize");
         let incident_id = prepared.certificate.incident_id.clone();
+        let current_native_census = self
+            .current_loss_native_census(&current_context, &prepared.certificate)
+            .await;
         let _notice = self
             .registry
-            .finalize_loss_cleanup(incident_id.clone(), outcome, cleanup)
+            .finalize_loss_cleanup_with_census(
+                incident_id.clone(),
+                outcome,
+                cleanup,
+                current_native_census,
+            )
             .await
             .map_err(map_registry)?;
         crate::service::crash_if("after_loss_finalize_before_export");
@@ -3507,9 +3561,71 @@ impl Supervisor {
         }
     }
 
-    /// Resume the incident-before-cleanup pipeline after a supervisor
-    /// crash. The incident row and exact cleanup capability were committed
-    /// together, so this never discovers authority from Docker-wide state.
+    async fn current_loss_native_census(
+        &self,
+        context: &RecoveryContext,
+        certificate: &freshell_runtime_protocol::LostDecisionCertificate,
+    ) -> Option<Vec<String>> {
+        let current = self
+            .current_native_census_for_paths(context, &certificate.recovery_paths)
+            .await;
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.loss.current_native_census",
+            serde_json::json!({
+                "severity": if current.is_some() { "info" } else { "warn" },
+                "soulId": context.soul_id, "incarnationId": context.prior_handle.incarnation_id(),
+                "incidentId": certificate.incident_id, "intentRevision": context.intent_revision,
+                "identityRevision": context.identity_revision, "evidenceRevision": context.evidence_revision,
+                "controlEpoch": context.control_epoch,
+                "reason": if current.is_some() { "current_exact_native_absence_verified" } else { "current_native_census_unavailable_or_changed" },
+            }),
+        );
+        current
+    }
+
+    async fn current_native_census_for_paths(
+        &self,
+        context: &RecoveryContext,
+        paths: &[RecoveryPathEvidence],
+    ) -> Option<Vec<String>> {
+        if context.provider == "shell" {
+            return Some(Vec::new());
+        }
+        crate::loss_report::validate_native_absence(context, paths).ok()?;
+        let native = paths
+            .iter()
+            .find(|row| row.path == RecoveryPath::NativeResume)?;
+        if !freshell_agent_runtime::native_absence_census_is_container(&native.evidence_refs) {
+            return freshell_agent_runtime::native_absence_census_current(&native.evidence_refs)
+                .then(|| native.evidence_refs.clone());
+        }
+        let spec = resume_catalog::exact_resume_candidate(context, None).ok()??;
+        let fresh = self
+            .backend
+            .read_native_census(
+                &context.prior_handle,
+                &spec,
+                &self.config.host_binary_path,
+                &self.config.image_ref,
+            )
+            .await
+            .ok()?;
+        let freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
+            evidence,
+            store_state,
+            ..
+        } = fresh
+        else {
+            return None;
+        };
+        (crate::loss_report::native_absence_matches(context, store_state, &evidence)
+            && freshell_agent_runtime::same_native_absence_census(&native.evidence_refs, &evidence))
+        .then_some(evidence)
+    }
+
+    /// Resume the incident-before-cleanup pipeline only after a current census
+    /// of the exact retained volume; a historical certificate is insufficient.
     pub async fn reconcile_pending_loss_cleanup(&self) -> Result<(), RuntimeError> {
         self.export_pending_incidents().await?;
         let incidents = self
@@ -3530,8 +3646,10 @@ impl Supervisor {
                 .recovery_context(certificate.soul_id.clone())
                 .await
                 .map_err(map_registry)?;
-            if crate::loss_report::validate_native_absence(&context, &certificate.recovery_paths)
-                .is_err()
+            if self
+                .current_loss_native_census(&context, &certificate)
+                .await
+                .is_none()
             {
                 crate::service::append_event(
                     &self.config.lifecycle_log,
@@ -3572,8 +3690,16 @@ impl Supervisor {
                     .then(freshell_runtime_observability::now_rfc3339_millis),
                 foreign_objects_touched: 0,
             };
+            let current_native_census = self
+                .current_loss_native_census(&context, &certificate)
+                .await;
             self.registry
-                .finalize_loss_cleanup(incident_id.clone(), outcome, cleanup)
+                .finalize_loss_cleanup_with_census(
+                    incident_id.clone(),
+                    outcome,
+                    cleanup,
+                    current_native_census,
+                )
                 .await
                 .map_err(map_registry)?;
             if let Err(error) = crate::service::append_incident_event_if_current(

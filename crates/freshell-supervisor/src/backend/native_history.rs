@@ -85,6 +85,80 @@ fn decode_docker_log_frames(
 }
 
 impl DockerEngineBackend {
+    pub(super) async fn read_census_helper(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        spec: &freshell_runtime_protocol::ResumeSpec,
+        reader_binary: &Path,
+        image_ref: &str,
+    ) -> Result<freshell_agent_runtime::ProviderStoreProbe, BackendError> {
+        if spec.provider_session.provider_store_id != handle.provider_store_id()
+            || spec.provider_home != OPENCODE_PROVIDER_HOME
+            || image_ref.len() != 71
+            || !image_ref.starts_with("sha256:")
+        {
+            return Err(BackendError::OwnershipMismatch(
+                "native census request does not bind the owned store and current image".into(),
+            ));
+        }
+        let (uid, gid) = handle
+            .terminal()
+            .map(|terminal| (terminal.run_as_uid, terminal.run_as_gid))
+            .or_else(|| {
+                handle
+                    .fresh_agent()
+                    .map(|agent| (agent.run_as_uid, agent.run_as_gid))
+            })
+            // Explicit fixtures already run as the host workload uid/gid.
+            // Real providers always use the configured identity above.
+            .or_else(|| handle.fixture().map(|_| (0, 0)))
+            .ok_or_else(|| {
+                BackendError::InvalidConfig("native census needs an exact provider workload".into())
+            })?;
+        // The native reader needs store selection only, never credentials or
+        // provider argv. No private environment enters Docker's Cmd or logs.
+        let mut reader_spec = spec.clone();
+        reader_spec.environment.retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "HOME"
+                    | "CLAUDE_CONFIG_DIR"
+                    | "CODEX_HOME"
+                    | "AMPLIFIER_HOME"
+                    | "XDG_DATA_HOME"
+                    | "OPENCODE_DB"
+            )
+        });
+        reader_spec.resume_argv.clear();
+        reader_spec.credential_references.clear();
+        let output = self
+            .readonly_native_helper(
+                handle,
+                reader_binary,
+                ReadonlyNativeReader {
+                    image_ref: image_ref.into(),
+                    uid,
+                    gid,
+                    args: vec![
+                        "provider-census-only".into(),
+                        serde_json::to_string(&reader_spec)
+                            .map_err(|error| BackendError::Malformed(error.to_string()))?,
+                    ],
+                    env: reader_spec
+                        .environment
+                        .iter()
+                        .map(|(key, value)| format!("{key}={value}"))
+                        .collect(),
+                    cwd: None,
+                    extra_mounts: Vec::new(),
+                    tmpfs: "rw,noexec,nosuid,nodev,size=16m",
+                    tty: false,
+                },
+                Duration::from_secs(30),
+            )
+            .await?;
+        serde_json::from_value(output).map_err(|error| BackendError::Malformed(error.to_string()))
+    }
     pub(super) async fn repair_stopped_opencode_helper(
         &self,
         handle: &OwnedRuntimeHandle,
@@ -636,6 +710,9 @@ mod tests {
             "success",
             "compatibility_success",
             "compatibility_failure",
+            "census_success",
+            "census_unreadable",
+            "census_fixture",
             "failed_exit",
             "bad_output",
             "timeout",
@@ -673,11 +750,48 @@ mod tests {
                     swap_bytes: 0,
                     pids_max: 32,
                 },
+                (mode == "census_fixture")
+                    .then_some(freshell_runtime_protocol::FixtureKind::NativeSession),
                 None,
-                None,
-                Some(agent),
+                (mode != "census_fixture").then_some(agent),
                 "owned-native-volume".into(),
             );
+            let terminal = serde_json::from_value(json!({"terminalId":"census","streamId":"census","mode":"opencode","program":"opencode",
+                "cwd":workspace,"workspacePath":workspace,"env":{"HOME":OPENCODE_PROVIDER_HOME,"API_KEY":"private-fixture-value"},
+                "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"test"})).unwrap();
+            let mut spec = freshell_agent_runtime::build_resume_spec(
+                freshell_agent_runtime::ResumeSpecInput {
+                    provider: "opencode",
+                    provider_store_id: "store",
+                    native_session_id: "ses_saved",
+                    terminal: &terminal,
+                    provider_version: None,
+                    creation_seed_ref: "seed".into(),
+                    checkpoint_revision: 0,
+                    evidence_revision: 1,
+                    never_dispatched: false,
+                },
+            )
+            .unwrap();
+            if mode == "census_unreadable" {
+                let database = temp.path().join(".local/share/opencode/opencode.db");
+                std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+                std::fs::write(database, "incomplete native store").unwrap();
+            }
+            let provider_home = temp.path().join("provider");
+            std::fs::create_dir_all(&provider_home).unwrap();
+            if mode == "census_fixture" {
+                spec.provider_session.provider = "native-session-fixture".into();
+            }
+            let actual_probe = freshell_agent_runtime::probe_provider_store(
+                if mode == "census_fixture" {
+                    &provider_home
+                } else {
+                    temp.path()
+                },
+                &spec,
+            );
+            let actual_receipt = serde_json::to_string(&actual_probe).unwrap();
             let seen = Arc::new(Mutex::new(Vec::new()));
             let captured = seen.clone();
             let server = tokio::spawn(async move {
@@ -685,6 +799,7 @@ mod tests {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let seen = captured.clone();
                     let daemon = expected_daemon.clone();
+                    let actual_receipt = actual_receipt.clone();
                     tokio::spawn(async move {
                         let mut raw = Vec::new();
                         let mut byte = [0];
@@ -729,7 +844,9 @@ mod tests {
                                 } else if matches!(mode, "failed_exit" | "compatibility_failure") {
                                     json!({"event":"session_host.fatal","error":"saved native session not found"}).to_string()
                                 } else {
-                                    if mode.starts_with("compatibility_") {
+                                    if mode.starts_with("census_") {
+                                        actual_receipt
+                                    } else if mode.starts_with("compatibility_") {
                                         let seen = seen.lock().unwrap();
                                         let create: Value = serde_json::from_slice(
                                             &seen
@@ -757,16 +874,18 @@ mod tests {
                         } else {
                             panic!("unexpected request {request}")
                         };
-                        let body =
-                            if mode.starts_with("compatibility_") && request.contains("/logs?") {
-                                let mut frame = docker_stdout_frame(body.as_bytes());
-                                if mode == "compatibility_failure" {
-                                    frame[0] = 2;
-                                }
-                                frame
-                            } else {
-                                body.into_bytes()
-                            };
+                        let body = if (mode.starts_with("compatibility_")
+                            || mode.starts_with("census_"))
+                            && request.contains("/logs?")
+                        {
+                            let mut frame = docker_stdout_frame(body.as_bytes());
+                            if mode == "compatibility_failure" {
+                                frame[0] = 2;
+                            }
+                            frame
+                        } else {
+                            body.into_bytes()
+                        };
                         let header=format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
                         let _ = stream.write_all(header.as_bytes()).await;
                         let _ = stream.write_all(&body).await;
@@ -774,7 +893,13 @@ mod tests {
                 }
             });
             let backend = DockerEngineBackend::new(&socket);
-            let result = if mode.starts_with("compatibility_") {
+            let result = if mode.starts_with("census_") {
+                backend.read_native_census(&handle, &spec, &binary, &format!("sha256:{}", "b".repeat(64))).await.map(|probe| {
+                    assert_eq!(probe, actual_probe);
+                    assert_eq!(matches!(probe, freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable { .. }), matches!(mode, "census_success" | "census_fixture"));
+                    serde_json::to_value(probe).unwrap()
+                })
+            } else if mode.starts_with("compatibility_") {
                 let request = freshell_runtime_protocol::RetainedStoreCompatibilityRequest {
                     provider_store_id: handle.provider_store_id().into(),
                     native_session_id: "ses_saved".into(),
@@ -806,7 +931,14 @@ mod tests {
             };
             assert_eq!(
                 result.is_ok(),
-                matches!(mode, "success" | "compatibility_success"),
+                matches!(
+                    mode,
+                    "success"
+                        | "compatibility_success"
+                        | "census_success"
+                        | "census_unreadable"
+                        | "census_fixture"
+                ),
                 "{mode}: {result:?}"
             );
             if matches!(mode, "failed_exit" | "compatibility_failure") {
@@ -828,8 +960,24 @@ mod tests {
                         .1,
                 )
                 .unwrap();
-                assert_eq!(create["User"], "65534:0");
-                assert_eq!(create["Tty"], !mode.starts_with("compatibility_"));
+                assert_eq!(
+                    create["User"],
+                    if mode == "census_fixture" {
+                        "0:0"
+                    } else {
+                        "65534:0"
+                    }
+                );
+                assert_eq!(
+                    create["Tty"],
+                    !(mode.starts_with("compatibility_") || mode.starts_with("census_"))
+                );
+                if mode.starts_with("census_") {
+                    assert_eq!(create["Cmd"][0], "provider-census-only");
+                    assert!(!create.to_string().contains("private-fixture-value"));
+                    assert_eq!(create["HostConfig"]["CapDrop"], json!(["ALL"]));
+                    assert_eq!(create["HostConfig"]["Mounts"][1]["ReadOnly"], true);
+                }
                 assert_eq!(create["HostConfig"]["NetworkMode"], "none");
                 assert_eq!(
                     create["HostConfig"]["Mounts"].as_array().unwrap().len(),

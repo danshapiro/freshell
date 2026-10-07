@@ -223,6 +223,18 @@ pub struct StoppedOpenCodeRepairReceipts {
 
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
+    /// Read the exact retained provider volume without a provider process or grant.
+    async fn read_native_census(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+        _spec: &freshell_runtime_protocol::ResumeSpec,
+        _reader_binary: &Path,
+        _image_ref: &str,
+    ) -> Result<freshell_agent_runtime::ProviderStoreProbe, BackendError> {
+        Err(BackendError::Unavailable(
+            "native census reader unavailable".into(),
+        ))
+    }
     /// Import and independently read one exact OpenCode generation from a
     /// stopped soul's provider volume. Implementations must not start the
     /// provider, create a PTY, or consume a launch grant.
@@ -622,6 +634,16 @@ fn runtime_host_environment(
 
 #[async_trait]
 impl RuntimeBackend for DockerEngineBackend {
+    async fn read_native_census(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        spec: &freshell_runtime_protocol::ResumeSpec,
+        reader_binary: &Path,
+        image_ref: &str,
+    ) -> Result<freshell_agent_runtime::ProviderStoreProbe, BackendError> {
+        self.read_census_helper(handle, spec, reader_binary, image_ref)
+            .await
+    }
     async fn repair_stopped_opencode(
         &self,
         handle: &OwnedRuntimeHandle,

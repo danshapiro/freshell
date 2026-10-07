@@ -6764,7 +6764,11 @@ pub(crate) mod tests {
 
         let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
         let negative_for = |context: &RecoveryContext| {
-            let provider_home = tempfile::tempdir().unwrap();
+            let provider_home = dir
+                .path()
+                .join("native-census")
+                .join(context.soul_id.as_str());
+            std::fs::create_dir_all(&provider_home).unwrap();
             let terminal = serde_json::from_value(serde_json::json!({
                 "terminalId":"native-census", "streamId":"native-census", "mode":"opencode",
                 "program":"opencode", "cwd":"/workspace", "workspacePath":"/workspace",
@@ -6786,7 +6790,7 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-            match freshell_agent_runtime::probe_provider_store(provider_home.path(), &spec) {
+            match freshell_agent_runtime::probe_provider_store(&provider_home, &spec) {
                 freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
                     reason,
                     evidence,

@@ -271,6 +271,15 @@ type LossSoulCleanupRow = (
 
 impl LostDecision {
     pub fn try_new(input: LossDecisionInput<'_>) -> Result<Self, LossDecisionError> {
+        Self::try_new_with_current_census(input, None)
+    }
+
+    // Only the supervisor supplies container evidence here, after its current
+    // authenticated/owned-volume reader. Public callers must inspect locally.
+    pub(crate) fn try_new_with_current_census(
+        input: LossDecisionInput<'_>,
+        current_native_census: Option<&[String]>,
+    ) -> Result<Self, LossDecisionError> {
         let context = input.context;
         if context.desired_state != DesiredState::Running {
             return Err(LossDecisionError::StopIntent);
@@ -321,6 +330,23 @@ impl LostDecision {
         }
         validate_path_inventory(applicable_paths, &input.path_evidence)?;
         validate_native_absence(context, &input.path_evidence)?;
+        if context.provider != "shell" {
+            let native = input
+                .path_evidence
+                .iter()
+                .find(|row| row.path == RecoveryPath::NativeResume)
+                .ok_or(LossDecisionError::UnknownPathEvidence("native_resume"))?;
+            if !freshell_agent_runtime::native_absence_census_current(&native.evidence_refs)
+                && current_native_census.is_none_or(|current| {
+                    !freshell_agent_runtime::same_native_absence_census(
+                        &native.evidence_refs,
+                        current,
+                    )
+                })
+            {
+                return Err(LossDecisionError::UnknownPathEvidence("native_resume"));
+            }
+        }
         validate_analysis(&input.analysis)?;
 
         let state = if context.provider == "shell" {
@@ -467,20 +493,22 @@ fn validate_loss_capture(
         )
         .optional()?
         .ok_or_else(|| RegistryError::UnknownSoul(certificate.soul_id.clone()))?;
-    if provider != "shell" {
-        let reference = freshell_agent_runtime::native_absence_reference(
-            &provider,
-            &store,
-            native_session_id.as_deref().unwrap_or(""),
-            evidence_revision,
-        );
-        if !certificate.recovery_paths.iter().any(|row| {
-            row.path == RecoveryPath::NativeResume && row.evidence_refs.contains(&reference)
-        }) {
-            return Err(RegistryError::LossCertificationBlocked(
-                "native absence census is unqualified or stale".into(),
-            ));
-        }
+    if provider != "shell"
+        && !certificate.recovery_paths.iter().any(|row| {
+            row.path == RecoveryPath::NativeResume
+                && freshell_agent_runtime::native_absence_census_matches(
+                    &provider,
+                    &store,
+                    native_session_id.as_deref().unwrap_or(""),
+                    evidence_revision,
+                    row.store_state,
+                    &row.evidence_refs,
+                )
+        })
+    {
+        return Err(RegistryError::LossCertificationBlocked(
+            "native absence census is unqualified or stale".into(),
+        ));
     }
     let native_session_hash =
         hash_native_session_reference(&provider, &store, native_session_id.as_deref());
@@ -581,6 +609,11 @@ pub(crate) fn native_absence_matches(
     if context.provider == "shell" {
         return true;
     }
+    if let Ok(Some(spec)) = crate::resume_catalog::exact_resume_candidate(context, None) {
+        if !freshell_agent_runtime::native_absence_census_environment_matches(&spec, evidence) {
+            return false;
+        }
+    }
     matches!(
         store_state,
         EvidenceStoreState::Missing | EvidenceStoreState::PresentReadable
@@ -589,12 +622,14 @@ pub(crate) fn native_absence_matches(
         .as_deref()
         .filter(|id| !id.trim().is_empty())
         .is_some_and(|id| {
-            evidence.contains(&freshell_agent_runtime::native_absence_reference(
+            freshell_agent_runtime::native_absence_census_matches(
                 &context.provider,
                 &context.provider_store_id,
                 id,
                 context.evidence_revision,
-            ))
+                store_state,
+                evidence,
+            )
         })
 }
 
@@ -1288,6 +1323,17 @@ impl Registry {
         outcome: StopOutcome,
         cleanup: LossCleanupReport,
     ) -> Result<RuntimeNotice, RegistryError> {
+        self.finalize_loss_cleanup_with_census(incident_id, outcome, cleanup, None)
+            .await
+    }
+
+    pub(crate) async fn finalize_loss_cleanup_with_census(
+        &self,
+        incident_id: IncidentId,
+        outcome: StopOutcome,
+        cleanup: LossCleanupReport,
+        current_native_census: Option<Vec<String>>,
+    ) -> Result<RuntimeNotice, RegistryError> {
         self.run_blocking(move |mut conn| {
             let _incident_coordinator = incident_file_coordinator();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1324,14 +1370,20 @@ impl Registry {
                     "SELECT provider,provider_store_id,native_session_id,evidence_revision FROM souls WHERE soul_id=?1",
                     params![soul_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )?;
-                let reference = native_id.as_deref().filter(|id| !id.trim().is_empty()).map(|id|
-                    freshell_agent_runtime::native_absence_reference(&provider, &store, id, revision));
                 if provider != certificate.provider || store != certificate.provider_store_id
                     || hash_native_session_reference(&provider, &store, native_id.as_deref()) != certificate.native_session_ref_hash
-                    || reference.is_none_or(|reference| !certificate.recovery_paths.iter().any(|row|
-                        row.path == RecoveryPath::NativeResume && row.evidence_refs.contains(&reference)))
+                    || !certificate.recovery_paths.iter().any(|row|
+                        row.path == RecoveryPath::NativeResume && freshell_agent_runtime::native_absence_census_matches(
+                            &provider, &store, native_id.as_deref().unwrap_or(""), revision, row.store_state, &row.evidence_refs))
                 {
                     return Err(RegistryError::LossCertificationBlocked("historical native absence census is unqualified or stale".into()));
+                }
+                let native = certificate.recovery_paths.iter().find(|row| row.path == RecoveryPath::NativeResume)
+                    .ok_or_else(|| RegistryError::LossCertificationBlocked("native census is missing".into()))?;
+                if freshell_agent_runtime::native_absence_census_is_container(&native.evidence_refs)
+                    && current_native_census.as_ref().is_none_or(|current|
+                        !freshell_agent_runtime::same_native_absence_census(&native.evidence_refs, current)) {
+                    return Err(RegistryError::LossCertificationBlocked("current owned-volume census is missing or changed before final cleanup".into()));
                 }
             }
             if current_state == "closed" {
