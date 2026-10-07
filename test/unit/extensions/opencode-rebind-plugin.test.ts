@@ -184,17 +184,22 @@ describe('createObservationEmitter', () => {
       ? { id: sessionId, parentID: undefined }
       : options.session
     const tuiMessages = options.tuiMessages ?? [{ id: tailMessageId, sessionID: sessionId, text: 'private user content' }]
-    const nativeMessages = options.nativeMessages ?? [{ info: { id: tailMessageId, sessionID: sessionId }, parts: [{ text: 'private user content' }] }]
+    const nativeMessages = options.nativeMessages ?? [{ info: { id: tailMessageId, sessionID: sessionId }, parts: [{ id: 'prt_tail1', messageID: tailMessageId, sessionID: sessionId, text: 'private user content' }] }]
     return {
       route: { current: { name: 'session', params: { sessionID: options.routeSessionId ?? sessionId } } },
       state: {
         ready: options.stateReady ?? true,
+        part: (id: string) => nativeMessages.flatMap((row: any) => row.info?.id === id ? row.parts : []),
         session: {
           get: (id: string) => id === sessionId ? session : undefined,
           messages: (id: string) => id === sessionId ? tuiMessages : [],
         },
       },
       client: {
+        session: {
+          get: async () => ({ data: session }),
+          messages: options.nativeRead ?? (async () => ({ data: nativeMessages })),
+        },
         v2: {
           session: {
             messages:
@@ -228,6 +233,74 @@ describe('createObservationEmitter', () => {
       messages_read: 'success',
     })
     expect(writes[0].body).not.toContain('private user content')
+  })
+
+  it('refuses V2 empty projections when the V1 root has active history', async () => {
+    const emit = createObservationEmitter(deps({
+      FRESHELL_OPENCODE_ADOPTION_TAIL_MESSAGE_ID: undefined,
+      FRESHELL_OPENCODE_ADOPTION_EXPECTED_EMPTY: 'true',
+    }))
+    const api = makeApi({ tuiMessages: [], nativeMessages: [] }) as any
+    api.client.session = {
+      get: async () => ({ data: { id: rootSessionId, parentID: null } }),
+      messages: async () => ({ data: [{ info: { id: tailMessageId, sessionID: rootSessionId }, parts: [] }] }),
+    }
+    await emit(api)
+    expect(writes.some((row) => JSON.parse(row.body).adoption_observation.messages_read === 'empty_confirmed')).toBe(false)
+  })
+
+  it('observes the active V1 tail before a saved full-message revert', async () => {
+    const earlier = 'msg_before1'
+    const reverted = 'msg_reverted1'
+    const emit = createObservationEmitter(deps({ FRESHELL_OPENCODE_ADOPTION_TAIL_MESSAGE_ID: earlier }))
+    const session = { id: rootSessionId, parentID: null, revert: { messageID: reverted } }
+    const api = makeApi({ session, tuiMessages: [
+      { id: earlier, sessionID: rootSessionId }, { id: reverted, sessionID: rootSessionId },
+    ] }) as any
+    api.client.session = {
+      get: async () => ({ data: session }),
+      messages: async () => ({ data: [earlier, reverted].map((id) => ({ info: { id, sessionID: rootSessionId }, parts: [] })) }),
+    }
+    api.state.part = () => []
+    await emit(api)
+    expect(writes).toHaveLength(1)
+    expect(JSON.parse(writes[0].body).adoption_observation).toMatchObject({ tail_message_id: earlier, messages_read: 'success' })
+  })
+
+  it('confirms active V1 empty history when all preserved messages are reverted', async () => {
+    const session = { id: rootSessionId, parentID: null, revert: { messageID: tailMessageId } }
+    const api = makeApi({ session }) as any
+    const emit = createObservationEmitter(deps({ FRESHELL_OPENCODE_ADOPTION_EXPECTED_EMPTY: 'true',
+      FRESHELL_OPENCODE_ADOPTION_TAIL_MESSAGE_ID: undefined }))
+    await emit(api)
+    expect(writes).toHaveLength(1)
+    expect(JSON.parse(writes[0].body).adoption_observation.messages_read).toBe('empty_confirmed')
+  })
+
+  it('requires the active part-revert tail and actual hydrated preceding parts', async () => {
+    const later = 'msg_later1'
+    const session = { id: rootSessionId, parentID: null,
+      revert: { messageID: tailMessageId, partID: 'prt_boundary1' } }
+    const parts = [{ id: 'prt_active1' }, { id: 'prt_boundary1' }, { id: 'prt_after1' }]
+    const api = makeApi({ session, tuiMessages: [{ id: tailMessageId, sessionID: rootSessionId },
+      { id: later, sessionID: rootSessionId }], nativeMessages: [
+      { info: { id: tailMessageId, sessionID: rootSessionId }, parts },
+      { info: { id: later, sessionID: rootSessionId }, parts: [] },
+    ] }) as any
+    const emit = createObservationEmitter(deps())
+    api.state.part = () => []
+    await emit(api)
+    expect(writes).toHaveLength(0)
+    api.state.part = () => parts
+    await emit(api)
+    expect(writes).toHaveLength(1)
+    expect(JSON.parse(writes[0].body).adoption_observation).toMatchObject({ tail_message_id: tailMessageId, messages_read: 'success' })
+  })
+
+  it('refuses global-ready and matching TUI tail after an actual V1 load error', async () => {
+    await createObservationEmitter(deps())(makeApi({ nativeRead: async () => { throw new Error('load failed') } }))
+    expect(writes).toHaveLength(1)
+    expect(JSON.parse(writes[0].body).adoption_observation.messages_read).toBe('failed')
   })
 
   it('retries unchanged managed evidence after a failed publication and suppresses successful duplicates', async () => {
@@ -311,6 +384,7 @@ describe('createObservationEmitter', () => {
       await emit(makeApi({
         sessionId: source.rootId,
         tuiMessages: [{ id: source.lastMessageId, sessionID: source.rootId }],
+        nativeMessages: [{ info: { id: source.lastMessageId, sessionID: source.rootId }, parts: [] }],
       }))
 
       expect(writes).toHaveLength(1)
@@ -371,7 +445,7 @@ describe('createObservationEmitter', () => {
     )
     await emit(makeApi({ tuiMessages: [], nativeRead: async () => ({}) }))
     await emit(makeApi({ tuiMessages: [], nativeRead: async () => [] }))
-    await emit(makeApi({ tuiMessages: [], nativeRead: async () => ({ data: [] }) }))
+    await emit(makeApi({ tuiMessages: [], nativeRead: async () => ({ data: null }) }))
     await emit(
       makeApi({
         tuiMessages: [],
@@ -389,7 +463,7 @@ describe('createObservationEmitter', () => {
       FRESHELL_OPENCODE_ADOPTION_TAIL_MESSAGE_ID: undefined,
       FRESHELL_OPENCODE_ADOPTION_EXPECTED_EMPTY: 'true',
     }
-    const nativeRead = vi.fn(async () => ({ data: { data: [] } }))
+    const nativeRead = vi.fn(async () => ({ data: [] }))
     const emit = createObservationEmitter(deps(env))
     await emit(makeApi({ tuiMessages: [], nativeRead }))
     expect(writes).toHaveLength(1)
@@ -458,7 +532,8 @@ describe('createObservationEmitter', () => {
       readExpectation: vi.fn(() => expectedFile),
     })
     const emit = createObservationEmitter(emitterDeps)
-    await emit(makeApi({ tuiMessages: [{ id: refreshedTail, sessionID: rootSessionId }] }))
+    await emit(makeApi({ tuiMessages: [{ id: refreshedTail, sessionID: rootSessionId }],
+      nativeMessages: [{ info: { id: refreshedTail, sessionID: rootSessionId }, parts: [] }] }))
 
     expect(emitterDeps.readExpectation).toHaveBeenCalledWith(
       '/home/u/.freshell/session-signals/opencode-adoption/term-managed.expected.json',
@@ -477,7 +552,8 @@ describe('createObservationEmitter', () => {
       incarnation_id: incarnationId,
       launch_nonce: secondNonce,
     })
-    await emit(makeApi({ tuiMessages: [{ id: secondTail, sessionID: rootSessionId }] }))
+    await emit(makeApi({ tuiMessages: [{ id: secondTail, sessionID: rootSessionId }],
+      nativeMessages: [{ info: { id: secondTail, sessionID: rootSessionId }, parts: [] }] }))
     expect(writes).toHaveLength(2)
     expect(JSON.parse(writes[1].body).adoption_observation).toMatchObject({
       tail_message_id: secondTail,
@@ -529,7 +605,7 @@ describe('createObservationEmitter', () => {
     })
     await createObservationEmitter(emitterDeps)(makeApi({
       tuiMessages: [],
-      nativeRead: async () => ({ data: { data: [] } }),
+      nativeRead: async () => ({ data: [] }),
     }))
     expect(writes).toHaveLength(1)
     expect(JSON.parse(writes[0].body).adoption_observation).toMatchObject({

@@ -58,20 +58,20 @@ interface AdoptionTuiApi {
   route?: { current?: unknown }
   state?: {
     ready?: unknown
+    part?: (messageId: string) => unknown
     session?: {
       get?: (sessionId: string) => unknown
       messages?: (sessionId: string) => unknown
     }
   }
   client?: {
-    v2?: {
       session?: {
+        get?: (parameters: { sessionID: string }, options: { throwOnError: true }) => Promise<unknown>
         messages?: (
           parameters: { sessionID: string },
           options: { throwOnError: true },
         ) => Promise<unknown>
       }
-    }
   }
 }
 
@@ -291,8 +291,18 @@ function nativeMessagesFromResult(value: unknown): unknown[] | null {
   const response = asRecord(value)
   if (!response) return null
   if ('error' in response && response.error !== undefined && response.error !== null) return null
-  const result = asRecord(response.data)
-  return result && Array.isArray(result.data) ? result.data : null
+  return Array.isArray(response.data) ? response.data : null
+}
+
+function activeMessages(value: unknown, sessionId: string, revertValue: unknown): unknown[] | null {
+  if (!Array.isArray(value) || (value.length > 0 && lastTuiMessageId(value, sessionId) === null)) return null
+  const revert = asRecord(revertValue)
+  if (!revert?.messageID) return value
+  if (typeof revert.messageID !== 'string' || !MESSAGE_ID_RE.test(revert.messageID)) return null
+  const index = value.findIndex((message) => asRecord(message)?.id === revert.messageID)
+  if (index < 0) return null
+  if (revert.partID !== undefined && revert.partID !== null && typeof revert.partID !== 'string') return null
+  return value.slice(0, index + (typeof revert.partID === 'string' ? 1 : 0))
 }
 
 function exactObjectKeys(value: Record<string, unknown>, keys: string[]): boolean {
@@ -384,23 +394,27 @@ function readCurrentAdoptionExpectation(
   }
 }
 
-async function readEmptyHistory(api: AdoptionTuiApi, sessionId: string): Promise<boolean> {
+async function readNativeHistory(api: AdoptionTuiApi, sessionId: string): Promise<{ session: Record<string, unknown>; messages: unknown[] } | null> {
   try {
-    const sessionClient = api.client?.v2?.session
+    const sessionClient = api.client?.session
     const read = sessionClient?.messages
-    if (typeof read !== 'function') return false
+    const get = sessionClient?.get
+    if (typeof read !== 'function' || typeof get !== 'function') return null
     // The exact-session SDK request explicitly throws for non-2xx results.
     // Changed shapes, errors, missing data, and malformed responses are all
     // treated as an unqualified read, never as empty history.
-    const result = await read.call(
-      sessionClient,
-      { sessionID: sessionId },
-      { throwOnError: true },
-    )
+    const [metadata, result] = await Promise.all([
+      get.call(sessionClient, { sessionID: sessionId }, { throwOnError: true }),
+      read.call(sessionClient, { sessionID: sessionId }, { throwOnError: true }),
+    ])
+    const response = asRecord(metadata)
+    const session = asRecord(response?.data)
+    if (!session || response?.error || !sessionIsExactRoot(session, sessionId)) return null
     const messages = nativeMessagesFromResult(result)
-    return messages !== null && messages.length === 0
+    if (!messages || messages.some((row) => !asRecord(asRecord(row)?.info) || !Array.isArray(asRecord(row)?.parts))) return null
+    return { session, messages }
   } catch {
-    return false
+    return null
   }
 }
 
@@ -443,16 +457,40 @@ export function createObservationEmitter(
         return
       }
 
-      const hydratedMessages = sessionState.messages(current.rootSessionId)
+      const native = await readNativeHistory(api, current.rootSessionId)
+      if (currentRouteSessionId(api.route?.current) !== current.rootSessionId || state.ready !== true) return
+      const selected = asRecord(sessionState.get(current.rootSessionId))
+      if (!sessionIsExactRoot(selected, current.rootSessionId)) return
+      const hydratedMessages = activeMessages(sessionState.messages(current.rootSessionId), current.rootSessionId, selected?.revert)
       let messagesRead: 'success' | 'empty_confirmed' | 'failed'
-      if (current.expectedEmpty) {
-        if (!Array.isArray(hydratedMessages) || hydratedMessages.length !== 0) return
-        messagesRead = await readEmptyHistory(api, current.rootSessionId)
-          ? 'empty_confirmed'
-          : 'failed'
+      if (!native) {
+        messagesRead = 'failed'
       } else {
-        if (lastTuiMessageId(hydratedMessages, current.rootSessionId) !== current.tailMessageId) return
-        messagesRead = 'success'
+        const revert = (value: unknown) => {
+          const record = asRecord(value)
+          return JSON.stringify({ messageID: record?.messageID ?? null, partID: record?.partID ?? null })
+        }
+        if (revert(native.session.revert) !== revert(selected?.revert)) return
+        const nativeActive = activeMessages(native.messages.map((row) => asRecord(row)?.info), current.rootSessionId, native.session.revert)
+        if (!nativeActive || !hydratedMessages) return
+        if (current.expectedEmpty) {
+          if (nativeActive.length !== 0 || hydratedMessages.length !== 0) return
+          messagesRead = 'empty_confirmed'
+        } else {
+          if (lastTuiMessageId(nativeActive, current.rootSessionId) !== current.tailMessageId
+            || lastTuiMessageId(hydratedMessages, current.rootSessionId) !== current.tailMessageId) return
+          const tail = native.messages.find((row) => asRecord(asRecord(row)?.info)?.id === current.tailMessageId)
+          const parts = asRecord(tail)?.parts as unknown[]
+          if (parts.length) {
+            const hydrated = typeof state.part === 'function' ? state.part(current.tailMessageId!) : null
+            if (!Array.isArray(hydrated)) return
+            const ids = new Set(hydrated.map((part) => asRecord(part)?.id))
+            const boundary = asRecord(native.session.revert)?.partID
+            const partIndex = typeof boundary === 'string' ? parts.findIndex((part) => asRecord(part)?.id === boundary) : parts.length
+            if (partIndex < 0 || parts.slice(0, partIndex).some((part) => typeof asRecord(part)?.id !== 'string' || !ids.has(asRecord(part)?.id))) return
+          }
+          messagesRead = 'success'
+        }
       }
 
       const observation = {
