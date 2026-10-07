@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
+import { createServer } from 'node:net'
+import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   runNativeFeasibility, executeManagedNativeCase, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
@@ -25,6 +27,75 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it('submits terminal Claude paste and Enter separately before qualifying the completed native seed', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-claude-native-input-'))
+    const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
+    const binary = path.join(directory, 'owned-controller'); fs.writeFileSync(binary, 'fixture-only controller artifact')
+    const socketPath = path.join(directory, 'mcp.sock')
+    const controller = createServer((socket) => {
+      const chunks: Buffer[] = []
+      socket.on('data', (chunk) => chunks.push(chunk))
+      socket.on('end', () => {
+        const request = JSON.parse(Buffer.concat(chunks).toString())
+        expect(request.action).toBe('issue'); expect(request.provider).toBe('claude')
+        socket.end(JSON.stringify({ context: { mcpCapability: { grantId: 'owned-fixture-grant' } },
+          secretReferences: [{ sourcePath: source, profile: 'claude_onecli_environment' }] }))
+      })
+    })
+    await new Promise<void>((resolve) => controller.listen(socketPath, resolve))
+    const start = vi.spyOn(RustServer.prototype, 'start').mockResolvedValue({ pid: undefined } as any)
+    const evidence = vi.spyOn(RustServer.prototype, 'processEvidence').mockReturnValue({} as any)
+    let request: any
+    let submitted = 0
+    let pasted = false
+    let replacement = false
+    let now = 0
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now += 25_000)
+    const gestures: string[] = []
+    const view = () => ({ containerId: 'owned-container', incarnationId: replacement ? 'new-incarnation' : 'old-incarnation',
+      nativeSessionId: request.params.nativeSessionId, recoveryState: 'live',
+      nativeIdentityObservation: { source: 'claude_native_event', nativeSessionId: request.params.nativeSessionId,
+        incarnationId: replacement ? 'new-incarnation' : 'old-incarnation' } })
+    const harness = { testRoot: directory, writeArtifact: () => '',
+      startSupervisor: async () => ({ controlSocket: path.join(directory, 'supervisor.sock'), controlSecret: 'owned-fixture-secret' }),
+      terminalInputBody: (_soul: string, data: string) => ({ method: 'terminal_input', params: { data } }),
+      terminalReadOutputBody: () => ({ method: 'terminal_read_output' }),
+      probeRecoveryBody: () => ({ method: 'probe_recovery' }), recoverBody: () => ({ method: 'recover' }),
+      killOwnedRuntimeExact: async () => { expect(submitted).toBe(1) }, waitForContainerExit: async () => {},
+      adminOk: async (_supervisor: unknown, body: any) => {
+        if (body.method === 'launch') { request = body; return { data: { view: view() } } }
+        if (body.method === 'terminal_input') {
+          gestures.push(body.params.data)
+          if (body.params.data.startsWith('\x1b[200~') && body.params.data.endsWith('\x1b[201~')) pasted = true
+          else if (body.params.data === '\r' && pasted) submitted++
+        }
+        if (body.method === 'recover') { replacement = true; return { data: { outcome: 'replaced', view: view() } } }
+        return { data: { kind: 'reattach_ready' } }
+      },
+      execOwnedContainerAsExact: async (_container: string, _uid: string, args: string[]) => JSON.stringify(args.at(-1) !== 'terminal' ? { processes: [] } : {
+        uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200, tlsVerifyMode: 2,
+        tlsCheckHostname: true, version: '2.1.263', executableSha256: 'f'.repeat(64), profileFiles: [], nativePreferences: {},
+        completedTurns: submitted, toolEvents: 0, transcript: submitted ? { sha256: 'e'.repeat(64), identity: [1, 2], completeEof: true } : null,
+        hook: { launch: { launchNonce: replacement ? 'new-nonce' : 'old-nonce', incarnationId: view().incarnationId },
+          native: { source: replacement ? 'resume' : 'startup', session_id: request.params.nativeSessionId } },
+        loaded: { launch: { launchNonce: replacement ? 'new-nonce' : 'old-nonce', incarnationId: view().incarnationId },
+          native: { version: '2.1.263', session_id: request.params.nativeSessionId,
+            model: { id: 'claude-haiku-4-5-20251001' }, workspace: { current_dir: request.params.terminal.cwd } } },
+      }),
+    } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
+    try {
+      const result = await executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, 'exact-resume', binary)
+      expect(result.assertions.every((assertion) => assertion.pass)).toBe(true)
+      expect(submitted).toBe(1)
+      expect(gestures).toHaveLength(2)
+      expect(gestures[1]).toBe('\r')
+    } finally {
+      clock.mockRestore(); evidence.mockRestore(); start.mockRestore()
+      await new Promise<void>((resolve, reject) => controller.close((error) => error ? reject(error) : resolve()))
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
   it('requires the actual owned controller artifact before terminal exact-resume can start a seed', async () => {
     const launch = vi.fn()
     const harness = { startSupervisor: launch } as unknown as RuntimeHarness

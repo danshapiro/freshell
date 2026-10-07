@@ -582,8 +582,13 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     // Count completed native model IDs, never the transport's input ACK.
     const turn = async (containerId: string, text: string, label: string) => {
       const before = await inspect(containerId, label + '-before-input')
+      // Keep paste content and the submit key as distinct ordinary gestures;
+      // a bulk text/CR packet can remain in the native TUI's paste buffer.
+      harness.writeArtifact(`${scenario}-${label}-paste-dispatch.json`, await harness.adminOk(supervisor,
+        harness.terminalInputBody(soulId, '\x1b[200~' + text + '\x1b[201~')))
+      await new Promise((resolve) => setTimeout(resolve, 100))
       harness.writeArtifact(`${scenario}-${label}-dispatch.json`, await harness.adminOk(supervisor,
-        harness.terminalInputBody(soulId, text + '\r')))
+        harness.terminalInputBody(soulId, '\r')))
       const deadline = Date.now() + 90_000
       while (Date.now() < deadline) {
         const current = await inspect(containerId, label)
