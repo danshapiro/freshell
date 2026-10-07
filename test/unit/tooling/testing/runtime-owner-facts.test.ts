@@ -400,6 +400,37 @@ function fixture() {
 }
 
 describe('exact owned runtime facts', () => {
+  it('keeps owner control responsive while cgroup facts are read for the exact native host', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-cgroup-child-'))
+    const command = path.join(root, 'docker')
+    const limits = { cpuMax: '50000 100000', memoryMax: '268435456', swapMax: '0', pidsMax: '64' }
+    await fsp.writeFile(command, `#!${process.execPath}\nsetTimeout(()=>process.stdout.write('${JSON.stringify(limits)}'),150)\n`, { mode: 0o700 })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    rig.supervisor = { scenarioId: 'owned-cgroup', containerId: 'd'.repeat(64), controlSocket: path.join(root, 'control.sock'),
+      controlSecret: 'synthetic-secret', controlSecretFile: path.join(root, 'secret'), runtimeRoot: root,
+      volumeName: 'owned-cgroup-volume', binaryKind: 'test' }
+    await fsp.mkdir(path.join(root, current.incarnationId))
+    await fsp.writeFile(path.join(root, current.incarnationId, 'host-state.json'), JSON.stringify({
+      hostBootId: current.hostBootId, workerPid: 42, workerLaunchCount: 1,
+    }))
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(root, 'unused.sock'), proxySocketPath: path.join(root, 'proxy.sock'),
+      runtimeRootPrefix: root, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId, logPath: path.join(root, 'broker.jsonl') })
+    vi.spyOn(rig.runtime.broker, 'receipts').mockReturnValue([{ ...current, runtimeDir: path.join(root, current.incarnationId), imageRef: 'owned-image',
+      createdAt: new Date().toISOString(), requestDigest: 'd'.repeat(64) }])
+    vi.spyOn(rig.runtime.broker, 'receiptIds').mockReturnValue(new Set([current.containerId]))
+    vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...current, launchState: 'running', intentRevision: 1 }])
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    vi.stubEnv('PATH', `${root}${path.delimiter}${process.env.PATH}`)
+    let settled = false
+    const responsive = new Promise<boolean>(resolve => setTimeout(() => resolve(!settled), 20))
+    const probe = rig.chaosHostFacts(current).then(result => { settled = true; return result })
+    try {
+      try { expect(await responsive).toBe(true) } finally {
+        await expect(probe).resolves.toEqual({ workerPid: 42, workerLaunchCount: 1, limits, unsafeBrokerAttempts: 0 })
+      }
+    } finally { vi.unstubAllEnvs(); await fsp.rm(root, { recursive: true, force: true }) }
+  })
   it('keeps owner control responsive while the fixed supervisor adoption probe runs', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-adoption-child-'))
     const command = path.join(root, 'docker')

@@ -1890,24 +1890,6 @@ export class RuntimeHarness {
     }
   }
 
-  async chaosHostFacts(instance: SupervisorInstance, handle: ExactRuntimeHandle): Promise<RuntimeHostFacts> {
-    return readExactRuntimeHostFacts({
-      ...this.ownerFactsAdapter(instance),
-      readHostFacts: async (current) => {
-        const state = JSON.parse(fs.readFileSync(path.join(this.runtimeDir(instance, current.incarnationId), 'host-state.json'), 'utf8'))
-        if (state.hostBootId !== current.hostBootId) throw new Error('owner host facts belong to a replaced boot')
-        const limits = JSON.parse(this.execOwnedContainerExact(current.containerId, [
-          'node', '-e',
-          "const fs=require('node:fs');const root='/sys/fs/cgroup/';process.stdout.write(JSON.stringify({cpuMax:fs.readFileSync(root+'cpu.max','utf8').trim(),memoryMax:fs.readFileSync(root+'memory.max','utf8').trim(),swapMax:fs.readFileSync(root+'memory.swap.max','utf8').trim(),pidsMax:fs.readFileSync(root+'pids.max','utf8').trim()}))",
-        ]))
-        return {
-          workerPid: state.workerPid, workerLaunchCount: state.workerLaunchCount,
-          limits, unsafeBrokerAttempts: this.broker.unsafeAttempts().length,
-        }
-      },
-    }, handle)
-  }
-
   async fixtureNativeState(instance: SupervisorInstance, handle: ExactRuntimeHandle): Promise<FixtureNativeState> {
     await assertExactRuntimeHandle(this.ownerFactsAdapter(instance), handle)
     const value = JSON.parse(this.execOwnedContainerAsExact(handle.containerId, '65534:0', [
@@ -3033,11 +3015,25 @@ export class ManagedRuntimeOwner {
   }
 
   async chaosHostFacts(handle: ExactRuntimeHandle): Promise<RuntimeHostFacts> {
-    return this.runtime.chaosHostFacts(this.supervisor, handle)
+    return readExactRuntimeHostFacts({
+      ...this.runtimeFactsAdapter(handle),
+      readHostFacts: async (current) => {
+        const state = JSON.parse(await fsp.readFile(path.join(this.runtime.runtimeDir(this.supervisor, current.incarnationId), 'host-state.json'), 'utf8'))
+        if (state.hostBootId !== current.hostBootId) throw new Error('owner host facts belong to a replaced boot')
+        const limits = JSON.parse(await this.ownedDockerProbe(current.containerId, [
+          'node', '-e',
+          "const fs=require('node:fs');const root='/sys/fs/cgroup/';process.stdout.write(JSON.stringify({cpuMax:fs.readFileSync(root+'cpu.max','utf8').trim(),memoryMax:fs.readFileSync(root+'memory.max','utf8').trim(),swapMax:fs.readFileSync(root+'memory.swap.max','utf8').trim(),pidsMax:fs.readFileSync(root+'pids.max','utf8').trim()}))",
+        ], false))
+        return {
+          workerPid: state.workerPid, workerLaunchCount: state.workerLaunchCount,
+          limits, unsafeBrokerAttempts: this.runtime.broker.unsafeAttempts().length,
+        }
+      },
+    }, handle)
   }
 
-  async assertCurrentHandle(handle: ExactRuntimeHandle): Promise<void> {
-    await assertExactRuntimeHandle({
+  private runtimeFactsAdapter(handle: ExactRuntimeHandle): Omit<RuntimeOwnerFactsAdapter, 'readHostFacts'> {
+    return {
       runId: this.runtime.runId, candidateSha: this.runtime.candidateSha,
       inventory: async () => {
         const rows = (await this.inventory()).filter(row => row.soulId === handle.soulId)
@@ -3047,7 +3043,11 @@ export class ManagedRuntimeOwner {
           : [])
       },
       receipts: () => this.runtime.broker.receipts(),
-    }, handle)
+    }
+  }
+
+  async assertCurrentHandle(handle: ExactRuntimeHandle): Promise<void> {
+    await assertExactRuntimeHandle(this.runtimeFactsAdapter(handle), handle)
   }
 
   async crashRuntimeHost(handle: ExactRuntimeHandle): Promise<void> {
