@@ -43,7 +43,10 @@ export function query({ prompt, options }) {
           const attachment = { type: 'attachment', sessionId: nativeRoot, uuid: 'checkpoint-original', version: '2.1.237',
             attachment: { type: 'hook_deferred_tool', toolUseID, toolName: 'Bash', toolInput: input,
               hookEvent: 'PreToolUse', permissionMode: options.permissionMode } }
-          await writeFile(transcriptPath, JSON.stringify(assistant) + '\n' + JSON.stringify(attachment) + '\n')
+          const bytes = JSON.stringify(assistant) + '\n' + JSON.stringify(attachment) + '\n'
+          if (process.env.FRESHELL_SIDECAR_TEST_DEFERRED_TRANSCRIPT_DELAY === '1') {
+            setTimeout(() => { void writeFile(transcriptPath, bytes) }, 150)
+          } else await writeFile(transcriptPath, bytes)
           yield { type: 'result', subtype: 'success', session_id: nativeRoot, is_error: false,
             stop_reason: 'tool_deferred', deferred_tool_use: { id: toolUseID, name: 'Bash', input } }
         } else {

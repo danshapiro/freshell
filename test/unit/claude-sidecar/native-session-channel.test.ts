@@ -20,10 +20,11 @@ async function hook(channel: any) {
   child.stdin.end(JSON.stringify(native))
   expect(await exited).toBe(0)
 }
-function checkpointSidecar(directory: string, nativeRequestId = 'native-current') {
+function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false) {
   const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/index.mjs')], {
     env: { ...process.env, HOME: directory, FRESHELL_SIDECAR_TEST_CHECKPOINT: '1',
       FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID: nativeRequestId,
+      FRESHELL_SIDECAR_TEST_DEFERRED_TRANSCRIPT_DELAY: delayedTranscript ? '1' : '0',
       FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(launch),
       FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -152,6 +153,23 @@ describe('native solo deferred checkpoint inspection', () => {
 })
 
 describe('production sidecar native checkpoint continuation', () => {
+  it('waits for the genuine deferred native transcript publication before exposing its pending card', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-deferred-publication-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    const worker = checkpointSidecar(directory, 'native-delayed', true)
+    try {
+      worker.send({ type: 'create', requestId: 'delayed-native', cwd: directory, resumeSessionId: root, permissionMode: 'default' })
+      const session = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: session.sessionId, text: 'owned original operation' })
+      const card = await worker.wait('sdk.permission.request')
+      expect(card.nativeCheckpoint.toolUseID).toBe('toolu_original1')
+      expect(worker.frames.some((frame) => frame.type === 'sdk.error')).toBe(false)
+      worker.send({ type: 'permission.respond', sessionId: session.sessionId, requestId: card.requestId,
+        decision: { behavior: 'deny', message: 'owned denial' } })
+      expect((await worker.wait('sdk.tool.result')).content[0].is_error).toBe(true)
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
   it.each(['current', 'current-reordered', 'current-changed-decision-input', 'current-missing-decision-input', 'current-changed-profile', 'wrong-input', 'dispatching'])('releases only a trusted recoverable checkpoint after explicit current control (%s)', async (scenario) => {
     const directory = await mkdtemp(join(tmpdir(), 'sidecar-explicit-resume-'))
     await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')

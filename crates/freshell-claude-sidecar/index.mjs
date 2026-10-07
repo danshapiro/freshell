@@ -373,8 +373,20 @@ async function handleSdkMessage(sessionId, msg) {
           || st.nativeSoloTool?.id !== tool.id || nativeInputDigest(st.nativeSoloTool.input) !== nativeInputDigest(tool.input)) {
           throw new Error('native deferred result does not match the original solo operation')
         }
-        const record = await st.nativeStore.publish(tool.id, nativeInputDigest(tool.input))
+        // The native result can precede its asynchronous JSONL publication.
+        // Wait boundedly for the real checkpoint, retaining the same query and
+        // no-effect fence; a result alone never exposes a pending card.
+        const query = st.query
+        const deadline = Date.now() + 3_000
+        let record
+        while (Date.now() < deadline) {
+          if (st.query !== query || st.abort.signal.aborted) throw new Error('native checkpoint publication cancelled')
+          record = await st.nativeStore.publish(tool.id, nativeInputDigest(tool.input))
+          if (record) break
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
         if (!record) throw new Error('native deferred checkpoint is unavailable or ambiguous')
+        if (st.query !== query || st.abort.signal.aborted) throw new Error('native checkpoint publication cancelled')
         await continueNativeCheckpoint(sessionId, st, record)
         break
       }
