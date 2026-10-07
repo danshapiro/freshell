@@ -29,9 +29,9 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-claude-route-'))
     const launch = vi.fn(async (_supervisor: unknown, request: any) => {
       expect(request.params.terminal.providerBootstrapFiles).toBeUndefined()
-      const selected = request.params.terminal.providerLaunchContext.config.find((file: any) => file.providerRelativePath === '.claude.json')
-      expect(selected.root).toBe('workspace')
-      const preferences = JSON.parse(fs.readFileSync(path.join(request.params.terminal.cwd, selected.relativePath), 'utf8'))
+      const selected = request.params.terminal.providerLaunchContext.config.find((file: any) => file.providerRelativePath === '.claude/.claude.json')
+      expect(selected.root).toBe('user_provider')
+      const preferences = JSON.parse(fs.readFileSync(path.join(directory, 'native-source/claude/.claude', selected.relativePath), 'utf8'))
       expect(preferences.projects[request.params.terminal.cwd].hasTrustDialogAccepted).toBe(true)
       throw new Error('controlled terminal launch boundary')
     })

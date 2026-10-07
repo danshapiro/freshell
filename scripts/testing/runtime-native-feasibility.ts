@@ -423,13 +423,16 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   const scenario = `claude-${caseId}`
   const workspace = path.join(harness.testRoot, `${scenario}-workspace`)
   fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
-  // UI preferences are ordinary non-secret configuration. Named Claude
-  // launches project them through the existing configuration copier.
-  const preferencesName = 'native-startup-user.json'
-  fs.copyFileSync(preferences.path, path.join(workspace, preferencesName))
-  fs.chmodSync(path.join(workspace, preferencesName), 0o660)
+  // Select the same ordinary user file on create and controller reissue.
+  // The supported config directory keeps preferences in that selected root.
+  const home = path.join(harness.testRoot, 'native-source/claude')
+  const userRoot = path.join(home, '.claude')
+  const preferencePath = path.join(userRoot, '.claude.json')
+  fs.mkdirSync(userRoot, { recursive: true, mode: 0o700 })
+  fs.copyFileSync(preferences.path, preferencePath)
+  fs.chmodSync(preferencePath, 0o600)
   const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release',
-    env: { FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude' } })
+    env: { HOME: home, FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude' } })
   const soulId = 'soul-' + randomUUID()
   const nativeRoot = randomUUID()
   const actualRoot = caseId === 'wrong-root' ? randomUUID() : nativeRoot
@@ -443,11 +446,11 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
     terminal: { terminalId: 'native-terminal-' + randomUUID(), streamId: 'native-stream-' + randomUUID(),
       mode: 'claude', program: 'claude', args: ['--settings', settings, '--session-id', actualRoot,
         '--model', 'claude-haiku-4-5-20251001', '--effort', 'low'],
-      env: { HOME: '/home/freshell/provider', TERM: 'xterm-256color' },
+      env: { HOME: '/home/freshell/provider', CLAUDE_CONFIG_DIR: '/home/freshell/provider/.claude', TERM: 'xterm-256color' },
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
       providerModel: 'claude-haiku-4-5-20251001', providerReasoningEffort: 'low', providerSecretReferences: grants,
-      providerLaunchContext: { preparation: { claude: { mcp_args: [] } }, config: [{ root: 'workspace',
-        relativePath: preferencesName, providerRelativePath: '.claude.json', format: 'json' }] } } } }
+      providerLaunchContext: { preparation: { claude: { mcp_args: [] } }, config: [{ root: 'user_provider',
+        relativePath: '.claude.json', providerRelativePath: '.claude/.claude.json', format: 'json' }] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
   const result = await harness.adminOk(supervisor, request)
   harness.writeArtifact(`${scenario}-launch.json`, result)
@@ -1121,7 +1124,7 @@ opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),
 with opener.open(urllib.request.Request('https://api.anthropic.com/v1/models',headers={'anthropic-version':'2023-06-01','authorization':'Bearer '+env['CLAUDE_CODE_OAUTH_TOKEN']}),timeout=20) as r:status=r.status;r.read()
 home=pathlib.Path(env.get('CLAUDE_CONFIG_DIR') or str(pathlib.Path(env['HOME'])/'.claude'));cwd=pathlib.Path(hook['native']['cwd']);profile=[]
 files=[home/'settings.json',cwd/'.claude/settings.json',cwd/'.claude/settings.local.json']
-if terminal:files.append(pathlib.Path(env['HOME'])/'.claude.json')
+if terminal:files.append(home/'.claude.json')
 for file in files:
  profile.append({'path':str(file),'sha256':hashlib.sha256(file.read_bytes()).hexdigest() if file.exists() else None})
 transcript=None;file=pathlib.Path(hook['native']['transcript_path'])
