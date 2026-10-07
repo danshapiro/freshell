@@ -46,14 +46,23 @@ pub(super) fn resource_units(
         roots.insert(parent.to_path_buf(), canonical);
     }
     let mut units = Vec::new();
-    for (ordinal, (logical, canonical)) in roots.into_iter().enumerate() {
+    let mut identities = BTreeMap::new();
+    for (logical, canonical) in roots {
+        let next = identities.len();
+        let ordinal = *identities.entry(canonical.clone()).or_insert(next);
         let destination =
             crate::managed_provider_references::sources::runtime_directory_destination(
                 home, global, &logical,
             );
-        let effective = crate::managed_provider_references::sources::runtime_directory_destination(
-            home, global, &canonical,
-        );
+        let effective = if destination.starts_with("/home/freshell/provider") {
+            // HOME is a new physical graph, so its native discovery root is
+            // mounted directly; the original user symlink remains untouched.
+            destination.clone()
+        } else {
+            crate::managed_provider_references::sources::runtime_directory_destination(
+                home, global, &canonical,
+            )
+        };
         units.push((
             canonical,
             ProviderResourceMount {

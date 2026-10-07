@@ -352,6 +352,7 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
     std::fs::write(nested.join("inline-rule"), "native-inline-selected-rule\n").unwrap();
     let resource_root = fixture.join("workspace/.opencode");
     let root_receipt = fixture.join("workspace/native-root-consumed.json");
+    let home_root_receipt = fixture.join("workspace/native-home-root-consumed.json");
     std::fs::create_dir_all(resource_root.join("plugins/selected/node_modules/fixture-dependency"))
         .unwrap();
     std::fs::write(
@@ -370,24 +371,56 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
     )
     .unwrap();
     std::fs::write(resource_root.join("plugins/selected/index.mjs"), r#"import fs from 'node:fs';import crypto from 'node:crypto';import dependency from 'fixture-dependency';
-export default {id:'closed-writable-selected-root',async server(input,options){return {async config(config){
+const home=import.meta.url.startsWith('file:///home/freshell/provider/.opencode/');
+export default {id:'closed-writable-selected-root-'+(home?'home':'workspace'),async server(input,options){return {async config(config){
  const root=new URL('../../',import.meta.url); const path=new URL('provider-owned-write',root);
  fs.writeFileSync(path,'selected-root-write');
- fs.writeFileSync(options.receipt,JSON.stringify({dependency:crypto.createHash('sha256').update(dependency).digest('hex'),resource:crypto.createHash('sha256').update(fs.readFileSync(new URL('./resource',import.meta.url))).digest('hex'),write:crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex')}));
+ fs.writeFileSync(home?options.homeReceipt:options.receipt,JSON.stringify({dependency:crypto.createHash('sha256').update(dependency).digest('hex'),resource:crypto.createHash('sha256').update(fs.readFileSync(new URL('./resource',import.meta.url))).digest('hex'),write:crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex')}));
 }}}};
 "#).unwrap();
     let root_config = serde_json::to_vec(
-        &json!({"plugin":[["./plugins/selected/index.mjs", {"receipt":root_receipt}]]}),
+        &json!({"plugin":[["./plugins/selected/index.mjs", {"receipt":root_receipt, "homeReceipt":home_root_receipt}]]}),
     )
     .unwrap();
     std::fs::write(resource_root.join("opencode.json"), &root_config).unwrap();
+    for name in ["package.json", "package-lock.json"] {
+        std::fs::copy(
+            fixture.join("source-home/.config/opencode").join(name),
+            resource_root.join(name),
+        )
+        .unwrap();
+    }
+    std::os::unix::fs::symlink(
+        fixture.join("source-home/.config/opencode/node_modules"),
+        resource_root.join("node_modules"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&resource_root, fixture.join("source-home/.opencode")).unwrap();
     let explicit_directory = fixture.join("source-home/selected-directory");
     let directory_receipt = fixture.join("workspace/native-directory-consumed.json");
     std::fs::create_dir_all(explicit_directory.join("plugins")).unwrap();
     std::fs::create_dir_all(explicit_directory.join("skills/probe")).unwrap();
+    let transported_dependency =
+        fixture.join("source-home/.config/opencode/node_modules/transport-only");
+    std::fs::create_dir_all(&transported_dependency).unwrap();
+    std::fs::write(
+        transported_dependency.join("package.json"),
+        r#"{"name":"transport-only","type":"module","exports":"./index.mjs"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        transported_dependency.join("index.mjs"),
+        "export default 'transport-only-cross-root-dependency';",
+    )
+    .unwrap();
     std::fs::copy(
         fixture.join("source-home/.config/opencode/package.json"),
         explicit_directory.join("package.json"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixture.join("source-home/.config/opencode/package-lock.json"),
+        explicit_directory.join("package-lock.json"),
     )
     .unwrap();
     std::os::unix::fs::symlink(
@@ -402,12 +435,20 @@ export default {id:'closed-writable-selected-root',async server(input,options){r
     .unwrap();
     let directory_plugin = format!(
         r#"import fs from 'node:fs';import crypto from 'node:crypto';
-export default {{id:'closed-directory-discovery',async server(){{return {{async config(){{
+export default {{id:'closed-directory-discovery',async server(){{
+ let dependency;
+ try {{dependency=(await import('transport-only')).default;}} catch(error) {{
+  const link=new URL('../node_modules',import.meta.url);
+  fs.writeFileSync({},JSON.stringify({{failureClass:'dependency_load',linkIsSymbolic:fs.lstatSync(link).isSymbolicLink(),linkAbsolute:fs.lstatSync(link).isSymbolicLink()&&fs.readlinkSync(link).startsWith('/'),modulePresent:fs.existsSync(new URL('../node_modules/transport-only/index.mjs',import.meta.url))}}));
+  throw error;
+ }}
+ return {{async config(){{
  const root=new URL('../',import.meta.url);const write=new URL('provider-owned-auto-write',root);
  fs.writeFileSync(write,'selected-directory-write');
- fs.writeFileSync({},JSON.stringify({{skill:crypto.createHash('sha256').update(fs.readFileSync(new URL('skills/probe/SKILL.md',root))).digest('hex'),write:crypto.createHash('sha256').update(fs.readFileSync(write)).digest('hex')}}));
+ fs.writeFileSync({},JSON.stringify({{linkIsSymbolic:fs.lstatSync(new URL('node_modules',root)).isSymbolicLink(),linkAbsolute:fs.lstatSync(new URL('node_modules',root)).isSymbolicLink()&&fs.readlinkSync(new URL('node_modules',root)).startsWith('/'),dependency:crypto.createHash('sha256').update(dependency).digest('hex'),skill:crypto.createHash('sha256').update(fs.readFileSync(new URL('skills/probe/SKILL.md',root))).digest('hex'),write:crypto.createHash('sha256').update(fs.readFileSync(write)).digest('hex')}}));
 }}}}}}}};
 "#,
+        serde_json::to_string(&directory_receipt).unwrap(),
         serde_json::to_string(&directory_receipt).unwrap()
     );
     std::fs::write(
@@ -519,7 +560,12 @@ export default {{id:'closed-directory-discovery',async server(){{return {{async 
     assert_eq!(terminal_receipt, expected);
     let expected_root = json!({"dependency":format!("{:x}",Sha256::digest(b"selected-root-dependency")),"resource":format!("{:x}",Sha256::digest(b"selected-root-resource")),"write":format!("{:x}",Sha256::digest(b"selected-root-write"))});
     assert_eq!(read_receipt(&root_receipt).await.unwrap(), expected_root);
-    let expected_directory = json!({"skill":format!("{:x}",Sha256::digest(b"selected-directory-skill")),"write":format!("{:x}",Sha256::digest(b"selected-directory-write"))});
+    assert_eq!(
+        read_receipt(&home_root_receipt).await.unwrap(),
+        expected_root,
+        "actual native HOME and workspace discovery must both consume the shared transported root"
+    );
+    let expected_directory = json!({"linkIsSymbolic":true,"linkAbsolute":true,"dependency":format!("{:x}",Sha256::digest(b"transport-only-cross-root-dependency")),"skill":format!("{:x}",Sha256::digest(b"selected-directory-skill")),"write":format!("{:x}",Sha256::digest(b"selected-directory-write"))});
     assert_eq!(
         read_receipt(&directory_receipt).await.unwrap(),
         expected_directory
@@ -577,6 +623,7 @@ export default {{id:'closed-directory-discovery',async server(){{return {{async 
     std::fs::remove_file(&receipt).unwrap();
     std::fs::remove_file(&shared_receipt).unwrap();
     std::fs::remove_file(&root_receipt).unwrap();
+    std::fs::remove_file(&home_root_receipt).unwrap();
     std::fs::remove_file(&directory_receipt).unwrap();
     // Fresh launches use current server controls; the terminal exercised a
     // request-only relative control. Both must activate the explicit layer.
@@ -628,6 +675,10 @@ export default {{id:'closed-directory-discovery',async server(){{return {{async 
         .await;
     assert_eq!(read_receipt(&receipt).await.unwrap(), fresh_expected);
     assert_eq!(read_receipt(&root_receipt).await.unwrap(), expected_root);
+    assert_eq!(
+        read_receipt(&home_root_receipt).await.unwrap(),
+        expected_root
+    );
     assert_eq!(
         read_receipt(&directory_receipt).await.unwrap(),
         expected_directory

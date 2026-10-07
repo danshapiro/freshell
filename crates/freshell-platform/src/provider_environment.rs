@@ -578,6 +578,59 @@ fn copy_environment_with_account_home(
     limits: CopyLimits,
     account_home: Option<PathBuf>,
 ) -> Result<CopyReport, CopyError> {
+    copy_environment_projection(
+        selections,
+        destination_root,
+        excluded_canonical_sources,
+        limits,
+        account_home,
+        &[],
+    )
+}
+
+/// Directory subpaths mounted at native discovery aliases retain in-unit
+/// relative links, while cross-unit links address the final physical HOME.
+pub fn copy_environment_for_mounts(
+    selections: &[CopySelection],
+    destination_root: &Path,
+    excluded_canonical_sources: &[PathBuf],
+    limits: CopyLimits,
+    mounted_directories: &[PathBuf],
+) -> Result<CopyReport, CopyError> {
+    let account_home = std::env::var_os("HOME").and_then(|home| fs::canonicalize(home).ok());
+    copy_environment_projection(
+        selections,
+        destination_root,
+        excluded_canonical_sources,
+        limits,
+        account_home,
+        mounted_directories,
+    )
+}
+
+fn copy_environment_projection(
+    selections: &[CopySelection],
+    destination_root: &Path,
+    excluded_canonical_sources: &[PathBuf],
+    limits: CopyLimits,
+    account_home: Option<PathBuf>,
+    mounted_directories: &[PathBuf],
+) -> Result<CopyReport, CopyError> {
+    bound(
+        Path::new(""),
+        "entries",
+        mounted_directories.len() as u64,
+        limits.max_entries as u64,
+    )?;
+    for root in mounted_directories {
+        if !valid_relative(root) || !destination_root.is_absolute() {
+            return Err(error(
+                root,
+                "select_mount_root",
+                "mounted resource requires a normal relative root and absolute destination HOME",
+            ));
+        }
+    }
     let mut plan = Plan {
         nodes: BTreeMap::new(),
         mappings: BTreeMap::new(),
@@ -737,12 +790,17 @@ fn copy_environment_with_account_home(
                 mode(&destination, private_file_mode(*source_mode), relative)?;
             }
             Node::Link(target) => {
+                let mounted = mounted_directories
+                    .iter()
+                    .find(|root| relative.starts_with(root));
+                let target = if mounted.is_some_and(|root| !target.starts_with(root)) {
+                    destination_root.join(target)
+                } else {
+                    relative_link(relative.parent().unwrap_or(Path::new("")), target)
+                };
                 #[cfg(unix)]
-                std::os::unix::fs::symlink(
-                    relative_link(relative.parent().unwrap_or(Path::new("")), target),
-                    &destination,
-                )
-                .map_err(|cause| io_error(relative, "create_link", cause))?;
+                std::os::unix::fs::symlink(target, &destination)
+                    .map_err(|cause| io_error(relative, "create_link", cause))?;
                 #[cfg(not(unix))]
                 return Err(error(
                     relative,
@@ -862,6 +920,13 @@ mod tests {
         }
     }
 
+    fn executable_fixture() -> tempfile::TempDir {
+        match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+            Some(root) => tempfile::tempdir_in(root).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        }
+    }
+
     #[test]
     fn failed_stage_creation_never_removes_a_preexisting_directory() {
         let root = tempfile::tempdir().unwrap();
@@ -935,7 +1000,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn copied_skill_executes_sibling_resources_after_two_stages() {
-        let root = tempfile::tempdir().unwrap();
+        let root = executable_fixture();
         let source = root.path().join("source/skill");
         fs::create_dir_all(source.join("scripts")).unwrap();
         fs::create_dir_all(source.join("references")).unwrap();
@@ -991,7 +1056,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn copied_pnpm_plugin_external_resources_and_circular_dependencies_execute() {
-        let root = tempfile::tempdir().unwrap();
+        let root = executable_fixture();
         let source = root.path().join("source");
         let package =
             source.join("node_modules/.pnpm/fixture-dependency@1/node_modules/fixture-dependency");

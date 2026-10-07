@@ -1628,16 +1628,31 @@ fn copy_environment_with_events(
     freshell_platform::provider_environment::CopyReport,
     freshell_platform::provider_environment::CopyError,
 > {
+    copy_environment_with_events_for_mounts(stage, provider, selections, destination, excluded, &[])
+}
+
+fn copy_environment_with_events_for_mounts(
+    stage: &str,
+    provider: &str,
+    selections: &[freshell_platform::provider_environment::CopySelection],
+    destination: &Path,
+    excluded: &[PathBuf],
+    mounted_directories: &[PathBuf],
+) -> Result<
+    freshell_platform::provider_environment::CopyReport,
+    freshell_platform::provider_environment::CopyError,
+> {
     let started = std::time::Instant::now();
     emit_environment_event(serde_json::json!({
         "severity": "info", "event": "provider.environment.copy.started",
         "stage": stage, "provider": provider, "selections": selections.len()
     }));
-    let report = freshell_platform::provider_environment::copy_environment(
+    let report = freshell_platform::provider_environment::copy_environment_for_mounts(
         selections,
         destination,
         excluded,
         Default::default(),
+        mounted_directories,
     )
     .inspect_err(|error| {
         emit_environment_event(serde_json::json!({
@@ -1657,31 +1672,13 @@ fn copy_environment_with_events(
     Ok(report)
 }
 
-fn copy_provider_config_references(
-    context: &freshell_runtime_protocol::ProviderLaunchContext,
-    provider: &str,
-    workspace: &Path,
-    user_provider_root: &Path,
-    provider_home: &Path,
-    run_as_uid: u32,
-    run_as_gid: u32,
-) -> Result<(), String> {
-    copy_provider_config_references_with_ownership(
-        context,
-        provider,
-        workspace,
-        user_provider_root,
-        provider_home,
-        (run_as_uid, run_as_gid),
-    )
-}
-
 fn copy_provider_config_references_with_ownership(
     context: &freshell_runtime_protocol::ProviderLaunchContext,
     provider: &str,
     workspace: &Path,
     user_provider_root: &Path,
     provider_home: &Path,
+    final_home: &Path,
     run_as: (u32, u32),
 ) -> Result<(), String> {
     use freshell_platform::provider_environment::CopySelection;
@@ -1722,12 +1719,18 @@ fn copy_provider_config_references_with_ownership(
             }
         }
     }
-    let report = copy_environment_with_events(
+    let mounted = if provider_home == final_home {
+        resource_mount_roots(context)
+    } else {
+        Vec::new()
+    };
+    let report = copy_environment_with_events_for_mounts(
         "session_host",
         provider,
         &selections,
         provider_home,
         &excluded,
+        &mounted,
     )
     .map_err(|error| error.to_string())?;
     let projected = report
@@ -1748,6 +1751,19 @@ fn copy_provider_config_references_with_ownership(
     set_owner(&manifest, run_as.0, run_as.1)?;
     Ok(())
 }
+
+fn resource_mount_roots(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+) -> Vec<PathBuf> {
+    context
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| &inputs.resource_mounts)
+        .filter(|root| root.kind == freshell_runtime_protocol::ProviderResourceKind::Directory)
+        .map(|root| PathBuf::from(&root.provider_relative_path))
+        .collect()
+}
+
 fn provider_credential_sources(root: &Path) -> Vec<PathBuf> {
     [
         ".credentials.json",
@@ -1909,14 +1925,14 @@ fn refresh_provider_config_references(
     let stage = tempfile::tempdir().map_err(|error| error.to_string())?;
     let projection = stage.path().join("projection");
     std::fs::create_dir(&projection).map_err(|error| error.to_string())?;
-    copy_provider_config_references(
+    copy_provider_config_references_with_ownership(
         context,
         provider,
         workspace,
         user_provider_root,
         &projection,
-        unsafe { libc::geteuid() },
-        unsafe { libc::getegid() },
+        provider_home,
+        (unsafe { libc::geteuid() }, unsafe { libc::getegid() }),
     )?;
     let mut destinations = provider_config_references(context)
         .iter()
@@ -1945,6 +1961,13 @@ fn refresh_provider_config_references(
             .map_err(|_| "private mountpoint metadata invalid")?,
     )
     .map_err(|_| "private mountpoint metadata write failed")?;
+    let mounted = freshell_runtime_protocol::bounded_json_bytes(
+        &resource_mount_roots(context),
+        freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+    )
+    .map_err(|_| "resource mountpoint metadata profile exceeded")?;
+    std::fs::write(stage.path().join("resource-mountpoints.json"), mounted)
+        .map_err(|_| "resource mountpoint metadata write failed")?;
     allow_provider_read_stage(stage.path(), run_as_gid)?;
     if run_as_uid == unsafe { libc::geteuid() } && run_as_gid == unsafe { libc::getegid() } {
         return apply_staged_provider_config(stage.path(), provider_home);
@@ -2105,12 +2128,39 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     ) {
         return Err("provider config refresh provider is unsupported".into());
     }
-    copy_environment_with_events(
+    let mounted: Vec<PathBuf> = {
+        use std::io::Read;
+        match std::fs::File::open(stage.join("resource-mountpoints.json")) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| "resource mountpoint metadata read failed")?;
+                if bytes.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES {
+                    return Err("resource mountpoint metadata profile exceeded".into());
+                }
+                serde_json::from_slice(&bytes)
+                    .map_err(|_| "resource mountpoint metadata invalid")?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(_) => return Err("resource mountpoint metadata unavailable".into()),
+        }
+    };
+    if mounted.iter().any(|path| {
+        !path.starts_with(".freshell/provider-roots")
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    }) {
+        return Err("resource mountpoint metadata has an invalid owned root".into());
+    }
+    copy_environment_with_events_for_mounts(
         "provider_publication",
         &provider,
         &selections,
         provider_home,
         &[],
+        &mounted,
     )
     .map_err(|error| error.to_string())?;
     let mut stale = previous.difference(&current).collect::<Vec<_>>();
@@ -3158,6 +3208,26 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    fn copy_provider_config_references(
+        context: &freshell_runtime_protocol::ProviderLaunchContext,
+        provider: &str,
+        workspace: &std::path::Path,
+        user_provider_root: &std::path::Path,
+        provider_home: &std::path::Path,
+        run_as_uid: u32,
+        run_as_gid: u32,
+    ) -> Result<(), String> {
+        super::copy_provider_config_references_with_ownership(
+            context,
+            provider,
+            workspace,
+            user_provider_root,
+            provider_home,
+            provider_home,
+            (run_as_uid, run_as_gid),
+        )
+    }
+
     fn executable_fixture() -> tempfile::TempDir {
         match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
             Some(directory) => tempfile::tempdir_in(directory),
@@ -3306,6 +3376,109 @@ mod tests {
             .expect("two-stage executable spawn");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"resource-nonce");
+    }
+
+    #[test]
+    fn provider_config_external_mount_preserves_cross_root_dependency_resolution() {
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let stage = owned.path().join("stage");
+        let home = owned.path().join("home");
+        let native = owned.path().join("native-directory");
+        std::fs::create_dir_all(stage.join("node_modules/transport-only")).unwrap();
+        std::fs::create_dir_all(stage.join(".freshell/resource-units/root-0")).unwrap();
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(
+            stage.join("node_modules/transport-only/nonce"),
+            "cross-root-dependency-nonce",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../../../node_modules",
+            stage.join(".freshell/resource-units/root-0/node_modules"),
+        )
+        .unwrap();
+        let capability = McpCapabilityReference {
+            grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
+            endpoint: "http://host.docker.internal:1234".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let context = ProviderLaunchContext {
+            config: vec![ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "node_modules".into(),
+                provider_relative_path: ".config/opencode/node_modules".into(),
+                format: "directory".into(),
+            }],
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: "a".repeat(64),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                indexed_files: None,
+                resource_mounts: vec![ProviderResourceMount {
+                    stage_relative_path: ".freshell/resource-units/root-0".into(),
+                    provider_relative_path: ".freshell/provider-roots/root-0".into(),
+                    logical_destination: native.to_str().unwrap().into(),
+                    effective_destination: native.to_str().unwrap().into(),
+                    kind: ProviderResourceKind::Directory,
+                }],
+            }),
+            mcp_capability: Some(capability),
+        };
+        copy_provider_config_references(
+            &context,
+            "opencode",
+            owned.path(),
+            &stage,
+            &home,
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+        )
+        .unwrap();
+        let link =
+            std::fs::read_link(home.join(".freshell/provider-roots/root-0/node_modules")).unwrap();
+        // A volume subpath is mounted at `native`, so this link is evaluated
+        // from that discovery parent rather than its physical soul parent.
+        let selected = native.join(link).join("transport-only/nonce");
+        assert_eq!(
+            std::fs::read_to_string(selected).unwrap(),
+            "cross-root-dependency-nonce"
+        );
+        std::fs::write(
+            stage.join("node_modules/transport-only/nonce"),
+            "cross-root-refreshed-nonce",
+        )
+        .unwrap();
+        refresh_provider_config_references(
+            &context,
+            "opencode",
+            owned.path(),
+            &stage,
+            &home,
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+        )
+        .unwrap();
+        let link =
+            std::fs::read_link(home.join(".freshell/provider-roots/root-0/node_modules")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(native.join(link).join("transport-only/nonce")).unwrap(),
+            "cross-root-refreshed-nonce"
+        );
     }
 
     #[test]

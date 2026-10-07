@@ -4038,6 +4038,67 @@ except Exception as error:
         );
     }
 
+    #[test]
+    fn managed_provider_home_and_workspace_root_aliases_share_one_physical_unit() {
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let shared = owned.path().join("shared-root");
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(shared.join("skills/probe")).unwrap();
+        std::fs::write(shared.join("skills/probe/SKILL.md"), "shared-root-resource").unwrap();
+        std::os::unix::fs::symlink(&shared, home.join(".opencode")).unwrap();
+        std::os::unix::fs::symlink(&shared, workspace.join(".opencode")).unwrap();
+        let roots = vec![home.join(".opencode"), workspace.join(".opencode")];
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let capability = store.issue(SoulId::new(), &directory, "http://host.docker.internal:4000".into(),
+            Some(("opencode", &home, &[])), OpencodeEphemeralInput {
+                cwd: Some(&workspace), workspace: Some(&workspace), source_plan: Some(&[]),
+                resource_roots: Some(&roots), secret_references: Some(&[]), ..Default::default()
+            }, None).expect("shared selected roots must keep both native discovery origins without competing physical copies");
+        let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+        let inputs: PreparedProviderInputs = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/prepared-inputs.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inputs.resource_mounts.len(), 2);
+        assert_eq!(
+            inputs.resource_mounts[0].stage_relative_path,
+            inputs.resource_mounts[1].stage_relative_path
+        );
+        assert_eq!(
+            inputs.resource_mounts[0].provider_relative_path,
+            inputs.resource_mounts[1].provider_relative_path
+        );
+        assert!(std::fs::symlink_metadata(
+            stage.join(&inputs.resource_mounts[0].stage_relative_path)
+        )
+        .unwrap()
+        .is_dir());
+        assert_eq!(
+            inputs.resource_mounts[0].effective_destination,
+            "/home/freshell/provider/.opencode"
+        );
+        assert_eq!(
+            inputs.resource_mounts[1].effective_destination,
+            shared.to_str().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                stage
+                    .join(&inputs.resource_mounts[0].stage_relative_path)
+                    .join("skills/probe/SKILL.md")
+            )
+            .unwrap(),
+            "shared-root-resource"
+        );
+        assert_eq!(std::fs::read_link(home.join(".opencode")).unwrap(), shared);
+    }
+
     #[tokio::test]
     async fn managed_provider_shared_workspace_sources_keep_original_form_and_private_aliases() {
         use freshell_runtime_protocol::*;
