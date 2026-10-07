@@ -14,7 +14,7 @@ import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
 import { ManagedRuntimeOwner, RuntimeHarness, type SupervisorInstance } from '../../../../scripts/testing/runtime-sandbox.js'
-import { runTask2RetainedFixture } from '../../../../scripts/testing/task002-retained-fixture.js'
+import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 
 beforeEach(() => execute.mockReset())
 
@@ -432,6 +432,54 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       await fsp.rm(directory, { recursive: true })
     }
   })
+  it('attempts retained registry cleanup after its actual owned web stop fails', async () => {
+    const { fixture: directory, entry } = await fixture()
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('base web unused') })
+    const info = { baseUrl: 'http://127.0.0.1:1', wsUrl: 'ws://127.0.0.1:1/ws', token: 'owned-stable-token',
+      port: 1, configDir: directory, homeDir: directory, logsDir: directory, debugLogPath: path.join(directory, 'log'), pid: 1, runtimeRoot: process.cwd() }
+    vi.spyOn(owned, 'info', 'get').mockReturnValue(info)
+    const supervisor: SupervisorInstance = { scenarioId: 'owned-failure', containerId: 'c'.repeat(64),
+      controlSocket: path.join(directory, 'control.sock'), controlSecret: 'owned-unit-secret', controlSecretFile: path.join(directory, 'secret'),
+      runtimeRoot: directory, volumeName: 'owned-unit-volume', binaryKind: 'test' }
+    let h: RuntimeHarness | undefined
+    vi.spyOn(RuntimeHarness.prototype, 'prepareTask2FixtureArtifacts').mockImplementation(async function () { h = this })
+    vi.spyOn(RuntimeHarness.prototype, 'startSupervisor').mockResolvedValue(supervisor)
+    vi.spyOn(RuntimeHarness.prototype, 'adminOk').mockResolvedValue({ kind: 'health', data: { controlEpoch: 1 } })
+    vi.spyOn(RuntimeHarness.prototype, 'assert').mockImplementation(() => {})
+    vi.spyOn(RuntimeHarness.prototype, 'waitForFile').mockRejectedValue(new Error('owned MCP readiness failed'))
+    const cleanup = vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    vi.spyOn(RuntimeHarness.prototype, 'verifyTransferCleanup').mockImplementation(() => {})
+    let stopWeb: (() => Promise<void>) | undefined
+    let webPid: number | undefined
+    const artifact = { path: entry, sha256: 'b'.repeat(64) }
+    const artifacts = { candidateSha: owned.runtime.candidateSha, imageDigest: `sha256:${'c'.repeat(64)}`,
+      currentSupervisor: artifact, currentHost: artifact, currentServer: artifact, legacySupervisor: artifact, legacyHost: artifact,
+      legacyCreatorCommit: '7dbc7ef6b0b87e47ec8386e19115f5e440399898' as const }
+    const fixtureOwner = new runner.OwnedRetainedBrowserFixtures(owned, artifacts, ['config'], options => {
+      const web = new runner.ManagedRuntimeWebServer({ ...options, binary: process.execPath,
+        candidateSha: 'a'.repeat(40), buildDirty: false, env: { ...options.env, NODE_OPTIONS: `--require=${entry}` } })
+      const start = web.start.bind(web)
+      web.start = async () => { const ready = await start(); webPid = ready.pid; return ready }
+      stopWeb = web.stop.bind(web)
+      web.stop = async () => { throw new Error('owned web stop failed') }
+      return web
+    })
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    try {
+      fixtureOwner.start('config')
+      await vi.waitFor(() => expect(fixtureOwner.status().kind).toBe('failed'))
+      expect(webPid).toBeDefined()
+      expect(cleanup).toHaveBeenCalledOnce()
+      await expect(fixtureOwner.cancel()).rejects.toThrow(/cleanup|stop/)
+    } finally {
+      await stopWeb?.()
+      if (webPid) await expect(fsp.stat(`/proc/${webPid}`)).rejects.toThrow()
+      if (h) await fsp.rm(h.testRoot, { recursive: true, force: true })
+      vi.unstubAllEnvs()
+      vi.restoreAllMocks()
+      await fsp.rm(directory, { recursive: true })
+    }
+  })
   it('strips inherited provider environment after overrides while preserving owned controller references', async () => {
     const { fixture: directory, entry, setup } = await fixture()
     const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
@@ -448,6 +496,27 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       expect(observed.environmentKeys).toContain('FRESHELL_RUNTIME_CONTROL_SOCKET')
     } finally {
       await server.stop()
+      await fsp.rm(directory, { recursive: true })
+    }
+  })
+  it('keeps the relay token admitted when the retained fixture selects another owned web process', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    await fsp.writeFile(entry, `require('node:http').createServer((req,res)=>{res.setHeader('content-type','application/json');if(req.headers['x-auth-token']!==process.env.AUTH_TOKEN){res.writeHead(401);res.end('{}');return}res.end(JSON.stringify({runtime:'rust',commit:'${'a'.repeat(40)}',buildDirty:false}))}).listen(Number(process.env.PORT),'127.0.0.1')`)
+    const token = 'owned-retained-relay-token'
+    const options = { binary: process.execPath, repoRoot: process.cwd(), candidateSha: 'a'.repeat(40),
+      buildDirty: false, setupHome: setup, preserveHomeOnStop: false, token,
+      env: { NODE_OPTIONS: `--require=${entry}` } }
+    const first = new runner.ManagedRuntimeWebServer(options)
+    const replacement = new runner.ManagedRuntimeWebServer(options)
+    try {
+      const initial = await first.start()
+      const next = await replacement.start()
+      expect(initial.pid).not.toBe(next.pid)
+      expect((await fetch(`${next.baseUrl}/api/server-info`, { headers: { 'x-auth-token': token } })).status).toBe(200)
+      expect((await fetch(`${next.baseUrl}/api/server-info`, { headers: { 'x-auth-token': 'foreign-token' } })).status).toBe(401)
+    } finally {
+      await first.stop()
+      await replacement.stop()
       await fsp.rm(directory, { recursive: true })
     }
   })
@@ -535,6 +604,54 @@ describe('closed external owner control', () => {
     await expect(control({ ...request, operationId: 'after-finish' })).rejects.toThrow(/finished/)
     expect(stop).toHaveBeenCalledOnce()
     expect(inventory).not.toHaveBeenCalled()
+  })
+  it('starts only a registered retained fixture once after a lost start reply', async () => {
+    const { owned, context, request } = fixture()
+    const session = new RetainedFixtureBrowserSession()
+    let release!: () => void
+    const pending = new Promise<void>(resolve => { release = resolve })
+    const start = vi.fn((fixtureId: 'config' | 'legacy') => {
+      expect(fixtureId).toBe('legacy')
+      session.start(async () => { await pending })
+    })
+    const retained = { start, status: () => session.status(), advance: (sequence: number) => session.advance(sequence),
+      cancel: async () => { release(); await session.cancel() } }
+    const control = runner.createExternalRuntimeControl(owned, context, retained)
+    try {
+      await expect(control({ ...request, action: 'retained-start', challengeId: 'foreign' })).rejects.toThrow(/fixture|operation/)
+      expect(start).not.toHaveBeenCalled()
+      const begin = { ...request, operationId: 'retained-begin', action: 'retained-start', challengeId: 'legacy' }
+      await expect(control(begin)).resolves.toMatchObject({ result: { kind: 'preparing' } })
+      await control(begin)
+      expect(start).toHaveBeenCalledOnce()
+      await expect(control({ ...request, operationId: 'retained-observe', action: 'retained-observed', generation: 0 })).rejects.toThrow(/stage/)
+      await expect(control({ ...request, operationId: 'retained-forged', action: 'retained-status', response: {} })).rejects.toThrow(/operation/)
+    } finally {
+      await retained.cancel()
+    }
+  })
+  it('still cleans the main owned runtime when retained fixture teardown fails', async () => {
+    const { owned, context, request, stop } = fixture()
+    const retained = { start: vi.fn(), status: () => ({ kind: 'preparing' as const, sequence: 0 }),
+      advance: vi.fn(), cancel: vi.fn(async () => { throw new Error('owned fixture cleanup failed') }) }
+    const control = runner.createExternalRuntimeControl(owned, context, retained)
+    await expect(control({ ...request, action: 'finish' })).resolves.toMatchObject({ result: {
+      ok: false, errors: ['retained fixture cleanup failed'],
+    } })
+    expect(stop).toHaveBeenCalledOnce()
+  })
+  it('finishes each retained case without ending the owner needed by the next selected case', async () => {
+    const { owned, context, request, stop, inventory } = fixture()
+    const retained = { start: vi.fn(), status: () => ({ kind: 'finished' as const, sequence: 1 }),
+      advance: vi.fn(), cancel: vi.fn(async () => {}) }
+    const control = runner.createExternalRuntimeControl(owned, context, retained)
+    await expect(control({ ...request, operationId: 'config-finished', action: 'retained-finish' })).resolves.toMatchObject({ result: { ok: true, errors: [] } })
+    expect(retained.cancel).toHaveBeenCalledOnce()
+    expect(stop).not.toHaveBeenCalled()
+    await control({ ...request, operationId: 'between-cases' })
+    expect(inventory).toHaveBeenCalledOnce()
+    await control({ ...request, operationId: 'legacy-begin', action: 'retained-start', challengeId: 'legacy' })
+    expect(retained.start).toHaveBeenCalledWith('legacy')
   })
 })
 

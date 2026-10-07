@@ -394,13 +394,44 @@ export type Task2RetainedPublicContext = Pick<Task2RetainedBrowserContext,
     info: { baseUrl: string; wsUrl: string; token: string }
     configMode: number
   }
+export function task2RetainedPublicContext(context: Task2RetainedBrowserContext): Task2RetainedPublicContext {
+  const { soulId, rootSessionId, childSessionId, oldContainerId, oldIncarnationId, providerVolumeName,
+    preferredTabId, preferredPaneId, title, result } = context
+  const { baseUrl, wsUrl, token } = context.web.info
+  return { soulId, rootSessionId, childSessionId, oldContainerId, oldIncarnationId, providerVolumeName,
+    preferredTabId, preferredPaneId, title, result, info: { baseUrl, wsUrl, token },
+    configMode: fs.statSync(context.configFile).mode & 0o777 }
+}
 export type Task2RetainedBrowserStage = {
-  kind: 'preparing' | 'finished' | 'failed'; sequence: number
+  kind: 'preparing' | 'failed'; sequence: number
+} | {
+  kind: 'finished'; sequence: number
+  facts?: { fixtureRunId: string; candidateSha: string; imageDigest: string; unsafeBrokerAttempts: number }
 } | {
   kind: 'observe' | 'retry'; sequence: number
   phase: Task2RetainedBrowserPhase | 'config_fault' | 'repaired'
   context: Task2RetainedPublicContext
 }
+
+const PublicRetainedContextSchema = z.object({
+  soulId: z.string().min(1), rootSessionId: z.string().min(1), childSessionId: z.string().min(1),
+  oldContainerId: z.string().regex(/^[a-f0-9]{64}$/), oldIncarnationId: z.string().min(1),
+  providerVolumeName: z.string().min(1), preferredTabId: z.string().min(1), preferredPaneId: z.string().min(1),
+  title: z.string().min(1), configMode: z.number().int().min(0).max(0o777),
+  info: z.object({ baseUrl: z.string().url(), wsUrl: z.string().url(), token: z.string().min(1) }).strict(),
+  result: z.object({ requestId: z.string().min(1), result: z.object({ Ok: z.unknown().optional(),
+    Err: z.object({ code: z.string(), message: z.string() }).strict().optional() }).strict() }).strict().optional(),
+}).strict()
+export const Task2RetainedBrowserStageSchema: z.ZodType<Task2RetainedBrowserStage> = z.union([
+  z.object({ kind: z.enum(['preparing', 'failed']), sequence: z.number().int().nonnegative() }).strict(),
+  z.object({ kind: z.literal('finished'), sequence: z.number().int().nonnegative(), facts: z.object({
+    fixtureRunId: z.string().uuid(), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
+    imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/), unsafeBrokerAttempts: z.number().int().nonnegative(),
+  }).strict().optional() }).strict(),
+  z.object({ kind: z.enum(['observe', 'retry']), sequence: z.number().int().positive(),
+    phase: z.enum(['store_blocked', 'config_blocked', 'replaced', 'config_fault', 'repaired']),
+    context: PublicRetainedContextSchema }).strict(),
+])
 
 /** The existing driver waits for observation acknowledgements and real UI responses. */
 export class RetainedFixtureBrowserSession {
@@ -434,14 +465,7 @@ export class RetainedFixtureBrowserSession {
   }
   private publish(context: Task2RetainedBrowserContext, kind: 'observe' | 'retry', phase: Task2RetainedBrowserPhase | 'config_fault' | 'repaired'): void {
     if (this.cancelled) throw new Error('owned retained browser session cancelled')
-    const { soulId, rootSessionId, childSessionId, oldContainerId, oldIncarnationId, providerVolumeName,
-      preferredTabId, preferredPaneId, title, result } = context
-    const { baseUrl, wsUrl, token } = context.web.info
-    this.stage = { kind, phase, sequence: this.stage.sequence + 1, context: {
-      soulId, rootSessionId, childSessionId, oldContainerId, oldIncarnationId, providerVolumeName,
-      preferredTabId, preferredPaneId, title, result, info: { baseUrl, wsUrl, token },
-      configMode: fs.statSync(context.configFile).mode & 0o777,
-    } }
+    this.stage = { kind, phase, sequence: this.stage.sequence + 1, context: task2RetainedPublicContext(context) }
   }
   status(): Task2RetainedBrowserStage { return this.stage }
   advance(sequence: number): void {

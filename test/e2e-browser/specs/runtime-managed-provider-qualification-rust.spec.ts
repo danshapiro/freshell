@@ -21,6 +21,8 @@ import {
   parseQualificationProviderSelection,
 } from '../../../scripts/testing/provider-qualification-selection.js'
 import { test, createFreshE2ePage } from '../helpers/fixtures.js'
+import { ExternalServer } from '../helpers/external-target.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 import { RuntimeHarness, type AdminReply } from '../../../scripts/testing/runtime-sandbox.js'
 import {
@@ -28,6 +30,8 @@ import {
   type Task2RetainedBrowserContext,
   type Task2RetainedBrowserPhase,
 } from '../../../scripts/testing/task002-config-legacy-fixtures.js'
+import { ExternalManagedRuntimeRig, resolveManagedExternalDescriptor } from '../../../scripts/testing/runtime-external-browser.js'
+import { task2RetainedPublicContext, type Task2RetainedPublicContext } from '../../../scripts/testing/task002-retained-fixture.js'
 import { managedRecoveryBlockedMessage } from '../../../src/lib/managed-runtime-recovery-message.js'
 import {
   ManagedRuntimeBrowserRig,
@@ -605,13 +609,13 @@ async function task2Soul(page: Page, token: string, soulId: string): Promise<any
   }, { token, soulId })
 }
 
-async function task2Pane(page: Page, context: Task2RetainedBrowserContext): Promise<any> {
+async function task2Pane(page: Page, context: Task2RetainedPublicContext): Promise<any> {
   const state = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getState())
   return leavesByMode(state?.panes?.layouts?.[context.preferredTabId], 'opencode')
     .find(leaf => leaf.id === context.preferredPaneId)
 }
 
-async function task2SelectProjectedPane(page: Page, context: Task2RetainedBrowserContext): Promise<void> {
+async function task2SelectProjectedPane(page: Page, context: Task2RetainedPublicContext): Promise<void> {
   const tab = page.getByRole('tab', { name: new RegExp(regexEscape(context.title)) })
   await expect(tab).toBeVisible({ timeout: 60_000 })
   await tab.click()
@@ -621,9 +625,9 @@ async function task2SelectProjectedPane(page: Page, context: Task2RetainedBrowse
 }
 
 async function task2ClickRetry(
-  page: Page, context: Task2RetainedBrowserContext,
+  page: Page, context: Task2RetainedPublicContext,
 ): Promise<AdminReply> {
-  const detail = await task2Soul(page, context.web.info.token, context.soulId)
+  const detail = await task2Soul(page, context.info.token, context.soulId)
   await expect.poll(async () => (await task2Pane(page, context))?.content?.soulIntentRevision, {
     timeout: 60_000,
   }).toBe(detail.soul.intentRevision)
@@ -649,89 +653,138 @@ async function task2ClickRetry(
 }
 
 async function exerciseTask2Browser(browser: Browser, legacy: boolean): Promise<void> {
-  const h = await task2FixtureHarness()
+  const descriptor = resolveManagedExternalDescriptor(process.env)
+  const h = descriptor ? undefined : await task2FixtureHarness()
+  const external = descriptor ? new ExternalManagedRuntimeRig(descriptor) : undefined
   let ownedPage: Awaited<ReturnType<typeof createFreshE2ePage>> | undefined
+  let localInfo: E2eServerInfo | undefined
   const observed: Task2RetainedBrowserPhase[] = []
   try {
-    await runTask2RetainedFixture(h, legacy, {
-      async observe(context, phase) {
-        if (!ownedPage) {
-          ownedPage = await createFreshE2ePage(browser, context.web.info)
-          installRecoveryOfferAutoDeclineOnContext(ownedPage.context)
-          await ownedPage.page.goto(`${context.web.info.baseUrl}/?token=${context.web.info.token}&e2e=1`, {
-            timeout: 60_000,
-          })
-          const harness = new TestHarness(ownedPage.page)
-          await harness.waitForHarness(60_000)
-          await harness.waitForConnection()
+    const observe = async (context: Task2RetainedPublicContext, phase: Task2RetainedBrowserPhase): Promise<void> => {
+      if (!ownedPage) {
+        const info = descriptor ? await new ExternalServer(process.env).start() : localInfo
+        if (!info) throw new Error('owned retained browser connection is missing')
+        ownedPage = await createFreshE2ePage(browser, info)
+        installRecoveryOfferAutoDeclineOnContext(ownedPage.context)
+        await ownedPage.page.goto(`${context.info.baseUrl}/?token=${context.info.token}&e2e=1`, {
+          timeout: 60_000,
+        })
+        const harness = new TestHarness(ownedPage.page)
+        await harness.waitForHarness(60_000)
+        await harness.waitForConnection()
+      }
+      const { page } = ownedPage
+      await task2SelectProjectedPane(page, context)
+      const detail = await task2Soul(page, context.info.token, context.soulId)
+      expect(detail.soul.soulId).toBe(context.soulId)
+      expect(detail.soul.nativeSessionId).toBe(context.rootSessionId)
+      expect(detail.soul.incidentId).toBeUndefined()
+      const intent = detail.viewIntents.find((view: any) => view.preferredPaneId === context.preferredPaneId)
+      expect(intent).toMatchObject({ kind: 'automatic_primary', visibility: 'visible',
+        preferredTabId: context.preferredTabId, soulId: context.soulId })
+      const alert = page.getByRole('alert').filter({ hasText: 'This session needs attention' })
+      if (phase === 'store_blocked') {
+        expect(detail.soul.recoveryState).toBe('blocked')
+        expect(detail.soul.recoveryReason).toBe('STORE_UNREADABLE')
+        expect(detail.soul.containerId).toBe(context.oldContainerId)
+        await expect(alert).toBeVisible()
+        await expect(alert).toContainText('saved conversation store is readable')
+        await expect(alert.getByRole('button', { name: 'Retry recovery', exact: true })).toBeEnabled()
+        await expect(page.getByRole('button', { name: 'Start new conversation', exact: true })).toHaveCount(0)
+      } else if (phase === 'config_blocked') {
+        expect(context.configMode).toBe(0)
+        expect(context.result?.result.Ok?.data.outcome).toBe('blocked')
+        expect(context.result?.result.Ok?.data.probe).toMatchObject({ kind: 'blocked',
+          data: { reason: 'CAPABILITY_PENDING' } })
+        expect(context.result?.result.Ok?.data.probe.data.retry_hint?.repair)
+          .toContain('provider configuration publication')
+        expect(detail.soul.recoveryState).toBe('blocked')
+        expect(detail.soul.recoveryReason).toBe('CAPABILITY_PENDING')
+        await expect(alert).toBeVisible()
+        // Assert the real persisted reason rendered by the production card.
+        await expect(alert).toContainText(managedRecoveryBlockedMessage(detail.soul.recoveryReason))
+        await expect(alert.getByRole('button', { name: 'Retry recovery', exact: true })).toBeEnabled()
+      } else {
+        expect(context.result?.result.Ok?.data.outcome).toBe('replaced')
+        expect(detail.soul.containerId).not.toBe(context.oldContainerId)
+        expect(detail.soul.incarnationId).not.toBe(context.oldIncarnationId)
+        expect(detail.soul.launchState).toBe('running')
+        await expect.poll(async () => (await task2Pane(page, context))?.content?.incarnationId, {
+          timeout: 60_000,
+        }).toBe(detail.soul.incarnationId)
+        const pane = await task2Pane(page, context)
+        expect(pane.content.soulId).toBe(context.soulId)
+        expect(pane.content.sessionRef?.sessionId).toBe(context.rootSessionId)
+        await expect(alert).toHaveCount(0)
+        await page.screenshot({ path: h ? path.join(h.browserDir, legacy ? 'legacy-replaced.png' : 'config-replaced.png') : test.info().outputPath(legacy ? 'legacy-replaced.png' : 'config-replaced.png') })
+      }
+      observed.push(phase)
+    }
+    const retry = async (context: Task2RetainedPublicContext, phase: 'config_fault' | 'repaired'): Promise<AdminReply> => {
+      if (!ownedPage) throw new Error('browser must observe the actual blocker before retry')
+      await task2SelectProjectedPane(ownedPage.page, context)
+      if (phase === 'repaired' && !legacy) expect(context.configMode).toBe(0o644)
+      return task2ClickRetry(ownedPage.page, context)
+    }
+    if (external) {
+      await external.start()
+      await external.startRetainedFixture(legacy ? 'legacy' : 'config')
+      let sequence = 0
+      for (;;) {
+        await expect.poll(async () => {
+          const stage = await external.retainedFixtureStage()
+          return stage.kind !== 'preparing' && stage.sequence > sequence
+        }, { timeout: 300_000 }).toBe(true)
+        const stage = await external.retainedFixtureStage()
+        if (stage.kind === 'finished') {
+          expect(stage.facts?.candidateSha).toBe(descriptor?.candidateSha)
+          expect(stage.facts?.unsafeBrokerAttempts).toBe(0)
+          expect(stage.facts?.fixtureRunId).toMatch(/^[a-f0-9-]{36}$/)
+          expect(stage.facts?.imageDigest).toMatch(/^sha256:[a-f0-9]{64}$/)
+          break
         }
-        const { page } = ownedPage
-        await task2SelectProjectedPane(page, context)
-        const detail = await task2Soul(page, context.web.info.token, context.soulId)
-        expect(detail.soul.soulId).toBe(context.soulId)
-        expect(detail.soul.nativeSessionId).toBe(context.rootSessionId)
-        expect(detail.soul.incidentId).toBeUndefined()
-        const intent = detail.viewIntents.find((view: any) => view.preferredPaneId === context.preferredPaneId)
-        expect(intent).toMatchObject({ kind: 'automatic_primary', visibility: 'visible',
-          preferredTabId: context.preferredTabId, soulId: context.soulId })
-        const alert = page.getByRole('alert').filter({ hasText: 'This session needs attention' })
-        if (phase === 'store_blocked') {
-          expect(detail.soul.recoveryState).toBe('blocked')
-          expect(detail.soul.recoveryReason).toBe('STORE_UNREADABLE')
-          expect(detail.soul.containerId).toBe(context.oldContainerId)
-          await expect(alert).toBeVisible()
-          await expect(alert).toContainText('saved conversation store is readable')
-          await expect(alert.getByRole('button', { name: 'Retry recovery', exact: true })).toBeEnabled()
-          await expect(page.getByRole('button', { name: 'Start new conversation', exact: true })).toHaveCount(0)
-        } else if (phase === 'config_blocked') {
-          expect(fs.statSync(context.configFile).mode & 0o777).toBe(0)
-          expect(context.result?.result.Ok?.data.outcome).toBe('blocked')
-          expect(context.result?.result.Ok?.data.probe).toMatchObject({ kind: 'blocked',
-            data: { reason: 'CAPABILITY_PENDING' } })
-          expect(context.result?.result.Ok?.data.probe.data.retry_hint?.repair)
-            .toContain('provider configuration publication')
-          expect(detail.soul.recoveryState).toBe('blocked')
-          expect(detail.soul.recoveryReason).toBe('CAPABILITY_PENDING')
-          await expect(alert).toBeVisible()
-          // Assert the real persisted reason rendered by the production card.
-          await expect(alert).toContainText(managedRecoveryBlockedMessage(detail.soul.recoveryReason))
-          await expect(alert.getByRole('button', { name: 'Retry recovery', exact: true })).toBeEnabled()
-        } else {
-          expect(context.result?.result.Ok?.data.outcome).toBe('replaced')
-          expect(detail.soul.containerId).not.toBe(context.oldContainerId)
-          expect(detail.soul.incarnationId).not.toBe(context.oldIncarnationId)
-          expect(detail.soul.launchState).toBe('running')
-          await expect.poll(async () => (await task2Pane(page, context))?.content?.incarnationId, {
-            timeout: 60_000,
-          }).toBe(detail.soul.incarnationId)
-          const pane = await task2Pane(page, context)
-          expect(pane.content.soulId).toBe(context.soulId)
-          expect(pane.content.sessionRef?.sessionId).toBe(context.rootSessionId)
-          await expect(alert).toHaveCount(0)
-          await page.screenshot({ path: path.join(h.browserDir, legacy ? 'legacy-replaced.png' : 'config-replaced.png') })
+        if (stage.kind === 'failed') throw new Error('actual owner retained fixture failed; inspect its private evidence')
+        if (stage.kind === 'preparing') throw new Error('owned retained stage changed unexpectedly')
+        sequence = stage.sequence
+        if (stage.kind === 'observe') {
+          if (stage.phase !== 'store_blocked' && stage.phase !== 'config_blocked' && stage.phase !== 'replaced') throw new Error('invalid retained observation phase')
+          await observe(stage.context, stage.phase)
+          await external.observeRetainedFixture(sequence)
+        } else if (stage.kind === 'retry') {
+          if (stage.phase !== 'config_fault' && stage.phase !== 'repaired') throw new Error('invalid retained retry phase')
+          await retry(stage.context, stage.phase)
         }
-        observed.push(phase)
-      },
-      async retry(context, phase) {
-        if (!ownedPage) throw new Error('browser must observe the actual blocker before retry')
-        await task2SelectProjectedPane(ownedPage.page, context)
-        if (phase === 'repaired' && !legacy) expect(fs.statSync(context.configFile).mode & 0o777).toBe(0o644)
-        return task2ClickRetry(ownedPage.page, context)
-      },
-    })
+      }
+    } else {
+      if (!h) throw new Error('local retained owner missing')
+      const publicContext = (context: Task2RetainedBrowserContext): Task2RetainedPublicContext => {
+        localInfo = context.web.info
+        return task2RetainedPublicContext(context)
+      }
+      await runTask2RetainedFixture(h, legacy, {
+        observe: (context, phase) => observe(publicContext(context), phase),
+        retry: (context, phase) => retry(publicContext(context), phase),
+      })
+    }
     expect(observed).toEqual(legacy ? ['store_blocked', 'replaced'] : ['store_blocked', 'config_blocked', 'replaced'])
-    expect(h.broker.unsafeAttempts()).toHaveLength(0)
+    if (h) expect(h.broker.unsafeAttempts()).toHaveLength(0)
   } finally {
     await ownedPage?.context.close()
-    const receipts = h.broker.receipts(), ids = h.transferOwnedIds()
-    const cleanup = await h.cleanup()
-    h.verifyTransferCleanup({ containers: [...new Set([...ids.containers, ...receipts.map(row => row.containerId)])],
-      volumes: [...new Set([...ids.volumes, ...receipts.flatMap(row => row.providerVolumeName ? [row.providerVolumeName] : [])])] })
-    expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+    if (external) {
+      const cleanup = await external.finishRetainedFixture()
+      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+    }
+    if (h) {
+      const receipts = h.broker.receipts(), ids = h.transferOwnedIds()
+      const cleanup = await h.cleanup()
+      h.verifyTransferCleanup({ containers: [...new Set([...ids.containers, ...receipts.map(row => row.containerId)])],
+        volumes: [...new Set([...ids.volumes, ...receipts.flatMap(row => row.providerVolumeName ? [row.providerVolumeName] : [])])] })
+      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+    }
   }
   // These labels describe the fixture type; physical/DOM/API assertions above
   // carry the evidence. This artifact cannot qualify native identity/readiness.
-  h.writeArtifact(legacy ? 'task002-legacy-browser.json' : 'task002-config-browser.json', {
+  h?.writeArtifact(legacy ? 'task002-legacy-browser.json' : 'task002-config-browser.json', {
     kind: 'synthetic-task2-browser', nativeQualified: false,
     candidateSha: h.candidateSha, imageDigest: h.imageRef, observed,
   })

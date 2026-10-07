@@ -134,6 +134,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-supervisor', 'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
+    'retained-start', 'retained-status', 'retained-observed', 'retained-finish',
   ]),
   handle: z.object({
     runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
@@ -1901,6 +1902,7 @@ export type RuntimeWebConstructOptions = {
   candidateSha: string; buildDirty: boolean
   env: Record<string, string>; setupHome: (homeDir: string) => Promise<void>
   stripEnvPrefixes?: string[]
+  token?: string
 }
 export interface RuntimeWebHandle {
   readonly info: RuntimeWebInfo

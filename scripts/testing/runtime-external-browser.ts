@@ -14,14 +14,16 @@ import net from 'node:net'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import type { RuntimeWebConstructOptions, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
-import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, dockerSocketPath } from './runtime-sandbox.js'
+import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
+import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
 import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
+import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
+  type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
 type OwnedProcessIdentity = { pid: number; startTicks: string; executable: string; cwd: string }
 
@@ -210,7 +212,7 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
   async start(): Promise<RuntimeWebInfo> {
     if (this.process?.alive()) throw new Error('owned managed web is already started')
     this.homeDir ??= this.options.homeDir ?? await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-managed-web-'))
-    return this.boot(await freeOwnerPort(), randomUUID())
+    return this.boot(await freeOwnerPort(), this.options.token ?? randomUUID())
   }
 
   private async boot(port: number, token: string): Promise<RuntimeWebInfo> {
@@ -713,6 +715,18 @@ export class ExternalManagedRuntimeRig {
   }
   async crashAndRestartWeb(): Promise<ManagedBrowserConnectionInfo> { return this.rpc('replace-web', this.infoSchema()) }
   async restartSupervisor(): Promise<void> { await this.rpc('replace-supervisor', CompletedOwnerOperationSchema) }
+  async startRetainedFixture(fixtureId: 'config' | 'legacy'): Promise<Task2RetainedBrowserStage> {
+    return this.rpc('retained-start', Task2RetainedBrowserStageSchema, { challengeId: fixtureId })
+  }
+  async retainedFixtureStage(): Promise<Task2RetainedBrowserStage> {
+    return this.rpc('retained-status', Task2RetainedBrowserStageSchema)
+  }
+  async observeRetainedFixture(sequence: number): Promise<Task2RetainedBrowserStage> {
+    return this.rpc('retained-observed', Task2RetainedBrowserStageSchema, { generation: sequence })
+  }
+  async finishRetainedFixture(): Promise<{ ok: boolean; errors: string[] }> {
+    return this.rpc('retained-finish', ExternalCleanupSchema)
+  }
   async stop(): Promise<{ ok: boolean; errors: string[] }> {
     this.stopSettlement ??= this.rpc('finish', ExternalCleanupSchema)
     try {
@@ -723,13 +737,131 @@ export class ExternalManagedRuntimeRig {
   }
 }
 
+export interface ExternalRetainedFixtureControl {
+  start(fixtureId: 'config' | 'legacy'): void
+  status(): Task2RetainedBrowserStage
+  advance(sequence: number): void
+  cancel(): Promise<void>
+}
+
+type RetainedArtifacts = Parameters<RuntimeHarness['prepareTask2FixtureArtifacts']>[0]
+const RetainedArtifactSchema = z.object({ path: z.string().min(1), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict()
+const RetainedArtifactsSchema: z.ZodType<RetainedArtifacts> = z.object({
+  candidateSha: z.string().regex(/^[a-f0-9]{40}$/), imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  currentSupervisor: RetainedArtifactSchema, currentHost: RetainedArtifactSchema, currentServer: RetainedArtifactSchema,
+  legacySupervisor: RetainedArtifactSchema, legacyHost: RetainedArtifactSchema,
+  legacyCreatorCommit: z.literal('7dbc7ef6b0b87e47ec8386e19115f5e440399898'),
+}).strict()
+
+function readRetainedArtifacts(file: string | undefined, repoRoot: string, candidateSha: string): RetainedArtifacts {
+  if (!file || !path.isAbsolute(file) || fs.realpathSync(file) !== file) throw new Error('exact owner Task2 artifact manifest required')
+  const stat = fs.lstatSync(file)
+  if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.()) throw new Error('Task2 artifact manifest must be private and owned')
+  const { repoRoot: manifestRoot, runId, ...artifacts } = JSON.parse(fs.readFileSync(file, 'utf8'))
+  const parsed = RetainedArtifactsSchema.parse(artifacts)
+  if (manifestRoot !== repoRoot || !z.string().uuid().safeParse(runId).success || parsed.candidateSha !== candidateSha) {
+    throw new Error('Task2 artifacts differ from the current exact candidate and worktree')
+  }
+  return parsed
+}
+
+/** Each browser case owns a separate actual retained driver, broker and registry. */
+export class OwnedRetainedBrowserFixtures implements ExternalRetainedFixtureControl {
+  private session?: RetainedFixtureBrowserSession
+  private activeWeb?: RuntimeWebHandle
+  private readonly webs = new Set<RuntimeWebHandle>()
+  private facts?: Extract<Task2RetainedBrowserStage, { kind: 'finished' }>['facts']
+  private readonly cleanupErrors: string[] = []
+  constructor(private readonly owner: ManagedRuntimeOwner, private readonly artifacts: RetainedArtifacts,
+    private readonly allowed: readonly ('config' | 'legacy')[],
+    private readonly webFactory: RuntimeWebFactory = options => new ManagedRuntimeWebServer(options)) {}
+
+  get backend(): string { return this.activeWeb?.info.baseUrl ?? this.owner.info.baseUrl }
+  start(fixtureId: 'config' | 'legacy'): void {
+    if (!this.allowed.includes(fixtureId) || (this.session && this.session.status().kind !== 'finished')) {
+      throw new Error('retained fixture is not registered or its previous run is unsettled')
+    }
+    const h: RuntimeHarness = new RuntimeHarness(this.owner.repoRoot, randomUUID(), 3)
+    if (h.candidateSha !== this.owner.runtime.candidateSha) throw new Error('retained fixture source candidate changed')
+    this.session = new RetainedFixtureBrowserSession()
+    this.facts = undefined
+    const factory: RuntimeWebFactory = options => {
+      const web = this.webFactory({ ...options, token: this.owner.info.token })
+      this.webs.add(web)
+      const start = web.start.bind(web), stop = web.stop.bind(web)
+      web.start = async () => { const info = await start(); this.activeWeb = web; return info }
+      web.stop = async () => { await stop(); if (this.activeWeb === web) this.activeWeb = undefined }
+      return web
+    }
+    this.session.start(async hooks => {
+      let original: unknown
+      try {
+        await h.prepareTask2FixtureArtifacts(this.artifacts)
+        h.recordLifecycle('external.retained_fixture_registered', { severity: 'info',
+          parentRunId: this.owner.runtime.runId, candidateSha: h.candidateSha, fixtureId })
+        await runTask2RetainedFixture(h, fixtureId === 'legacy', factory, hooks)
+        h.assert(fixtureId, h.broker.unsafeAttempts().length === 0, 'retained browser fixture performs no unsafe broker operation')
+      } catch (error) { original = error }
+      let cleanupFailure: unknown
+      try {
+        const webErrors: unknown[] = []
+        for (const web of this.webs) {
+          try { await web.stop() } catch (error) { webErrors.push(error) }
+        }
+        const receipts = h.broker?.receipts() ?? [], ids = h.transferOwnedIds()
+        const cleanup = await h.cleanup()
+        h.verifyTransferCleanup({ containers: [...new Set([...ids.containers, ...receipts.map(row => row.containerId)])],
+          volumes: [...new Set([...ids.volumes, ...receipts.flatMap(row => row.providerVolumeName ? [row.providerVolumeName] : [])])] })
+        if (!cleanup.ok) throw new Error('actual retained resources did not clean up')
+        if (webErrors.length) throw new AggregateError(webErrors, 'retained owned web cleanup failed')
+        this.facts = { fixtureRunId: h.runId, candidateSha: h.candidateSha, imageDigest: h.imageRef,
+          unsafeBrokerAttempts: h.broker?.unsafeAttempts().length ?? 0 }
+        h.writeArtifact(fixtureId === 'legacy' ? 'task002-legacy-browser.json' : 'task002-config-browser.json', {
+          kind: 'synthetic-task2-browser', nativeQualified: false, ...this.facts,
+          parentRunId: this.owner.runtime.runId,
+        })
+      } catch (error) { cleanupFailure = error; this.cleanupErrors.push('retained fixture cleanup failed') }
+      if (original && cleanupFailure) throw new AggregateError([original, cleanupFailure], 'retained fixture and cleanup failed')
+      if (original) throw original
+      if (cleanupFailure) throw cleanupFailure
+    })
+  }
+  status(): Task2RetainedBrowserStage {
+    if (!this.session) throw new Error('owned retained fixture has not started')
+    const stage = this.session.status()
+    return stage.kind === 'finished' ? { ...stage, facts: this.facts } : stage
+  }
+  advance(sequence: number): void {
+    if (!this.session) throw new Error('owned retained fixture has not started')
+    this.session.advance(sequence)
+  }
+  captureRetry(observed: { soulId: string; requestId: string; response: unknown }): void {
+    if (!this.session) throw new Error('owned retained fixture has not started')
+    this.session.captureRetry(observed.soulId, observed.requestId, observed.response)
+  }
+  async cancel(): Promise<void> {
+    await this.session?.cancel()
+    for (const web of this.webs) await web.stop()
+    if (this.cleanupErrors.length) throw new Error(this.cleanupErrors.join('; '))
+  }
+}
+
 export function createExternalRuntimeControl(
   owner: ManagedRuntimeOwner, descriptor: ManagedExternalDescriptor,
+  retained?: ExternalRetainedFixtureControl,
 ): (input: unknown) => Promise<unknown> {
   if (owner.runtime.runId !== descriptor.runId || owner.runtime.candidateSha !== descriptor.candidateSha) {
     throw new Error('external controller differs from its exact owned run and candidate')
   }
   let finished = false
+  const retainedStage = () => {
+    if (!retained) throw new Error('registered retained fixture required')
+    const stage = retained.status()
+    return stage.kind === 'observe' || stage.kind === 'retry'
+      ? { ...stage, context: { ...stage.context, info: {
+        baseUrl: descriptor.baseUrl, wsUrl: descriptor.wsUrl, token: descriptor.token,
+      } } } : stage
+  }
   const queue = new RuntimeOwnerOperationQueue(descriptor.runId, descriptor.candidateSha, 'browser-managed-runtime', async request => {
     if (finished && request.action !== 'finish' && request.action !== 'abort') throw new Error('external owned runtime is finished')
     const handle = () => {
@@ -743,6 +875,25 @@ export function createExternalRuntimeControl(
           registration: owner.fixtureRegistrationFacts() }
         break
       case 'inventory': result = await owner.inventory(); break
+      case 'retained-start':
+        if (!retained || (request.challengeId !== 'config' && request.challengeId !== 'legacy')) throw new Error('registered retained fixture required')
+        retained.start(request.challengeId)
+        result = retainedStage()
+        break
+      case 'retained-status':
+        if (!retained) throw new Error('registered retained fixture required')
+        result = retainedStage()
+        break
+      case 'retained-observed':
+        if (!retained || request.generation === undefined) throw new Error('exact retained stage sequence required')
+        retained.advance(request.generation)
+        result = retainedStage()
+        break
+      case 'retained-finish':
+        if (!retained) throw new Error('registered retained fixture required')
+        try { await retained.cancel(); result = { ok: true, errors: [] } }
+        catch { result = { ok: false, errors: ['retained fixture cleanup failed'] } }
+        break
       case 'host-facts': result = await owner.chaosHostFacts(handle()); break
       case 'fixture-state': result = await owner.fixtureNativeState(handle()); break
       case 'fixture-worker': result = await owner.fixtureWorkerFacts(handle()); break
@@ -761,9 +912,12 @@ export function createExternalRuntimeControl(
       case 'replace-supervisor': await owner.restartSupervisor(); result = { completed: true }; break
       case 'finish':
       case 'abort': {
+        const errors: string[] = []
+        try { await retained?.cancel() } catch { errors.push('retained fixture cleanup failed') }
         const cleanup = await owner.stop()
-        finished = cleanup.ok
-        result = cleanup
+        errors.push(...cleanup.errors)
+        finished = cleanup.ok && errors.length === 0
+        result = { ok: finished, errors }
         break
       }
       default: throw new Error('owner operation is not admitted by this external fixture controller')
@@ -1184,6 +1338,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
   private tunnel?: OwnedManagedRuntimeTunnel
   private cloud?: OwnedRuntimeChild
   private descriptor?: ManagedExternalDescriptor
+  private retained?: OwnedRetainedBrowserFixtures
   private readonly cloudJobs = new Map<string, OwnedExternalCloudJob>()
   constructor(private readonly repoRoot = process.cwd(), private readonly environment: NodeJS.ProcessEnv = process.env) {}
 
@@ -1201,6 +1356,10 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     const security = JSON.parse(execFileSync('docker', ['info', '--format', '{{json .SecurityOptions}}'], { encoding: 'utf8' }))
     if (!Array.isArray(security) || !security.includes('name=rootless')) throw new Error('owned runtime Docker daemon is not rootless')
     const fixture = path.basename(selection.spec) === 'runtime-fresh-agent-fixture-rust.spec.ts'
+    const retainedSelection = path.basename(selection.spec) === 'runtime-managed-provider-qualification-rust.spec.ts'
+      && this.environment.FRESHELL_RUNTIME_SYNTHETIC_RESUME === '1'
+    const retainedArtifacts = retainedSelection ? readRetainedArtifacts(this.environment.FRESHELL_TASK002_FIXTURE_ARTIFACT_MANIFEST,
+      root, execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()) : undefined
     const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : selection.mode ? [selection.mode] : []
     const providers = fixture || selection.mode ? [] : selection.provider ? [selection.provider] : ['opencode']
     const phase = fixture ? 3 : selection.provider || selection.mode ? 5
@@ -1210,17 +1369,23 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     this.owner = new ManagedRuntimeOwner(options => new ManagedRuntimeWebServer({ ...options, preserveHomeOnStop: false }), root, phase,
       {}, {}, fixture ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
         fixtureFreshAgentModes: fixture ? modes : [] }, undefined, {
-        bootstrapProviders: fixture ? [] : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
+        bootstrapProviders: fixture || retainedArtifacts ? [] : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
       })
     execFileSync('pnpm', ['run', 'build:client'], { cwd: root, stdio: 'inherit' })
     execFileSync('pnpm', ['run', 'build:tools'], { cwd: root, stdio: 'inherit' })
     await this.owner.start()
+    if (retainedArtifacts) {
+      const titles = { config: 'synthetic config-blocked exact retry', legacy: 'synthetic legacy retained-runtime exact retry' }
+      const allowed = (['config', 'legacy'] as const).filter(id => !selection.grep || new RegExp(selection.grep).test(titles[id]))
+      this.retained = new OwnedRetainedBrowserFixtures(this.owner, retainedArtifacts, allowed)
+    }
     let control: ((request: unknown) => Promise<unknown>) | undefined
-    this.relay = new OwnedManagedRuntimeRelay({ token: this.owner.info.token, backend: () => this.owner!.info.baseUrl,
+    this.relay = new OwnedManagedRuntimeRelay({ token: this.owner.info.token, backend: () => this.retained?.backend ?? this.owner!.info.baseUrl,
       control: async request => {
         if (!control) throw new Error('owned external controller is not admitted yet')
         return control(request)
       },
+      retryResponse: this.retained ? observed => this.retained!.captureRetry(observed) : undefined,
     })
     await this.relay.start()
     this.tunnel = new OwnedManagedRuntimeTunnel(root, this.environment.FRESHELL_RUNTIME_CLOUDFLARED_BINARY)
@@ -1228,7 +1393,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     this.relay.setOrigin(this.tunnel.baseUrl)
     this.descriptor = { baseUrl: this.tunnel.baseUrl, wsUrl: this.tunnel.wsUrl,
       token: this.owner.info.token, runId: this.owner.runtime.runId, candidateSha: this.owner.runtime.candidateSha }
-    control = createExternalRuntimeControl(this.owner, this.descriptor)
+    control = createExternalRuntimeControl(this.owner, this.descriptor, this.retained)
     await verifyExternalManagedTransport(this.descriptor)
     this.owner.runtime.recordLifecycle('external.transport_ready', { runId: this.descriptor.runId,
       candidateSha: this.descriptor.candidateSha, tunnel: this.tunnel.processEvidence(), web: this.owner.web.processEvidence() })
@@ -1298,6 +1463,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
         }
       }],
       ['Cloud jobs', async () => { for (const job of this.cloudJobs.values()) cleanupOwnedExternalCloudJob(job) }],
+      ['retained fixtures', async () => { await this.retained?.cancel() }],
       ['runtime', async () => { if (this.owner) { const result = await this.owner.stop(); errors.push(...result.errors) } }],
       ['tunnel', async () => { await this.tunnel?.stop() }],
       ['relay', async () => { await this.relay?.stop() }],
