@@ -869,7 +869,7 @@ async fn grant_execution(
         .or_else(|| {
             fresh_agent.as_ref().map(|launch| {
                 (
-                    launch.provider.as_str(),
+                    launch.provider.native_provider(),
                     launch.provider_secret_references.as_slice(),
                     launch.provider_launch_context.as_ref(),
                 )
@@ -1098,7 +1098,7 @@ async fn grant_execution(
             }
             if !exact_resume {
                 prepare_provider_bootstrap_files(
-                    launch.provider.as_str(),
+                    launch.provider.native_provider(),
                     &launch.provider_bootstrap_files,
                     launch.run_as_uid,
                     launch.run_as_gid,
@@ -1115,7 +1115,7 @@ async fn grant_execution(
                 })?;
                 prepare_provider_context(
                     launch.provider_launch_context.as_ref(),
-                    launch.provider.as_str(),
+                    launch.provider.native_provider(),
                     &launch.workspace_path,
                     launch.run_as_uid,
                     launch.run_as_gid,
@@ -1129,7 +1129,7 @@ async fn grant_execution(
             } else {
                 refresh_provider_context(
                     launch.provider_launch_context.as_ref(),
-                    launch.provider.as_str(),
+                    launch.provider.native_provider(),
                     &launch.workspace_path,
                     launch.run_as_uid,
                     launch.run_as_gid,
@@ -1144,7 +1144,7 @@ async fn grant_execution(
                 )
             })?;
             prepare_provider_files(
-                launch.provider.as_str(),
+                launch.provider.native_provider(),
                 &resolved_secrets.provider_files,
                 &resolved_secrets.configuration_files,
                 launch.run_as_uid,

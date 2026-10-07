@@ -72,7 +72,7 @@ pub fn fresh_agent_mounts(spec: &FreshAgentLaunchSpec) -> Result<TerminalMounts,
         &spec.provider_bootstrap_files,
         &spec.provider_secret_references,
         spec.provider_launch_context.as_ref(),
-        spec.provider.as_str(),
+        spec.provider.native_provider(),
     )
 }
 

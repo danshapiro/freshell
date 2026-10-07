@@ -102,7 +102,7 @@ impl FreshAgentProfile {
         if self
             .provider_launch_context
             .as_ref()
-            .is_some_and(|context| context.validate(self.provider.as_str()).is_err())
+            .is_some_and(|context| context.validate(self.provider.native_provider()).is_err())
         {
             return Err(ActorError::InvalidProfile);
         }

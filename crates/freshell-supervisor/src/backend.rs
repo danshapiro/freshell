@@ -1080,7 +1080,10 @@ fn runtime_tmpfs(mode: Option<&str>) -> std::collections::BTreeMap<String, Strin
             "rw,exec,nosuid,nodev,size=64m,mode=1777".to_string(),
         );
     }
-    if matches!(mode, Some("claude" | "codex" | "opencode" | "amplifier")) {
+    if matches!(
+        mode,
+        Some("claude" | "kilroy" | "codex" | "opencode" | "amplifier")
+    ) {
         mounts.insert(
             "/run/freshell-private".to_string(),
             "rw,noexec,nosuid,nodev,size=16m,mode=0700".to_string(),

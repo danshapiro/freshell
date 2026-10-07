@@ -628,7 +628,7 @@ impl Supervisor {
                 replacement_fresh.as_ref().and_then(|agent| {
                     agent.provider_launch_context.as_ref().map(|context| {
                         (
-                            agent.provider.as_str().to_owned(),
+                            agent.provider.native_provider().to_owned(),
                             context.clone(),
                             agent.provider_secret_references.clone(),
                             agent.cwd.clone(),
@@ -2115,7 +2115,7 @@ fn install_prepared_provider_context(
             terminal.provider_secret_references = prepared.provider_secret_references;
         }
         (None, Some(agent)) => {
-            prepared.validate(agent.provider.as_str())?;
+            prepared.validate(agent.provider.native_provider())?;
             agent.provider_launch_context = Some(prepared.provider_launch_context);
             agent.provider_secret_references = prepared.provider_secret_references;
         }

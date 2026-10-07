@@ -7,6 +7,7 @@ pub(crate) struct ClaudePreparation<'a> {
     pub client: &'a freshell_runtime_client::RuntimeClient,
     pub soul: &'a SoulId,
     pub creation_seed: &'a str,
+    pub reservation_provider: &'a str,
     pub home: &'a Path,
     pub cwd: &'a Path,
     pub workspace: &'a Path,
@@ -18,6 +19,9 @@ pub(crate) struct ClaudePreparation<'a> {
 pub(crate) async fn prepare_managed(
     request: ClaudePreparation<'_>,
 ) -> Result<ProviderLaunchContext, String> {
+    if !matches!(request.reservation_provider, "claude" | "kilroy") {
+        return Err("Claude source preparation requires its exact supported runtime flavor".into());
+    }
     let mut plugin_dirs = Vec::new();
     let mut path_bytes = 0usize;
     let cli = request
@@ -63,12 +67,12 @@ pub(crate) async fn prepare_managed(
         .client
         .reserve_provider_inputs(
             request.soul.clone(),
-            "claude".into(),
+            request.reservation_provider.into(),
             request.creation_seed.into(),
         )
         .await
         .map_err(|error| error.to_string())?;
-    if reservation.provider != "claude"
+    if reservation.provider != request.reservation_provider
         || &reservation.soul_id != request.soul
         || reservation.creation_seed_ref != request.creation_seed
     {

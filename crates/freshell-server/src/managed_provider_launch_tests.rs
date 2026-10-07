@@ -215,6 +215,97 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
     }
 }
 
+fn capture_fresh_launch_failure_classes() -> std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> {
+    use tracing_subscriber::prelude::*;
+    #[derive(Clone)]
+    struct FailureLayer(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FailureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if !event.metadata().target().contains("fresh_agent_proxy") {
+                return;
+            }
+            struct Classes(Vec<&'static str>);
+            impl tracing::field::Visit for Classes {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() != "error" {
+                        return;
+                    }
+                    let text = format!("{value:?}");
+                    for label in [
+                        "HostUnreachable",
+                        "InvalidRequest",
+                        "ProviderInputsChanged",
+                        "prepare hosted provider config",
+                        "prepare hosted fresh-agent provider state",
+                        "prepare hosted OneCLI provider files",
+                        "open hosted",
+                        "OneCLI",
+                        "profile",
+                        "credential",
+                        "unsafe or mismatched",
+                        "MCP",
+                        "sidecar",
+                        "source",
+                        "manifest",
+                        "copy",
+                        "Permission",
+                        "unavailable",
+                        "initialization",
+                        "timed out",
+                        "Claude",
+                        "kilroy",
+                        "environment",
+                        "grant",
+                        "provider",
+                        "configuration",
+                        "refresh",
+                        "input bind",
+                        "trusted uid/group",
+                        "provider home",
+                        "resource",
+                        "destination",
+                        "projection",
+                        "stage",
+                        "metadata",
+                        "path",
+                        "readable",
+                        "preparation",
+                        "version",
+                        "changed",
+                        "rootless",
+                        "directory",
+                        "filesystem",
+                        "temporary",
+                        "failed to start",
+                        "failed with status",
+                    ] {
+                        if text.contains(label) {
+                            self.0.push(label);
+                        }
+                    }
+                }
+            }
+            let mut classes = Classes(Vec::new());
+            event.record(&mut classes);
+            self.0.lock().unwrap().extend(classes.0);
+        }
+    }
+    let classes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(FailureLayer(classes.clone())),
+    )
+    .unwrap();
+    classes
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_provider_amplifier_terminal_native_startup_consumes_prepared_inputs() {
     use freshell_supervisor::{
@@ -648,6 +739,7 @@ async def on_session_ready(coordinator):
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prepared_inputs() {
+    let failure_classes = capture_fresh_launch_failure_classes();
     use freshell_supervisor::{
         admission::AdmissionPolicy,
         registry::Registry,
@@ -1071,11 +1163,14 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     )
     .unwrap()
     .unwrap();
-    Arc::clone(&proxy).dispatch(HostedFreshAgentCommand::Create(serde_json::from_value(json!({"requestId":"closed-native-fresh-create","sessionType":"freshclaude","provider":"claude","cwd":cwd,"plugins":[plugin.to_str().unwrap()]})).unwrap())).await;
+    let flavor = std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_FLAVOR").unwrap();
+    assert!(matches!(flavor.as_str(), "freshclaude" | "kilroy"));
+    Arc::clone(&proxy).dispatch(HostedFreshAgentCommand::Create(serde_json::from_value(json!({"requestId":"closed-native-fresh-create","sessionType":flavor,"provider":"claude","cwd":cwd,"plugins":[plugin.to_str().unwrap()]})).unwrap())).await;
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let frame: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
             if frame["type"] == "freshAgent.create.failed" {
+                println!("provider_launch_failure_classes {}", json!({"provider":"claude","flavor":flavor,"classes":failure_classes.lock().unwrap().clone()}));
                 panic!(
                     "fresh Claude startup failed classification: {}",
                     frame["message"]

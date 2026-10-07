@@ -18,9 +18,9 @@ use freshell_protocol::{
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
     AgentEvent, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
-    FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, LaunchRequest,
-    ProviderBootstrapFile, RequestId, RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId,
-    StopOutcome, ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
+    FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, LaunchRequest, RequestId,
+    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome, ViewIntentKind,
+    ViewIntentRequest, ViewVisibilityIntent,
 };
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
 use sha2::{Digest, Sha256};
@@ -453,10 +453,12 @@ impl HostedFreshAgentProxy {
             .map(|value| value.session_id.clone());
         let session_type = session_type_wire(message.session_type);
         let request_id = stable_request_id(&message.request_id).map_err(|_| ())?;
-        let provider_bootstrap_files = provider_bootstrap_files(&provider).map_err(|_| ())?;
+        let provider_bootstrap_files = Vec::new();
         let mut provider_secret_references =
-            crate::managed_provider_bootstrap::named_provider_onecli_references(provider.as_str())
-                .map_err(|_| ())?;
+            crate::managed_provider_bootstrap::named_provider_onecli_references(
+                provider.native_provider(),
+            )
+            .map_err(|_| ())?;
         let (mcp_capability, mut provider_launch_context) = if provider == FreshProvider::Opencode {
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
@@ -515,12 +517,13 @@ impl HostedFreshAgentProxy {
                 tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
             })?;
             (context.mcp_capability.clone().ok_or(())?, Some(context))
-        } else if provider == FreshProvider::Claude {
+        } else if matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy) {
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .ok_or(())?;
             let context = crate::managed_provider_references::claude::prepare_managed(
                 crate::managed_provider_references::claude::ClaudePreparation {
+                    reservation_provider: provider.as_str(),
                     client: &self.client,
                     soul: &soul,
                     creation_seed: &message.request_id,
@@ -1287,40 +1290,6 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn provider_bootstrap_files(
-    provider: &FreshProvider,
-) -> Result<Vec<ProviderBootstrapFile>, String> {
-    let home = std::env::var("HOME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    let (override_key, fallback, relative) = match provider {
-        FreshProvider::Kilroy => (
-            "FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE",
-            home.map(|value| value.join(".claude/.credentials.json")),
-            ".claude/.credentials.json",
-        ),
-        FreshProvider::Claude | FreshProvider::Codex | FreshProvider::Opencode => {
-            return Ok(Vec::new())
-        }
-    };
-    let candidate = std::env::var(override_key)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or(fallback)
-        .filter(|value| value.is_file());
-    let Some(candidate) = candidate else {
-        return Ok(Vec::new());
-    };
-    let source_path = std::fs::canonicalize(candidate)
-        .map_err(|_| "provider credential reference is unreadable".to_string())?;
-    Ok(vec![ProviderBootstrapFile {
-        source_path: source_path.to_string_lossy().into_owned(),
-        provider_relative_path: relative.into(),
-    }])
 }
 
 #[cfg(test)]

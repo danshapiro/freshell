@@ -829,7 +829,15 @@ async fn one_state_directory_has_only_one_writer() {
 #[tokio::test]
 async fn exact_native_identity_and_profile_are_reused_on_host_actor_recovery() {
     let dir = tempfile::tempdir().unwrap();
-    let initial = profile(FreshProvider::Kilroy, "kilroy-store", None);
+    let mut initial = profile(FreshProvider::Kilroy, "kilroy-store", None);
+    initial.provider_launch_context = Some(freshell_runtime_protocol::ProviderLaunchContext {
+        preparation: freshell_runtime_protocol::ProviderPreparation::Claude {
+            mcp_args: Vec::new(),
+        },
+        prepared_inputs: None,
+        mcp_capability: None,
+        config: Vec::new(),
+    });
     let actor =
         FreshAgentHostActor::open(dir.path(), initial, FakeTransport::new("claude-native-9"))
             .await

@@ -151,7 +151,7 @@ impl Registry {
     ) -> Result<OwnedInputReservation, RegistryError> {
         if !matches!(
             request.provider.as_str(),
-            "opencode" | "codex" | "claude" | "amplifier"
+            "opencode" | "codex" | "claude" | "kilroy" | "amplifier"
         ) || request.creation_seed_ref.is_empty()
             || request.creation_seed_ref.len() > 4096
             || request.creation_seed_ref.chars().any(char::is_control)
@@ -225,7 +225,10 @@ pub(super) fn bind_in_transaction(
     // This does not grant native-auth lookup; OpenCode's initial auth authority
     // still requires an identity-free creation, and host resume checks remain.
     if input.native_session_id.is_some()
-        && !matches!(input.provider.as_str(), "codex" | "claude" | "amplifier")
+        && !matches!(
+            input.provider.as_str(),
+            "codex" | "claude" | "kilroy" | "amplifier"
+        )
     {
         return Err(RegistryError::RequestConflict);
     }

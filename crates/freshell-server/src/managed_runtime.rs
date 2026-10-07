@@ -260,6 +260,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     .ok_or("original Claude HOME is unavailable")?;
                 let context = crate::managed_provider_references::claude::prepare_managed(
                     crate::managed_provider_references::claude::ClaudePreparation {
+                        reservation_provider: "claude",
                         client: &self.client,
                         soul: &soul_id,
                         creation_seed: create_key,

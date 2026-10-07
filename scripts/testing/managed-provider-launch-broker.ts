@@ -15,6 +15,10 @@ const image=configuration.provider==='claude'
 if (configuration.imageRef!==image || !['opencode','codex','claude','amplifier'].includes(configuration.provider) || !Array.isArray(configuration.initialVolumes) || configuration.initialVolumes.length!==(configuration.provider==='amplifier'?1:2)) {
   throw new Error('closed provider startup image or finite source set changed')
 }
+if (!['freshclaude','kilroy'].includes(configuration.claudeFlavor)
+  || (configuration.claudeFlavor==='kilroy' && configuration.provider!=='claude')) {
+  throw new Error('closed provider startup Claude flavor changed')
+}
 const gateways=new Set<string>()
 const broker=new RestrictedDockerBroker({
   realSocketPath:'/run/fixture-docker.sock',proxySocketPath:path.join(root,'broker.sock'),

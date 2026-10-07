@@ -33,7 +33,10 @@ def main():
     parser.add_argument("--broker-binary",type=Path,required=True)
     parser.add_argument("--receipt-dir",type=Path,required=True)
     parser.add_argument("--provider",choices=["opencode","codex","claude","amplifier"],default="opencode")
+    parser.add_argument("--claude-flavor",choices=["freshclaude","kilroy"],default="freshclaude")
     args=parser.parse_args()
+    if args.provider!="claude" and args.claude_flavor!="freshclaude":
+        parser.error("the finite Claude flavor requires --provider claude")
     selected_test={"opencode":TEST,"codex":CODEX_TEST,"claude":CLAUDE_TEST,"amplifier":AMPLIFIER_TEST}[args.provider]
     if args.provider=="claude": IMAGE=CLAUDE_IMAGE
     repo=Path(__file__).resolve().parents[2]
@@ -89,12 +92,13 @@ def main():
                 (root/name).mkdir(parents=True,exist_ok=True)
             initial=[]
             souls=["soul-terminal-"+hashlib.sha256(b"closed-native-terminal-create").hexdigest()[:32]]
-            if args.provider!="amplifier": souls.append("soul-fresh-"+args.provider+"-"+hashlib.sha256(b"closed-native-fresh-create").hexdigest()[:32])
+            fresh_provider="kilroy" if args.provider=="claude" and args.claude_flavor=="kilroy" else args.provider
+            if args.provider!="amplifier": souls.append("soul-fresh-"+fresh_provider+"-"+hashlib.sha256(b"closed-native-fresh-create").hexdigest()[:32])
             for soul in souls:
                 volume="freshell-provider-"+hashlib.sha256((installation+"\0"+soul).encode()).hexdigest()[:24]
                 volumes.add(volume)
                 initial.append({"installationId":installation,"soulId":soul,"providerVolumeName":volume,"imageRef":IMAGE,"hostBinaryPath":str(host),"binarySha256":digest(host),"daemonId":info["ID"]})
-            (root/"broker-configuration.json").write_text(json.dumps({"imageRef":IMAGE,"hostBinaryPath":str(host),"runId":run,"provider":args.provider,"initialVolumes":initial}))
+            (root/"broker-configuration.json").write_text(json.dumps({"imageRef":IMAGE,"hostBinaryPath":str(host),"runId":run,"provider":args.provider,"claudeFlavor":args.claude_flavor,"initialVolumes":initial}))
             setup=run+"-dependencies"
             # Install the actual exact published SDK tree into synthetic config
             # storage. No read-only install bypass, fake SDK or model call.
@@ -165,6 +169,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                    "--env",f"RULE_DIR={config}","--env",f"FRESHELL_PROVIDER_LAUNCH_FIXTURE={root}",
                    "--env",f"FRESHELL_PROVIDER_LAUNCH_HOST_BINARY={host}","--env",f"FRESHELL_PROVIDER_LAUNCH_IMAGE={IMAGE}",
                    "--env",f"FRESHELL_PROVIDER_LAUNCH_INSTALLATION={installation}","--env",f"FRESHELL_PROVIDER_LAUNCH_RUN_ID={run}",
+                   "--env",f"FRESHELL_PROVIDER_LAUNCH_CLAUDE_FLAVOR={args.claude_flavor}",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE={root}/grants/environment.env",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE={root}/grants/auth.json",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE={root}/grants/ca.pem",
@@ -179,6 +184,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
             exit_code=int(waited.stdout.strip())
             outcome=docker("logs",controller,check=False)
             receipt["exitCode"]=exit_code
+            if args.provider=="claude": receipt["claudeFlavor"]=args.claude_flavor
             receipt["consumedRoutes"]=[json.loads(line.split("provider_launch_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_launch_consumer " in line]
             print(outcome.stdout,end="",flush=True);print(outcome.stderr,end="",flush=True)
             expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")} if args.provider=="opencode" else ({(args.provider,"terminal")} if args.provider=="amplifier" else {(args.provider,"terminal"),(args.provider,"fresh")})

@@ -1724,6 +1724,15 @@ mod double_optional {
 }
 
 impl FreshProvider {
+    /// Native input recipes are shared by the two existing Claude flavors.
+    /// Runtime identities and reservation owners still use `as_str()`.
+    pub fn native_provider(&self) -> &'static str {
+        match self {
+            Self::Kilroy => "claude",
+            _ => self.as_str(),
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -1880,9 +1889,12 @@ impl FreshAgentLaunchSpec {
             }
         }
         if let Some(context) = &self.provider_launch_context {
-            context.validate(self.provider.as_str())?;
+            context.validate(self.provider.native_provider())?;
         }
-        validate_provider_secrets(self.provider.as_str(), &self.provider_secret_references)?;
+        validate_provider_secrets(
+            self.provider.native_provider(),
+            &self.provider_secret_references,
+        )?;
         if let Some(inputs) = self
             .provider_launch_context
             .as_ref()
@@ -3810,6 +3822,38 @@ mod tests {
             HostCommand::FreshAgentResolve { decision_id, .. }
                 if decision_id == "decision-7"
         ));
+    }
+
+    #[test]
+    fn fresh_kilroy_consumes_claude_recipes_without_changing_runtime_identity() {
+        let mut launch = fresh_agent_launch(FreshProvider::Kilroy, "kilroy");
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude {
+                mcp_args: Vec::new(),
+            },
+            prepared_inputs: None,
+            mcp_capability: None,
+            config: Vec::new(),
+        };
+        assert!(context.validate("kilroy").is_err());
+        launch.provider_launch_context = Some(context);
+        launch.provider_secret_references = vec![ProviderSecretReference {
+            source_path: "/synthetic/private/claude-environment".into(),
+            profile: ProviderSecretProfile::ClaudeOnecliEnvironment,
+            provider_relative_path: None,
+        }];
+        launch.validate().unwrap();
+        let retained: FreshAgentLaunchSpec =
+            serde_json::from_slice(&serde_json::to_vec(&launch).unwrap()).unwrap();
+        assert_eq!(retained.provider, FreshProvider::Kilroy);
+        assert_eq!(retained.session_type, "kilroy");
+        assert_eq!(retained.native_session_id.as_deref(), Some("native-one"));
+        assert_eq!(retained, launch);
+        launch.provider = FreshProvider::Codex;
+        launch.session_type = "freshcodex".into();
+        assert!(launch.validate().is_err());
+        launch.provider_launch_context = None;
+        assert!(launch.validate().is_err());
     }
 
     #[test]

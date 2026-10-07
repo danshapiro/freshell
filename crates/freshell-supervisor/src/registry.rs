@@ -2965,6 +2965,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_kilroy_ordinary_authority_cannot_bind_the_other_claude_flavor() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("synthetic-host");
+        std::fs::write(&binary, "synthetic artifact").unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let request = freshell_runtime_protocol::ReserveProviderInputsRequest {
+            expected_control_epoch: Some(registry.control_epoch()),
+            soul_id: soul.clone(),
+            provider: "kilroy".into(),
+            creation_seed_ref: "seed".into(),
+        };
+        let reservation = registry
+            .reserve_initial_inputs(
+                request.clone(),
+                format!("sha256:{}", "a".repeat(64)),
+                binary.clone(),
+            )
+            .await
+            .expect("the existing Kilroy flavor requires its distinct creation authority");
+        let mut wrong = request;
+        wrong.provider = "claude".into();
+        assert!(matches!(
+            registry
+                .reserve_initial_inputs(wrong, format!("sha256:{}", "a".repeat(64)), binary)
+                .await,
+            Err(RegistryError::RequestConflict)
+        ));
+        let receipt = registry
+            .record_initial_observation(
+                reservation,
+                freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+                    daemon_id: DockerDaemonId::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.provider, "kilroy");
+        let mut launch = prep(soul, RequestId::new(), "kilroy-owned-inputs");
+        launch.provider = "kilroy".into();
+        launch.terminal = None;
+        launch.fresh_agent = Some(serde_json::from_value(serde_json::json!({
+            "sessionId":"synthetic-fresh", "provider":"kilroy", "sessionType":"kilroy",
+            "runtimeVariant":"kilroy-claude-agent-sdk", "providerStoreId":"test-store",
+            "cwd":"/synthetic/workspace", "workspacePath":"/synthetic/workspace", "runAsUid":65534,"runAsGid":0,
+            "providerLaunchContext": {
+                "preparation":{"claude":{"mcp_args":[]}},
+                "mcpCapability":{"grantId":"grant-ordinary", "endpoint":"http://host.docker.internal:3001/api/mcp", "providerRelativePath":".freshell/mcp-capability.json"},
+                "preparedInputs":{"generationId":"grant-ordinary", "initialAuthReservation":receipt.reservation_id,
+                    "manifest":{"relativePath":".freshell/input-manifest.json","sha256":"a".repeat(64),"sourceCount":0,"aliasCount":0,"recipeCount":0}}
+            }
+        })).unwrap());
+        let mut other = launch.clone();
+        other.provider = "claude".into();
+        let fresh = other.fresh_agent.as_mut().unwrap();
+        fresh.provider = freshell_runtime_protocol::FreshProvider::Claude;
+        fresh.session_type = "freshclaude".into();
+        fresh.runtime_variant = "claude-agent-sdk".into();
+        assert!(matches!(
+            registry.prepare_launch(other).await,
+            Err(RegistryError::RequestConflict)
+        ));
+        let prepared = registry.prepare_launch(launch).await.unwrap();
+        let bound = registry
+            .bound_input_reservation(prepared.incarnation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.reservation.provider, "kilroy");
+    }
+
+    #[tokio::test]
     async fn provider_ordinary_initial_reservation_preserves_provider_identity() {
         for provider in ["codex", "claude", "amplifier"] {
             for native_session_id in [None, Some("fixture-native-session".to_string())] {
