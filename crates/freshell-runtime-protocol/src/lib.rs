@@ -2288,7 +2288,7 @@ pub fn durable_managed_terminal_args(
                     index += 2;
                     value.as_str()
                 };
-                selected_settings = Some(value);
+                selected_settings = Some((out.len(), value));
             }
             _ => {
                 out.push(args[index].clone());
@@ -2296,9 +2296,10 @@ pub fn durable_managed_terminal_args(
             }
         }
     }
-    if let Some(value) = selected_settings {
-        out.push("--settings".into());
-        out.push(
+    if let Some((position, value)) = selected_settings {
+        out.insert(position, "--settings".into());
+        out.insert(
+            position + 1,
             if freshell_platform::cli_launch::is_owned_claude_settings(value) {
                 claude_settings.ok_or_else(invalid)?.into()
             } else {

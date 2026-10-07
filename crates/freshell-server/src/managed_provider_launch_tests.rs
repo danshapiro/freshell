@@ -510,6 +510,14 @@ async def on_session_ready(coordinator):
         .unwrap()
         .unwrap();
     let cwd = workspace.to_str().unwrap().to_string();
+    let ambient_home = fixture.join("ambient-home");
+    std::fs::create_dir_all(ambient_home.join(".amplifier")).unwrap();
+    std::fs::write(
+        ambient_home.join(".amplifier/settings.yaml"),
+        "bundle:\n  active: ./missing-ambient-decoy\n",
+    )
+    .unwrap();
+    std::env::set_var("HOME", &ambient_home);
     let terminal = controller
         .launch(ManagedTerminalLaunch {
             spec: freshell_platform::spawn::SpawnSpec {
@@ -525,7 +533,7 @@ async def on_session_ready(coordinator):
                 cols: 120,
                 rows: 30,
             },
-            env: BTreeMap::new(),
+            env: BTreeMap::from([("HOME".into(), home.to_str().unwrap().into())]),
             terminal_id: "closed-native-terminal".into(),
             stream_id: "closed-native-stream".into(),
             mode: "amplifier".into(),
@@ -1028,6 +1036,14 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         .unwrap()
         .unwrap();
     let cwd = workspace.to_str().unwrap().to_string();
+    let ambient_home = fixture.join("ambient-home");
+    std::fs::create_dir_all(ambient_home.join(".claude")).unwrap();
+    std::fs::write(
+        ambient_home.join(".claude/CLAUDE.md"),
+        "@missing-ambient-decoy.md\n",
+    )
+    .unwrap();
+    std::env::set_var("HOME", &ambient_home);
     let terminal = controller
         .launch(ManagedTerminalLaunch {
             spec: freshell_platform::spawn::SpawnSpec {
@@ -1051,10 +1067,10 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
                 cols: 120,
                 rows: 30,
             },
-            env: BTreeMap::from([(
-                "CLAUDE_CONFIG_DIR".into(),
-                "../source-home/selected-config".into(),
-            )]),
+            env: BTreeMap::from([
+                ("HOME".into(), home.to_str().unwrap().into()),
+                ("CLAUDE_CONFIG_DIR".into(), "../source-home/selected-config".into()),
+            ]),
             terminal_id: "closed-native-terminal".into(),
             stream_id: "closed-native-stream".into(),
             mode: "claude".into(),
@@ -1254,6 +1270,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     std::fs::remove_file(&instructions_events).unwrap();
     let (broadcast, _) = tokio::sync::broadcast::channel(256);
     let mut events = broadcast.subscribe();
+    std::env::set_var("HOME", &home);
     let proxy = crate::fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
         Some(client.clone()),
         Arc::new(broadcast),

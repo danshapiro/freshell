@@ -201,12 +201,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 ..Default::default()
             };
             let (mcp_capability, provider_launch_context) = if request.mode == "opencode" {
-                let home = request
-                    .env
-                    .get("HOME")
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
-                    .ok_or("managed provider HOME unavailable")?;
+                let home = original_provider_home(&request.env)?;
                 let original = |name: &str| {
                     request
                         .env
@@ -241,12 +236,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     Some(prepared.context),
                 )
             } else if request.mode == "codex" {
-                let home = request
-                    .env
-                    .get("HOME")
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
-                    .ok_or("managed provider HOME unavailable")?;
+                let home = original_provider_home(&request.env)?;
                 let original = |name: &str| {
                     request
                         .env
@@ -270,9 +260,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 .await?;
                 (context.mcp_capability.clone(), Some(context))
             } else if request.mode == "claude" {
-                let home = std::env::var_os("HOME")
-                    .map(std::path::PathBuf::from)
-                    .ok_or("original Claude HOME is unavailable")?;
+                let home = original_provider_home(&request.env)?;
                 let original = |name: &str| {
                     request
                         .env
@@ -299,9 +287,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 .await?;
                 (context.mcp_capability.clone(), Some(context))
             } else if request.mode == "amplifier" {
-                let home = std::env::var_os("HOME")
-                    .map(std::path::PathBuf::from)
-                    .ok_or("original Amplifier HOME is unavailable")?;
+                let home = original_provider_home(&request.env)?;
                 let context = crate::managed_provider_references::amplifier::prepare_managed(
                     crate::managed_provider_references::amplifier::AmplifierPreparation {
                         client: &self.client,
@@ -808,6 +794,16 @@ fn managed_env_allowlist(
         .filter(|(key, _)| ALLOWED.contains(&key.as_str()))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+fn original_provider_home(
+    request: &std::collections::BTreeMap<String, String>,
+) -> Result<PathBuf, &'static str> {
+    request
+        .get("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .ok_or("managed provider HOME unavailable")
 }
 
 fn managed_provider_env(
