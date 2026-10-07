@@ -312,18 +312,10 @@ async fn apply_prepared_callback(
             manifest.validate().map_err(str::to_string)?;
             manifest
         } else {
-            let cwd = callback
-                .cwd
-                .as_deref()
-                .or(callback.workspace.as_deref())
-                .ok_or("missing provider working directory")?;
-            freshell_platform::codex_inputs::CodexInputManifest {
-                version: 1,
-                original_home: home.into(),
-                cwd: cwd.into(),
-                codex_home: home.join(".codex"),
-                named_profile: None,
-            }
+            tracing::warn!(event="provider.inputs.preparation.blocked",stage="controller_callback",operation="select_original_sources",provider,
+                soul_id=%callback.soul_id,reason="origin_unknown",
+                "Original source origins are unrecorded; retained inputs were preserved");
+            return Err("original Codex source origins are unrecorded; retain the existing inputs and reprepare from their original source before dispatch".into());
         };
         context.config.clear();
         let references = callback.provider_secret_references.unwrap_or_default();
@@ -3984,6 +3976,93 @@ except Exception as error:
         assert_eq!(
             std::fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
             raw
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_provider_legacy_codex_origin_unknown_blocks_and_retains_inputs() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("current-home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "model_instructions_file='./current.md'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".codex/current.md"),
+            b"must not substitute current HOME",
+        )
+        .unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let endpoint = "http://host.docker.internal:4000";
+        let prior = store
+            .issue(
+                soul.clone(),
+                &directory,
+                endpoint.into(),
+                None,
+                Default::default(),
+                None,
+            )
+            .unwrap();
+        let legacy_root = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+        std::fs::create_dir_all(&legacy_root).unwrap();
+        std::fs::write(
+            legacy_root.join("retained-resource"),
+            b"retained legacy resource",
+        )
+        .unwrap();
+        let private_before =
+            std::fs::read(grant_path(&directory, &prior.grant_id).unwrap()).unwrap();
+        let context = freshell_runtime_protocol::ProviderLaunchContext {
+            preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+                tui_args: vec![],
+                sidecar_args: vec![],
+            },
+            config: vec![],
+            mcp_capability: Some(prior.clone()),
+            prepared_inputs: None,
+        };
+        let callback=serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,"provider":"codex","workspace":workspace,"cwd":workspace,"priorContext":context,"providerSecretReferences":[],"authLookupAuthority":"fixture-owned-attempt"})).unwrap();
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let error = apply_prepared_callback(
+            &callback,
+            "fixture-control",
+            &store,
+            &directory,
+            endpoint,
+            &home,
+            &client,
+        )
+        .await
+        .err()
+        .expect(
+            "legacy metadata cannot grant current HOME authority for an unrecorded original source",
+        );
+        assert!(error.contains("original Codex source origins are unrecorded"));
+        assert!(
+            std::fs::read(grant_path(&directory, &prior.grant_id).unwrap()).unwrap()
+                == private_before,
+            "unknown origins must retain the original private capability unchanged"
+        );
+        assert_eq!(
+            std::fs::read(legacy_root.join("retained-resource")).unwrap(),
+            b"retained legacy resource"
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.parent().unwrap().join("provider-roots"))
+                .unwrap()
+                .count(),
+            1
         );
     }
 
