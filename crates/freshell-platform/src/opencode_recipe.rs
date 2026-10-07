@@ -30,6 +30,7 @@ pub struct GeneratedFileRecipe {
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveryRole {
     #[default]
+    Unknown,
     Workspace,
     Global,
     Home,
@@ -48,6 +49,8 @@ pub struct SourceManifest {
     pub version: u8,
     pub cwd: PathBuf,
     pub original_home: PathBuf,
+    #[serde(default)]
+    pub global_config_root: Option<PathBuf>,
     pub sources: Vec<SourceView>,
     pub files: Vec<SelectedSourceFile>,
     #[serde(default)]
@@ -63,6 +66,24 @@ pub struct SourceManifest {
     #[serde(default)]
     pub inline_edits: crate::opencode_config::OwnedConfigEdits,
 }
+impl SourceManifest {
+    pub fn require_known_discovery_roles(&self) -> Result<(), &'static str> {
+        if self
+            .sources
+            .iter()
+            .any(|source| source.discovery_role == DiscoveryRole::Unknown)
+            || self
+                .resource_roots
+                .iter()
+                .any(|root| root.role == DiscoveryRole::Unknown)
+        {
+            Err("native discovery role is unrecorded")
+        } else {
+            Ok(())
+        }
+    }
+}
+
 fn default_rebind_enabled() -> bool {
     true
 }

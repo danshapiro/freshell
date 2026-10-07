@@ -748,6 +748,7 @@ pub(crate) struct OpencodePreparation<'a> {
     pub references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
     pub auth_authority: Option<&'a str>,
     pub selected_sources: Option<Vec<sources::SourceOccurrence>>,
+    pub accepted_global_root: Option<PathBuf>,
     pub selected_resource_roots: Option<Vec<sources::DiscoveryRoot>>,
     pub native_source_flags: Option<Vec<freshell_platform::opencode_recipe::NativeSourceFlag>>,
     pub rebind_enabled: Option<bool>,
@@ -785,6 +786,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         mut references,
         auth_authority,
         selected_sources,
+        accepted_global_root,
         selected_resource_roots,
         native_source_flags,
         rebind_enabled,
@@ -807,16 +809,29 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         inline_edits.bash_permission = original("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
             .filter(|value| matches!(value.as_str(), "allow" | "ask" | "deny"));
     }
-    let xdg = original("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"));
-    let xdg = if xdg.is_absolute() {
-        xdg
+    let config_root = if let Some(root) = accepted_global_root {
+        if !root.is_absolute() || root.file_name() != Some(std::ffi::OsStr::new("opencode")) {
+            return Err(
+                "accepted global configuration root is invalid; retain prior inputs and reprepare"
+                    .into(),
+            );
+        }
+        root
     } else {
-        cwd.join(xdg)
+        let xdg = original("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        let xdg = if xdg.is_absolute() {
+            xdg
+        } else {
+            cwd.join(xdg)
+        };
+        xdg.join("opencode")
     };
-    let config_root = xdg.join("opencode");
+    let xdg = config_root
+        .parent()
+        .ok_or("global configuration root parent unavailable")?;
     let resource_roots = if let Some(roots) = selected_resource_roots {
         roots
     } else {
@@ -834,7 +849,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         workspace,
         cwd,
         home,
-        Some(&xdg),
+        Some(xdg),
         None,
     )?
     .ok_or("OpenCode provider preparation unavailable")?;

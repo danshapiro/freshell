@@ -436,6 +436,7 @@ async fn apply_prepared_callback(
                     .ok_or("replacement provider preparation requires attempt authority")?,
             ),
             selected_sources,
+            accepted_global_root: accepted_manifest.as_ref().map(|manifest| manifest.global_config_root.clone().ok_or_else(|| "accepted global configuration root is unrecorded; retain prior inputs and reprepare before dispatch".to_string())).transpose()?,
             selected_resource_roots: accepted_manifest
                 .as_ref()
                 .map(|manifest| manifest.resource_roots.clone()),
@@ -538,6 +539,10 @@ fn read_prior_source_manifest(
     {
         return Err("prior source manifest origin profile invalid".into());
     }
+    manifest.require_known_discovery_roles().map_err(|_| {
+        "prior native discovery role is unrecorded; retain inputs and reprepare before dispatch"
+            .to_string()
+    })?;
     Ok(Some(manifest))
 }
 
@@ -3602,6 +3607,7 @@ except Exception as error:
                         references: vec![],
                         auth_authority: Some("fixture-owned-attempt"),
                         selected_sources: None,
+                        accepted_global_root: None,
                         selected_resource_roots: None,
                         native_source_flags: None,
                         rebind_enabled: None,
@@ -3734,6 +3740,7 @@ except Exception as error:
                         references: vec![],
                         auth_authority: Some("fixture-owned-attempt"),
                         selected_sources: None,
+                        accepted_global_root: None,
                         selected_resource_roots: None,
                         native_source_flags: None,
                         rebind_enabled: None,
@@ -3943,6 +3950,7 @@ except Exception as error:
                 references: vec![],
                 auth_authority: Some("existing-owned-attempt"),
                 selected_sources: None,
+                accepted_global_root: None,
                 selected_resource_roots: None,
                 native_source_flags: None,
                 rebind_enabled: None,
@@ -4050,6 +4058,174 @@ except Exception as error:
             stage.exists(),
             "pending replacement cannot retire the previous usable roots"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_provider_replacement_retains_accepted_global_root_without_current_xdg() {
+        use freshell_runtime_protocol::*;
+        for document in [false, true] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let workspace = owned.path().join("workspace");
+            let xdg = owned.path().join("accepted-xdg");
+            let global = xdg.join("opencode");
+            std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(global.join("plugins/probe")).unwrap();
+            std::fs::write(
+                global.join("plugins/probe/resource"),
+                "accepted-global-resource",
+            )
+            .unwrap();
+            if document {
+                std::fs::write(
+                    global.join("opencode.json"),
+                    r#"{"plugin":["./plugins/probe/index.mjs"]}"#,
+                )
+                .unwrap();
+            }
+            std::fs::write(
+                global.join("plugins/probe/index.mjs"),
+                "export default async()=>({});",
+            )
+            .unwrap();
+            let directory = owned.path().join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let store = CapabilityStore::default();
+            let soul = SoulId::new();
+            let client = freshell_runtime_client::RuntimeClient::new(
+                owned.path().join("unused.sock"),
+                "fixture-control",
+            );
+            let prepared =
+                crate::managed_provider_references::prepare_managed_opencode_with_publisher(
+                    crate::managed_provider_references::OpencodePreparation {
+                        client: &client,
+                        soul: &soul,
+                        creation_seed: "existing-fixture",
+                        home: &home,
+                        cwd: &workspace,
+                        workspace: &workspace,
+                        original: &|name| {
+                            (name == "XDG_CONFIG_HOME").then(|| xdg.to_str().unwrap().into())
+                        },
+                        references: vec![],
+                        auth_authority: Some("existing-owned-attempt"),
+                        selected_sources: None,
+                        accepted_global_root: None,
+                        selected_resource_roots: None,
+                        native_source_flags: None,
+                        rebind_enabled: None,
+                        inherited_inline: None,
+                        inline_edits: None,
+                    },
+                    |soul, home, context, input| {
+                        let capability = store.issue(
+                            soul.clone(),
+                            &directory,
+                            "http://host.docker.internal:4000".into(),
+                            Some(("opencode", home, &context.config)),
+                            OpencodeEphemeralInput {
+                                launch_context: Some(context),
+                                ..input
+                            },
+                            None,
+                        )?;
+                        read_prepared_context(&directory, &capability)
+                    },
+                )
+                .await
+                .unwrap();
+            let prior = prepared.context.mcp_capability.as_ref().unwrap();
+            let prior_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(prior_stage.join("plugins/probe/resource")).unwrap(),
+                "accepted-global-resource"
+            );
+            if document {
+                use sha2::Digest;
+                let manifest_path = prior_stage.join(".freshell/input-manifest.json");
+                let current = std::fs::read(&manifest_path).unwrap();
+                let mut legacy: serde_json::Value = serde_json::from_slice(&current).unwrap();
+                for source in legacy["sources"].as_array_mut().unwrap() {
+                    source.as_object_mut().unwrap().remove("discoveryRole");
+                }
+                let bytes = serde_json::to_vec(&legacy).unwrap();
+                std::fs::write(&manifest_path, &bytes).unwrap();
+                let mut legacy_context = prepared.context.clone();
+                legacy_context
+                    .prepared_inputs
+                    .as_mut()
+                    .unwrap()
+                    .manifest
+                    .sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+                let legacy_callback = serde_json::to_vec(&serde_json::json!({"controlSecret":"fixture-control", "action":"issue", "provider":"opencode", "soulId":soul,
+                    "priorContext":legacy_context, "providerSecretReferences":[], "workspace":workspace, "cwd":workspace, "authLookupAuthority":"existing-owned-attempt"})).unwrap();
+                let error = apply_prepared_callback(
+                    &legacy_callback,
+                    "fixture-control",
+                    &store,
+                    &directory,
+                    "http://host.docker.internal:4000",
+                    &home,
+                    &client,
+                )
+                .await
+                .err()
+                .unwrap_or_default();
+                assert!(error.contains("discovery role"), "missing role metadata is unknown evidence and must block before a replacement generation is prepared");
+                assert!(prior_stage.is_dir());
+                std::fs::write(&manifest_path, current).unwrap();
+            }
+            std::fs::write(
+                global.join("plugins/probe/resource"),
+                "refreshed-accepted-global-resource",
+            )
+            .unwrap();
+            let callback = serde_json::to_vec(&serde_json::json!({"controlSecret":"fixture-control", "action":"issue", "provider":"opencode", "soulId":soul,
+                "priorContext":prepared.context, "providerSecretReferences":[], "workspace":workspace, "cwd":workspace, "authLookupAuthority":"existing-owned-attempt"})).unwrap();
+            let ready: PreparedProviderContext = serde_json::from_slice(
+                &apply_prepared_callback(
+                    &callback,
+                    "fixture-control",
+                    &store,
+                    &directory,
+                    "http://host.docker.internal:4000",
+                    &home,
+                    &client,
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+            let next_stage = staged_provider_root_path(
+                &directory,
+                &ready
+                    .provider_launch_context
+                    .mcp_capability
+                    .as_ref()
+                    .unwrap()
+                    .grant_id,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(next_stage.join("plugins/probe/resource")).expect("reissue must refresh the accepted global resource graph independently of the current XDG env"), "refreshed-accepted-global-resource");
+            assert!(
+                prior_stage.is_dir(),
+                "replacement preparation cannot retire prior usable inputs"
+            );
+            if document {
+                let bind = &ready
+                    .provider_launch_context
+                    .prepared_inputs
+                    .as_ref()
+                    .unwrap()
+                    .config_binds[0];
+                assert_eq!(
+                    bind.logical_destination,
+                    "/home/freshell/provider/.config/opencode/opencode.json"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4415,6 +4591,7 @@ except Exception as error:
                 references: vec![],
                 auth_authority: Some("existing-owned-attempt"),
                 selected_sources: None,
+                accepted_global_root: None,
                 selected_resource_roots: None,
                 native_source_flags: None,
                 rebind_enabled: None,
@@ -4508,6 +4685,7 @@ except Exception as error:
                 references: vec![],
                 auth_authority: Some("fixture-owned-attempt"),
                 selected_sources: None,
+                accepted_global_root: None,
                 selected_resource_roots: None,
                 native_source_flags: None,
                 rebind_enabled: None,
@@ -4610,6 +4788,7 @@ except Exception as error:
                 references: vec![],
                 auth_authority: Some("fixture-owned-attempt"),
                 selected_sources: None,
+                accepted_global_root: None,
                 selected_resource_roots: None,
                 native_source_flags: None,
                 rebind_enabled: None,
@@ -4702,6 +4881,7 @@ except Exception as error:
                 references: vec![],
                 auth_authority: Some("fixture-owned-attempt"),
                 selected_sources: None,
+                accepted_global_root: None,
                 selected_resource_roots: None,
                 native_source_flags: None,
                 rebind_enabled: None,

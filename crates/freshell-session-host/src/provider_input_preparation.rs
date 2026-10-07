@@ -64,6 +64,7 @@ pub fn prepare(
     {
         return Err("prepared source metadata profile exceeded".into());
     }
+    manifest.require_known_discovery_roles().map_err(|_| "prepared native discovery role is unrecorded; retain inputs and reprepare before dispatch".to_string())?;
     if frozen.iter().any(|(name, _)| {
         !manifest
             .frozen_inputs
@@ -272,6 +273,7 @@ mod tests {
             version: 1,
             cwd: "/original-unavailable/project".into(),
             original_home: "/original-unavailable/home".into(),
+            global_config_root: None,
             sources: vec![SourceView {
                 discovery_role: DiscoveryRole::Workspace,
                 logical_path: "/original-unavailable/project/opencode.json".into(),
@@ -365,6 +367,26 @@ mod tests {
             Some("/original-unavailable/project/opencode.json"),
             "an explicitly selected native source must be delivered to the actual child environment");
         assert!(!generated.contains_key("INSERT"),"independent generated recipes do not forward an original ambient variable into the native child");
+        let current_bytes = serde_json::to_vec(&manifest).unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_slice(&current_bytes).unwrap();
+        legacy["sources"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("discoveryRole");
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
+        let error = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            error.contains("discovery role"),
+            "a role-less prepared source must block before the execution grant is consumed"
+        );
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &current_bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&current_bytes));
         // Original-form shared configurations have approved native source
         // identity but deliberately no replacement config bind.
         manifest.sources[0].original_form = true;

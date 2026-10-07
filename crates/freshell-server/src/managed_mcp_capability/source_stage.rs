@@ -22,6 +22,9 @@ pub(super) fn resource_units(
     use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
     let mut roots = BTreeMap::new();
     for root in accepted_roots.unwrap_or_default() {
+        if root.role == crate::managed_provider_references::sources::DiscoveryRole::Unknown {
+            return Err("selected resource discovery role is unrecorded".into());
+        }
         let canonical = std::fs::canonicalize(&root.logical_path)
             .map_err(|_| "selected OpenCode resource root is unavailable, dangling or cyclic")?;
         if !canonical.is_dir() {
@@ -125,6 +128,12 @@ pub(super) fn stage(
         version: 1,
         cwd: cwd.into(),
         original_home: home.into(),
+        global_config_root: Some(
+            input
+                .config_root
+                .unwrap_or(&home.join(".config/opencode"))
+                .to_path_buf(),
+        ),
         sources: Vec::new(),
         files: Vec::new(),
         frozen_inputs: input.frozen_inputs.unwrap_or(&[]).to_vec(),
@@ -139,6 +148,10 @@ pub(super) fn stage(
     let mut files = BTreeMap::new();
     let mut view_bytes = 0usize;
     for (ordinal, source) in plan.iter().enumerate() {
+        if source.source.role == crate::managed_provider_references::sources::DiscoveryRole::Unknown
+        {
+            return Err("selected configuration discovery role is unrecorded".into());
+        }
         if source.source.lane == SourceLane::Main {
             manifest.user_owns_freshell_mcp |=
                 freshell_platform::opencode_config::source_owns_freshell_mcp(

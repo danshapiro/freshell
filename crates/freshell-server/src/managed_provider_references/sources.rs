@@ -138,7 +138,7 @@ pub fn runtime_config_destination(
             .strip_prefix(home)
             .map(|relative| runtime_home.join(relative))
             .unwrap_or_else(|_| logical.into()),
-        DiscoveryRole::Workspace => logical.into(),
+        DiscoveryRole::Workspace | DiscoveryRole::Unknown => logical.into(),
     }
 }
 
