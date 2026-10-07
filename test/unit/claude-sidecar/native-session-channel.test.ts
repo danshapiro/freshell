@@ -58,6 +58,28 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
   }
 }
 describe('managed native startup channel', () => {
+  it('writes current terminal post-load evidence and preserves the selected ordinary status output', async () => withChannel(async (channel) => {
+    const home = await mkdtemp(join(tmpdir(), 'terminal-status-home-'))
+    const cwd = join(home, 'workspace')
+    await mkdir(join(home, '.claude'))
+    await mkdir(join(cwd, '.claude'), { recursive: true })
+    await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ statusLine: { type: 'command', command: 'printf user' } }))
+    await writeFile(join(cwd, '.claude', 'settings.local.json'), JSON.stringify({ statusLine: { type: 'command', command: "node -e 'let x=\"\";process.stdin.on(\"data\",c=>x+=c);process.stdin.on(\"end\",()=>process.stdout.write(JSON.parse(x).session_id))'" } }))
+    const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/native-session-channel.mjs'), '--status-line'], {
+      cwd, env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), ...channel.env }, stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let output = ''
+    child.stdout.on('data', (chunk) => { output += chunk })
+    const exited = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('close', resolve) })
+    const status = { session_id: root, transcript_path: '/owned/native.jsonl', version: '2.1.263',
+      model: { id: 'claude-haiku-4-5-20251001' }, workspace: { current_dir: cwd }, context_window: { context_window_size: 200000, current_usage: null } }
+    child.stdin.end(JSON.stringify(status))
+    try {
+      expect(await exited).toBe(0)
+      expect(output).toBe(root)
+      expect(JSON.parse(await readFile(join(channel.directory, 'statusline-loaded.json'), 'utf8'))).toEqual({ launch, native: status })
+    } finally { await rm(home, { recursive: true, force: true }) }
+  }))
   it('production sidecar emits the normalized native identity before any input and blocks early input', async () => {
     const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/index.mjs')], {
       env: { ...process.env, FRESHELL_SIDECAR_TEST_PREINIT_PERMISSION: '1', FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(launch), FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') }, stdio: ['pipe', 'pipe', 'pipe'],

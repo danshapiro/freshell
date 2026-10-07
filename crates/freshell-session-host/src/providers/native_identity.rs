@@ -83,6 +83,7 @@ pub fn read_claude_observation(
     gid: u32,
     launch: &NativeIdentityLaunch,
     expected_source: &str,
+    expected_cwd: &std::path::Path,
 ) -> Result<Option<NativeIdentityObservation>, String> {
     let value = read_signal_as_provider(path, uid, gid)?;
     let Some(value) = value else { return Ok(None) };
@@ -101,11 +102,43 @@ pub fn read_claude_observation(
     else {
         return Ok(None);
     };
+    let Some(loaded) =
+        read_signal_as_provider(&path.with_file_name("statusline-loaded.json"), uid, gid)?
+    else {
+        return Ok(None);
+    };
+    let loaded_launch: NativeIdentityLaunch = serde_json::from_value(loaded["launch"].clone())
+        .map_err(|_| "native post-load signal lacks a typed launch")?;
+    let status = &loaded["native"];
+    let cwd = expected_cwd.to_string_lossy();
+    if &loaded_launch != launch
+        || status["session_id"] != root
+        || status["transcript_path"] != native["transcript_path"]
+        || !status["transcript_path"]
+            .as_str()
+            .is_some_and(|path| std::path::Path::new(path).is_absolute())
+        || native["cwd"] != cwd.as_ref()
+        || status["workspace"]["current_dir"] != cwd.as_ref()
+        || status["version"] != "2.1.263"
+        || !status["model"]["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+        || !status["context_window"]["context_window_size"]
+            .as_u64()
+            .is_some_and(|size| size > 0)
+        || !status["context_window"]
+            .as_object()
+            .is_some_and(|context| context.contains_key("current_usage"))
+        || !(status["context_window"]["current_usage"].is_null()
+            || status["context_window"]["current_usage"].is_object())
+    {
+        return Ok(None);
+    }
     Ok(bind_provider_observation(
         launch,
         root,
         NativeIdentitySource::ClaudeNativeEvent,
-        &serde_json::json!({"nativeSessionId":root,"source":expected_source,"launch":actual}),
+        &serde_json::json!({"sessionStart":value,"loadedContext":loaded}),
     ))
 }
 

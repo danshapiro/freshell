@@ -56,6 +56,7 @@ pub struct HostedPty {
     native_identity_launch: Option<freshell_runtime_protocol::NativeIdentityLaunch>,
     provider_mode: String,
     native_signal: Option<(PathBuf, u32, u32, String)>,
+    native_cwd: PathBuf,
     opencode_adoption: Option<Arc<Mutex<OpenCodeAdoptionGate>>>,
     codex: Option<CodexLifecycle>,
 }
@@ -139,9 +140,17 @@ impl HostedPty {
         let mut provider_args = crate::provider_identity_args(launch.run_as_uid, launch.run_as_gid);
         provider_args.push(launch.program.clone());
         let mut native_args = launch.args.clone();
+        let mut statusline_settings = None;
         if launch.mode == "claude" && native_identity_launch.is_some() {
             for index in 0..native_args.len().saturating_sub(1) {
                 if native_args[index] == "--settings" {
+                    if let Ok(settings) =
+                        serde_json::from_str::<serde_json::Value>(&native_args[index + 1])
+                    {
+                        if let Some(selected) = settings.get("statusLine") {
+                            statusline_settings = Some(selected.to_string());
+                        }
+                    }
                     native_args[index + 1] =
                         freshell_platform::cli_launch::claude_managed_settings_json();
                 }
@@ -158,6 +167,9 @@ impl HostedPty {
         };
         let mut provider_env = launch.env.clone();
         provider_env.extend(child_secret_env);
+        if let Some(settings) = statusline_settings {
+            provider_env.insert("FRESHELL_NATIVE_STATUSLINE_SETTINGS".into(), settings);
+        }
         // The PTY replaces inherited environment. setpriv must retain the
         // runtime image's command search path, including installed CLIs in
         // /usr/local/bin, while preserving an explicit launch PATH.
@@ -302,6 +314,7 @@ impl HostedPty {
             native_identity_launch,
             provider_mode: launch.mode.clone(),
             native_signal,
+            native_cwd: PathBuf::from(&launch.cwd),
             opencode_adoption,
             codex,
         })
@@ -450,7 +463,12 @@ impl HostedPty {
                 )
             } else {
                 crate::providers::native_identity::read_claude_observation(
-                    path, *uid, *gid, launch, source,
+                    path,
+                    *uid,
+                    *gid,
+                    launch,
+                    source,
+                    &self.native_cwd,
                 )
             };
             return match result {
