@@ -79,6 +79,39 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(records.get('claude-create-signal-native-private.json')).toEqual({ processes: [{ pid: 7, signals: [] }] })
     } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it('refreshes the current host observation before reading terminal inventory', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-observation-refresh-'))
+    const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
+    let request: any
+    let refreshed = false
+    let now = 0
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now += 25_000)
+    const view = () => ({ soulId: request.params.soulId, containerId: 'owned-container', incarnationId: 'owned-incarnation',
+      recoveryState: 'live', nativeSessionId: request.params.nativeSessionId,
+      nativeIdentityObservation: refreshed ? { nativeSessionId: request.params.nativeSessionId,
+        incarnationId: 'owned-incarnation', source: 'claude_native_event' } : undefined })
+    const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '',
+      inventoryBody: () => ({ method: 'inventory' }), terminalReadOutputBody: () => ({ method: 'terminal_read_output' }),
+      probeRecoveryBody: () => ({ method: 'probe_recovery' }),
+      adminOk: async (_supervisor: unknown, body: any) => {
+        if (body.method === 'launch') { request = body; return { data: { view: view() } } }
+        if (body.method === 'probe_recovery') { refreshed = true; return { data: { kind: 'unknown' } } }
+        return { data: body.method === 'inventory' ? [view()] : {} }
+      },
+      execOwnedContainerAsExact: async (_container: string, _uid: string, args: string[]) => JSON.stringify(args.at(-1) === 'terminal'
+        ? { uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200,
+          tlsVerifyMode: 2, tlsCheckHostname: true, version: '2.1.263', executableSha256: 'f'.repeat(64), profileFiles: [],
+          hook: { launch: {} }, loaded: { launch: {}, native: { version: '2.1.263', session_id: request.params.nativeSessionId,
+            model: { id: 'claude-haiku-4-5-20251001' }, workspace: { current_dir: request.params.terminal.cwd } } } }
+        : { processes: [] }),
+    } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
+    try {
+      const original = await executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, 'create')
+      expect(refreshed).toBe(true)
+      expect(original.assertions.every((assertion) => assertion.pass)).toBe(true)
+    } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['death', 'published', 'cached', 'redispatch'])('protects the native post-effect observation boundary (%s)', async (fault) => {
     const publishedOutcome = fault === 'published'
     const recover = fault === 'cached' || fault === 'redispatch'

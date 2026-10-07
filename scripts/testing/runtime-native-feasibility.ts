@@ -454,6 +454,9 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   const deadline = Date.now() + 50_000
   while (!view.nativeIdentityObservation && Date.now() < deadline) {
     harness.writeArtifact(`${scenario}-terminal-output-private.json`, await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId)))
+    // Refresh asynchronous PTY evidence through the existing host snapshot
+    // probe before reading the registry's stored observation.
+    harness.writeArtifact(`${scenario}-store-probe.json`, await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId)))
     const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
     harness.writeArtifact(`${scenario}-inventory.json`, inventory)
     view = inventory.data.find((row: any) => row.soulId === soulId)
