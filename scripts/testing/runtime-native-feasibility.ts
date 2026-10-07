@@ -192,7 +192,7 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     sourceFiles: { name: string; path: string; sha256: string }[]
   }
   const harness = new RuntimeHarness(process.cwd(), undefined, 1)
-  if (selection.provider === 'claude' && selection.case === 'startup'
+  if (selection.provider === 'claude'
     && !manifest.sourceFiles.some((file) => file.name === 'claude/profile/native-startup-user.json')) {
     // Newly owned native UI preferences remove onboarding interaction only.
     // Permission/model policy stays in its ordinary native settings sources.

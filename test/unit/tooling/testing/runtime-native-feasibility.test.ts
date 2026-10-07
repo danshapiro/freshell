@@ -371,12 +371,12 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       fs.rmSync(directory, { recursive: true, force: true })
     }
   })
-  it('does not start a paid terminal seed after the actual create prerequisite fails', async () => {
+  it.each(['startup', 'native-turn'] as const)('executes terminal %s profile preparation and paid prerequisite ordering', async (caseId) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-create-hold-'))
     const manifest = path.join(directory, 'artifacts.json')
     const preferences = path.join(directory, 'preferences.json'); fs.writeFileSync(preferences, '{}')
     const previous = process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
-    const files = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json']
+    const files = (caseId === 'startup' ? ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'] : ['grants/env_file', 'grants/ca_file'])
       .map((name) => ({ name: 'claude/' + name, path: preferences, sha256: 'e'.repeat(64) }))
     fs.writeFileSync(manifest, JSON.stringify({ candidateSha, imageDigest, artifacts: {
       supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
@@ -384,9 +384,15 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     }, sourceFiles: files }))
     process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = manifest
     let scratch: string | undefined
-    const prepare = vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function () {
+    let generatedProfileRoot: string | undefined
+    const prepare = vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function (input) {
       scratch = this.testRoot; fs.mkdirSync(scratch, { recursive: true, mode: 0o700 })
-      return { supervisorPath: '/fixture/supervisor', hostPath: '/fixture/host', serverPath: '/fixture/server', files }
+      const profile = input.sourceFiles.find((file) => file.name === 'claude/profile/native-startup-user.json')
+      if (profile && profile.path !== preferences) {
+        fs.readFileSync(profile.path)
+        generatedProfileRoot = path.dirname(profile.path)
+      }
+      return { supervisorPath: '/fixture/supervisor', hostPath: '/fixture/host', serverPath: '/fixture/server', files: input.sourceFiles }
     })
     const start = vi.spyOn(RuntimeHarness.prototype, 'startSupervisor').mockResolvedValue({} as never)
     const write = vi.spyOn(RuntimeHarness.prototype, 'writeArtifact').mockReturnValue('fixture-artifact')
@@ -397,9 +403,14 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     const stop = vi.spyOn(RustServer.prototype, 'stop').mockResolvedValue()
     const cleanup = vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
     try {
-      await expect(runNativeFeasibility(['--provider', 'claude', '--case', 'startup'])).rejects.toThrow('native experiment cases failed')
-      expect(admin).toHaveBeenCalledOnce()
-      expect(server).not.toHaveBeenCalled()
+      await expect(runNativeFeasibility(['--provider', 'claude', '--case', caseId])).rejects.toThrow('native experiment cases failed')
+      if (caseId === 'startup') {
+        expect(admin).toHaveBeenCalledOnce()
+        expect(server).not.toHaveBeenCalled()
+      } else {
+        expect(server).toHaveBeenCalledOnce()
+        expect(admin).not.toHaveBeenCalled()
+      }
       expect(cleanup).toHaveBeenCalledOnce()
     } finally {
       prepare.mockRestore(); start.mockRestore(); write.mockRestore(); admin.mockRestore(); raw.mockRestore()
@@ -408,6 +419,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = previous
       fs.rmSync(directory, { recursive: true, force: true })
       if (scratch) fs.rmSync(scratch, { recursive: true, force: true })
+      if (generatedProfileRoot) fs.rmSync(generatedProfileRoot, { recursive: true, force: true })
     }
   })
   it('prepares only exact private native artifacts and selected source copies without ambient mounts', async () => {
