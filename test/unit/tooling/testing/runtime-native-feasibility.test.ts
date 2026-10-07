@@ -6,7 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, nativeCheckpointTranscriptRetained,
+  runNativeFeasibility, nativeCheckpointTranscriptRetained, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -271,5 +271,32 @@ describe('original native checkpoint byte continuity (fixtures do not qualify pr
       if (fault === 'wrong-root') after.nativeRoot = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
       if (fault === 'missing-identity') { before.transcript.identity = []; after.transcript.identity = [] }
       expect(nativeCheckpointTranscriptRetained(before, after, toolUseID)).toBe(false)
+    })
+})
+
+describe('selected native Amplifier profile continuity (fixture metadata only)', () => {
+  const workspace = '/owned/native-workspace'
+  const files = (settings = 'a'.repeat(64), keys = 'b'.repeat(64)) => [
+    { relative: '.amplifier/settings.yaml', sha256: settings },
+    { relative: '.amplifier/bundles/default.yaml', sha256: 'c'.repeat(64) },
+    { relative: '.amplifier/keys.env', sha256: keys },
+  ]
+  const before = () => ({ nativeCwd: workspace, nativeSettingsSha256: 'd'.repeat(64), profileFiles: files() })
+  it('uses the full native resolved settings while preserving bundle and workspace when saved secret aliases normalize', () => {
+    const old = before()
+    const current = { ...before(), profileFiles: files('e'.repeat(64), 'f'.repeat(64)) }
+    expect(amplifierNativeProfileRetained(old, current, workspace)).toBe(true)
+  })
+  it.each(['resolved-settings', 'bundle', 'workspace', 'missing-native-profile', 'missing-file', 'duplicate-file', 'invalid-digest'])(
+    'refuses changed %s rather than treating raw-byte differences alone as harmless', (fault) => {
+      const old = before(); const current = before()
+      if (fault === 'resolved-settings') current.nativeSettingsSha256 = 'e'.repeat(64)
+      if (fault === 'bundle') current.profileFiles[1]!.sha256 = 'e'.repeat(64)
+      if (fault === 'workspace') current.nativeCwd = '/different/owned/workspace'
+      if (fault === 'missing-native-profile') current.nativeSettingsSha256 = ''
+      if (fault === 'missing-file') current.profileFiles.pop()
+      if (fault === 'duplicate-file') current.profileFiles[2] = { ...current.profileFiles[0]! }
+      if (fault === 'invalid-digest') current.nativeSettingsSha256 = 'unqualified'
+      expect(amplifierNativeProfileRetained(old, current, workspace)).toBe(false)
     })
 })

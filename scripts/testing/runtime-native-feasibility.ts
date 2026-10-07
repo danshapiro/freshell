@@ -97,6 +97,20 @@ export function nativeCheckpointTranscriptRetained(before: NativeCheckpointSnaps
   } catch { return false }
 }
 
+type AmplifierProfileSnapshot = { nativeCwd: string; nativeSettingsSha256: string;
+  profileFiles: { relative: string; sha256: string | null; bytesBase64?: string | null }[] }
+export function amplifierNativeProfileRetained(before: AmplifierProfileSnapshot,
+  after: AmplifierProfileSnapshot, workspace: string): boolean {
+  const names = ['.amplifier/settings.yaml', '.amplifier/bundles/default.yaml', '.amplifier/keys.env']
+  const valid = (snapshot: AmplifierProfileSnapshot) => snapshot.nativeCwd === workspace
+    && /^[a-f0-9]{64}$/.test(snapshot.nativeSettingsSha256)
+    && snapshot.profileFiles.length === names.length && names.every((relative) =>
+      snapshot.profileFiles.filter((file) => file.relative === relative && /^[a-f0-9]{64}$/.test(file.sha256 ?? '')).length === 1)
+  if (!valid(before) || !valid(after) || before.nativeSettingsSha256 !== after.nativeSettingsSha256) return false
+  const bundle = (snapshot: AmplifierProfileSnapshot) => snapshot.profileFiles.find((file) => file.relative === names[1])!.sha256
+  return bundle(before) === bundle(after)
+}
+
 /** Finite process dispatcher only; fixture children never establish native qualification. */
 export async function dispatchNativeFeasibility(input: {
   selection: NativeSelection
@@ -520,7 +534,7 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
       { name: 'replacement-new-incarnation-same-native-root', pass: replacement.incarnationId !== view.incarnationId && replacement.nativeSessionId === nativeRoot },
       { name: 'original-owned-volume-transcript-continuity', pass: seed.transcript.sha256 === restored.transcript.sha256
         && seed.transcript.identity[0] === restored.transcript.identity[0] && seed.transcript.identity[1] === restored.transcript.identity[1] },
-      { name: 'same-workspace-selected-native-profile', pass: JSON.stringify(seed.profileFiles) === JSON.stringify(restored.profileFiles)
+      { name: 'same-workspace-selected-native-profile', pass: amplifierNativeProfileRetained(seed, restored, workspace)
         && recalled.metadata.model === 'glm-5.3' },
       { name: 'actual-restored-context-private-marker-recall', pass: recalled.lastAssistantText.trim() === marker },
       { name: 'native-turns-requested-no-tools', pass: seed.toolEvents === 0 && recalled.toolEvents === 0 })
@@ -669,11 +683,22 @@ if check_tls:
  with opener.open(request,timeout=20) as response:status=response.status;response.read()
 profile=[]
 for relative in ['.amplifier/settings.yaml','.amplifier/bundles/default.yaml','.amplifier/keys.env']:
- source=pathlib.Path(env['HOME'])/relative;profile.append({'relative':relative,'sha256':hashlib.sha256(source.read_bytes()).hexdigest() if source.exists() else None})
+ source=pathlib.Path(env['HOME'])/relative;body=source.read_bytes() if source.exists() else None;profile.append({'relative':relative,'sha256':hashlib.sha256(body).hexdigest() if body is not None else None,'bytesBase64':base64.b64encode(body).decode() if body is not None else None})
+native_cwd=os.readlink(p/'cwd');os.environ.clear();os.environ.update(env);os.chdir(native_cwd)
+from amplifier_app_cli.key_manager import KeyManager
+from amplifier_app_cli.lib.settings import AppSettings
+from amplifier_app_cli.runtime.config import expand_env_vars
+import yaml
+KeyManager();settings=AppSettings();settings_files=[]
+for source in [settings.paths.global_settings,settings.paths.project_settings,settings.paths.local_settings]:
+ body=source.read_bytes() if source.exists() else None
+ if body is not None:assert isinstance(yaml.safe_load(body) or {},dict)
+ settings_files.append({'path':str(source),'bytesBase64':base64.b64encode(body).decode() if body is not None else None})
+native_settings_sha=hashlib.sha256(json.dumps(expand_env_vars(settings.get_merged_settings()),sort_keys=True,separators=(',',':')).encode()).hexdigest()
 assistants=[m for m in messages if m.get('role')=='assistant']
 def text(m):
  c=m.get('content');return c if isinstance(c,str) else ''.join(p.get('text','') for p in (c or []) if isinstance(p,dict) and p.get('type')=='text')
-print(json.dumps({'nativeRoot':root,'nativePid':int(p.name),'transcript':{'identity':identity(after),'sha256':hashlib.sha256(raw).hexdigest(),'completeEof':not raw or raw.endswith(b'\n'),'bytesBase64':base64.b64encode(raw).decode()},'eventsBytesBase64':base64.b64encode(event_raw).decode(),'metadata':meta,'completedTurns':sum(e.get('event')=='cleanup:store_end' for e in events),'toolEvents':sum(str(e.get('event','')).startswith('tool:') for e in events),'responses':[e.get('data') for e in events if e.get('event')=='llm:response'],'lastAssistantText':text(assistants[-1]) if assistants else '', 'profileFiles':profile,'httpsStatus':status,'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname}))
+print(json.dumps({'nativeRoot':root,'nativePid':int(p.name),'transcript':{'identity':identity(after),'sha256':hashlib.sha256(raw).hexdigest(),'completeEof':not raw or raw.endswith(b'\n'),'bytesBase64':base64.b64encode(raw).decode()},'eventsBytesBase64':base64.b64encode(event_raw).decode(),'metadata':meta,'completedTurns':sum(e.get('event')=='cleanup:store_end' for e in events),'toolEvents':sum(str(e.get('event','')).startswith('tool:') for e in events),'responses':[e.get('data') for e in events if e.get('event')=='llm:response'],'lastAssistantText':text(assistants[-1]) if assistants else '', 'profileFiles':profile,'nativeCwd':native_cwd,'nativeSettingsSha256':native_settings_sha,'nativeSettingsFiles':settings_files,'httpsStatus':status,'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname}))
 `
 
 // Reads the currently owned native child and its exact hook-selected transcript.
