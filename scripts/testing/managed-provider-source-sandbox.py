@@ -75,7 +75,7 @@ def main():
                 value = json.loads(line.split(marker, 1)[1])
                 cases.append({"provider": value["provider"], "case": value["case"], "digest": value["digest"]})
         receipt["consumedCases"] = cases
-        if result.returncode == 0 and (len(cases) != {"amplifier":18,"codex":4,"claude":1}[args.provider] or "test result: ok. 1 passed;" not in result.stdout):
+        if result.returncode == 0 and (len(cases) != {"amplifier":18,"codex":5,"claude":1}[args.provider] or "test result: ok. 1 passed;" not in result.stdout):
             receipt["exitCode"] = 2
             receipt["failureClass"] = "native_consumer_count_mismatch"
         # Only the Rust fixture's classified assertion/digest receipt is emitted.

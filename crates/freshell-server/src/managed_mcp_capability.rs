@@ -4472,7 +4472,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         std::fs::create_dir_all(original.join(".codex/agents/nested")).unwrap();
         std::fs::create_dir_all(workspace.join(".codex/skills/probe/scripts")).unwrap();
         std::fs::create_dir(workspace.join(".git")).unwrap();
-        let config = format!("model_instructions_file = 'user.md'\n[[skills.config]]\npath = 'absent-skill'\nenabled = false\n[projects.{}]\ntrust_level = 'trusted'\n[agents.reader]\nconfig_file = 'agents/nested/reader.toml'\n",serde_json::to_string(workspace.to_str().unwrap()).unwrap());
+        let config = format!("model_instructions_file = 'user.md'\n[[skills.config]]\npath = 'absent-skill'\nenabled = false\n[projects.{}]\ntrust_level = 'trusted'\n[agents.reader]\nconfig_file = 'agents/nested/reader.toml'\n[features]\nplugins=true\n[plugins.\"probe@fixture\"]\n",serde_json::to_string(workspace.to_str().unwrap()).unwrap());
         std::fs::write(original.join(".codex/config.toml"), &config).unwrap();
         std::fs::write(original.join(".codex/user.md"), "user-instructions-nonce").unwrap();
         std::fs::write(
@@ -4509,6 +4509,29 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let plugin = original.join(".codex/plugins/cache/fixture/probe/1.0.0");
+        std::fs::create_dir_all(plugin.join(".codex-plugin")).unwrap();
+        std::fs::create_dir_all(plugin.join("skills/probe/scripts/node_modules/probe-dependency"))
+            .unwrap();
+        std::fs::write(
+            plugin.join(".codex-plugin/plugin.json"),
+            r#"{"name":"probe","version":"1.0.0","skills":"./skills"}"#,
+        )
+        .unwrap();
+        std::fs::write(plugin.join("skills/probe/SKILL.md"), "---\nname: installed-probe\ndescription: Synthetic installed plugin dependency consumer\n---\nRun scripts/run.\n").unwrap();
+        std::fs::write(
+            plugin.join("skills/probe/resource"),
+            "installed-resource-nonce",
+        )
+        .unwrap();
+        std::fs::write(
+            plugin.join("skills/probe/scripts/node_modules/probe-dependency/index.js"),
+            "module.exports='installed-dependency-nonce'",
+        )
+        .unwrap();
+        let plugin_script = plugin.join("skills/probe/scripts/run");
+        std::fs::write(&plugin_script, "#!/usr/bin/env node\nprocess.stdout.write(require('node:fs').readFileSync(__dirname+'/../resource')+'|'+require('probe-dependency'))\n").unwrap();
+        std::fs::set_permissions(&plugin_script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mcp = crate::managed_provider_bootstrap::managed_codex_mcp_args().unwrap();
         let context = ProviderLaunchContext {
             config: vec![],
@@ -4680,8 +4703,57 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             found,
             "native Codex must discover the transported project skill"
         );
+        let installed = skills["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|data| data["skills"].as_array().unwrap())
+            .find(|skill| skill["name"] == "probe:installed-probe")
+            .expect("native Codex must discover an installed plugin with default enabled=true");
+        let installed_path = Path::new(installed["path"].as_str().unwrap());
+        // The native catalog is complete. Join it before the independent
+        // executable consumer, as for the existing project resource below.
         child.kill().await.unwrap();
         child.wait().await.unwrap();
+        let pids_before = std::fs::read_to_string("/sys/fs/cgroup/pids.current")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok());
+        let installed_resource =
+            std::process::Command::new(installed_path.parent().unwrap().join("scripts/run"))
+                .output()
+                .unwrap();
+        if !installed_resource.status.success() {
+            use std::os::unix::process::ExitStatusExt;
+            let stderr = String::from_utf8_lossy(&installed_resource.stderr);
+            let classes = [
+                "MODULE_NOT_FOUND",
+                "ENOENT",
+                "EACCES",
+                "Permission denied",
+                "node: not found",
+                "No such file",
+                "SyntaxError",
+                "pthread_create",
+                "uv_thread_create",
+                "Resource temporarily unavailable",
+            ]
+            .into_iter()
+            .filter(|class| stderr.contains(class))
+            .collect::<Vec<_>>();
+            println!(
+                "provider_source_diagnostic {}",
+                serde_json::json!({
+                    "provider":"codex", "operation":"installed_plugin_helper", "exitCode":installed_resource.status.code(), "signal":installed_resource.status.signal(), "pidsBefore":pids_before,
+                    "stderrBytes":installed_resource.stderr.len(),
+                    "classes":classes
+                })
+            );
+        }
+        assert!(installed_resource.status.success());
+        assert_eq!(
+            installed_resource.stdout,
+            b"installed-resource-nonce|installed-dependency-nonce"
+        );
         let resource =
             std::process::Command::new(workspace.join(".codex/skills/probe/scripts/run"))
                 .output()
@@ -4702,6 +4774,10 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             (
                 "native-retained-mcp-args",
                 b"node:/opt/freshell-mcp/server.js".as_slice(),
+            ),
+            (
+                "native-installed-plugin-dependency",
+                installed_resource.stdout.as_slice(),
             ),
         ] {
             println!(

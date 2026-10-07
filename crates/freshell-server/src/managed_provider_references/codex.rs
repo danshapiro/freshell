@@ -519,8 +519,13 @@ pub fn discover(
     // not change the selection. Copy complete installed package/data units.
     if let Some(plugins) = preceding.get("plugins").and_then(toml::Value::as_table) {
         for (identity, value) in plugins {
-            if value.get("enabled").and_then(toml::Value::as_bool) != Some(true) {
-                continue;
+            let value = value
+                .as_table()
+                .ok_or("Codex installed plugin configuration must be a table")?;
+            match value.get("enabled") {
+                None | Some(toml::Value::Boolean(true)) => {}
+                Some(toml::Value::Boolean(false)) => continue,
+                _ => return Err("Codex installed plugin enabled field must be a boolean"),
             }
             let (plugin, market) = identity
                 .split_once('@')
@@ -653,6 +658,139 @@ mod tests {
             enabled,
             kind: LayerKind::User,
         }
+    }
+
+    #[test]
+    fn managed_provider_codex_omitted_plugin_enabled_retains_executable_dependencies() {
+        use freshell_platform::{
+            codex_inputs::CodexInputManifest,
+            provider_environment::{copy_environment, CopyLimits, CopySelection},
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let cache = home.join(".codex/plugins/cache/fixture/probe");
+        let plugin = cache.join("1.0.0");
+        std::fs::create_dir_all(plugin.join("scripts/node_modules/probe-dependency")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(plugin.join("scripts/resource"), "selected-plugin-resource").unwrap();
+        std::fs::write(
+            plugin.join("scripts/node_modules/probe-dependency/index.js"),
+            "module.exports='installed-plugin-dependency'",
+        )
+        .unwrap();
+        std::fs::write(plugin.join("scripts/probe.cjs"), "process.stdout.write(require('node:fs').readFileSync(__dirname+'/resource')+'|'+require('probe-dependency'))").unwrap();
+        for (index, flag) in ["", "enabled=true\n"].into_iter().enumerate() {
+            std::fs::write(
+                home.join(".codex/config.toml"),
+                format!("[plugins.\"probe@fixture\"]\n{flag}"),
+            )
+            .unwrap();
+            let found = discover(CodexInputManifest {
+                version: 1,
+                original_home: home.clone(),
+                cwd: cwd.clone(),
+                codex_home: home.join(".codex"),
+                named_profile: None,
+            })
+            .unwrap();
+            let root = found.resource_roots.iter().find(|root| root.starts_with(&cache))
+                .expect("omitted enabled uses native true default and must retain selected installation");
+            let stage = owned.path().join(format!("stage-{index}"));
+            copy_environment(
+                &[CopySelection {
+                    source: root.clone(),
+                    destination_relative: "plugin".into(),
+                }],
+                &stage,
+                &[],
+                CopyLimits::default(),
+            )
+            .unwrap();
+            let output = std::process::Command::new("node")
+                .arg(
+                    stage
+                        .join("plugin")
+                        .join(plugin.strip_prefix(root).unwrap())
+                        .join("scripts/probe.cjs"),
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout,
+                b"selected-plugin-resource|installed-plugin-dependency"
+            );
+        }
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"missing@fixture\"]\nenabled=false\n",
+        )
+        .unwrap();
+        let disabled = discover(CodexInputManifest {
+            version: 1,
+            original_home: home.clone(),
+            cwd,
+            codex_home: home.join(".codex"),
+            named_profile: None,
+        })
+        .unwrap();
+        assert!(!disabled
+            .resource_roots
+            .iter()
+            .any(|root| root.starts_with(home.join(".codex/plugins"))));
+    }
+
+    #[test]
+    fn managed_provider_codex_invalid_plugin_enabled_is_an_actionable_selection_error() {
+        use freshell_platform::codex_inputs::CodexInputManifest;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex/plugins/cache/fixture/probe/1.0.0")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"probe@fixture\"]\nenabled='PRIVATE_INVALID_FIELD'\n",
+        )
+        .unwrap();
+        let error = discover(CodexInputManifest {
+            version: 1,
+            original_home: home.clone(),
+            cwd,
+            codex_home: home.join(".codex"),
+            named_profile: None,
+        })
+        .err()
+        .expect("unsupported native plugin enabled type must block before capability publication");
+        assert!(error.contains("enabled"));
+        assert!(!error.contains("PRIVATE_INVALID_FIELD"));
+    }
+
+    #[test]
+    fn managed_provider_codex_invalid_plugin_table_cannot_become_default_enabled() {
+        use freshell_platform::codex_inputs::CodexInputManifest;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex/plugins/cache/fixture/probe/1.0.0")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "plugins={\"probe@fixture\"='PRIVATE_NOT_TABLE'}\n",
+        )
+        .unwrap();
+        let error = discover(CodexInputManifest {
+            version: 1,
+            original_home: home.clone(),
+            cwd,
+            codex_home: home.join(".codex"),
+            named_profile: None,
+        })
+        .err()
+        .expect("an unsupported scalar plugin must never acquire omitted-enabled authority");
+        assert!(error.contains("configuration"));
+        assert!(!error.contains("PRIVATE_NOT_TABLE"));
     }
     #[test]
     fn managed_provider_codex_skill_path_selectors_do_not_create_resource_authority() {
