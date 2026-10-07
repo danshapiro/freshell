@@ -783,6 +783,15 @@ async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prep
         .status()
         .unwrap()
         .success());
+    let disabled_project_memory = workspace.join("CLAUDE.md");
+    let disabled_project_settings = workspace.join(".claude/settings.json");
+    std::fs::create_dir_all(workspace.join(".claude")).unwrap();
+    std::fs::write(&disabled_project_memory, "@missing-disabled-project.md\n").unwrap();
+    std::fs::write(
+        &disabled_project_settings,
+        r#"{"env":{"CLAUDE_SELECTED_NONCE":"disabled-project-decoy"}}"#,
+    )
+    .unwrap();
     let receipt = workspace.join("claude-consumed.json");
     let instructions_receipt = workspace.join("claude-import-consumed.json");
     let memory = format!(
@@ -853,7 +862,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
  const input=JSON.parse(raw),name=path.basename(input.file_path||''),event=input.hook_event_name==='InstructionsLoaded';
  const names=['imported-memory.md','relative-memory.md','home-memory.md','absolute-memory.md','spaced memory.md','nested-memory.md'];
  const selected=event&&names.includes(name)?{name,digest:crypto.createHash('sha256').update(fs.readFileSync(input.file_path)).digest('hex')}:null;
- fs.appendFileSync(process.argv[2]+'.events',JSON.stringify({event,global:input.file_path===process.env.HOME+'/.claude/CLAUDE.md',ignored:event&&name.startsWith('ignored-'),selected})+'\n');
+ fs.appendFileSync(process.argv[2]+'.events',JSON.stringify({event,global:input.file_path===process.env.HOME+'/.claude/CLAUDE.md',project:input.file_path===process.argv[3],ignored:event&&name.startsWith('ignored-'),selected})+'\n');
  if(event&&input.file_path===process.env.HOME+'/imported-memory.md')fs.writeFileSync(process.argv[2],JSON.stringify({nativeImport:true,digest:selected.digest}));
 });
 "#;
@@ -871,7 +880,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     let key_digest = format!("{:x}", Sha256::digest(b"synthetic-claude-onecli-value"));
     let hooks = json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":format!("node \"${{CLAUDE_PLUGIN_ROOT}}/scripts/consume.cjs\" {} {}",serde_json::to_string(receipt.to_str().unwrap()).unwrap(),key_digest),"timeout":10}]}]}});
     let mut hooks = hooks;
-    hooks["hooks"]["InstructionsLoaded"] = json!([{"hooks":[{"type":"command","command":format!("node \"${{CLAUDE_PLUGIN_ROOT}}/scripts/instructions.cjs\" {}",serde_json::to_string(instructions_receipt.to_str().unwrap()).unwrap()),"timeout":10}]}]);
+    hooks["hooks"]["InstructionsLoaded"] = json!([{"hooks":[{"type":"command","command":format!("node \"${{CLAUDE_PLUGIN_ROOT}}/scripts/instructions.cjs\" {} {}",serde_json::to_string(instructions_receipt.to_str().unwrap()).unwrap(),serde_json::to_string(disabled_project_memory.to_str().unwrap()).unwrap()),"timeout":10}]}]);
     std::fs::write(
         plugin.join("hooks/hooks.json"),
         serde_json::to_vec(&hooks).unwrap(),
@@ -991,6 +1000,8 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
                 program: "claude".into(),
                 args: vec![
                     "--init-only".into(),
+                    "--setting-sources".into(),
+                    "user".into(),
                     "--plugin-dir".into(),
                     plugin.to_str().unwrap().into(),
                 ],
@@ -1086,7 +1097,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         );
     }
     let qualified_digest = hash(
-        serde_json::to_vec(&json!({"startup":expected,"nativeImports":expected_imports}))
+        serde_json::to_vec(&json!({"startup":expected,"nativeImports":expected_imports,"terminalSettingSources":"user","disabledProjectConsumed":false,"freshSettingSources":"user,project,local"}))
             .unwrap()
             .as_slice(),
     );
@@ -1168,6 +1179,20 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     assert!(instruction_events(&instructions_events)
         .iter()
         .all(|event| event["ignored"] != json!(true)));
+    assert!(
+        instruction_events(&instructions_events)
+            .iter()
+            .all(|event| event["project"] != json!(true)),
+        "the real native terminal must leave project memory unselected"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&disabled_project_memory).unwrap(),
+        "@missing-disabled-project.md\n"
+    );
+    // Fresh SDK exposes the existing all-source default. Remove only these
+    // terminal-specific owned decoys before its independent launch.
+    std::fs::remove_file(&disabled_project_memory).unwrap();
+    std::fs::remove_file(&disabled_project_settings).unwrap();
     std::fs::remove_file(&receipt).unwrap();
     std::fs::remove_file(&instructions_receipt).unwrap();
     std::fs::remove_file(&instructions_events).unwrap();
