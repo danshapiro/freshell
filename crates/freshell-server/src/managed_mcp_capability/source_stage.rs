@@ -146,7 +146,7 @@ pub(super) fn stage(
     private_directory(&root.join(".freshell/source-views"))?;
     private_directory(&root.join(".freshell/templates"))?;
     let mut files = BTreeMap::new();
-    let mut view_bytes = 0usize;
+    let mut view_budget = crate::managed_provider_references::sources::SourceViewBudget::default();
     for (ordinal, source) in plan.iter().enumerate() {
         if source.source.role == crate::managed_provider_references::sources::DiscoveryRole::Unknown
         {
@@ -161,15 +161,13 @@ pub(super) fn stage(
                 )
                 .map_err(|error| error.to_string())?;
         }
-        view_bytes = view_bytes
-            .checked_add(source.references.unexpanded_source().len())
-            .and_then(|value| value.checked_add(source.references.template.len()))
-            .ok_or("source view size overflow")?;
-        if source.references.unexpanded_source().len() > 16 * 1024 * 1024
-            || source.references.template.len() > 16 * 1024 * 1024
-            || view_bytes > 64 * 1024 * 1024
-            || ordinal >= 8192
-        {
+        view_budget
+            .charge(source.references.unexpanded_source())
+            .map_err(str::to_string)?;
+        view_budget
+            .charge(&source.references.template)
+            .map_err(str::to_string)?;
+        if ordinal >= 8192 {
             return Err("source view profile exceeded before stage publication".into());
         }
         let raw = format!(".freshell/source-views/source-{ordinal}");
@@ -283,7 +281,8 @@ pub(super) fn describe(
     for (ordinal, occurrence) in plan.iter().enumerate() {
         if occurrence.source.lane != SourceLane::Inline
             && (!occurrence.original_form
-                || occurrence.references.template != occurrence.references.unexpanded_source())
+                || occurrence.references.template.as_str()
+                    != occurrence.references.unexpanded_source())
         {
             let logical = &occurrence.source.logical_path;
             let destination = freshell_platform::opencode_config::lexical_path(
@@ -334,7 +333,7 @@ pub(super) fn describe(
             };
             let relative = format!(".freshell/templates/source-{ordinal}");
             let prior = bind_sources.get(&effective);
-            if prior.is_some_and(|template| *template != occurrence.references.template) {
+            if prior.is_some_and(|template| *template != occurrence.references.template.as_str()) {
                 return Err("shared effective config target has incompatible templates; retain prior inputs and reprepare".into());
             }
             if prior.is_none() {

@@ -307,6 +307,43 @@ pub struct PlannedSourceOccurrence {
     pub original_form: bool,
 }
 
+#[derive(Default)]
+pub(crate) struct SourceViewBudget {
+    views: std::collections::BTreeSet<(usize, usize)>,
+    pub bytes: usize,
+}
+impl SourceViewBudget {
+    pub fn charge(&mut self, view: &str) -> Result<(), &'static str> {
+        if view.len() > 16 * 1024 * 1024 {
+            return Err("source view exceeds 16 MiB");
+        }
+        let identity = (view.as_ptr() as usize, view.len());
+        if self.views.contains(&identity) {
+            return Ok(());
+        }
+        let bytes = self
+            .bytes
+            .checked_add(view.len())
+            .ok_or("source-view byte count overflow")?;
+        if bytes > 64 * 1024 * 1024 {
+            return Err("simultaneous retained source views exceed 64 MiB");
+        }
+        self.views.insert(identity);
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+pub fn retained_source_view_bytes(
+    sources: &[LoadedSourceOccurrence],
+) -> Result<usize, &'static str> {
+    let mut budget = SourceViewBudget::default();
+    for source in sources {
+        budget.charge(&source.view)?;
+    }
+    Ok(budget.bytes)
+}
+
 pub struct LoadedSourceOccurrence {
     pub source: SourceOccurrence,
     pub view: std::sync::Arc<String>,
@@ -349,16 +386,13 @@ pub fn read_opencode_sources(
             if raw.len() > limit {
                 return Err(fail("selected source exceeds source-view limit"));
             }
+            retained = retained
+                .checked_add(raw.len())
+                .ok_or_else(|| fail("source-view byte count overflow"))?;
             let view = std::sync::Arc::new(raw);
             canonical.insert(source.canonical_source.clone(), view.clone());
             view
         };
-        retained = retained
-            .checked_add(view.len())
-            .ok_or_else(|| fail("source-view byte count overflow"))?;
-        if retained > 64 * 1024 * 1024 {
-            return Err(fail("simultaneous retained source views exceed 64 MiB"));
-        }
         loaded.push(LoadedSourceOccurrence { source, view });
     }
     Ok(loaded)
@@ -451,7 +485,7 @@ pub fn plan_loaded_opencode_sources_relocated(
     let mut aliases = std::collections::BTreeSet::new();
     let mut variables = std::collections::BTreeSet::new();
     let mut event_count = 0usize;
-    let mut retained_view_bytes = 0usize;
+    let mut view_budget = SourceViewBudget::default();
     for (ordinal, loaded) in sources.into_iter().enumerate() {
         let source = loaded.source;
         let original_form = source.lane != SourceLane::Inline
@@ -539,13 +573,10 @@ pub fn plan_loaded_opencode_sources_relocated(
         recipe_count = recipe_count
             .checked_add(references.recipes.len())
             .ok_or_else(|| fail("source recipe count overflow"))?;
-        retained_view_bytes = retained_view_bytes
-            .checked_add(references.template.len())
-            .and_then(|bytes| bytes.checked_add(references.unexpanded_source().len()))
-            .ok_or_else(|| fail("source-view byte count overflow"))?;
-        if retained_view_bytes > 64 * 1024 * 1024 {
-            return Err(fail("simultaneous retained source views exceed 64 MiB"));
-        }
+        view_budget.charge(&references.template).map_err(fail)?;
+        view_budget
+            .charge(references.unexpanded_source())
+            .map_err(fail)?;
         for occurrence in &references.occurrences {
             if aliases.len() >= 256 && !aliases.contains(&occurrence.approved_alias) {
                 return Err(fail("configuration alias count exceeds 256 across sources"));
@@ -583,6 +614,35 @@ mod tests {
     fn digest(path: &Path) -> String {
         format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
     }
+    #[test]
+    fn managed_provider_references_shared_large_source_uses_unique_view_budget() {
+        let owned = tempfile::tempdir().unwrap();
+        let shared = owned.path().join("shared.json");
+        let raw = format!(
+            "{{\"agent\":{{\"large\":{{\"description\":\"{}\"}}}}}}",
+            "x".repeat(9 * 1024 * 1024)
+        );
+        std::fs::write(&shared, &raw).unwrap();
+        let sources = (0..8)
+            .map(|ordinal| SourceOccurrence {
+                logical_path: owned.path().join(format!("origin-{ordinal}/opencode.json")),
+                canonical_source: shared.clone(),
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            })
+            .collect();
+        let plan = plan_opencode_sources(sources, owned.path(), owned.path(), &|_, _, _| None)
+            .expect(
+                "eight native occurrences of one 9 MiB source fit the shared 64 MiB view profile",
+            );
+        assert_eq!(plan.len(), 8);
+        for source in plan {
+            assert_eq!(source.references.template.as_str(), raw);
+            assert_eq!(source.references.unexpanded_source(), raw);
+            assert!(source.original_form && source.references.selections.is_empty());
+        }
+    }
+
     #[test]
     fn managed_provider_references_shared_source_is_read_once_before_auth_lookup() {
         let owned = tempfile::tempdir().unwrap();

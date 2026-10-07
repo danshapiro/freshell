@@ -52,7 +52,7 @@ pub(crate) enum NativeAliasKind {
 }
 
 pub struct ResolvedFileReferencePlan {
-    pub template: String,
+    pub template: std::sync::Arc<String>,
     // Generated recipes already own the raw view. Keep one raw view for
     // direct references too; a rewritten template cannot revalidate selection.
     unexpanded_direct_source: Option<std::sync::Arc<String>>,
@@ -335,10 +335,19 @@ pub(super) fn resolve_file_references_from_view_relocated(
         template.push_str(&raw[cursor..]);
         (template, Vec::new())
     };
+    let unexpanded_direct_source = (!generated || projection.original_form)
+        .then(|| source_view.unwrap_or_else(|| std::sync::Arc::new(raw.to_owned())));
+    let template = if template == raw {
+        unexpanded_direct_source
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::sync::Arc::new(template))
+    } else {
+        std::sync::Arc::new(template)
+    };
     Ok(ResolvedFileReferencePlan {
         template,
-        unexpanded_direct_source: (!generated || projection.original_form)
-            .then(|| source_view.unwrap_or_else(|| std::sync::Arc::new(raw.to_owned()))),
+        unexpanded_direct_source,
         selections,
         referenced_variables: variables.into_inner().into_iter().collect(),
         path_variables: path_variables.into_iter().collect(),
@@ -411,7 +420,7 @@ process.stdout.write(JSON.stringify(receipts));
             std::fs::copy(&selection.canonical_source, runtime.join(relative)).unwrap();
         }
         let source = runtime.join("source.json");
-        std::fs::write(&source, &plan.template).unwrap();
+        std::fs::write(&source, plan.template.as_bytes()).unwrap();
         let mut child = std::collections::BTreeMap::new();
         for recipe in &plan.recipes {
             child.insert(
@@ -870,11 +879,9 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         if raw.len() > 16 * 1024 * 1024 {
             return Err("OpenCode inherited inline source exceeds 16 MiB".into());
         }
-        let retained = loaded
-            .iter()
-            .try_fold(raw.len(), |bytes, source| {
-                bytes.checked_add(source.view.len())
-            })
+        let retained = sources::retained_source_view_bytes(&loaded)
+            .map_err(str::to_string)?
+            .checked_add(raw.len())
             .ok_or("source-view size overflow")?;
         let remaining = (64 * 1024 * 1024usize)
             .checked_sub(retained)
@@ -990,10 +997,8 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         }
         flags
     };
-    let mut retained_views = loaded
-        .iter()
-        .try_fold(0usize, |bytes, source| bytes.checked_add(source.view.len()))
-        .ok_or("source-view byte count overflow")?;
+    let mut retained_views =
+        sources::retained_source_view_bytes(&loaded).map_err(str::to_string)?;
     for source in &mut loaded {
         if rebind_enabled
             && source.source.lane == SourceLane::Tui
