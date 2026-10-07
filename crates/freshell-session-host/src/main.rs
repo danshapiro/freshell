@@ -6175,6 +6175,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_provider_uses_image_path_and_preserves_explicit_path() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("FRESHELL_NATIVE_PATH_TEST_ROOT").is_none() {
+            let root = tempfile::tempdir().unwrap();
+            for (directory, marker) in [
+                ("image-bin", "image-path"),
+                ("selected-bin", "selected-path"),
+            ] {
+                let bin = root.path().join(directory);
+                std::fs::create_dir(&bin).unwrap();
+                let executable = bin.join("owned-provider-fixture");
+                std::fs::write(
+                    &executable,
+                    format!("#!/bin/sh\nprintf '{marker}\\n'\nprintf 'home=%s\\n' \"$HOME\"\n"),
+                )
+                .unwrap();
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::hosted_provider_uses_image_path_and_preserves_explicit_path",
+                    "--nocapture",
+                ])
+                .env("FRESHELL_NATIVE_PATH_TEST_ROOT", root.path())
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", root.path().join("image-bin").display()),
+                )
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("FRESHELL_NATIVE_PATH_TEST_ROOT").unwrap());
+        for (path_override, home_override, expected) in [
+            (None, true, "image-path"),
+            (Some(root.join("selected-bin")), true, "selected-path"),
+            (None, false, "image-path"),
+        ] {
+            let state = test_host_state();
+            let uid = unsafe { libc::geteuid() };
+            let mut env: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::from([(
+                    "HOME".into(),
+                    root.to_string_lossy().into_owned(),
+                )]);
+            if let Some(path) = path_override {
+                env.insert("PATH".into(), path.to_string_lossy().into_owned());
+            }
+            if !home_override {
+                env.remove("HOME");
+            }
+            let launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                "terminalId":"native-path", "streamId":"native-path", "mode":"claude", "program":"owned-provider-fixture", "args":[],
+                "cwd":root, "workspacePath":root, "projectKey":"owned-path", "cols":80, "rows":24,
+                "runAsUid":if uid==0 {65534} else {uid}, "runAsGid":unsafe {libc::getegid()}, "env":env
+            })).unwrap();
+            let pty = HostedPty::spawn(
+                &state.state_dir,
+                state.incarnation_id.clone(),
+                &launch,
+                Default::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            for _ in 0..100 {
+                if pty.exited() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(pty.exited());
+            let output = pty
+                .read_output(state.incarnation_id.clone(), 0, 65536, None)
+                .unwrap();
+            assert_eq!(pty.exit_code(), 0);
+            assert!(output
+                .frames
+                .iter()
+                .any(|frame| frame.data.contains(expected)));
+            let expected_home = if home_override {
+                root.to_string_lossy().into_owned()
+            } else {
+                "/home/freshell/provider".into()
+            };
+            assert!(output
+                .frames
+                .iter()
+                .any(|frame| frame.data.contains(&format!("home={expected_home}"))));
+        }
+    }
+
+    #[tokio::test]
     async fn requested_identity_is_not_provider_observation() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
