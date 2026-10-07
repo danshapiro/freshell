@@ -1399,7 +1399,7 @@ export async function dispatchOwnedExternalBrowser(
     const selected = requiredCases(selection, await owner.list(selection, env), env)
     signal?.throwIfAborted()
     const child = await owner.child('pnpm', [
-      'run', 'test:e2e', '--project=chromium-external-target', '--shards=1', '--workers=1', '--retries=0',
+      'run', 'test:e2e', '--project=chromium-external-target', '--shards=1', '--workers=1', '--retries=0', '--timeout=120m',
       selection.spec, ...(selection.grep ? ['--grep', selection.grep] : []),
     ], env, ...(signal ? [signal] : []))
     signal?.throwIfAborted()
@@ -1552,7 +1552,9 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     const manager = (this.environment.PATH ?? '').split(path.delimiter).map(directory => path.join(directory, 'pnpm')).find(file => fs.existsSync(file))
     if (!manager || execFileSync(manager, ['--version'], { encoding: 'utf8' }).trim() !== '10.34.5') throw new Error('owned dispatch requires pinned pnpm')
     this.cloud = await OwnedRuntimeChild.create(process.execPath, [fs.realpathSync(manager), ...args], this.repoRoot, environment)
-    const deadline = Date.now() + 2 * 60 * 60_000
+    // The Cloud task retains its full two-hour envelope after image build;
+    // the owner also covers build/dispatch and exact cleanup time.
+    const deadline = Date.now() + 3 * 60 * 60_000
     const events = new Map<string, Record<string, unknown>>()
     while (this.cloud.alive()) {
       signal?.throwIfAborted()

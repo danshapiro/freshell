@@ -140,6 +140,9 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     const childArgs = child.mock.calls[0][1]
     expect(childArgs).not.toContain('--')
     expect(childArgs).not.toContain('--local')
+    // Preserve the 60-minute native case plus two 15-minute retained cases,
+    // including their browser setup and cleanup time.
+    expect(childArgs).toContain('--timeout=120m')
     expect(owned.list.mock.invocationCallOrder[0]).toBeLessThan(child.mock.invocationCallOrder[0])
     expect(receipt).toMatchObject({ selected: 1, executed: 1, passed: 1, skipped: 0, failed: 0, timedOut: 0 })
     expect(owned.finish).toHaveBeenCalledOnce()
