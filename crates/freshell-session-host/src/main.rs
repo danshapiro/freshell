@@ -1502,23 +1502,17 @@ async fn grant_execution(
                         format!("prepare hosted provider bootstrap: {error}"),
                     )
                 })?;
-                prepare_provider_context(
-                    launch.provider_launch_context.as_ref(),
-                    launch.provider.as_str(),
-                    &launch.workspace_path,
-                    launch.run_as_uid,
-                    launch.run_as_gid,
-                )
-                .map_err(|error| {
-                    RuntimeError::new(
-                        RuntimeErrorCode::HostUnreachable,
-                        format!("prepare hosted provider config: {error}"),
-                    )
-                })?;
+                prepare_fresh_provider_context_at(&launch, &ProviderConfigPaths::default())
+                    .map_err(|error| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            format!("prepare hosted provider config: {error}"),
+                        )
+                    })?;
             } else {
                 refresh_provider_context(
                     launch.provider_launch_context.as_ref(),
-                    launch.provider.as_str(),
+                    launch.provider.native_family(),
                     &launch.workspace_path,
                     launch.run_as_uid,
                     launch.run_as_gid,
@@ -1536,17 +1530,15 @@ async fn grant_execution(
                     )
                 })?;
             }
-            let mut resolved_secrets = provider_secret_resolution::resolve_child_secrets(
-                launch.provider.as_str(),
-                &launch.provider_secret_references,
-                Path::new("/run/freshell-secrets"),
-            )
-            .map_err(|error| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("resolve hosted OneCLI grant: {error}"),
-                )
-            })?;
+            let mut resolved_secrets =
+                resolve_fresh_child_secrets(&launch, Path::new("/run/freshell-secrets")).map_err(
+                    |error| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            format!("resolve hosted OneCLI grant: {error}"),
+                        )
+                    },
+                )?;
             prepare_provider_files(
                 launch.provider.as_str(),
                 &resolved_secrets.provider_files,
@@ -3776,20 +3768,28 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     Ok(())
 }
 
-fn prepare_provider_context(
-    context: Option<&freshell_runtime_protocol::ProviderLaunchContext>,
-    provider: &str,
-    workspace: &str,
-    run_as_uid: u32,
-    run_as_gid: u32,
+fn resolve_fresh_child_secrets(
+    launch: &FreshAgentLaunchSpec,
+    mount_root: &Path,
+) -> Result<provider_secret_resolution::ResolvedProviderSecrets, String> {
+    provider_secret_resolution::resolve_child_secrets(
+        launch.provider.native_family(),
+        &launch.provider_secret_references,
+        mount_root,
+    )
+}
+
+fn prepare_fresh_provider_context_at(
+    launch: &FreshAgentLaunchSpec,
+    paths: &ProviderConfigPaths,
 ) -> Result<(), String> {
     prepare_provider_context_at(
-        context,
-        provider,
-        workspace,
-        run_as_uid,
-        run_as_gid,
-        &ProviderConfigPaths::default(),
+        launch.provider_launch_context.as_ref(),
+        launch.provider.native_family(),
+        &launch.workspace_path,
+        launch.run_as_uid,
+        launch.run_as_gid,
+        paths,
     )
 }
 fn prepare_provider_context_for_fresh_launch(
@@ -4841,6 +4841,102 @@ mod tests {
             assert_eq!(std::fs::read(&file).unwrap(), *bytes);
             std::fs::write(&file, bytes).expect("provider owns native refresh publication");
         }
+    }
+
+    fn kilroy_typed_launch(workspace: &Path) -> FreshAgentLaunchSpec {
+        serde_json::from_value(serde_json::json!({
+            "sessionId":"kilroy-presentation", "provider":"kilroy", "sessionType":"kilroy",
+            "runtimeVariant":"claude-sdk-sidecar", "providerStoreId":"kilroy-store",
+            "cwd":workspace, "workspacePath":workspace,
+            "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+            "providerLaunchContext":{"preparation":{"claude":{"mcp_args":[]}}, "config":[]},
+            "providerSecretReferences":[{"sourcePath":"/private/claude.env", "profile":"claude_onecli_environment"},
+              {"sourcePath":"/private/claude-ca.pem", "profile":"claude_onecli_ca_file"}]
+        })).unwrap()
+    }
+
+    #[test]
+    fn kilroy_host_resolves_only_native_claude_typed_environment_and_ca() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("provider-0"), "CLAUDE_CODE_OAUTH_TOKEN=fixture-oauth\nHTTPS_PROXY=http://192.0.2.10:10255\nNODE_EXTRA_CA_CERTS=/home/freshell/provider/.config/onecli/gateway-ca.pem\n").unwrap();
+        std::fs::write(root.path().join("provider-1"), "fixture-ca").unwrap();
+        let mut launch = kilroy_typed_launch(root.path());
+        let resolved = resolve_fresh_child_secrets(&launch, root.path()).unwrap();
+        assert_eq!(
+            resolved
+                .environment
+                .get("CLAUDE_CODE_OAUTH_TOKEN")
+                .map(String::as_str),
+            Some("fixture-oauth")
+        );
+        assert_eq!(
+            resolved.provider_files,
+            vec![(".config/onecli/gateway-ca.pem", b"fixture-ca".to_vec())]
+        );
+        assert_eq!(launch.provider.as_str(), "kilroy");
+        launch.provider_secret_references[0].profile =
+            freshell_runtime_protocol::ProviderSecretProfile::CodexOnecliEnvironment;
+        assert!(resolve_fresh_child_secrets(&launch, root.path()).is_err());
+    }
+
+    #[test]
+    fn kilroy_host_prepares_native_claude_context_without_changing_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        let source = private.join("user-provider");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let bytes = br#"{"permissions":{"ask":["Bash"]}}"#;
+        std::fs::write(source.join("settings.json"), bytes).unwrap();
+        let mut launch = kilroy_typed_launch(root.path());
+        launch
+            .provider_launch_context
+            .as_mut()
+            .unwrap()
+            .config
+            .push(freshell_runtime_protocol::ProviderConfigReference {
+                root: freshell_runtime_protocol::ProviderConfigRoot::UserProvider,
+                relative_path: "settings.json".into(),
+                provider_relative_path: ".claude/settings.json".into(),
+                format: "json".into(),
+            });
+        let paths = ProviderConfigPaths {
+            private_mount: private,
+            provider_home: home.clone(),
+        };
+        prepare_fresh_provider_context_at(&launch, &paths).unwrap();
+        assert_eq!(
+            std::fs::read(home.join(".claude/settings.json")).unwrap(),
+            bytes
+        );
+        assert_eq!(launch.provider.as_str(), "kilroy");
+        assert_eq!(launch.session_type, "kilroy");
+        let refreshed = br#"{"permissions":{"deny":["Bash"]}}"#;
+        std::fs::write(source.join("settings.json"), refreshed).unwrap();
+        refresh_provider_context(
+            launch.provider_launch_context.as_ref(),
+            launch.provider.native_family(),
+            &launch.workspace_path,
+            launch.run_as_uid,
+            launch.run_as_gid,
+            &paths,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(home.join(".claude/settings.json")).unwrap(),
+            refreshed
+        );
+        launch.provider_launch_context.as_mut().unwrap().preparation =
+            freshell_runtime_protocol::ProviderPreparation::Codex {
+                tui_args: Vec::new(),
+                sidecar_args: Vec::new(),
+            };
+        assert!(prepare_fresh_provider_context_at(&launch, &paths).is_err());
+        assert_eq!(
+            std::fs::read(home.join(".claude/settings.json")).unwrap(),
+            refreshed
+        );
     }
 
     #[cfg(unix)]
