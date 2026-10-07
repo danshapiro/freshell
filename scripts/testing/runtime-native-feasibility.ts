@@ -263,7 +263,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'claude' && ['create', 'wrong-root', 'exact-resume', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'claude' && ['create', 'wrong-root', 'disabled-hooks', 'exact-resume', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
   if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
@@ -418,6 +418,7 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
   const resumes = ['exact-resume', 'current-native-turn'].includes(caseId)
+  const hooksDisabled = caseId === 'disabled-hooks'
   if (resumes && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   const grants = (['env_file', 'ca_file'] as const).map((suffix) => {
     const file = sources.find((source) => source.name === `claude/grants/${suffix}`)
@@ -431,12 +432,13 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
   // Select the same ordinary user file on create and controller reissue.
   // The supported config directory keeps preferences in that selected root.
-  const home = path.join(harness.testRoot, 'native-source/claude')
+  const home = path.join(harness.testRoot, 'native-source/claude', scenario)
   const userRoot = path.join(home, '.claude')
   const preferencePath = path.join(userRoot, '.claude.json')
   fs.mkdirSync(userRoot, { recursive: true, mode: 0o700 })
   fs.copyFileSync(preferences.path, preferencePath)
   fs.chmodSync(preferencePath, 0o600)
+  if (hooksDisabled) fs.writeFileSync(path.join(userRoot, 'settings.json'), JSON.stringify({ disableAllHooks: true }), { mode: 0o600 })
   const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release',
     env: { HOME: home, FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude' } })
   const soulId = 'soul-' + randomUUID()
@@ -501,21 +503,24 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
       providerModel: 'claude-haiku-4-5-20251001', providerReasoningEffort: 'low', providerSecretReferences: managedPreparation?.secretReferences ?? grants,
       providerLaunchContext: managedPreparation?.context ?? { preparation: { claude: { mcp_args: [] } }, config: [{ root: 'user_provider',
-        relativePath: '.claude.json', providerRelativePath: '.claude/.claude.json', format: 'json' }] } } } }
+        relativePath: '.claude.json', providerRelativePath: '.claude/.claude.json', format: 'json' },
+        ...(hooksDisabled ? [{ root: 'user_provider', relativePath: 'settings.json', providerRelativePath: '.claude/settings.json', format: 'json' }] : [])] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
   const wrongRoot = caseId === 'wrong-root'
-  const result = wrongRoot ? await harness.adminRaw(supervisor, request) : await harness.adminOk(supervisor, request)
+  const startupRefusal = wrongRoot || hooksDisabled
+  const result = startupRefusal ? await harness.adminRaw(supervisor, request) : await harness.adminOk(supervisor, request)
   harness.writeArtifact(`${scenario}-launch.json`, result)
   let view: any
-  if (wrongRoot) {
-    if (result.result?.Err?.code !== 'RECOVERY_BLOCKED') throw new Error('wrong current native root published a running launch')
+  if (startupRefusal) {
+    const failure = hooksDisabled ? 'disabled native hooks published a running launch' : 'wrong current native root published a running launch'
+    if (result.result?.Err?.code !== 'RECOVERY_BLOCKED') throw new Error(failure)
     const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
     harness.writeArtifact(`${scenario}-inventory.json`, inventory)
     view = inventory.data.find((row: any) => row.soulId === soulId)
-    if (view?.launchState !== 'starting' || view.nativeIdentityObservation) throw new Error('wrong current native root published a running launch')
+    if (view?.launchState !== 'starting' || view.nativeIdentityObservation) throw new Error(failure)
   } else view = result.data.view
   const deadline = Date.now() + 50_000
-  while (!wrongRoot && !view.nativeIdentityObservation && Date.now() < deadline) {
+  while (!startupRefusal && !view.nativeIdentityObservation && Date.now() < deadline) {
     harness.writeArtifact(`${scenario}-terminal-output-private.json`, await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId)))
     // Refresh asynchronous PTY evidence through the existing host snapshot
     // probe before reading the registry's stored observation.
@@ -554,19 +559,23 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
   const currentObservation = !!observation && view.recoveryState === 'live' && observation.source === 'claude_native_event'
     && observation.nativeSessionId === nativeRoot && view.nativeSessionId === nativeRoot
     && observation.incarnationId === view.incarnationId
-  if (wrongRoot ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
+  if (startupRefusal ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-    ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
+    ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : [])]))
   harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
+  const selectedModel = hooksDisabled ? namespace.nativeArgv?.[namespace.nativeArgv.indexOf('--model') + 1] : namespace.loaded?.native?.model?.id
+  const selectedCwd = hooksDisabled ? namespace.nativeCwd : namespace.loaded?.native?.workspace?.current_dir
+  const loaderMatches = hooksDisabled
+    ? namespace.hook === null && namespace.loaded === null && namespace.hooksDisabled === true
+    : namespace.loaded?.native?.version === '2.1.263' && namespace.loaded.native.session_id === actualRoot
+      && JSON.stringify(namespace.loaded.launch) === JSON.stringify(namespace.hook.launch)
   if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
     || !namespace.readOnlyRoot || namespace.httpsStatus !== 200 || namespace.tlsVerifyMode !== 2 || !namespace.tlsCheckHostname
-    || !namespace.version.startsWith('2.1.263') || namespace.loaded?.native?.version !== '2.1.263'
-    || namespace.loaded.native.session_id !== actualRoot || namespace.loaded.native.model?.id !== 'claude-haiku-4-5-20251001'
-    || namespace.loaded.native.workspace?.current_dir !== workspace
-    || JSON.stringify(namespace.loaded.launch) !== JSON.stringify(namespace.hook.launch)) {
+    || !namespace.version.startsWith('2.1.263') || !loaderMatches
+    || selectedModel !== 'claude-haiku-4-5-20251001' || selectedCwd !== workspace) {
     throw new Error('actual terminal Claude pin/profile/namespace/TLS differs')
   }
-  if (!wrongRoot) {
+  if (!startupRefusal) {
     // Exercise the ordinary output/store path before starting a paid seed.
     // Input ACKs cannot hide a dispatcher or store failure at this boundary.
     harness.writeArtifact(`${scenario}-pre-input-terminal-private.json`, await harness.adminOk(supervisor,
@@ -574,22 +583,24 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     harness.writeArtifact(`${scenario}-pre-input-store-probe.json`, await harness.adminOk(supervisor,
       harness.probeRecoveryBody(soulId)))
   }
-  const assertions = wrongRoot ? [{ name: 'wrong-current-native-root-refused-before-running-and-input', pass: false }]
+  const assertions = startupRefusal ? [{ name: hooksDisabled ? 'actual-disabled-native-hooks-refused-before-running-and-input' : 'wrong-current-native-root-refused-before-running-and-input', pass: false }]
     : [{ name: 'actual-terminal-current-native-post-load-observation-before-input', pass:
       observation.nativeSessionId === namespace.loaded.native.session_id && observation.incarnationId === view.incarnationId }]
-  if (wrongRoot) {
+  if (startupRefusal) {
     const rejected = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned blocked startup probe. Do not use tools.\r'))
     harness.writeArtifact(`${scenario}-input-refusal.json`, rejected)
     const after = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-      ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
+      ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : [])]))
     harness.writeArtifact(`${scenario}-after-refused-input-native-private.json`, after)
     // No Running incarnation exists, so the ordinary input route has no
     // admissible target. Inspect actual provider state separately.
-    assertions[0]!.pass = !observation && actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
+    assertions[0]!.pass = !observation
       && view.launchState === 'starting' && rejected.result?.Err?.code === 'UNKNOWN_SOUL'
       && JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
-      && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0
-    if (!assertions[0]!.pass) throw new Error('wrong current native root released ordinary input or changed native state')
+      && (hooksDisabled ? (!after.hook && !after.loaded && after.hooksDisabled === true && after.completedTurns === 0 && after.toolEvents === 0)
+        : (actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
+          && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0))
+    if (!assertions[0]!.pass) throw new Error(hooksDisabled ? 'disabled native hooks released ordinary input or changed native state' : 'wrong current native root released ordinary input or changed native state')
   }
   if (resumes) {
     const inspect = async (containerId: string, label: string) => {
@@ -659,13 +670,12 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
   const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
     nativeVersion: namespace.version, executableSha256: namespace.executableSha256,
     profileSha256: createHash('sha256').update(JSON.stringify({ preferences: preferences.sha256, profileFiles: namespace.profileFiles,
-      model: namespace.loaded.native.model.id, workspace })).digest('hex'),
+      model: selectedModel, workspace })).digest('hex'),
     artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace-native-private.json`],
     assertions: [...assertions,
     { name: 'actual-terminal-global-pin-distinct-from-sdk-child', pass: namespace.version.startsWith('2.1.263')
-      && namespace.loaded.native.version === '2.1.263' },
-    { name: 'actual-terminal-selected-model-workspace-profile', pass: namespace.loaded.native.model.id === 'claude-haiku-4-5-20251001'
-      && namespace.loaded.native.workspace.current_dir === workspace }] }
+      && (hooksDisabled || namespace.loaded.native.version === '2.1.263') },
+    { name: 'actual-terminal-selected-model-workspace-profile', pass: selectedModel === 'claude-haiku-4-5-20251001' && selectedCwd === workspace }] }
   harness.writeArtifact(`${scenario}-original.json`, original)
   return original
 }
@@ -1240,6 +1250,7 @@ print(json.dumps({'nativeRoot':root,'nativePid':int(p.name),'transcript':{'ident
 const claudeNativeInspection = String.raw`
 import pathlib,os,json,hashlib,ssl,urllib.parse,urllib.request,subprocess,sys,base64
 root=sys.argv[1];required=sys.argv[2]=='true';terminal=len(sys.argv)>3 and sys.argv[3]=='terminal'
+disabled_hooks=terminal and len(sys.argv)>4 and sys.argv[4]=='disabled-hooks'
 selected=pathlib.Path('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe' if terminal else '/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude')
 expected=hashlib.sha256(selected.read_bytes()).hexdigest();matches=[]
 for p in pathlib.Path('/proc').iterdir():
@@ -1249,18 +1260,24 @@ for p in pathlib.Path('/proc').iterdir():
   if 'FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR' in env and (terminal or 'FRESHELL_CLAUDE_SIDECAR_ID' in env) and hashlib.sha256((p/'exe').read_bytes()).hexdigest()==expected:matches.append((p,env))
  except (OSError,ValueError):continue
 assert len(matches)==1
-p,env=matches[0];hook=json.loads((pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'])/'session-start.json').read_text());assert hook['native']['session_id']==root
-loaded=json.loads((pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'])/'statusline-loaded.json').read_text()) if terminal else None
+p,env=matches[0];signal_dir=pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR']);hook_file=signal_dir/'session-start.json';loaded_file=signal_dir/'statusline-loaded.json'
+hook=None if disabled_hooks and not hook_file.exists() else json.loads(hook_file.read_text())
+assert hook is None and disabled_hooks or hook['native']['session_id']==root
+loaded=None if not terminal or disabled_hooks and not loaded_file.exists() else json.loads(loaded_file.read_text())
 ca=pathlib.Path(env.get('SSL_CERT_FILE') or env['NODE_EXTRA_CA_CERTS']);context=ssl.create_default_context(cafile=str(ca));proxy=env.get('HTTPS_PROXY') or env.get('https_proxy')
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),urllib.request.HTTPSHandler(context=context))
 with opener.open(urllib.request.Request('https://api.anthropic.com/v1/models',headers={'anthropic-version':'2023-06-01','authorization':'Bearer '+env['CLAUDE_CODE_OAUTH_TOKEN']}),timeout=20) as r:status=r.status;r.read()
-home=pathlib.Path(env.get('CLAUDE_CONFIG_DIR') or str(pathlib.Path(env['HOME'])/'.claude'));cwd=pathlib.Path(hook['native']['cwd']);profile=[]
+home=pathlib.Path(env.get('CLAUDE_CONFIG_DIR') or str(pathlib.Path(env['HOME'])/'.claude'));cwd=pathlib.Path(hook['native']['cwd']) if hook else (p/'cwd').resolve();profile=[]
+native_argv=[v.decode() for v in (p/'cmdline').read_bytes().split(b'\0') if v]
+settings=json.loads((home/'settings.json').read_text()) if (home/'settings.json').exists() else {}
 files=[home/'settings.json',cwd/'.claude/settings.json',cwd/'.claude/settings.local.json']
 if terminal:files.append(home/'.claude.json')
 for file in files:
  profile.append({'path':str(file),'sha256':hashlib.sha256(file.read_bytes()).hexdigest() if file.exists() else None})
-transcript=None;rows=[];file=pathlib.Path(hook['native']['transcript_path'])
-if file.exists():
+transcript=None;rows=[];candidates=list(home.glob('projects/**/'+root+'.jsonl')) if not hook else []
+assert len(candidates)<=1
+file=pathlib.Path(hook['native']['transcript_path']) if hook else (candidates[0] if candidates else None)
+if file is not None and file.exists():
  with file.open('rb') as f:
   before=os.fstat(f.fileno());raw=f.read();after=os.fstat(f.fileno())
  identity=lambda s:[str(s.st_dev),str(s.st_ino),str(s.st_size),str(s.st_mtime_ns),str(s.st_ctime_ns)]
@@ -1274,7 +1291,7 @@ last_text=''.join(part.get('text','') for part in (assistants[-1].get('message',
 preferences=json.loads((home/'.claude.json').read_text()) if terminal else None
 native_preferences={key:preferences.get(key) for key in ['theme','hasCompletedOnboarding']} if preferences else None
 if native_preferences is not None:native_preferences['workspaceTrust']=preferences.get('projects',{}).get(str(cwd),{}).get('hasTrustDialogAccepted')
-print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':root,'hook':hook,'loaded':loaded,'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'nativePreferences':native_preferences,'completedTurns':len(completed_ids),'toolEvents':tool_events,'lastAssistantText':last_text,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':hook['native']['session_id'] if hook else None,'hook':hook,'loaded':loaded,'hooksDisabled':settings.get('disableAllHooks'),'nativeArgv':native_argv,'nativeCwd':str((p/'cwd').resolve()),'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'nativePreferences':native_preferences,'completedTurns':len(completed_ids),'toolEvents':tool_events,'lastAssistantText':last_text,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
 `
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

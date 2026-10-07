@@ -103,17 +103,19 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       .rejects.toThrow('actual terminal recovery requires the owned real server artifact')
     expect(launch).not.toHaveBeenCalled()
   })
-  it.each(['create', 'wrong-root'])('sends terminal Claude %s through its real launch route with the selected profile', async (caseId) => {
+  it.each(['create', 'wrong-root', 'disabled-hooks'])('sends terminal Claude %s through its real launch route with the selected profile', async (caseId) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-claude-route-'))
+    let home: string
     const launch = vi.fn(async (_supervisor: unknown, request: any) => {
       expect(request.params.terminal.providerBootstrapFiles).toBeUndefined()
       const selected = request.params.terminal.providerLaunchContext.config.find((file: any) => file.providerRelativePath === '.claude/.claude.json')
       expect(selected.root).toBe('user_provider')
-      const preferences = JSON.parse(fs.readFileSync(path.join(directory, 'native-source/claude/.claude', selected.relativePath), 'utf8'))
+      const preferences = JSON.parse(fs.readFileSync(path.join(home, '.claude', selected.relativePath), 'utf8'))
       expect(preferences.projects[request.params.terminal.cwd].hasTrustDialogAccepted).toBe(true)
       throw new Error('controlled terminal launch boundary')
     })
-    const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '', adminOk: launch, adminRaw: launch } as unknown as RuntimeHarness
+    const harness = { testRoot: directory, startSupervisor: async (options: any) => { home = options.env.HOME; return {} },
+      writeArtifact: () => '', adminOk: launch, adminRaw: launch } as unknown as RuntimeHarness
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({
       name: 'claude/' + name, path: path.join(directory, path.basename(name)), sha256: 'e'.repeat(64) }))
     fs.writeFileSync(sources[2]!.path, JSON.stringify({ theme: 'dark', hasCompletedOnboarding: true,
@@ -160,8 +162,9 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(records.get('claude-create-signal-native-private.json')).toEqual({ processes: [{ pid: 7, signals: [] }] })
     } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['create', 'wrong-root', 'wrong-root-admitted', 'wrong-root-published', 'wrong-root-late-published'])('refreshes the current host and protects the terminal %s verdict', async (fault) => {
-    const caseId = fault === 'create' ? 'create' : 'wrong-root'
+  it.each(['create', 'wrong-root', 'wrong-root-admitted', 'wrong-root-published', 'wrong-root-late-published',
+    'disabled-hooks', 'disabled-hooks-admitted', 'disabled-hooks-published'])('refreshes the current host and protects the terminal %s verdict', async (fault) => {
+    const caseId = fault === 'create' ? 'create' : fault.startsWith('disabled-hooks') ? 'disabled-hooks' : 'wrong-root'
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-observation-refresh-'))
     const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
     let request: any
@@ -180,20 +183,22 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       adminRaw: async (_supervisor: unknown, body: any) => {
         if (body.method === 'launch') {
           request = body
-          return { result: fault === 'wrong-root-published' ? { Ok: { view: view() } } : { Err: { code: 'RECOVERY_BLOCKED' } } }
+          return { result: fault.endsWith('-published') && !fault.includes('late') ? { Ok: { view: view() } } : { Err: { code: 'RECOVERY_BLOCKED' } } }
         }
-        return { result: fault === 'wrong-root-admitted' ? { Ok: {} } : { Err: { code: fault === 'wrong-root-published' ? 'RECOVERY_BLOCKED' : 'UNKNOWN_SOUL' } } }
+        return { result: fault.endsWith('-admitted') ? { Ok: {} } : { Err: { code: fault === 'wrong-root-published' ? 'RECOVERY_BLOCKED' : 'UNKNOWN_SOUL' } } }
       },
       adminOk: async (_supervisor: unknown, body: any) => {
         if (body.method === 'launch') { request = body; return { data: { view: view() } } }
         if (body.method === 'probe_recovery') { refreshed = true; return { data: { kind: 'unknown' } } }
         return { data: body.method === 'inventory' ? [view()] : {} }
       },
-      execOwnedContainerAsExact: async (_container: string, _uid: string, args: string[]) => JSON.stringify(args.at(-1) === 'terminal'
+      execOwnedContainerAsExact: async (_container: string, _uid: string, args: string[]) => JSON.stringify(args.includes('terminal')
         ? { uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200,
           tlsVerifyMode: 2, tlsCheckHostname: true, version: '2.1.263', executableSha256: 'f'.repeat(64), profileFiles: [],
-          transcript: null, hook: { launch: {}, native: { session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1] } },
-          loaded: { launch: {}, native: { version: '2.1.263', session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1],
+          transcript: null, hooksDisabled: caseId === 'disabled-hooks', completedTurns: 0, toolEvents: 0,
+          nativeArgv: request.params.terminal.args, nativeCwd: request.params.terminal.cwd,
+          hook: caseId === 'disabled-hooks' ? null : { launch: {}, native: { session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1] } },
+          loaded: caseId === 'disabled-hooks' ? null : { launch: {}, native: { version: '2.1.263', session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1],
             context_window: { total_input_tokens: 0, total_output_tokens: 0 },
             model: { id: 'claude-haiku-4-5-20251001' }, workspace: { current_dir: request.params.terminal.cwd } } } }
         : { processes: [] }),
@@ -202,11 +207,11 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     try {
       const execution = executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, caseId)
       if (fault.includes('published')) {
-        await expect(execution).rejects.toThrow('wrong current native root published a running launch')
+        await expect(execution).rejects.toThrow(caseId === 'disabled-hooks' ? 'disabled native hooks published a running launch' : 'wrong current native root published a running launch')
         return
       }
-      if (fault === 'wrong-root-admitted') {
-        await expect(execution).rejects.toThrow('wrong current native root released ordinary input')
+      if (fault.endsWith('-admitted')) {
+        await expect(execution).rejects.toThrow(caseId === 'disabled-hooks' ? 'disabled native hooks released ordinary input' : 'wrong current native root released ordinary input')
         return
       }
       const original = await execution
