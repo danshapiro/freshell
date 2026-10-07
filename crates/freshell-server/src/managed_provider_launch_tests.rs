@@ -812,6 +812,10 @@ async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prep
     )
     .unwrap();
     std::fs::write(selected_config.join("CLAUDE.md"), &memory).unwrap();
+    std::fs::create_dir_all(selected_config.join("rules/nested")).unwrap();
+    let rule = "@../../../rule-memory.md\n`@../../../missing-rule-code.md`\n```\n@../../../missing-rule-fence.md\n```\n";
+    std::fs::write(selected_config.join("rules/nested/policy.md"), rule).unwrap();
+    std::fs::write(home.join("rule-memory.md"), "closed-selected-rule-memory\n").unwrap();
     std::fs::write(
         home.join(".claude/CLAUDE.md"),
         "@../missing-unselected-default.md\n",
@@ -902,7 +906,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
     let instructions_consumer = r#"const fs=require('node:fs'),crypto=require('node:crypto'),path=require('node:path');
 let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
  const input=JSON.parse(raw),name=path.basename(input.file_path||''),event=input.hook_event_name==='InstructionsLoaded';
- const names=['imported-memory.md','relative-memory.md','home-memory.md','absolute-memory.md','spaced memory.md','nested-memory.md'];
+ const names=['imported-memory.md','relative-memory.md','home-memory.md','absolute-memory.md','spaced memory.md','nested-memory.md','rule-memory.md'];
  const selected=event&&names.includes(name)?{name,digest:crypto.createHash('sha256').update(fs.readFileSync(input.file_path)).digest('hex')}:null;
  fs.appendFileSync(process.argv[2]+'.events',JSON.stringify({event,global:input.file_path===process.env.HOME+'/.claude/CLAUDE.md',project:input.file_path===process.argv[3],ignored:event&&name.startsWith('ignored-'),selected})+'\n');
  if(event&&input.file_path===process.env.HOME+'/imported-memory.md')fs.writeFileSync(process.argv[2],JSON.stringify({nativeImport:true,digest:selected.digest}));
@@ -1105,6 +1109,10 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     let imported_bytes = std::fs::read(home.join("imported-memory.md")).unwrap();
     let mut expected_imports = serde_json::Map::new();
     expected_imports.insert("imported-memory.md".into(), json!(hash(&imported_bytes)));
+    expected_imports.insert(
+        "rule-memory.md".into(),
+        json!(hash(b"closed-selected-rule-memory\n")),
+    );
     for name in [
         "relative-memory.md",
         "home-memory.md",
@@ -1227,6 +1235,10 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         );
     }
     assert_eq!(std::fs::read(&flag_settings).unwrap(), flag_bytes);
+    assert_eq!(
+        std::fs::read_to_string(selected_config.join("rules/nested/policy.md")).unwrap(),
+        rule
+    );
     assert_eq!(std::fs::read_link(&flag_alias).unwrap(), flag_settings);
     let native_import = consumed(&instructions_receipt).await;
     if native_import.is_none() {

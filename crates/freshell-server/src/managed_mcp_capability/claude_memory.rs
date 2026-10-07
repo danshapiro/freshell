@@ -13,6 +13,7 @@ use std::{
 pub(super) fn imports(
     home: &Path,
     roots: &[PathBuf],
+    user_rules: &[PathBuf],
     excluded: &[PathBuf],
 ) -> Result<Vec<PathBuf>, String> {
     let excluded = excluded
@@ -29,9 +30,17 @@ pub(super) fn imports(
         events: 0,
         path_bytes: 0,
         selected: Vec::new(),
+        rule_directories: BTreeSet::new(),
+        rule_entries: 0,
+        rule_path_bytes: 0,
     };
     for root in roots {
         graph.visit(root, 0)?;
+    }
+    // Native user rules use the same Markdown import parser, including
+    // external imports, before conditional rules are activated by the provider.
+    for root in user_rules {
+        graph.visit_rules(root, 0)?;
     }
     Ok(graph.selected)
 }
@@ -46,8 +55,74 @@ struct ImportGraph<'a> {
     events: usize,
     path_bytes: usize,
     selected: Vec<PathBuf>,
+    rule_directories: BTreeSet<PathBuf>,
+    rule_entries: usize,
+    rule_path_bytes: usize,
 }
 impl ImportGraph<'_> {
+    fn visit_rules(&mut self, logical: &Path, depth: usize) -> Result<(), String> {
+        let limits = freshell_platform::provider_environment::CopyLimits::default();
+        let error =
+            |cause: &str| format!("Claude selected user rules {}: {cause}", logical.display());
+        if depth > limits.max_depth {
+            return Err(error("resource depth profile exceeded"));
+        }
+        let source = std::fs::canonicalize(logical)
+            .map_err(|cause| error(&format!("selected directory unavailable: {cause}")))?;
+        if self
+            .excluded
+            .iter()
+            .any(|excluded| source.starts_with(excluded))
+        {
+            return Err(error(
+                "selected private or native-state source cannot become ordinary rules",
+            ));
+        }
+        if self.active.contains(&source) {
+            return Err(error("cyclic selected rules directory"));
+        }
+        if !self.rule_directories.insert(logical.to_owned()) {
+            return Ok(());
+        }
+        self.active.insert(source.clone());
+        let entries = std::fs::read_dir(logical)
+            .map_err(|cause| error(&format!("selected directory unreadable: {cause}")))?;
+        let mut paths = Vec::new();
+        for entry in entries {
+            let path = entry
+                .map_err(|cause| error(&format!("selected directory entry unavailable: {cause}")))?
+                .path();
+            self.rule_entries = self
+                .rule_entries
+                .checked_add(1)
+                .ok_or_else(|| error("resource entry accounting overflow"))?;
+            self.rule_path_bytes = self
+                .rule_path_bytes
+                .checked_add(path.as_os_str().len())
+                .ok_or_else(|| error("resource metadata accounting overflow"))?;
+            if self.rule_entries > limits.max_entries || self.rule_path_bytes > 64 * 1024 * 1024 {
+                return Err(error("resource entry or metadata profile exceeded"));
+            }
+            paths.push(path);
+        }
+        paths.sort();
+        for path in paths {
+            let metadata = std::fs::metadata(&path).map_err(|cause| {
+                error(&format!(
+                    "selected rule {} metadata failed: {cause}",
+                    path.display()
+                ))
+            })?;
+            if metadata.is_dir() {
+                self.visit_rules(&path, depth + 1)?;
+            } else if path.extension().is_some_and(|extension| extension == "md") {
+                self.visit(&path, depth + 1)?;
+            }
+        }
+        self.active.remove(&source);
+        Ok(())
+    }
+
     fn visit(&mut self, logical: &Path, depth: usize) -> Result<(), String> {
         let logical = normalize(logical);
         let error = |cause: &str| format!("Claude memory import {}: {cause}", logical.display());
@@ -284,7 +359,7 @@ mod tests {
             memory.push_str(&format!("@{name}\n"));
         }
         std::fs::write(&root, memory).unwrap();
-        let selected = imports(owned.path(), &[root], &[])
+        let selected = imports(owned.path(), &[root], &[], &[])
             .expect("ordinary references retain the declared source event profile");
         assert_eq!(selected.len(), 129);
         for path in selected {
@@ -311,7 +386,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let selected = imports(&home, &[memory], &[]).unwrap();
+        let selected = imports(&home, &[memory], &[], &[]).unwrap();
         assert_eq!(selected.len(), 2);
         let values = selected
             .iter()
@@ -329,10 +404,10 @@ mod tests {
         let root = owned.path().join("CLAUDE.md");
         let nested = owned.path().join("nested.md");
         std::fs::write(&root, "@nested.md\n").unwrap();
-        let missing = imports(owned.path(), &[root.clone()], &[]).unwrap_err();
+        let missing = imports(owned.path(), &[root.clone()], &[], &[]).unwrap_err();
         assert!(missing.contains("nested.md") && missing.contains("unavailable"));
         std::fs::write(&nested, "@CLAUDE.md\n").unwrap();
-        let cycle = imports(owned.path(), &[root.clone()], &[]).unwrap_err();
+        let cycle = imports(owned.path(), &[root.clone()], &[], &[]).unwrap_err();
         assert!(cycle.contains("cyclic"));
         assert_eq!(std::fs::read_to_string(root).unwrap(), "@nested.md\n");
         assert_eq!(std::fs::read_to_string(nested).unwrap(), "@CLAUDE.md\n");

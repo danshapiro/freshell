@@ -26,6 +26,7 @@ pub(super) fn prepare(
     let mut configurations = Vec::new();
     let mut resources = Vec::new();
     let mut memory = Vec::new();
+    let mut user_rules = Vec::new();
     if let Some(selected) = &manifest.settings_file {
         let origin = canonical(selected)?;
         if !std::fs::metadata(&origin).is_ok_and(|metadata| metadata.is_file()) {
@@ -75,6 +76,8 @@ pub(super) fn prepare(
         if optional(&logical)? {
             if relative == "CLAUDE.md" {
                 memory.push(logical.clone());
+            } else if relative == "rules" {
+                user_rules.push(logical.clone());
             }
             resources.push(logical);
         }
@@ -125,7 +128,7 @@ pub(super) fn prepare(
         canonical(plugin)?; // Explicit selections may never be silently omitted.
         resources.push(plugin.clone());
     }
-    for imported in super::claude_memory::imports(&manifest.original_home, &memory, excluded).inspect_err(|error| {
+    for imported in super::claude_memory::imports(&manifest.original_home, &memory, &user_rules, excluded).inspect_err(|error| {
         tracing::warn!(event="provider.inputs.preparation.blocked",provider="claude",stage="controller",operation="select_memory_imports",reason=%error,"Selected Claude memory imports could not be prepared");
     })? {
         if !resources.iter().any(|root| imported.starts_with(root)) {
@@ -241,6 +244,60 @@ mod tests {
         claude_inputs::ClaudeSettingSource,
         provider_environment::{copy_environment, CopyLimits},
     };
+
+    #[test]
+    fn managed_provider_claude_selected_user_rules_keep_external_imports() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let rules = home.join(".claude/rules/nested");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let rule = rules.join("policy.md");
+        let raw = "@../../../rule-memory.md\n`@../../../missing-inline.md`\n```\n@../../../missing-fence.md\n```\n";
+        std::fs::write(&rule, raw).unwrap();
+        std::fs::write(home.join("rule-memory.md"), "@./adjacent-memory.md\n").unwrap();
+        std::fs::write(home.join("adjacent-memory.md"), "selected-rule-resource").unwrap();
+        let selected = prepare(&home, &cwd, &cwd, None, &[]).unwrap();
+        let stage = owned.path().join("stage");
+        copy_environment(&selected.selections, &stage, &[], CopyLimits::default()).unwrap();
+        let target = Path::new("/home/freshell/provider/adjacent-memory.md");
+        let imported = selected
+            .mounts
+            .iter()
+            .find(|mount| Path::new(&mount.logical_destination) == target)
+            .expect("selected native user rule imports must enter the ordinary graph");
+        let output = std::process::Command::new("node")
+            .args([
+                "-e",
+                "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))",
+            ])
+            .arg(stage.join(&imported.stage_relative_path))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"selected-rule-resource");
+        assert_eq!(std::fs::read_to_string(&rule).unwrap(), raw);
+        // A failed next preparation cannot change the complete prior stage.
+        std::fs::write(&rule, "@../../../missing-selected-rule.md\n").unwrap();
+        let failed = prepare(&home, &cwd, &cwd, None, &[]).err().unwrap();
+        assert!(failed.contains("missing-selected-rule.md"));
+        assert_eq!(
+            std::fs::read(stage.join(&imported.stage_relative_path)).unwrap(),
+            b"selected-rule-resource"
+        );
+        std::fs::write(&rule, raw).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&rules, rules.join("cycle")).unwrap();
+            let failed = prepare(&home, &cwd, &cwd, None, &[]).err().unwrap();
+            assert!(failed.contains("cyclic selected rules directory"));
+            assert_eq!(
+                std::fs::read(stage.join(&imported.stage_relative_path)).unwrap(),
+                b"selected-rule-resource"
+            );
+        }
+    }
 
     #[test]
     fn managed_provider_claude_disabled_sources_do_not_traverse_or_copy_unselected_memory() {
