@@ -10,15 +10,16 @@ import { expect, type Page } from '@playwright/test'
 import { test } from '../helpers/fixtures.js'
 import {
   ManagedRuntimeBrowserRig,
+  createManagedRuntimeBrowserRig,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
   type SyntheticOpenCodeSourceFacts,
+  type ManagedFixtureRig,
 } from '../helpers/managed-runtime.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { OPENCODE_NATIVE_HISTORY_SCRIPT } from '../helpers/opencode-native-history.js'
 
 function leavesByMode(node: any, mode: string): any[] {
   if (!node) return []
@@ -106,11 +107,11 @@ type NativeDigests = {
   parts: Record<string, string>
 }
 
-async function providerHistoryDigests(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): Promise<NativeDigests> {
+async function providerHistoryDigests(rig: ManagedFixtureRig, view: ManagedRuntimeView): Promise<NativeDigests> {
   return rig.syntheticOpenCodeHistoryFacts(rig.exactRuntimeHandle(view))
 }
 
-async function assertExcludedSentinelsAbsent(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): Promise<void> {
+async function assertExcludedSentinelsAbsent(rig: ManagedFixtureRig, view: ManagedRuntimeView): Promise<void> {
   const matches = await rig.syntheticOpenCodeExcludedSentinels(rig.exactRuntimeHandle(view))
   expect(matches).toEqual([])
 }
@@ -338,10 +339,10 @@ test.describe('managed OpenCode source-to-soul resume', () => {
     // recovery proof below does not submit a prompt. Set the separate
     // FOLLOWUP opt-in only when a synthetic provider turn is specifically
     // needed.
-    test.skip(process.env.FRESHELL_RUNTIME_SYNTHETIC_RESUME !== '1', 'requires approved local Docker synthetic-resume run')
+    test.skip(process.env.FRESHELL_RUNTIME_SYNTHETIC_RESUME !== '1', 'requires owned synthetic-resume opt-in')
     test.setTimeout(900_000)
 
-    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3)
+    const rig = createManagedRuntimeBrowserRig(process.cwd(), 3)
     try {
       const source = await rig.prepareSyntheticOpenCodeSource()
       const nonce = source.nonce
@@ -407,26 +408,18 @@ test.describe('managed OpenCode source-to-soul resume', () => {
         await page.keyboard.insertText(`Reply with exactly SYNTHETIC_FOLLOWUP_${nonce} and use no tools.`)
         await page.keyboard.press('Enter')
         const nativeFollowup = await waitForValue('completed synthetic follow-up in native history', async () => {
-          const raw = (await rig.ownedProviderExec(before.containerId!, [
-            'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
-            '/home/freshell/provider/.local/share/opencode/opencode.db', source.rootId,
-          ]))
-          const history = JSON.parse(raw) as { turns: Array<{ messageId: string; text: string; toolCalls: unknown[] }> }
-          return history.turns.find((turn) =>
-            !(turn.messageId in source.baselineMessages)
-              && turn.toolCalls.length === 0
-              && turn.text.includes(`SYNTHETIC_FOLLOWUP_${nonce}`)) ?? null
+          return rig.syntheticOpenCodeFollowUpMessageId(rig.exactRuntimeHandle(before))
         }, 180_000)
-        expect(nativeFollowup.messageId).toBeTruthy()
-        expectedTailMessageId = nativeFollowup.messageId
+        expect(nativeFollowup).toBeTruthy()
+        expectedTailMessageId = nativeFollowup
         appended = await waitForValue('native follow-up append', async () => {
           const snapshot = (await providerHistoryDigests(rig, before))
-          return snapshot.messages[nativeFollowup.messageId] ? snapshot : null
+          return snapshot.messages[nativeFollowup] ? snapshot : null
         }, 180_000)
         assertBaselinePreserved(source, appended)
       }
 
-      rig.runtime.killOwnedRuntimeExact(before.containerId!)
+      await rig.crashRuntimeHost(rig.exactRuntimeHandle(before))
       const reopened = await waitForValue('same soul reopened after provider loss', async () => {
         const view = await rig.runningViewForTerminal(terminalId)
         return view?.containerId && view.hostBootId && view.incarnationId !== before.incarnationId ? view : null
@@ -463,7 +456,7 @@ test.describe('managed OpenCode source-to-soul resume', () => {
       // The host copy remains the original source; managed turns are never
       // written back into that store.
       expect((await rig.syntheticOpenCodeSourceFacts()).rootMessageCount).toBe(106)
-      expect(rig.runtime.broker.unsafeAttempts()).toHaveLength(0)
+      expect((await rig.chaosHostFacts(rig.exactRuntimeHandle(reopened))).unsafeBrokerAttempts).toBe(0)
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)

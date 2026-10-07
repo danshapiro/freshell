@@ -698,6 +698,9 @@ export class ExternalManagedRuntimeRig {
       || (status.data.observation.rootSessionId === handle.nativeSessionId
         && status.data.observation.incarnationId === handle.incarnationId), 'source adoption differs from the exact address'), { handle })
   }
+  async syntheticOpenCodeFollowUpMessageId(handle: ExactRuntimeHandle): Promise<string | null> {
+    return this.rpc('synthetic-source-follow-up', z.string().min(1).nullable(), { handle })
+  }
   async inventorySnapshot(): Promise<ManagedRuntimeInventorySnapshot> {
     return this.rpc('inventory-snapshot', ManagedRuntimeInventorySnapshotSchema)
   }
@@ -950,6 +953,7 @@ export function createExternalRuntimeControl(
       case 'synthetic-source-history': result = await owner.syntheticOpenCodeHistoryFacts(handle()); break
       case 'synthetic-source-exclusions': result = await owner.syntheticOpenCodeExcludedSentinels(handle()); break
       case 'synthetic-source-adoption': result = await owner.syntheticOpenCodeAdoptionStatus(handle()); break
+      case 'synthetic-source-follow-up': result = await owner.syntheticOpenCodeFollowUpMessageId(handle()); break
       case 'inventory-snapshot': result = await owner.inventorySnapshot(); break
       case 'control-epoch': result = await owner.controlEpoch(); break
       case 'managed-opt-in':

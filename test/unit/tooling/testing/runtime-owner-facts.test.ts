@@ -19,6 +19,28 @@ const handle = {
 }
 
 describe('owner-side synthetic OpenCode source preparation', () => {
+  it('returns only a new matching no-tool follow-up ID from the existing private native history', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    try {
+      const source = await rig.prepareSyntheticOpenCodeSource()
+      const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha, nativeSessionId: source.rootId }
+      const marker = `SYNTHETIC_FOLLOWUP_${source.nonce}`
+      const turns = [
+        { messageId: source.lastMessageId, text: marker, toolCalls: [] },
+        { messageId: 'new-tool-turn', text: marker, toolCalls: [{ id: 'tool-call' }] },
+        { messageId: 'other-marker-turn', text: 'other synthetic marker', toolCalls: [] },
+        { messageId: 'new-matching-turn', text: marker, toolCalls: [] },
+      ]
+      const probe = vi.spyOn(rig, 'ownedProviderExec').mockResolvedValue(JSON.stringify({ turns }))
+      await expect(rig.syntheticOpenCodeFollowUpMessageId(current)).resolves.toBe('new-matching-turn')
+      probe.mockResolvedValue(JSON.stringify({ turns: turns.slice(0, 3) }))
+      await expect(rig.syntheticOpenCodeFollowUpMessageId(current)).resolves.toBeNull()
+    } finally { vi.unstubAllEnvs(); await rig.stop() }
+  })
+
   it('binds the existing authenticated adoption result to the registered source and current native address', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
     vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })

@@ -664,6 +664,20 @@ describe('closed external owner control', () => {
     read.mockResolvedValue({ state: 'observed', data: { observation: { ...observation, rootSessionId: 'foreign-root' } } })
     await expect(rig.syntheticOpenCodeAdoptionStatus(address)).rejects.toThrow(/invalid/)
   })
+  it('returns only the fixed source follow-up ID or no match through the owner', async () => {
+    const { owned, context } = fixture()
+    const address = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-source-soul',
+      incarnationId: 'owned-source-incarnation', containerId: 'c'.repeat(64), hostBootId: 'owned-source-boot', nativeSessionId: 'owned-source-root' }
+    const read = vi.spyOn(owned, 'syntheticOpenCodeFollowUpMessageId').mockResolvedValue('actual-matching-message')
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.syntheticOpenCodeFollowUpMessageId(address)).resolves.toBe('actual-matching-message')
+    expect(read).toHaveBeenCalledWith(address)
+    read.mockResolvedValue(null)
+    await expect(rig.syntheticOpenCodeFollowUpMessageId(address)).resolves.toBeNull()
+  })
   it('routes exact inventory observations and binds the reply to run, candidate and operation', async () => {
     const { owned, context, inventory, request } = fixture()
     const control = runner.createExternalRuntimeControl(owned, context)

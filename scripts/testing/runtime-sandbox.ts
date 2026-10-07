@@ -616,6 +616,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'synthetic-source-facts',
     'synthetic-source-history', 'synthetic-source-exclusions',
     'synthetic-source-adoption',
+    'synthetic-source-follow-up',
     'retained-start', 'retained-status', 'retained-observed', 'retained-finish',
   ]),
   handle: z.object({
@@ -2702,6 +2703,19 @@ export class ManagedRuntimeOwner {
       throw new Error('registered source adoption observation belongs to another root')
     }
     return status
+  }
+
+  async syntheticOpenCodeFollowUpMessageId(handle: ExactRuntimeHandle): Promise<string | null> {
+    await this.assertSyntheticOpenCodeSourceHandle(handle)
+    const fixture = this.syntheticSource
+    if (!fixture) throw new Error('registered synthetic source required')
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
+      '/home/freshell/provider/.local/share/opencode/opencode.db', handle.nativeSessionId])
+    const history = z.object({ turns: z.array(z.object({ messageId: z.string().min(1), text: z.string(),
+      toolCalls: z.array(z.unknown()) }).passthrough()) }).passthrough().parse(JSON.parse(raw))
+    const turn = history.turns.find(candidate => !fixture.source.baselineMessages.has(candidate.messageId)
+      && candidate.toolCalls.length === 0 && candidate.text.includes(`SYNTHETIC_FOLLOWUP_${fixture.nonce}`))
+    return turn?.messageId ?? null
   }
 
   async start(): Promise<RuntimeWebInfo> {
