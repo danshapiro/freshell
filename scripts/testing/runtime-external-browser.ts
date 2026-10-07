@@ -22,7 +22,7 @@ import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
-import type { NativeChallengeKind, NativeToolEvidence } from './runtime-sandbox.js'
+import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -714,6 +714,10 @@ export class ExternalManagedRuntimeRig {
   async registerNativeChallenge(handle: ExactRuntimeHandle, kind: NativeChallengeKind): Promise<{ challengeId: string }> {
     return this.rpc('native-challenge-register', z.object({ challengeId: z.string().uuid() }).strict(), { handle, challengeId: kind })
   }
+  async createSyntheticOpenCodeChallenge(handle: ExactRuntimeHandle): Promise<SyntheticOpenCodeChallenge> {
+    return this.rpc('synthetic-history-challenge', z.object({ challengeId: z.string().uuid(),
+      nativeSessionId: z.literal(handle.nativeSessionId), messageId: z.string().min(1), toolPartId: z.string().min(1) }).strict(), { handle })
+  }
   async nativeToolEvidence(handle: ExactRuntimeHandle, challengeId: string): Promise<NativeToolEvidence> {
     return this.rpc('native-tool-evidence', z.object({ requestIds: z.array(z.string().min(1)), resultIds: z.array(z.string().min(1)),
       replayCount: z.number().int().nonnegative() }).strict(), { handle, challengeId })
@@ -926,6 +930,7 @@ export function createExternalRuntimeControl(
         if (request.challengeId !== 'chaos-approval' && request.challengeId !== 'chaos-long-tool' && request.challengeId !== 'chaos-follow-up') throw new Error('registered native challenge kind required')
         result = await owner.registerNativeChallenge(handle(), request.challengeId)
         break
+      case 'synthetic-history-challenge': result = await owner.createSyntheticOpenCodeChallenge(handle()); break
       case 'native-tool-evidence':
         if (!request.challengeId) throw new Error('registered native challenge required')
         result = await owner.nativeToolEvidence(handle(), request.challengeId)
@@ -1387,20 +1392,22 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     const security = JSON.parse(execFileSync('docker', ['info', '--format', '{{json .SecurityOptions}}'], { encoding: 'utf8' }))
     if (!Array.isArray(security) || !security.includes('name=rootless')) throw new Error('owned runtime Docker daemon is not rootless')
     const fixture = path.basename(selection.spec) === 'runtime-fresh-agent-fixture-rust.spec.ts'
+    const smoke = path.basename(selection.spec) === 'runtime-external-target-smoke-rust.spec.ts'
+    const deterministic = fixture || smoke
     const retainedSelection = path.basename(selection.spec) === 'runtime-managed-provider-qualification-rust.spec.ts'
       && this.environment.FRESHELL_RUNTIME_SYNTHETIC_RESUME === '1'
     const retainedArtifacts = retainedSelection ? readRetainedArtifacts(this.environment.FRESHELL_TASK002_FIXTURE_ARTIFACT_MANIFEST,
       root, execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()) : undefined
-    const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : selection.mode ? [selection.mode] : []
-    const providers = fixture || selection.mode ? [] : selection.provider ? [selection.provider] : ['opencode']
-    const phase = fixture ? 3 : selection.provider || selection.mode ? 5
+    const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : smoke ? ['freshopencode'] : selection.mode ? [selection.mode] : []
+    const providers = deterministic || selection.mode ? [] : selection.provider ? [selection.provider] : ['opencode']
+    const phase = deterministic ? 3 : selection.provider || selection.mode ? 5
       : path.basename(selection.spec).includes('resurrection') ? 3
         : path.basename(selection.spec).includes('rehydrate') ? 4
           : /chaos|lost-soul/.test(selection.spec) ? 5 : 2
     this.owner = new ManagedRuntimeOwner(options => new ManagedRuntimeWebServer({ ...options, preserveHomeOnStop: false }), root, phase,
-      {}, {}, fixture ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
-        fixtureFreshAgentModes: fixture ? modes : [] }, undefined, {
-        bootstrapProviders: fixture || retainedArtifacts ? [] : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
+      {}, {}, deterministic ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
+        fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
+        bootstrapProviders: deterministic || retainedArtifacts ? [] : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
       })
     execFileSync('pnpm', ['run', 'build:client'], { cwd: root, stdio: 'inherit' })
     execFileSync('pnpm', ['run', 'build:tools'], { cwd: root, stdio: 'inherit' })

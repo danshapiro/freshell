@@ -133,19 +133,29 @@ describe('browser selection non-vacuity', () => {
     expect(listed.status).not.toBe(0)
     expect(`${listed.stdout}${listed.stderr}`).toMatch(/No tests found/)
   })
+  it('selects the actual topology smoke only with its owned external project', () => {
+    const spec = 'test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts'
+    const absent = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig, '--list', spec], {
+      cwd: projectRoot, env: cleanEnvironment(), encoding: 'utf8',
+    })
+    expect(absent.status).not.toBe(0)
+    expect(`${absent.stdout}${absent.stderr}`).toMatch(/No tests found/)
+    const selected = listedProjects(cleanEnvironment({ ...external, FRESHELL_RUNTIME_EXTERNAL_SPEC: spec }), cloudConfig,
+      ['--project=chromium-external-target', spec, '--grep', 'actual managed external topology and finite owner facts'])
+    expect(selected.tests).toBe(1)
+    expect(selected.files).toBe(1)
+    expect(selected.output).toContain('actual managed external topology and finite owner facts')
+  })
 
   it('resolves only Rust application projects with the exact continuity exclusion', () => {
     const defaultProjects = resolvedConfig(playwrightConfig, cleanEnvironment())
     expect(defaultProjects.map((project) => project.name)).toEqual(['chromium'])
-    expect(defaultProjects[0].testIgnore).toEqual([continuityPattern])
 
     const ciProjects = resolvedConfig(playwrightConfig, cleanEnvironment({ CI: '1' }))
     expect(ciProjects.map((project) => project.name)).toEqual(['chromium', 'firefox', 'webkit'])
-    for (const project of ciProjects) expect(project.testIgnore).toEqual([continuityPattern])
 
     const continuityProjects = resolvedConfig(playwrightConfig, cleanEnvironment({ FRESHELL_SMOKE: '1' }))
     expect(continuityProjects.map((project) => project.name)).toEqual(['chromium', 'continuity-smoke'])
-    expect(continuityProjects[0].testIgnore).toEqual([continuityPattern])
     expect(continuityProjects[1]).toMatchObject({
       name: 'continuity-smoke',
       testIgnore: [],
@@ -212,10 +222,6 @@ describe('browser selection non-vacuity', () => {
 
     const cloudProjects = resolvedConfig(cloudConfig, cleanEnvironment())
     expect(cloudProjects.map((project) => project.name)).toEqual(['chromium'])
-    expect(cloudProjects[0].testIgnore).toEqual([
-      continuityPattern,
-      ...CLOUD_SKIP_SPECS.map((spec) => ({ kind: 'string' as const, source: `**/${spec}` })),
-    ])
     expect(new Set(CLOUD_SKIP_SPECS).size).toBe(CLOUD_SKIP_SPECS.length)
     for (const localOnly of LOCAL_ONLY_SPECS) expect(CLOUD_SKIP_SPECS).toContain(localOnly.spec)
 

@@ -13,7 +13,7 @@ if (managedExternal) {
 
 /** Match-all browser projects exclude only the separately selected live-CLI smoke. */
 export const CONTINUITY_SMOKE_SPEC = /continuity-smoke\.spec\.ts$/
-export const MATCH_ALL_TEST_IGNORE = [CONTINUITY_SMOKE_SPEC]
+export const MATCH_ALL_TEST_IGNORE = [CONTINUITY_SMOKE_SPEC, /runtime-external-target-smoke-rust\.spec\.ts$/]
 
 /**
  * These specs require local provider binaries or a host Docker supervisor.

@@ -688,6 +688,29 @@ describe('closed external owner control', () => {
       .resolves.toMatchObject({ result: { requestIds: ['tool-actual'], resultIds: ['tool-actual'], replayCount: 0 } })
     expect(exec).toHaveBeenCalledExactlyOnceWith(handle.containerId, expect.arrayContaining(['challenge-owned-native', 'p5-chaos-approval-count']))
   })
+  it('creates synthetic history only for the registered OpenCode fixture and returns observed row identities', async () => {
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3, {}, {}, 'test', {
+      enabledProviders: [], freshAgentModes: ['freshopencode'], fixtureFreshAgentModes: ['freshopencode'],
+    })
+    const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'synthetic-owned-soul',
+      incarnationId: 'synthetic-owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'synthetic-owned-boot', nativeSessionId: 'synthetic-owned-native' }
+    vi.spyOn(owned, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const worker = vi.spyOn(owned, 'fixtureWorkerFacts').mockResolvedValue({ provider: 'codex', workerPid: 42 })
+    vi.spyOn(owned, 'fixtureNativeState').mockResolvedValue({ nativeSessionId: handle.nativeSessionId, pendingDecisionId: null, dispatchCount: 1, completionCount: 1 })
+    const exec = vi.spyOn(owned, 'ownedProviderExec').mockResolvedValue(JSON.stringify({ nativeSessionId: handle.nativeSessionId,
+      messageId: 'observed-message', toolPartId: 'observed-tool' }))
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const request = { runId: context.runId, candidateSha: context.candidateSha, scenarioId: 'browser-managed-runtime',
+      operationId: 'synthetic-fixture', action: 'synthetic-history-challenge', handle }
+    await expect(control(request)).rejects.toThrow(/OpenCode|opencode|operation/)
+    expect(exec).not.toHaveBeenCalled()
+    worker.mockResolvedValue({ provider: 'opencode', workerPid: 42 })
+    const result = await control({ ...request, operationId: 'synthetic-valid' })
+    expect(result).toMatchObject({ result: { nativeSessionId: handle.nativeSessionId, messageId: 'observed-message', toolPartId: 'observed-tool' } })
+    expect(exec).toHaveBeenCalledTimes(2)
+    await expect(control({ ...request, operationId: 'synthetic-forged', sql: 'select anything' })).rejects.toThrow(/operation/)
+  })
 })
 
 describe('external finite fixture client', () => {

@@ -123,6 +123,33 @@ const NativeChallengeMarkers: Record<NativeChallengeKind, string> = {
   'chaos-approval': 'p5-chaos-approval-count', 'chaos-long-tool': 'p5-chaos-long-tool-count',
   'chaos-follow-up': 'P5_CHAOS_FOLLOWUP',
 }
+export type SyntheticOpenCodeChallenge = { challengeId: string; nativeSessionId: string; messageId: string; toolPartId: string }
+const SYNTHETIC_OPENCODE_CHALLENGE_SCRIPT = String.raw`
+const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
+const [root, projectId, workspace, marker] = process.argv.slice(1);
+const database = '/home/freshell/provider/.local/share/opencode/opencode.db';
+const db = new DatabaseSync(database);
+try {
+  db.exec('BEGIN IMMEDIATE');
+  if (db.prepare('SELECT id FROM session WHERE id = ?').all(root).length) throw new Error('synthetic root already exists');
+  db.prepare('INSERT INTO project (id,worktree,time_created,time_updated,sandboxes) VALUES (?,?,?,?,?)').run(projectId,workspace,1,1,'[]');
+  db.prepare('INSERT INTO project_directory (project_id,directory,time_created) VALUES (?,?,?)').run(projectId,workspace,1);
+  db.prepare('INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) VALUES (?,?,?,?,?,?,?,?)').run(root,projectId,'fixture',workspace,'Task008 synthetic challenge','1.18.21',1,1);
+  const messageId='msg_'+projectId, toolPartId='prt_tool_'+projectId;
+  db.prepare('INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)').run(messageId,root,1,1,
+    JSON.stringify({role:'assistant',time:{created:1,completed:2},providerID:'synthetic-fixture',modelID:'synthetic-fixture'}));
+  const part=db.prepare('INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)');
+  part.run('prt_text_'+projectId,messageId,root,1,1,JSON.stringify({type:'text',text:marker+' synthetic owner-only challenge'}));
+  part.run(toolPartId,messageId,root,2,2,JSON.stringify({type:'tool',tool:'synthetic-fixture',state:{status:'completed',input:{marker}}}));
+  db.exec('COMMIT');
+  const session=db.prepare('SELECT id FROM session WHERE id = ?').get(root);
+  const message=db.prepare('SELECT id FROM message WHERE session_id = ?').get(root);
+  const tool=db.prepare('SELECT id FROM part WHERE session_id = ? AND id = ?').get(root,toolPartId);
+  process.stdout.write(JSON.stringify({nativeSessionId:session.id,messageId:message.id,toolPartId:tool.id}));
+} catch(error) { try {db.exec('ROLLBACK')} catch {} throw error }
+finally {db.close()}
+`
 
 export const OPENCODE_TOOL_EVIDENCE_SCRIPT = String.raw`
 const fs = require('node:fs');
@@ -279,6 +306,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'replace-web', 'replace-supervisor', 'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
     'native-challenge-register',
+    'synthetic-history-challenge',
     'retained-start', 'retained-status', 'retained-observed', 'retained-finish',
   ]),
   handle: z.object({
@@ -2528,6 +2556,24 @@ export class ManagedRuntimeOwner {
     this.nativeChallenges.set(challengeId, { soulId: handle.soulId, nativeSessionId: handle.nativeSessionId,
       marker: NativeChallengeMarkers[kind] })
     return { challengeId }
+  }
+
+  async createSyntheticOpenCodeChallenge(handle: ExactRuntimeHandle): Promise<SyntheticOpenCodeChallenge> {
+    if (!this.fixtureFreshAgentModes.includes('freshopencode')) throw new Error('registered synthetic OpenCode fixture required')
+    const worker = await this.fixtureWorkerFacts(handle)
+    if (worker.provider !== 'opencode') throw new Error('registered synthetic OpenCode worker required')
+    await this.fixtureNativeState(handle)
+    const challengeId = randomUUID(), marker = `task008-synthetic-${challengeId}`
+    this.nativeChallenges.set(challengeId, { soulId: handle.soulId, nativeSessionId: handle.nativeSessionId, marker })
+    // Initialize the installed CLI's actual schema without dispatching a turn.
+    await this.ownedProviderExec(handle.containerId, ['env', 'XDG_DATA_HOME=/home/freshell/provider/.local/share',
+      'OPENCODE_DISABLE_DEFAULT_PLUGINS=1', 'OPENCODE_DISABLE_MODELS_FETCH=1', 'OPENCODE_DISABLE_AUTOUPDATE=1',
+      'opencode', 'session', 'list', '--format', 'json'])
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', SYNTHETIC_OPENCODE_CHALLENGE_SCRIPT,
+      handle.nativeSessionId, `task008_${challengeId.replaceAll('-', '')}`, this.repoRoot, marker])
+    const rows = z.object({ nativeSessionId: z.literal(handle.nativeSessionId), messageId: z.string().min(1),
+      toolPartId: z.string().min(1) }).strict().parse(JSON.parse(raw))
+    return { challengeId, ...rows }
   }
 
   private async nativeChallengeMarker(handle: ExactRuntimeHandle, challengeId: string): Promise<string> {
