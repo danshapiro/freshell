@@ -400,6 +400,18 @@ function fixture() {
 }
 
 describe('exact owned runtime facts', () => {
+  it('reads only the unique running incarnation when stopped history belongs to the same soul', async () => {
+    const { adapter, read, row } = fixture()
+    const prior = { ...row, incarnationId: 'prior-incarnation', containerId: 'c'.repeat(64), hostBootId: 'prior-boot', launchState: 'stopped' }
+    adapter.inventory.mockResolvedValue([prior, row])
+    await expect(owner.readExactRuntimeHostFacts(adapter, handle)).resolves.toMatchObject({ workerPid: 42 })
+    expect(read).toHaveBeenCalledExactlyOnceWith(handle)
+    read.mockClear()
+    vi.spyOn(adapter, 'receipts').mockReturnValue([prior, row])
+    await expect(owner.readExactRuntimeHostFacts(adapter, { ...handle, incarnationId: prior.incarnationId,
+      containerId: prior.containerId, hostBootId: prior.hostBootId })).rejects.toThrow(/current/)
+    expect(read).not.toHaveBeenCalled()
+  })
   it.each(['launchState', 'incarnationId', 'containerId', 'hostBootId', 'nativeSessionId'] as const)(
     'identifies the changed %s before reading owner facts', async field => {
     const { adapter, read, row } = fixture()
@@ -743,6 +755,17 @@ describe('current handle admission before owner mutation', () => {
     const { rig, current, kill } = rigFixture()
     await rig.crashRuntimeHost(current)
     expect(kill).toHaveBeenCalledExactlyOnceWith(current.containerId)
+  })
+  it('keeps stopped history out of current address and fixture-registration selection', async () => {
+    const { rig, current, row } = rigFixture()
+    const prior = { ...row, incarnationId: 'prior-incarnation', containerId: 'c'.repeat(64), hostBootId: 'prior-boot',
+      launchState: 'stopped', freshAgentSessionType: 'freshclaude', provider: 'claude' }
+    vi.spyOn(rig, 'inventory').mockResolvedValue([prior, row])
+    await expect(rig.providerVolumeFacts(current)).resolves.toEqual({ providerVolumeName: 'volume-owned' })
+    const state = { nativeSessionId: current.nativeSessionId, pendingDecisionId: 'pending-owned', dispatchCount: 2, completionCount: 1 }
+    const read = vi.spyOn(rig.runtime, 'fixtureNativeState').mockResolvedValue(state)
+    await expect(rig.fixtureNativeState(current)).resolves.toEqual(state)
+    expect(read).toHaveBeenCalledExactlyOnceWith(rig.supervisor, current)
   })
   it('refuses stale incarnation and boot before signalling a host', async () => {
     const { rig, current, row, kill } = rigFixture()

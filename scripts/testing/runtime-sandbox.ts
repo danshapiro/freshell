@@ -732,7 +732,7 @@ export async function assertExactRuntimeHandle(
     && receipt.soulId === handle.soulId && receipt.incarnationId === handle.incarnationId)) {
     throw new Error('runtime handle has no exact owned broker receipt')
   }
-  const rows = (await owner.inventory()).filter((row) => row.soulId === handle.soulId)
+  const rows = (await owner.inventory()).filter((row) => row.soulId === handle.soulId && row.launchState !== 'stopped')
   const row = rows[0]
   const mismatches: z.infer<typeof RuntimeHandleMismatchFieldsSchema> = []
   if (rows.length !== 1) mismatches.push('inventoryMembership')
@@ -3048,7 +3048,7 @@ export class ManagedRuntimeOwner {
     return {
       runId: this.runtime.runId, candidateSha: this.runtime.candidateSha,
       inventory: async () => {
-        const rows = (await this.inventory()).filter(row => row.soulId === handle.soulId)
+        const rows = (await this.inventory()).filter(row => row.soulId === handle.soulId && row.launchState !== 'stopped')
         if (rows.length !== 1) throw new Error('exact current runtime inventory is absent or ambiguous')
         return rows.flatMap(row => row.containerId && row.hostBootId && row.nativeSessionId
           ? [{ ...row, containerId: row.containerId, hostBootId: row.hostBootId, nativeSessionId: row.nativeSessionId }]
@@ -3072,7 +3072,7 @@ export class ManagedRuntimeOwner {
   }
 
   private async currentRuntimeEnclosure(handle: RuntimeEnclosureHandle): Promise<ManagedRuntimeView> {
-    const rows = (await this.inventory()).filter(view => view.soulId === handle.soulId)
+    const rows = (await this.inventory()).filter(view => view.soulId === handle.soulId && view.launchState !== 'stopped')
     const row = rows[0]
     if (handle.runId !== this.runtime.runId || handle.candidateSha !== this.runtime.candidateSha || rows.length !== 1
       || row.launchState !== 'running' || row.incarnationId !== handle.incarnationId
@@ -3152,7 +3152,7 @@ export class ManagedRuntimeOwner {
 
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {
     await this.assertCurrentHandle(handle)
-    const row = (await this.inventory()).find(view => view.soulId === handle.soulId)
+    const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
     const facts = row?.freshAgentSessionType
       ? await this.freshAgentLaunchFacts(this.runtimeEnclosureHandle(handle))
       : await this.chaosHostFacts(handle)
@@ -3247,7 +3247,7 @@ export class ManagedRuntimeOwner {
 
   async fixtureWorkerFacts(handle: ExactRuntimeHandle): Promise<{ provider: string; workerPid: number }> {
     await this.assertCurrentHandle(handle)
-    const row = (await this.inventory()).find(view => view.soulId === handle.soulId)
+    const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
     if (!row?.freshAgentSessionType || !row.provider || !this.fixtureFreshAgentModes.includes(row.freshAgentSessionType)) {
       throw new Error('registered deterministic fresh-agent fixture required')
     }
@@ -3274,7 +3274,7 @@ export class ManagedRuntimeOwner {
   }
 
   async fixtureNativeState(handle: ExactRuntimeHandle): Promise<FixtureNativeState> {
-    const row = (await this.inventory()).find((view) => view.soulId === handle.soulId)
+    const row = (await this.inventory()).find((view) => view.soulId === handle.soulId && view.launchState === 'running')
     if (!row?.freshAgentSessionType || !this.fixtureFreshAgentModes.includes(row.freshAgentSessionType)) {
       throw new Error('registered deterministic fresh-agent fixture required')
     }
