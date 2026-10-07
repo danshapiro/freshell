@@ -156,7 +156,7 @@ pub async fn prepare_terminal(
             .env
             .remove("OPENCODE_CONFIG_CONTENT")
             .or_else(|| child_env.get("OPENCODE_CONFIG_CONTENT").cloned());
-        if inherited.is_some() || permission.is_some() || has_mcp {
+        if !plan.inline_prepared && (inherited.is_some() || permission.is_some() || has_mcp) {
             let config = freshell_platform::opencode_config::merge_owned_entries(
                 inherited.as_deref(),
                 &plan,
@@ -309,11 +309,12 @@ pub fn prepare_fresh_agent_child_environment(
         .provider_launch_context
         .as_ref()
         .is_some_and(|context| context.mcp_capability.is_some());
-    if child_env.contains_key("OPENCODE_CONFIG_CONTENT") || has_mcp {
+    if !plan.inline_prepared && (child_env.contains_key("OPENCODE_CONFIG_CONTENT") || has_mcp) {
         let normalized = freshell_platform::opencode_config::merge_owned_entries(
             child_env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
             &plan,
             &freshell_platform::opencode_config::OwnedConfigEdits {
+                disable_snapshots: true,
                 freshell_command: has_mcp
                     .then(|| vec!["node".into(), "/opt/freshell-mcp/server.js".into()]),
                 ..Default::default()

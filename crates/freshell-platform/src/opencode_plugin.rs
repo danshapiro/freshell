@@ -166,35 +166,7 @@ pub fn selected_tui_content_bounded(
     {
         plugins.push(serde_json::Value::String(own));
     }
-    struct BoundedView {
-        bytes: Vec<u8>,
-        limit: usize,
-    }
-    impl Write for BoundedView {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self
-                .bytes
-                .len()
-                .checked_add(bytes.len())
-                .is_none_or(|size| size > self.limit)
-            {
-                return Err(std::io::Error::other(
-                    "OpenCode effective TUI source-view profile exceeded",
-                ));
-            }
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut view = BoundedView {
-        bytes: Vec::new(),
-        limit: remaining.min(16 * 1024 * 1024),
-    };
-    serde_json::to_writer(&mut view, &config).map_err(std::io::Error::other)?;
-    String::from_utf8(view.bytes).map_err(std::io::Error::other)
+    crate::opencode_config::serialize_source_view(&config, remaining)
 }
 
 /// Install only the implementation when the controller already prepared the

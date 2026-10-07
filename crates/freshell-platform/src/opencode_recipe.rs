@@ -40,6 +40,8 @@ pub struct SourceManifest {
     pub native_source_flags: Vec<NativeSourceFlag>,
     #[serde(default = "default_rebind_enabled")]
     pub rebind_enabled: bool,
+    #[serde(default)]
+    pub inline_edits: crate::opencode_config::OwnedConfigEdits,
 }
 fn default_rebind_enabled() -> bool {
     true
@@ -72,6 +74,8 @@ pub struct SourceView {
     pub lane: SourceLane,
     pub unexpanded_relative_path: String,
     pub template_relative_path: String,
+    #[serde(default)]
+    pub template_sha256: Option<String>,
     pub generated_name: Option<String>,
     pub occurrences: Vec<ApprovedFileOccurrence>,
     pub referenced_variables: Vec<String>,
@@ -85,6 +89,7 @@ pub struct SourceView {
 pub enum SourceLane {
     Main,
     Tui,
+    Inline,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

@@ -4,14 +4,39 @@ use crate::managed_provider_references::sources::{PlannedSourceOccurrence, Sourc
 use freshell_platform::opencode_recipe::{SelectedSourceFile, SourceManifest, SourceView};
 use std::{collections::BTreeMap, path::Path};
 
+pub(super) fn read_source_view(root: &Path, relative: &str) -> Result<String, String> {
+    use std::io::Read;
+    if Path::new(relative)
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err("accepted source view has an invalid private path".into());
+    }
+    let path = root.join(relative);
+    if !std::fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        || std::fs::canonicalize(&path).map_err(|_| "accepted source view is unavailable")? != path
+    {
+        return Err("accepted source view must be a physical stage file".into());
+    }
+    let mut raw = String::new();
+    std::fs::File::open(path)
+        .map_err(|_| "accepted source view is unavailable")?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_string(&mut raw)
+        .map_err(|_| "accepted source view read failed")?;
+    if raw.len() > 16 * 1024 * 1024 {
+        return Err("accepted source view exceeds 16 MiB".into());
+    }
+    Ok(raw)
+}
+
 pub(super) fn stage(
     root: &Path,
     home: &Path,
     cwd: &Path,
     plan: &[PlannedSourceOccurrence],
-    frozen_inputs: &[String],
-    native_source_flags: &[freshell_platform::opencode_recipe::NativeSourceFlag],
-    rebind_enabled: bool,
+    input: super::OpencodeEphemeralInput<'_>,
 ) -> Result<(), String> {
     let mut manifest = SourceManifest {
         version: 1,
@@ -19,10 +44,11 @@ pub(super) fn stage(
         original_home: home.into(),
         sources: Vec::new(),
         files: Vec::new(),
-        frozen_inputs: frozen_inputs.to_vec(),
+        frozen_inputs: input.frozen_inputs.unwrap_or(&[]).to_vec(),
         user_owns_freshell_mcp: false,
-        native_source_flags: native_source_flags.to_vec(),
-        rebind_enabled,
+        native_source_flags: input.native_source_flags.unwrap_or(&[]).to_vec(),
+        rebind_enabled: input.rebind_enabled.unwrap_or(true),
+        inline_edits: input.inline_edits.cloned().unwrap_or_default(),
     };
     private_directory(&root.join(".freshell/source-views"))?;
     private_directory(&root.join(".freshell/templates"))?;
@@ -75,9 +101,17 @@ pub(super) fn stage(
             lane: match source.source.lane {
                 SourceLane::Main => freshell_platform::opencode_recipe::SourceLane::Main,
                 SourceLane::Tui => freshell_platform::opencode_recipe::SourceLane::Tui,
+                SourceLane::Inline => freshell_platform::opencode_recipe::SourceLane::Inline,
             },
             unexpanded_relative_path: raw,
             template_relative_path: template,
+            template_sha256: Some({
+                use sha2::Digest;
+                format!(
+                    "{:x}",
+                    sha2::Sha256::digest(source.references.template.as_bytes())
+                )
+            }),
             generated_name: source
                 .references
                 .recipes
@@ -128,46 +162,51 @@ pub(super) fn describe(
             .or_default() += 1;
     }
     for (ordinal, occurrence) in plan.iter().enumerate() {
-        if canonical_occurrences[occurrence.source.canonical_source.as_path()] > 1 {
+        if occurrence.source.lane != SourceLane::Inline
+            && canonical_occurrences[occurrence.source.canonical_source.as_path()] > 1
+        {
             return Err(
                 "shared source preparation requires its original-form aliases before publication"
                     .into(),
             );
         }
-        let logical = &occurrence.source.logical_path;
-        let destination = crate::managed_provider_references::sources::runtime_config_destination(
-            home, global, logical,
-        );
-        let effective = if let Ok(relative) = logical.strip_prefix(&global) {
-            let physical = std::fs::canonicalize(root.join(relative))
-                .map_err(|_| "selected global config is unavailable in its private stage")?;
-            let relative = physical
-                .strip_prefix(root)
-                .map_err(|_| "selected global config escaped its owned stage")?;
-            if relative.starts_with(".freshell/resources") {
-                runtime_home.join(relative)
+        if occurrence.source.lane != SourceLane::Inline {
+            let logical = &occurrence.source.logical_path;
+            let destination =
+                crate::managed_provider_references::sources::runtime_config_destination(
+                    home, global, logical,
+                );
+            let effective = if let Ok(relative) = logical.strip_prefix(&global) {
+                let physical = std::fs::canonicalize(root.join(relative))
+                    .map_err(|_| "selected global config is unavailable in its private stage")?;
+                let relative = physical
+                    .strip_prefix(root)
+                    .map_err(|_| "selected global config escaped its owned stage")?;
+                if relative.starts_with(".freshell/resources") {
+                    runtime_home.join(relative)
+                } else {
+                    runtime_home.join(".config/opencode").join(relative)
+                }
             } else {
-                runtime_home.join(".config/opencode").join(relative)
-            }
-        } else {
-            occurrence
-                .source
-                .canonical_source
-                .strip_prefix(home)
-                .map(|relative| runtime_home.join(relative))
-                .unwrap_or_else(|_| occurrence.source.canonical_source.clone())
-        };
-        binds.push(ProviderConfigBind {
-            source_relative_path: format!(".freshell/templates/source-{ordinal}"),
-            logical_destination: destination
-                .to_str()
-                .ok_or("config destination is not UTF-8")?
-                .into(),
-            effective_destination: effective
-                .to_str()
-                .ok_or("config destination is not UTF-8")?
-                .into(),
-        });
+                occurrence
+                    .source
+                    .canonical_source
+                    .strip_prefix(home)
+                    .map(|relative| runtime_home.join(relative))
+                    .unwrap_or_else(|_| occurrence.source.canonical_source.clone())
+            };
+            binds.push(ProviderConfigBind {
+                source_relative_path: format!(".freshell/templates/source-{ordinal}"),
+                logical_destination: destination
+                    .to_str()
+                    .ok_or("config destination is not UTF-8")?
+                    .into(),
+                effective_destination: effective
+                    .to_str()
+                    .ok_or("config destination is not UTF-8")?
+                    .into(),
+            });
+        }
         recipes = recipes
             .checked_add(occurrence.references.recipes.len())
             .ok_or("source recipe count overflow")?;

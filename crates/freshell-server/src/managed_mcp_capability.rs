@@ -46,6 +46,7 @@ pub(crate) struct OpencodeEphemeralInput<'a> {
     pub frozen_inputs: Option<&'a [String]>,
     pub native_source_flags: Option<&'a [freshell_platform::opencode_recipe::NativeSourceFlag]>,
     pub rebind_enabled: Option<bool>,
+    pub inline_edits: Option<&'a freshell_platform::opencode_config::OwnedConfigEdits>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,16 +377,47 @@ async fn apply_prepared_callback(
             .or_else(|| std::env::var(name).ok())
     };
     let selected_sources=accepted_manifest.as_ref().map(|manifest|{
-        manifest.sources.iter().enumerate().map(|(ordinal,source)|{
+        manifest.sources.iter().enumerate().filter(|(_, source)| source.lane != freshell_platform::opencode_recipe::SourceLane::Inline).map(|(ordinal,source)|{
             let canonical=std::fs::canonicalize(&source.logical_path)
                 .map_err(|_|format!("prior selected configuration source {ordinal} is unavailable; repair it before reissue"))?;
             Ok(crate::managed_provider_references::sources::SourceOccurrence {
                 logical_path:source.logical_path.clone(),canonical_source:canonical,
                 lane:match source.lane {freshell_platform::opencode_recipe::SourceLane::Main=>crate::managed_provider_references::sources::SourceLane::Main,
-                    freshell_platform::opencode_recipe::SourceLane::Tui=>crate::managed_provider_references::sources::SourceLane::Tui},
+                    freshell_platform::opencode_recipe::SourceLane::Tui=>crate::managed_provider_references::sources::SourceLane::Tui,
+                    freshell_platform::opencode_recipe::SourceLane::Inline=>crate::managed_provider_references::sources::SourceLane::Inline},
             })
         }).collect::<Result<Vec<_>,String>>()
     }).transpose()?;
+    let inherited_inline = accepted_manifest
+        .as_ref()
+        .map(|manifest| {
+            let mut sources = manifest.sources.iter().filter(|source| {
+                source.lane == freshell_platform::opencode_recipe::SourceLane::Inline
+            });
+            let Some(source) = sources.next() else {
+                return Ok(None);
+            };
+            if sources.next().is_some()
+                || source.logical_path != Path::new("OPENCODE_CONFIG_CONTENT")
+            {
+                return Err("accepted inline source identity is invalid".to_string());
+            }
+            let context = callback
+                .prior_context
+                .as_ref()
+                .ok_or("accepted inline source has no prior context")?;
+            let root = staged_provider_root_path(
+                directory,
+                &context
+                    .mcp_capability
+                    .as_ref()
+                    .ok_or("accepted inline source has no generation")?
+                    .grant_id,
+            )?;
+            source_stage::read_source_view(&root, &source.unexpanded_relative_path).map(Some)
+        })
+        .transpose()?
+        .flatten();
     let prepared = crate::managed_provider_references::prepare_managed_opencode_with_publisher(
         crate::managed_provider_references::OpencodePreparation {
             client,
@@ -409,6 +441,10 @@ async fn apply_prepared_callback(
             rebind_enabled: accepted_manifest
                 .as_ref()
                 .map(|manifest| manifest.rebind_enabled),
+            inherited_inline,
+            inline_edits: accepted_manifest
+                .as_ref()
+                .map(|manifest| manifest.inline_edits.clone()),
         },
         |soul, home, context, input| {
             let input = OpencodeEphemeralInput {
@@ -1227,9 +1263,7 @@ fn stage_provider_root(
                 home,
                 opencode_input.cwd.ok_or("source plan requires cwd")?,
                 plan,
-                opencode_input.frozen_inputs.unwrap_or(&[]),
-                opencode_input.native_source_flags.unwrap_or(&[]),
-                opencode_input.rebind_enabled.unwrap_or(true),
+                opencode_input,
             )?;
         }
         allow_controller_stage_read(&temporary)?;
@@ -3534,6 +3568,8 @@ except Exception as error:
                         selected_sources: None,
                         native_source_flags: None,
                         rebind_enabled: None,
+                        inherited_inline: None,
+                        inline_edits: None,
                     },
                     |soul, home, context, input| {
                         let capability = store.issue(
@@ -3627,6 +3663,136 @@ except Exception as error:
     }
 
     #[tokio::test]
+    async fn managed_provider_inline_source_uses_instance_origin_after_owned_mcp_edits() {
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let config = workspace.join("selected-tui.jsonc");
+        let raw = r#"{"agent":{"probe":{"prompt":"{file:./theme.txt}"}}}"#;
+        std::fs::write(&config, raw).unwrap();
+        let theme = workspace.join("theme.txt");
+        std::fs::write(&theme, "dark").unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        for fresh in [false, true] {
+            let soul = SoulId::new();
+            let prepared =
+                crate::managed_provider_references::prepare_managed_opencode_with_publisher(
+                    crate::managed_provider_references::OpencodePreparation {
+                        client: &client,
+                        soul: &soul,
+                        creation_seed: "fixture-existing-soul",
+                        home: &home,
+                        cwd: &workspace,
+                        workspace: &workspace,
+                        original: &|name| (name == "OPENCODE_CONFIG_CONTENT").then(|| raw.into()),
+                        references: vec![],
+                        auth_authority: Some("fixture-owned-attempt"),
+                        selected_sources: None,
+                        native_source_flags: None,
+                        rebind_enabled: None,
+                        inherited_inline: None,
+                        inline_edits: Some(freshell_platform::opencode_config::OwnedConfigEdits {
+                            disable_snapshots: fresh,
+                            ..Default::default()
+                        }),
+                    },
+                    |soul, home, context, input| {
+                        let capability = store.issue(
+                            soul.clone(),
+                            &directory,
+                            "http://host.docker.internal:4000".into(),
+                            Some(("opencode", home, &context.config)),
+                            OpencodeEphemeralInput {
+                                launch_context: Some(context),
+                                ..input
+                            },
+                            None,
+                        )?;
+                        read_prepared_context(&directory, &capability)
+                    },
+                )
+                .await
+                .expect("inline config must remain supported through the shared managed producer");
+            let stage = staged_provider_root_path(
+                &directory,
+                &prepared.context.mcp_capability.as_ref().unwrap().grant_id,
+            )
+            .unwrap();
+            let manifest: freshell_platform::opencode_recipe::SourceManifest =
+                serde_json::from_slice(
+                    &std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+                )
+                .unwrap();
+            assert!(manifest.native_source_flags.is_empty());
+            let effective =
+                std::fs::read_to_string(stage.join(&manifest.sources[0].unexpanded_relative_path))
+                    .unwrap();
+            let effective: serde_json::Value = serde_json::from_str(&effective).unwrap();
+            assert_eq!(effective["agent"]["probe"]["prompt"], "{file:./theme.txt}");
+            assert_eq!(
+                effective["mcp"]["freshell"]["command"],
+                serde_json::json!(["node", "/opt/freshell-mcp/server.js"])
+            );
+            assert_eq!(manifest.inline_edits.disable_snapshots, fresh);
+            assert_eq!(
+                effective["snapshot"],
+                if fresh {
+                    serde_json::json!(false)
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+            assert_eq!(prepared.references[0].source_path, theme.to_str().unwrap());
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+            let callback = serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,
+            "provider":"opencode","workspace":workspace,"cwd":workspace,"priorContext":prepared.context,
+            "providerSecretReferences":prepared.references,"authLookupAuthority":"fixture-owned-attempt"})).unwrap();
+            let reissued = apply_prepared_callback(
+                &callback,
+                "fixture-control",
+                &store,
+                &directory,
+                "http://host.docker.internal:4000",
+                &home,
+                &client,
+            )
+            .await
+            .unwrap();
+            let reissued: PreparedProviderContext = serde_json::from_slice(&reissued).unwrap();
+            let stage = staged_provider_root_path(
+                &directory,
+                &reissued
+                    .provider_launch_context
+                    .mcp_capability
+                    .as_ref()
+                    .unwrap()
+                    .grant_id,
+            )
+            .unwrap();
+            let retained: freshell_platform::opencode_recipe::SourceManifest =
+                serde_json::from_slice(
+                    &std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+                )
+                .unwrap();
+            let retained = freshell_platform::opencode_config::parse_jsonc_object(
+                &std::fs::read_to_string(stage.join(&retained.sources[0].unexpanded_relative_path))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(retained, effective, "request-only inline source and owned edits must survive reissue without current inline env");
+        }
+    }
+
+    #[tokio::test]
     async fn managed_provider_explicit_native_source_selection_survives_preparation() {
         use freshell_runtime_protocol::*;
         let owned = tempfile::tempdir().unwrap();
@@ -3661,6 +3827,8 @@ except Exception as error:
                 selected_sources: None,
                 native_source_flags: None,
                 rebind_enabled: None,
+                inherited_inline: None,
+                inline_edits: None,
             },
             |soul, home, context, input| {
                 let capability = store.issue(
@@ -3750,6 +3918,8 @@ except Exception as error:
                 selected_sources: None,
                 native_source_flags: None,
                 rebind_enabled: None,
+                inherited_inline: None,
+                inline_edits: None,
             },
             |_, _, _, _| panic!("missing selected native source must fail before publication"),
         )

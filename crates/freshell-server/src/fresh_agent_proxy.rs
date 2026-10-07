@@ -470,6 +470,11 @@ impl HostedFreshAgentProxy {
                     selected_sources: None,
                     native_source_flags: None,
                     rebind_enabled: None,
+                    inherited_inline: None,
+                    inline_edits: Some(freshell_platform::opencode_config::OwnedConfigEdits {
+                        disable_snapshots: true,
+                        ..Default::default()
+                    }),
                 },
             )
             .await

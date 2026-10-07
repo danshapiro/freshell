@@ -102,8 +102,13 @@ pub fn prepare(
     let plan = freshell_platform::opencode_config::OpencodeConfigPlan {
         sources: vec![],
         user_owns_freshell_mcp: manifest.user_owns_freshell_mcp,
+        inline_prepared: manifest
+            .sources
+            .iter()
+            .any(|source| source.lane == SourceLane::Inline),
     };
     let mut generated = BTreeMap::new();
+    let mut budget = frozen.clone();
     if manifest.native_source_flags.len() > 2 {
         return Err("prepared native source selector profile exceeded".into());
     }
@@ -118,10 +123,12 @@ pub fn prepare(
         {
             return Err("prepared native source selector has no approved config bind or collides with child input".into());
         }
+        budget
+            .insert(name.into(), flag.runtime_destination.clone())
+            .map_err(|error| error.message)?;
         generated.insert(name.into(), flag.runtime_destination.clone());
     }
     let mut views = 0usize;
-    let mut budget = frozen.clone();
     for source in manifest.sources {
         let remaining = (64 * 1024 * 1024usize)
             .checked_sub(views)
@@ -165,6 +172,28 @@ pub fn prepare(
             freshell_platform::opencode_recipe::evaluate_document(&recipe, &lookup)
         }
         .map_err(str::to_string)?;
+        if source.lane == SourceLane::Inline {
+            let template = String::from_utf8(read_private(
+                stage,
+                &source.template_relative_path,
+                64 * 1024,
+            )?)
+            .map_err(|_| "prepared inline source is not UTF-8")?;
+            if source.template_sha256.as_deref()
+                != Some(format!("{:x}", Sha256::digest(template.as_bytes())).as_str())
+            {
+                return Err("prepared inline template changed before dispatch; reprepare the source generation".into());
+            }
+            if generated.contains_key("OPENCODE_CONFIG_CONTENT")
+                || secrets.environment.contains_key("OPENCODE_CONFIG_CONTENT")
+            {
+                return Err("prepared inline source collides with another child source".into());
+            }
+            budget
+                .insert("OPENCODE_CONFIG_CONTENT".into(), template.clone())
+                .map_err(|error| error.message)?;
+            generated.insert("OPENCODE_CONFIG_CONTENT".into(), template);
+        }
         if let Some(name) = source.generated_name {
             if secrets.environment.contains_key(&name)
                 || auth.contains_key(&name)
@@ -217,6 +246,7 @@ mod tests {
                 lane: SourceLane::Main,
                 unexpanded_relative_path: ".freshell/source-views/source-0".into(),
                 template_relative_path: ".freshell/templates/source-0".into(),
+                template_sha256: None,
                 generated_name: Some("FRESHELL_CONFIG_REFERENCE_0".into()),
                 occurrences: vec![ApprovedFileOccurrence {
                     ordinal: 0,
@@ -229,6 +259,7 @@ mod tests {
             }],
             frozen_inputs: vec!["INSERT".into()],
             user_owns_freshell_mcp: true,
+            inline_edits: Default::default(),
             rebind_enabled: true,
             native_source_flags: vec![NativeSourceFlag {
                 kind: NativeSourceFlagKind::Main,
@@ -300,6 +331,36 @@ mod tests {
             Some("/original-unavailable/project/opencode.json"),
             "an explicitly selected native source must be delivered to the actual child environment");
         assert!(!generated.contains_key("INSERT"),"independent generated recipes do not forward an original ambient variable into the native child");
+        std::fs::create_dir_all(stage.join(".freshell/templates")).unwrap();
+        let inline_template = "{env:FRESHELL_CONFIG_REFERENCE_0}";
+        std::fs::write(stage.join(".freshell/templates/source-0"), inline_template).unwrap();
+        manifest.sources[0].lane = SourceLane::Inline;
+        manifest.sources[0].template_sha256 =
+            Some(format!("{:x}", Sha256::digest(inline_template.as_bytes())));
+        let native_flags = std::mem::take(&mut manifest.native_source_flags);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
+        let inline = prepare(Some(&context), &mut secrets, &frozen, &stage, &home).unwrap();
+        assert_eq!(
+            inline.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+            Some(inline_template)
+        );
+        assert!(secrets.opencode_plan.as_ref().unwrap().inline_prepared);
+        std::fs::write(
+            stage.join(".freshell/templates/source-0"),
+            r#"{"instructions":["{file:/unapproved/private-file}"]}"#,
+        )
+        .unwrap();
+        assert!(prepare(Some(&context), &mut secrets, &frozen, &stage, &home).is_err(), "changed inline template must fail before an unapproved file can reach the native child");
+        manifest.sources[0].lane = SourceLane::Main;
+        manifest.sources[0].template_sha256 = None;
+        manifest.native_source_flags = native_flags;
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
         let changed = ProviderPathInputs::new(BTreeMap::from([(
             "INSERT".into(),
             "{file:/different-unapproved/rules}".into(),

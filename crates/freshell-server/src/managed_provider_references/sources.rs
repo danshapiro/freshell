@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub enum SourceLane {
     Main,
     Tui,
+    Inline,
 }
 
 pub struct SourceOccurrence {

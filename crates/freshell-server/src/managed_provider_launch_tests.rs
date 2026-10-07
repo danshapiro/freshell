@@ -248,12 +248,13 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
     // auth-store key before reading local configuration. Keep that dependency
     // inside the same owned synthetic fixture as the launch consumers.
     let well_known_url = format!("http://host.docker.internal:{port}");
+    let inline_auth_url = format!("{well_known_url}/inline-auth");
     std::fs::write(
         fixture.join("grants/auth.json"),
         serde_json::to_vec(&json!({well_known_url: {
             "type": "wellknown", "key": "OPENAI_API_KEY",
             "token": "AUTH_PREFIX{file:./rules.txt}AUTH_SUFFIX"
-        }}))
+        }, inline_auth_url: {"type":"wellknown","key":"INLINE_VALUE","token":"AUTH_INLINE_SHADOW_NO_FILE"}}))
         .unwrap(),
     )
     .unwrap();
@@ -303,6 +304,15 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
     let selected_tui_bytes = format!("{{ // selected origin\n\"theme\":\"{{file:./selected-theme}}\",\"plugin\":[[\"file:///home/freshell/provider/.config/opencode/plugins/probe-tui/index.mjs\",{{\"receipt\":{}}}]],}}", serde_json::to_string(&tui_receipt).unwrap());
     std::fs::write(&selected_tui, &selected_tui_bytes).unwrap();
     std::fs::write(fixture.join("workspace/selected-theme"), "  dark\n").unwrap();
+    let inline_source = r#"{ // inline instance origin
+"agent":{"probe":{"description":"{env:INLINE_VALUE}"}}}"#;
+    let inline_value = "INLINE_PREFIX{file:./inline-rule}INLINE_SUFFIX";
+    std::fs::write(
+        fixture.join("workspace/inline-rule"),
+        "native-inline-selected-rule\n",
+    )
+    .unwrap();
+
     let request: ManagedTerminalLaunch = ManagedTerminalLaunch {
         spec: freshell_platform::spawn::SpawnSpec {
             program: "opencode".into(),
@@ -315,6 +325,8 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
         env: BTreeMap::from([
             ("OPENCODE_CONFIG".into(), "selected-config.json".into()),
             ("OPENCODE_TUI_CONFIG".into(), "selected-tui.jsonc".into()),
+            ("OPENCODE_CONFIG_CONTENT".into(), inline_source.into()),
+            ("INLINE_VALUE".into(), inline_value.into()),
         ]),
         terminal_id: "closed-native-terminal".into(),
         stream_id: "closed-native-stream".into(),
@@ -348,10 +360,10 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
         .map_err(|_| "actual pinned provider startup did not consume selected config and closure")
     }
     let expected = json!({"prompt":format!("{:x}",Sha256::digest(b"AUTH_PREFIXnative-ruleAUTH_SUFFIX")),
-        "description":format!("{:x}",Sha256::digest(b"native-explicit-selected-rule")),
+        "description":format!("{:x}",Sha256::digest(b"INLINE_PREFIXnative-inline-selected-ruleINLINE_SUFFIX")),
         "references":(["third","fourth","fifth","sixth"].map(|ordinal|format!("{:x}",Sha256::digest(format!("native-{ordinal}-rule").as_bytes())))),
         "resource":format!("{:x}",Sha256::digest(b"plugin-relative-resource")),
-        "dependency":format!("{:x}",Sha256::digest(b"plugin-actual-local-dependency")),"sdk":format!("{:x}",Sha256::digest(b"function"))});
+        "dependency":format!("{:x}",Sha256::digest(b"plugin-actual-local-dependency")),"sdk":format!("{:x}",Sha256::digest(b"function")),"snapshotDisabled":false});
     let client = controller.runtime_client();
     let terminal_receipt = match read_receipt(&receipt).await {
         Ok(value) => value,
@@ -422,6 +434,10 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
     // request-only relative control. Both must activate the explicit layer.
     std::env::set_var("OPENCODE_CONFIG", &explicit_config);
     std::env::set_var("OPENCODE_TUI_CONFIG", &selected_tui);
+    std::env::set_var("OPENCODE_CONFIG_CONTENT", inline_source);
+    std::env::set_var("INLINE_VALUE", inline_value);
+    let mut fresh_expected = expected.clone();
+    fresh_expected["snapshotDisabled"] = json!(true);
     let (broadcast, _) = tokio::sync::broadcast::channel(256);
     let mut events = broadcast.subscribe();
     let proxy = crate::fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
@@ -461,7 +477,7 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
     Arc::clone(&proxy)
         .dispatch(HostedFreshAgentCommand::Send(send))
         .await;
-    assert_eq!(read_receipt(&receipt).await.unwrap(), expected);
+    assert_eq!(read_receipt(&receipt).await.unwrap(), fresh_expected);
     assert_eq!(std::fs::read(&original_config).unwrap(), original_bytes);
     assert_eq!(std::fs::read(&explicit_config).unwrap(), explicit_bytes);
     let stopped = fixture.join("workspace/native-consumed.json.stopped");
@@ -479,7 +495,7 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
     .expect("native plugin must stop the fresh request before the model loop");
     println!(
         "provider_launch_consumer {}",
-        json!({"provider":"opencode","route":"fresh","digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&expected).unwrap()))})
+        json!({"provider":"opencode","route":"fresh","digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&fresh_expected).unwrap()))})
     );
     // Scan only run-owned durable/staged surfaces; referenced payloads belong
     // in private indexed files, not ordinary resource/configuration trees.
@@ -495,6 +511,9 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
                     b"AUTH_PREFIX".as_slice(),
                     b"native-rule".as_slice(),
                     b"native-explicit-selected-rule".as_slice(),
+                    b"native-inline-selected-rule".as_slice(),
+                    b"INLINE_PREFIX".as_slice(),
+                    b"AUTH_INLINE_SHADOW_NO_FILE".as_slice(),
                     b"synthetic-onecli-shadowed".as_slice(),
                 ] {
                     assert!(

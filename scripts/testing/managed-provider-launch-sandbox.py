@@ -109,7 +109,7 @@ def main():
             (plugin/"index.mjs").write_text("""import fs from 'node:fs';import crypto from 'node:crypto';import {tool} from '@opencode-ai/plugin';import {value} from './dependency.mjs';
 const hash=(value)=>crypto.createHash('sha256').update(value).digest('hex');
 export default {id:'closed-native-fixture',async server(input,options){return {async config(config){
- const receipt={prompt:hash(config.agent.probe.prompt),description:hash(config.agent.probe.description),references:['third','fourth','fifth','sixth'].map(name=>hash(config.agent[name].prompt)),resource:hash(fs.readFileSync(new URL('./resource.txt',import.meta.url))),dependency:hash(value),sdk:hash(typeof tool)};
+ const receipt={prompt:hash(config.agent.probe.prompt),description:hash(config.agent.probe.description),references:['third','fourth','fifth','sixth'].map(name=>hash(config.agent[name].prompt)),resource:hash(fs.readFileSync(new URL('./resource.txt',import.meta.url))),dependency:hash(value),sdk:hash(typeof tool),snapshotDisabled:config.snapshot===false};
  fs.writeFileSync(options.receipt,JSON.stringify(receipt));
 },async 'chat.message'(){
  fs.writeFileSync(options.receipt+'.stopped','FRESHELL_SYNTHETIC_STARTUP_STOP');

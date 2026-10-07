@@ -32,9 +32,10 @@ pub enum ConfigSourceKind {
 pub struct OpencodeConfigPlan {
     pub sources: Vec<ConfigSource>,
     pub user_owns_freshell_mcp: bool,
+    pub inline_prepared: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OwnedConfigEdits {
     pub disable_snapshots: bool,
     pub bash_permission: Option<String>,
@@ -136,6 +137,7 @@ pub fn prepare_opencode_config(
     Ok(OpencodeConfigPlan {
         sources,
         user_owns_freshell_mcp,
+        inline_prepared: false,
     })
 }
 
@@ -198,6 +200,15 @@ pub fn merge_owned_entries(
     plan: &OpencodeConfigPlan,
     edits: &OwnedConfigEdits,
 ) -> Result<String, ConfigError> {
+    merge_owned_entries_bounded(inherited, plan, edits, 16 * 1024 * 1024)
+}
+
+pub fn merge_owned_entries_bounded(
+    inherited: Option<&str>,
+    plan: &OpencodeConfigPlan,
+    edits: &OwnedConfigEdits,
+    limit: usize,
+) -> Result<String, ConfigError> {
     let mut config = match inherited.filter(|raw| !raw.is_empty()) {
         Some(raw) => parse_jsonc_object(raw).ok_or_else(|| ConfigError::Malformed {
             path: PathBuf::from("OPENCODE_CONFIG_CONTENT"),
@@ -239,7 +250,44 @@ pub fn merge_owned_entries(
             );
         }
     }
-    Ok(config.to_string())
+    serialize_source_view(&config, limit).map_err(|source| ConfigError::Io {
+        path: "OPENCODE_CONFIG_CONTENT".into(),
+        source,
+    })
+}
+
+/// Serialize an effective source without allocating beyond its accepted view.
+pub fn serialize_source_view(config: &Value, limit: usize) -> std::io::Result<String> {
+    use std::io::Write;
+    struct BoundedView {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl Write for BoundedView {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self
+                .bytes
+                .len()
+                .checked_add(bytes.len())
+                .is_none_or(|size| size > self.limit)
+            {
+                return Err(std::io::Error::other(
+                    "OpenCode effective source-view profile exceeded",
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut view = BoundedView {
+        bytes: Vec::new(),
+        limit: limit.min(16 * 1024 * 1024),
+    };
+    serde_json::to_writer(&mut view, config).map_err(std::io::Error::other)?;
+    String::from_utf8(view.bytes).map_err(std::io::Error::other)
 }
 
 /// Normalize the JSONC accepted by OpenCode's `jsonc-parser` (comments and
@@ -380,6 +428,7 @@ mod tests {
             &OpencodeConfigPlan {
                 sources: vec![],
                 user_owns_freshell_mcp: false,
+                inline_prepared: false,
             },
             &OwnedConfigEdits::default(),
         )
@@ -463,6 +512,7 @@ mod tests {
         let plan = OpencodeConfigPlan {
             sources: vec![],
             user_owns_freshell_mcp: false,
+            inline_prepared: false,
         };
         let raw = "{ // inline user settings\n\"provider\":{\"demo\":{}},\"mcp\":{\"freshell\":{\"type\":\"local\",\"command\":[\"user-command\"]}},\"permission\":{\"edit\":\"ask\"},}";
         let merged = merge_owned_entries(

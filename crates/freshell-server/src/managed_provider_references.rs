@@ -716,6 +716,8 @@ pub(crate) struct OpencodePreparation<'a> {
     pub selected_sources: Option<Vec<sources::SourceOccurrence>>,
     pub native_source_flags: Option<Vec<freshell_platform::opencode_recipe::NativeSourceFlag>>,
     pub rebind_enabled: Option<bool>,
+    pub inherited_inline: Option<String>,
+    pub inline_edits: Option<freshell_platform::opencode_config::OwnedConfigEdits>,
 }
 
 pub(crate) async fn prepare_managed_opencode(
@@ -750,6 +752,8 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         selected_sources,
         native_source_flags,
         rebind_enabled,
+        inherited_inline,
+        inline_edits,
     } = request;
     let rebind_enabled = rebind_enabled.unwrap_or_else(|| {
         !matches!(
@@ -758,10 +762,14 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         )
     });
     use sources::*;
-    if original("OPENCODE_CONFIG_CONTENT").is_some_and(|value| !value.is_empty()) {
-        return Err(
-            "selected OpenCode inline/TUI source requires its owned pre-recipe view".into(),
-        );
+    let inherited_inline = inherited_inline
+        .or_else(|| original("OPENCODE_CONFIG_CONTENT"))
+        .filter(|raw| !raw.is_empty());
+    let mut inline_edits = inline_edits.unwrap_or_default();
+    inline_edits.freshell_command = Some(vec!["node".into(), "/opt/freshell-mcp/server.js".into()]);
+    if inline_edits.bash_permission.is_none() {
+        inline_edits.bash_permission = original("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
+            .filter(|value| matches!(value.as_str(), "allow" | "ask" | "deny"));
     }
     let xdg = original("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
@@ -795,6 +803,56 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         .map_err(str::to_string)?
     };
     let mut loaded = read_opencode_sources(selected).map_err(|error| error.to_string())?;
+    if let Some(raw) = inherited_inline {
+        if raw.len() > 16 * 1024 * 1024 {
+            return Err("OpenCode inherited inline source exceeds 16 MiB".into());
+        }
+        let retained = loaded
+            .iter()
+            .try_fold(raw.len(), |bytes, source| {
+                bytes.checked_add(source.view.len())
+            })
+            .ok_or("source-view size overflow")?;
+        let remaining = (64 * 1024 * 1024usize)
+            .checked_sub(retained)
+            .ok_or("simultaneous source views exceed 64 MiB")?;
+        let user_owns_freshell_mcp = loaded
+            .iter()
+            .filter(|source| source.source.lane == SourceLane::Main)
+            .try_fold(false, |owned, source| {
+                freshell_platform::opencode_config::source_owns_freshell_mcp(
+                    &source.view,
+                    &source.source.logical_path,
+                    cwd,
+                )
+                .map(|user_owns| owned || user_owns)
+            })
+            .map_err(|error| error.to_string())?;
+        let view = freshell_platform::opencode_config::merge_owned_entries_bounded(
+            Some(&raw),
+            &freshell_platform::opencode_config::OpencodeConfigPlan {
+                sources: vec![],
+                user_owns_freshell_mcp,
+                inline_prepared: false,
+            },
+            &inline_edits,
+            remaining.min(64 * 1024),
+        )
+        .map_err(|error| error.to_string())?;
+        let inline = LoadedSourceOccurrence {
+            source: SourceOccurrence {
+                logical_path: "OPENCODE_CONFIG_CONTENT".into(),
+                canonical_source: "OPENCODE_CONFIG_CONTENT".into(),
+                lane: SourceLane::Inline,
+            },
+            view: std::sync::Arc::new(view),
+        };
+        let position = loaded
+            .iter()
+            .position(|source| source.source.lane == SourceLane::Tui)
+            .unwrap_or(loaded.len());
+        loaded.insert(position, inline);
+    }
     let native_source_flags = if let Some(flags) = native_source_flags {
         flags
     } else {
@@ -957,6 +1015,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
             frozen_inputs: Some(&frozen_names),
             native_source_flags: Some(&native_source_flags),
             rebind_enabled: Some(rebind_enabled),
+            inline_edits: Some(&inline_edits),
             ..Default::default()
         },
     )?;

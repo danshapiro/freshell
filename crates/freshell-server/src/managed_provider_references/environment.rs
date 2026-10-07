@@ -168,7 +168,10 @@ impl SourceEnvironment {
         }
         let generated_count = plan
             .iter()
-            .map(|source| source.references.recipes.len())
+            .map(|source| {
+                source.references.recipes.len()
+                    + usize::from(source.source.lane == SourceLane::Inline)
+            })
             .try_fold(0usize, usize::checked_add)
             .ok_or("selected/generated source name count overflow")?;
         if selected

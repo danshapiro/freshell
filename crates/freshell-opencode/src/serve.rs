@@ -64,6 +64,7 @@ pub fn merged_opencode_config_content(inherited: Option<&str>) -> Result<String,
         &freshell_platform::opencode_config::OpencodeConfigPlan {
             sources: Vec::new(),
             user_owns_freshell_mcp: false,
+            inline_prepared: false,
         },
         &freshell_platform::opencode_config::OwnedConfigEdits {
             disable_snapshots: true,
