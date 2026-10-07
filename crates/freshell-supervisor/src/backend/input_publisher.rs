@@ -1374,6 +1374,7 @@ mod tests {
         let handle = crate::registry::OwnedRuntimeHandle::from_registry(
             InstallationId::parse("installation-nonindexed").unwrap(),
             SoulId::parse("soul-nonindexed").unwrap(),
+            "store".into(),
             IncarnationId::parse("incarnation-nonindexed").unwrap(),
             freshell_runtime_protocol::LaunchNonce::new(),
             DockerDaemonId::parse("daemon-nonindexed").unwrap(),
@@ -1596,6 +1597,7 @@ mod tests {
         })).unwrap();
         terminal.validate().unwrap();
         let spec = CreateRuntimeSpec {
+            opencode_transfer_dir: None,
             prior_provider_owner: None,
             initial_input_reservation: None,
             installation_id: InstallationId::parse("installation-input").unwrap(),
@@ -1813,6 +1815,7 @@ mod tests {
                     crate::registry::OwnedRuntimeHandle::from_registry(
                         candidate.installation_id.clone(),
                         candidate.soul_id.clone(),
+                        "store".into(),
                         candidate.incarnation_id.clone(),
                         freshell_runtime_protocol::LaunchNonce::new(),
                         DockerDaemonId::parse("input-publisher-daemon").unwrap(),

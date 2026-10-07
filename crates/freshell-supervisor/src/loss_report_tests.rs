@@ -11,16 +11,29 @@ use freshell_runtime_protocol::{
 use rusqlite::{params, Connection};
 use std::collections::BTreeSet;
 
+fn request_only_absence_reference(context: &RecoveryContext) -> String {
+    let fields = serde_json::to_vec(&(
+        &context.provider,
+        &context.provider_store_id,
+        context.native_session_id.as_deref().unwrap(),
+        context.evidence_revision,
+    ))
+    .unwrap();
+    format!("nativeAbsenceCensus=sha256:{:x}", Sha256::digest(fields))
+}
+
 fn evidence(context: Option<&RecoveryContext>) -> Vec<RecoveryPathEvidence> {
     let native_evidence = context
         .and_then(|context| context.native_session_id.as_deref().map(|id| (context, id)))
         .map(|(context, native_id)| {
-            let directory = tempfile::tempdir().unwrap();
-            let database = directory.path().join(".local/share/opencode/opencode.db");
+            let directory = context.prior_handle.runtime_dir().join("loss-census").join(context.soul_id.as_str());
+            let database = directory.join(".local/share/opencode/opencode.db");
             fs::create_dir_all(database.parent().unwrap()).unwrap();
-            let connection = crate::registry::tests::native_inventory_fixture(&database);
-            connection.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
-            connection.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES ('unrelated-exact-root','slug','prj','/synthetic','synthetic','1.18.21',1,1)", []).unwrap();
+            if !database.exists() {
+                let connection = crate::registry::tests::native_inventory_fixture(&database);
+                connection.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
+                connection.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES ('unrelated-exact-root','slug','prj','/synthetic','synthetic','1.18.21',1,1)", []).unwrap();
+            }
             let terminal = serde_json::from_value(serde_json::json!({
                 "terminalId":"absent-store", "streamId":"absent-store", "mode":context.provider,
                 "program":context.provider, "cwd":"/workspace", "workspacePath":"/workspace",
@@ -42,7 +55,7 @@ fn evidence(context: Option<&RecoveryContext>) -> Vec<RecoveryPathEvidence> {
                 },
             )
             .unwrap();
-            match freshell_agent_runtime::probe_provider_store(directory.path(), &spec) {
+            match freshell_agent_runtime::probe_provider_store(&directory, &spec) {
                 freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
                     reason,
                     evidence,
@@ -416,7 +429,7 @@ async fn loss_report_rejects_uninspected_native_negative_even_with_identity() {
     rows.iter_mut()
         .find(|row| row.path == RecoveryPath::NativeResume)
         .unwrap()
-        .evidence_refs = vec!["nativeResume=definitively_unavailable".into()];
+        .evidence_refs = vec![request_only_absence_reference(&context)];
     let mut input = LossDecisionInput {
         installation_id: registry.installation_id(),
         context: &context,
@@ -441,6 +454,45 @@ async fn loss_report_rejects_uninspected_native_negative_even_with_identity() {
     assert!(
         LostDecision::try_new(input).is_ok(),
         "qualified exact absence must remain certifiable"
+    );
+}
+
+#[tokio::test]
+async fn public_loss_constructor_rejects_hash_shaped_container_census() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, context) = prepared_context(dir.path()).await;
+    let valid = decision_for(&registry, &context).unwrap();
+    let mut paths = valid.certificate().recovery_paths.clone();
+    let native = paths
+        .iter_mut()
+        .find(|row| row.path == RecoveryPath::NativeResume)
+        .unwrap();
+    let reference = native
+        .evidence_refs
+        .iter_mut()
+        .find(|reference| reference.starts_with("nativeAbsenceCensus=v2:"))
+        .unwrap();
+    let mut census: serde_json::Value =
+        serde_json::from_str(reference.strip_prefix("nativeAbsenceCensus=v2:").unwrap()).unwrap();
+    census["inspectedHome"] = freshell_agent_runtime::PROVIDER_HOME.into();
+    census["generation"] = "0".repeat(64).into();
+    *reference = format!(
+        "nativeAbsenceCensus=v2:{}",
+        serde_json::to_string(&census).unwrap()
+    );
+    let input = LossDecisionInput {
+        installation_id: registry.installation_id(),
+        context: &context,
+        cleanup_handle: &context.prior_handle,
+        path_evidence: paths,
+        builds: valid.certificate().builds.clone(),
+        timeline: Vec::new(),
+        analysis: valid.certificate().analysis.clone(),
+        created_at: None,
+    };
+    assert!(
+        LostDecision::try_new(input).is_err(),
+        "a serialized hash shape without a current reader cannot certify container absence"
     );
 }
 
@@ -495,6 +547,175 @@ async fn historical_uninspected_loss_cannot_resume_cleanup() {
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .any(|event| event["event"] == "supervisor.loss.historical_certification_blocked"));
+}
+
+fn restore_native_history(context: &RecoveryContext) {
+    let database = context
+        .prior_handle
+        .runtime_dir()
+        .join("loss-census")
+        .join(context.soul_id.as_str())
+        .join(".local/share/opencode/opencode.db");
+    Connection::open(database).unwrap().execute(
+        "INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES (?1,'retained','prj','/synthetic','retained','1.18.21',1,1)",
+        [context.native_session_id.as_deref().unwrap()],
+    ).unwrap();
+}
+
+#[tokio::test]
+async fn request_only_token_cannot_certify_present_or_unreadable_native_store() {
+    for fault in ["present", "unreadable"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, context) = prepared_context(dir.path()).await;
+        let valid = decision_for(&registry, &context).unwrap();
+        let mut rows = valid.certificate().recovery_paths.clone();
+        rows.iter_mut()
+            .find(|row| row.path == RecoveryPath::NativeResume)
+            .unwrap()
+            .evidence_refs = vec![request_only_absence_reference(&context)];
+        restore_native_history(&context);
+        if fault == "unreadable" {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let path = context
+                    .prior_handle
+                    .runtime_dir()
+                    .join("loss-census")
+                    .join(context.soul_id.as_str())
+                    .join(".local/share/opencode/opencode.db");
+                fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+            }
+        }
+        let input = LossDecisionInput {
+            installation_id: registry.installation_id(),
+            context: &context,
+            cleanup_handle: &context.prior_handle,
+            path_evidence: rows,
+            builds: valid.certificate().builds.clone(),
+            timeline: Vec::new(),
+            analysis: valid.certificate().analysis.clone(),
+            created_at: None,
+        };
+        assert!(
+            LostDecision::try_new(input).is_err(),
+            "{fault}: request-computed tokens cannot prove absence"
+        );
+        assert!(registry
+            .unresolved_loss_incident_ids()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            registry
+                .recovery_context(context.soul_id)
+                .await
+                .unwrap()
+                .desired_state,
+            DesiredState::Running
+        );
+    }
+}
+
+#[tokio::test]
+async fn current_native_storage_generation_fences_initial_loss_cas() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, context) = prepared_context(dir.path()).await;
+    let decision = decision_for(&registry, &context).unwrap();
+    restore_native_history(&context);
+    assert!(
+        registry.prepare_loss(decision).await.is_err(),
+        "native history arriving after capture must fence initial loss CAS"
+    );
+    assert!(registry
+        .unresolved_loss_incident_ids()
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        registry
+            .recovery_context(context.soul_id)
+            .await
+            .unwrap()
+            .desired_state,
+        DesiredState::Running
+    );
+}
+
+#[tokio::test]
+async fn current_native_storage_generation_fences_pending_and_final_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, prepared, _) = prepared_loss_with_decision(dir.path()).await;
+    let context = registry
+        .recovery_context(prepared.certificate.soul_id.clone())
+        .await
+        .unwrap();
+    restore_native_history(&context);
+    let retained = dir.path().join("retained-output");
+    fs::write(&retained, "existing output").unwrap();
+    let before = registry
+        .loss_certificate(prepared.certificate.incident_id.clone())
+        .await
+        .unwrap();
+    let conn = Connection::open(registry.database_path()).unwrap();
+    let claims_before: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1",
+            [context.soul_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        claims_before, 1,
+        "the pending incident retains its exact native writer claim"
+    );
+    let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    supervisor.reconcile_pending_loss_cleanup().await.unwrap();
+    assert_eq!(
+        registry
+            .loss_certificate(before.incident_id.clone())
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(
+        registry
+            .finalize_loss_cleanup(
+                before.incident_id.clone(),
+                StopOutcome::VerifiedEmpty,
+                cleanup(&prepared)
+            )
+            .await
+            .is_err(),
+        "storage generation must be checked again at final cleanup CAS"
+    );
+    let conn = Connection::open(registry.database_path()).unwrap();
+    let state: String = conn
+        .query_row(
+            "SELECT cleanup_state FROM loss_incidents WHERE incident_id=?1",
+            [before.incident_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "cleanup_pending");
+    let claims_after: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1",
+            [context.soul_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(claims_after, claims_before);
+    assert_eq!(
+        registry
+            .recovery_context(context.soul_id)
+            .await
+            .unwrap()
+            .prior_handle
+            .provider_volume_name(),
+        context.prior_handle.provider_volume_name()
+    );
+    assert_eq!(fs::read_to_string(retained).unwrap(), "existing output");
 }
 
 #[test]

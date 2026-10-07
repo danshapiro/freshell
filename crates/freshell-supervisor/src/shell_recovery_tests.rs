@@ -316,6 +316,9 @@ async fn recovery_host_status(
                     effective_limits: checkpoints::tests::limits(),
                 },
                 HostCommand::Status { .. } => HostResult::Status {
+                    opencode_adoption:
+                        freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
+                    opencode_transfer_receipt: None,
                     host_boot_id: boot.clone(),
                     worker_pid,
                     worker_launch_count: 1,
@@ -516,8 +519,13 @@ async fn recovery_inspected_sqlite_absence_certifies_loss_and_preserves_output()
     let db = temp.path().join("effective.db");
     let connection = rusqlite::Connection::open(&db).unwrap();
     connection
-        .execute("CREATE TABLE session(id TEXT PRIMARY KEY)", [])
+        .execute_batch(freshell_sessions::opencode_transfer::pinned_destination_schema_sql())
         .unwrap();
+    for migration in freshell_sessions::opencode_transfer::pinned_destination_migration_ids() {
+        connection
+            .execute("INSERT INTO migration VALUES (?1,0)", [migration])
+            .unwrap();
+    }
     drop(connection);
     let mut spec = checkpoints::tests::spec("opencode");
     spec.environment

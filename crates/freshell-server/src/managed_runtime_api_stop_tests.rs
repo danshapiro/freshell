@@ -200,6 +200,22 @@ async fn fixture_fresh_soul_with_cleanup(
         return (registry, view);
     }
     let context = registry.recovery_context(soul_id.clone()).await.unwrap();
+    let provider_home = root
+        .join("qualified-empty-provider-store")
+        .join(soul_id.as_str());
+    std::fs::create_dir_all(&provider_home).unwrap();
+    let spec = freshell_supervisor::resume_catalog::exact_resume_candidate(&context, None)
+        .unwrap()
+        .unwrap();
+    let freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
+        reason: native_reason,
+        evidence: native_evidence,
+        store_state: native_store_state,
+        ..
+    } = freshell_agent_runtime::probe_provider_store(&provider_home, &spec)
+    else {
+        panic!("loss fixture requires an actual complete native reader negative");
+    };
     let paths = [
         (
             RecoveryPath::Reattach,
@@ -230,10 +246,22 @@ async fn fixture_fresh_soul_with_cleanup(
     .into_iter()
     .map(|(path, store_state, reason)| RecoveryPathEvidence {
         path,
-        store_state,
+        store_state: if path == RecoveryPath::NativeResume {
+            native_store_state
+        } else {
+            store_state
+        },
         verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-        reason_code: reason.into(),
-        evidence_refs: vec![format!("fixture://{reason}")],
+        reason_code: if path == RecoveryPath::NativeResume {
+            native_reason.clone()
+        } else {
+            reason.into()
+        },
+        evidence_refs: if path == RecoveryPath::NativeResume {
+            native_evidence.clone()
+        } else {
+            vec![format!("fixture://{reason}")]
+        },
     })
     .collect();
     let decision = LostDecision::try_new(LossDecisionInput {

@@ -5100,6 +5100,7 @@ mod native_observation_ipc_tests {
                         &HostReply {
                             request_id: request.request_id,
                             result: Ok(HostResult::TerminalOutput(RuntimeOutputBatch {
+                                completion: None,
                                 incarnation_id,
                                 terminal_id: "terminal".into(),
                                 stream_epoch: "epoch".into(),

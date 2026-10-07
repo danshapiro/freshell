@@ -456,6 +456,7 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
                     handle: Box::new(OwnedRuntimeHandle::from_registry(
                         InstallationId::new(),
                         reservation.soul_id,
+                        "retained-store".into(),
                         IncarnationId::new(),
                         LaunchNonce::new(),
                         daemon_id,
@@ -682,6 +683,7 @@ async fn qualify_transport(mode: &'static str) {
             handle: Box::new(OwnedRuntimeHandle::from_registry(
                 InstallationId::new(),
                 reservation.soul_id.clone(),
+                "synthetic-store".into(),
                 IncarnationId::new(),
                 LaunchNonce::new(),
                 daemon.clone(),

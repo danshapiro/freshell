@@ -55,16 +55,293 @@ pub fn unverified_native_probe() -> RecoveryProbe {
     }
 }
 
-/// Body-free binding for a complete exact-store negative captured by a reader.
-pub fn native_absence_reference(
+const NATIVE_CENSUS_PREFIX: &str = "nativeAbsenceCensus=v2:";
+
+const NATIVE_STORE_ENVIRONMENT: &[&str] = &[
+    "HOME",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "AMPLIFIER_HOME",
+    "XDG_DATA_HOME",
+    "OPENCODE_DB",
+    "OPENCODE_DISABLE_CHANNEL_DB",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeStoreSelection {
+    cwd: String,
+    provider_version: Option<String>,
+    environment: BTreeMap<String, String>,
+}
+impl NativeStoreSelection {
+    fn from_spec(spec: &ResumeSpec) -> Self {
+        Self {
+            cwd: spec.cwd.clone(),
+            provider_version: spec.provider_version.clone(),
+            environment: spec
+                .environment
+                .iter()
+                .filter(|(name, _)| NATIVE_STORE_ENVIRONMENT.contains(&name.as_str()))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        }
+    }
+    fn fingerprint(&self, provider_home: &str) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(provider_home, self)).expect("store selection serializes")
+            )
+        )
+    }
+    fn valid(&self) -> bool {
+        self.environment
+            .keys()
+            .all(|name| NATIVE_STORE_ENVIRONMENT.contains(&name.as_str()))
+    }
+}
+
+/// Body-free evidence emitted only after a complete provider reader negative.
+/// The storage generation is independent of the registry evidence revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeAbsenceCensus {
+    provider: String,
+    store: String,
+    native_id: String,
+    evidence_revision: u64,
+    provider_home: String,
+    environment_fingerprint: String,
+    selection: NativeStoreSelection,
+    inspected_home: String,
+    generation: String,
+    store_state: EvidenceStoreState,
+}
+
+fn native_census(evidence: &[String]) -> Option<NativeAbsenceCensus> {
+    let mut receipts = evidence
+        .iter()
+        .filter_map(|reference| reference.strip_prefix(NATIVE_CENSUS_PREFIX));
+    let receipt = serde_json::from_str(receipts.next()?).ok()?;
+    if receipts.next().is_some() {
+        return None;
+    }
+    Some(receipt)
+}
+
+fn native_environment_fingerprint(spec: &ResumeSpec) -> String {
+    NativeStoreSelection::from_spec(spec).fingerprint(&spec.provider_home)
+}
+
+pub fn native_absence_census_environment_matches(spec: &ResumeSpec, evidence: &[String]) -> bool {
+    native_census(evidence).is_some_and(|census| {
+        census.provider_home == spec.provider_home
+            && census.selection == NativeStoreSelection::from_spec(spec)
+            && census.environment_fingerprint == native_environment_fingerprint(spec)
+    })
+}
+
+pub fn native_absence_census_matches(
     provider: &str,
     store: &str,
     native_id: &str,
-    evidence_revision: u64,
-) -> String {
-    let fields = serde_json::to_vec(&(provider, store, native_id, evidence_revision))
-        .expect("census fields serialize");
-    format!("nativeAbsenceCensus=sha256:{:x}", Sha256::digest(fields))
+    revision: u64,
+    store_state: EvidenceStoreState,
+    evidence: &[String],
+) -> bool {
+    let Some(census) = native_census(evidence) else {
+        return false;
+    };
+    census.selection.valid()
+        && census.environment_fingerprint == census.selection.fingerprint(&census.provider_home)
+        && census.provider == provider
+        && census.store == store
+        && census.native_id == native_id
+        && census.evidence_revision == revision
+        && census.store_state == store_state
+        && !native_id.trim().is_empty()
+        && !census.provider_home.is_empty()
+        && [&census.environment_fingerprint, &census.generation]
+            .iter()
+            .all(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        && (census.inspected_home == PROVIDER_HOME || native_absence_census_current(evidence))
+}
+
+/// Reinspect a directly accessible capture before registry commit or cleanup.
+/// Container-home receipts instead require a new owned-volume reader result.
+pub fn native_absence_census_current(evidence: &[String]) -> bool {
+    native_census(evidence).is_some_and(|census| {
+        if !census.selection.valid()
+            || census.environment_fingerprint != census.selection.fingerprint(&census.provider_home)
+        { return false; }
+        let home = Path::new(&census.inspected_home);
+        let before = native_store_generation(home, &census.provider, &census.selection).ok();
+        before.as_deref() == Some(&census.generation)
+            && matches!(probe_selected_provider_identity(home, &census.provider, &census.native_id, &census.selection),
+                ProviderStoreProbe::DefinitivelyUnavailable { store_state, .. } if store_state == census.store_state)
+            && native_store_generation(home, &census.provider, &census.selection).ok() == before
+    })
+}
+
+pub fn native_absence_census_is_container(evidence: &[String]) -> bool {
+    native_census(evidence).is_some_and(|census| census.inspected_home == PROVIDER_HOME)
+}
+
+pub fn same_native_absence_census(captured: &[String], current: &[String]) -> bool {
+    match (native_census(captured), native_census(current)) {
+        (Some(captured), Some(current)) => captured == current,
+        _ => false,
+    }
+}
+
+fn native_store_roots(
+    home: &Path,
+    provider: &str,
+    selection: &NativeStoreSelection,
+) -> Result<Vec<std::path::PathBuf>, ProviderStoreProbe> {
+    let roots = match provider {
+        "claude" | "kilroy" => vec![selection
+            .environment
+            .get("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join(".claude"))
+            .join("projects")],
+        "codex" => vec![selection
+            .environment
+            .get("CODEX_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex"))
+            .join("sessions")],
+        "amplifier" => vec![home.join(".amplifier/projects")],
+        "opencode" => {
+            let (path, _) = selected_opencode_database(home, selection)?;
+            let mut roots = vec![path.clone()];
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut companion = path.as_os_str().to_os_string();
+                companion.push(suffix);
+                roots.push(companion.into());
+            }
+            roots
+        }
+        "phase1-fixture" | "native-session-fixture" => vec![home.to_path_buf()],
+        _ => {
+            return Err(blocked(
+                RecoveryBlockReason::ImplementationUnavailable,
+                "native storage selection is unavailable",
+                Vec::new(),
+                None,
+            ))
+        }
+    };
+    Ok(roots)
+}
+
+/// Exact nonsecret paths the owned native reader must be able to inspect.
+pub fn native_store_paths(
+    home: &Path,
+    spec: &ResumeSpec,
+) -> Result<Vec<std::path::PathBuf>, ProviderStoreProbe> {
+    native_store_roots(
+        home,
+        &spec.provider_session.provider,
+        &NativeStoreSelection::from_spec(spec),
+    )
+}
+
+fn native_store_generation(
+    home: &Path,
+    provider: &str,
+    selection: &NativeStoreSelection,
+) -> Result<String, ()> {
+    let canonical = fs::canonicalize(home).map_err(|_| ())?;
+    if canonical != home {
+        return Err(());
+    }
+    let roots = native_store_roots(home, provider, selection).map_err(|_| ())?;
+    for root in &roots {
+        if !root.is_absolute() {
+            return Err(());
+        }
+        inspect_native_path(home, root).map_err(|_| ())?;
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"freshell-native-store-generation-v2\0");
+    let mut queue = roots
+        .into_iter()
+        .map(|root| (root, 0_u8))
+        .collect::<VecDeque<_>>();
+    let mut visited = 0_usize;
+    let mut total_bytes = 0_u64;
+    while let Some((path, depth)) = queue.pop_front() {
+        visited += 1;
+        if visited > 50_000 || depth > 8 {
+            return Err(());
+        }
+        hash.update(path.as_os_str().as_encoded_bytes());
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && depth == 0 => {
+                hash.update(b"missing");
+                continue;
+            }
+            Err(_) => return Err(()),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode();
+            hash.update(mode.to_le_bytes());
+            if mode & 0o444 == 0 || (metadata.is_dir() && mode & 0o111 == 0) {
+                return Err(());
+            }
+        }
+        if metadata.is_dir() {
+            hash.update(b"directory\0");
+            let mut children = fs::read_dir(&path)
+                .map_err(|_| ())?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ())?;
+            children.sort();
+            for child in children {
+                queue.push_back((child, depth + 1));
+            }
+        } else if metadata.is_file() {
+            total_bytes = total_bytes.checked_add(metadata.len()).ok_or(())?;
+            if total_bytes > 512 * 1024 * 1024 {
+                return Err(());
+            }
+            hash.update(b"file\0");
+            hash.update(metadata.len().to_le_bytes());
+            use std::io::Read;
+            let mut file = fs::File::open(&path).map_err(|_| ())?;
+            let mut buffer = [0_u8; 64 * 1024];
+            let mut read_bytes = 0_u64;
+            loop {
+                let count = file.read(&mut buffer).map_err(|_| ())?;
+                if count == 0 {
+                    break;
+                }
+                read_bytes = read_bytes.checked_add(count as u64).ok_or(())?;
+                if read_bytes > metadata.len() {
+                    return Err(());
+                }
+                hash.update(&buffer[..count]);
+            }
+            if read_bytes != metadata.len() {
+                return Err(());
+            }
+        } else {
+            return Err(());
+        }
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 /// Whether a provider's durable-soul behavior has actually been proven by a
@@ -673,48 +950,73 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
             None,
         );
     }
-    let mut result = match spec.provider_session.provider.as_str() {
-        "phase1-fixture" | "native-session-fixture" => {
-            probe_native_fixture(provider_home, expected)
-        }
-        "claude" | "kilroy" => probe_bounded_tree(
-            &spec
-                .environment
-                .get("CLAUDE_CONFIG_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| provider_home.join(".claude"))
-                .join("projects"),
-            expected,
-        ),
-        "codex" => probe_bounded_tree(
-            &spec
-                .environment
-                .get("CODEX_HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| provider_home.join(".codex"))
-                .join("sessions"),
-            expected,
-        ),
-        "amplifier" => probe_amplifier(provider_home, expected),
-        "opencode" => probe_opencode(provider_home, expected, spec),
-        other => blocked(
-            RecoveryBlockReason::ImplementationUnavailable,
-            &format!("no managed recovery probe for provider {other}"),
-            vec![format!("provider={other}")],
+    if spec
+        .environment
+        .get("HOME")
+        .is_some_and(|home| home != &spec.provider_home)
+    {
+        return blocked(
+            RecoveryBlockReason::StoreUnreadable,
+            "recorded provider HOME differs from the inspected store",
+            Vec::new(),
             None,
-        ),
-    };
+        );
+    }
+    let selection = NativeStoreSelection::from_spec(spec);
+    let mut result = probe_selected_provider_store(provider_home, spec);
+    let captured_result = result.clone();
     if let ProviderStoreProbe::DefinitivelyUnavailable {
         evidence,
+        store_state,
         negative_paths,
         ..
     } = &mut result
     {
-        let reference = native_absence_reference(
-            &spec.provider_session.provider,
-            &spec.provider_session.provider_store_id,
-            expected,
-            spec.evidence_revision,
+        let generation_before =
+            native_store_generation(provider_home, &spec.provider_session.provider, &selection);
+        // Repeat the semantic reader inside the storage-generation window.
+        // Positive resume probes need no negative census.
+        if probe_selected_provider_store(provider_home, spec) != captured_result {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "native storage classification changed during inspection",
+                Vec::new(),
+                None,
+            );
+        }
+        let generation_after =
+            native_store_generation(provider_home, &spec.provider_session.provider, &selection);
+        let (Ok(before), Ok(after)) = (generation_before, generation_after) else {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "complete native storage generation could not be inspected",
+                Vec::new(),
+                None,
+            );
+        };
+        if before != after {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "native storage changed during inspection",
+                Vec::new(),
+                None,
+            );
+        }
+        let census = NativeAbsenceCensus {
+            provider: spec.provider_session.provider.clone(),
+            store: spec.provider_session.provider_store_id.clone(),
+            native_id: expected.into(),
+            evidence_revision: spec.evidence_revision,
+            provider_home: spec.provider_home.clone(),
+            environment_fingerprint: native_environment_fingerprint(spec),
+            selection,
+            inspected_home: provider_home.display().to_string(),
+            generation: after,
+            store_state: *store_state,
+        };
+        let reference = format!(
+            "{NATIVE_CENSUS_PREFIX}{}",
+            serde_json::to_string(&census).expect("census serializes")
         );
         evidence.push(reference.clone());
         for row in negative_paths.iter_mut().filter(|row| {
@@ -725,6 +1027,54 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
         }
     }
     result
+}
+
+fn probe_selected_provider_store(provider_home: &Path, spec: &ResumeSpec) -> ProviderStoreProbe {
+    probe_selected_provider_identity(
+        provider_home,
+        &spec.provider_session.provider,
+        &spec.provider_session.native_session_id,
+        &NativeStoreSelection::from_spec(spec),
+    )
+}
+
+fn probe_selected_provider_identity(
+    provider_home: &Path,
+    provider: &str,
+    expected: &str,
+    selection: &NativeStoreSelection,
+) -> ProviderStoreProbe {
+    match provider {
+        "phase1-fixture" | "native-session-fixture" => {
+            probe_native_fixture(provider_home, expected)
+        }
+        "claude" | "kilroy" => probe_bounded_tree(
+            &selection
+                .environment
+                .get("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| provider_home.join(".claude"))
+                .join("projects"),
+            expected,
+        ),
+        "codex" => probe_bounded_tree(
+            &selection
+                .environment
+                .get("CODEX_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| provider_home.join(".codex"))
+                .join("sessions"),
+            expected,
+        ),
+        "amplifier" => probe_amplifier(provider_home, expected),
+        "opencode" => probe_opencode(provider_home, expected, selection),
+        other => blocked(
+            RecoveryBlockReason::ImplementationUnavailable,
+            &format!("no managed recovery probe for provider {other}"),
+            vec![format!("provider={other}")],
+            None,
+        ),
+    }
 }
 
 fn probe_native_fixture(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
@@ -1046,32 +1396,35 @@ fn inspect_native_path(provider_home: &Path, path: &Path) -> Result<bool, Provid
     Ok(true)
 }
 
-fn probe_opencode(provider_home: &Path, expected: &str, spec: &ResumeSpec) -> ProviderStoreProbe {
+fn selected_opencode_database(
+    provider_home: &Path,
+    selection: &NativeStoreSelection,
+) -> Result<(std::path::PathBuf, bool), ProviderStoreProbe> {
     // OpenCode v1.18's relative OPENCODE_DB is relative to its XDG data
     // directory. Channel is compiled into the executable, not an environment
     // override; an explicit DB or disabled channel DB establishes its authority.
-    let data = spec
+    let data = selection
         .environment
         .get("XDG_DATA_HOME")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| provider_home.join(".local/share"))
         .join("opencode");
-    let explicit_db = spec
+    let explicit_db = selection
         .environment
         .get("OPENCODE_DB")
         .filter(|value| !value.is_empty());
-    let channel_disabled = spec
+    let channel_disabled = selection
         .environment
         .get("OPENCODE_DISABLE_CHANNEL_DB")
         .is_some_and(|value| value == "1" || value == "true");
     if explicit_db.is_some_and(|value| value == ":memory:") {
-        return blocked(
+        return Err(blocked(
             RecoveryBlockReason::AmbiguousIdentity,
             "OpenCode in-memory database is unavailable for durable inspection",
             vec!["database=:memory:".into()],
             None,
-        );
+        ));
     }
     let path = explicit_db
         .map(|value| {
@@ -1085,30 +1438,42 @@ fn probe_opencode(provider_home: &Path, expected: &str, spec: &ResumeSpec) -> Pr
         .unwrap_or_else(|| data.join("opencode.db"));
     let path = if path.is_absolute() {
         path
-    } else if Path::new(&spec.cwd).is_absolute() {
-        Path::new(&spec.cwd).join(path)
+    } else if Path::new(&selection.cwd).is_absolute() {
+        Path::new(&selection.cwd).join(path)
     } else {
-        return blocked(
+        return Err(blocked(
             RecoveryBlockReason::AmbiguousIdentity,
             "OpenCode relative database root requires a recorded absolute provider cwd",
             vec!["providerCwd=unestablished".into()],
             None,
-        );
+        ));
     };
     let authoritative = explicit_db.is_some() || channel_disabled;
     if !authoritative
-        && spec
+        && selection
             .provider_version
             .as_deref()
             .is_some_and(|version| version.contains('-'))
     {
-        return blocked(
+        return Err(blocked(
             RecoveryBlockReason::AmbiguousIdentity,
             "OpenCode channel database is unrecorded",
             vec![data.display().to_string()],
             None,
-        );
+        ));
     }
+    Ok((path, authoritative))
+}
+
+fn probe_opencode(
+    provider_home: &Path,
+    expected: &str,
+    selection: &NativeStoreSelection,
+) -> ProviderStoreProbe {
+    let (path, authoritative) = match selected_opencode_database(provider_home, selection) {
+        Ok(selected) => selected,
+        Err(probe) => return probe,
+    };
     let present = match inspect_native_path(provider_home, &path) {
         Ok(present) => present,
         Err(probe) => return probe,
@@ -1221,6 +1586,7 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
     let mut incomplete = false;
     let mut queue = VecDeque::from([(root.clone(), 0_u8)]);
     let mut matches = Vec::new();
+    let mut unresolved_candidates = false;
     let mut visited = 0_usize;
     while let Some((path, depth)) = queue.pop_front() {
         visited += 1;
@@ -1253,6 +1619,16 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
         if path.file_name().is_some_and(|name| name == expected) {
             matches.push(path.clone());
             continue;
+        }
+        if path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "sessions")
+        {
+            unresolved_candidates |= path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|identity| qualified_amplifier_stub(&path, identity).is_none());
         }
         if depth >= 8 {
             incomplete = true;
@@ -1341,7 +1717,9 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                 };
                 // Exact materialized history needs readability, not a whole-file
                 // parse. Only metadata carries the bounded identity document.
-                let inspection = if name.starts_with("metadata.json") {
+                let inspection = if name.starts_with("metadata.json")
+                    || (name == "events.jsonl" && metadata.len() <= MAX_INSPECTED_METADATA_BYTES)
+                {
                     if metadata.len() > MAX_INSPECTED_METADATA_BYTES {
                         return blocked(
                             RecoveryBlockReason::StoreUnreadable,
@@ -1373,6 +1751,19 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                         )
                     }
                 };
+                if name == "events.jsonl" && metadata.len() <= MAX_INSPECTED_METADATA_BYTES {
+                    match qualified_amplifier_events(&bytes, expected) {
+                        Some(has_history) => materialized |= has_history,
+                        None => {
+                            return blocked(
+                                RecoveryBlockReason::StoreUnreadable,
+                                "Amplifier event history is incomplete or malformed",
+                                vec![path.display().to_string()],
+                                None,
+                            )
+                        }
+                    }
+                }
                 if name.starts_with("transcript.jsonl") && metadata.len() > 0 {
                     materialized = true;
                 }
@@ -1403,7 +1794,15 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                                 }
                                 identity_recorded = true;
                             }
-                            if value.get("turn_count").is_some() {
+                            if let Some(turn_count) = value.get("turn_count") {
+                                if turn_count.as_u64().is_none_or(|count| count == 0) {
+                                    return blocked(
+                                        RecoveryBlockReason::StoreUnreadable,
+                                        "Amplifier recorded turn count is incomplete",
+                                        vec![path.display().to_string()],
+                                        None,
+                                    );
+                                }
                                 materialized = true;
                             }
                         }
@@ -1437,8 +1836,16 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                     None,
                 );
             }
-            if !materialized && freshell_sessions::amplifier_stub::stub_is_unused(session_dir) {
-                if incomplete {
+            if !materialized {
+                if qualified_amplifier_stub(session_dir, expected) != Some(true) {
+                    return blocked(
+                        RecoveryBlockReason::StoreUnreadable,
+                        "Amplifier exact launcher-stub census is unresolved",
+                        vec![session_dir.display().to_string()],
+                        None,
+                    );
+                }
+                if incomplete || unresolved_candidates {
                     return blocked(
                         RecoveryBlockReason::AmbiguousIdentity,
                         "Amplifier store scan is incomplete",
@@ -1562,6 +1969,81 @@ fn probe_bounded_tree(root: &Path, expected: &str) -> ProviderStoreProbe {
         _ => blocked(RecoveryBlockReason::AmbiguousIdentity,
             "provider identity has multiple candidate artifacts", matches, None),
     }
+}
+
+// Loss evidence is stricter than the independent best-effort stub GC policy.
+// Every canonical child must be inspected; partial candidates remain unknown.
+fn qualified_amplifier_stub(session_dir: &Path, expected: &str) -> Option<bool> {
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(session_dir).ok()? {
+        let path = entry.ok()?.path();
+        let name = path.file_name()?.to_str()?.to_owned();
+        if !matches!(
+            name.as_str(),
+            "metadata.json" | "transcript.jsonl" | "events.jsonl"
+        ) {
+            return None;
+        }
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o444 == 0 {
+                return None;
+            }
+        }
+        files.insert(name, fs::read(path).ok()?);
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(files.get("metadata.json")?).ok()?;
+    if metadata
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected)
+        || !["created", "working_dir"].iter().all(|key| {
+            metadata
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    {
+        return None;
+    }
+    let transcript = files.get("transcript.jsonl")?;
+    let events = files.get("events.jsonl")?;
+    let mut materialized = !transcript.is_empty();
+    if let Some(turn_count) = metadata.get("turn_count") {
+        if turn_count.as_u64().is_none_or(|count| count == 0) {
+            return None;
+        }
+        materialized = true;
+    }
+    materialized |= qualified_amplifier_events(events, expected)?;
+    Some(!materialized)
+}
+
+fn qualified_amplifier_events(bytes: &[u8], expected: &str) -> Option<bool> {
+    let mut materialized = false;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+    {
+        let event: serde_json::Value = serde_json::from_slice(line).ok()?;
+        match event.get("event").and_then(serde_json::Value::as_str)? {
+            "session:start" | "session:end" | "session:resume" => {}
+            "prompt:submit" => materialized = true,
+            _ => return None,
+        }
+        if event
+            .get("session_id")
+            .is_some_and(|id| id.as_str() != Some(expected))
+        {
+            return None;
+        }
+    }
+    Some(materialized)
 }
 
 fn blocked(
@@ -1894,13 +2376,15 @@ mod tests {
             .find(|row| row.path == RecoveryPath::NativeResume)
             .unwrap();
         assert!(
-            native.evidence_refs.contains(&native_absence_reference(
+            native_absence_census_matches(
                 "opencode",
                 &spec.provider_session.provider_store_id,
                 "exact",
                 spec.evidence_revision,
-            )),
-            "the path-specific native verdict must retain its identity and revision binding"
+                native.store_state,
+                &native.evidence_refs,
+            ),
+            "the path-specific native verdict must retain its qualified current reader receipt"
         );
         assert!(negative_paths.iter().all(|row| row
             .evidence_refs
@@ -2547,6 +3031,181 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn native_artifact_semantic_identity_is_required_for_absence() {
+        for provider in ["claude", "kilroy", "codex"] {
+            for bytes in [
+                br#"{}"#.as_slice(),
+                br#"{"sessionId":null}"#.as_slice(),
+                br#"{"type":"session_meta","payload":{}}"#.as_slice(),
+                br#"{"type":"session_meta","payload":{"id":null}}"#.as_slice(),
+                br#"{"type":"session_meta","payload":{"id":"other"}}"#.as_slice(),
+                br#"{"sessionId":"other"}"#.as_slice(),
+                br#"{"type":"user","sessionId":"other"}"#.as_slice(),
+                br#"{"type":"user","sessionId":"other","message":{"role":"user","content":"synthetic"}}"#.as_slice(),
+            ] {
+                let home = tempfile::tempdir().unwrap();
+                let root = home.path().join(if provider == "codex" {
+                    ".codex/sessions"
+                } else {
+                    ".claude/projects"
+                });
+                fs::create_dir_all(&root).unwrap();
+                fs::write(root.join("unknown.jsonl"), bytes).unwrap();
+                let spec = resume_spec_for_test(provider, "saved-exact-root", home.path());
+                let probe = probe_provider_store(home.path(), &spec);
+                let complete_other = if provider == "codex" {
+                    bytes == br#"{"type":"session_meta","payload":{"id":"other"}}"#
+                } else {
+                    bytes == br#"{"type":"user","sessionId":"other","message":{"role":"user","content":"synthetic"}}"#
+                };
+                assert_eq!(
+                    matches!(probe, ProviderStoreProbe::DefinitivelyUnavailable { .. }),
+                    complete_other,
+                    "{provider}: semantically unresolved artifacts must stay blocked: {probe:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alternate_home_cannot_certify_native_absence_from_the_canonical_store() {
+        for provider in ["claude", "kilroy", "codex", "opencode", "amplifier"] {
+            let home = tempfile::tempdir().unwrap();
+            let mut spec = resume_spec_for_test(provider, "saved-exact-root", home.path());
+            spec.environment
+                .insert("HOME".into(), "/uninspected/provider-home".into());
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "{provider}: selected HOME must match the inspected provider home"
+            );
+        }
+    }
+
+    #[test]
+    fn amplifier_absence_requires_complete_exact_stub() {
+        for fault in [
+            "null",
+            "empty",
+            "missing_id",
+            "conflicting_id",
+            "partial_events",
+            "unknown_events",
+            "child_symlink",
+            "missing_transcript",
+            "extra_child",
+            "unreadable_child",
+            "null_turn_count",
+            "materialized_partial_events",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let cwd = home.path().join("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let session = freshell_sessions::amplifier_stub::ensure_session(
+                &home.path().join(".amplifier"),
+                "amp-exact-session",
+                cwd.to_str().unwrap(),
+                "terminal-one",
+            )
+            .unwrap();
+            let metadata = session.session_dir.join("metadata.json");
+            match fault {
+                "null" => fs::write(&metadata, "null").unwrap(),
+                "empty" => fs::write(&metadata, "{}").unwrap(),
+                "missing_id" | "conflicting_id" => {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+                    if fault == "missing_id" {
+                        value.as_object_mut().unwrap().remove("session_id");
+                    } else {
+                        value["session_id"] = "different-session".into();
+                    }
+                    fs::write(&metadata, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "null_turn_count" | "materialized_partial_events" => {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+                    value["turn_count"] = if fault == "null_turn_count" {
+                        serde_json::Value::Null
+                    } else {
+                        1.into()
+                    };
+                    fs::write(&metadata, serde_json::to_vec(&value).unwrap()).unwrap();
+                    if fault == "materialized_partial_events" {
+                        fs::write(
+                            session.session_dir.join("events.jsonl"),
+                            "{\"event\":\"session:sta",
+                        )
+                        .unwrap();
+                    }
+                }
+                "unreadable_child" => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&metadata, fs::Permissions::from_mode(0o000)).unwrap();
+                    }
+                }
+                "partial_events" => fs::write(
+                    session.session_dir.join("events.jsonl"),
+                    "{\"event\":\"session:sta",
+                )
+                .unwrap(),
+                "unknown_events" => {
+                    fs::write(session.session_dir.join("events.jsonl"), "{}\n").unwrap()
+                }
+                "missing_transcript" => {
+                    fs::remove_file(session.session_dir.join("transcript.jsonl")).unwrap()
+                }
+                "extra_child" => {
+                    fs::write(session.session_dir.join("uninspected"), "retained").unwrap()
+                }
+                "child_symlink" => {
+                    fs::remove_file(&metadata).unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(home.path().join("missing"), &metadata).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let spec = resume_spec_for_test("amplifier", "amp-exact-session", home.path());
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "{fault}: incomplete stub cannot certify absence"
+            );
+            assert!(session.session_dir.is_dir());
+        }
+    }
+
+    #[test]
+    fn amplifier_other_candidate_identity_must_be_resolved_before_absence() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = home.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let other = freshell_sessions::amplifier_stub::ensure_session(
+            &home.path().join(".amplifier"),
+            "other-session",
+            workspace.to_str().unwrap(),
+            "terminal",
+        )
+        .unwrap();
+        fs::write(other.session_dir.join("metadata.json"), "{}").unwrap();
+        let spec = resume_spec_for_test("amplifier", "saved-exact-root", home.path());
+        assert!(
+            matches!(
+                probe_provider_store(home.path(), &spec),
+                ProviderStoreProbe::Blocked { .. }
+            ),
+            "an identity-incomplete candidate cannot exclude the requested exact Amplifier root"
+        );
+        assert!(other.session_dir.is_dir());
     }
 
     #[test]

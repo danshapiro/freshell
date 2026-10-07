@@ -63,6 +63,7 @@ pub(crate) async fn context_with_native_identity(
         .commit_created(
             prepared.incarnation_id.clone(),
             BackendCreatedRecord {
+                launch_policy: None,
                 daemon_id: DockerDaemonId::new(),
                 container_id: "a".repeat(64),
                 image_ref: format!("sha256:{}", "b".repeat(64)),

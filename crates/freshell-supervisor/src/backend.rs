@@ -297,6 +297,18 @@ pub trait RuntimeBackend: Send + Sync {
             "native auth reader unavailable".into(),
         ))
     }
+    /// Read the exact retained provider volume without a provider process or grant.
+    async fn read_native_census(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+        _spec: &freshell_runtime_protocol::ResumeSpec,
+        _reader_binary: &Path,
+        _image_ref: &str,
+    ) -> Result<freshell_agent_runtime::ProviderStoreProbe, BackendError> {
+        Err(BackendError::Unavailable(
+            "native census reader unavailable".into(),
+        ))
+    }
     /// Import and independently read one exact OpenCode generation from a
     /// stopped soul's provider volume. Implementations must not start the
     /// provider, create a PTY, or consume a launch grant.
@@ -902,6 +914,16 @@ impl RuntimeBackend for DockerEngineBackend {
             std::time::Duration::from_secs(20),
         )
         .await
+    }
+    async fn read_native_census(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        spec: &freshell_runtime_protocol::ResumeSpec,
+        reader_binary: &Path,
+        image_ref: &str,
+    ) -> Result<freshell_agent_runtime::ProviderStoreProbe, BackendError> {
+        self.read_census_helper(handle, spec, reader_binary, image_ref)
+            .await
     }
     async fn repair_stopped_opencode(
         &self,
@@ -2170,7 +2192,11 @@ mod tests {
         );
         let mut tmpfs = runtime_tmpfs(Some("opencode"));
         tmpfs.remove("/run/freshell-private");
-        let inspection = json!({"Id":handle.container_id(),"Image":handle.image_ref(),"Config":{"Labels":{"com.freshell.managed":"true","com.freshell.installation-id":handle.installation_id(),"com.freshell.soul-id":handle.soul_id(),"com.freshell.incarnation-id":handle.incarnation_id()},"Env":runtime_host_environment(handle.terminal(),None).unwrap()},"HostConfig":{"NetworkMode":"bridge","PidMode":"","Privileged":false,"CapAdd":["CHOWN","SETUID","SETGID"],"Tmpfs":tmpfs},"Mounts":[{"Source":binary,"Destination":"/runtime/freshell-session-host","RW":false},{"Source":runtime_dir,"Destination":"/run/freshell","RW":true},{"Name":handle.provider_volume_name(),"Destination":"/home/freshell/provider","RW":true},{"Source":workspace,"Destination":workspace,"RW":true}]});
+        let inspection = json!({"Id":handle.container_id(),"Image":handle.image_ref(),"Config":{"Labels":{"com.freshell.managed":"true","com.freshell.installation-id":handle.installation_id(),"com.freshell.soul-id":handle.soul_id(),"com.freshell.incarnation-id":handle.incarnation_id()},"Env":runtime_host_environment(
+            handle.terminal(),
+            None,
+            None,
+        ).unwrap()},"HostConfig":{"NetworkMode":"bridge","PidMode":"","Privileged":false,"CapAdd":["CHOWN","SETUID","SETGID"],"Tmpfs":tmpfs},"Mounts":[{"Source":binary,"Destination":"/runtime/freshell-session-host","RW":false},{"Source":runtime_dir,"Destination":"/run/freshell","RW":true},{"Name":handle.provider_volume_name(),"Destination":"/home/freshell/provider","RW":true},{"Source":workspace,"Destination":workspace,"RW":true}]});
         (root, handle, inspection)
     }
 
@@ -2766,6 +2792,8 @@ mod tests {
         })).unwrap();
         for fresh_route in [false, true] {
             let mut expected = ExpectedConfig {
+                opencode_transfer_dir: None,
+                launch_policy: None,
                 image_ref: "sha256:image".into(),
                 installation_id: "installation-digest".into(),
                 soul_id: "soul-digest".into(),
@@ -2828,6 +2856,9 @@ mod tests {
 
     fn terminal_spec_fixture(workspace: &Path) -> TerminalLaunchSpec {
         TerminalLaunchSpec {
+            opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
             terminal_id: "terminal-fixture".into(),
             stream_id: "stream-fixture".into(),
             mode: "shell".into(),
@@ -2979,6 +3010,7 @@ mod tests {
         let handle = OwnedRuntimeHandle::from_registry(
             installation_id.clone(),
             soul_id.clone(),
+            "store".into(),
             incarnation_id.clone(),
             LaunchNonce::new(),
             DockerDaemonId::new(),

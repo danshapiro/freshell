@@ -440,6 +440,13 @@ async fn run() -> Result<(), String> {
             ).map_err(str::to_owned)
         }
         Some("retained-opencode-store-worker") => retained_store::run(&args[2..]),
+        Some("provider-census-only") => {
+            let spec: freshell_runtime_protocol::ResumeSpec = serde_json::from_str(args.get(2).ok_or("missing native census request")?)
+                .map_err(|_| "invalid native census request")?;
+            if spec.provider_home != freshell_agent_runtime::PROVIDER_HOME { return Err("native census requires the canonical provider home".into()); }
+            let result = freshell_agent_runtime::probe_provider_store(Path::new(&spec.provider_home), &spec);
+            serde_json::to_writer(std::io::stdout(), &result).map_err(|error| format!("encode native census: {error}"))
+        }
         Some("native-history-only") => {
             let snapshot = freshell_freshagent::native_history::read(
                 &required_arg(&args[2..], "--provider")?,

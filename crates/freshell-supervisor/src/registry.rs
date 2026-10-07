@@ -5457,6 +5457,7 @@ pub(crate) mod tests {
             .commit_created(
                 prepared.incarnation_id.clone(),
                 BackendCreatedRecord {
+                    launch_policy: None,
                     daemon_id: DockerDaemonId::new(),
                     container_id: "a".repeat(64),
                     image_ref: format!("sha256:{}", "b".repeat(64)),
@@ -5516,6 +5517,7 @@ pub(crate) mod tests {
                 .commit_created(
                     id.clone(),
                     BackendCreatedRecord {
+                        launch_policy: None,
                         daemon_id: DockerDaemonId::new(),
                         container_id: format!("{expected:064x}"),
                         image_ref: format!("sha256:{}", "b".repeat(64)),
@@ -5532,7 +5534,16 @@ pub(crate) mod tests {
                 .unwrap();
             registry.mark_running(id.clone()).await.unwrap();
             registry
-                .mark_recovery_success(soul.clone(), id, attempt)
+                .mark_recovery_success(
+                    soul.clone(),
+                    id,
+                    attempt,
+                    registry
+                        .recovery_context(soul.clone())
+                        .await
+                        .unwrap()
+                        .write_fence(),
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -7664,7 +7675,11 @@ pub(crate) mod tests {
 
         let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
         let negative_for = |context: &RecoveryContext| {
-            let provider_home = tempfile::tempdir().unwrap();
+            let provider_home = dir
+                .path()
+                .join("native-census")
+                .join(context.soul_id.as_str());
+            std::fs::create_dir_all(&provider_home).unwrap();
             let terminal = serde_json::from_value(serde_json::json!({
                 "terminalId":"native-census", "streamId":"native-census", "mode":"opencode",
                 "program":"opencode", "cwd":"/workspace", "workspacePath":"/workspace",
@@ -7686,7 +7701,7 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-            match freshell_agent_runtime::probe_provider_store(provider_home.path(), &spec) {
+            match freshell_agent_runtime::probe_provider_store(&provider_home, &spec) {
                 freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
                     reason,
                     evidence,
@@ -8093,6 +8108,11 @@ pub(crate) mod tests {
                 None,
                 RecoveryBlockReason::ProviderUnavailable,
                 vec!["synthetic provider store outage".into()],
+                registry
+                    .recovery_context(soul.clone())
+                    .await
+                    .unwrap()
+                    .write_fence(),
             )
             .await
             .unwrap();
