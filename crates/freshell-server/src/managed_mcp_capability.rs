@@ -39,6 +39,7 @@ pub(crate) struct OpencodeEphemeralInput<'a> {
     pub workspace: Option<&'a Path>,
     pub source_plan:
         Option<&'a [crate::managed_provider_references::sources::PlannedSourceOccurrence]>,
+    pub resource_roots: Option<&'a [PathBuf]>,
     pub initial_auth_reservation: Option<&'a str>,
     pub secret_references: Option<&'a [freshell_runtime_protocol::ProviderSecretReference]>,
     pub config_root: Option<&'a Path>,
@@ -435,6 +436,9 @@ async fn apply_prepared_callback(
                     .ok_or("replacement provider preparation requires attempt authority")?,
             ),
             selected_sources,
+            selected_resource_roots: accepted_manifest
+                .as_ref()
+                .map(|manifest| manifest.resource_roots.clone()),
             native_source_flags: accepted_manifest
                 .as_ref()
                 .map(|manifest| manifest.native_source_flags.clone()),
@@ -1121,7 +1125,8 @@ fn stage_provider_root(
                 .map(|reference| PathBuf::from(&reference.source_path)),
         );
         if let Some(plan) = opencode_input.source_plan {
-            let units = source_stage::resource_units(home, &source, plan)?;
+            let units =
+                source_stage::resource_units(home, &source, plan, opencode_input.resource_roots)?;
             selections.extend(units.iter().map(|(source, mount)| CopySelection {
                 source: source.clone(),
                 destination_relative: mount.stage_relative_path.clone().into(),
@@ -3583,6 +3588,7 @@ except Exception as error:
                         references: vec![],
                         auth_authority: Some("fixture-owned-attempt"),
                         selected_sources: None,
+                        selected_resource_roots: None,
                         native_source_flags: None,
                         rebind_enabled: None,
                         inherited_inline: None,
@@ -3714,6 +3720,7 @@ except Exception as error:
                         references: vec![],
                         auth_authority: Some("fixture-owned-attempt"),
                         selected_sources: None,
+                        selected_resource_roots: None,
                         native_source_flags: None,
                         rebind_enabled: None,
                         inherited_inline: None,
@@ -3886,6 +3893,152 @@ except Exception as error:
     }
 
     #[tokio::test]
+    async fn managed_provider_selected_directory_without_config_retains_discovery_resources() {
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let selected = owned.path().join("selected-config-directory");
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(selected.join("skills/probe")).unwrap();
+        std::fs::write(
+            selected.join("skills/probe/SKILL.md"),
+            "skill-resource-nonce",
+        )
+        .unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let prepared = crate::managed_provider_references::prepare_managed_opencode_with_publisher(
+            crate::managed_provider_references::OpencodePreparation {
+                client: &client,
+                soul: &soul,
+                creation_seed: "existing-fixture",
+                home: &home,
+                cwd: &workspace,
+                workspace: &workspace,
+                original: &|name| {
+                    (name == "OPENCODE_CONFIG_DIR").then(|| selected.to_str().unwrap().into())
+                },
+                references: vec![],
+                auth_authority: Some("existing-owned-attempt"),
+                selected_sources: None,
+                selected_resource_roots: None,
+                native_source_flags: None,
+                rebind_enabled: None,
+                inherited_inline: None,
+                inline_edits: None,
+            },
+            |soul, home, context, input| {
+                let capability = store.issue(
+                    soul.clone(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("opencode", home, &context.config)),
+                    OpencodeEphemeralInput {
+                        launch_context: Some(context),
+                        ..input
+                    },
+                    None,
+                )?;
+                read_prepared_context(&directory, &capability)
+            },
+        )
+        .await
+        .unwrap();
+        let inputs = prepared.context.prepared_inputs.as_ref().unwrap();
+        let unit = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| mount.logical_destination == selected.to_str().unwrap())
+            .expect(
+                "explicit config directory resources remain selected even with no JSON config leaf",
+            );
+        let stage = staged_provider_root_path(&directory, &inputs.generation_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                stage
+                    .join(&unit.stage_relative_path)
+                    .join("skills/probe/SKILL.md")
+            )
+            .unwrap(),
+            "skill-resource-nonce"
+        );
+        let manifest: freshell_platform::opencode_recipe::SourceManifest = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            manifest
+                .native_source_flags
+                .iter()
+                .any(|flag| flag.kind.variable() == "OPENCODE_CONFIG_DIR"
+                    && flag.runtime_destination == selected.to_str().unwrap()),
+            "the native directory selection must activate the exact selected root"
+        );
+        std::fs::write(
+            selected.join("skills/probe/SKILL.md"),
+            "skill-resource-refreshed",
+        )
+        .unwrap();
+        let callback = serde_json::to_vec(&serde_json::json!({
+            "controlSecret":"fixture-control", "action":"issue", "provider":"opencode", "soulId":soul,
+            "priorContext":prepared.context, "providerSecretReferences":[], "workspace":workspace,
+            "cwd":workspace, "authLookupAuthority":"existing-owned-attempt",
+        })).unwrap();
+        let reissued: PreparedProviderContext = serde_json::from_slice(
+            &apply_prepared_callback(
+                &callback,
+                "fixture-control",
+                &store,
+                &directory,
+                "http://host.docker.internal:4000",
+                &home,
+                &client,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let next = reissued
+            .provider_launch_context
+            .prepared_inputs
+            .as_ref()
+            .unwrap();
+        let next_unit = next
+            .resource_mounts
+            .iter()
+            .find(|mount| mount.logical_destination == selected.to_str().unwrap())
+            .unwrap();
+        let next_stage = staged_provider_root_path(&directory, &next.generation_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                next_stage
+                    .join(&next_unit.stage_relative_path)
+                    .join("skills/probe/SKILL.md")
+            )
+            .unwrap(),
+            "skill-resource-refreshed"
+        );
+        let next_manifest: freshell_platform::opencode_recipe::SourceManifest =
+            serde_json::from_slice(
+                &std::fs::read(next_stage.join(".freshell/input-manifest.json")).unwrap(),
+            )
+            .unwrap();
+        assert!(next_manifest.native_source_flags.iter().any(|flag| flag.kind.variable() == "OPENCODE_CONFIG_DIR" && flag.runtime_destination == selected.to_str().unwrap()), "reissue must retain accepted directory selection when current controller env has no selector");
+        assert!(
+            stage.exists(),
+            "pending replacement cannot retire the previous usable roots"
+        );
+    }
+
+    #[tokio::test]
     async fn managed_provider_shared_workspace_sources_keep_original_form_and_private_aliases() {
         use freshell_runtime_protocol::*;
         let owned = tempfile::tempdir().unwrap();
@@ -3921,6 +4074,7 @@ except Exception as error:
                 references: vec![],
                 auth_authority: Some("fixture-owned-attempt"),
                 selected_sources: None,
+                selected_resource_roots: None,
                 native_source_flags: None,
                 rebind_enabled: None,
                 inherited_inline: None,
@@ -4022,6 +4176,7 @@ except Exception as error:
                 references: vec![],
                 auth_authority: Some("fixture-owned-attempt"),
                 selected_sources: None,
+                selected_resource_roots: None,
                 native_source_flags: None,
                 rebind_enabled: None,
                 inherited_inline: None,
@@ -4113,6 +4268,7 @@ except Exception as error:
                 references: vec![],
                 auth_authority: Some("fixture-owned-attempt"),
                 selected_sources: None,
+                selected_resource_roots: None,
                 native_source_flags: None,
                 rebind_enabled: None,
                 inherited_inline: None,

@@ -109,7 +109,7 @@ pub fn prepare(
     };
     let mut generated = BTreeMap::new();
     let mut budget = frozen.clone();
-    if manifest.native_source_flags.len() > 2 {
+    if manifest.native_source_flags.len() > 3 {
         return Err("prepared native source selector profile exceeded".into());
     }
     for flag in &manifest.native_source_flags {
@@ -120,7 +120,15 @@ pub fn prepare(
                     &flag.runtime_destination,
                 ))
         });
-        let approved = if let Some(ordinal) = flag.source_ordinal {
+        let approved = if flag.kind
+            == freshell_platform::opencode_recipe::NativeSourceFlagKind::Directory
+        {
+            flag.source_ordinal.is_none()
+                && inputs.resource_mounts.iter().any(|mount| {
+                    mount.logical_destination == flag.runtime_destination
+                        && mount.kind == freshell_runtime_protocol::ProviderResourceKind::Directory
+                })
+        } else if let Some(ordinal) = flag.source_ordinal {
             manifest
                 .sources
                 .get(usize::from(ordinal))
@@ -132,6 +140,9 @@ pub fn prepare(
                             }
                             freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui => {
                                 source.lane == SourceLane::Tui
+                            }
+                            freshell_platform::opencode_recipe::NativeSourceFlagKind::Directory => {
+                                false
                             }
                         }
                         && (source.original_form || has_bind)
@@ -257,6 +268,7 @@ mod tests {
         let raw = r#"{"instructions":["{env:INSERT}"]}"#;
         std::fs::write(stage.join(".freshell/source-views/source-0"), raw).unwrap();
         let mut manifest = SourceManifest {
+            resource_roots: vec![],
             version: 1,
             cwd: "/original-unavailable/project".into(),
             original_home: "/original-unavailable/home".into(),

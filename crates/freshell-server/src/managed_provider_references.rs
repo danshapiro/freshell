@@ -723,6 +723,7 @@ pub(crate) struct OpencodePreparation<'a> {
     pub references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
     pub auth_authority: Option<&'a str>,
     pub selected_sources: Option<Vec<sources::SourceOccurrence>>,
+    pub selected_resource_roots: Option<Vec<PathBuf>>,
     pub native_source_flags: Option<Vec<freshell_platform::opencode_recipe::NativeSourceFlag>>,
     pub rebind_enabled: Option<bool>,
     pub inherited_inline: Option<String>,
@@ -759,6 +760,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         mut references,
         auth_authority,
         selected_sources,
+        selected_resource_roots,
         native_source_flags,
         rebind_enabled,
         inherited_inline,
@@ -790,6 +792,18 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         cwd.join(xdg)
     };
     let config_root = xdg.join("opencode");
+    let resource_roots = if let Some(roots) = selected_resource_roots {
+        roots
+    } else {
+        sources::select_opencode_resource_roots(&OpencodeDiscovery {
+            home,
+            cwd,
+            worktree: workspace,
+            config_root: &config_root,
+            env: original,
+        })
+        .map_err(str::to_string)?
+    };
     let base = crate::managed_provider_bootstrap::provider_launch_context_from_home_at_with_xdg(
         "opencode",
         workspace,
@@ -887,6 +901,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
                     .position(|source| source.source.logical_path == path && match kind {
                         freshell_platform::opencode_recipe::NativeSourceFlagKind::Main => source.source.lane == SourceLane::Main,
                         freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui => source.source.lane == SourceLane::Tui,
+                        freshell_platform::opencode_recipe::NativeSourceFlagKind::Directory => false,
                     }).ok_or_else(|| format!("selected {name} source is missing or unavailable; repair it before dispatch"))?;
                 let destination = sources::runtime_config_destination(home, &config_root, &path);
                 flags.push(freshell_platform::opencode_recipe::NativeSourceFlag {
@@ -901,6 +916,30 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
                         .into(),
                 });
             }
+        }
+        if let Some(path) = original("OPENCODE_CONFIG_DIR").filter(|path| !path.is_empty()) {
+            let path = if Path::new(&path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                cwd.join(path)
+            };
+            if !resource_roots.contains(&path) {
+                return Err(
+                    "selected OPENCODE_CONFIG_DIR root is unavailable before dispatch".into(),
+                );
+            }
+            flags.push(freshell_platform::opencode_recipe::NativeSourceFlag {
+                kind: freshell_platform::opencode_recipe::NativeSourceFlagKind::Directory,
+                source_ordinal: None,
+                runtime_destination: sources::runtime_directory_destination(
+                    home,
+                    &config_root,
+                    &path,
+                )
+                .to_str()
+                .ok_or("selected directory is not UTF-8")?
+                .into(),
+            });
         }
         flags
     };
@@ -1023,6 +1062,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
             workspace: Some(workspace),
             config_root: Some(&config_root),
             source_plan: Some(&plan),
+            resource_roots: Some(&resource_roots),
             initial_auth_reservation: reservation.as_deref(),
             secret_references: Some(&references),
             frozen_inputs: Some(&frozen_names),

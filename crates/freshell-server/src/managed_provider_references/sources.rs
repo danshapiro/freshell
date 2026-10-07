@@ -108,6 +108,14 @@ pub fn runtime_config_destination(home: &Path, global: &Path, logical: &Path) ->
     }
 }
 
+pub fn runtime_directory_destination(home: &Path, global: &Path, logical: &Path) -> PathBuf {
+    runtime_config_destination(
+        home,
+        global,
+        &freshell_platform::opencode_config::lexical_path(logical),
+    )
+}
+
 fn absolute_from_cwd(path: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(path);
     if path.is_absolute() {
@@ -167,6 +175,42 @@ pub fn config_directories(
         }
     }
     Ok(result)
+}
+
+/// Native discovery includes directories with plugins or skills even when no
+/// configuration document exists. Keep these selections independent of files.
+pub fn select_opencode_resource_roots(
+    request: &OpencodeDiscovery<'_>,
+) -> Result<Vec<PathBuf>, &'static str> {
+    let disabled = (request.env)("OPENCODE_DISABLE_PROJECT_CONFIG")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true"));
+    let mut roots = config_directories(request, None, disabled)?;
+    for directory in std::iter::once(request.home.to_path_buf())
+        .chain(ancestors(request.cwd, Some(request.worktree)))
+    {
+        for name in [".claude/skills", ".agents/skills"] {
+            let path = directory.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    if !roots.contains(&path) {
+                        roots.push(path);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("selected OpenCode skill root metadata failed"),
+            }
+        }
+    }
+    roots.retain(|root| root != request.config_root);
+    for root in &roots {
+        let canonical = std::fs::canonicalize(root).map_err(|_| {
+            "selected OpenCode resource directory is missing, inaccessible or cyclic"
+        })?;
+        if !canonical.is_dir() || canonical == request.home || canonical == Path::new("/") {
+            return Err("selected OpenCode resource requires a bounded directory scope");
+        }
+    }
+    Ok(roots)
 }
 
 fn add_source(

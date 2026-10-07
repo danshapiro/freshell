@@ -38,6 +38,8 @@ pub struct SourceManifest {
     pub user_owns_freshell_mcp: bool,
     #[serde(default)]
     pub native_source_flags: Vec<NativeSourceFlag>,
+    #[serde(default)]
+    pub resource_roots: Vec<PathBuf>,
     #[serde(default = "default_rebind_enabled")]
     pub rebind_enabled: bool,
     #[serde(default)]
@@ -60,12 +62,14 @@ pub struct NativeSourceFlag {
 pub enum NativeSourceFlagKind {
     Main,
     Tui,
+    Directory,
 }
 impl NativeSourceFlagKind {
     pub fn variable(self) -> &'static str {
         match self {
             Self::Main => "OPENCODE_CONFIG",
             Self::Tui => "OPENCODE_TUI_CONFIG",
+            Self::Directory => "OPENCODE_CONFIG_DIR",
         }
     }
 }

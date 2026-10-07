@@ -381,6 +381,40 @@ export default {id:'closed-writable-selected-root',async server(input,options){r
     )
     .unwrap();
     std::fs::write(resource_root.join("opencode.json"), &root_config).unwrap();
+    let explicit_directory = fixture.join("source-home/selected-directory");
+    let directory_receipt = fixture.join("workspace/native-directory-consumed.json");
+    std::fs::create_dir_all(explicit_directory.join("plugins")).unwrap();
+    std::fs::create_dir_all(explicit_directory.join("skills/probe")).unwrap();
+    std::fs::copy(
+        fixture.join("source-home/.config/opencode/package.json"),
+        explicit_directory.join("package.json"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        fixture.join("source-home/.config/opencode/node_modules"),
+        explicit_directory.join("node_modules"),
+    )
+    .unwrap();
+    std::fs::write(
+        explicit_directory.join("skills/probe/SKILL.md"),
+        "selected-directory-skill",
+    )
+    .unwrap();
+    let directory_plugin = format!(
+        r#"import fs from 'node:fs';import crypto from 'node:crypto';
+export default {{id:'closed-directory-discovery',async server(){{return {{async config(){{
+ const root=new URL('../',import.meta.url);const write=new URL('provider-owned-auto-write',root);
+ fs.writeFileSync(write,'selected-directory-write');
+ fs.writeFileSync({},JSON.stringify({{skill:crypto.createHash('sha256').update(fs.readFileSync(new URL('skills/probe/SKILL.md',root))).digest('hex'),write:crypto.createHash('sha256').update(fs.readFileSync(write)).digest('hex')}}));
+}}}}}}}};
+"#,
+        serde_json::to_string(&directory_receipt).unwrap()
+    );
+    std::fs::write(
+        explicit_directory.join("plugins/auto-probe.js"),
+        directory_plugin,
+    )
+    .unwrap();
 
     let request: ManagedTerminalLaunch = ManagedTerminalLaunch {
         spec: freshell_platform::spawn::SpawnSpec {
@@ -392,6 +426,10 @@ export default {id:'closed-writable-selected-root',async server(input,options){r
             rows: 30,
         },
         env: BTreeMap::from([
+            (
+                "OPENCODE_CONFIG_DIR".into(),
+                "../../source-home/selected-directory".into(),
+            ),
             ("OPENCODE_CONFIG".into(), "../selected-config.json".into()),
             ("OPENCODE_TUI_CONFIG".into(), "../selected-tui.jsonc".into()),
             ("OPENCODE_CONFIG_CONTENT".into(), inline_source.into()),
@@ -461,6 +499,11 @@ export default {id:'closed-writable-selected-root',async server(input,options){r
                 "plugin",
                 "opencode.json",
                 "bun install",
+                "install",
+                "Resolving",
+                "package",
+                "lockfile",
+                "Permission denied",
                 "ModuleNotFound",
             ]
             .into_iter()
@@ -476,6 +519,14 @@ export default {id:'closed-writable-selected-root',async server(input,options){r
     assert_eq!(terminal_receipt, expected);
     let expected_root = json!({"dependency":format!("{:x}",Sha256::digest(b"selected-root-dependency")),"resource":format!("{:x}",Sha256::digest(b"selected-root-resource")),"write":format!("{:x}",Sha256::digest(b"selected-root-write"))});
     assert_eq!(read_receipt(&root_receipt).await.unwrap(), expected_root);
+    let expected_directory = json!({"skill":format!("{:x}",Sha256::digest(b"selected-directory-skill")),"write":format!("{:x}",Sha256::digest(b"selected-directory-write"))});
+    assert_eq!(
+        read_receipt(&directory_receipt).await.unwrap(),
+        expected_directory
+    );
+    assert!(!explicit_directory
+        .join("provider-owned-auto-write")
+        .exists());
     assert!(
         !resource_root.join("provider-owned-write").exists(),
         "native writes must land in the selected soul subpath, preserving originals"
@@ -526,9 +577,11 @@ export default {id:'closed-writable-selected-root',async server(input,options){r
     std::fs::remove_file(&receipt).unwrap();
     std::fs::remove_file(&shared_receipt).unwrap();
     std::fs::remove_file(&root_receipt).unwrap();
+    std::fs::remove_file(&directory_receipt).unwrap();
     // Fresh launches use current server controls; the terminal exercised a
     // request-only relative control. Both must activate the explicit layer.
     std::env::set_var("OPENCODE_CONFIG", &explicit_config);
+    std::env::set_var("OPENCODE_CONFIG_DIR", &explicit_directory);
     std::env::set_var("OPENCODE_TUI_CONFIG", &selected_tui);
     std::env::set_var("OPENCODE_CONFIG_CONTENT", inline_source);
     std::env::set_var("INLINE_VALUE", inline_value);
@@ -575,6 +628,13 @@ export default {id:'closed-writable-selected-root',async server(input,options){r
         .await;
     assert_eq!(read_receipt(&receipt).await.unwrap(), fresh_expected);
     assert_eq!(read_receipt(&root_receipt).await.unwrap(), expected_root);
+    assert_eq!(
+        read_receipt(&directory_receipt).await.unwrap(),
+        expected_directory
+    );
+    assert!(!explicit_directory
+        .join("provider-owned-auto-write")
+        .exists());
     assert!(!resource_root.join("provider-owned-write").exists());
     assert_eq!(
         std::fs::read(resource_root.join("opencode.json")).unwrap(),

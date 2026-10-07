@@ -39,6 +39,24 @@ fn selections(mounts: &docker::TerminalMounts) -> Result<Vec<Mountpoint>, Backen
         let directory = root.kind == freshell_runtime_protocol::ProviderResourceKind::Directory;
         add(&home.join(&root.provider_relative_path), directory)?;
         add(Path::new(&root.effective_destination), directory)?;
+        for leaf in mounts
+            .config_binds
+            .iter()
+            .map(|bind| &bind.reference.effective_destination)
+            .chain(mounts.indexed_files.iter().flat_map(|files| {
+                files
+                    .aliases
+                    .iter()
+                    .map(|alias| &alias.effective_destination)
+            }))
+        {
+            if let Ok(relative) = Path::new(leaf).strip_prefix(&root.effective_destination) {
+                add(
+                    &home.join(&root.provider_relative_path).join(relative),
+                    false,
+                )?;
+            }
+        }
     }
     if let Some(files) = &mounts.indexed_files {
         for alias in &files.aliases {
@@ -247,5 +265,46 @@ impl DockerEngineBackend {
         }
         tracing::debug!(soul_id=%spec.soul_id,entries=selected.len(),succeeded=result.is_ok(),"runtime.provider_mountpoints_settled");
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freshell_runtime_protocol::{
+        ProviderConfigBind, ProviderResourceKind, ProviderResourceMount,
+    };
+
+    #[test]
+    fn provider_mountpoints_precreate_private_leaf_inside_external_selected_root() {
+        let mounts = docker::TerminalMounts {
+            workspace: "/synthetic/workspace".into(),
+            git_common_dir: None,
+            provider_bootstrap_files: vec![],
+            provider_secret_files: vec![],
+            indexed_secret_sources: BTreeMap::new(),
+            provider_user_root: None,
+            mcp_capability_file: None,
+            input_manifest: None,
+            indexed_files: None,
+            config_binds: vec![docker::ResolvedProviderConfigBind {
+                source: "/private/template".into(),
+                reference: ProviderConfigBind {
+                    source_relative_path: ".freshell/templates/source-0".into(),
+                    logical_destination: "/synthetic/workspace/.opencode/opencode.json".into(),
+                    effective_destination: "/synthetic/workspace/.opencode/opencode.json".into(),
+                },
+            }],
+            resource_mounts: vec![ProviderResourceMount {
+                stage_relative_path: ".freshell/resource-units/root-0".into(),
+                provider_relative_path: ".freshell/provider-roots/root-0".into(),
+                logical_destination: "/synthetic/workspace/.opencode".into(),
+                effective_destination: "/synthetic/workspace/.opencode".into(),
+                kind: ProviderResourceKind::Directory,
+            }],
+        };
+        let selected = selections(&mounts).unwrap();
+        assert!(selected.iter().any(|point| point.relative_path == ".freshell/provider-roots/root-0/opencode.json" && !point.directory),
+            "exact private leaves must exist in the owned soul subpath before Docker mounts the external root");
     }
 }

@@ -468,6 +468,7 @@ impl HostedFreshAgentProxy {
                     references: provider_secret_references,
                     auth_authority: None,
                     selected_sources: None,
+                    selected_resource_roots: None,
                     native_source_flags: None,
                     rebind_enabled: None,
                     inherited_inline: None,

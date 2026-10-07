@@ -10,6 +10,7 @@ pub(super) fn resource_units(
     home: &Path,
     global: &Path,
     plan: &[PlannedSourceOccurrence],
+    accepted_roots: Option<&[std::path::PathBuf]>,
 ) -> Result<
     Vec<(
         std::path::PathBuf,
@@ -19,6 +20,14 @@ pub(super) fn resource_units(
 > {
     use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
     let mut roots = BTreeMap::new();
+    for root in accepted_roots.unwrap_or_default() {
+        let canonical = std::fs::canonicalize(root)
+            .map_err(|_| "selected OpenCode resource root is unavailable, dangling or cyclic")?;
+        if !canonical.is_dir() {
+            return Err("selected OpenCode resource root must be a directory".into());
+        }
+        roots.insert(root.clone(), canonical);
+    }
     for source in plan {
         if source.source.lane == SourceLane::Inline {
             continue;
@@ -38,10 +47,11 @@ pub(super) fn resource_units(
     }
     let mut units = Vec::new();
     for (ordinal, (logical, canonical)) in roots.into_iter().enumerate() {
-        let destination = crate::managed_provider_references::sources::runtime_config_destination(
-            home, global, &logical,
-        );
-        let effective = crate::managed_provider_references::sources::runtime_config_destination(
+        let destination =
+            crate::managed_provider_references::sources::runtime_directory_destination(
+                home, global, &logical,
+            );
+        let effective = crate::managed_provider_references::sources::runtime_directory_destination(
             home, global, &canonical,
         );
         units.push((
@@ -107,6 +117,7 @@ pub(super) fn stage(
         frozen_inputs: input.frozen_inputs.unwrap_or(&[]).to_vec(),
         user_owns_freshell_mcp: false,
         native_source_flags: input.native_source_flags.unwrap_or(&[]).to_vec(),
+        resource_roots: input.resource_roots.unwrap_or(&[]).to_vec(),
         rebind_enabled: input.rebind_enabled.unwrap_or(true),
         inline_edits: input.inline_edits.cloned().unwrap_or_default(),
     };
