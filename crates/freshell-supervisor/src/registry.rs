@@ -3040,7 +3040,7 @@ mod tests {
                 tui_source: None,
                 inline_config: false,
             };
-            let wrong_result = registry.prepare_launch(wrong).await;
+            let wrong_result = registry.prepare_launch(wrong.clone()).await;
             assert!(
                 matches!(wrong_result, Err(RegistryError::RequestConflict)),
                 "foreign provider bind outcome: {wrong_result:?}"
@@ -3048,11 +3048,22 @@ mod tests {
             let prepared = registry.prepare_launch(launch.clone()).await.unwrap();
             assert_eq!(
                 registry
-                    .prepare_launch(launch)
+                    .prepare_launch(launch.clone())
                     .await
                     .unwrap()
                     .incarnation_id,
                 prepared.incarnation_id
+            );
+            assert!(matches!(registry.prepare_launch(wrong).await, Err(RegistryError::RequestConflict)),
+                "a bound reservation retry cannot change provider even when its caller reuses the payload digest");
+            let mut changed_seed = launch;
+            changed_seed.creation_seed_ref = "changed-creation-seed".into();
+            assert!(
+                matches!(
+                    registry.prepare_launch(changed_seed).await,
+                    Err(RegistryError::RequestConflict)
+                ),
+                "a bound reservation retry cannot change its creation seed"
             );
             let bound = registry
                 .bound_input_reservation(prepared.incarnation_id)

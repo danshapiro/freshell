@@ -237,8 +237,12 @@ pub(super) fn check_bound_reference(
     input: &LaunchPreparation,
     incarnation: &IncarnationId,
 ) -> Result<(), RegistryError> {
-    let stored:Option<String>=conn.query_row("SELECT reservation_id FROM provider_input_preparations WHERE bound_incarnation_id=?1 AND soul_id=?2 AND consumed=1",params![incarnation.as_str(),input.soul_id.as_str()],|row|row.get(0)).optional()?;
-    if stored.as_deref() != reservation_reference(input) {
+    let stored:Option<(String,String,String)>=conn.query_row("SELECT reservation_id,provider,creation_seed_ref FROM provider_input_preparations WHERE bound_incarnation_id=?1 AND soul_id=?2 AND consumed=1",params![incarnation.as_str(),input.soul_id.as_str()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+    if stored.as_ref().map(|(id, _, _)| id.as_str()) != reservation_reference(input)
+        || stored.as_ref().is_some_and(|(_, provider, seed)| {
+            provider != &input.provider || seed != &input.creation_seed_ref
+        })
+    {
         return Err(RegistryError::RequestConflict);
     }
     Ok(())
