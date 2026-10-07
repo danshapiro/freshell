@@ -98,7 +98,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       inventoryBody: () => ({ method: 'inventory' }), terminalReadOutputBody: () => ({ method: 'terminal_read_output' }),
       probeRecoveryBody: () => ({ method: 'probe_recovery' }),
       terminalInputBody: () => ({ method: 'terminal_input' }),
-      adminRaw: async () => ({ result: fault === 'wrong-root-admitted' ? { Ok: {} } : { Err: { code: 'RECOVERY_WRONG_IDENTITY' } } }),
+      adminRaw: async () => ({ result: fault === 'wrong-root-admitted' ? { Ok: {} } : { Err: { code: 'RECOVERY_BLOCKED' } } }),
       adminOk: async (_supervisor: unknown, body: any) => {
         if (body.method === 'launch') { request = body; return { data: { view: view() } } }
         if (body.method === 'probe_recovery') { refreshed = true; return { data: { kind: 'unknown' } } }

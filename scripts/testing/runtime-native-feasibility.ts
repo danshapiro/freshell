@@ -513,8 +513,10 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     const after = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
       ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
     harness.writeArtifact(`${scenario}-after-refused-input-native-private.json`, after)
+    // This PTY input boundary uses RecoveryBlocked when its current native
+    // observation is unavailable; inspect the provider state separately.
     assertions[0]!.pass = !observation && actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
-      && rejected.result?.Err?.code === 'RECOVERY_WRONG_IDENTITY'
+      && rejected.result?.Err?.code === 'RECOVERY_BLOCKED'
       && JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
       && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0
     if (!assertions[0]!.pass) throw new Error('wrong current native root released ordinary input or changed native state')
