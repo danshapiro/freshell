@@ -13,7 +13,8 @@ import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
-import { ManagedRuntimeOwner } from '../../../../scripts/testing/runtime-sandbox.js'
+import { ManagedRuntimeOwner, RuntimeHarness, type SupervisorInstance } from '../../../../scripts/testing/runtime-sandbox.js'
+import { runTask2RetainedFixture } from '../../../../scripts/testing/task002-retained-fixture.js'
 
 beforeEach(() => execute.mockReset())
 
@@ -366,6 +367,40 @@ describe('owned web process lifetime (Node process fixture only)', () => {
     })
     return { fixture, entry, home, setup }
   }
+  it('stops the actual factory-created web PID when retained producer readiness fails', async () => {
+    const { fixture: directory, entry } = await fixture()
+    const h = new RuntimeHarness(process.cwd(), undefined, 3)
+    const supervisor: SupervisorInstance = { scenarioId: 'task2-config-jsonc', containerId: 'c'.repeat(64),
+      controlSocket: path.join(h.testRoot, 'control.sock'), controlSecret: 'owned-unit-secret',
+      controlSecretFile: path.join(h.testRoot, 'control-secret'), runtimeRoot: h.testRoot,
+      volumeName: 'owned-unit-volume', binaryKind: 'test' }
+    vi.spyOn(h, 'startSupervisor').mockResolvedValue(supervisor)
+    vi.spyOn(h, 'adminOk').mockResolvedValue({ kind: 'health', data: { controlEpoch: 1 } })
+    vi.spyOn(h, 'assert').mockImplementation(() => {})
+    vi.spyOn(h, 'waitForFile').mockRejectedValue(new Error('owned MCP readiness failed'))
+    let server: runner.ManagedRuntimeWebServer | undefined
+    let webPid: number | undefined
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    await fsp.mkdir(h.testRoot, { recursive: true, mode: 0o700 })
+    try {
+      await expect(runTask2RetainedFixture(h, false, options => {
+        server = new runner.ManagedRuntimeWebServer({ ...options, binary: process.execPath,
+          candidateSha: 'a'.repeat(40), buildDirty: false, env: { ...options.env, NODE_OPTIONS: `--require=${entry}` } })
+        const start = server.start.bind(server)
+        vi.spyOn(server, 'start').mockImplementation(async () => {
+          const info = await start(); webPid = info.pid; return info
+        })
+        return server
+      })).rejects.toThrow('owned MCP readiness failed')
+      expect(webPid).toBeDefined()
+      await expect(fsp.stat(`/proc/${webPid}`)).rejects.toThrow()
+    } finally {
+      await server?.stop()
+      vi.unstubAllEnvs()
+      await fsp.rm(h.testRoot, { recursive: true, force: true })
+      await fsp.rm(directory, { recursive: true })
+    }
+  })
   it('strips inherited provider environment after overrides while preserving owned controller references', async () => {
     const { fixture: directory, entry, setup } = await fixture()
     const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),

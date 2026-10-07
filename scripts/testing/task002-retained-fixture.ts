@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import net from 'node:net'
 import { createHmac, randomUUID } from 'node:crypto'
+import { z } from 'zod'
 import { RuntimeHarness, newSoul, newRequest, type SupervisorInstance, type AdminReply, type RuntimeWebFactory, type RuntimeWebHandle } from './runtime-sandbox.js'
 
 const ROOT = 'ses_task002syntheticroot'
@@ -200,11 +201,17 @@ async function producer(h: RuntimeHarness, supervisor: SupervisorInstance, scena
   })
   // Strip inherited grants in the fixture's child, while keeping these explicit
   // owned controller values. RustServer's final stripping runs after merging.
-  const previous = process.env.FRESHELL_E2E_RUST_SERVER_BIN
-  process.env.FRESHELL_E2E_RUST_SERVER_BIN = h.task2ServerBinary
-  try { await server.start() } finally { if (previous === undefined) delete process.env.FRESHELL_E2E_RUST_SERVER_BIN; else process.env.FRESHELL_E2E_RUST_SERVER_BIN = previous }
-  await h.waitForFile(path.join(path.dirname(supervisor.controlSocket), 'mcp.sock'))
-  return server
+  try {
+    const previous = process.env.FRESHELL_E2E_RUST_SERVER_BIN
+    process.env.FRESHELL_E2E_RUST_SERVER_BIN = h.task2ServerBinary
+    try { await server.start() } finally { if (previous === undefined) delete process.env.FRESHELL_E2E_RUST_SERVER_BIN; else process.env.FRESHELL_E2E_RUST_SERVER_BIN = previous }
+    await h.waitForFile(path.join(path.dirname(supervisor.controlSocket), 'mcp.sock'))
+    return server
+  } catch (error) {
+    try { await server.stop() }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], 'retained producer readiness and owned cleanup failed') }
+    throw error
+  }
 }
 
 async function selectedPreparation(supervisor: SupervisorInstance, soulId: string, workspace: string, tuiFormat: 'json' | 'jsonc'): Promise<any> {
@@ -380,3 +387,92 @@ export async function runTask2RetainedFixture(
 
 
 export { data as task2FixtureData, inventory as task2FixtureInventory, ownedRecord as task2FixtureOwnedRecord, selected as TASK2_FIXTURE_CASES }
+
+export type Task2RetainedPublicContext = Pick<Task2RetainedBrowserContext,
+  'soulId' | 'rootSessionId' | 'childSessionId' | 'oldContainerId' | 'oldIncarnationId' |
+  'providerVolumeName' | 'preferredTabId' | 'preferredPaneId' | 'title' | 'result'> & {
+    info: { baseUrl: string; wsUrl: string; token: string }
+    configMode: number
+  }
+export type Task2RetainedBrowserStage = {
+  kind: 'preparing' | 'finished' | 'failed'; sequence: number
+} | {
+  kind: 'observe' | 'retry'; sequence: number
+  phase: Task2RetainedBrowserPhase | 'config_fault' | 'repaired'
+  context: Task2RetainedPublicContext
+}
+
+/** The existing driver waits for observation acknowledgements and real UI responses. */
+export class RetainedFixtureBrowserSession {
+  private stage: Task2RetainedBrowserStage = { kind: 'preparing', sequence: 0 }
+  private settlement?: Promise<void>
+  private failure?: unknown
+  private cancelled = false
+  private pending?: { context: Task2RetainedBrowserContext; kind: 'observe' | 'retry';
+    resolve: (reply?: AdminReply) => void; reject: (error: Error) => void }
+
+  start(run: (hooks: Task2RetainedBrowserHooks) => Promise<void>): void {
+    if (this.settlement) throw new Error('owned retained session already started')
+    const observe: Task2RetainedBrowserHooks['observe'] = (context, phase) => new Promise<void>((resolve, reject) => {
+      this.publish(context, 'observe', phase)
+      this.pending = { context, kind: 'observe', resolve: () => resolve(), reject }
+    })
+    const retry: Task2RetainedBrowserHooks['retry'] = (context, phase) => new Promise<AdminReply>((resolve, reject) => {
+      this.publish(context, 'retry', phase)
+      this.pending = { context, kind: 'retry', resolve: reply => {
+        if (reply) resolve(reply); else reject(new Error('actual owned UI retry response required'))
+      }, reject }
+    })
+    this.settlement = run({ observe, retry }).then(() => {
+      this.pending = undefined
+      this.stage = { kind: 'finished', sequence: this.stage.sequence + 1 }
+    }).catch(error => {
+      this.pending = undefined
+      this.failure = error
+      this.stage = { kind: 'failed', sequence: this.stage.sequence + 1 }
+    })
+  }
+  private publish(context: Task2RetainedBrowserContext, kind: 'observe' | 'retry', phase: Task2RetainedBrowserPhase | 'config_fault' | 'repaired'): void {
+    if (this.cancelled) throw new Error('owned retained browser session cancelled')
+    const { soulId, rootSessionId, childSessionId, oldContainerId, oldIncarnationId, providerVolumeName,
+      preferredTabId, preferredPaneId, title, result } = context
+    const { baseUrl, wsUrl, token } = context.web.info
+    this.stage = { kind, phase, sequence: this.stage.sequence + 1, context: {
+      soulId, rootSessionId, childSessionId, oldContainerId, oldIncarnationId, providerVolumeName,
+      preferredTabId, preferredPaneId, title, result, info: { baseUrl, wsUrl, token },
+      configMode: fs.statSync(context.configFile).mode & 0o777,
+    } }
+  }
+  status(): Task2RetainedBrowserStage { return this.stage }
+  advance(sequence: number): void {
+    if (this.stage.kind !== 'observe' || sequence !== this.stage.sequence || this.pending?.kind !== 'observe') {
+      throw new Error('exact observed retained stage sequence required')
+    }
+    const pending = this.pending
+    this.pending = undefined
+    this.stage = { kind: 'preparing', sequence }
+    pending.resolve()
+  }
+  captureRetry(soulId: string, requestId: string, response: unknown): void {
+    if (this.stage.kind !== 'retry' || this.pending?.kind !== 'retry' || soulId !== this.pending.context.soulId || !requestId) {
+      throw new Error('actual pending retained soul retry required')
+    }
+    const parsed = z.object({ view: z.object({ soulId: z.literal(soulId) }).passthrough(),
+      outcome: z.enum(['blocked', 'replaced']) }).passthrough().safeParse(response)
+    if (!parsed.success) throw new Error('actual retained UI retry response differs from the pending soul')
+    const pending = this.pending
+    this.pending = undefined
+    this.stage = { kind: 'preparing', sequence: this.stage.sequence }
+    pending.resolve({ requestId, result: { Ok: { kind: 'recovery', data: parsed.data } } })
+  }
+  async settled(): Promise<void> {
+    if (!this.settlement) throw new Error('owned retained session is not started')
+    await this.settlement
+    if (this.failure) throw this.failure
+  }
+  async cancel(): Promise<void> {
+    this.cancelled = true
+    this.pending?.reject(new Error('owned retained browser session cancelled'))
+    if (this.settlement) await this.settlement
+  }
+}

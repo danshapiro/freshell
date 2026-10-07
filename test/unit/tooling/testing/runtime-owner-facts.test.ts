@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { runTask2RetainedFixture } from '../../../../scripts/testing/task002-config-legacy-fixtures.js'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
+import * as retained from '../../../../scripts/testing/task002-retained-fixture.js'
 
 const handle = {
   runId: 'run-owned', candidateSha: 'a'.repeat(40), soulId: 'soul-owned',
@@ -34,6 +35,68 @@ describe('retained fixture owner web injection', () => {
     } finally {
       browserStart.mockRestore()
       vi.unstubAllEnvs()
+      await fsp.rm(h.testRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('finite retained browser stage protocol (source coverage only)', () => {
+  it('requires the exact observed stage before advancing and accepts only the actual soul retry response', async () => {
+    const h = new owner.RuntimeHarness(process.cwd(), undefined, 3)
+    const info: owner.RuntimeWebInfo = { baseUrl: 'https://owned.example.invalid', wsUrl: 'wss://owned.example.invalid/ws',
+      token: 'synthetic-unit-token', port: 443, configDir: h.testRoot, homeDir: h.testRoot, logsDir: h.testRoot,
+      debugLogPath: path.join(h.testRoot, 'log'), pid: 1, runtimeRoot: h.repoRoot }
+    const web = new RustServer()
+    vi.spyOn(web, 'info', 'get').mockReturnValue(info)
+    const context: retained.Task2RetainedBrowserContext = { h, web,
+      supervisor: { scenarioId: 'owned-stage', containerId: 'b'.repeat(64), controlSocket: path.join(h.testRoot, 'control.sock'),
+        controlSecret: 'synthetic-unit-control', controlSecretFile: path.join(h.testRoot, 'secret'), runtimeRoot: h.testRoot,
+        volumeName: 'owned-stage-volume', binaryKind: 'test' },
+      soulId: 'owned-stage-soul', rootSessionId: 'ses_owned', childSessionId: 'ses_child',
+      oldContainerId: 'c'.repeat(64), oldIncarnationId: 'owned-incarnation', providerVolumeName: 'owned-stage-provider',
+      configFile: path.join(h.testRoot, 'opencode.json'), preferredTabId: 'owned-tab', preferredPaneId: 'owned-pane', title: 'owned fixture' }
+    let advanced = 0
+    const session = new retained.RetainedFixtureBrowserSession()
+    try {
+      await fsp.mkdir(h.testRoot, { recursive: true, mode: 0o700 })
+      await fsp.writeFile(context.configFile, '{}', { mode: 0o644 })
+      session.start(async hooks => {
+        await hooks.observe(context, 'store_blocked')
+        advanced++
+        const reply = await hooks.retry(context, 'repaired')
+        expect(reply.requestId).toBe('actual-ui-request')
+        advanced++
+      })
+      const first = session.status()
+      expect(first).toMatchObject({ kind: 'observe', phase: 'store_blocked', sequence: 1 })
+      expect(() => session.advance(2)).toThrow(/stage|sequence/)
+      expect(advanced).toBe(0)
+      session.advance(1)
+      await new Promise(resolve => setImmediate(resolve))
+      expect(session.status()).toMatchObject({ kind: 'retry', phase: 'repaired', sequence: 2 })
+      expect(() => session.captureRetry('foreign-soul', 'actual-ui-request', { view: { soulId: context.soulId }, outcome: 'replaced' })).toThrow(/soul/)
+      expect(advanced).toBe(1)
+      session.captureRetry(context.soulId, 'actual-ui-request', { view: { soulId: context.soulId }, outcome: 'replaced' })
+      await session.settled()
+      expect(advanced).toBe(2)
+      expect(session.status().kind).toBe('finished')
+      const preparing = new retained.RetainedFixtureBrowserSession()
+      let release!: () => void
+      const setup = new Promise<void>(resolve => { release = resolve })
+      preparing.start(async hooks => { await setup; await hooks.observe(context, 'store_blocked') })
+      const cancellation = preparing.cancel()
+      release()
+      try {
+        await new Promise(resolve => setImmediate(resolve))
+        expect(preparing.status().kind).toBe('failed')
+        await cancellation
+      } finally {
+        const late = preparing.status()
+        if (late.kind === 'observe') preparing.advance(late.sequence)
+        await cancellation
+      }
+    } finally {
+      await session.cancel()
       await fsp.rm(h.testRoot, { recursive: true, force: true })
     }
   })
