@@ -205,7 +205,7 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     manifest.sourceFiles.push({ name: 'claude/profile/native-startup-user.json', path: profilePath,
       sha256: createHash('sha256').update(fs.readFileSync(profilePath)).digest('hex') })
   }
-  let paidApprovalPrerequisiteFailed = false
+  let paidPrerequisiteFailed = false
   const servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []
   try {
     const prepared = await harness.prepareNativeArtifacts({ candidateSha: manifest.candidateSha,
@@ -216,12 +216,15 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     const originals = await dispatchNativeFeasibility({ selection, imageDigest: manifest.imageDigest,
       candidateSha: manifest.candidateSha, ownerId: harness.runId,
       execute: async (caseId) => {
-        if (paidApprovalPrerequisiteFailed && selection.case === 'approval-checkpoint') {
-          throw new Error('prior native approval prerequisite failed; no further paid operation started')
+        const paidCase = selection.case === 'approval-checkpoint'
+          || (selection.provider === 'claude' && caseId === 'exact-resume')
+        if (paidPrerequisiteFailed && paidCase) {
+          throw new Error('prior native prerequisite failed; no further paid operation started')
         }
         try { return await executeManagedNativeCase(harness, prepared.files, selection, caseId, prepared.serverPath, servers) }
         catch (error) {
-          if (selection.case === 'approval-checkpoint') paidApprovalPrerequisiteFailed = true
+          if (selection.case === 'approval-checkpoint'
+            || (selection.provider === 'claude' && caseId === 'create')) paidPrerequisiteFailed = true
           const reason = error instanceof Error ? error.message : 'unknown native case failure'
           harness.writeArtifact(`native-case-${caseId}-failure.json`, { severity: 'error',
             event: 'runtime.native_feasibility.case_failed', caseId, reason })
@@ -562,6 +565,14 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     || namespace.loaded.native.workspace?.current_dir !== workspace
     || JSON.stringify(namespace.loaded.launch) !== JSON.stringify(namespace.hook.launch)) {
     throw new Error('actual terminal Claude pin/profile/namespace/TLS differs')
+  }
+  if (!wrongRoot) {
+    // Exercise the ordinary output/store path before starting a paid seed.
+    // Input ACKs cannot hide a dispatcher or store failure at this boundary.
+    harness.writeArtifact(`${scenario}-pre-input-terminal-private.json`, await harness.adminOk(supervisor,
+      harness.terminalReadOutputBody(soulId)))
+    harness.writeArtifact(`${scenario}-pre-input-store-probe.json`, await harness.adminOk(supervisor,
+      harness.probeRecoveryBody(soulId)))
   }
   const assertions = wrongRoot ? [{ name: 'wrong-current-native-root-refused-before-running-and-input', pass: false }]
     : [{ name: 'actual-terminal-current-native-post-load-observation-before-input', pass:

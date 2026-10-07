@@ -371,6 +371,45 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       fs.rmSync(directory, { recursive: true, force: true })
     }
   })
+  it('does not start a paid terminal seed after the actual create prerequisite fails', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-create-hold-'))
+    const manifest = path.join(directory, 'artifacts.json')
+    const preferences = path.join(directory, 'preferences.json'); fs.writeFileSync(preferences, '{}')
+    const previous = process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
+    const files = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json']
+      .map((name) => ({ name: 'claude/' + name, path: preferences, sha256: 'e'.repeat(64) }))
+    fs.writeFileSync(manifest, JSON.stringify({ candidateSha, imageDigest, artifacts: {
+      supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
+      host: { path: '/fixture/host', sha256: 'd'.repeat(64) },
+    }, sourceFiles: files }))
+    process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = manifest
+    let scratch: string | undefined
+    const prepare = vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function () {
+      scratch = this.testRoot; fs.mkdirSync(scratch, { recursive: true, mode: 0o700 })
+      return { supervisorPath: '/fixture/supervisor', hostPath: '/fixture/host', serverPath: '/fixture/server', files }
+    })
+    const start = vi.spyOn(RuntimeHarness.prototype, 'startSupervisor').mockResolvedValue({} as never)
+    const write = vi.spyOn(RuntimeHarness.prototype, 'writeArtifact').mockReturnValue('fixture-artifact')
+    const admin = vi.spyOn(RuntimeHarness.prototype, 'adminOk').mockRejectedValue(new Error('controlled create failure'))
+    const raw = vi.spyOn(RuntimeHarness.prototype, 'adminRaw').mockRejectedValue(new Error('controlled negative failure'))
+    const server = vi.spyOn(RustServer.prototype, 'start').mockRejectedValue(new Error('paid seed must remain held'))
+    const evidence = vi.spyOn(RustServer.prototype, 'processEvidence').mockReturnValue({} as never)
+    const stop = vi.spyOn(RustServer.prototype, 'stop').mockResolvedValue()
+    const cleanup = vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    try {
+      await expect(runNativeFeasibility(['--provider', 'claude', '--case', 'startup'])).rejects.toThrow('native experiment cases failed')
+      expect(admin).toHaveBeenCalledOnce()
+      expect(server).not.toHaveBeenCalled()
+      expect(cleanup).toHaveBeenCalledOnce()
+    } finally {
+      prepare.mockRestore(); start.mockRestore(); write.mockRestore(); admin.mockRestore(); raw.mockRestore()
+      server.mockRestore(); evidence.mockRestore(); stop.mockRestore(); cleanup.mockRestore()
+      if (previous === undefined) delete process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
+      else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = previous
+      fs.rmSync(directory, { recursive: true, force: true })
+      if (scratch) fs.rmSync(scratch, { recursive: true, force: true })
+    }
+  })
   it('prepares only exact private native artifacts and selected source copies without ambient mounts', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-artifact-unit-'))
     execFileSync('git', ['init', '-q', directory])
