@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
+import { createServer } from 'node:net'
+import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   runNativeFeasibility, executeManagedNativeCase, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
@@ -25,6 +27,75 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it('submits terminal Claude paste and Enter separately before qualifying the completed native seed', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-claude-native-input-'))
+    const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
+    const binary = path.join(directory, 'owned-controller'); fs.writeFileSync(binary, 'fixture-only controller artifact')
+    const socketPath = path.join(directory, 'mcp.sock')
+    const controller = createServer((socket) => {
+      const chunks: Buffer[] = []
+      socket.on('data', (chunk) => chunks.push(chunk))
+      socket.on('end', () => {
+        const request = JSON.parse(Buffer.concat(chunks).toString())
+        expect(request.action).toBe('issue'); expect(request.provider).toBe('claude')
+        socket.end(JSON.stringify({ context: { mcpCapability: { grantId: 'owned-fixture-grant' } },
+          secretReferences: [{ sourcePath: source, profile: 'claude_onecli_environment' }] }))
+      })
+    })
+    await new Promise<void>((resolve) => controller.listen(socketPath, resolve))
+    const start = vi.spyOn(RustServer.prototype, 'start').mockResolvedValue({ pid: undefined } as any)
+    const evidence = vi.spyOn(RustServer.prototype, 'processEvidence').mockReturnValue({} as any)
+    let request: any
+    let submitted = 0
+    let pasted = false
+    let replacement = false
+    let now = 0
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now += 25_000)
+    const gestures: string[] = []
+    const view = () => ({ containerId: 'owned-container', incarnationId: replacement ? 'new-incarnation' : 'old-incarnation',
+      nativeSessionId: request.params.nativeSessionId, recoveryState: 'live',
+      nativeIdentityObservation: { source: 'claude_native_event', nativeSessionId: request.params.nativeSessionId,
+        incarnationId: replacement ? 'new-incarnation' : 'old-incarnation' } })
+    const harness = { testRoot: directory, writeArtifact: () => '',
+      startSupervisor: async () => ({ controlSocket: path.join(directory, 'supervisor.sock'), controlSecret: 'owned-fixture-secret' }),
+      terminalInputBody: (_soul: string, data: string) => ({ method: 'terminal_input', params: { data } }),
+      terminalReadOutputBody: () => ({ method: 'terminal_read_output' }),
+      probeRecoveryBody: () => ({ method: 'probe_recovery' }), recoverBody: () => ({ method: 'recover' }),
+      killOwnedRuntimeExact: async () => { expect(submitted).toBe(1) }, waitForContainerExit: async () => {},
+      adminOk: async (_supervisor: unknown, body: any) => {
+        if (body.method === 'launch') { request = body; return { data: { view: view() } } }
+        if (body.method === 'terminal_input') {
+          gestures.push(body.params.data)
+          if (body.params.data.startsWith('\x1b[200~') && body.params.data.endsWith('\x1b[201~')) pasted = true
+          else if (body.params.data === '\r' && pasted) submitted++
+        }
+        if (body.method === 'recover') { replacement = true; return { data: { outcome: 'replaced', view: view() } } }
+        return { data: { kind: 'reattach_ready' } }
+      },
+      execOwnedContainerAsExact: async (_container: string, _uid: string, args: string[]) => JSON.stringify(args.at(-1) !== 'terminal' ? { processes: [] } : {
+        uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200, tlsVerifyMode: 2,
+        tlsCheckHostname: true, version: '2.1.263', executableSha256: 'f'.repeat(64), profileFiles: [], nativePreferences: {},
+        completedTurns: submitted, toolEvents: 0, transcript: submitted ? { sha256: 'e'.repeat(64), identity: [1, 2], completeEof: true } : null,
+        hook: { launch: { launchNonce: replacement ? 'new-nonce' : 'old-nonce', incarnationId: view().incarnationId },
+          native: { source: replacement ? 'resume' : 'startup', session_id: request.params.nativeSessionId } },
+        loaded: { launch: { launchNonce: replacement ? 'new-nonce' : 'old-nonce', incarnationId: view().incarnationId },
+          native: { version: '2.1.263', session_id: request.params.nativeSessionId,
+            model: { id: 'claude-haiku-4-5-20251001' }, workspace: { current_dir: request.params.terminal.cwd } } },
+      }),
+    } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
+    try {
+      const result = await executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, 'exact-resume', binary)
+      expect(result.assertions.every((assertion) => assertion.pass)).toBe(true)
+      expect(submitted).toBe(1)
+      expect(gestures).toHaveLength(2)
+      expect(gestures[1]).toBe('\r')
+    } finally {
+      clock.mockRestore(); evidence.mockRestore(); start.mockRestore()
+      await new Promise<void>((resolve, reject) => controller.close((error) => error ? reject(error) : resolve()))
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
   it('requires the actual owned controller artifact before terminal exact-resume can start a seed', async () => {
     const launch = vi.fn()
     const harness = { startSupervisor: launch } as unknown as RuntimeHarness
@@ -42,7 +113,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(preferences.projects[request.params.terminal.cwd].hasTrustDialogAccepted).toBe(true)
       throw new Error('controlled terminal launch boundary')
     })
-    const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '', adminOk: launch } as unknown as RuntimeHarness
+    const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '', adminOk: launch, adminRaw: launch } as unknown as RuntimeHarness
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({
       name: 'claude/' + name, path: path.join(directory, path.basename(name)), sha256: 'e'.repeat(64) }))
     fs.writeFileSync(sources[2]!.path, JSON.stringify({ theme: 'dark', hasCompletedOnboarding: true,
@@ -89,7 +160,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(records.get('claude-create-signal-native-private.json')).toEqual({ processes: [{ pid: 7, signals: [] }] })
     } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['create', 'wrong-root', 'wrong-root-admitted'])('refreshes the current host and protects the terminal %s verdict', async (fault) => {
+  it.each(['create', 'wrong-root', 'wrong-root-admitted', 'wrong-root-published', 'wrong-root-late-published'])('refreshes the current host and protects the terminal %s verdict', async (fault) => {
     const caseId = fault === 'create' ? 'create' : 'wrong-root'
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-observation-refresh-'))
     const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
@@ -98,6 +169,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     let now = 0
     const clock = vi.spyOn(Date, 'now').mockImplementation(() => now += 25_000)
     const view = () => ({ soulId: request.params.soulId, containerId: 'owned-container', incarnationId: 'owned-incarnation',
+      launchState: caseId === 'create' || fault.includes('published') ? 'running' : 'starting',
       recoveryState: 'live', nativeSessionId: request.params.nativeSessionId,
       nativeIdentityObservation: refreshed && caseId === 'create' ? { nativeSessionId: request.params.nativeSessionId,
         incarnationId: 'owned-incarnation', source: 'claude_native_event' } : undefined })
@@ -105,7 +177,13 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       inventoryBody: () => ({ method: 'inventory' }), terminalReadOutputBody: () => ({ method: 'terminal_read_output' }),
       probeRecoveryBody: () => ({ method: 'probe_recovery' }),
       terminalInputBody: () => ({ method: 'terminal_input' }),
-      adminRaw: async () => ({ result: fault === 'wrong-root-admitted' ? { Ok: {} } : { Err: { code: 'RECOVERY_BLOCKED' } } }),
+      adminRaw: async (_supervisor: unknown, body: any) => {
+        if (body.method === 'launch') {
+          request = body
+          return { result: fault === 'wrong-root-published' ? { Ok: { view: view() } } : { Err: { code: 'RECOVERY_BLOCKED' } } }
+        }
+        return { result: fault === 'wrong-root-admitted' ? { Ok: {} } : { Err: { code: fault === 'wrong-root-published' ? 'RECOVERY_BLOCKED' : 'UNKNOWN_SOUL' } } }
+      },
       adminOk: async (_supervisor: unknown, body: any) => {
         if (body.method === 'launch') { request = body; return { data: { view: view() } } }
         if (body.method === 'probe_recovery') { refreshed = true; return { data: { kind: 'unknown' } } }
@@ -123,12 +201,16 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
     try {
       const execution = executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, caseId)
+      if (fault.includes('published')) {
+        await expect(execution).rejects.toThrow('wrong current native root published a running launch')
+        return
+      }
       if (fault === 'wrong-root-admitted') {
         await expect(execution).rejects.toThrow('wrong current native root released ordinary input')
         return
       }
       const original = await execution
-      expect(refreshed).toBe(true)
+      expect(refreshed).toBe(caseId === 'create')
       expect(original.assertions.every((assertion) => assertion.pass)).toBe(true)
     } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
   })
@@ -287,6 +369,57 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = previous
       if (scratch) fs.rmSync(scratch, { recursive: true, force: true })
       fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+  it.each(['startup', 'native-turn'] as const)('executes terminal %s profile preparation and paid prerequisite ordering', async (caseId) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-create-hold-'))
+    const manifest = path.join(directory, 'artifacts.json')
+    const preferences = path.join(directory, 'preferences.json'); fs.writeFileSync(preferences, '{}')
+    const previous = process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
+    const files = (caseId === 'startup' ? ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'] : ['grants/env_file', 'grants/ca_file'])
+      .map((name) => ({ name: 'claude/' + name, path: preferences, sha256: 'e'.repeat(64) }))
+    fs.writeFileSync(manifest, JSON.stringify({ candidateSha, imageDigest, artifacts: {
+      supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
+      host: { path: '/fixture/host', sha256: 'd'.repeat(64) },
+    }, sourceFiles: files }))
+    process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = manifest
+    let scratch: string | undefined
+    let generatedProfileRoot: string | undefined
+    const prepare = vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function (input) {
+      scratch = this.testRoot; fs.mkdirSync(scratch, { recursive: true, mode: 0o700 })
+      const profile = input.sourceFiles.find((file) => file.name === 'claude/profile/native-startup-user.json')
+      if (profile && profile.path !== preferences) {
+        fs.readFileSync(profile.path)
+        generatedProfileRoot = path.dirname(profile.path)
+      }
+      return { supervisorPath: '/fixture/supervisor', hostPath: '/fixture/host', serverPath: '/fixture/server', files: input.sourceFiles }
+    })
+    const start = vi.spyOn(RuntimeHarness.prototype, 'startSupervisor').mockResolvedValue({} as never)
+    const write = vi.spyOn(RuntimeHarness.prototype, 'writeArtifact').mockReturnValue('fixture-artifact')
+    const admin = vi.spyOn(RuntimeHarness.prototype, 'adminOk').mockRejectedValue(new Error('controlled create failure'))
+    const raw = vi.spyOn(RuntimeHarness.prototype, 'adminRaw').mockRejectedValue(new Error('controlled negative failure'))
+    const server = vi.spyOn(RustServer.prototype, 'start').mockRejectedValue(new Error('paid seed must remain held'))
+    const evidence = vi.spyOn(RustServer.prototype, 'processEvidence').mockReturnValue({} as never)
+    const stop = vi.spyOn(RustServer.prototype, 'stop').mockResolvedValue()
+    const cleanup = vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    try {
+      await expect(runNativeFeasibility(['--provider', 'claude', '--case', caseId])).rejects.toThrow('native experiment cases failed')
+      if (caseId === 'startup') {
+        expect(admin).toHaveBeenCalledOnce()
+        expect(server).not.toHaveBeenCalled()
+      } else {
+        expect(server).toHaveBeenCalledOnce()
+        expect(admin).not.toHaveBeenCalled()
+      }
+      expect(cleanup).toHaveBeenCalledOnce()
+    } finally {
+      prepare.mockRestore(); start.mockRestore(); write.mockRestore(); admin.mockRestore(); raw.mockRestore()
+      server.mockRestore(); evidence.mockRestore(); stop.mockRestore(); cleanup.mockRestore()
+      if (previous === undefined) delete process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
+      else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = previous
+      fs.rmSync(directory, { recursive: true, force: true })
+      if (scratch) fs.rmSync(scratch, { recursive: true, force: true })
+      if (generatedProfileRoot) fs.rmSync(generatedProfileRoot, { recursive: true, force: true })
     }
   })
   it('prepares only exact private native artifacts and selected source copies without ambient mounts', async () => {

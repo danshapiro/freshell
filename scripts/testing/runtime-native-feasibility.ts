@@ -192,7 +192,7 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     sourceFiles: { name: string; path: string; sha256: string }[]
   }
   const harness = new RuntimeHarness(process.cwd(), undefined, 1)
-  if (selection.provider === 'claude' && selection.case === 'startup'
+  if (selection.provider === 'claude'
     && !manifest.sourceFiles.some((file) => file.name === 'claude/profile/native-startup-user.json')) {
     // Newly owned native UI preferences remove onboarding interaction only.
     // Permission/model policy stays in its ordinary native settings sources.
@@ -205,7 +205,7 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     manifest.sourceFiles.push({ name: 'claude/profile/native-startup-user.json', path: profilePath,
       sha256: createHash('sha256').update(fs.readFileSync(profilePath)).digest('hex') })
   }
-  let paidApprovalPrerequisiteFailed = false
+  let paidPrerequisiteFailed = false
   const servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []
   try {
     const prepared = await harness.prepareNativeArtifacts({ candidateSha: manifest.candidateSha,
@@ -216,12 +216,15 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     const originals = await dispatchNativeFeasibility({ selection, imageDigest: manifest.imageDigest,
       candidateSha: manifest.candidateSha, ownerId: harness.runId,
       execute: async (caseId) => {
-        if (paidApprovalPrerequisiteFailed && selection.case === 'approval-checkpoint') {
-          throw new Error('prior native approval prerequisite failed; no further paid operation started')
+        const paidCase = selection.case === 'approval-checkpoint'
+          || (selection.provider === 'claude' && caseId === 'exact-resume')
+        if (paidPrerequisiteFailed && paidCase) {
+          throw new Error('prior native prerequisite failed; no further paid operation started')
         }
         try { return await executeManagedNativeCase(harness, prepared.files, selection, caseId, prepared.serverPath, servers) }
         catch (error) {
-          if (selection.case === 'approval-checkpoint') paidApprovalPrerequisiteFailed = true
+          if (selection.case === 'approval-checkpoint'
+            || (selection.provider === 'claude' && caseId === 'create')) paidPrerequisiteFailed = true
           const reason = error instanceof Error ? error.message : 'unknown native case failure'
           harness.writeArtifact(`native-case-${caseId}-failure.json`, { severity: 'error',
             event: 'runtime.native_feasibility.case_failed', caseId, reason })
@@ -500,11 +503,19 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
       providerLaunchContext: managedPreparation?.context ?? { preparation: { claude: { mcp_args: [] } }, config: [{ root: 'user_provider',
         relativePath: '.claude.json', providerRelativePath: '.claude/.claude.json', format: 'json' }] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
-  const result = await harness.adminOk(supervisor, request)
+  const wrongRoot = caseId === 'wrong-root'
+  const result = wrongRoot ? await harness.adminRaw(supervisor, request) : await harness.adminOk(supervisor, request)
   harness.writeArtifact(`${scenario}-launch.json`, result)
-  let view = result.data.view
+  let view: any
+  if (wrongRoot) {
+    if (result.result?.Err?.code !== 'RECOVERY_BLOCKED') throw new Error('wrong current native root published a running launch')
+    const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+    harness.writeArtifact(`${scenario}-inventory.json`, inventory)
+    view = inventory.data.find((row: any) => row.soulId === soulId)
+    if (view?.launchState !== 'starting' || view.nativeIdentityObservation) throw new Error('wrong current native root published a running launch')
+  } else view = result.data.view
   const deadline = Date.now() + 50_000
-  while (!view.nativeIdentityObservation && Date.now() < deadline) {
+  while (!wrongRoot && !view.nativeIdentityObservation && Date.now() < deadline) {
     harness.writeArtifact(`${scenario}-terminal-output-private.json`, await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId)))
     // Refresh asynchronous PTY evidence through the existing host snapshot
     // probe before reading the registry's stored observation.
@@ -543,7 +554,7 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
   const currentObservation = !!observation && view.recoveryState === 'live' && observation.source === 'claude_native_event'
     && observation.nativeSessionId === nativeRoot && view.nativeSessionId === nativeRoot
     && observation.incarnationId === view.incarnationId
-  if (caseId === 'wrong-root' ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
+  if (wrongRoot ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
     ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
   harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
@@ -555,19 +566,27 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     || JSON.stringify(namespace.loaded.launch) !== JSON.stringify(namespace.hook.launch)) {
     throw new Error('actual terminal Claude pin/profile/namespace/TLS differs')
   }
-  const assertions = caseId === 'wrong-root' ? [{ name: 'wrong-current-native-root-refused-before-input', pass: false }]
+  if (!wrongRoot) {
+    // Exercise the ordinary output/store path before starting a paid seed.
+    // Input ACKs cannot hide a dispatcher or store failure at this boundary.
+    harness.writeArtifact(`${scenario}-pre-input-terminal-private.json`, await harness.adminOk(supervisor,
+      harness.terminalReadOutputBody(soulId)))
+    harness.writeArtifact(`${scenario}-pre-input-store-probe.json`, await harness.adminOk(supervisor,
+      harness.probeRecoveryBody(soulId)))
+  }
+  const assertions = wrongRoot ? [{ name: 'wrong-current-native-root-refused-before-running-and-input', pass: false }]
     : [{ name: 'actual-terminal-current-native-post-load-observation-before-input', pass:
       observation.nativeSessionId === namespace.loaded.native.session_id && observation.incarnationId === view.incarnationId }]
-  if (caseId === 'wrong-root') {
+  if (wrongRoot) {
     const rejected = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned blocked startup probe. Do not use tools.\r'))
     harness.writeArtifact(`${scenario}-input-refusal.json`, rejected)
     const after = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
       ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
     harness.writeArtifact(`${scenario}-after-refused-input-native-private.json`, after)
-    // This PTY input boundary uses RecoveryBlocked when its current native
-    // observation is unavailable; inspect the provider state separately.
+    // No Running incarnation exists, so the ordinary input route has no
+    // admissible target. Inspect actual provider state separately.
     assertions[0]!.pass = !observation && actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
-      && rejected.result?.Err?.code === 'RECOVERY_BLOCKED'
+      && view.launchState === 'starting' && rejected.result?.Err?.code === 'UNKNOWN_SOUL'
       && JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
       && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0
     if (!assertions[0]!.pass) throw new Error('wrong current native root released ordinary input or changed native state')
@@ -582,8 +601,13 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     // Count completed native model IDs, never the transport's input ACK.
     const turn = async (containerId: string, text: string, label: string) => {
       const before = await inspect(containerId, label + '-before-input')
+      // Keep paste content and the submit key as distinct ordinary gestures;
+      // a bulk text/CR packet can remain in the native TUI's paste buffer.
+      harness.writeArtifact(`${scenario}-${label}-paste-dispatch.json`, await harness.adminOk(supervisor,
+        harness.terminalInputBody(soulId, '\x1b[200~' + text + '\x1b[201~')))
+      await new Promise((resolve) => setTimeout(resolve, 100))
       harness.writeArtifact(`${scenario}-${label}-dispatch.json`, await harness.adminOk(supervisor,
-        harness.terminalInputBody(soulId, text + '\r')))
+        harness.terminalInputBody(soulId, '\r')))
       const deadline = Date.now() + 90_000
       while (Date.now() < deadline) {
         const current = await inspect(containerId, label)

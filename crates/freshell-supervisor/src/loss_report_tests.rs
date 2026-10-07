@@ -6,7 +6,8 @@ use crate::{
 };
 use freshell_runtime_protocol::{
     AllocationState, DockerDaemonId, DurabilityState, FixtureKind, HostBootId, IncarnationId,
-    LaunchNonce, RecoveryBlockReason, RuntimeLimits, RuntimeProfile, SoulId,
+    LaunchNonce, NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource,
+    RecoveryBlockReason, RuntimeLimits, RuntimeProfile, SoulId,
 };
 use rusqlite::{params, Connection};
 use std::collections::BTreeSet;
@@ -194,8 +195,35 @@ async fn prepared_context_in_registry(
         )
         .await
         .unwrap();
-    registry
+    let grant = registry
         .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+        .await
+        .unwrap();
+    let context = registry.recovery_context(soul_id.clone()).await.unwrap();
+    let launch = registry
+        .bind_native_identity_launch(NativeIdentityLaunch {
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+            evidence_revision: context.evidence_revision,
+            execution_generation: grant.execution_generation,
+            requested_native_session_id: context.native_session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let context = registry.recovery_context(soul_id.clone()).await.unwrap();
+    registry
+        .record_native_identity_observation(
+            soul_id.clone(),
+            NativeIdentityObservation {
+                native_session_id: context.native_session_id.clone().unwrap(),
+                incarnation_id: launch.incarnation_id,
+                launch_nonce: launch.launch_nonce,
+                evidence_revision: launch.evidence_revision,
+                source: NativeIdentitySource::OpencodeTui,
+                evidence_digest: "a".repeat(64),
+            },
+            context.write_fence(),
+        )
         .await
         .unwrap();
     registry

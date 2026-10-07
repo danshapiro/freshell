@@ -55,7 +55,7 @@ type StoppedRepairGroups = BTreeMap<
 >;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum NativeIdentityWait {
+pub(crate) enum NativeIdentityWait {
     Observed {
         native_session_id: String,
         elapsed_ms: u64,
@@ -140,7 +140,7 @@ fn deterministic_fresh_fixture(context: &RecoveryContext) -> bool {
     })
 }
 
-fn current_native_observation<'a>(
+pub(crate) fn current_native_observation<'a>(
     context: &RecoveryContext,
     status: &'a crate::service::HostStatus,
 ) -> Option<&'a freshell_runtime_protocol::NativeIdentityObservation> {
@@ -159,7 +159,7 @@ fn current_native_observation<'a>(
     .then_some(observation)
 }
 
-fn native_identity_wait_timeout(opencode_adoption_required: bool) -> Duration {
+pub(crate) fn native_identity_wait_timeout(opencode_adoption_required: bool) -> Duration {
     if opencode_adoption_required {
         OPENCODE_ADOPTION_READINESS_TIMEOUT
     } else {
@@ -2705,6 +2705,7 @@ impl Supervisor {
                     &prepared.prepared.incarnation_id,
                     start.context.intent_revision,
                     native_identity_wait_timeout(adoption_required),
+                    true,
                 )
                 .await;
             if matches!(wait, NativeIdentityWait::StopIntent { .. }) {
@@ -4231,12 +4232,13 @@ impl Supervisor {
         Ok(outcome)
     }
 
-    async fn wait_for_native_identity(
+    pub(crate) async fn wait_for_native_identity(
         &self,
         soul_id: &SoulId,
         incarnation_id: &freshell_runtime_protocol::IncarnationId,
         expected_intent_revision: u64,
         timeout: Duration,
+        persist_observation: bool,
     ) -> NativeIdentityWait {
         let started = Instant::now();
         let handle = match self.registry.owned_handle(incarnation_id.clone()).await {
@@ -4321,7 +4323,7 @@ impl Supervisor {
                     native_capability && observation.incarnation_id == *incarnation_id
                 })
                 .cloned();
-            if !status.exited {
+            if !status.exited && persist_observation {
                 if let Some(observation) = observation.as_ref() {
                     let mut fence = current.write_fence();
                     if current.native_session_id.is_none() {
@@ -4896,7 +4898,7 @@ pub(crate) mod tests {
                         proof: host_proof(b"synthetic-secret", &challenge, &boot, &incarnation_id),
                         host_boot_id: boot.clone(),
                         capabilities: vec!["native-identity-observation-v1".into()],
-                        effective_limits: limits.clone(),
+                        effective_limits: limits,
                     },
                     HostCommand::Status { .. } => HostResult::Status {
                         native_identity_observation: responder_observation.lock().unwrap().clone(),
@@ -4950,6 +4952,44 @@ pub(crate) mod tests {
                     &prepared.incarnation_id,
                     prepared.intent_revision,
                     Duration::from_millis(20),
+                    false,
+                )
+                .await;
+            assert_eq!(
+                matches!(wait, NativeIdentityWait::Observed { .. }),
+                name == "current",
+                "native startup acceptance for {name}"
+            );
+            let stored: Option<String> = rusqlite::Connection::open(
+                dir.path().join("registry/runtime.sqlite3"),
+            )
+            .unwrap()
+            .query_row(
+                "SELECT native_identity_observation FROM incarnations WHERE incarnation_id=?1",
+                [prepared.incarnation_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+            assert!(
+                stored.is_none(),
+                "startup wait must retain publication for the activation transaction"
+            );
+            assert_eq!(
+                registry
+                    .recovery_context(soul.clone())
+                    .await
+                    .unwrap()
+                    .write_fence(),
+                context.write_fence(),
+                "startup wait must not advance the activation's original write fence"
+            );
+            let wait = supervisor
+                .wait_for_native_identity(
+                    &soul,
+                    &prepared.incarnation_id,
+                    prepared.intent_revision,
+                    Duration::from_millis(20),
+                    true,
                 )
                 .await;
             results.push((name, matches!(wait, NativeIdentityWait::Observed { .. })));
@@ -5047,7 +5087,7 @@ pub(crate) mod tests {
         let actual_releases = releases.clone();
         let actual_registry = registry.clone();
         let actual_soul = soul.clone();
-        let limits = context.requested_limits.clone();
+        let limits = context.requested_limits;
         let listener = tokio::net::UnixListener::bind(runtime.join("host.sock")).unwrap();
         let responder = tokio::spawn(async move {
             let boot = HostBootId::new();
@@ -5062,7 +5102,7 @@ pub(crate) mod tests {
                         proof: host_proof(b"synthetic-secret", &challenge, &boot, &incarnation_id),
                         host_boot_id: boot.clone(),
                         capabilities: vec!["native-identity-observation-v1".into()],
-                        effective_limits: limits.clone(),
+                        effective_limits: limits,
                     },
                     HostCommand::Status { .. } => HostResult::Status {
                         native_identity_observation: responder_observation.lock().unwrap().clone(),
