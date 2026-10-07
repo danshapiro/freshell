@@ -18,7 +18,7 @@ async function scenario(run: (store: any, reopen: (profile?: string) => any, pat
   const transcriptPath = join(directory, root + '.jsonl')
   const recordPath = join(directory, 'checkpoint.json')
   const assistant = { type: 'assistant', sessionId: root, uuid: 'assistant-original', version: '2.1.237',
-    message: { content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input }] } }
+    message: { id: 'msg_original', content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input }] } }
   const attachment = { type: 'attachment', sessionId: root, uuid: 'checkpoint-original', version: '2.1.237',
     attachment: { type: 'hook_deferred_tool', toolUseID, toolName: 'Bash', toolInput: input,
       hookEvent: 'PreToolUse', permissionMode: 'default' } }

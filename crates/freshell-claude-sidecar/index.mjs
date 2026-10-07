@@ -384,7 +384,13 @@ async function handleSdkMessage(sessionId, msg) {
     case 'assistant': {
       const content = msg.message?.content || []
       const tools = content.filter((block) => block.type === 'tool_use')
-      st.nativeSoloTool = tools.length === 1 ? tools[0] : undefined
+      if (st.nativeChannel && msg.session_id === st.cliSessionId && msg.parent_tool_use_id == null
+        && st.nativeBatch?.id === msg.message?.id) {
+        for (const tool of tools) {
+          st.nativeBatch.tools.set(tool.id, tool)
+          st.nativeBatch.assistantToolIds.add(tool.id)
+        }
+      }
       const blocks = content.map((b) => {
         if (b.type === 'text') return { type: 'text', text: b.text }
         if (b.type === 'thinking') return { type: 'thinking', thinking: b.thinking }
@@ -410,7 +416,7 @@ async function handleSdkMessage(sessionId, msg) {
       if (st.nativeChannel && msg.stop_reason === 'tool_deferred') {
         const tool = msg.deferred_tool_use
         if (!tool || tool.name !== 'Bash' || msg.session_id !== st.cliSessionId
-          || st.nativeSoloTool?.id !== tool.id || nativeInputDigest(st.nativeSoloTool.input) !== nativeInputDigest(tool.input)) {
+          || nativeSoloTool(st)?.id !== tool.id || nativeInputDigest(nativeSoloTool(st).input) !== nativeInputDigest(tool.input)) {
           throw new Error('native deferred result does not match the original solo operation')
         }
         // The native result can precede its asynchronous JSONL publication.
@@ -458,6 +464,17 @@ async function handleSdkMessage(sessionId, msg) {
       break
     }
     case 'stream_event': {
+      if (st.nativeChannel && msg.session_id === st.cliSessionId && msg.parent_tool_use_id == null) {
+        const event = msg.event
+        if (event?.type === 'message_start') {
+          st.nativeBatch = typeof event.message?.id === 'string' && event.message.id
+            ? { id: event.message.id, tools: new Map(), assistantToolIds: new Set(), complete: false } : undefined
+        } else if (st.nativeBatch && event?.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+          st.nativeBatch.tools.set(event.content_block.id, event.content_block)
+        } else if (st.nativeBatch && event?.type === 'message_stop') {
+          st.nativeBatch.complete = true
+        }
+      }
       emit({ type: 'sdk.stream', sessionId, event: msg.event, parentToolUseId: msg.parent_tool_use_id })
       break
     }
@@ -465,6 +482,13 @@ async function handleSdkMessage(sessionId, msg) {
       // Unhandled SDK message type — ignored (matches SdkBridge default).
       break
   }
+}
+
+function nativeSoloTool(state) {
+  const batch = state.nativeBatch
+  if (!batch?.complete || batch.tools.size !== 1) return undefined
+  const tool = batch.tools.values().next().value
+  return batch.assistantToolIds.has(tool.id) ? tool : undefined
 }
 
 async function consumeStream(sessionId, sdkQuery) {
@@ -517,6 +541,7 @@ async function consumeStream(sessionId, sdkQuery) {
 async function openSessionQuery(sessionId, state, req, launch, announceCreated = true) {
   const abort = state.abort
   const generation = state.queryGeneration = (state.queryGeneration ?? 0) + 1
+  state.nativeBatch = undefined
   state.nativeReady = false
   state.commandsInitSeen = false
   const { iterable, handle } = createInputStream((isCompact) => {
@@ -571,14 +596,14 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
         // consumers. Wait briefly for the actual assistant batch; never infer
         // solo execution from the hook's one-tool view alone.
         const deadline = Date.now() + 100
-        while (state.nativeSoloTool?.id !== input.tool_use_id && Date.now() < deadline
+        while (!state.nativeBatch?.complete && Date.now() < deadline
           && state.queryGeneration === generation && !abort.signal.aborted) {
           await new Promise((resolve) => setTimeout(resolve, 1))
         }
         if (state.queryGeneration !== generation || !state.nativeReady || abort.signal.aborted) {
           return deny('Current native query was replaced')
         }
-        const solo = state.nativeSoloTool
+        const solo = nativeSoloTool(state)
         if (solo?.name !== 'Bash' || solo.id !== input.tool_use_id
           || nativeInputDigest(solo.input) !== nativeInputDigest(input.tool_input)) return {}
         return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'defer',

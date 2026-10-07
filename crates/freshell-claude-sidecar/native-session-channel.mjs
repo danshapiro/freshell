@@ -3,6 +3,7 @@ import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/prom
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { spawn } from 'node:child_process'
 
 const launchKey = 'FRESHELL_NATIVE_IDENTITY_LAUNCH'
 const signalKey = 'FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'
@@ -95,7 +96,14 @@ export async function inspectNativeDeferredCheckpoint({ path, nativeSessionId, t
       || (consumed && !includeConsumed)) return null
     const assistant = rows.slice(0, checkpointIndex).findLast((row) => row.type === 'assistant'
       && Array.isArray(row.message?.content) && row.message.content.some((block) => block.type === 'tool_use' && block.id === toolUseID))
-    const tools = assistant?.message.content.filter((block) => block.type === 'tool_use')
+    const messageId = assistant?.message.id
+    if (typeof messageId !== 'string' || !messageId) return null
+    // Native streaming serializes one model response into multiple assistant
+    // rows. Count the entire response, including rows after the attachment.
+    const batchRows = rows.filter((row) => row.type === 'assistant' && row.message?.id === messageId)
+    if (batchRows.some((row) => row.sessionId !== nativeSessionId || row.version !== '2.1.237'
+      || !Array.isArray(row.message.content))) return null
+    const tools = batchRows.flatMap((row) => row.message.content.filter((block) => block.type === 'tool_use'))
     if (assistant?.sessionId !== nativeSessionId || assistant.version !== '2.1.237'
       || typeof assistant.uuid !== 'string' || !assistant.uuid || tools?.length !== 1
       || tools[0].name !== attachment.toolName || nativeInputDigest(tools[0].input) !== inputDigest) return null
@@ -109,19 +117,61 @@ export async function inspectNativeDeferredCheckpoint({ path, nativeSessionId, t
   }
 }
 
-export async function writeNativeSessionSignal(input, env = process.env) {
+async function writeNativeSignal(name, input, env) {
   const launch = JSON.parse(env[launchKey] ?? 'null')
   const directory = env[signalKey]
   if (!launch?.launchNonce || !launch.incarnationId || !directory) throw new Error('missing current native launch')
+  const payload = JSON.stringify({ launch, native: input })
+  if (Buffer.byteLength(payload) > 65_536) throw new Error('native signal input too large')
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const staging = join(directory, `signal-${randomUUID()}.tmp`)
+  try {
+    await writeFile(staging, payload, { mode: 0o600 })
+    await rename(staging, join(directory, name))
+  } finally { await rm(staging, { force: true }) }
+}
+
+export async function writeNativeSessionSignal(input, env = process.env) {
   if (!input || input.hook_event_name !== 'SessionStart' || typeof input.session_id !== 'string'
     || !validRoot(input.session_id) || !['startup', 'resume', 'clear', 'compact'].includes(input.source)) {
     throw new Error('invalid native SessionStart')
   }
-  const payload = { launch, native: input }
-  await mkdir(directory, { recursive: true, mode: 0o700 })
-  const staging = join(directory, `signal-${randomUUID()}.tmp`)
-  await writeFile(staging, JSON.stringify(payload), { mode: 0o600 })
-  await rename(staging, join(directory, 'session-start.json'))
+  await writeNativeSignal('session-start.json', input, env)
+}
+
+async function terminalStatusLine(input, bytes, env = process.env) {
+  if (!validRoot(input?.session_id) || input.version !== '2.1.263'
+    || typeof input.transcript_path !== 'string' || !input.transcript_path.startsWith('/')
+    || typeof input.model?.id !== 'string' || !input.model.id
+    || typeof input.workspace?.current_dir !== 'string'
+    || !Number.isSafeInteger(input.context_window?.context_window_size)
+    || input.context_window.context_window_size <= 0) throw new Error('invalid native post-load status')
+  // Compose the ordinary selected command. The native CLI merges these
+  // supported sources in this order; our injected command supplies evidence
+  // without changing the selected command's stdin or stdout.
+  let selected
+  for (const path of [join(env.CLAUDE_CONFIG_DIR ?? join(env.HOME ?? '', '.claude'), 'settings.json'),
+    join(process.cwd(), '.claude/settings.json'), join(process.cwd(), '.claude/settings.local.json'),
+    '/etc/claude-code/managed-settings.json']) {
+    try {
+      const settingsBytes = await readFile(path)
+      if (settingsBytes.length > 1024 * 1024) throw new Error('native status settings too large')
+      const settings = JSON.parse(settingsBytes)
+      if (Object.hasOwn(settings, 'statusLine')) selected = settings.statusLine
+    } catch (error) { if (error?.code !== 'ENOENT') throw error }
+  }
+  if (env.FRESHELL_NATIVE_STATUSLINE_SETTINGS) selected = JSON.parse(env.FRESHELL_NATIVE_STATUSLINE_SETTINGS)
+  await writeNativeSignal('statusline-loaded.json', input, env)
+  if (!selected?.command) return
+  if (selected.type !== 'command' || typeof selected.command !== 'string'
+    || selected.command.includes('native-session-channel.mjs --status-line')) throw new Error('invalid selected native status command')
+  await new Promise((resolve, reject) => {
+    const child = spawn('/bin/sh', ['-c', selected.command], { env, stdio: ['pipe', 'inherit', 'inherit'] })
+    child.once('error', reject)
+    child.once('close', (code) => code === 0 ? resolve() : reject(new Error('selected native status command failed')))
+    child.stdin.on('error', () => {})
+    child.stdin.end(bytes)
+  })
 }
 
 export async function createNativeSessionChannel({ launch, directory, timeoutMs = 50_000, signal } = {}) {
@@ -170,8 +220,11 @@ if (process.argv[1] === ownPath) {
       input += chunk
       if (input.length > 1024 * 1024) throw new Error('native hook input too large')
     }
-    await writeNativeSessionSignal(JSON.parse(input))
-    process.stdout.write('{}\n')
+    if (process.argv[2] === '--status-line') await terminalStatusLine(JSON.parse(input), input)
+    else {
+      await writeNativeSessionSignal(JSON.parse(input))
+      process.stdout.write('{}\n')
+    }
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ severity: 'error', component: 'native-session-hook', message: error.message })}\n`)
     process.exitCode = 1

@@ -81,7 +81,9 @@ where
             target == "freshell_server::extensions" && level == tracing::Level::WARN;
         let is_session_directory_error =
             target == "freshell_server::session_directory" && level == tracing::Level::ERROR;
-        if !is_extension_warning && !is_session_directory_error {
+        let is_fresh_create_warning =
+            target == "freshell_server::fresh_agent_proxy" && level == tracing::Level::WARN;
+        if !is_extension_warning && !is_session_directory_error && !is_fresh_create_warning {
             return;
         }
 

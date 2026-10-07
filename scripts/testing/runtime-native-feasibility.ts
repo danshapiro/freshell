@@ -97,6 +97,27 @@ export function nativeCheckpointTranscriptRetained(before: NativeCheckpointSnaps
   } catch { return false }
 }
 
+export function nativeTwoToolBatchMatches(snapshot: NativeCheckpointSnapshot, commands: readonly string[]): boolean {
+  try {
+    const distinctCommands = new Set(commands)
+    if (!snapshot.nativeRoot || !snapshot.transcript.completeEof || commands.length !== 2 || distinctCommands.size !== 2) return false
+    const bytes = Buffer.from(snapshot.transcript.bytesBase64, 'base64')
+    if (bytes.at(-1) !== 10 || createHash('sha256').update(bytes).digest('hex') !== snapshot.transcript.sha256) return false
+    const batches = new Map<string, any[]>()
+    for (const row of bytes.toString('utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))) {
+      if (row.type !== 'assistant') continue
+      const tools = (Array.isArray(row.message?.content) ? row.message.content : []).filter((part: any) => part.type === 'tool_use')
+      if (!tools.length) continue
+      if (row.sessionId !== snapshot.nativeRoot || typeof row.message.id !== 'string' || !row.message.id
+        || tools.some((tool: any) => typeof tool.id !== 'string' || !tool.id)) return false
+      batches.set(row.message.id, [...(batches.get(row.message.id) ?? []), ...tools])
+    }
+    return [...batches.values()].some((tools) => tools.length === 2 && new Set(tools.map((tool) => tool.id)).size === 2
+      && tools.every((tool) => tool.name === 'Bash' && distinctCommands.has(tool.input?.command))
+      && new Set(tools.map((tool) => tool.input.command)).size === 2)
+  } catch { return false }
+}
+
 type AmplifierProfileSnapshot = { nativeCwd: string; nativeSettingsSha256: string;
   profileFiles: { relative: string; sha256: string | null; bytesBase64?: string | null }[] }
 export function amplifierNativeProfileRetained(before: AmplifierProfileSnapshot,
@@ -229,7 +250,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
     return executeManagedAmplifier(harness, sources, caseId, serverPath, servers)
   }
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
-    || !['create', 'current-native-turn', 'allow', 'deny', 'changed-tool', 'missing-tool',
+    || !['create', 'exact-resume', 'current-native-turn', 'allow', 'deny', 'changed-tool', 'missing-tool',
       'changed-input', 'changed-profile', 'changed-root', 'stale-callback', 'crash-before-checkpoint',
       'multiple-tools', 'effect-before-observation'].includes(caseId)) {
     throw new Error(`actual native case has no qualified execution path: ${selection.mode ?? selection.provider}/${caseId}`)
@@ -248,14 +269,13 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
   if (caseId === 'crash-before-checkpoint' || caseId === 'effect-before-observation') {
     const directory = path.join(workspace, '.claude'); fs.mkdirSync(directory, { mode: 0o770 }); fs.chmodSync(directory, 0o770)
-    const settings = caseId === 'effect-before-observation' ? { permissions: { allow: ['Bash'] } }
-      : { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command',
-        command: `python3 '${path.join(directory, 'pause-before-checkpoint.py')}' '${path.join(workspace, 'native-before-checkpoint.json')}'`, timeout: 60 }] }] } }
-    if (caseId === 'crash-before-checkpoint') {
-      const hook = path.join(directory, 'pause-before-checkpoint.py')
-      fs.writeFileSync(hook, "import sys,json,pathlib,time\nvalue=json.load(sys.stdin)\np=pathlib.Path(sys.argv[1])\np.write_text(json.dumps(value))\ntime.sleep(45)\nprint('{}')\n", { mode: 0o660 })
-      fs.chmodSync(hook, 0o660)
-    }
+    const afterEffect = caseId === 'effect-before-observation'
+    const hook = path.join(directory, afterEffect ? 'pause-after-effect.py' : 'pause-before-checkpoint.py')
+    const signal = path.join(workspace, afterEffect ? 'native-after-effect-before-observation.json' : 'native-before-checkpoint.json')
+    const settings = { hooks: { [afterEffect ? 'PostToolUse' : 'PreToolUse']: [{ matcher: 'Bash', hooks: [{ type: 'command',
+      command: `python3 '${hook}' '${signal}'`, timeout: 60 }] }] } }
+    fs.writeFileSync(hook, "import sys,json,pathlib,time\nvalue=json.load(sys.stdin)\np=pathlib.Path(sys.argv[1])\np.write_text(json.dumps(value))\ntime.sleep(45)\nprint('{}')\n", { mode: 0o660 })
+    fs.chmodSync(hook, 0o660)
     fs.writeFileSync(path.join(directory, 'settings.json'), JSON.stringify(settings), { mode: 0o660 })
     fs.chmodSync(path.join(directory, 'settings.json'), 0o660)
   }
@@ -297,7 +317,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (namespace.uid !== 65534 || namespace.gid !== 0 || !namespace.version.includes('2.1.237')) {
     throw new Error('actual selected native child/UID differs')
   }
-  if (caseId === 'current-native-turn') {
+  if (caseId === 'current-native-turn' || caseId === 'exact-resume') {
     const marker = 'owned-memory-' + randomUUID()
     let cursor = 0
     const nativeTurn = async (text: string, label: string): Promise<any[]> => {
@@ -340,20 +360,26 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
     const after = await inspect(recovery.data.view.containerId, 'after-death', true)
     if (before.transcript.sha256 !== after.transcript.sha256 || before.transcript.identity[0] !== after.transcript.identity[0]
       || before.transcript.identity[1] !== after.transcript.identity[1]) throw new Error('native transcript lost original owned volume/file continuity')
-    const recalled = await nativeTurn('Reply with only the private marker from before. Do not use tools.', 'recall')
-    const text = recalled.flatMap((event) => event.content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('').trim()
-    if (text !== marker) throw new Error('native restored context did not recall the private marker')
-    if (recalled.some((event) => (event.content ?? []).some((part: any) => part.type === 'tool_use'))) throw new Error('native recall unexpectedly requested a tool')
     assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
       { name: 'replacement-new-incarnation-same-native-root', pass: recovery.data.outcome === 'replaced'
         && recovery.data.view.incarnationId !== view.incarnationId && recovery.data.view.nativeSessionId === view.nativeSessionId
         && recovery.data.view.nativeIdentityObservation.nativeSessionId === view.nativeSessionId },
       { name: 'original-owned-volume-transcript-continuity', pass: before.transcript.sha256 === after.transcript.sha256
         && before.transcript.identity[0] === after.transcript.identity[0] && before.transcript.identity[1] === after.transcript.identity[1] },
-      { name: 'same-workspace-selected-native-profile', pass: JSON.stringify(before.profileFiles) === JSON.stringify(after.profileFiles) },
-      { name: 'actual-restored-context-private-marker-recall', pass: text === marker },
-      { name: 'native-turns-requested-no-tools', pass: ![...seedEvents, ...recalled].some((event) =>
-        (event.content ?? []).some((part: any) => part.type === 'tool_use')) })
+      { name: 'same-workspace-selected-native-profile', pass: JSON.stringify(before.profileFiles) === JSON.stringify(after.profileFiles) })
+    if (caseId === 'current-native-turn') {
+      const recalled = await nativeTurn('Reply with only the private marker from before. Do not use tools.', 'recall')
+      const text = recalled.flatMap((event) => event.content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('').trim()
+      if (text !== marker) throw new Error('native restored context did not recall the private marker')
+      if (recalled.some((event) => (event.content ?? []).some((part: any) => part.type === 'tool_use'))) throw new Error('native recall unexpectedly requested a tool')
+      assertions.push({ name: 'actual-restored-context-private-marker-recall', pass: text === marker },
+        { name: 'native-turns-requested-no-tools', pass: ![...seedEvents, ...recalled].some((event) =>
+          (event.content ?? []).some((part: any) => part.type === 'tool_use')) })
+    } else {
+      assertions.push({ name: 'current-native-resume-observation-before-replacement-input', pass:
+        after.hook.native.source === 'resume' && after.hook.native.session_id === view.nativeSessionId
+        && recovery.data.view.nativeIdentityObservation.incarnationId === recovery.data.view.incarnationId })
+    }
   }
   if (selection.case === 'approval-checkpoint') {
     assertions.push(...await executeManagedNativeApproval({ harness, supervisor, soulId, workspace,
@@ -564,20 +590,22 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
   return original
 }
 
-async function executeManagedNativeApproval(input: {
+export async function executeManagedNativeApproval(input: {
   harness: RuntimeHarness; supervisor: any; soulId: string; workspace: string; view: any; scenario: string
   decision: string; inspect: (containerId: string, label: string, requireTranscript: boolean) => Promise<any>
 }): Promise<{ name: string; pass: boolean }[]> {
   const { harness, supervisor, soulId, workspace, view, scenario, inspect } = input
   const effectPath = path.join(workspace, 'owned-native-effect.jsonl')
-  if (fs.existsSync(effectPath)) throw new Error('native effect oracle must be new')
+  const effectPaths = input.decision === 'multiple-tools' ? [effectPath, path.join(workspace, 'second-owned-native-effect.jsonl')] : [effectPath]
+  if (effectPaths.some((file) => fs.existsSync(file))) throw new Error('native effect oracle must be new')
   const command = `printf 'effect\\n' >> '${effectPath}'`
-  const effectCount = () => {
-    if (!fs.existsSync(effectPath)) return 0
-    const bytes = fs.readFileSync(effectPath, 'utf8')
+  const commands = effectPaths.map((file) => `printf 'effect\\n' >> '${file}'`)
+  const effectCount = () => effectPaths.reduce((count, file) => {
+    if (!fs.existsSync(file)) return count
+    const bytes = fs.readFileSync(file, 'utf8')
     if (!/^(effect\n)+$/.test(bytes)) throw new Error('native effect oracle contains unexpected bytes')
-    return bytes.split('\n').length - 1
-  }
+    return count + bytes.split('\n').length - 1
+  }, 0)
   let cursor = 0
   const batches: unknown[] = []
   const observed: any[] = []
@@ -592,6 +620,9 @@ async function executeManagedNativeApproval(input: {
       observed.push(...events)
       const found = events.find(select)
       if (found) return found
+      if (events.some((event: any) => event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.result')) {
+        throw new Error(`native turn completed without required ${label}`)
+      }
       await new Promise((resolve) => setTimeout(resolve, 100))
     }
     throw new Error(`bounded native ${label} deadline exceeded`)
@@ -600,10 +631,11 @@ async function executeManagedNativeApproval(input: {
   harness.writeArtifact(`${scenario}-operation.json`, { command, effectPath })
   await harness.adminOk(supervisor, { method: 'fresh_agent_send', params: { soulId,
     text: input.decision === 'multiple-tools'
-      ? `Issue exactly two Bash tool calls together in ONE parallel assistant tool batch, BOTH using this exact command: ${command}. Do not run sequential calls, do not use other tools, and wait for approval.`
+      ? `Run these two independent harmless Bash commands in parallel, using one Bash tool call for each command: ${commands[0]} and ${commands[1]}. Send both tool calls together in the same assistant message. Do not combine commands, ask questions, or use other tools. After both results, reply done.`
       : `Use the Bash tool exactly once with this exact command: ${command}. Do not use other tools or another command. After its result, reply done.` } })
   if (['crash-before-checkpoint', 'multiple-tools', 'effect-before-observation'].includes(input.decision)) {
     let originalOperation: any
+    let effectDecision: any
     if (input.decision === 'crash-before-checkpoint') {
       const paused = path.join(workspace, 'native-before-checkpoint.json')
       await harness.waitForFile(paused, 90_000)
@@ -613,20 +645,38 @@ async function executeManagedNativeApproval(input: {
         throw new Error('real native pre-checkpoint hook did not park the intended operation')
       }
     } else if (input.decision === 'multiple-tools') {
-      originalOperation = await wait((event) => event.kind === 'provider'
-        && event.data.payload.event?.type === 'freshAgent.assistant'
-        && event.data.payload.event.content?.filter((part: any) => part.type === 'tool_use').length === 2, 'actual two-tool native batch')
-      const tools = originalOperation.data.payload.event.content.filter((part: any) => part.type === 'tool_use')
-      if (tools.some((tool: any) => tool.name !== 'Bash' || tool.input.command !== command)) throw new Error('actual native multi-tool batch differs')
-      await wait((event) => event.kind === 'permission_requested' && !event.data.payload.nativeCheckpoint, 'ordinary native multi-tool permission')
+      originalOperation = await wait((event) => event.kind === 'permission_requested'
+        && !event.data.payload.nativeCheckpoint, 'ordinary native multi-tool permission')
+      const deadline = Date.now() + 3_000
+      let native = await inspect(view.containerId, 'actual-two-tool-batch', true)
+      while (!nativeTwoToolBatchMatches(native, commands) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        native = await inspect(view.containerId, 'actual-two-tool-batch', true)
+      }
+      if (!nativeTwoToolBatchMatches(native, commands)) throw new Error('actual native multi-tool batch differs')
     } else {
-      originalOperation = (await wait((event) => event.kind === 'provider'
-        && event.data.payload.event?.type === 'freshAgent.result', 'ordinary native allow-policy result')).data.payload.event
-      if (originalOperation.nativeSessionId !== view.nativeSessionId || originalOperation.isError || effectCount() !== 1
-        || observed.some((event) => event.kind === 'permission_requested')) throw new Error('ordinary native allow policy did not complete once without a callback/card')
-      const nativeResult = observed.filter((event) => event.kind === 'provider'
-        && event.data.payload.event?.type === 'freshAgent.tool.result').flatMap((event) => event.data.payload.event.content ?? [])
-      if (nativeResult.length !== 1 || nativeResult[0].is_error) throw new Error('ordinary native allow branch lacks its actual successful correlated tool result')
+      const current = (await wait(isCard, 'current native ask before effect')).data
+      effectDecision = current
+      const payload = current.payload
+      if (payload.tool?.name !== 'Bash' || payload.tool.input?.command !== command
+        || payload.nativeCheckpoint.nativeSessionId !== view.nativeSessionId
+        || payload.nativeCheckpoint.toolUseID !== payload.toolUseID || effectCount() !== 0) {
+        throw new Error('original current native operation differs before effect')
+      }
+      // Resolve the actual current native ask, then deliberately stop reading
+      // normalized outcomes. The supported PostToolUse hook parks only after
+      // the native command has executed, before its result is observed.
+      const receipt = await harness.adminOk(supervisor, harness.freshAgentResolveBody(soulId, current.decision_id,
+        { behavior: 'allow', updatedInput: payload.tool.input }))
+      harness.writeArtifact(`${scenario}-current-allow-dispatch.json`, receipt)
+      const paused = path.join(workspace, 'native-after-effect-before-observation.json')
+      await harness.waitForFile(paused, 90_000)
+      originalOperation = JSON.parse(fs.readFileSync(paused, 'utf8'))
+      if (originalOperation.hook_event_name !== 'PostToolUse' || originalOperation.session_id !== view.nativeSessionId
+        || originalOperation.tool_name !== 'Bash' || originalOperation.tool_use_id !== payload.toolUseID
+        || originalOperation.tool_input?.command !== command || effectCount() !== 1) {
+        throw new Error('actual native post-effect hook did not park the original completed effect')
+      }
     }
     const before = await inspect(view.containerId, 'native-edge-before-death', true)
     harness.writeArtifact(`${scenario}-original-native-operation-private.json`, originalOperation)
@@ -634,6 +684,23 @@ async function executeManagedNativeApproval(input: {
     if (input.decision !== 'effect-before-observation' && (effectCount() !== 0
       || rows.some((row) => row.type === 'attachment' && row.attachment?.type === 'hook_deferred_tool'))) {
       throw new Error('actual crash/batch operation already produced an effect or deferred checkpoint')
+    }
+    if (input.decision === 'effect-before-observation') {
+      if (rows.some((row) => row.type === 'user' && Array.isArray(row.message?.content)
+        && row.message.content.some((block: any) => block.type === 'tool_result' && block.tool_use_id === originalOperation.tool_use_id))) {
+        throw new Error('post-effect native outcome was already published')
+      }
+      const files = await captureCheckpointState(view.containerId, 'effect-before-observation')
+      const record = JSON.parse(Buffer.from(files.find((file) => file.readerUid === 65534).bytesBase64, 'base64').toString('utf8'))
+      if (record.phase !== 'dispatching' || record.nativeSessionId !== view.nativeSessionId
+        || record.toolUseID !== originalOperation.tool_use_id) throw new Error('native effect has no durable ambiguous dispatch fence')
+      const actor = JSON.parse(Buffer.from(files.find((file) => file.readerUid === 0).bytesBase64, 'base64').toString('utf8'))
+      const resolved = actor.decisions[effectDecision.decision_id]
+      const responseDigest = createHash('sha256').update(JSON.stringify({ behavior: 'allow',
+        updatedInput: effectDecision.payload.tool.input })).digest('hex')
+      if (resolved?.state !== 'resolved' || resolved.responseDigest !== responseDigest) {
+        throw new Error('native effect lacks its original durably acknowledged decision')
+      }
     }
     const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
     harness.writeArtifact(`${scenario}-native-edge-store-probe.json`, probe)
@@ -645,14 +712,44 @@ async function executeManagedNativeApproval(input: {
       || recovery.data.view.nativeSessionId !== view.nativeSessionId || recovery.data.view.recoveryState !== 'live'
       || !recovery.data.view.nativeIdentityObservation) throw new Error('actual native edge replacement did not preserve its root/current gate')
     let refused
-    if (input.decision !== 'effect-before-observation') {
+    if (input.decision === 'effect-before-observation') {
+      await inspect(recovery.data.view.containerId, 'native-edge-after-effect-recovery', true)
+      // Original dispatch acknowledgements precede this new event cursor.
+      // An identical resolved decision may return its durable cached success;
+      // only an actual new native dispatch would constitute replay.
+      const baseline = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events',
+        params: { soulId, afterSequence: cursor, maxEvents: 128 } })
+      harness.writeArtifact(`${scenario}-effect-recovery-event-baseline-private.json`, baseline)
+      cursor = baseline.data.head
+      if (baseline.data.events.some((row: any) => row.event.kind === 'permission_requested')) {
+        throw new Error('ambiguous effect revived a native permission callback')
+      }
+      refused = await harness.adminRaw(supervisor, harness.freshAgentResolveBody(soulId, effectDecision.decision_id,
+        { behavior: 'allow', updatedInput: effectDecision.payload.tool.input }))
+      harness.writeArtifact(`${scenario}-ambiguous-decision-refused.json`, refused)
+      const completedCacheReply = refused.result?.Ok?.kind === 'fresh_agent_command'
+        && refused.result.Ok.data?.state === 'completed'
+      if (!refused.result?.Err && !completedCacheReply) throw new Error('old native decision has no refusal or identical completed cache reply')
+    } else {
+      await inspect(recovery.data.view.containerId, 'native-edge-after-death-before-input', true)
       refused = await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: { soulId,
         text: 'Do not perform any tools. Report whether the unfinished original operation is blocked.' } })
-      if (!refused.result?.Err) throw new Error('uncheckpointed native operation accepted automatic-replay input')
+      harness.writeArtifact(`${scenario}-native-edge-input-dispatch.json`, refused)
+      if (!refused.result?.Err) {
+        // The Admin reply acknowledges a sidecar write. Its actual native
+        // admission refusal arrives on the normalized provider event stream.
+        await wait((event) => event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.error'
+          && event.data.payload.event.message?.includes('ordinary input is blocked'), 'actual unfinished-operation input refusal')
+      }
+      await inspect(recovery.data.view.containerId, 'native-edge-after-refused-input', true)
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000))
     const current = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events', params: { soulId, afterSequence: cursor, maxEvents: 128 } })
     const cards = current.data.events.filter((row: any) => row.event.kind === 'permission_requested')
+    if (input.decision === 'effect-before-observation' && current.data.events.some((row: any) =>
+      row.event.kind === 'provider' && row.event.data.payload.event?.type === 'freshAgent.permission.dispatch')) {
+      throw new Error('native decision dispatched again after its effect')
+    }
     const expected = input.decision === 'effect-before-observation' ? 1 : 0
     harness.writeArtifact(`${scenario}-native-edge-outcome-private.json`, { recovery, refused, current, effectCount: effectCount() })
     if (cards.length || effectCount() !== expected) throw new Error('uncheckpointed or completed native operation revived a callback or repeated an effect')
@@ -670,7 +767,7 @@ async function executeManagedNativeApproval(input: {
     || oldPayload.nativeCheckpoint.toolUseID !== oldPayload.toolUseID || effectCount() !== 0) {
     throw new Error('original native solo checkpoint/effect oracle differs')
   }
-  const captureCheckpointState = async (containerId: string, label: string) => {
+  async function captureCheckpointState(containerId: string, label: string) {
     const files = []
     for (const [uid, file] of [['0:0', '/run/freshell-host-actor/fresh-agent-state.json'],
       ['65534:0', `/home/freshell/provider/.freshell/native-checkpoints/claude/${view.nativeSessionId}.json`]]) {
@@ -679,6 +776,7 @@ async function executeManagedNativeApproval(input: {
       files.push(JSON.parse(source))
     }
     harness.writeArtifact(`${scenario}-${label}-checkpoint-state-private.json`, { nativeRoot: view.nativeSessionId, files })
+    return files
   }
   const before = await inspect(view.containerId, 'checkpoint-before-death', true)
   await captureCheckpointState(view.containerId, 'before-death')
@@ -711,7 +809,10 @@ async function executeManagedNativeApproval(input: {
         { behavior: 'allow', updatedInput: oldPayload.tool.input })))
       replies.push(await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: {
         soulId, text: 'Do not perform any tools. Report whether the interrupted original operation is blocked.' } }))
-      if (replies.some((reply) => !reply.result?.Err)) throw new Error('changed native source/profile accepted an orphan decision or ordinary replay input')
+      if (!replies[0]?.result?.Err) throw new Error('changed native source/profile accepted an orphan decision')
+      if (!replies[1]?.result?.Err) await wait((event) => event.kind === 'provider'
+        && event.data.payload.event?.type === 'freshAgent.error'
+        && event.data.payload.event.message?.includes('ordinary input is blocked'), 'actual changed-source input refusal')
     } else if (currentView?.recoveryState !== 'blocked') {
       throw new Error('changed native source/profile has no explicit recovery disposition')
     }
@@ -723,7 +824,9 @@ async function executeManagedNativeApproval(input: {
       throw new Error('changed native source/profile replayed or revived the original operation')
     }
     return [{ name: 'actual-native-checkpoint-before-source-fault', pass: oldPayload.nativeCheckpoint.toolUseID === oldPayload.toolUseID },
-      { name: 'changed-native-source-or-profile-refuses-original-operation', pass: replies.every((reply) => !!reply.result?.Err) },
+      { name: 'changed-native-source-or-profile-refuses-original-operation', pass: currentView?.recoveryState === 'blocked'
+        || (!!replies[0]?.result?.Err && (!!replies[1]?.result?.Err || observed.some((event) => event.kind === 'provider'
+          && event.data.payload.event?.type === 'freshAgent.error' && event.data.payload.event.message?.includes('ordinary input is blocked')))) },
       { name: 'no-resurrected-native-permission-callback', pass: currentView?.recoveryState !== 'live'
         || !batch?.data.events.some((row: any) => isCard(row.event)) },
       { name: 'independent-native-effect-count', pass: effectCount() === 0 }]
@@ -759,11 +862,19 @@ async function executeManagedNativeApproval(input: {
   const allowed = input.decision === 'allow'
   const expectedEffectCount = allowed ? 1 : 0
   const decision = allowed ? { behavior: 'allow', updatedInput: currentPayload.tool.input }
-    : { behavior: 'deny', message: 'Denied this original owned operation' }
+    : { behavior: 'deny', message: 'The user declined this operation. Do not retry it or use any other tools. End this turn now with a short acknowledgment.' }
   const receipt = await harness.adminOk(supervisor, harness.freshAgentResolveBody(soulId, current.decision_id, decision))
   harness.writeArtifact(`${scenario}-approval-dispatch.json`, receipt)
-  const result = (await wait((event) => event.kind === 'provider'
-    && event.data.payload.event?.type === 'freshAgent.result', 'native completion')).data.payload.event
+  const terminal = await wait((event) => event.kind === 'permission_requested'
+    || (event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.result'), 'native completion')
+  if (terminal.kind === 'permission_requested') {
+    await inspect(currentView.containerId, 'unexpected-next-operation', true)
+    await captureCheckpointState(currentView.containerId, 'unexpected-next-operation')
+    harness.writeArtifact(`${scenario}-unexpected-next-operation-private.json`, { originalToolUseID: oldPayload.toolUseID,
+      nextOperation: terminal.data, effectCount: effectCount() })
+    throw new Error('native model requested another operation after the bounded original decision')
+  }
+  const result = terminal.data.payload.event
   const toolResults = observed.filter((event) => event.kind === 'provider'
     && event.data.payload.event?.type === 'freshAgent.tool.result').flatMap((event) => event.data.payload.event.content ?? [])
   const toolResult = toolResults.find((part: any) => part.tool_use_id === oldPayload.toolUseID)

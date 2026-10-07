@@ -6,6 +6,187 @@ use freshell_runtime_protocol::{
 };
 use tokio::net::UnixListener;
 
+// The MCP controller is process-global. Run these refusal paths in exact
+// isolated test children so their owned HOME/controller cannot affect peers.
+fn create_failure_trace_child(case: &str, test: &str) -> bool {
+    if std::env::var("FRESHELL_CREATE_FAILURE_TRACE_CHILD")
+        .ok()
+        .as_deref()
+        == Some(case)
+    {
+        return false;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env("FRESHELL_CREATE_FAILURE_TRACE_CHILD", case)
+        .env("HOME", home.path())
+        .env("CLAUDE_CONFIG_DIR", home.path().join(".claude"))
+        .env("CLAUDE_HOME", home.path().join(".claude"))
+        .env("CODEX_HOME", home.path().join(".codex"))
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env(
+            "FRESHELL_RUNTIME_CAPABILITY_DIR",
+            home.path().join("owned-capabilities"),
+        );
+    for provider in ["CLAUDE", "CODEX", "OPENCODE", "AMPLIFIER"] {
+        for suffix in ["ENV_FILE", "AUTH_FILE", "CA_FILE"] {
+            child.env_remove(format!("FRESHELL_MANAGED_{provider}_ONECLI_{suffix}"));
+        }
+    }
+    child.env_remove("FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE");
+    let output = child.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+#[tokio::test]
+async fn create_failure_trace_missing_cwd() {
+    if create_failure_trace_child(
+        "cwd",
+        "fresh_agent_proxy::tests::create_failure_trace_missing_cwd",
+    ) {
+        return;
+    }
+    let events = crate::test_trace_capture::captured_trace_events();
+    let root = tempfile::tempdir().unwrap();
+    let proxy = snapshot_outage_proxy(&root.path().join("never-contacted.sock"));
+    let message = serde_json::from_value(serde_json::json!({"requestId":"trace-cwd-owned", "provider":"claude", "sessionType":"freshclaude",
+        "cwd":root.path().join("missing-private-workspace")})).unwrap();
+    assert!(proxy.create(message).await.is_err());
+    let captured = events.snapshot();
+    let event = captured
+        .iter()
+        .find(|event| event.fields.get("request_id").map(String::as_str) == Some("trace-cwd-owned"))
+        .expect("executed cwd refusal must emit its finite create observation");
+    assert_eq!(event.level, tracing::Level::WARN);
+    assert_eq!(
+        event.fields.get("event").map(String::as_str),
+        Some("fresh_agent.create.preparation_failed")
+    );
+    assert_eq!(
+        event.fields.get("reason").map(String::as_str),
+        Some("cwd_unavailable")
+    );
+    assert_eq!(
+        event.fields.get("provider").map(String::as_str),
+        Some("claude")
+    );
+    assert_eq!(
+        event.fields.get("session_type").map(String::as_str),
+        Some("freshclaude")
+    );
+    assert!(!format!("{event:?}").contains("missing-private-workspace"));
+    assert!(!event.fields.contains_key("error"));
+}
+
+#[tokio::test]
+async fn create_failure_trace_launch_rejection() {
+    if create_failure_trace_child(
+        "launch",
+        "fresh_agent_proxy::tests::create_failure_trace_launch_rejection",
+    ) {
+        return;
+    }
+    let events = crate::test_trace_capture::captured_trace_events();
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("typed-supervisor.sock");
+    let secret = root.path().join("control-secret");
+    std::fs::write(&secret, "0123456789abcdef").unwrap();
+    crate::managed_mcp_capability::configure("0.0.0.0", 39481, &socket, &secret).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let expected_soul = stable_soul_id("claude", "trace-launch-owned").unwrap();
+    let supervisor = tokio::spawn(async move {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health if index == 0 => Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+                AdminCommand::Launch(launch) if index == 1 => {
+                    assert_eq!(launch.soul_id, expected_soul);
+                    assert_eq!(launch.provider, "claude");
+                    Err(freshell_runtime_protocol::RuntimeError::new(
+                        RuntimeErrorCode::BackendUnavailable,
+                        "private-launch-failure-body",
+                    ))
+                }
+                other => panic!("unexpected create request {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let proxy = snapshot_outage_proxy(&socket);
+    let message = serde_json::from_value(serde_json::json!({"requestId":"trace-launch-owned", "provider":"claude", "sessionType":"freshclaude",
+        "cwd":root.path()})).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), proxy.create(message))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .expect("typed supervisor must receive Launch")
+        .unwrap();
+    let captured = events.snapshot();
+    let event = captured
+        .iter()
+        .find(|event| {
+            event.fields.get("event").map(String::as_str)
+                == Some("fresh_agent.create.launch_failed")
+        })
+        .expect("executed typed Launch refusal must emit a finite observation");
+    assert_eq!(event.level, tracing::Level::WARN);
+    assert_eq!(
+        event.fields.get("request_id").map(String::as_str),
+        Some("trace-launch-owned")
+    );
+    assert_eq!(
+        event.fields.get("provider").map(String::as_str),
+        Some("claude")
+    );
+    assert_eq!(
+        event.fields.get("session_type").map(String::as_str),
+        Some("freshclaude")
+    );
+    assert_eq!(
+        event.fields.get("soul_id").map(String::as_str),
+        Some(
+            stable_soul_id("claude", "trace-launch-owned")
+                .unwrap()
+                .as_str()
+        )
+    );
+    assert_eq!(
+        event.fields.get("reason").map(String::as_str),
+        Some("runtime_rejection")
+    );
+    assert_eq!(
+        event.fields.get("runtime_code").map(String::as_str),
+        Some("BACKEND_UNAVAILABLE")
+    );
+    assert!(!format!("{event:?}").contains("private-launch-failure-body"));
+    assert!(!event.fields.contains_key("error"));
+}
+
 #[test]
 fn hosted_created_frame_uses_the_public_request_identity() {
     let (broadcast, mut receiver) = broadcast::channel(8);

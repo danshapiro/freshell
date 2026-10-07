@@ -6,7 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, nativeCheckpointTranscriptRetained, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -25,8 +25,77 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['death', 'published', 'cached', 'redispatch'])('protects the native post-effect observation boundary (%s)', async (fault) => {
+    const publishedOutcome = fault === 'published'
+    const recover = fault === 'cached' || fault === 'redispatch'
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'native-effect-edge-'))
+    const command = `printf 'effect\\n' >> '${path.join(workspace, 'owned-native-effect.jsonl')}'`
+    const toolUseID = 'toolu_original1'
+    const nativeRoot = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const methods: string[] = []
+    let read = false
+    const payload = { tool: { name: 'Bash', input: { command } }, toolUseID,
+      nativeCheckpoint: { nativeSessionId: nativeRoot, toolUseID }, nativeRequestId: 'current-native-request' }
+    const harness = { writeArtifact: () => '',
+      freshAgentResolveBody: (_soul: string, decision: string, value: unknown) => ({ method: 'fresh_agent_resolve', params: { decision, value } }),
+      probeRecoveryBody: () => ({ method: 'probe_recovery' }),
+      recoverBody: () => ({ method: 'recover' }),
+      adminOk: async (_supervisor: unknown, body: any) => {
+        methods.push(body.method)
+        if (body.method === 'fresh_agent_read_events') {
+          if (read && recover) return { data: { head: 2, events: fault === 'redispatch' && methods.filter((m) => m === 'fresh_agent_read_events').length > 2
+            ? [{ event: { kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true } } } } }] : [] } }
+          if (read) throw new Error('unexpected observation read after parked card')
+          read = true
+          return { data: { head: 1, events: [{ event: { kind: 'permission_requested', data: { decision_id: 'current-card', payload } } }] } }
+        }
+        if (body.method === 'fresh_agent_resolve') {
+          expect(body.params.decision).toBe('current-card')
+          expect(body.params.value).toEqual({ behavior: 'allow', updatedInput: { command } })
+          fs.writeFileSync(path.join(workspace, 'owned-native-effect.jsonl'), 'effect\n')
+          fs.writeFileSync(path.join(workspace, 'native-after-effect-before-observation.json'), JSON.stringify({
+            hook_event_name: 'PostToolUse', session_id: nativeRoot, tool_name: 'Bash', tool_use_id: toolUseID, tool_input: { command } }))
+        }
+        if (body.method === 'recover') return { data: { outcome: 'replaced', view: {
+          incarnationId: 'new-incarnation', containerId: 'replacement-container', nativeSessionId: nativeRoot,
+          recoveryState: 'live', nativeIdentityObservation: { nativeSessionId: nativeRoot } } } }
+        return { data: { kind: 'reattach_ready' } }
+      },
+      adminRaw: async () => { methods.push('cached-decision-resolve'); return { result: { Ok: { kind: 'fresh_agent_command', data: { state: 'completed' } } } } },
+      waitForFile: async (file: string) => { expect(fs.existsSync(file)).toBe(true) },
+      execOwnedContainerAsExact: async (_container: string, uid: string, args: string[]) => {
+        const bytes = Buffer.from(JSON.stringify(uid === '0:0' ? { decisions: { 'current-card': { state: 'resolved',
+          responseDigest: createHash('sha256').update(JSON.stringify({ behavior: 'allow', updatedInput: { command } })).digest('hex') } } }
+          : { phase: 'dispatching', nativeSessionId: nativeRoot, toolUseID }))
+        return JSON.stringify({ path: args.at(-1), readerUid: Number(uid.split(':')[0]), bytesBase64: bytes.toString('base64'),
+          sha256: createHash('sha256').update(bytes).digest('hex') })
+      },
+      killOwnedRuntimeExact: async () => { if (!recover) throw new Error('controlled exact native death') },
+      waitForContainerExit: async () => {},
+    } as unknown as RuntimeHarness
+    const rows = [{ type: 'assistant', sessionId: nativeRoot, message: { id: 'msg_original',
+      content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command } }] } },
+    { type: 'attachment', sessionId: nativeRoot, attachment: { type: 'hook_deferred_tool', toolUseID } }]
+    const bytes = Buffer.from(rows.map((row) => JSON.stringify(row)).join('\n') + '\n')
+    const nativeBytes = publishedOutcome ? Buffer.concat([bytes, Buffer.from(JSON.stringify({ type: 'user', sessionId: nativeRoot,
+      message: { content: [{ type: 'tool_result', tool_use_id: toolUseID, is_error: false }] } }) + '\n')]) : bytes
+    try {
+      const run = executeManagedNativeApproval({ harness, supervisor: {}, soulId: 'owned-soul', workspace,
+        view: { incarnationId: 'old-incarnation', nativeSessionId: nativeRoot, containerId: 'owned-container' }, scenario: 'controlled-effect-edge',
+        decision: 'effect-before-observation', inspect: async () => ({ nativeRoot,
+          transcript: { bytesBase64: nativeBytes.toString('base64'), sha256: createHash('sha256').update(nativeBytes).digest('hex'), completeEof: true } }) })
+      if (fault === 'cached') await expect(run).resolves.toBeDefined()
+      else await expect(run).rejects.toThrow(publishedOutcome ? 'post-effect native outcome was already published'
+        : fault === 'redispatch' ? 'native decision dispatched again after its effect' : 'controlled exact native death')
+      if (recover) {
+        expect(methods.filter((m) => m === 'fresh_agent_resolve')).toHaveLength(1)
+        expect(methods.filter((m) => m === 'cached-decision-resolve')).toHaveLength(1)
+        expect(fs.readFileSync(path.join(workspace, 'owned-native-effect.jsonl'), 'utf8')).toBe('effect\n')
+      } else expect(methods).toEqual(['fresh_agent_send', 'fresh_agent_read_events', 'fresh_agent_resolve', ...(publishedOutcome ? [] : ['probe_recovery'])])
+    } finally { fs.rmSync(workspace, { recursive: true, force: true }) }
+  })
   it.each(['changed-tool', 'missing-tool', 'changed-input', 'changed-profile', 'changed-root', 'stale-callback',
-    'crash-before-checkpoint', 'multiple-tools', 'effect-before-observation'])(
+    'crash-before-checkpoint', 'multiple-tools', 'effect-before-observation', 'exact-resume'])(
     'dispatches %s through the managed native launch boundary', async (caseId) => {
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-negative-route-'))
       const launch = vi.fn(async (_supervisor: unknown, _body: any) => { throw new Error('controlled native launch boundary') })
@@ -36,7 +105,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         await expect(executeManagedNativeCase(harness,
           ['env_file', 'ca_file'].map((suffix) => ({ name: 'claude/grants/' + suffix,
             path: path.join(directory, suffix), sha256: 'e'.repeat(64) })),
-          { mode: 'freshclaude', case: 'approval-checkpoint' }, caseId))
+          { mode: 'freshclaude', case: caseId === 'exact-resume' ? 'startup' : 'approval-checkpoint' }, caseId))
           .rejects.toThrow('controlled native launch boundary')
         expect(launch).toHaveBeenCalledOnce()
         expect(launch.mock.calls[0]![1].params.freshAgent.sessionType).toBe('freshclaude')
@@ -264,6 +333,26 @@ describe('original native checkpoint byte continuity (fixtures do not qualify pr
   const snapshot = (raw: Buffer, device = '2065', inode = '42') => ({ nativeRoot: root,
     transcript: { bytesBase64: raw.toString('base64'), sha256: createHash('sha256').update(raw).digest('hex'),
       completeEof: raw.at(-1) === 10, identity: [device, inode, String(raw.length)] } })
+  it('recognizes two actual native tool rows sharing one model message without combining unrelated turns', () => {
+    const commands = ['first independent command', 'second independent command']
+    const row = (command: string, id: string, messageId = 'msg_actual_batch', name = 'Bash') => ({
+      type: 'assistant', sessionId: root, message: { id: messageId,
+        content: [{ type: 'tool_use', id, name, input: { command } }] } })
+    const native = (rows: unknown[]) => snapshot(Buffer.from(rows.map((r) => JSON.stringify(r)).join('\n') + '\n'))
+    const first = row(commands[0]!, 'toolu_first1'); const second = row(commands[1]!, 'toolu_second1')
+    expect(nativeTwoToolBatchMatches(native([first, second]), commands)).toBe(true)
+    expect(nativeTwoToolBatchMatches(native([{ ...first, message: { ...first.message,
+      content: [...first.message.content, ...second.message.content] } }]), commands)).toBe(true)
+    expect(nativeTwoToolBatchMatches(native([first, row(commands[1]!, 'toolu_second1', 'msg_next_turn')]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, row(commands[0]!, 'toolu_second1')]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, row(commands[1]!, 'toolu_first1')]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, row(commands[1]!, 'toolu_second1', '', 'Bash')]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, row(commands[1]!, 'toolu_second1', 'msg_actual_batch', 'Read')]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, { ...second, sessionId: 'other-root' }]), commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches({ ...native([first, second]), transcript: {
+      ...native([first, second]).transcript, sha256: 'f'.repeat(64) } }, commands)).toBe(false)
+    expect(nativeTwoToolBatchMatches(native([first, second]), [commands[0]!, commands[0]!])).toBe(false)
+  })
   const lifecycle = Buffer.from(JSON.stringify({ type: 'queue-operation', operation: 'enqueue', sessionId: root }) + '\n'
     + JSON.stringify({ type: 'attachment', sessionId: root, attachment: { type: 'hook_success' } }) + '\n')
   it('retains the original EOF bytes and inode when native resume appends only lifecycle rows', () => {

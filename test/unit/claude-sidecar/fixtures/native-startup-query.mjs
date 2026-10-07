@@ -48,14 +48,34 @@ export function query({ prompt, options }) {
         const toolUseID = 'toolu_original1'
         const assistant = { type: 'assistant', sessionId: nativeRoot, session_id: nativeRoot,
           uuid: 'assistant-original', version: '2.1.237',
-          message: { content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input }] } }
+          message: { id: 'msg_fixture_original', content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input }] } }
         const callback = message.eager && process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT_EAGER_CALLBACK_ONLY === '1'
           ? undefined : options.hooks?.PreToolUse?.[0]?.hooks?.[0]
         const hookInput = { hook_event_name: 'PreToolUse', session_id: nativeRoot,
           tool_name: 'Bash', tool_input: input, tool_use_id: toolUseID }
+        if (['1', 'incomplete'].includes(process.env.FRESHELL_SIDECAR_TEST_SPLIT_BATCH)) {
+          yield { type: 'stream_event', session_id: nativeRoot, event: { type: 'message_start', message: { id: assistant.message.id } } }
+          yield assistant
+          const first = callback(hookInput, toolUseID, { signal: options.abortController.signal })
+          await new Promise((resolve) => setTimeout(resolve, 20))
+          const secondInput = { command: 'second owned harmless counter' }
+          yield { ...assistant, uuid: 'assistant-second', message: { id: assistant.message.id,
+            content: [{ type: 'tool_use', id: 'toolu_second1', name: 'Bash', input: secondInput }] } }
+          const second = callback({ ...hookInput, tool_use_id: 'toolu_second1', tool_input: secondInput },
+            'toolu_second1', { signal: options.abortController.signal })
+          if (process.env.FRESHELL_SIDECAR_TEST_SPLIT_BATCH !== 'incomplete') {
+            yield { type: 'stream_event', session_id: nativeRoot, event: { type: 'message_stop' } }
+          }
+          process.stdout.write(JSON.stringify({ type: 'probe.batch-hooks', outcomes: await Promise.all([first, second]) }) + '\n')
+          continue
+        }
         const hookFirst = callback && process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT_HOOK_FIRST === '1'
           ? callback(hookInput, toolUseID, { signal: options.abortController.signal }) : undefined
-        if (!message.eager) yield assistant
+        if (!message.eager) {
+          yield { type: 'stream_event', session_id: nativeRoot, event: { type: 'message_start', message: { id: assistant.message.id } } }
+          yield assistant
+          yield { type: 'stream_event', session_id: nativeRoot, event: { type: 'message_stop' } }
+        }
         const outcome = hookFirst ? await hookFirst : callback ? await callback(hookInput, toolUseID,
           { signal: options.abortController.signal }) : {}
         if (outcome.hookSpecificOutput?.permissionDecision === 'defer') {

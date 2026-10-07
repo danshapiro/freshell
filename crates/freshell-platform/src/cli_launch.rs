@@ -258,7 +258,7 @@ pub fn claude_settings_json(target: ProviderTarget) -> String {
 }
 
 pub fn claude_managed_settings_json() -> String {
-    serde_json::json!({"hooks": {
+    serde_json::json!({"statusLine":{"type":"command","command":"node /opt/freshell-claude-sidecar/native-session-channel.mjs --status-line"},"hooks": {
         "SessionStart": [{"hooks": [{"type":"command","command":"node /opt/freshell-claude-sidecar/native-session-channel.mjs"}]}],
         "Stop": [{"hooks": [{"type":"command","command":CLAUDE_BELL_COMMAND_UNIX}]}],
     }}).to_string()
@@ -690,7 +690,11 @@ mod tests {
         let wrapper = binary_dir.join("node");
         std::fs::write(
             &wrapper,
-            format!("#!/bin/sh\nexec '{}' '{}'\n", node.trim(), module.display()),
+            format!(
+                "#!/bin/sh\nshift\nexec '{}' '{}' \"$@\"\n",
+                node.trim(),
+                module.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -731,6 +735,43 @@ mod tests {
         let signal: serde_json::Value = serde_json::from_slice(&signal).unwrap();
         assert_eq!(signal["launch"], launch);
         assert_eq!(signal["native"]["source"], "resume");
+        let status_command = settings["statusLine"]["command"].as_str().unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", status_command])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    binary_dir.display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("HOME", owned.path())
+            .env("FRESHELL_NATIVE_IDENTITY_LAUNCH", launch.to_string())
+            .env("FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR", &directory)
+            .env(
+                "FRESHELL_NATIVE_STATUSLINE_SETTINGS",
+                r#"{"type":"command","command":"printf selected-status-output"}"#,
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(br#"{"session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","transcript_path":"/owned/native.jsonl","version":"2.1.263","model":{"id":"claude-haiku-4-5-20251001"},"workspace":{"current_dir":"/owned"},"context_window":{"context_window_size":200000,"current_usage":null}}"#).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"selected-status-output");
+        let loaded: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("statusline-loaded.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded["launch"], launch);
+        assert_eq!(loaded["native"]["version"], "2.1.263");
         assert!(!owned
             .path()
             .join(".freshell/session-signals/claude")

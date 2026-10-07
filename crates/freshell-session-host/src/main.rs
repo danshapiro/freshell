@@ -6332,7 +6332,7 @@ mod tests {
         .unwrap();
         let mut pty = state.pty.lock().await.take().unwrap();
         pty.stop().await;
-        assert_eq!(std::fs::read_to_string(history).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&history).unwrap(), original);
         assert!(
             matches!(
                 status,
@@ -6377,7 +6377,8 @@ mod tests {
             .join(".freshell/native-identity/current-native-launch");
         std::fs::create_dir_all(&directory).unwrap();
         let file = directory.join("session-start.json");
-        let native = serde_json::json!({"hook_event_name":"SessionStart","session_id":native_root,"source":"resume"});
+        let native = serde_json::json!({"hook_event_name":"SessionStart","session_id":native_root,"source":"resume",
+            "cwd":root.path(),"transcript_path":history});
         let mut variants = vec![];
         let mut wrong = binding.clone();
         wrong.launch_nonce = "old-launch".into();
@@ -6395,12 +6396,70 @@ mod tests {
         ));
         variants.push(("fork source",serde_json::json!({"launch":binding,"native":{"hook_event_name":"SessionStart","session_id":native_root,"source":"fork"}}),false));
         variants.push((
+            "start without completed restoration",
+            serde_json::json!({"launch":binding,"native":native}),
+            false,
+        ));
+        variants.push((
             "current",
             serde_json::json!({"launch":binding,"native":native}),
             true,
         ));
+        for name in [
+            "loaded wrong nonce",
+            "loaded wrong root",
+            "loaded wrong transcript",
+            "loaded wrong version",
+            "loaded wrong workspace",
+            "loaded missing model",
+            "loaded missing context",
+            "loaded missing usage",
+        ] {
+            variants.push((
+                name,
+                serde_json::json!({"launch":binding,"native":native}),
+                false,
+            ));
+        }
         let mut outcomes = vec![];
         for (name, value, expected) in variants {
+            if name == "current" || name.starts_with("loaded ") {
+                let mut loaded = serde_json::json!({"launch":binding,"native":{"session_id":native_root,
+                    "transcript_path":history,"version":"2.1.263","model":{"id":"claude-haiku-4-5-20251001"},
+                    "workspace":{"current_dir":root.path()},"context_window":{"context_window_size":200000,"current_usage":null}}});
+                match name {
+                    "loaded wrong nonce" => {
+                        loaded["launch"]["launchNonce"] = serde_json::json!("old")
+                    }
+                    "loaded wrong root" => {
+                        loaded["native"]["session_id"] =
+                            serde_json::json!("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+                    }
+                    "loaded wrong transcript" => {
+                        loaded["native"]["transcript_path"] =
+                            serde_json::json!("/other/native.jsonl")
+                    }
+                    "loaded wrong version" => {
+                        loaded["native"]["version"] = serde_json::json!("2.1.237")
+                    }
+                    "loaded wrong workspace" => {
+                        loaded["native"]["workspace"]["current_dir"] = serde_json::json!("/other")
+                    }
+                    "loaded missing model" => loaded["native"]["model"] = serde_json::Value::Null,
+                    "loaded missing context" => {
+                        loaded["native"]["context_window"] = serde_json::Value::Null
+                    }
+                    "loaded missing usage" => {
+                        loaded["native"]["context_window"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("current_usage");
+                    }
+                    _ => {}
+                }
+                std::fs::write(directory.join("statusline-loaded.json"), loaded.to_string())
+                    .unwrap();
+            }
             std::fs::write(&file, value.to_string()).unwrap();
             let result = dispatch(
                 authenticated_host_envelope(
