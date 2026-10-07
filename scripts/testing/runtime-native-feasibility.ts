@@ -126,6 +126,7 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     sourceFiles: { name: string; path: string; sha256: string }[]
   }
   const harness = new RuntimeHarness(process.cwd(), undefined, 1)
+  let paidApprovalPrerequisiteFailed = false
   const servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []
   try {
     const prepared = await harness.prepareNativeArtifacts({ candidateSha: manifest.candidateSha,
@@ -136,8 +137,12 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     const originals = await dispatchNativeFeasibility({ selection, imageDigest: manifest.imageDigest,
       candidateSha: manifest.candidateSha, ownerId: harness.runId,
       execute: async (caseId) => {
+        if (paidApprovalPrerequisiteFailed && ['allow', 'deny'].includes(caseId)) {
+          throw new Error('prior native approval prerequisite failed; no further paid operation started')
+        }
         try { return await executeManagedNativeCase(harness, prepared.files, selection, caseId, prepared.serverPath, servers) }
         catch (error) {
+          if (selection.case === 'approval-checkpoint' && ['allow', 'deny'].includes(caseId)) paidApprovalPrerequisiteFailed = true
           const reason = error instanceof Error ? error.message : 'unknown native case failure'
           harness.writeArtifact(`native-case-${caseId}-failure.json`, { severity: 'error',
             event: 'runtime.native_feasibility.case_failed', caseId, reason })
