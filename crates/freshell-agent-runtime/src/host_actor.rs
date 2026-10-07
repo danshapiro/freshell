@@ -405,6 +405,10 @@ impl FreshAgentHostActor {
     pub async fn resume_pending_native_permissions(&self) -> Result<(), ActorError> {
         let _serial = self.dispatch_lock.lock().await;
         if !self.native_recovery_prepared {
+            eprintln!(
+                "{}",
+                serde_json::json!({"severity":"info", "event":"fresh_agent.native_checkpoint.release", "outcome":"not_prepared"})
+            );
             return Ok(());
         }
         if self
@@ -530,6 +534,12 @@ impl FreshAgentHostActor {
         ) {
             let checkpoints = native_recovery_checkpoints(&state);
             native_recovery_prepared = !checkpoints.is_empty();
+            eprintln!(
+                "{}",
+                serde_json::json!({"severity":"info", "event":"fresh_agent.native_checkpoint.prepared",
+                "provider":state.profile.provider.as_str(), "checkpointCount":checkpoints.len(), "decisionCount":state.decisions.len(),
+                "nativeSessionId":state.profile.native_session_id})
+            );
             transport
                 .prepare_native_permission_recovery(checkpoints)
                 .await

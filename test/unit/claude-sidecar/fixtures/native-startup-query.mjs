@@ -34,19 +34,28 @@ export function query({ prompt, options }) {
     async *[Symbol.asyncIterator]() {
       if (!checkpointScenario) { await new Promise((resolve) => options.abortController.signal.addEventListener('abort', resolve, { once: true })); return }
       await loaded
-      for await (const message of prompt) {
-        process.stdout.write(JSON.stringify({ type: 'probe.native-input' }) + '\n')
+      const eager = process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT_EAGER_RESUME === '1'
+      async function* inputs() {
+        if (eager) {
+          await new Promise((resolve) => setTimeout(resolve, 100))
+          yield { eager: true }
+        }
+        for await (const message of prompt) yield message
+      }
+      for await (const message of inputs()) {
+        process.stdout.write(JSON.stringify({ type: message.eager ? 'probe.native-eager-operation' : 'probe.native-input' }) + '\n')
         const input = { command: 'fixture owned harmless counter' }
         const toolUseID = 'toolu_original1'
         const assistant = { type: 'assistant', sessionId: nativeRoot, session_id: nativeRoot,
           uuid: 'assistant-original', version: '2.1.237',
           message: { content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input }] } }
-        const callback = options.hooks?.PreToolUse?.[0]?.hooks?.[0]
+        const callback = message.eager && process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT_EAGER_CALLBACK_ONLY === '1'
+          ? undefined : options.hooks?.PreToolUse?.[0]?.hooks?.[0]
         const hookInput = { hook_event_name: 'PreToolUse', session_id: nativeRoot,
           tool_name: 'Bash', tool_input: input, tool_use_id: toolUseID }
         const hookFirst = callback && process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT_HOOK_FIRST === '1'
           ? callback(hookInput, toolUseID, { signal: options.abortController.signal }) : undefined
-        yield assistant
+        if (!message.eager) yield assistant
         const outcome = hookFirst ? await hookFirst : callback ? await callback(hookInput, toolUseID,
           { signal: options.abortController.signal }) : {}
         if (outcome.hookSpecificOutput?.permissionDecision === 'defer') {
@@ -60,8 +69,10 @@ export function query({ prompt, options }) {
           yield { type: 'result', subtype: 'success', session_id: nativeRoot, is_error: false,
             stop_reason: 'tool_deferred', deferred_tool_use: { id: toolUseID, name: 'Bash', input } }
         } else {
-          const result = await options.canUseTool('Bash', input, { toolUseID,
-            requestId: process.env.FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID ?? 'native-query-current', signal: options.abortController.signal })
+          const result = outcome.hookSpecificOutput?.permissionDecision === 'deny'
+            ? { behavior: 'deny' }
+            : await options.canUseTool('Bash', input, { toolUseID,
+              requestId: process.env.FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID ?? 'native-query-current', signal: options.abortController.signal })
           const is_error = result.behavior !== 'allow'
           if (!is_error) await appendFile(join(options.cwd, 'effect-count'), '1\n')
           const nativeResult = { type: 'user', sessionId: nativeRoot, session_id: nativeRoot,

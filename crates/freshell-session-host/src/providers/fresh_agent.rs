@@ -1876,6 +1876,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_actor_checkpoint_recovery_preserves_the_created_root_and_current_card() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let keys = [
+            "HOME",
+            "CLAUDE_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+            "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+            "FRESHELL_SIDECAR_TEST_CHECKPOINT",
+            "FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID",
+        ];
+        let _restore = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+            let owned = tempfile::tempdir().unwrap();
+            let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            std::fs::write(
+                owned.path().join("native.jsonl"),
+                format!("{{\"type\":\"system\",\"sessionId\":\"{native}\"}}\n"),
+            )
+            .unwrap();
+            std::env::set_var("HOME", owned.path());
+            std::env::set_var("CLAUDE_HOME", owned.path().join(".claude"));
+            std::env::set_var("CLAUDE_CONFIG_DIR", owned.path().join(".claude"));
+            std::env::set_var(
+                "FRESHELL_CLAUDE_SIDECAR",
+                repo.join("crates/freshell-claude-sidecar/index.mjs"),
+            );
+            std::env::set_var(
+                "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+                repo.join("test/unit/claude-sidecar/fixtures/native-startup-query.mjs"),
+            );
+            std::env::set_var("FRESHELL_SIDECAR_TEST_CHECKPOINT", "1");
+            std::env::set_var(
+                "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+                json!({"incarnationId":"current","launchNonce":"current-nonce",
+                "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":native})
+                .to_string(),
+            );
+            let mut profile = parity_profile(FreshProvider::Claude);
+            profile.provider = provider.clone();
+            profile.cwd = owned.path().to_string_lossy().into();
+            profile.native_session_id = None;
+            profile.session_ref = None;
+            profile.provider_launch_context = None;
+            profile.provider_secret_references.clear();
+            profile.plugins = None;
+            profile.permission_mode = Some("default".into());
+            std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID", "native-old");
+            let original = HostedTransport::new(provider.clone()).await;
+            let actor_dir = owned.path().join("actor");
+            let actor = FreshAgentHostActor::open(&actor_dir, profile.clone(), original.clone())
+                .await
+                .unwrap();
+            actor
+                .dispatch(
+                    RequestId::parse("original-operation").unwrap(),
+                    "owned original operation".into(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let old_card = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(payload) =
+                        actor
+                            .read_events(0, 128)
+                            .await
+                            .events
+                            .iter()
+                            .find_map(|row| {
+                                if let AgentEvent::PermissionRequested { payload, .. } = &row.event
+                                {
+                                    Some(payload.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                    {
+                        break payload;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let checkpoint = old_card["nativeCheckpoint"].clone();
+            profile = actor.profile().await;
+            assert_eq!(profile.native_session_id.as_deref(), Some(native));
+            if let ProviderState::Claude(state) = &original.state {
+                state.shutdown().await;
+            }
+            drop(actor);
+            tokio::task::yield_now().await;
+            std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID", "native-new");
+            let current = HostedTransport::new(provider).await;
+            let actor = FreshAgentHostActor::open(&actor_dir, profile.clone(), current.clone())
+                .await
+                .unwrap();
+            assert!(
+                !current
+                    .prepared_native_checkpoints
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .is_empty(),
+                "actual saved actor must register its native checkpoint before startup"
+            );
+            let before = std::fs::read(owned.path().join("native.jsonl")).unwrap();
+            let receipt = actor.resume_pending_native_permissions().await;
+            let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(payload) = actor
+                        .read_events(0, 128)
+                        .await
+                        .events
+                        .iter()
+                        .rev()
+                        .find_map(|row| {
+                            if let AgentEvent::PermissionRequested { payload, .. } = &row.event {
+                                if payload["nativeRequestId"] == "native-new" {
+                                    return Some(payload.clone());
+                                }
+                            }
+                            None
+                        })
+                    {
+                        break payload;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            let duplicate = actor.resume_pending_native_permissions().await;
+            if let ProviderState::Claude(state) = &current.state {
+                state.shutdown().await;
+            }
+            drop(actor);
+            assert!(
+                receipt.is_ok(),
+                "current exact checkpoint release must be checked: {receipt:?}"
+            );
+            let recovered = recovered
+                .expect("explicit hosted release must surface the same current native ask");
+            assert_eq!(recovered["nativeCheckpoint"], checkpoint);
+            assert_eq!(recovered["nativeRequestId"], "native-new");
+            assert!(
+                duplicate.is_err(),
+                "staged recovery release cannot run twice"
+            );
+            assert_eq!(
+                std::fs::read(owned.path().join("native.jsonl")).unwrap(),
+                before,
+                "parked native ask must not execute or rewrite history"
+            );
+            assert!(!owned.path().join("effect-count").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn actual_opencode_bootstrap_materializes_once_before_send_and_reuses_owned_native_http_session(
     ) {
         let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
