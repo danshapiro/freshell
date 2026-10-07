@@ -801,11 +801,19 @@ async function executeManagedNativeApproval(input: {
   const allowed = input.decision === 'allow'
   const expectedEffectCount = allowed ? 1 : 0
   const decision = allowed ? { behavior: 'allow', updatedInput: currentPayload.tool.input }
-    : { behavior: 'deny', message: 'Denied this original owned operation' }
+    : { behavior: 'deny', message: 'The user declined this operation. Do not retry it or use any other tools. End this turn now with a short acknowledgment.' }
   const receipt = await harness.adminOk(supervisor, harness.freshAgentResolveBody(soulId, current.decision_id, decision))
   harness.writeArtifact(`${scenario}-approval-dispatch.json`, receipt)
-  const result = (await wait((event) => event.kind === 'provider'
-    && event.data.payload.event?.type === 'freshAgent.result', 'native completion')).data.payload.event
+  const terminal = await wait((event) => event.kind === 'permission_requested'
+    || (event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.result'), 'native completion')
+  if (terminal.kind === 'permission_requested') {
+    await inspect(currentView.containerId, 'unexpected-next-operation', true)
+    await captureCheckpointState(currentView.containerId, 'unexpected-next-operation')
+    harness.writeArtifact(`${scenario}-unexpected-next-operation-private.json`, { originalToolUseID: oldPayload.toolUseID,
+      nextOperation: terminal.data, effectCount: effectCount() })
+    throw new Error('native model requested another operation after the bounded original decision')
+  }
+  const result = terminal.data.payload.event
   const toolResults = observed.filter((event) => event.kind === 'provider'
     && event.data.payload.event?.type === 'freshAgent.tool.result').flatMap((event) => event.data.payload.event.content ?? [])
   const toolResult = toolResults.find((part: any) => part.tool_use_id === oldPayload.toolUseID)
