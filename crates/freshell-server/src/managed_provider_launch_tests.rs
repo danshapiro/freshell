@@ -1424,6 +1424,39 @@ let result={};if(message.method==='initialize'){
 process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\n');});
 "#;
     std::fs::write(skill.join("scripts/server.cjs"), server).unwrap();
+    let plugin = home.join(".codex/plugins/cache/fixture/probe/local");
+    let plugin_data_name = format!("{:x}", Sha256::digest(b"fixture\0probe"));
+    let plugin_data = home
+        .join(".codex/plugins/data/agent-plugins")
+        .join(&plugin_data_name);
+    let plugin_receipt = workspace.join("codex-installed-consumed.json");
+    std::fs::create_dir_all(plugin.join("scripts/node_modules/probe-dependency")).unwrap();
+    std::fs::create_dir_all(&plugin_data).unwrap();
+    std::fs::write(plugin.join("plugin.json"), r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"probe"}"#).unwrap();
+    std::fs::write(
+        plugin.join("scripts/node_modules/probe-dependency/index.js"),
+        "module.exports='closed-installed-plugin-dependency'",
+    )
+    .unwrap();
+    std::fs::write(plugin_data.join("nonce"), b"closed-hashed-plugin-resource").unwrap();
+    std::fs::write(plugin.join("scripts/server.cjs"), r#"const fs=require('node:fs'),crypto=require('node:crypto');
+const digest=value=>crypto.createHash('sha256').update(value).digest('hex');
+require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
+ let message;try{message=JSON.parse(line)}catch{return}if(message.id===undefined)return;
+ let result={};if(message.method==='initialize'){
+  const record={initialized:true,data:digest(fs.readFileSync(process.argv[2])),dependency:digest(require('probe-dependency')),
+   dataIdentity:process.env.PLUGIN_DATA.endsWith('/plugins/data/agent-plugins/'+process.argv[4]),
+   dataCwd:process.cwd()===process.env.PLUGIN_DATA,root:process.env.PLUGIN_ROOT==='/home/freshell/provider/.codex/plugins/cache/fixture/probe/local'};
+  fs.writeFileSync(process.argv[3],JSON.stringify(record));
+  result={protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'closed-installed-data-consumer',version:'1'}};
+ }else if(message.method==='tools/list')result={tools:[]};else if(message.method==='resources/list')result={resources:[]};else if(message.method==='prompts/list')result={prompts:[]};
+ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\n');
+});
+"#).unwrap();
+    std::fs::write(plugin.join("mcp.json"), serde_json::to_vec(&json!({
+        "$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+        "mcpServers":{"data-probe":{"type":"stdio","command":"node","args":["${PLUGIN_ROOT}/scripts/server.cjs","${PLUGIN_DATA}/nonce",plugin_receipt,plugin_data_name],"cwd":"${PLUGIN_DATA}"}}
+    })).unwrap()).unwrap();
     std::fs::create_dir_all(home.join(".codex/rules")).unwrap();
     std::fs::write(home.join(".codex/AGENTS.md"), b"closed-global-instructions").unwrap();
     std::fs::write(
@@ -1432,6 +1465,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\n');
     )
     .unwrap();
     let config = format!("model='synthetic-model'\nmodel_provider='fixture'\nmodel_instructions_file='./user.md'\n[model_providers.fixture]\nname='Closed fixture'\nbase_url='http://127.0.0.1:9'\nwire_api='responses'\nrequires_openai_auth=false\n[projects.{}]\ntrust_level='trusted'\n[mcp_servers.probe]\ncommand='node'\nenv_vars=['FRESHELL_URL','FRESHELL_TOKEN','FRESHELL','CODEX_HOME']\nargs=[{},{}]\n", serde_json::to_string(workspace.to_str().unwrap()).unwrap(), serde_json::to_string(skill.join("scripts/server.cjs").to_str().unwrap()).unwrap(), serde_json::to_string(receipt.to_str().unwrap()).unwrap());
+    let config = format!("{config}[features]\nplugins=true\n[plugins.\"probe@fixture\"]\n");
     std::fs::write(home.join(".codex/config.toml"), &config).unwrap();
     std::fs::write(home.join(".codex/user.md"), b"closed-user-input").unwrap();
     let project_config = "model_instructions_file='./project.md'\n[agents.worker]\nconfig_file='./agents/worker.toml'\n";
@@ -1621,15 +1655,23 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\n');
         );
     }
     assert_eq!(consumed_terminal.unwrap(), expected);
+    let expected_plugin = json!({"initialized":true,"data":hash(b"closed-hashed-plugin-resource"),"dependency":hash(b"closed-installed-plugin-dependency"),"dataIdentity":true,"dataCwd":true,"root":true});
+    assert_eq!(
+        consumed(&plugin_receipt)
+            .await
+            .expect("native AgentPlugin MCP must consume transported hashed data"),
+        expected_plugin
+    );
     println!(
         "provider_launch_consumer {}",
-        json!({"provider":"codex","route":"terminal","digest":hash(serde_json::to_vec(&expected).unwrap().as_slice())})
+        json!({"provider":"codex","route":"terminal","digest":hash(serde_json::to_vec(&json!({"ordinary":expected,"installed":expected_plugin})).unwrap().as_slice())})
     );
     client
         .stop(SoulId::parse(terminal.soul_id).unwrap())
         .await
         .unwrap();
     std::fs::remove_file(&receipt).unwrap();
+    std::fs::remove_file(&plugin_receipt).unwrap();
     let (broadcast, _) = tokio::sync::broadcast::channel(256);
     let mut events = broadcast.subscribe();
     let proxy = crate::fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
@@ -1653,9 +1695,15 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\n');
     .await
     .unwrap();
     assert_eq!(consumed(&receipt).await.unwrap(), expected);
+    assert_eq!(
+        consumed(&plugin_receipt)
+            .await
+            .expect("native fresh AgentPlugin MCP must consume transported hashed data"),
+        expected_plugin
+    );
     println!(
         "provider_launch_consumer {}",
-        json!({"provider":"codex","route":"fresh","digest":hash(serde_json::to_vec(&expected).unwrap().as_slice())})
+        json!({"provider":"codex","route":"fresh","digest":hash(serde_json::to_vec(&json!({"ordinary":expected,"installed":expected_plugin})).unwrap().as_slice())})
     );
     assert_eq!(
         std::fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
@@ -1664,6 +1712,10 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\n');
     assert_eq!(
         std::fs::read_to_string(workspace.join(".codex/config.toml")).unwrap(),
         project_config
+    );
+    assert_eq!(
+        std::fs::read(plugin_data.join("nonce")).unwrap(),
+        b"closed-hashed-plugin-resource"
     );
     for view in client.inventory().await.unwrap() {
         if view.desired_state == DesiredState::Running {

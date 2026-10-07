@@ -548,11 +548,25 @@ pub fn discover(
                     "Codex selected installed plugin is unavailable; repair installation and retry",
                 );
             }
-            resources.push(active_plugin_version(&cache)?);
-            let data = manifest
-                .codex_home
-                .join("plugins/data")
-                .join(format!("{plugin}-{market}"));
+            let active = active_plugin_version(&cache)?;
+            let agent_plugin = is_agent_plugin(&active)?;
+            resources.push(active);
+            let data = if agent_plugin {
+                use sha2::{Digest, Sha256};
+                let mut identity = Sha256::new();
+                identity.update(market.as_bytes());
+                identity.update([0]);
+                identity.update(plugin.as_bytes());
+                manifest
+                    .codex_home
+                    .join("plugins/data/agent-plugins")
+                    .join(format!("{:x}", identity.finalize()))
+            } else {
+                manifest
+                    .codex_home
+                    .join("plugins/data")
+                    .join(format!("{plugin}-{market}"))
+            };
             if exists(&data)? {
                 resources.push(data);
             }
@@ -621,6 +635,44 @@ fn active_plugin_version(cache: &Path) -> Result<PathBuf, &'static str> {
             "Codex selected installed plugin has no active version; repair installation and retry",
         )?;
     Ok(cache.join(selected))
+}
+fn is_agent_plugin(active: &Path) -> Result<bool, &'static str> {
+    use std::io::Read;
+    let path = active.join("plugin.json");
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => {
+            return Err(
+                "Codex active plugin manifest is inaccessible; repair installation and retry",
+            )
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("Codex active root plugin manifest must be a physical regular file; repair installation and retry");
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| "Codex active plugin manifest is unreadable; repair installation and retry")?
+        .take(MAX_SOURCE_VIEW_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Codex active plugin manifest read failed; repair installation and retry")?;
+    if bytes.len() as u64 > MAX_SOURCE_VIEW_BYTES {
+        return Err("Codex active plugin manifest source view exceeded");
+    }
+    // Unrelated root JSON uses the native ordered Legacy manifest fallback.
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    let schema = value
+        .as_ref()
+        .and_then(|value| value.get("$schema"))
+        .and_then(serde_json::Value::as_str);
+    match schema {
+        Some("https://agent-plugins.org/schemas/1.0.0/plugin.schema.json") => Ok(true),
+        Some(schema) if schema.starts_with("https://agent-plugins.org/schemas/") => {
+            Err("Codex active AgentPlugin schema is unsupported; repair installation and retry")
+        }
+        _ => Ok(false),
+    }
 }
 fn exists(path: &Path) -> Result<bool, &'static str> {
     match std::fs::symlink_metadata(path) {
@@ -864,6 +916,207 @@ mod tests {
                 std::fs::remove_dir_all(cache.join(expected)).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn managed_provider_codex_agent_plugin_data_keeps_hashed_native_identity() {
+        use freshell_platform::{
+            codex_inputs::CodexInputManifest,
+            provider_environment::{copy_environment, CopyLimits, CopySelection},
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let codex_home = home.join(".codex");
+        let plugin = codex_home.join("plugins/cache/fixture/probe/local");
+        let data = codex_home
+            .join("plugins/data/agent-plugins")
+            .join(format!("{:x}", Sha256::digest(b"fixture\0probe")));
+        std::fs::create_dir_all(plugin.join("scripts/node_modules/probe-dependency")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[plugins.\"probe@fixture\"]\n",
+        )
+        .unwrap();
+        std::fs::write(plugin.join("plugin.json"), r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"probe"}"#).unwrap();
+        std::fs::write(
+            plugin.join("scripts/node_modules/probe-dependency/index.js"),
+            "module.exports='agent-plugin-dependency'",
+        )
+        .unwrap();
+        std::fs::write(plugin.join("scripts/probe.cjs"), "process.stdout.write(require('node:fs').readFileSync(process.argv[2])+'|'+require('probe-dependency'))").unwrap();
+        std::fs::write(data.join("nonce"), "hashed-data-resource").unwrap();
+        #[cfg(unix)]
+        {
+            let unselected = codex_home.join("plugins/data/probe-fixture");
+            std::fs::create_dir_all(&unselected).unwrap();
+            std::os::unix::fs::symlink(
+                "absent-unselected-target",
+                unselected.join("unselected-resource"),
+            )
+            .unwrap();
+        }
+        let found = discover(CodexInputManifest {
+            version: 1,
+            original_home: home,
+            cwd,
+            codex_home: codex_home.clone(),
+            named_profile: None,
+        })
+        .unwrap();
+        let stage = owned.path().join("stage");
+        let selections = found
+            .resource_roots
+            .iter()
+            .filter(|root| root.starts_with(codex_home.join("plugins")))
+            .map(|root| CopySelection {
+                source: root.clone(),
+                destination_relative: root.strip_prefix(&codex_home).unwrap().into(),
+            })
+            .collect::<Vec<_>>();
+        copy_environment(&selections, &stage, &[], CopyLimits::default()).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(
+                stage
+                    .join(plugin.strip_prefix(&codex_home).unwrap())
+                    .join("scripts/probe.cjs"),
+            )
+            .arg(
+                stage
+                    .join(data.strip_prefix(&codex_home).unwrap())
+                    .join("nonce"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "selected native AgentPlugin data must survive source transport"
+        );
+        assert_eq!(
+            output.stdout,
+            b"hashed-data-resource|agent-plugin-dependency"
+        );
+        assert_eq!(
+            std::fs::read(data.join("nonce")).unwrap(),
+            b"hashed-data-resource"
+        );
+    }
+
+    #[test]
+    fn managed_provider_codex_legacy_data_is_selected_by_native_manifest_family() {
+        use freshell_platform::{
+            codex_inputs::CodexInputManifest,
+            provider_environment::{copy_environment, CopyLimits, CopySelection},
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let codex_home = home.join(".codex");
+        let plugin = codex_home.join("plugins/cache/fixture/probe/local");
+        let named = codex_home.join("plugins/data/probe-fixture");
+        let hashed = codex_home
+            .join("plugins/data/agent-plugins")
+            .join(format!("{:x}", Sha256::digest(b"fixture\0probe")));
+        for directory in [
+            plugin.join(".claude-plugin"),
+            plugin.join("scripts/node_modules/probe-dependency"),
+            named.clone(),
+            hashed.clone(),
+            cwd.clone(),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[plugins.\"probe@fixture\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            plugin.join(".claude-plugin/plugin.json"),
+            r#"{"name":"probe"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin.join("scripts/node_modules/probe-dependency/index.js"),
+            "module.exports='legacy-dependency'",
+        )
+        .unwrap();
+        std::fs::write(plugin.join("scripts/probe.cjs"), "process.stdout.write(require('node:fs').readFileSync(process.argv[2])+'|'+require('probe-dependency'))").unwrap();
+        std::fs::write(named.join("nonce"), "native-named-data").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "absent-unselected-target",
+            hashed.join("unselected-resource"),
+        )
+        .unwrap();
+        for (index, unrelated) in [
+            r#"{"name":"unrelated"}"#,
+            "malformed-json",
+            r#"{"$schema":"https://unrelated.invalid/schema"}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            std::fs::write(plugin.join("plugin.json"), unrelated).unwrap();
+            let found = discover(CodexInputManifest {
+                version: 1,
+                original_home: home.clone(),
+                cwd: cwd.clone(),
+                codex_home: codex_home.clone(),
+                named_profile: None,
+            })
+            .unwrap();
+            let stage = owned.path().join(format!("legacy-stage-{index}"));
+            let selections = found
+                .resource_roots
+                .iter()
+                .filter(|root| root.starts_with(codex_home.join("plugins")))
+                .map(|root| CopySelection {
+                    source: root.clone(),
+                    destination_relative: root.strip_prefix(&codex_home).unwrap().into(),
+                })
+                .collect::<Vec<_>>();
+            copy_environment(&selections, &stage, &[], CopyLimits::default()).unwrap();
+            let output = std::process::Command::new("node")
+                .arg(
+                    stage
+                        .join(plugin.strip_prefix(&codex_home).unwrap())
+                        .join("scripts/probe.cjs"),
+                )
+                .arg(
+                    stage
+                        .join(named.strip_prefix(&codex_home).unwrap())
+                        .join("nonce"),
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"native-named-data|legacy-dependency");
+        }
+        std::fs::write(
+            plugin.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/2.0.0/PRIVATE_UNSUPPORTED_SCHEMA"}"#,
+        )
+        .unwrap();
+        let error = discover(CodexInputManifest {
+            version: 1,
+            original_home: home,
+            cwd,
+            codex_home,
+            named_profile: None,
+        })
+        .err()
+        .expect(
+            "unsupported active AgentPlugin schema must not fall back to valid Legacy manifest",
+        );
+        assert!(error.contains("schema"));
+        assert!(!error.contains("PRIVATE_UNSUPPORTED_SCHEMA"));
+        assert_eq!(
+            std::fs::read(named.join("nonce")).unwrap(),
+            b"native-named-data"
+        );
     }
 
     #[test]
