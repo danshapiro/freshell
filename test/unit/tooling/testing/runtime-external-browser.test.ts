@@ -1942,6 +1942,61 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('reads qualification native assistant message IDs on the exact owner root without returning bodies', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-qualification-message-ids-'))
+    const filename = path.join(directory, 'opencode.db')
+    const db = new DatabaseSync(filename)
+    try {
+      const { owned, context, inventory, request } = fixture()
+      Object.assign(owned.runtime, { phase: 5 })
+      const row = { soulId: 'ids-soul', incarnationId: 'ids-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'ids-boot', nativeSessionId: 'ses_ids', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+      db.exec('CREATE TABLE session(id TEXT); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT)')
+      db.prepare('INSERT INTO session VALUES (?)').run(row.nativeSessionId)
+      const insert = (id: string, order: number) => {
+        db.prepare('INSERT INTO message VALUES (?,?,?,?)').run(id, row.nativeSessionId, order,
+          JSON.stringify({ role: 'assistant', time: { completed: order }, providerID: 'openai', modelID: 'gpt-5.6-luna' }))
+        db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run(`part_${id}`, row.nativeSessionId, id, order,
+          JSON.stringify({ type: 'text', text: 'private native response body' }))
+      }
+      insert('msg_second', 2); insert('msg_first', 1)
+      const read = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (_id, args) => {
+        const child = spawnSync(process.execPath, [...args.slice(1, -2), filename, args[args.length - 1]], { encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('private native ID probe failed')
+        return child.stdout
+      })
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const wire: unknown[] = []
+      const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      const handle = rig.exactRuntimeHandle(row)
+      await expect(rig.openCodeQualificationAssistantMessageIds(handle)).resolves.toEqual(['msg_first', 'msg_second'])
+      insert('msg_third', 3)
+      await expect(rig.openCodeQualificationAssistantMessageIds(handle)).resolves.toEqual(['msg_first', 'msg_second', 'msg_third'])
+      expect(JSON.stringify(wire)).not.toContain('private')
+      expect(JSON.stringify(wire)).not.toContain('resolvedModel')
+      read.mockResolvedValueOnce(JSON.stringify({ schemaVersion: 1, nativeSessionId: row.nativeSessionId, turns: [{ messageId: '' }] }))
+      await expect(owned.openCodeQualificationAssistantMessageIds(handle)).rejects.toThrow()
+      read.mockResolvedValueOnce(JSON.stringify({ schemaVersion: 1, nativeSessionId: 'ses_foreign', turns: [{ messageId: 'msg_fake' }] }))
+      await expect(owned.openCodeQualificationAssistantMessageIds(handle)).rejects.toThrow()
+      read.mockClear()
+      inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement' }])
+      await expect(owned.openCodeQualificationAssistantMessageIds(handle)).rejects.toThrow(/current/)
+      await expect(control({ ...request, action: 'opencode-qualification-message-ids', handle, sql: 'arbitrary' })).rejects.toThrow(/operation/)
+      expect(read).not.toHaveBeenCalled()
+      inventory.mockResolvedValue([{ ...row, provider: 'claude' }])
+      await expect(owned.openCodeQualificationAssistantMessageIds(handle)).rejects.toThrow(/OpenCode/)
+      Object.assign(owned.runtime, { phase: 2 })
+      await expect(owned.openCodeQualificationAssistantMessageIds(handle)).rejects.toThrow(/Phase 5/)
+    } finally { db.close(); await fsp.rm(directory, { recursive: true, force: true }) }
+  })
   it('counts only the fixed qualification notices at the current epoch without returning notice bodies', async () => {
     const { owned, context, request } = fixture()
     Object.assign(owned.runtime, { phase: 5 })

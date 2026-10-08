@@ -982,6 +982,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'opencode-replacement-readiness',
     'opencode-qualification-second-view',
     'opencode-qualification-notice-count',
+    'opencode-qualification-message-ids',
     'terminal-continuity-receipt',
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
@@ -3691,6 +3692,16 @@ export class ManagedRuntimeOwner {
     return OpencodeReplacementReadinessSchema.parse({ incarnationId: output.incarnationId, streamEpoch: output.streamEpoch,
       terminalId: output.terminalId, exited: output.exited, headSeq: output.headSeq,
       sourceReady: openCodeTerminalReady(sourceText, ['GPT-5.6 Luna', P2_OPENCODE_MODEL]) })
+  }
+  async openCodeQualificationAssistantMessageIds(handle: ExactRuntimeHandle): Promise<string[]> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    await this.assertCurrentHandle(handle)
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
+      '/home/freshell/provider/.local/share/opencode/opencode.db', handle.nativeSessionId])
+    const history = z.object({ schemaVersion: z.literal(1), nativeSessionId: z.literal(handle.nativeSessionId),
+      turns: z.array(z.object({ messageId: z.string().min(1) }).passthrough()) }).passthrough().parse(JSON.parse(raw))
+    return history.turns.map(turn => turn.messageId)
   }
   async openCodeQualificationNoticeCount(): Promise<number> {
     if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')

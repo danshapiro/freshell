@@ -529,10 +529,8 @@ test.describe.serial('OpenCode provider qualification', () => {
         page, harness, rig, tabId, first.paneId, afterHostCrash, beforeHostCrashStreamId,
         observedStreamChanges, observedWebSocketFrameTypes, observedWebSocketCount,
       )
-      const beforeRecall = new Set((await nativeAssistantTurns(rig, afterHostCrash, nativeSessionId)).map((turn) => {
-        if (!turn.messageId) throw new Error('native assistant turn has no message identity')
-        return turn.messageId
-      }))
+      const beforeRecall = new Set(await rig.openCodeQualificationAssistantMessageIds(
+        rig.exactRuntimeHandle({ ...afterHostCrash, nativeSessionId })))
       await executeInPane(page, first.paneId,
         'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
       const recalledAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterHostCrash, nativeSessionId, beforeRecall, nonce)
@@ -568,10 +566,8 @@ test.describe.serial('OpenCode provider qualification', () => {
         page, harness, rig, tabId, first.paneId, afterProviderCrash, beforeProviderCrashStreamId,
         observedStreamChanges, observedWebSocketFrameTypes, observedWebSocketCount,
       )
-      const beforeProviderFollowup = new Set((await nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId)).map((turn) => {
-        if (!turn.messageId) throw new Error('native assistant turn has no message identity')
-        return turn.messageId
-      }))
+      const beforeProviderFollowup = new Set(await rig.openCodeQualificationAssistantMessageIds(
+        rig.exactRuntimeHandle({ ...afterProviderCrash, nativeSessionId })))
       await executeInPane(page, first.paneId,
         'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
       const providerAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup, nonce)

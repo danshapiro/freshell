@@ -927,6 +927,9 @@ export class ExternalManagedRuntimeRig {
   async openCodeQualificationNoticeCount(): Promise<number> {
     return this.rpc('opencode-qualification-notice-count', z.number().int().nonnegative())
   }
+  async openCodeQualificationAssistantMessageIds(handle: ExactRuntimeHandle): Promise<string[]> {
+    return this.rpc('opencode-qualification-message-ids', z.array(z.string().min(1)), { handle })
+  }
   async openCodeContinuityFirstTurnCompleted(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
     return this.rpc('opencode-continuity-first-turn', z.boolean(), { enclosure })
   }
@@ -1320,6 +1323,9 @@ export function createExternalRuntimeControl(
         break
       case 'opencode-qualification-notice-count':
         result = await owner.openCodeQualificationNoticeCount()
+        break
+      case 'opencode-qualification-message-ids':
+        result = await owner.openCodeQualificationAssistantMessageIds(handle())
         break
       case 'opencode-continuity-effect-count':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
