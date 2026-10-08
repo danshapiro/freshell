@@ -184,7 +184,27 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
         spec: &CreateRuntimeSpec,
     ) -> Result<BackendCreated, BackendError> {
         self.authorize(spec).await?;
-        self.real.create_stopped(spec).await
+        let created = self.real.create_stopped(spec).await?;
+        if std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_SOURCE_GUARD").as_deref()
+            == Ok("changed-git")
+        {
+            let (route, cwd) = if let Some(terminal) = &spec.terminal {
+                ("terminal", terminal.cwd.as_str())
+            } else {
+                ("fresh", spec.fresh_agent.as_ref().unwrap().cwd.as_str())
+            };
+            // Native discovery recognizes the closest filesystem Git marker.
+            // Introduce a closer root only after accepted-source observation
+            // and mount validation. All original files and declared workspace
+            // and common-directory mount paths remain untouched.
+            std::fs::create_dir(Path::new(cwd).join(".git")).unwrap();
+            std::fs::write(
+                self.handoff.join(format!("source-guard-{route}.state")),
+                spec.runtime_dir.to_str().unwrap(),
+            )
+            .unwrap();
+        }
+        Ok(created)
     }
     async fn start_host(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
         self.real.start_host(handle).await
@@ -250,6 +270,7 @@ fn capture_fresh_launch_failure_classes() -> std::sync::Arc<std::sync::Mutex<Vec
                     }
                     let text = format!("{value:?}");
                     for label in [
+                        "Claude native source selection changed",
                         "HostUnreachable",
                         "InvalidRequest",
                         "ProviderInputsChanged",
@@ -905,7 +926,12 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
     std::os::unix::fs::symlink(&flag_settings, &flag_alias).unwrap();
     let settings_form = std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_SETTINGS_FORM")
         .unwrap_or_else(|_| "file".into());
+    let source_guard = std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_SOURCE_GUARD")
+        .unwrap_or_else(|_| "unchanged".into());
+    assert!(matches!(source_guard.as_str(), "unchanged" | "changed-git"));
+    let changed_git = source_guard == "changed-git";
     let flag_argument = match settings_form.as_str() {
+        "file" if changed_git => flag_alias.to_str().unwrap().into(),
         "file" => "../source-home/selected-config/selected-settings.json".into(),
         "inline" => String::from_utf8(flag_bytes.clone()).unwrap(),
         "owned-last" => freshell_platform::cli_launch::claude_settings_json(
@@ -1134,7 +1160,14 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
     )
     .await;
-    let cwd = workspace.to_str().unwrap().to_string();
+    let cwd = if changed_git {
+        workspace.join("source-observer/nested")
+    } else {
+        workspace.clone()
+    }
+    .to_str()
+    .unwrap()
+    .to_string();
     let ambient_home = fixture.join("ambient-home");
     std::fs::create_dir_all(ambient_home.join(".claude")).unwrap();
     std::fs::write(
@@ -1150,7 +1183,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
                 args: vec![
                     "--init-only".into(),
                     "--setting-sources".into(),
-                    "user".into(),
+                    if changed_git { "user,local" } else { "user" }.into(),
                     // Native chooses the last selector. Neither an unavailable
                     // earlier file nor its private inline document is selected.
                     "--settings".into(),
@@ -1168,7 +1201,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
             },
             env: BTreeMap::from([
                 ("HOME".into(), home.to_str().unwrap().into()),
-                ("CLAUDE_CONFIG_DIR".into(), "../source-home/selected-config".into()),
+                ("CLAUDE_CONFIG_DIR".into(), if changed_git { selected_config.to_str().unwrap().into() } else { "../source-home/selected-config".into() }),
             ]),
             terminal_id: "closed-native-terminal".into(),
             stream_id: "closed-native-stream".into(),
@@ -1182,8 +1215,101 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
             view_pane_id: None,
             create_request_id: Some("closed-native-terminal-create".into()),
         })
+        .await;
+    if changed_git {
+        let error = terminal.expect_err("actual final source mismatch must block terminal startup");
+        println!(
+            "provider_source_guard_diagnostic {}",
+            json!({"selectionChanged":error.contains("Claude native source selection changed"),"commonDir":error.contains("git common dir"),"hostUnreachable":error.contains("host") })
+        );
+        assert!(
+            error.contains("Claude native source selection changed"),
+            "final native source mismatch must be the cause, not a fixture or preparation failure"
+        );
+        fn unconsumed_host(handoff: &Path, route: &str, receipt: &Path) {
+            let runtime =
+                std::fs::read_to_string(handoff.join(format!("source-guard-{route}.state")))
+                    .unwrap();
+            let state: Value = serde_json::from_slice(
+                &std::fs::read(Path::new(&runtime).join("host-state.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(state["grantId"].is_null());
+            assert!(state["workerPid"].is_null());
+            assert_eq!(state["workerLaunchCount"], json!(0));
+            assert!(!receipt.exists(), "no native startup consumer may execute");
+            println!(
+                "provider_source_guard {}",
+                json!({"provider":"claude","route":route,"grantUnconsumed":true,"workerLaunchCount":0,"nativeNotStarted":true})
+            );
+        }
+        let handoff = fixture.join("handoff");
+        unconsumed_host(&handoff, "terminal", &receipt);
+        std::fs::remove_dir(Path::new(&cwd).join(".git")).unwrap();
+        // These owned terminal-only decoys are outside the fresh route's
+        // intended selection; remove them exactly as in the positive case.
+        std::fs::remove_file(&disabled_project_memory).unwrap();
+        std::fs::remove_file(&disabled_project_settings).unwrap();
+        let (broadcast, _) = tokio::sync::broadcast::channel(256);
+        let mut events = broadcast.subscribe();
+        std::env::set_var("HOME", &home);
+        let proxy = crate::fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
+            Some(client.clone()),
+            Arc::new(broadcast),
+        )
+        .unwrap()
+        .unwrap();
+        let flavor = std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_FLAVOR").unwrap();
+        let source_provider = if flavor == "kilroy" {
+            "kilroy"
+        } else {
+            "claude"
+        };
+        qualify_private_source_reader(
+            &client,
+            SoulId::parse(format!(
+                "soul-fresh-{source_provider}-{}",
+                &format!("{:x}", Sha256::digest(b"closed-native-fresh-create"))[..32]
+            ))
+            .unwrap(),
+            source_provider,
+            "closed-native-fresh-create",
+            &workspace,
+            freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
+        )
+        .await;
+        Arc::clone(&proxy).dispatch(HostedFreshAgentCommand::Create(serde_json::from_value(json!({"requestId":"closed-native-fresh-create","sessionType":flavor,"provider":"claude","cwd":cwd,"plugins":[plugin.to_str().unwrap()]})).unwrap())).await;
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                let frame: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
+                assert_ne!(frame["type"], json!("freshAgent.created"));
+                if frame["type"] == "freshAgent.create.failed" {
+                    break;
+                }
+            }
+        })
         .await
-        .expect("complete native Claude terminal startup");
+        .unwrap();
+        assert!(
+            failure_classes
+                .lock()
+                .unwrap()
+                .contains(&"Claude native source selection changed"),
+            "fresh failure must come from the actual final native source selection check"
+        );
+        unconsumed_host(&handoff, "fresh", &receipt);
+        std::fs::remove_dir(Path::new(&cwd).join(".git")).unwrap();
+        assert_eq!(std::fs::read(&flag_settings).unwrap(), flag_bytes);
+        assert_eq!(std::fs::read_link(&flag_alias).unwrap(), flag_settings);
+        assert!(!flag_receipt.exists());
+        assert!(!instructions_receipt.exists());
+        web_task.abort();
+        control_task.abort();
+        assert!(web_task.await.unwrap_err().is_cancelled());
+        assert!(control_task.await.unwrap_err().is_cancelled());
+        return;
+    }
+    let terminal = terminal.expect("complete native Claude terminal startup");
     async fn consumed(path: &Path) -> Option<Value> {
         tokio::time::timeout(Duration::from_secs(45), async {
             loop {

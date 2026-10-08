@@ -35,11 +35,14 @@ def main():
     parser.add_argument("--provider",choices=["opencode","codex","claude","amplifier"],default="opencode")
     parser.add_argument("--claude-flavor",choices=["freshclaude","kilroy"],default="freshclaude")
     parser.add_argument("--claude-settings-form",choices=["file","inline","owned-last"],default="file")
+    parser.add_argument("--claude-source-guard",choices=["unchanged","changed-git"],default="unchanged")
     args=parser.parse_args()
     if args.provider!="claude" and args.claude_flavor!="freshclaude":
         parser.error("the finite Claude flavor requires --provider claude")
     if args.provider!="claude" and args.claude_settings_form!="file":
         parser.error("the finite Claude settings form requires --provider claude")
+    if args.provider!="claude" and args.claude_source_guard!="unchanged":
+        parser.error("the finite Claude source guard requires --provider claude")
     selected_test={"opencode":TEST,"codex":CODEX_TEST,"claude":CLAUDE_TEST,"amplifier":AMPLIFIER_TEST}[args.provider]
     if args.provider=="claude": IMAGE=CLAUDE_IMAGE
     repo=Path(__file__).resolve().parents[2]
@@ -174,6 +177,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                    "--env",f"FRESHELL_PROVIDER_LAUNCH_INSTALLATION={installation}","--env",f"FRESHELL_PROVIDER_LAUNCH_RUN_ID={run}",
                    "--env",f"FRESHELL_PROVIDER_LAUNCH_CLAUDE_FLAVOR={args.claude_flavor}",
                    "--env",f"FRESHELL_PROVIDER_LAUNCH_CLAUDE_SETTINGS_FORM={args.claude_settings_form}",
+                   "--env",f"FRESHELL_PROVIDER_LAUNCH_CLAUDE_SOURCE_GUARD={args.claude_source_guard}",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE={root}/grants/environment.env",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE={root}/grants/auth.json",
                    "--env",f"FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE={root}/grants/ca.pem",
@@ -191,11 +195,17 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
             if args.provider=="claude":
                 receipt["claudeFlavor"]=args.claude_flavor
                 receipt["claudeSettingsForm"]=args.claude_settings_form
+                receipt["claudeSourceGuard"]=args.claude_source_guard
             receipt["consumedRoutes"]=[json.loads(line.split("provider_launch_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_launch_consumer " in line]
             print(outcome.stdout,end="",flush=True);print(outcome.stderr,end="",flush=True)
             expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")} if args.provider=="opencode" else ({(args.provider,"terminal")} if args.provider=="amplifier" else {(args.provider,"terminal"),(args.provider,"fresh")})
             observed_routes={(item.get("provider"),item.get("route")) for item in receipt["consumedRoutes"]}
-            if exit_code==0 and (len(receipt["consumedRoutes"])!=len(expected_routes) or observed_routes!=expected_routes or "test result: ok. 1 passed;" not in outcome.stdout):
+            route_mismatch=len(receipt["consumedRoutes"])!=len(expected_routes) or observed_routes!=expected_routes
+            if args.claude_source_guard=="changed-git":
+                receipt["blockedRoutes"]=[json.loads(line.split("provider_source_guard ",1)[1]) for line in outcome.stdout.splitlines() if "provider_source_guard " in line]
+                blocked={(item.get("provider"),item.get("route")) for item in receipt["blockedRoutes"]}
+                route_mismatch=bool(receipt["consumedRoutes"]) or len(receipt["blockedRoutes"])!=2 or blocked!={("claude","terminal"),("claude","fresh")} or any(item.get("grantUnconsumed") is not True or item.get("workerLaunchCount")!=0 or item.get("nativeNotStarted") is not True for item in receipt["blockedRoutes"])
+            if exit_code==0 and (route_mismatch or "test result: ok. 1 passed;" not in outcome.stdout):
                 receipt["exitCode"]=2;receipt["failureClass"]="native_startup_count_mismatch"
             (root/"broker-complete").write_text("ok")
             deadline=time.monotonic()+10
