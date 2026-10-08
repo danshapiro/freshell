@@ -2001,7 +2001,15 @@ fn refresh_provider_config_references(
     run_as_gid: u32,
 ) -> Result<(), String> {
     context.validate(provider).map_err(|error| error.message)?;
-    let stage = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let stage =
+        if run_as_uid == unsafe { libc::geteuid() } && run_as_gid == unsafe { libc::getegid() } {
+            tempfile::Builder::new()
+                .prefix(".freshell-provider-refresh-")
+                .tempdir_in(provider_home)
+        } else {
+            tempfile::tempdir()
+        }
+        .map_err(|error| error.to_string())?;
     let projection = stage.path().join("projection");
     std::fs::create_dir(&projection).map_err(|error| error.to_string())?;
     copy_provider_config_references_with_ownership(

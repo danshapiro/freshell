@@ -217,22 +217,24 @@ pub(crate) fn serve_stdio() -> Result<(), String> {
     exchange(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
 }
 
-fn project_candidate(
+fn candidate_projection_unavailable(operation: &'static str) -> String {
+    tracing::warn!(
+        event = "provider.inputs.candidate_projection.blocked",
+        provider = "claude",
+        stage = "candidate",
+        operation,
+        "Candidate ordinary projection unavailable"
+    );
+    format!("Claude candidate {operation} unavailable; retain inputs and reprepare")
+}
+
+fn validate_candidate_projection(
     request: &freshell_runtime_protocol::ClaudeCandidateProjectionRequest,
     stage: &std::path::Path,
     home: &std::path::Path,
     identity: (u32, u32),
 ) -> Result<(), String> {
-    let unavailable = |operation: &'static str| {
-        tracing::warn!(
-            event = "provider.inputs.candidate_projection.blocked",
-            provider = "claude",
-            stage = "candidate",
-            operation,
-            "Candidate ordinary projection unavailable"
-        );
-        format!("Claude candidate {operation} unavailable; retain inputs and reprepare")
-    };
+    let unavailable = candidate_projection_unavailable;
     request.validate().map_err(|_| unavailable("metadata"))?;
     let published = crate::provider_input_preparation::read_private(
         stage,
@@ -277,6 +279,15 @@ fn project_candidate(
     {
         return Err(unavailable("selection_binding"));
     }
+    Ok(())
+}
+
+fn refresh_candidate_projection(
+    request: &freshell_runtime_protocol::ClaudeCandidateProjectionRequest,
+    stage: &std::path::Path,
+    home: &std::path::Path,
+    identity: (u32, u32),
+) -> Result<(), String> {
     // Reuse the workload's selected copier and stale-leaf transaction. This
     // never resolves secrets, probes a provider, or reads original HOME again.
     crate::refresh_provider_config_references(
@@ -288,7 +299,18 @@ fn project_candidate(
         identity.0,
         identity.1,
     )
-    .map_err(|_| unavailable("ordinary_refresh"))
+    .map_err(|_| candidate_projection_unavailable("ordinary_refresh"))
+}
+
+#[cfg(test)]
+fn project_candidate(
+    request: &freshell_runtime_protocol::ClaudeCandidateProjectionRequest,
+    stage: &std::path::Path,
+    home: &std::path::Path,
+    identity: (u32, u32),
+) -> Result<(), String> {
+    validate_candidate_projection(request, stage, home, identity)?;
+    refresh_candidate_projection(request, stage, home, identity)
 }
 
 fn read_candidate_request(
@@ -390,7 +412,7 @@ pub(crate) fn serve_candidate_private() -> Result<(), String> {
     let raw =
         freshell_runtime_protocol::bounded_json_bytes(&request.source_request, MAX_REQUEST_BYTES)
             .map_err(|_| "Claude candidate source request exceeds metadata profile")?;
-    project_candidate(
+    validate_candidate_projection(
         &request,
         Path::new("/run/freshell-candidate-inputs"),
         home,
@@ -405,6 +427,15 @@ pub(crate) fn serve_candidate_private() -> Result<(), String> {
         return Err("Claude candidate provider identity transition unavailable".into());
     }
     crate::verify_private_helper_namespace(home, socket).map_err(|_| unavailable())?;
+    // Private publication is validated by the fixed host above. Ordinary
+    // projection now runs as the same provider identity that will read it,
+    // using its owned disk transaction instead of read-only ambient /tmp.
+    refresh_candidate_projection(
+        &request,
+        Path::new("/run/freshell-candidate-inputs"),
+        home,
+        (65534, 0),
+    )?;
     if request.source_request.native_source_runtime
         == freshell_platform::claude_inputs::NativeSourceRuntime::Terminal
     {
@@ -757,10 +788,32 @@ mod tests {
                     b"PRIVATE_RETAINED_AUTH_SENTINEL"
                 );
             }
-            project_candidate(&request, &stage, &home, unsafe {
+            // A private subprocess changes only its own ambient temporary
+            // root. The selected frozen inputs and provider disk stay usable.
+            let blocked_ambient_temp =
+                std::env::var_os("FRESHELL_TEST_CANDIDATE_DISK_TEMP").is_some();
+            let previous_temp = std::env::var_os("TMPDIR");
+            if blocked_ambient_temp {
+                std::env::set_var("TMPDIR", &retained_auth);
+            }
+            let projection_result = project_candidate(&request, &stage, &home, unsafe {
                 (libc::geteuid(), libc::getegid())
-            })
-            .unwrap();
+            });
+            if blocked_ambient_temp {
+                match previous_temp {
+                    Some(value) => std::env::set_var("TMPDIR", value),
+                    None => std::env::remove_var("TMPDIR"),
+                }
+            }
+            projection_result.expect("frozen ordinary projection must use provider disk even when ambient temporary storage is unavailable");
+            assert!(
+                std::fs::read_dir(&home).unwrap().all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".freshell-provider-refresh-")),
+                "owned disk transaction must be removed before accepting projection"
+            );
             let output = std::process::Command::new("node")
                 .arg(home.join(".freshell/provider-roots/unit-0/consumer.cjs"))
                 .arg(home.join(".claude/settings.json"))
@@ -787,6 +840,19 @@ mod tests {
                 "pure candidate projection must not rescan frozen original HOME"
             );
         }
+    }
+
+    #[test]
+    fn claude_candidate_projection_uses_provider_disk_without_ambient_temporary_storage() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "claude_source_observation::tests::claude_candidate_projection_runs_selected_dependency_and_frozen_config_consumer", "--nocapture", "--test-threads=1"])
+            .env("FRESHELL_TEST_CANDIDATE_DISK_TEMP", "1")
+            .status()
+            .unwrap();
+        assert!(
+            result.success(),
+            "the isolated frozen consumer must succeed with ambient temporary storage unavailable"
+        );
     }
 
     struct ReaderCase {
