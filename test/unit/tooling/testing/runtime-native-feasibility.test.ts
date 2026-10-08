@@ -10,7 +10,7 @@ import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
-  amplifierNativeAckFileFault, amplifierNativeHostStatus, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
+  amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
 const candidateSha = 'b'.repeat(40)
@@ -118,11 +118,63 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(fs.readFileSync(target)).toEqual(bytes)
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['exact-resume', 'native-followup'])('requires the owned controller before Amplifier %s can seed', async (caseId) => {
+  it.each(['exact-resume', 'native-followup', 'old-writer'])('requires the owned controller before Amplifier %s can seed', async (caseId) => {
     const start = vi.fn()
     await expect(executeManagedNativeCase({ startSupervisor: start } as unknown as RuntimeHarness, [],
       { provider: 'amplifier', case: 'startup' }, caseId)).rejects.toThrow('actual terminal recovery requires the owned real server artifact')
     expect(start).not.toHaveBeenCalled()
+  })
+  it.each(['valid', 'no-native-record', 'wrong-current-nonce', 'wrong-current-incarnation', 'wrong-current-revision', 'wrong-previous-signal',
+    'current-signal-binding', 'wrong-native-root', 'wrong-source-inode', 'wrong-source-eof', 'wrong-producer', 'wrong-cli', 'wrong-uid', 'wrong-cwd',
+    'not-blocked', 'empty-inventory', 'running', 'published', 'admitted-input', 'wrong-previous-incarnation', 'wrong-previous-root',
+    'wrong-native-parent', 'wrong-message-count', 'wrong-signal-bytes'])('requires actual stale native writer refusal and original file conservation (%s)', async (form) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-stale-writer-'))
+    const root = randomUUID(), prior = { incarnationId: 'old-incarnation', launchNonce: 'old-nonce', evidenceRevision: 0, executionGeneration: 1, requestedNativeSessionId: root }
+    const current = { ...prior, incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 1 }
+    const previousSignal = { launch: prior, native: { session_id: root, parent_id: null } }
+    const bytes = JSON.stringify(previousSignal), sha = createHash('sha256').update(bytes).digest('hex')
+    fs.writeFileSync(path.join(workspace, 'prior-native-signal.json'), bytes)
+    const faultImage = { originalCliSha256: 'a'.repeat(64), producerSha256: 'b'.repeat(64) }
+    const load = { sessionId: root, parentId: null, messageCount: 2, transcript: { device: 2, inode: 7, size: 22, eofSha256: 'c'.repeat(64) } }
+    const fault: any = { event: 'test.amplifier.native_startup_fault.applied', severity: 'warning', fault: 'old-writer', phase: 'before-stale-native-publication',
+      launch: current, previousLaunch: prior, previousSignalSha256: sha, originalLoad: load, nativePid: process.pid, uid: 65534, gid: 0,
+      caps: '0000000000000000', readOnlyRoot: true, nativeCwd: workspace, ...faultImage }
+    const publication: any = { currentLaunch: current, nativeSignal: { launch: prior, native: { session_id: root, parent_id: null, source: 'resume',
+      producer_sha256: faultImage.producerSha256, load, acceptedMessageCount: 3 } } }
+    publication.signalText = JSON.stringify(publication.nativeSignal)
+    publication.signalSha256 = createHash('sha256').update(publication.signalText).digest('hex')
+    if (form === 'wrong-previous-incarnation') previousSignal.launch = { ...prior, incarnationId: 'foreign-prior-incarnation' }
+    if (form === 'wrong-previous-root') previousSignal.native.session_id = randomUUID()
+    if (form === 'wrong-current-nonce') fault.launch = { ...current, launchNonce: 'foreign-nonce' }
+    if (form === 'wrong-current-incarnation') fault.launch = { ...current, incarnationId: 'foreign-incarnation' }
+    if (form === 'wrong-current-revision') fault.launch = { ...current, evidenceRevision: 0 }
+    if (form === 'wrong-previous-signal') fault.previousSignalSha256 = '0'.repeat(64)
+    if (form === 'current-signal-binding') publication.nativeSignal.launch = current
+    if (form === 'wrong-native-root') publication.nativeSignal.native.session_id = randomUUID()
+    if (form === 'wrong-source-inode') fault.originalLoad = { ...load, transcript: { ...load.transcript, inode: 8 } }
+    if (form === 'wrong-source-eof') fault.originalLoad = { ...load, transcript: { ...load.transcript, eofSha256: '0'.repeat(64) } }
+    if (form === 'wrong-producer') fault.producerSha256 = '0'.repeat(64)
+    if (form === 'wrong-cli') fault.originalCliSha256 = '0'.repeat(64)
+    if (form === 'wrong-uid') fault.uid = 0
+    if (form === 'wrong-cwd') fault.nativeCwd = '/foreign-workspace'
+    if (form === 'wrong-native-parent') publication.nativeSignal.native.parent_id = randomUUID()
+    if (form === 'wrong-message-count') publication.nativeSignal.native.acceptedMessageCount = 1
+    if (form === 'wrong-signal-bytes') publication.signalText = '{}'
+    if (form !== 'no-native-record') fs.writeFileSync(path.join(workspace, 'native-startup-fault.json'), JSON.stringify(fault))
+    fs.writeFileSync(path.join(workspace, 'native-stale-publication.json'), JSON.stringify(publication))
+    const records = new Map<string, unknown>(), input = vi.fn(async () => ({ result: form === 'admitted-input' ? { Ok: {} } : { Err: { code: 'RECOVERY_BLOCKED' } } }))
+    const harness = { writeArtifact: (name: string, value: unknown) => records.set(name, value), inventoryBody: () => ({ method: 'inventory' }), terminalInputBody: () => ({}),
+      adminRaw: input, adminOk: async () => ({ data: form === 'empty-inventory' ? [] : [{ soulId: 'owned-soul', launchState: form === 'running' ? 'running' : 'stopped',
+        nativeIdentityObservation: form === 'published' ? { incarnationId: current.incarnationId } : null }] }),
+      execOwnedContainerAsExact: async () => JSON.stringify(current) } as unknown as RuntimeHarness
+    try {
+      const result = completeAmplifierStaleWriter(harness, { containerId: 'owned-control' }, { scenario: 'amplifier-old-writer', workspace, nativeRoot: root,
+        previousView: { soulId: 'owned-soul', incarnationId: prior.incarnationId }, previousSignal,
+        seed: { transcript: { identity: ['2', '7', '22'], sha256: load.transcript.eofSha256 } },
+        recovery: { result: { Ok: { data: { outcome: form === 'not-blocked' ? 'replaced' : 'blocked' } } } }, faultImage })
+      if (form === 'valid') { const assertions = await result; expect(assertions.every(row => row.pass)).toBe(true); expect(assertions.length).toBeGreaterThan(2); expect(input).toHaveBeenCalledOnce() }
+      else { await expect(result).rejects.toThrow(form === 'no-native-record' ? 'ENOENT' : 'actual Amplifier stale writer'); if (form !== 'admitted-input') expect(input).not.toHaveBeenCalled() }
+    } finally { fs.rmSync(workspace, { recursive: true, force: true }) }
   })
   it('preserves selected Amplifier create profile and refuses a missing follow-up controller before workspace allocation', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-case-route-'))
@@ -413,6 +465,11 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         const native = JSON.parse(fs.readFileSync(path.join(directory, 'signals', 'amplifier-loaded-context.json'), 'utf8'))
         expect(native.launch).toEqual(previousLaunch); expect(native.native.session_id).toBe(root)
         expect(native.native.load.sessionId).toBe(root); expect(native.native.parent_id).toBeNull()
+        const publication = JSON.parse(fs.readFileSync(path.join(workspace, 'native-stale-publication.json'), 'utf8'))
+        expect(publication.currentLaunch).toEqual(launch)
+        expect(publication.nativeSignal).toEqual(native)
+        expect(publication.signalText).toBe(fs.readFileSync(path.join(directory, 'signals', 'amplifier-loaded-context.json'), 'utf8'))
+        expect(publication.signalSha256).toBe(createHash('sha256').update(fs.readFileSync(path.join(directory, 'signals', 'amplifier-loaded-context.json'))).digest('hex'))
       }
       if (fault === 'parent-root') {
         expect(observed.phase).toBe('before-native-load')

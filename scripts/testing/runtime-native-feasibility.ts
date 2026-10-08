@@ -388,7 +388,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
-  if (selection.provider === 'amplifier' && ['create', 'wrong-root', 'missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'file-replacement', 'file-truncation', 'malformed-ack', 'parent-root', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'amplifier' && ['create', 'wrong-root', 'missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'file-replacement', 'file-truncation', 'malformed-ack', 'parent-root', 'old-writer', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
     return executeManagedAmplifier(harness, sources, caseId, serverPath, servers)
   }
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
@@ -1443,6 +1443,10 @@ if owned:
    record('before-stale-native-publication',previousLaunch=old,originalLoad=witness,
     previousSignalSha256=hashlib.sha256(previous_raw).hexdigest())
    await freshell_native_resume._publish_initialized(session,config,(old,binding[1]))
+   raw=(binding[1]/'amplifier-loaded-context.json').read_bytes()
+   with (workspace/'native-stale-publication.json').open('x',encoding='utf8') as out:
+    json.dump({'currentLaunch':launch,'nativeSignal':json.loads(raw),'signalText':raw.decode('utf8'),'signalSha256':hashlib.sha256(raw).hexdigest()},out);out.write('\n')
+   (workspace/'native-stale-publication.json').chmod(0o660)
   freshell_native_resume.publish_initialized=stale_publish
  else:
   import time
@@ -1552,6 +1556,61 @@ print(json.dumps({'incarnationId':incarnation,'hostBootId':boot,'workerPid':data
  'nativeSessionId':data.get('native_session_id'),'nativeIdentityObservation':data.get('native_identity_observation')}))
 `
 
+export async function completeAmplifierStaleWriter(harness: RuntimeHarness, supervisor: any,
+  context: { scenario: string; workspace: string; nativeRoot: string; previousView: any; previousSignal: any; seed: any; recovery: any; faultImage: any }): Promise<{ name: string; pass: boolean }[]> {
+  const { scenario, workspace, nativeRoot, previousView, previousSignal, seed, recovery, faultImage } = context
+  const fault = JSON.parse(fs.readFileSync(path.join(workspace, 'native-startup-fault.json'), 'utf8'))
+  const publication = JSON.parse(fs.readFileSync(path.join(workspace, 'native-stale-publication.json'), 'utf8'))
+  const previousRaw = fs.readFileSync(path.join(workspace, 'prior-native-signal.json'))
+  harness.writeArtifact(`${scenario}-current-native-fault-private.json`, fault)
+  harness.writeArtifact(`${scenario}-stale-native-publication-private.json`, publication)
+  const launch = JSON.parse(await harness.execOwnedContainerAsExact(supervisor.containerId, '0:0',
+    ['python3', '-c', "import sqlite3,sys; c=sqlite3.connect('file:/var/lib/freshell-supervisor/runtime.sqlite3?mode=ro',uri=True); c.execute('PRAGMA query_only=ON'); row=c.execute('SELECT native_identity_launch FROM incarnations WHERE incarnation_id=?',(sys.argv[1],)).fetchone(); assert row and row[0]; print(row[0])", fault.launch.incarnationId]))
+  harness.writeArtifact(`${scenario}-current-persisted-native-launch.json`, launch)
+  const sameLaunch = (actual: any, expected: any) => actual?.incarnationId === expected.incarnationId && actual.launchNonce === expected.launchNonce
+    && actual.evidenceRevision === expected.evidenceRevision && actual.executionGeneration === expected.executionGeneration
+    && actual.requestedNativeSessionId === expected.requestedNativeSessionId
+  const prior = previousSignal.launch, native = publication.nativeSignal?.native
+  let parsedSignal: unknown
+  try { parsedSignal = JSON.parse(publication.signalText) } catch { /* Invalid native bytes cannot qualify. */ }
+  const currentNative = fault.event === 'test.amplifier.native_startup_fault.applied' && fault.severity === 'warning'
+    && fault.fault === 'old-writer' && fault.phase === 'before-stale-native-publication'
+    && sameLaunch(fault.launch, launch) && sameLaunch(publication.currentLaunch, launch)
+    && launch.requestedNativeSessionId === nativeRoot && launch.incarnationId !== previousView.incarnationId && launch.launchNonce !== prior.launchNonce
+    && prior.incarnationId === previousView.incarnationId && prior.requestedNativeSessionId === nativeRoot
+    && previousSignal.native.session_id === nativeRoot && previousSignal.native.parent_id === null
+    && launch.evidenceRevision > prior.evidenceRevision && sameLaunch(fault.previousLaunch, prior) && sameLaunch(publication.nativeSignal?.launch, prior)
+    && fault.previousSignalSha256 === createHash('sha256').update(previousRaw).digest('hex')
+    && sameLaunch(JSON.parse(previousRaw.toString('utf8')).launch, prior)
+    && native?.session_id === nativeRoot && native.parent_id === null && native.source === 'resume'
+    && native.producer_sha256 === faultImage.producerSha256
+    && Number.isSafeInteger(native.load?.messageCount) && native.load.messageCount > 0 && Number.isSafeInteger(native.acceptedMessageCount)
+    && native.acceptedMessageCount >= native.load.messageCount && native.acceptedMessageCount - native.load.messageCount <= 1
+    && typeof publication.signalText === 'string' && createHash('sha256').update(publication.signalText).digest('hex') === publication.signalSha256
+    && JSON.stringify(parsedSignal) === JSON.stringify(publication.nativeSignal)
+    && fault.uid === 65534 && fault.gid === 0 && fault.caps === '0000000000000000' && fault.readOnlyRoot
+    && fault.nativeCwd === workspace && Number.isSafeInteger(fault.nativePid) && fault.nativePid > 1
+    && fault.originalCliSha256 === faultImage.originalCliSha256 && fault.producerSha256 === faultImage.producerSha256
+  const source = fault.originalLoad?.transcript
+  const retained = Boolean(source && fault.originalLoad?.sessionId === nativeRoot && fault.originalLoad.parentId === null
+    && JSON.stringify(native?.load) === JSON.stringify(fault.originalLoad)
+    && [source.device, source.inode, source.size].every(Number.isSafeInteger)
+    && JSON.stringify([source.device, source.inode, source.size].map(String)) === JSON.stringify(seed.transcript.identity.slice(0, 3))
+    && source.eofSha256 === seed.transcript.sha256)
+  const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+  harness.writeArtifact(`${scenario}-stale-writer-current-inventory.json`, inventory)
+  const current = inventory.data.filter((row: any) => row.soulId === previousView.soulId)
+  const contained = recovery.result?.Ok?.data?.outcome === 'blocked' && current.length > 0
+    && current.every((row: any) => row.launchState !== 'running' && row.nativeIdentityObservation?.incarnationId !== launch.incarnationId)
+  if (!currentNative || !retained || !contained) throw new Error('actual Amplifier stale writer native binding, source or containment differs')
+  const input = await harness.adminRaw(supervisor, harness.terminalInputBody(previousView.soulId, 'Owned stale native writer input probe. Do not use tools.\r'))
+  harness.writeArtifact(`${scenario}-stale-writer-input-refusal.json`, input)
+  if (!input.result?.Err) throw new Error('actual Amplifier stale writer admitted ordinary input')
+  return [{ name: 'real-current-native-publisher-retains-actual-prior-launch', pass: currentNative },
+    { name: 'original-native-root-source-inode-full-eof-retained', pass: retained },
+    { name: 'stale-native-launch-blocks-running-observation-and-input', pass: contained && !!input.result.Err }]
+}
+
 async function executeManagedAmplifier(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath: string | undefined,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[]): Promise<NativeExperimentOriginal> {
@@ -1560,15 +1619,19 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
   const sourceFault = ['missing-history', 'load-failure', 'missing-context-restore', 'parent-root'].includes(caseId)
   const pendingFault = ['timeout', 'provider-exit', 'stop-cancellation'].includes(caseId)
   const ackFault = ['file-replacement', 'file-truncation', 'malformed-ack'].includes(caseId)
+  const staleWriter = caseId === 'old-writer'
+  const resumes = ['exact-resume', 'native-followup', 'current-native-turn', 'old-writer'].includes(caseId)
+  const followup = caseId === 'native-followup' || caseId === 'current-native-turn'
+  if (resumes && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   let faultImage: any
-  if (sourceFault || pendingFault) {
+  if (sourceFault || pendingFault || staleWriter) {
     const descriptor = sources.find(source => source.name === 'amplifier/native-fault/startup.json')
     if (!descriptor) throw new Error('actual owned Amplifier fault image descriptor missing')
     const raw = fs.readFileSync(descriptor.path)
     if (createHash('sha256').update(raw).digest('hex') !== descriptor.sha256) throw new Error('Amplifier fault image descriptor changed')
     faultImage = JSON.parse(raw.toString('utf8'))
-    const cases = ['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'parent-root']
-    const admittedLengths = caseId === 'parent-root' ? [7] : pendingFault ? [6, 7] : [3, 6, 7]
+    const cases = ['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'parent-root', 'old-writer']
+    const admittedLengths = staleWriter ? [8] : caseId === 'parent-root' ? [7, 8] : pendingFault ? [6, 7, 8] : [3, 6, 7, 8]
     if (faultImage.schemaVersion !== 1 || faultImage.imageDigest !== harness.imageRef
       || !/^[a-f0-9]{40}$/.test(faultImage.wrapperSourceSha)
       || !['wrapperSha256', 'originalCliSha256', 'producerSha256'].every(key => /^[a-f0-9]{64}$/.test(faultImage[key]))
@@ -1576,9 +1639,6 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
       throw new Error('actual owned Amplifier fault image binding differs')
     }
   }
-  const resumes = ['exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)
-  const followup = caseId === 'native-followup' || caseId === 'current-native-turn'
-  if (resumes && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   const grants = (['env_file', 'ca_file'] as const).map((suffix) => {
     const file = sources.find((source) => source.name === `amplifier/grants/${suffix}`)
     if (!file) throw new Error(`selected Amplifier ${suffix} reference missing`)
@@ -2009,10 +2069,22 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
     const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
     harness.writeArtifact(`${scenario}-turn-store-probe.json`, probe)
     if (probe.data.kind !== 'reattach_ready') throw new Error('completed Amplifier native store not readable before death')
+    if (staleWriter) {
+      const file = path.join(workspace, 'prior-native-signal.json')
+      fs.writeFileSync(file, fs.readFileSync(nativeSignalFile), { flag: 'wx', mode: 0o660 }); fs.chmodSync(file, 0o660)
+    }
     await harness.killOwnedRuntimeExact(view.containerId)
     await harness.waitForContainerExit(view.containerId)
-    const recovery = await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+    const recovery = staleWriter ? await harness.adminRaw(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+      : await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
     harness.writeArtifact(`${scenario}-turn-recovery.json`, recovery)
+    if (staleWriter) {
+      assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
+        ...await completeAmplifierStaleWriter(harness, supervisor, { scenario, workspace, nativeRoot, previousView: view,
+          previousSignal: signal, seed, recovery, faultImage }))
+      return finish(namespace, [`${scenario}-current-view.json`, `${scenario}-native-signal-original.json`, `${scenario}-turn-recovery.json`,
+        `${scenario}-current-native-fault-private.json`, `${scenario}-stale-native-publication-private.json`, `${scenario}-stale-writer-input-refusal.json`], assertions)
+    }
     const replacement = recovery.data.view
     if (recovery.data.outcome !== 'replaced' || replacement.incarnationId === view.incarnationId
       || replacement.nativeSessionId !== nativeRoot || replacement.recoveryState !== 'live'
