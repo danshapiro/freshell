@@ -591,7 +591,50 @@ cmd_run() {
       echo "[e2e-cloud] ERROR: exact managed browser image digest is unavailable." >&2
       exit 1
     fi
+    local managed_source_digest="$managed_browser_digest"
+    managed_browser_digest=$(node --input-type=module - "${IMAGE_REMOTE%:*}" "$managed_source_digest" "$GCP_ACCOUNT" <<'JS'
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+try {
+  const [repository, sourceDigest, account] = process.argv.slice(2)
+  if (!/^[a-z0-9-]+-docker\.pkg\.dev\/[a-z0-9-]+\/[a-z0-9_-]+\/[a-z0-9_-]+$/.test(repository)) throw new Error('repository')
+  const token = execFileSync('gcloud', ['auth', 'print-access-token', ...(account ? [`--account=${account}`] : [])], { encoding: 'utf8', timeout: 30_000 }).trim()
+  const imageTypes = ['application/vnd.oci.image.manifest.v1+json', 'application/vnd.docker.distribution.manifest.v2+json']
+  const indexTypes = ['application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json']
+  async function manifest(digest) {
+    if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error('digest')
+    const response = await fetch(`https://${repository.split('/')[0]}/v2/${repository.split('/').slice(1).join('/')}/manifests/${digest}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: [...indexTypes, ...imageTypes].join(', ') },
+      redirect: 'error', signal: AbortSignal.timeout(30_000),
+    })
+    if (!response.ok || response.headers.get('Docker-Content-Digest') !== digest) throw new Error('manifest response')
+    const raw = Buffer.from(await response.arrayBuffer())
+    if (raw.length > 2 * 1024 * 1024 || `sha256:${createHash('sha256').update(raw).digest('hex')}` !== digest) throw new Error('manifest content')
+    const document = JSON.parse(raw.toString('utf8'))
+    if (document.schemaVersion !== 2) throw new Error('manifest schema')
+    return document
+  }
+  const source = await manifest(sourceDigest)
+  let selectedDigest = sourceDigest
+  if (indexTypes.includes(source.mediaType)) {
+    if (!Array.isArray(source.manifests)) throw new Error('index')
+    const matches = source.manifests.filter(entry => entry.platform?.os === 'linux' && entry.platform?.architecture === 'amd64')
+    if (matches.length !== 1 || !imageTypes.includes(matches[0].mediaType)) throw new Error('platform')
+    selectedDigest = matches[0].digest
+    const selected = await manifest(selectedDigest)
+    if (!imageTypes.includes(selected.mediaType)) throw new Error('selected manifest')
+  } else if (!imageTypes.includes(source.mediaType)) throw new Error('manifest type')
+  console.log(selectedDigest)
+} catch {
+  console.error('[e2e-cloud] ERROR: exact candidate Linux amd64 image manifest could not be verified.')
+  process.exit(1)
+}
+JS
+    )
     IMAGE_REMOTE="${IMAGE_REMOTE%:*}@${managed_browser_digest}"
+    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+      --arg sourceImageDigest "$managed_source_digest" --arg imageDigest "$managed_browser_digest" \
+      '{severity:"info", event:"managed_external_image_resolved", runId:$runId, candidateSha:$candidateSha, sourceImageDigest:$sourceImageDigest, imageDigest:$imageDigest}'
   fi
 
   echo "[e2e-cloud] Running on Cloud Run Jobs..."

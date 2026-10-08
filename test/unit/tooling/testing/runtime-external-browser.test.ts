@@ -1455,7 +1455,9 @@ describe('closed Cloud metadata handoff', () => {
 })
 
 describe('actual Cloud launcher browser image binding', () => {
-  async function launch(external: boolean, digest: string, observedImage?: string, executionImage?: string) {
+  const imageManifest = { schemaVersion: 2, mediaType: 'application/vnd.oci.image.manifest.v1+json', config: {}, layers: [] }
+  const fixtureDigest = `sha256:${createHash('sha256').update(JSON.stringify(imageManifest)).digest('hex')}`
+  async function launch(external: boolean, digest: string, observedImage?: string, executionImage?: string, registryDocuments?: Record<string, unknown>) {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-cloud-image-'))
     try {
       const scripts = path.join(directory, 'scripts')
@@ -1477,11 +1479,22 @@ if(args.includes('describe')){const job=args.find(x=>x.startsWith('freshell-e2e-
 if(args.includes('execute')){const job=args.find(x=>x.startsWith('freshell-e2e-'));console.log('Execution ['+job+'-fixture] has failed.');process.exit(73)}
 process.exit(0);\n`
       for (const name of ['git', 'gcloud', 'pnpm']) await fsp.writeFile(path.join(bin, name), command, { mode: 0o700 })
+      const registryFixture = path.join(directory, 'registry-fixture.mjs')
+      await fsp.writeFile(registryFixture, `globalThis.fetch = async url => {
+        const fs = await import('node:fs');
+        fs.appendFileSync(process.env.TEST_CALLS,JSON.stringify({name:'registry',args:[String(url)]})+'\\n');
+        const documents = JSON.parse(process.env.TEST_REGISTRY_DOCUMENTS || '{}');
+        const digest = String(url).split('/').at(-1);
+        const document = documents[digest];
+        if (!document) throw new Error('unregistered manifest request');
+        return new Response(JSON.stringify(document), { headers: { 'Docker-Content-Digest': digest } });
+      };`)
+      await fsp.writeFile(path.join(bin, 'node'), `#!${process.execPath}\nconst fs=require('node:fs');const cp=require('node:child_process');const child=cp.spawnSync(process.execPath,['--import',${JSON.stringify(registryFixture)},...process.argv.slice(2)],{input:fs.readFileSync(0),encoding:'utf8',env:process.env});process.stdout.write(child.stdout||'');process.stderr.write(child.stderr||'');process.exit(child.status??1);\n`, { mode: 0o700 })
       const child = spawnSync('bash', [path.join(scripts, 'e2e-cloud.sh'), 'run', '--cloud'], {
         env: { ...process.env, ...descriptor, PATH: `${bin}${path.delimiter}${process.env.PATH}`,
           FRESHELL_GCP_ACCOUNT: 'owned-fixture@example.test', TEST_CALLS: calls,
           TEST_EXTERNAL: external ? '1' : '0', TEST_DIGEST: digest, TEST_OBSERVED_IMAGE: observedImage,
-          TEST_EXECUTION_IMAGE: executionImage },
+          TEST_EXECUTION_IMAGE: executionImage, TEST_REGISTRY_DOCUMENTS: JSON.stringify(registryDocuments ?? { [digest]: imageManifest }) },
         encoding: 'utf8', timeout: 20_000,
       })
       const operations = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { name: string; args: string[] })
@@ -1490,8 +1503,45 @@ process.exit(0);\n`
     } finally { await fsp.rm(directory, { recursive: true, force: true }) }
   }
 
+  it('pins the uniquely verified Linux amd64 manifest from the candidate index before create', async () => {
+    const childManifest = { schemaVersion: 2, mediaType: 'application/vnd.oci.image.manifest.v1+json', config: {}, layers: [] }
+    const childDigest = `sha256:${createHash('sha256').update(JSON.stringify(childManifest)).digest('hex')}`
+    const index = { schemaVersion: 2, mediaType: 'application/vnd.oci.image.index.v1+json', manifests: [
+      { digest: childDigest, mediaType: childManifest.mediaType, platform: { os: 'linux', architecture: 'amd64' } },
+      { digest: `sha256:${'c'.repeat(64)}`, platform: { os: 'unknown', architecture: 'unknown' } },
+    ] }
+    const digest = `sha256:${createHash('sha256').update(JSON.stringify(index)).digest('hex')}`
+    const result = await launch(true, digest, undefined, undefined, { [digest]: index, [childDigest]: childManifest })
+    const image = `us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e@${childDigest}`
+    expect(result.operations.find(row => row.args.includes('create'))?.args).toContain(`--image=${image}`)
+    expect(result.events.find(row => row.event === 'managed_external_job_execution')).toMatchObject({ image, imageDigest: childDigest })
+    expect(result.events.find(row => row.event === 'managed_external_image_resolved')).toMatchObject({ sourceImageDigest: digest, imageDigest: childDigest })
+    expect(result.operations.filter(row => row.name === 'registry').map(row => row.args[0])).toEqual([
+      `https://us-west1-docker.pkg.dev/v2/misc-puttering-project/freshell-e2e/freshell-e2e/manifests/${digest}`,
+      `https://us-west1-docker.pkg.dev/v2/misc-puttering-project/freshell-e2e/freshell-e2e/manifests/${childDigest}`,
+    ])
+  })
+
+  it.each(['missing-platform', 'ambiguous-platform', 'changed-child', 'unsupported-child', 'changed-source'])(
+    'refuses an unverifiable candidate manifest %s before creating or executing a job', async (failure) => {
+      const child = failure === 'unsupported-child' ? { ...imageManifest, mediaType: 'unsupported' } : imageManifest
+      const childDigest = `sha256:${createHash('sha256').update(JSON.stringify(child)).digest('hex')}`
+      const selected = { digest: childDigest, mediaType: imageManifest.mediaType, platform: { os: 'linux', architecture: 'amd64' } }
+      const index = { schemaVersion: 2, mediaType: 'application/vnd.oci.image.index.v1+json', manifests:
+        failure === 'missing-platform' ? [] : failure === 'ambiguous-platform' ? [selected, selected] : [selected] }
+      const digest = `sha256:${createHash('sha256').update(JSON.stringify(index)).digest('hex')}`
+      const result = await launch(true, digest, undefined, undefined, {
+        [digest]: failure === 'changed-source' ? { ...index, schemaVersion: 1 } : index,
+        [childDigest]: failure === 'changed-child' ? { ...child, layers: ['changed'] } : child,
+      })
+      expect(result.child.status).toBe(1)
+      expect(result.operations.some(row => row.args.includes('create') || row.args.includes('execute'))).toBe(false)
+      expect(result.events.some(row => row.event === 'managed_external_image_resolved')).toBe(false)
+      expect(result.child.stdout + result.child.stderr).not.toContain('fixture-token')
+    })
+
   it('pins the resolved digest before create and records the actual owned job image before execution', async () => {
-    const digest = `sha256:${'b'.repeat(64)}`
+    const digest = fixtureDigest
     const image = `us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e@${digest}`
     const result = await launch(true, digest)
     const create = result.operations.find(row => row.name === 'gcloud' && row.args.includes('create'))
@@ -1510,7 +1560,7 @@ process.exit(0);\n`
   })
 
   it('refuses a changed job image before execution and still runs owned cleanup', async () => {
-    const result = await launch(true, `sha256:${'b'.repeat(64)}`, 'foreign.example/image:latest')
+    const result = await launch(true, fixtureDigest, 'foreign.example/image:latest')
     expect(result.child.status).toBe(1)
     expect(result.operations.some(row => row.args.includes('execute'))).toBe(false)
     expect(result.events.some(row => row.event === 'managed_external_job_created')).toBe(false)
@@ -1518,28 +1568,29 @@ process.exit(0);\n`
   })
 
   it('refuses a changed execution image without certifying that execution', async () => {
-    const result = await launch(true, `sha256:${'b'.repeat(64)}`, undefined, 'foreign.example/image:latest')
+    const result = await launch(true, fixtureDigest, undefined, 'foreign.example/image:latest')
     expect(result.child.status).toBe(1)
     expect(result.operations.some(row => row.args.includes('execute'))).toBe(true)
     expect(result.events.some(row => row.event === 'managed_external_job_execution')).toBe(false)
     expect(result.events.find(row => row.event === 'managed_external_execution_image_refused')).toMatchObject({
       observedContainerCount: 1, observedImages: ['foreign.example/image:latest'],
-      expectedImage: `us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e@sha256:${'b'.repeat(64)}`,
+      expectedImage: `us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e@${fixtureDigest}`,
     })
     expect(result.events.find(row => row.event === 'managed_external_job_cleanup')).toMatchObject({ ok: true })
   })
 
   it('preserves ordinary Cloud tag selection without external image observations', async () => {
-    const result = await launch(false, `sha256:${'b'.repeat(64)}`)
+    const result = await launch(false, fixtureDigest)
     const create = result.operations.find(row => row.name === 'gcloud' && row.args.includes('create'))
     expect(create?.args).toContain('--image=us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e:aaaaaaaaaaaa')
     expect(result.operations.some(row => row.args.includes('--format=value(image_summary.digest)'))).toBe(false)
     expect(result.operations.some(row => row.args.includes('describe') && row.args.includes('jobs'))).toBe(false)
     expect(result.events).toEqual([])
+    expect(result.operations.some(row => row.name === 'registry')).toBe(false)
     expect(result.child.status).toBe(1)
   })
   it('omits a malformed image value from refusal diagnostics and still cleans its owned job', async () => {
-    const result = await launch(true, `sha256:${'b'.repeat(64)}`, undefined, 'credential-must-not-leak')
+    const result = await launch(true, fixtureDigest, undefined, 'credential-must-not-leak')
     expect(result.child.status).toBe(1)
     expect(result.events.find(row => row.event === 'managed_external_execution_image_refused')).toMatchObject({
       observedContainerCount: 1, observedImages: [null],
