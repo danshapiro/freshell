@@ -27,6 +27,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   OpencodeContinuityStartupFactsSchema, OpencodeContinuityFirstReplySchema, RuntimeTerminalContinuityObservationSchema,
   OpencodeQualificationStartupFactsSchema,
   OpencodeReplacementReadinessSchema,
+  OpencodeReadinessConfirmationSchema,
   OpencodeQualificationTurnSchema,
   requireOpenCodeOnecliBootstrap, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
@@ -720,7 +721,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -921,6 +922,9 @@ export class ExternalManagedRuntimeRig {
   }
   async openCodeReplacementReadiness(enclosure: RuntimeEnclosureHandle, qualificationTerminalId: string): Promise<z.infer<typeof OpencodeReplacementReadinessSchema>> {
     return this.rpc('opencode-replacement-readiness', OpencodeReplacementReadinessSchema, { enclosure, qualificationTerminalId })
+  }
+  async confirmOpenCodeReplacementReadiness(enclosure: RuntimeEnclosureHandle, qualificationReadiness: z.infer<typeof OpencodeReadinessConfirmationSchema>): Promise<void> {
+    await this.rpc('opencode-readiness-confirm', CompletedOwnerOperationSchema, { enclosure, qualificationReadiness })
   }
   async addOpenCodeQualificationSecondView(handle: ExactRuntimeHandle, expectedIntentRevision: number, expectedControlEpoch: number): Promise<void> {
     await this.rpc('opencode-qualification-second-view', CompletedOwnerOperationSchema, { handle, expectedIntentRevision, expectedControlEpoch })
@@ -1325,6 +1329,11 @@ export function createExternalRuntimeControl(
       case 'opencode-replacement-readiness':
         if (!request.enclosure || !request.qualificationTerminalId) throw new Error('exact OpenCode enclosure and observed terminal required')
         result = await owner.openCodeReplacementReadiness(request.enclosure, request.qualificationTerminalId)
+        break
+      case 'opencode-readiness-confirm':
+        if (!request.enclosure || !request.qualificationReadiness) throw new Error('exact enclosure and readiness observations required')
+        await owner.confirmOpenCodeReplacementReadiness(request.enclosure, request.qualificationReadiness)
+        result = { completed: true }
         break
       case 'opencode-qualification-second-view':
         if (request.expectedIntentRevision === undefined || request.expectedControlEpoch === undefined) throw new Error('exact view revision and controller epoch required')

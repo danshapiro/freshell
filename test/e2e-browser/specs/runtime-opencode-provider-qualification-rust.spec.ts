@@ -308,12 +308,10 @@ async function waitForReplacementPrompt(
     ) {
       throw new Error('replacement provider source and browser stream identities did not agree')
     }
-    rig.runtime.assert('PC-OPENCODE', true, 'replacement TUI prompt is source-observed and rendered before input', {
-      soulId: view.soulId,
-      incarnationId: view.incarnationId,
+    await rig.confirmOpenCodeReplacementReadiness(rig.runtimeEnclosureHandle(view), {
       terminalId,
       streamEpoch: output.streamEpoch,
-      cursor: output.headSeq,
+      headSeq: output.headSeq,
     })
   } catch (error) {
     // Keep identity/readiness facts, never conversation text, in failure receipts.

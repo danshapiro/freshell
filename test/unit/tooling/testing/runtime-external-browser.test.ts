@@ -2177,6 +2177,7 @@ describe('closed external owner control', () => {
       exited: false, headSeq: 12, frames: [{ streamEpoch: 'owned-host-stream', terminalId: row.terminalId,
         data: '\x1b[?2004hBuild GPT-5.6 Luna\nprivate terminal conversation body' }] }
     const admin = vi.spyOn(owned.runtime, 'adminOk').mockResolvedValue({ kind: 'terminal_output', data: output })
+    const assertion = vi.spyOn(owned.runtime, 'assert').mockImplementation(() => undefined)
     const control = runner.createExternalRuntimeControl(owned, context)
     const wire: unknown[] = []
     const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
@@ -2185,14 +2186,24 @@ describe('closed external owner control', () => {
       return new Response(JSON.stringify(reply), { status: 200 })
     })
     const enclosure = rig.runtimeEnclosureHandle(row)
+    const confirmation = { terminalId: row.terminalId, streamEpoch: output.streamEpoch, headSeq: output.headSeq }
+    await expect(owned.confirmOpenCodeReplacementReadiness(enclosure, confirmation)).rejects.toThrow(/observed/)
     await expect(rig.openCodeReplacementReadiness(enclosure, row.terminalId)).resolves.toEqual({ incarnationId: row.incarnationId,
       streamEpoch: 'owned-host-stream', terminalId: row.terminalId, exited: false, headSeq: 12, sourceReady: true })
     expect(admin).toHaveBeenCalledWith(owned.supervisor, { method: 'terminal_read_output', params: {
       soulId: row.soulId, afterSeq: 0, maxBytes: 256 * 1024, expectedControlEpoch: 4 } })
     expect(JSON.stringify(wire)).not.toContain('private')
     expect(JSON.stringify(wire)).not.toContain('Build')
+    await rig.confirmOpenCodeReplacementReadiness(enclosure, confirmation)
+    expect(assertion).toHaveBeenCalledExactlyOnceWith('PC-OPENCODE', true,
+      'replacement TUI prompt is source-observed and rendered before input', { soulId: row.soulId,
+        incarnationId: row.incarnationId, terminalId: row.terminalId, streamEpoch: output.streamEpoch, cursor: output.headSeq })
+    assertion.mockClear()
+    await expect(owned.confirmOpenCodeReplacementReadiness(enclosure, { ...confirmation, streamEpoch: 'foreign-stream' })).rejects.toThrow(/observed/)
     output.frames[0].data += '\x1b[?2004l'
     expect(await rig.openCodeReplacementReadiness(enclosure, row.terminalId)).toMatchObject({ sourceReady: false })
+    await expect(owned.confirmOpenCodeReplacementReadiness(enclosure, confirmation)).rejects.toThrow(/observed/)
+    expect(assertion).not.toHaveBeenCalled()
     output.frames[0].streamEpoch = 'foreign-stream'
     await expect(owned.openCodeReplacementReadiness(enclosure, row.terminalId)).rejects.toThrow(/frame.*ownership/)
     output.frames[0].streamEpoch = output.streamEpoch

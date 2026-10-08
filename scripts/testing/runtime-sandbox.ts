@@ -885,6 +885,8 @@ export const OpencodeReplacementReadinessSchema = z.object({
   exited: z.boolean(), headSeq: z.union([z.number().int().nonnegative(), z.string().regex(/^\d+$/)]), sourceReady: z.boolean(),
 }).strict()
 export type OpencodeReplacementReadiness = z.infer<typeof OpencodeReplacementReadinessSchema>
+export const OpencodeReadinessConfirmationSchema = OpencodeReplacementReadinessSchema.pick({ terminalId: true, streamEpoch: true, headSeq: true })
+export type OpencodeReadinessConfirmation = z.infer<typeof OpencodeReadinessConfirmationSchema>
 const OpencodeQualificationProofStageSchema = z.enum(['initial', 'after_session_host_crash', 'after_provider_process_crash'])
 export type OpencodeQualificationProofStage = z.infer<typeof OpencodeQualificationProofStageSchema>
 const OpencodeQualificationNativeEvidenceSchema = z.object({ kind: z.literal('identified_message'),
@@ -1002,6 +1004,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'opencode-qualification-limits',
     'opencode-qualification-blockers',
     'opencode-replacement-readiness',
+    'opencode-readiness-confirm',
     'opencode-qualification-second-view',
     'opencode-qualification-notice-count',
     'opencode-qualification-message-ids',
@@ -1047,6 +1050,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   qualificationProofStage: OpencodeQualificationProofStageSchema.optional(),
   priorMessageIds: z.array(z.string().min(1)).max(128).optional(),
   otherChallengeId: z.string().min(1).optional(),
+  qualificationReadiness: OpencodeReadinessConfirmationSchema.optional(),
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
@@ -3012,6 +3016,7 @@ export class ManagedRuntimeOwner {
   private lossIncidentNativeHash?: string
   private lossAssertionsPublished = false
   private readonly terminalChildren = new Map<string, number>()
+  private readonly openCodeReadiness = new Map<string, OpencodeReplacementReadiness>()
 
   constructor(
     private readonly webFactory: RuntimeWebFactory,
@@ -3717,9 +3722,25 @@ export class ManagedRuntimeOwner {
       throw new Error('replacement source identity does not match the current owner')
     }
     const { openCodeTerminalReady } = await import('./provider-native-history.js')
-    return OpencodeReplacementReadinessSchema.parse({ incarnationId: output.incarnationId, streamEpoch: output.streamEpoch,
+    const observation = OpencodeReplacementReadinessSchema.parse({ incarnationId: output.incarnationId, streamEpoch: output.streamEpoch,
       terminalId: output.terminalId, exited: output.exited, headSeq: output.headSeq,
       sourceReady: openCodeTerminalReady(sourceText, ['GPT-5.6 Luna', P2_OPENCODE_MODEL]) })
+    this.openCodeReadiness.set(JSON.stringify(handle), observation)
+    return { ...observation }
+  }
+  async confirmOpenCodeReplacementReadiness(handle: RuntimeEnclosureHandle, input: OpencodeReadinessConfirmation): Promise<void> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    const confirmation = OpencodeReadinessConfirmationSchema.parse(input)
+    const observed = this.openCodeReadiness.get(JSON.stringify(handle))
+    if (!observed || !observed.sourceReady || observed.exited || observed.terminalId !== confirmation.terminalId
+      || observed.streamEpoch !== confirmation.streamEpoch || observed.headSeq !== confirmation.headSeq) {
+      throw new Error('matching observed owner source readiness required')
+    }
+    this.runtime.assert('PC-OPENCODE', true, 'replacement TUI prompt is source-observed and rendered before input', {
+      soulId: handle.soulId, incarnationId: handle.incarnationId, terminalId: observed.terminalId,
+      streamEpoch: observed.streamEpoch, cursor: observed.headSeq,
+    })
   }
   async registerOpenCodeQualificationNonce(handle: ExactRuntimeHandle, nonce: string): Promise<{ challengeId: string }> {
     if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
