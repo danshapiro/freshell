@@ -327,7 +327,7 @@ function candidateLabels(input: ClaudeCandidateAuthorization) {
   return { 'com.freshell.installation-id': input.installationId, 'com.freshell.soul-id': input.soulId,
     'com.freshell.runtime-test-run-id': 'run-one', 'com.freshell.source-request-id': input.requestId,
     'com.freshell.source-binary-sha256': input.binarySha256, 'com.freshell.input-generation': input.generationId,
-    'com.freshell.source-reservation-id': input.reservationId, 'com.freshell.claude-candidate': 'ordinary' }
+    ...(input.retained ? { 'com.freshell.source-recovery-attempt-id': input.retained.attemptId } : { 'com.freshell.source-reservation-id': input.reservationId }), 'com.freshell.claude-candidate': 'ordinary' }
 }
 function candidateHelperBody(input: ClaudeCandidateAuthorization, role: 'mountpoints' | 'reader'): any {
   const volume = `freshell-claude-candidate-${input.requestId}`
@@ -356,10 +356,57 @@ function candidateHelperBody(input: ClaudeCandidateAuthorization, role: 'mountpo
   for (const relative of selected) body.HostConfig.Mounts.push({ Type: 'bind', Source: `${input.stageRoot}/${relative}`, Target: `/run/freshell-candidate-inputs/${relative}`, ReadOnly: true })
   for (const bind of input.configurationBinds) body.HostConfig.Mounts.push({ Type: 'bind', Source: `${input.stageRoot}/${bind.sourceRelativePath}`, Target: bind.effectiveDestination, ReadOnly: true })
   for (const mount of input.resourceMounts) body.HostConfig.Mounts.push({ Type: 'volume', Source: volume, Target: mount.effectiveDestination, ReadOnly: mount.kind === 'file', VolumeOptions: { NoCopy: true, Subpath: mount.providerRelativePath } })
+  if (input.retained) {
+    body.HostConfig.Mounts.push(
+      { Type: 'volume', Source: input.providerVolumeName, Target: '/run/freshell-retained-home', ReadOnly: true, VolumeOptions: { NoCopy: true } },
+      { Type: 'bind', Source: `${exchange}/retained-stage`, Target: '/run/freshell-retained-inputs', ReadOnly: true },
+    )
+    const selected = new Set(['.freshell/prepared-context.json',input.manifestRelativePath,
+      ...input.retained.configurationBinds.map((bind) => bind.sourceRelativePath), ...input.retained.resourceMounts.map((unit) => unit.stageRelativePath)])
+    for (const relative of selected) body.HostConfig.Mounts.push({ Type: 'bind', Source: `${input.retained.stageRoot}/${relative}`, Target: `/run/freshell-retained-inputs/${relative}`, ReadOnly: true })
+  }
   return body
 }
 
 describe('fixed initial Claude candidate broker', () => {
+  it('qualifies retained candidates only through selected frozen inputs and read-only owned HOME', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      const input = candidateAuthorization(), generationId = 'grant-55555555-5555-4555-8555-555555555555'
+      input.retained = { generationId, stageRoot: `/tmp/owned/scenarios/claude/control/provider-roots/${generationId}`,
+        attemptId: 'recovery-66666666-6666-4666-8666-666666666666', configurationBinds: structuredClone(input.configurationBinds), resourceMounts: structuredClone(input.resourceMounts) }
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      for (const mutation of ['generation','stage','credential-source']) {
+        const changed = structuredClone(input)
+        if (mutation === 'generation') changed.retained!.generationId = input.generationId
+        if (mutation === 'stage') changed.retained!.stageRoot = `/outside/${generationId}`
+        if (mutation === 'credential-source') changed.retained!.configurationBinds[0].sourceRelativePath = '.freshell/mcp-capability.json'
+        expect(() => instance.authorizeClaudeCandidate(changed),mutation).toThrow()
+      }
+      instance.authorizeClaudeCandidate(input)
+      const volume = `freshell-claude-candidate-${input.requestId}`
+      expect((await request('POST','/v1.47/volumes/create',{Name:volume,Driver:'local',DriverOpts:{},Labels:candidateLabels(input)})).status).toBe(201)
+      const name = 'freshell-claude-candidate-reader-11111111-1111-4111-8111-111111111111'
+      const body = candidateHelperBody(input,'reader'), before = forwarded.length
+      for (const mutation of ['retained-write','retained-name','retained-stage','retained-credential','attempt','extra-native-alias']) {
+        const changed = structuredClone(body)
+        if (mutation === 'retained-write') changed.HostConfig.Mounts.find((mount:any) => mount.Target === '/run/freshell-retained-home').ReadOnly = false
+        if (mutation === 'retained-name') changed.HostConfig.Mounts.find((mount:any) => mount.Target === '/run/freshell-retained-home').Source = 'foreign-provider-home'
+        if (mutation === 'retained-stage') changed.HostConfig.Mounts.find((mount:any) => mount.Target === '/run/freshell-retained-inputs/.freshell/prepared-context.json').Source = `${input.stageRoot}/.freshell/prepared-context.json`
+        if (mutation === 'retained-credential') changed.HostConfig.Mounts.push({Type:'bind',Source:`${input.retained.stageRoot}/.freshell/mcp-capability.json`,Target:'/run/freshell-retained-inputs/.freshell/mcp-capability.json',ReadOnly:true})
+        if (mutation === 'attempt') changed.Labels['com.freshell.source-recovery-attempt-id'] = 'recovery-77777777-7777-4777-8777-777777777777'
+        if (mutation === 'extra-native-alias') changed.HostConfig.Mounts.push({Type:'volume',Source:input.providerVolumeName,Target:'/history',ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:'.claude/projects'}})
+        expect((await request('POST',`/v1.47/containers/create?name=${name}`,changed)).status,mutation).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST',`/v1.47/containers/create?name=${name}`,body)).status).toBe(201)
+      expect((await request('POST',`/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST',`/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('DELETE',`/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
+      expect((await request('GET',`/v1.47/containers/${helperId}/json`)).status).toBe(404)
+      expect((await request('DELETE',`/v1.47/volumes/${volume}`)).status).toBe(204)
+      expect(forwarded.some((operation) => operation.method === 'DELETE' && operation.url.includes(input.providerVolumeName))).toBe(false)
+    })
+  })
   it('owns only the exact request disk backing and confirms non-force cleanup', async () => {
     await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
       const input = candidateAuthorization(), name = `freshell-claude-candidate-${input.requestId}`

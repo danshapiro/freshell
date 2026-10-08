@@ -151,7 +151,7 @@ export type InitialProviderVolumeAuthorization = {
   daemonId:string
 }
 
-/** Metadata for the fixed initial Claude candidate, before a workload exists. */
+/** Selected ordinary metadata for the fixed initial or retained Claude candidate. */
 export type ClaudeCandidateAuthorization = InitialProviderVolumeAuthorization & {
   reservationId: string
   requestId: string
@@ -163,6 +163,7 @@ export type ClaudeCandidateAuthorization = InitialProviderVolumeAuthorization & 
   manifestRelativePath: string
   configurationBinds: { sourceRelativePath: string; effectiveDestination: string }[]
   resourceMounts: { stageRelativePath: string; providerRelativePath: string; effectiveDestination: string; kind: 'file' | 'directory' }[]
+  retained?: Pick<ClaudeCandidateAuthorization, 'generationId' | 'stageRoot' | 'configurationBinds' | 'resourceMounts'> & { attemptId: string }
 }
 
 function candidateVolumeName(input: ClaudeCandidateAuthorization): string {
@@ -172,7 +173,7 @@ function candidateLabels(input: ClaudeCandidateAuthorization, runId: string): Re
   return { 'com.freshell.installation-id': input.installationId, 'com.freshell.soul-id': input.soulId,
     'com.freshell.runtime-test-run-id': runId, 'com.freshell.source-request-id': input.requestId,
     'com.freshell.source-binary-sha256': input.binarySha256, 'com.freshell.input-generation': input.generationId,
-    'com.freshell.source-reservation-id': input.reservationId, 'com.freshell.claude-candidate': 'ordinary' }
+    ...(input.retained ? { 'com.freshell.source-recovery-attempt-id': input.retained.attemptId } : { 'com.freshell.source-reservation-id': input.reservationId }), 'com.freshell.claude-candidate': 'ordinary' }
 }
 
 type DockerResponse = {
@@ -224,17 +225,29 @@ export class RestrictedDockerBroker {
       || input.manifestRelativePath !== '.freshell/input-manifest.json'
       || !Array.isArray(input.configurationBinds) || !Array.isArray(input.resourceMounts)
       || Buffer.byteLength(JSON.stringify(input)) > 1024 * 1024) throw new Error('initial Claude candidate is outside this fixture request')
-    const targets = new Set<string>()
-    const claim = (value: string) => { if (!destination(value) || targets.has(value)) throw new Error('Claude candidate selected target is invalid'); targets.add(value) }
-    for (const bind of input.configurationBinds) {
-      if (!unit(bind.sourceRelativePath, '\\.freshell/templates')) throw new Error('Claude candidate template source is invalid')
-      claim(bind.effectiveDestination)
-    }
-    for (const mount of input.resourceMounts) {
-      if (!['file','directory'].includes(mount.kind)
-        || !unit(mount.stageRelativePath, '\\.freshell/resource-units', mount.kind === 'file')
-        || !unit(mount.providerRelativePath, '\\.freshell/provider-roots', mount.kind === 'file')) throw new Error('Claude candidate resource source is invalid')
-      claim(mount.effectiveDestination)
+    if (input.retained && (typeof input.retained.attemptId !== 'string' || !input.retained.attemptId.startsWith('recovery-') || !uuid(input.retained.attemptId.slice(9))
+      || typeof input.retained.generationId !== 'string' || !input.retained.generationId.startsWith('grant-') || !uuid(input.retained.generationId.slice(6))
+      || input.retained.generationId === input.generationId || input.retained.stageRoot !== path.join(path.dirname(input.stageRoot),input.retained.generationId)
+      || !Array.isArray(input.retained.configurationBinds) || !Array.isArray(input.retained.resourceMounts))) throw new Error('retained Claude candidate is outside its frozen generation')
+    for (const profile of [input,...(input.retained ? [input.retained] : [])]) {
+      const targets = new Set<string>()
+      // Retained logical origins are metadata only: the helper receives their
+      // frozen stage files, rather than mounts at those original destinations.
+      const claim = (value: string) => {
+        const valid = profile === input ? destination(value) : typeof value === 'string' && path.isAbsolute(value) && path.normalize(value) === value && !/[\x00-\x1f\x7f]/.test(value)
+        if (!valid || targets.has(value)) throw new Error('Claude candidate selected target is invalid')
+        targets.add(value)
+      }
+      for (const bind of profile.configurationBinds) {
+        if (!unit(bind.sourceRelativePath, '\\.freshell/templates')) throw new Error('Claude candidate template source is invalid')
+        claim(bind.effectiveDestination)
+      }
+      for (const mount of profile.resourceMounts) {
+        if (!['file','directory'].includes(mount.kind)
+          || !unit(mount.stageRelativePath, '\\.freshell/resource-units', mount.kind === 'file')
+          || !unit(mount.providerRelativePath, '\\.freshell/provider-roots', mount.kind === 'file')) throw new Error('Claude candidate resource source is invalid')
+        claim(mount.effectiveDestination)
+      }
     }
     const key = candidateVolumeName(input), previous = this.claudeCandidates.get(key)
     if (previous && JSON.stringify(previous) !== JSON.stringify(input)) throw new Error('Claude candidate request changed')
@@ -509,7 +522,7 @@ export class RestrictedDockerBroker {
           `${DOCKER_API_PREFIX}/containers/${targetName}/start`,
           `${DOCKER_API_PREFIX}/containers/${targetName}/wait?condition=not-running`,
         ].includes(url))) {
-        await this.forwardAndReply(request, response, body, { destructive: method !== 'GET', containerId: helper.containerId, helperName: name })
+        await this.forwardAndReply(request, response, body, { destructive: true, containerId: helper.containerId, helperName: name })
         return
       }
     }
@@ -896,6 +909,13 @@ export class RestrictedDockerBroker {
       const selected = new Set(['.freshell/claude-candidate-binding.json','.freshell/prepared-context.json','.freshell/prepared-result.json',input.manifestRelativePath,
         ...input.configurationBinds.map((bind) => bind.sourceRelativePath),...input.resourceMounts.map((mount) => mount.stageRelativePath)])
       for (const relative of selected) expected.push({ Type: 'bind', Source: path.join(input.stageRoot, relative), Target: path.join('/run/freshell-candidate-inputs', relative), ReadOnly: true })
+      if (input.retained) {
+        expected.push({ Type:'volume',Source:input.providerVolumeName,Target:'/run/freshell-retained-home',ReadOnly:true,VolumeOptions:{NoCopy:true} },
+          { Type:'bind',Source:path.join(exchange.Source,'retained-stage'),Target:'/run/freshell-retained-inputs',ReadOnly:true })
+        const selected = new Set(['.freshell/prepared-context.json',input.manifestRelativePath,
+          ...input.retained.configurationBinds.map((bind) => bind.sourceRelativePath),...input.retained.resourceMounts.map((unit) => unit.stageRelativePath)])
+        for (const relative of selected) expected.push({Type:'bind',Source:path.join(input.retained.stageRoot,relative),Target:path.join('/run/freshell-retained-inputs',relative),ReadOnly:true})
+      }
       if (input.gitCommonDir && input.gitCommonDir !== input.workspacePath && !isStrictDescendant(input.gitCommonDir, input.workspacePath)) {
         expected.push({ Type: 'bind', Source: input.gitCommonDir, Target: input.gitCommonDir, ReadOnly: true })
       }
