@@ -4573,7 +4573,8 @@ export class ManagedRuntimeOwner {
       if (observedLaunch.data.incarnationId !== handle.incarnationId || observedLaunch.data.containerId !== handle.containerId
         || observedLaunch.data.workerLaunchCount !== data.managedLaunch.data.workerLaunchCount) throw new Error('observed owned launch required')
       stage = 'controller_reattachment'
-      const controller = lifecycle.filter(event => event.event === 'browser.owned_controller_reattached'
+      const ownerLifecycle = await this.readOwnedLifecycle('owner')
+      const controller = ownerLifecycle.filter(event => event.event === 'browser.owned_controller_reattached'
         && z.object({ completedAt: z.number() }).parse(event.data).completedAt === data.observerWindow.controllerReattachment.completedAt).at(-1)
       if (!controller) throw new Error('recorded owned controller reattachment required')
       const observedController = FreshCodexControllerReattachmentSchema.parse(controller.data)
@@ -4643,8 +4644,10 @@ export class ManagedRuntimeOwner {
     this.runtime.recordLifecycle('browser.saved_history_measurement.started', measurement)
   }
 
-  private async readOwnedLifecycle() {
-    return (await fsp.readFile(path.join(path.dirname(this.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl'), 'utf8'))
+  private async readOwnedLifecycle(source: 'supervisor' | 'owner' = 'supervisor') {
+    const file = source === 'owner' ? this.runtime.lifecyclePath
+      : path.join(path.dirname(this.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')
+    return (await fsp.readFile(file, 'utf8'))
       .split('\n').filter(Boolean).map((line: string) => z.object({ event: z.string() }).passthrough().parse(JSON.parse(line)))
   }
 

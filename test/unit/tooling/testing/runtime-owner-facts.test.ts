@@ -553,7 +553,8 @@ describe('fixed owned saved-history preservation artifact', () => {
     vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: true, running: true })
     vi.spyOn(rig, 'freshCodexSavedHistoryUnchanged').mockResolvedValue(true)
     const coincident = vi.spyOn(rig, 'coincidentFreshCodexHistoryUnchanged').mockResolvedValue(true)
-    const record = vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    Object.assign(rig.runtime, { lifecyclePath: path.join(root, 'owner', 'lifecycle.jsonl') })
+    const record = vi.spyOn(rig.runtime, 'recordLifecycle')
     const state = { nativeSessionId: current.nativeSessionId, pendingDecisionId: null, dispatchCount: 1, completionCount: 1 }
     const privateState = { ...state, schemaVersion: 1, createProfile: { fixtureTransport: true, privateReference: 'owner-only-profile' } }
     vi.spyOn(rig.runtime, 'fixtureNativeState').mockImplementation(async (_instance, address, capture) => {
@@ -575,8 +576,9 @@ describe('fixed owned saved-history preservation artifact', () => {
     const privateLaunch = { ...launch, data: { ...launch.data, privateLaunchReference: 'owner-only-launch' } }
     const privateStartup = { ...startupFinished, data: { ...startupFinished.data, privateScanReference: 'owner-only-scan' } }
     const privateController = { ...controllerReattachment, startupFinished: privateStartup }
-    await fsp.writeFile(lifecycle, [privateLaunch, privateStartup, controllerReady,
-      { event: 'browser.owned_controller_reattached', at: 'private-time', data: privateController }].map(value => JSON.stringify(value)).join('\n')+'\n')
+    await fsp.writeFile(lifecycle, [privateLaunch, privateStartup, controllerReady]
+      .map(value => JSON.stringify(value)).join('\n')+'\n')
+    await rig.recordFreshCodexControllerReattachment(current, controllerReattachment)
     const input: owner.FreshCodexSavedHistoryPreservation = { source: 'owned provider-volume native history',
       wrongSource: 'coincident web-local native history', heldHost: { containerId: current.containerId, incarnationId: current.incarnationId, pid: 42 },
       bootstrap: { type: 'pane.reconcile.request', reconcileId: 'reconcile-owned', panes: [{ paneKey: 'tab:pane', kind: 'fresh-agent',
@@ -610,6 +612,18 @@ describe('fixed owned saved-history preservation artifact', () => {
       await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha, scenarioId: 'browser-managed-runtime',
         operationId: 'foreign-history-preservation-path', action: 'freshcodex-history-preservation-artifact', handle: current,
         historyPreservation: input, outputPath: '/foreign/history' })).rejects.toThrow(/operation/)
+      const recordedOwnerLifecycle = await fsp.readFile(rig.runtime.lifecyclePath, 'utf8')
+      await fsp.writeFile(rig.runtime.lifecyclePath, '')
+      // The supervisor's log cannot substitute for the private owner's actual observation.
+      await fsp.appendFile(lifecycle, JSON.stringify({ event: 'browser.owned_controller_reattached',
+        at: 'wrong-source-time', data: privateController })+'\n')
+      await expect(rig.publishFreshCodexSavedHistoryPreservation(current, input)).rejects.toThrow(/recorded owned controller/)
+      expect(record).toHaveBeenLastCalledWith('external.saved_history_preservation_refused', {
+        severity: 'warn', ...current, stage: 'controller_reattachment',
+      })
+      await fsp.writeFile(rig.runtime.lifecyclePath, recordedOwnerLifecycle)
+      await expect(rig.publishFreshCodexSavedHistoryPreservation(current, input)).resolves.toEqual(result)
+
       record.mockClear()
       await expect(rig.publishFreshCodexSavedHistoryPreservation(current, { ...input, beforeHistory: { ...state, completionCount: 99 } })).rejects.toThrow(/captured/)
       expect(record).toHaveBeenLastCalledWith('external.saved_history_preservation_refused', {
