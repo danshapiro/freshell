@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from 'node:util'
 import { createHash } from 'node:crypto'
 
 import type {
@@ -136,3 +137,30 @@ export function selectNativeAssistantTurn(
   )) ?? null
 }
 
+
+/** The configured model must appear after Build in the same visible header line. */
+export function hasOpenCodePromptModelText(
+  renderedText: string,
+  expectedModelTexts: readonly string[],
+): boolean {
+  const modelTexts = expectedModelTexts.filter((modelText) => modelText.length > 0)
+  if (modelTexts.length === 0) return false
+
+  return renderedText.split(/\r\n|\n|\r/).some((line) => {
+    const buildIndex = line.indexOf('Build')
+    if (buildIndex === -1) return false
+    const headerText = line.slice(buildIndex + 'Build'.length)
+    return modelTexts.some((modelText) => headerText.includes(modelText))
+  })
+}
+
+/** Resumed conversations omit the home-screen placeholder. Observe model text and actual TUI input mode. */
+export function openCodeTerminalReady(
+  rawOutput: string,
+  expectedModelTexts: readonly string[],
+): boolean {
+  const modes = [...rawOutput.matchAll(/\x1b\[\?2004([hl])/g)]
+  if (modes.at(-1)?.[1] !== 'h') return false
+  const rendered = stripVTControlCharacters(rawOutput)
+  return hasOpenCodePromptModelText(rendered, expectedModelTexts)
+}
