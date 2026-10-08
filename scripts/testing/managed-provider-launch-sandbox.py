@@ -74,6 +74,15 @@ def main():
                 if labels.get("com.freshell.soul-id")==metadata["soulId"] and labels.get("com.freshell.incarnation-id")==metadata["incarnationId"]:
                     known_helpers.append(metadata)
         fixed_helper=value["Config"].get("Image")==IMAGE and value["Config"].get("Cmd") in [["publish-provider-inputs"],["prepare-provider-mountpoints"]] and bool(known_helpers)
+        candidate_helper=value["Config"].get("Image")==IMAGE and value["Config"].get("Cmd") in [["project-claude-candidate-private"],["prepare-provider-mountpoints"]] and labels.get("com.freshell.runtime-test-run-id")==run and labels.get("com.freshell.installation-id")==installation and labels.get("com.freshell.claude-candidate")=="ordinary"
+        if candidate_helper:
+            host_config=value["HostConfig"]
+            receipt.setdefault("candidateHelperInspections",[]).append({
+                "id":value["Id"],"image":value["Config"]["Image"],"user":value["Config"]["User"],
+                "command":value["Config"]["Cmd"],"labels":labels,"workingDirectory":value["Config"].get("WorkingDir"),
+                "running":value["State"].get("Running"),"exitCode":value["State"].get("ExitCode"),
+                "hostSafety":{key:host_config.get(key) for key in ["NetworkMode","ReadonlyRootfs","CapDrop","CapAdd","SecurityOpt","Memory","MemorySwap","NanoCpus","PidsLimit","Tmpfs","LogConfig","Mounts"]},
+            })
         if fixed_helper:
             receipt.setdefault("helperInspections",[]).append({
                 "id":value["Id"],"image":value["Config"]["Image"],"user":value["Config"]["User"],
@@ -94,7 +103,7 @@ def main():
         root=Path(temporary).with_name("fln-"+uuid.uuid4().hex[:16])
         Path(temporary).rename(root)
         try:
-            for name in ["workspace","source-home/.config/opencode","grants","handoff","tmp","scenarios"]:
+            for name in ["workspace","source-home/.config/opencode","grants","handoff","candidate-handoff","tmp","scenarios"]:
                 (root/name).mkdir(parents=True,exist_ok=True)
             initial=[]
             souls=["soul-terminal-"+hashlib.sha256(b"closed-native-terminal-create").hexdigest()[:32]]
@@ -197,6 +206,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                 receipt["claudeSettingsForm"]=args.claude_settings_form
                 receipt["claudeSourceGuard"]=args.claude_source_guard
             receipt["consumedRoutes"]=[json.loads(line.split("provider_launch_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_launch_consumer " in line]
+            receipt["candidateObservers"]=[json.loads(line.split("provider_candidate_observer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_candidate_observer " in line]
             print(outcome.stdout,end="",flush=True);print(outcome.stderr,end="",flush=True)
             expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")} if args.provider=="opencode" else ({(args.provider,"terminal")} if args.provider=="amplifier" else {(args.provider,"terminal"),(args.provider,"fresh")})
             observed_routes={(item.get("provider"),item.get("route")) for item in receipt["consumedRoutes"]}
@@ -215,6 +225,16 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                 evidence=json.loads((root/"broker-receipt.json").read_text())
                 receipt["broker"]=evidence
                 for value in evidence["receipts"]:owned.append(value["containerId"])
+                if exit_code==0 and args.provider=="claude" and args.claude_source_guard=="unchanged":
+                    candidates=evidence["authorizedCandidates"]
+                    observers=receipt["candidateObservers"]
+                    authorized={(value["requestId"],value["generationId"],value["soulId"]) for value in candidates}
+                    observed={(value.get("requestId"),value.get("generationId"),value.get("soulId")) for value in observers}
+                    # Authorization alone is not source acceptance. Require
+                    # real backend replies after its owned helper cleanup,
+                    # plus the native consumer and terminal test above.
+                    if not 2<=len(candidates)<=6 or len(authorized)!=len(candidates) or observed!=authorized or len(observers)!=len(candidates) or any(value.get("uid")!=65534 or value.get("gid")!=0 or value.get("backendCompleteAfterCleanup") is not True for value in observers):
+                        receipt["exitCode"]=2;receipt["failureClass"]="candidate_observer_count_mismatch"
             else:
                 receipt["exitCode"]=2;receipt["failureClass"]="broker_receipt_unavailable"
         finally:
@@ -228,6 +248,13 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
             for candidate in (root/"handoff").glob("*.json"):
                 value=json.loads(candidate.read_text())
                 if value.get("indexedFiles"):volumes.add(value["indexedFiles"]["volumeName"])
+            candidates=[json.loads(candidate.read_text()) for candidate in (root/"candidate-handoff").glob("*.json")]
+            if len(candidates)>6:
+                raise RuntimeError("closed candidate cleanup exceeds its finite request set")
+            for candidate in candidates:
+                if not re.fullmatch(r"[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}",candidate["requestId"]):
+                    raise RuntimeError("closed candidate cleanup request identity invalid")
+                volumes.add("freshell-claude-candidate-"+candidate["requestId"])
             for volume in volumes:
                 inspected=docker("volume","inspect",volume,check=False)
                 if inspected.returncode:continue
@@ -245,7 +272,14 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                         labels={"com.freshell.managed-inputs":"true","com.freshell.installation-id":installation,
                                 "com.freshell.soul-id":prepared["soulId"],"com.freshell.incarnation-id":prepared["incarnationId"],
                                 "com.freshell.input-generation":prepared["generationId"]}
-                if labels is None or value.get("Driver")!="local" or value.get("Labels")!=labels:
+                for candidate in candidates:
+                    if volume=="freshell-claude-candidate-"+candidate["requestId"]:
+                        source=next(item for item in initial if item["soulId"]==candidate["soulId"])
+                        labels={"com.freshell.installation-id":installation,"com.freshell.soul-id":candidate["soulId"],
+                                "com.freshell.runtime-test-run-id":run,"com.freshell.source-request-id":candidate["requestId"],
+                                "com.freshell.source-binary-sha256":source["binarySha256"],"com.freshell.input-generation":candidate["generationId"],
+                                "com.freshell.source-reservation-id":candidate["reservationId"],"com.freshell.claude-candidate":"ordinary"}
+                if labels is None or value.get("Driver")!="local" or value.get("Options") not in (None,{}) or value.get("Labels")!=labels:
                     raise RuntimeError("closed startup volume cleanup ownership changed")
                 docker("volume","rm",volume)
             receipt["ownedCleanup"]=all(docker("container","inspect",name,check=False).returncode!=0 for name in owned) and all(docker("volume","inspect",volume,check=False).returncode!=0 for volume in volumes)

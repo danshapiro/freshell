@@ -2,7 +2,7 @@
 //! the native startup fixture receives this broker's restricted proxy socket.
 import fs from 'node:fs'
 import path from 'node:path'
-import { RestrictedDockerBroker, type PreparedInputAuthorization } from './runtime-test-broker.js'
+import { RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from './runtime-test-broker.js'
 
 const root=process.env.FRESHELL_PROVIDER_LAUNCH_FIXTURE ?? ''
 if (path.dirname(root)!=='/tmp' || !/^fln-[a-f0-9]{16}$/.test(path.basename(root))) {
@@ -39,6 +39,7 @@ const broker=new RestrictedDockerBroker({
 for (const authorization of configuration.initialVolumes) broker.authorizeInitialProviderVolume(authorization)
 await broker.start()
 const accepted=new Set<string>()
+const candidates=new Map<string,ClaudeCandidateAuthorization>()
 const timer=setInterval(()=>{
   try {
     const gatewayFile=path.join(root,'controller-gateway.json')
@@ -65,11 +66,26 @@ const timer=setInterval(()=>{
       accepted.add(name)
       fs.writeFileSync(file.slice(0,-'.json'.length)+'.accepted','ok',{mode:0o600})
     }
+    const candidateDirectory=path.join(root,'candidate-handoff')
+    const candidateEntries=fs.readdirSync(candidateDirectory).filter((name)=>name.endsWith('.json'))
+    if (candidateEntries.length>6 || (configuration.provider!=='claude' && candidateEntries.length)) throw new Error('closed candidate handoff exceeds two routes and two replans')
+    for (const name of candidateEntries) {
+      if (candidates.has(name)) continue
+      if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\.json$/.test(name)) throw new Error('closed candidate handoff request identity invalid')
+      const file=path.join(candidateDirectory,name),stat=fs.lstatSync(file)
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size>1024*1024) throw new Error('closed candidate handoff profile exceeded')
+      const input=JSON.parse(fs.readFileSync(file,'utf8')) as ClaudeCandidateAuthorization
+      if (name!==`${input.requestId}.json`) throw new Error('closed candidate handoff request changed')
+      broker.authorizeClaudeCandidate(input)
+      candidates.set(name,input)
+      fs.writeFileSync(file.slice(0,-'.json'.length)+'.accepted','ok',{mode:0o600})
+    }
     if (fs.existsSync(path.join(root,'broker-complete'))) {
       clearInterval(timer)
       void broker.close().then(()=>{
         fs.writeFileSync(path.join(root,'broker-receipt.json'),JSON.stringify({
           events:broker.eventsSnapshot(),receipts:broker.receipts(),unsafeAttempts:broker.unsafeAttempts(),acceptedPreparations:accepted.size,
+          authorizedCandidates:[...candidates.values()],
         })+'\n',{mode:0o600})
       })
     }

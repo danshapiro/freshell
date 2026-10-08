@@ -60,6 +60,117 @@ struct BrokerAuthorizedBackend {
     certificate_sentinel: Vec<u8>,
 }
 impl BrokerAuthorizedBackend {
+    async fn authorize_claude_candidate(
+        &self,
+        owner: &freshell_supervisor::backend::ClaudeSourceOwner,
+        request: &ObserveClaudeSourcesRequest,
+    ) -> Result<(), BackendError> {
+        use std::io::Read;
+        let Some(candidate) = request.candidate.as_ref() else {
+            return Ok(());
+        };
+        let invalid = || {
+            BackendError::InvalidConfig("closed initial Claude candidate handoff invalid".into())
+        };
+        let freshell_supervisor::backend::ClaudeSourceOwner::Initial { observation, .. } = owner
+        else {
+            // The retained reader stays fail-closed until its actual prior
+            // ordinary topology is qualified. Do not invent initial authority.
+            return Ok(());
+        };
+        let InitialAuthVolumeObservation::Absent { daemon_id } = observation;
+        let ClaudeSourceAuthority::InitialReservation { reservation_id } = &request.authority
+        else {
+            return Err(invalid());
+        };
+        request.validate().map_err(|_| invalid())?;
+        let inputs = candidate
+            .provider_launch_context
+            .prepared_inputs
+            .as_ref()
+            .ok_or_else(invalid)?;
+        let binding = request
+            .observation_request
+            .candidate_binding
+            .as_ref()
+            .ok_or_else(invalid)?;
+        if binding.soul_id != request.soul_id.as_str()
+            || binding.generation_id != inputs.generation_id
+            || inputs.initial_auth_reservation.as_deref() != Some(reservation_id.as_str())
+            || inputs.indexed_files.is_some()
+            || inputs.manifest.source_count != 0
+            || inputs.manifest.alias_count != 0
+            || inputs.manifest.recipe_count != 0
+        {
+            return Err(invalid());
+        }
+        let root = self.handoff.parent().ok_or_else(invalid)?;
+        // The wrapper's closed source configuration contains only artifact and
+        // owner metadata. Bound the physical file before allocating its frame.
+        let mut file =
+            std::fs::File::open(root.join("broker-configuration.json")).map_err(|_| invalid())?;
+        let length = file.metadata().map_err(|_| invalid())?.len();
+        if length > MAX_CONTROL_FRAME_BYTES as u64 {
+            return Err(invalid());
+        }
+        let mut bytes = vec![0; length as usize];
+        file.read_exact(&mut bytes).map_err(|_| invalid())?;
+        let mut growth = [0; 1];
+        if file.read(&mut growth).map_err(|_| invalid())? != 0 {
+            return Err(invalid());
+        }
+        let configuration: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        let sources = configuration["initialVolumes"]
+            .as_array()
+            .ok_or_else(invalid)?;
+        let mut matching = sources
+            .iter()
+            .filter(|source| source["soulId"] == request.soul_id.as_str());
+        let source = matching.next().ok_or_else(invalid)?;
+        if matching.next().is_some() || source["daemonId"] != daemon_id.as_str() {
+            return Err(invalid());
+        }
+        let value = json!({
+            "installationId":source["installationId"],"soulId":request.soul_id,
+            "providerVolumeName":source["providerVolumeName"],"imageRef":source["imageRef"],
+            "hostBinaryPath":source["hostBinaryPath"],"binarySha256":source["binarySha256"],"daemonId":source["daemonId"],
+            "reservationId":reservation_id,"requestId":request.observation_request.request_id,"generationId":inputs.generation_id,
+            "stageRoot":self.control.join("provider-roots").join(&inputs.generation_id),
+            "workspacePath":request.workspace_path,"cwd":request.observation_request.cwd,
+            "manifestRelativePath":inputs.manifest.relative_path,
+            "configurationBinds":inputs.config_binds.iter().map(|bind|json!({"sourceRelativePath":bind.source_relative_path,"effectiveDestination":bind.effective_destination})).collect::<Vec<_>>(),
+            "resourceMounts":inputs.resource_mounts.iter().map(|mount|json!({"stageRelativePath":mount.stage_relative_path,"providerRelativePath":mount.provider_relative_path,"effectiveDestination":mount.effective_destination,"kind":mount.kind})).collect::<Vec<_>>(),
+        });
+        let mut value = value;
+        if let Some(common) = &request.git_common_dir {
+            value["gitCommonDir"] = json!(common);
+        }
+        let metadata =
+            bounded_json_bytes(&value, MAX_CONTROL_FRAME_BYTES).map_err(|_| invalid())?;
+        let path = root
+            .join("candidate-handoff")
+            .join(format!("{}.json", request.observation_request.request_id));
+        let temporary = path.with_extension("pending");
+        std::fs::write(&temporary, metadata).map_err(|_| invalid())?;
+        std::fs::rename(&temporary, &path).map_err(|_| invalid())?;
+        assert_private_sentinels_absent(
+            &root.join("candidate-handoff"),
+            &self.certificate_sentinel,
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !path.with_extension("accepted").is_file() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            BackendError::Unavailable(
+                "closed Claude candidate broker authorization timed out".into(),
+            )
+        })?;
+        Ok(())
+    }
+
     async fn authorize(&self, spec: &CreateRuntimeSpec) -> Result<(), BackendError> {
         let invalid =
             || BackendError::InvalidConfig("closed native fixture metadata handoff invalid".into());
@@ -144,9 +255,24 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
         request: &ObserveClaudeSourcesRequest,
         test_run_id: &str,
     ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
-        self.real
+        self.authorize_claude_candidate(owner, request).await?;
+        let reply = self
+            .real
             .observe_claude_sources(owner, request, test_run_id)
-            .await
+            .await?;
+        if let Some(binding) = &request.observation_request.candidate_binding {
+            println!(
+                "provider_candidate_observer {}",
+                json!({
+                    "requestId":request.observation_request.request_id,"generationId":binding.generation_id,
+                    "soulId":request.soul_id,"planRevision":request.observation_request.plan_revision,
+                    "runtime":request.observation_request.native_source_runtime,"uid":reply.observation.uid,
+                    "gid":reply.observation.gid,"supplementaryGroups":reply.observation.supplementary_groups,
+                    "backendCompleteAfterCleanup":true,
+                })
+            );
+        }
+        Ok(reply)
     }
     async fn observe_initial_auth_volume(
         &self,
