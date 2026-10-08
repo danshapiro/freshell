@@ -176,7 +176,7 @@ async function runOwnedReceiverLoadFault() {
     JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH ?? '{}'),
     JSON.parse(fs.readFileSync(path.join(cwd, 'native-receiver-load-fault-control.json'), 'utf8')))
   const executable = provider === 'codex'
-    ? '/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex'
+    ? '/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex'
     : '/usr/local/lib/node_modules/opencode-ai/bin/opencode.exe'
   const expectedPin = provider === 'codex' ? 'cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40'
     : 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99'
