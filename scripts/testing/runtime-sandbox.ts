@@ -1053,7 +1053,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
     'provider-volume', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
@@ -3042,6 +3042,18 @@ export const ManagedOpenCodeAdoptionStatusSchema: z.ZodType<ManagedOpenCodeAdopt
   }).strict() }).strict() }).strict(),
 ])
 
+function freshCodexSavedTranscript(nativeId: string): string {
+  return [
+    JSON.stringify({ type: 'session_meta', payload: { id: nativeId, cwd: '/workspace', model_provider: 'openai' } }),
+    ...Array.from({ length: 80 }, (_, index) => [
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: `retained-${index}` } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: `Managed prompt ${index}` } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: `retained-${index}`,
+        last_agent_message: `${index === 79 ? 'Managed fixture saved answer' : `Managed retained answer ${index}`}\n${'x'.repeat(20_000)}` } }),
+    ]).flat(),
+  ].join('\n') + '\n'
+}
+
 /**
  * Owned managed-runtime browser rig: restricted Docker broker + supervisor +
  * a feature-enabled Rust web server. Web restart methods touch only the web
@@ -4227,6 +4239,51 @@ export class ManagedRuntimeOwner {
     await this.runtime.adminOk(this.supervisor, this.runtime.freshAgentResolveBody(
       handle.soulId, decisionId, { behavior: 'allow' }, await this.controlEpoch(),
     ))
+  }
+
+  private async assertFreshCodexSavedHistoryFixture(handle: ExactRuntimeHandle): Promise<void> {
+    if (this.runtime.phase !== 3 || !this.fixtureFreshAgentModes.includes('freshcodex')) throw new Error('registered Phase 3 fresh Codex history fixture required')
+    await this.assertCurrentHandle(handle)
+    const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
+    if (row?.provider !== 'codex' || row.freshAgentSessionType !== 'freshcodex') throw new Error('exact fresh Codex history fixture required')
+  }
+
+  async prepareFreshCodexSavedHistory(handle: ExactRuntimeHandle): Promise<{ bytes: number }> {
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    const target = `/home/freshell/provider/.codex/sessions/2026/03/01/rollout-${handle.nativeSessionId}.jsonl`
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--input-type=module', '-e',
+      `import fs from "node:fs"; import path from "node:path"; const makeTranscript = ${freshCodexSavedTranscript.toString()}; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1], makeTranscript(process.argv[2])); process.stdout.write(JSON.stringify({bytes: fs.statSync(process.argv[1]).size}));`,
+      target, handle.nativeSessionId])
+    const result = z.object({ bytes: z.number().int().positive() }).strict().parse(JSON.parse(raw))
+    this.runtime.recordLifecycle('external.freshcodex_saved_history_prepared', { severity: 'info', ...handle, bytes: result.bytes })
+    return result
+  }
+
+  async freshCodexSavedHistoryUnchanged(handle: ExactRuntimeHandle): Promise<boolean> {
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    const raw = await this.ownedProviderExec(handle.containerId, ['cat',
+      `/home/freshell/provider/.codex/sessions/2026/03/01/rollout-${handle.nativeSessionId}.jsonl`])
+    return raw === freshCodexSavedTranscript(handle.nativeSessionId)
+  }
+
+  private coincidentFreshCodexHistoryPath(handle: ExactRuntimeHandle): string {
+    if (!this.web) throw new Error('owned web HOME required for coincident fixture history')
+    return path.join(this.web.info.homeDir, '.codex', 'sessions', `rollout-${handle.nativeSessionId}.jsonl`)
+  }
+
+  async prepareCoincidentFreshCodexHistory(handle: ExactRuntimeHandle): Promise<void> {
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    const target = this.coincidentFreshCodexHistoryPath(handle)
+    await fsp.mkdir(path.dirname(target), { recursive: true })
+    await fsp.writeFile(target, freshCodexSavedTranscript(handle.nativeSessionId)
+      .replaceAll('Managed fixture saved answer', 'Wrong web-local answer'))
+    this.runtime.recordLifecycle('external.freshcodex_coincident_history_prepared', { severity: 'info', ...handle })
+  }
+
+  async coincidentFreshCodexHistoryUnchanged(handle: ExactRuntimeHandle): Promise<boolean> {
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    return await fsp.readFile(this.coincidentFreshCodexHistoryPath(handle), 'utf8') ===
+      freshCodexSavedTranscript(handle.nativeSessionId).replaceAll('Managed fixture saved answer', 'Wrong web-local answer')
   }
 
   async fixtureNativeState(handle: ExactRuntimeHandle): Promise<FixtureNativeState> {

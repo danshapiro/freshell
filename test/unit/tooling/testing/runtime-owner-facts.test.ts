@@ -113,6 +113,68 @@ describe('fixed fresh-agent launch observations', () => {
   })
 })
 
+describe('fixed owned fresh Codex saved history', () => {
+  it('prepares the original large fixture in its owned provider and detects later changes', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-codex-saved-history-'))
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused saved-history web') }, process.cwd(), 3,
+      {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...current, provider: 'codex',
+      freshAgentSessionType: 'freshcodex', launchState: 'running', intentRevision: 1 }])
+    const file = path.join(root, 'retained.jsonl')
+    const probe = vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (container, args) => {
+      expect(container).toBe(current.containerId)
+      if (args[0] === 'cat') return fsp.readFile(file, 'utf8')
+      expect(args.slice(0, 3)).toEqual(['node', '--input-type=module', '-e'])
+      return execFileSync(process.execPath, [args[1], args[2], args[3], file, args[5]], { encoding: 'utf8' })
+    })
+    try {
+      const prepared = await rig.prepareFreshCodexSavedHistory(current)
+      const raw = await fsp.readFile(file, 'utf8')
+      const rows = raw.trim().split('\n').map(line => JSON.parse(line))
+      expect(prepared.bytes).toBe(Buffer.byteLength(raw))
+      expect(prepared.bytes).toBeGreaterThan(1024 * 1024)
+      expect(rows).toHaveLength(241)
+      expect(rows[0].payload.id).toBe(current.nativeSessionId)
+      expect(rows.at(-1).payload.last_agent_message).toBe(`Managed fixture saved answer\n${'x'.repeat(20_000)}`)
+      await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(true)
+      await fsp.appendFile(file, 'changed\n')
+      await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(false)
+      Object.assign(rig, { web: { info: { homeDir: root } } })
+      await rig.prepareCoincidentFreshCodexHistory(current)
+      const coincident = path.join(root, '.codex', 'sessions', `rollout-${current.nativeSessionId}.jsonl`)
+      expect(await fsp.readFile(coincident, 'utf8')).toContain('Wrong web-local answer')
+      await expect(rig.coincidentFreshCodexHistoryUnchanged(current)).resolves.toBe(true)
+      await fsp.appendFile(coincident, 'changed\n')
+      await expect(rig.coincidentFreshCodexHistoryUnchanged(current)).resolves.toBe(false)
+      const descriptor = external.resolveManagedExternalDescriptor({ FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+        FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws', FRESHELL_E2E_TARGET_TOKEN: 'private-token',
+        FRESHELL_RUNTIME_EXTERNAL_RUN_ID: rig.runtime.runId, FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: rig.runtime.candidateSha })!
+      const control = external.createExternalRuntimeControl(rig, descriptor)
+      const remote = new external.ExternalManagedRuntimeRig(descriptor, async (_url, init) => (
+        new Response(JSON.stringify(await control(JSON.parse(String(init?.body)))), { status: 200 })
+      ))
+      await expect(remote.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(false)
+      await expect(remote.coincidentFreshCodexHistoryUnchanged(current)).resolves.toBe(false)
+      await expect(remote.prepareFreshCodexSavedHistory(current)).resolves.toEqual(prepared)
+      await remote.prepareCoincidentFreshCodexHistory(current)
+      await expect(remote.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(true)
+      await expect(remote.coincidentFreshCodexHistoryUnchanged(current)).resolves.toBe(true)
+      probe.mockClear()
+      await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha,
+        scenarioId: 'browser-managed-runtime', operationId: 'foreign-codex-history-path', action: 'freshcodex-history-prepare',
+        handle: current, outputPath: '/foreign/file' })).rejects.toThrow(/operation/)
+      expect(probe).not.toHaveBeenCalled()
+      inventory.mockResolvedValue([{ ...current, provider: 'codex', freshAgentSessionType: 'freshclaude', launchState: 'running', intentRevision: 1 }])
+      probe.mockClear()
+      await expect(rig.prepareFreshCodexSavedHistory(current)).rejects.toThrow(/fixture/)
+      expect(probe).not.toHaveBeenCalled()
+    } finally { await fsp.rm(root, { recursive: true, force: true }) }
+  })
+})
+
 describe('finite Phase 4 browser receipt publication', () => {
   it('writes the existing observation privately on its owner and refuses worker paths or transcript fields', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-phase4-receipt-'))

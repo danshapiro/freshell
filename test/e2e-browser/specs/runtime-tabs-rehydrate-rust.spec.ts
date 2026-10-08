@@ -221,25 +221,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       ), 90_000)
       expect(view.containerId).toBeTruthy()
       expect(view.nativeSessionId).toBeTruthy()
-      const rolloutPath = `/home/freshell/provider/.codex/sessions/2026/03/01/rollout-${view.nativeSessionId}.jsonl`
-      const makeTranscript = (nativeId: string) => [
-        JSON.stringify({ type: 'session_meta', payload: { id: nativeId, cwd: '/workspace', model_provider: 'openai' } }),
-        ...Array.from({ length: 80 }, (_, index) => [
-          JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: `retained-${index}` } }),
-          JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: `Managed prompt ${index}` } }),
-          JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: `retained-${index}`,
-            last_agent_message: `${index === 79 ? 'Managed fixture saved answer' : `Managed retained answer ${index}`}\n${'x'.repeat(20_000)}` } }),
-        ]).flat(),
-      ].join('\n') + '\n'
-      const transcript = makeTranscript(view.nativeSessionId!)
-      expect(Buffer.byteLength(transcript)).toBeGreaterThan(1024 * 1024)
-      // Generate in the owned provider process, avoiding a multi-MiB argv value.
-      await rig.ownedProviderExec(view.containerId!, ['node', '--input-type=module', '-e',
-        `import fs from "node:fs"; import path from "node:path"; const makeTranscript = ${makeTranscript.toString()}; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1], makeTranscript(process.argv[2]));`,
-        rolloutPath, view.nativeSessionId!])
-      const fixtureState = async () => JSON.parse((await rig.ownedProviderExec(view.containerId!, [
-        'cat', '/home/freshell/provider/.freshell-fixture/provider-native-state.json',
-      ])))
+      const seededHistory = await rig.prepareFreshCodexSavedHistory(rig.exactRuntimeHandle(view))
+      expect(seededHistory.bytes).toBeGreaterThan(1024 * 1024)
+      const fixtureState = () => rig.fixtureNativeState(rig.exactRuntimeHandle(view))
       const before = (await fixtureState())
       const ownedSnapshot = await rig.runtime.adminOk(rig.supervisor, {
         method: 'fresh_agent_read_snapshot', params: { soulId: view.soulId, expectedControlEpoch: await rig.controlEpoch() },
@@ -336,15 +320,12 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId })
       await expectOriginalConversation()
       expect(sent.slice(baseline).filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')).toHaveLength(0)
-      expect((await rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath]))).toBe(transcript)
+      expect(await rig.freshCodexSavedHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
       const stableProviderState = (await fixtureState())
       // A tracked host can stop answering while its managed projection still says live.
       // Its saved source is the owned provider volume, never a coincident web-local file.
       await page.unroute('**/api/fresh-agent/threads/**')
-      const wrongPath = `${info.homeDir}/.codex/sessions/rollout-${view.nativeSessionId}.jsonl`
-      await fs.mkdir(`${info.homeDir}/.codex/sessions`, { recursive: true })
-      const wrongTranscript = transcript.replaceAll('Managed fixture saved answer', 'Wrong web-local answer')
-      await fs.writeFile(wrongPath, wrongTranscript)
+      await rig.prepareCoincidentFreshCodexHistory(rig.exactRuntimeHandle(view))
       const lifecyclePath = path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')
       const readLifecycle = async () => (await fs.readFile(lifecyclePath, 'utf8'))
         .split('\n').filter(Boolean).map((line) => JSON.parse(line))
@@ -362,8 +343,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         desiredState: 'running', launchState: 'running', recoveryState: 'live' })
       expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
-      expect((await rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath]))).toBe(transcript)
-      expect(await fs.readFile(wrongPath, 'utf8')).toBe(wrongTranscript)
+      expect(await rig.freshCodexSavedHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
+      expect(await rig.coincidentFreshCodexHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
       await expectOriginalConversation()
       expect(sent.slice(controllerSentBaseline).filter((frame) => frame.type === 'freshAgent.create'
         || frame.type === 'pane.reconcile.request')).toHaveLength(0)
@@ -460,8 +441,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await expectOriginalConversation()
       expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
-      expect((await rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath]))).toBe(transcript)
-      expect(await fs.readFile(wrongPath, 'utf8')).toBe(wrongTranscript)
+      expect(await rig.freshCodexSavedHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
+      expect(await rig.coincidentFreshCodexHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
       const managedReceipts = rig.runtime.broker.receipts().filter((receipt) => receipt.soulId === view.soulId)
       expect(managedReceipts).toHaveLength(1)
       expect(managedReceipts[0].containerId).toBe(view.containerId)

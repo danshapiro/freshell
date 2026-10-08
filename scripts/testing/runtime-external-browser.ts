@@ -817,6 +817,18 @@ export class ExternalManagedRuntimeRig {
     return { runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, soulId: view.soulId,
       incarnationId: view.incarnationId, containerId: view.containerId, hostBootId: view.hostBootId, nativeSessionId: view.nativeSessionId }
   }
+  async prepareFreshCodexSavedHistory(handle: ExactRuntimeHandle): Promise<{ bytes: number }> {
+    return this.rpc('freshcodex-history-prepare', z.object({ bytes: z.number().int().positive() }).strict(), { handle })
+  }
+  async freshCodexSavedHistoryUnchanged(handle: ExactRuntimeHandle): Promise<boolean> {
+    return this.rpc('freshcodex-history-unchanged', z.boolean(), { handle })
+  }
+  async prepareCoincidentFreshCodexHistory(handle: ExactRuntimeHandle): Promise<void> {
+    await this.rpc('freshcodex-coincident-prepare', z.object({ completed: z.literal(true) }).strict(), { handle })
+  }
+  async coincidentFreshCodexHistoryUnchanged(handle: ExactRuntimeHandle): Promise<boolean> {
+    return this.rpc('freshcodex-coincident-unchanged', z.boolean(), { handle })
+  }
   async fixtureNativeState(handle: ExactRuntimeHandle): Promise<FixtureNativeState> {
     return this.rpc('fixture-state', z.object({ nativeSessionId: z.literal(handle.nativeSessionId),
       pendingDecisionId: z.string().min(1).nullable(), dispatchCount: z.number().int().nonnegative(),
@@ -1421,6 +1433,10 @@ export function createExternalRuntimeControl(
         result = await owner.publishPhase3BrowserReceipt(handle(), request.phase3Browser)
         break
       case 'crash-provider-worker': await owner.crashProviderWorker(handle()); result = { completed: true }; break
+      case 'freshcodex-history-prepare': result = await owner.prepareFreshCodexSavedHistory(handle()); break
+      case 'freshcodex-history-unchanged': result = await owner.freshCodexSavedHistoryUnchanged(handle()); break
+      case 'freshcodex-coincident-prepare': await owner.prepareCoincidentFreshCodexHistory(handle()); result = { completed: true }; break
+      case 'freshcodex-coincident-unchanged': result = await owner.coincidentFreshCodexHistoryUnchanged(handle()); break
       case 'fixture-state': result = await owner.fixtureNativeState(handle()); break
       case 'fixture-worker': result = await owner.fixtureWorkerFacts(handle()); break
       case 'provider-volume': result = await owner.providerVolumeFacts(handle()); break
