@@ -783,7 +783,7 @@ async fn confirm_claude_callback_candidate(
         plan_revision: plan.plan_revision,
         candidate_binding: None,
     };
-    let request = bind_claude_candidate_request(
+    let (request, mut frozen_plan) = bind_claude_candidate_request_and_plan(
         store,
         directory,
         ObserveClaudeSourcesRequest {
@@ -815,9 +815,11 @@ async fn confirm_claude_callback_candidate(
             "Claude recovery candidate evidence unavailable; both private generations retained");
         "Claude current candidate native source evidence unavailable; retain inputs and reprepare"
     })?;
-    let mut compared = plan.clone();
+    // A replay's files were selected by its frozen manifest, which may differ
+    // from the newly observed baseline. Two current observations agreeing on
+    // drift cannot authorize an older selection without a deliberate replan.
     if crate::managed_provider_references::claude::accept_candidate_observation(
-        &mut compared,
+        &mut frozen_plan,
         &source,
         &reply,
     )? {
@@ -2903,6 +2905,20 @@ fn bind_claude_candidate_request(
     directory: &Path,
     request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
 ) -> Result<freshell_runtime_protocol::ObserveClaudeSourcesRequest, String> {
+    bind_claude_candidate_request_and_plan(store, directory, request).map(|(request, _)| request)
+}
+
+fn bind_claude_candidate_request_and_plan(
+    store: &CapabilityStore,
+    directory: &Path,
+    request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+) -> Result<
+    (
+        freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+        freshell_platform::claude_inputs::AcceptedNativeSourcePlan,
+    ),
+    String,
+> {
     use freshell_platform::claude_inputs::{observation::CandidateBinding, ClaudeInputManifest};
     use freshell_runtime_protocol::{
         bounded_json_bytes, ClaudeCandidatePublication, PreparedProviderContext,
@@ -3005,7 +3021,7 @@ fn bind_claude_candidate_request(
         .map_err(|_| blocked())?;
     bounded_json_bytes(&bound, MAX_CONTROL_FRAME_BYTES).map_err(|_| blocked())?;
     tracing::debug!(event="provider.inputs.claude_candidate.request_bound",soul_id=%bound.soul_id,plan_revision=bound.observation_request.plan_revision,"Frozen Claude candidate request bound to its issuer");
-    Ok(bound)
+    Ok((bound, plan.clone()))
 }
 
 pub(crate) fn bind_prepared_claude_candidate(
@@ -7167,6 +7183,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             "digest",
             "identity",
             "none",
+            "pending_selection_drift",
             "replacement",
             "candidate_digest",
         ] {
@@ -7240,8 +7257,9 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                                         version: 1, native_source_runtime: selected.native_source_runtime,
                                         setting_sources: selected.setting_sources, uid: if fault == "identity" { 0 } else { 65534 },
                                         euid: if fault == "identity" { 0 } else { 65534 }, gid: 0, egid: 0,
-                                        supplementary_groups: vec![], local_settings: vec![selected.cwd.join(".claude/settings.local.json")], cwd: selected.cwd, home: Some(selected.home),
-                                        roots: None, local_decision: LocalDecision::NoRoot,
+                                        supplementary_groups: vec![], local_settings: vec![selected.cwd.join(".claude/settings.local.json")], cwd: selected.cwd.clone(), home: Some(selected.home),
+                                        roots: (fault == "pending_selection_drift").then(|| freshell_platform::claude_inputs::git::Roots { checkout: selected.cwd.clone(), canonical: selected.cwd }),
+                                        local_decision: if fault == "pending_selection_drift" { LocalDecision::CwdRoot } else { LocalDecision::NoRoot },
                                         root_uid: None, git_uid: None, claude_uid: None,
                                     },
                                 })
@@ -7267,7 +7285,10 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             .await;
             let _ = settled.send(());
             let observations = reader.await.unwrap();
-            if matches!(fault, "none" | "replacement" | "candidate_digest") {
+            if matches!(
+                fault,
+                "none" | "replacement" | "candidate_digest" | "pending_selection_drift"
+            ) {
                 assert_eq!(observations, vec![false, true], "both pending replay and new replacement must confirm their actual candidate before any consumer");
             } else {
                 assert_eq!(
@@ -7336,7 +7357,10 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 std::fs::read(prior_stage.join(".freshell/prepared-context.json")).unwrap(),
                 prior_before
             );
-            if matches!(fault, "digest" | "identity" | "none") {
+            if matches!(
+                fault,
+                "digest" | "identity" | "none" | "pending_selection_drift"
+            ) {
                 assert_eq!(
                     std::fs::read(pending_stage.join(".freshell/prepared-result.json")).unwrap(),
                     pending_before
