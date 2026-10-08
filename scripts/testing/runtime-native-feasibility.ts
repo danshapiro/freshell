@@ -1260,11 +1260,9 @@ async function executeManagedOpenCodeTuiDisposal(harness: RuntimeHarness,
       || report.nativeSessionId !== source.rootId || report.nativeMessageCount !== 2 || report.producerActive !== false) {
       throw new Error('actual disposed TUI native namespace/current binding differs')
     }
-    // Baseline/native store existence cannot admit input after its real
-    // producer scope has been disposed. Stop then cancels the original wait.
-    const input = await harness.adminRaw(supervisor, harness.terminalInputBody(request.params.soulId, 'Owned disposed native input probe.\r'))
-    harness.writeArtifact(`${scenario}-input-refusal.json`, input)
-    if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('disposed native TUI admitted ordinary input')
+    // Capture the unadmitted native store before Stop. Input serializes with
+    // the launch, so first cancel that wait through the ordinary Stop intent.
+    harness.writeArtifact(`${scenario}-unadmitted-view-before-stop.json`, view)
     stopped = await harness.adminOk(supervisor, harness.stopBody(request.params.soulId))
     await pending
     if (failure) throw failure
@@ -1275,12 +1273,17 @@ async function executeManagedOpenCodeTuiDisposal(harness: RuntimeHarness,
     harness.writeArtifact(`${scenario}-current-view.json`, current)
     if (!reply.result?.Err || stopped.data?.outcome !== 'verified_empty' || current.launchState !== 'stopped'
       || current.desiredState !== 'stopped' || current.nativeIdentityObservation) throw new Error('disposed native TUI Stop did not finish unobserved empty runtime')
+    const input = await harness.adminRaw(supervisor, harness.terminalInputBody(request.params.soulId, 'Owned disposed native input probe.\r'))
+    harness.writeArtifact(`${scenario}-input-refusal.json`, input)
+    if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('disposed native TUI admitted ordinary input')
     const original = { caseId: 'disposal', ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
       nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256, profileSha256: namespace.profileSha256,
-      artifactReferences: [`${scenario}-supported-disposal.json`, `${scenario}-namespace-native-private.json`, `${scenario}-input-refusal.json`, `${scenario}-ordinary-stop.json`],
+      artifactReferences: [`${scenario}-supported-disposal.json`, `${scenario}-namespace-native-private.json`,
+        `${scenario}-unadmitted-view-before-stop.json`, `${scenario}-input-refusal.json`, `${scenario}-ordinary-stop.json`],
       assertions: [{ name: 'supported-real-plugin-scope-disposed-before-publication', pass: report.outcome === 'disposed_before_publication' },
         { name: 'actual-native-pinned-current-root-store-and-normal-uid-tls', pass: namespace.nativeMessageCount === 2 },
-        { name: 'disposed-native-producer-never-admits-running-or-input', pass: input.result.Err.code === 'UNKNOWN_SOUL' },
+        { name: 'disposed-native-producer-never-admits-running-or-input', pass: view.launchState === 'starting'
+          && !view.nativeIdentityObservation && !current.nativeIdentityObservation && input.result.Err.code === 'UNKNOWN_SOUL' },
         { name: 'ordinary-stop-finishes-disposed-unobserved-startup', pass: stopped.data.outcome === 'verified_empty' && current.launchState === 'stopped' }] }
     harness.writeArtifact(`${scenario}-original.json`, original)
     return original
