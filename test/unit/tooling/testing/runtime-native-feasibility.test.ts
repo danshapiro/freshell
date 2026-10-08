@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { execFile, execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
 import { describe, expect, it, vi } from 'vitest'
@@ -7,6 +8,7 @@ import path from 'node:path'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { createServer } from 'node:net'
 import { createServer as createHttpServer } from 'node:http'
+import { DatabaseSync } from 'node:sqlite'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
@@ -29,6 +31,55 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['freshcodex','freshopencode'].flatMap(mode => ['valid','copied-volume','wrong-incarnation','wrong-root','store-changed','profile-changed'].map(fault => [mode,fault])))('executes exact receiver recovery only after completed native history and preserves its original volume (%s, %s; controlled orchestration)', async (mode,fault) => {
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'receiver-exact-recovery-')), provider=mode==='freshcodex'?'codex':'opencode'
+    const root=provider==='codex'?randomUUID():'ses_ownedFixture', turn=randomUUID(), container='owned-initial', replacement='owned-replacement'
+    const raw=Buffer.from([
+      {type:'session_meta',payload:{id:root,model_provider:'openai'}},
+      {type:'turn_context',payload:{turn_id:turn,model:'gpt-5.6-luna',effort:'low'}},
+      {type:'response_item',payload:{type:'message',role:'assistant',id:'msg-owned',content:[{type:'output_text',text:'stored'}]}},
+      {type:'event_msg',timestamp:'2026-10-08T09:00:00Z',payload:{type:'task_complete',turn_id:turn,last_agent_message:'stored'}},
+    ].map(row=>JSON.stringify(row)).join('\n')+'\n')
+    const databasePath=path.join(directory,'controlled-native.db'),database=new DatabaseSync(databasePath)
+    database.exec('CREATE TABLE session(id TEXT); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);')
+    database.prepare('INSERT INTO session VALUES (?)').run(root)
+    database.prepare('INSERT INTO message VALUES (?,?,?,?)').run('msg-owned',root,1,JSON.stringify({role:'assistant',time:{completed:1},providerID:'openai',modelID:'gpt-5.6-luna'}))
+    database.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('part-owned',root,'msg-owned',1,JSON.stringify({type:'text',text:'stored'}));database.close()
+    const querySnapshot=fs.readFileSync(databasePath)
+    let seeded=false,probed=false,dead=false
+    const view=(current=false)=>({launchState:'running',recoveryState:'live',containerId:current?replacement:container,
+      incarnationId:current&&fault!=='wrong-incarnation'?'new-inc':'initial-inc',nativeSessionId:current&&fault==='wrong-root'?'other-root':root,
+      nativeIdentityObservation:{nativeSessionId:current&&fault==='wrong-root'?'other-root':root,incarnationId:current&&fault!=='wrong-incarnation'?'new-inc':'initial-inc',
+        launchNonce:current?'new-nonce':'initial-nonce',evidenceRevision:current?1:0,evidenceDigest:'a'.repeat(64),source:'fresh_provider_handshake'}})
+    const harness={testRoot:directory,evidenceDir:directory,runId:ownerId,candidateSha,imageRef:imageDigest,
+      startSupervisor:async()=>({}),writeArtifact:(name:string,value:unknown)=>fs.writeFileSync(path.join(directory,name),JSON.stringify(value)),
+      probeRecoveryBody:()=>({method:'probe_recovery'}),recoverBody:()=>({method:'recover'}),
+      broker:{receipts:()=>[{containerId:container,providerVolumeName:'owned-original-volume'},{containerId:replacement,providerVolumeName:fault==='copied-volume'?'copied-volume':'owned-original-volume'}]},
+      killOwnedRuntimeExact:async()=>{expect(seeded&&probed).toBe(true);dead=true},waitForContainerExit:async()=>{expect(dead).toBe(true)},
+      adminOk:async(_supervisor:unknown,request:any)=>{
+        if(request.method==='launch')return{data:{view:view()}}
+        if(request.method==='fresh_agent_send'){seeded=true;return{data:{state:'dispatched'}}}
+        if(request.method==='probe_recovery'){expect(seeded).toBe(true);probed=true;return{data:{kind:'reattach_ready'}}}
+        if(request.method==='recover'){expect(dead).toBe(true);return{data:{outcome:'recovered',view:view(true)}}}
+        throw new Error('unexpected receiver command')
+      },
+      execOwnedContainerAsExact:async(id:string,_uid:string,argv:string[])=>{
+        if(argv[2]===receiverNativeNamespace)return JSON.stringify({uid:65534,gid:0,caps:'0000000000000000',readOnlyRoot:true,httpsStatus:200,tlsVerifyMode:2,tlsCheckHostname:true,
+          nativeCwd:path.join(directory,`${mode}-exact-resume-workspace`),nativeVersion:provider==='codex'?'codex-cli 0.147.0':'1.18.21',
+          executableSha256:'e'.repeat(64),profileSha256:dead&&fault==='profile-changed'?'f'.repeat(64):'d'.repeat(64),nativeRoot:root,nativeMessageCount:seeded?2:0,activeNativeProcesses:1})
+        expect(seeded).toBe(true)
+        const bytes=dead&&fault==='store-changed'?Buffer.from(raw.toString().replaceAll('stored','changed')):raw
+        return JSON.stringify({nativeRoot:provider==='codex'?root:null,path:provider==='codex'?`/home/freshell/provider/.codex/sessions/rollout-${root}.jsonl`:'/home/freshell/provider/.local/share/opencode/opencode.db',identity:['1',dead&&fault==='store-changed'?'2':'3',String(bytes.length)],sha256:createHash('sha256').update(bytes).digest('hex'),bytesBase64:provider==='codex'?bytes.toString('base64'):null,
+          querySnapshotBase64:querySnapshot.toString('base64'),querySnapshotSha256:createHash('sha256').update(querySnapshot).digest('hex'),completeEof:true})
+      },
+    } as unknown as RuntimeHarness
+    const sources=['env_file','auth_file','ca_file'].map(suffix=>({name:`${provider}/grants/${suffix}`,path:'/owned/'+suffix,sha256:'e'.repeat(64)}))
+    try{
+      const run=executeManagedNativeCase(harness,sources,{mode:mode as 'freshcodex'|'freshopencode',case:'startup'},'exact-resume')
+      if(fault==='valid'){const original=await run;expect(original.assertions.every(row=>row.pass)).toBe(true);expect(original.assertions.some(row=>row.name==='original-owned-volume-transcript-continuity')).toBe(true)}
+      else await expect(run).rejects.toThrow()
+    }finally{fs.rmSync(directory,{recursive:true,force:true})}
+  })
   it.each(['valid', 'wrong-root', 'wrong-directory', 'parent-root', 'foreign-history', 'root-http-error', 'missing-tag'])('executes the real native session HTTP reader through an owned process fixture (%s; no provider qualification)', async (fault) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-serve-reader-')), proc = path.join(directory, 'proc'), processRoot = path.join(proc, '26')
     const workspace = path.join(directory, 'session-workspace'), globalCwd = path.join(directory, 'global-server')
@@ -1720,6 +1771,26 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
       fs.rmSync(directory, { recursive: true, force: true })
       if (scratch) fs.rmSync(scratch, { recursive: true, force: true })
       if (generatedProfileRoot) fs.rmSync(generatedProfileRoot, { recursive: true, force: true })
+    }
+  })
+  it.each(['freshcodex','freshopencode'] as const)('holds receiver paid recovery after failed initial create (%s; entrypoint orchestration only)', async mode => {
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'receiver-paid-hold-')),provider=mode==='freshcodex'?'codex':'opencode'
+    const manifest=path.join(directory,'artifacts.json'),previous=process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
+    fs.writeFileSync(manifest,JSON.stringify({candidateSha,imageDigest,artifacts:{supervisor:{path:'/fixture/supervisor',sha256:'c'.repeat(64)},host:{path:'/fixture/host',sha256:'d'.repeat(64)}},
+      sourceFiles:['env_file','auth_file','ca_file'].map(suffix=>({name:`${provider}/grants/${suffix}`,path:'/fixture/'+suffix,sha256:'e'.repeat(64)}))}))
+    process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE=manifest
+    let scratch=''
+    const prepare=vi.spyOn(RuntimeHarness.prototype,'prepareNativeArtifacts').mockImplementation(async function(input){scratch=this.testRoot;fs.mkdirSync(scratch,{recursive:true});return{supervisorPath:'/fixture/supervisor',hostPath:'/fixture/host',files:input.sourceFiles}})
+    const start=vi.spyOn(RuntimeHarness.prototype,'startSupervisor').mockResolvedValue({} as never),write=vi.spyOn(RuntimeHarness.prototype,'writeArtifact').mockReturnValue('fixture')
+    const admin=vi.spyOn(RuntimeHarness.prototype,'adminOk').mockRejectedValue(new Error('controlled failed native create'))
+    const cleanup=vi.spyOn(RuntimeHarness.prototype,'cleanup').mockResolvedValue({ok:true,errors:[]})
+    try{
+      await expect(runNativeFeasibility(['--mode',mode,'--case','startup'])).rejects.toThrow('native experiment cases failed')
+      expect(admin).toHaveBeenCalledTimes(1);expect(start).toHaveBeenCalledTimes(1);expect(cleanup).toHaveBeenCalledTimes(1)
+    }finally{
+      prepare.mockRestore();start.mockRestore();write.mockRestore();admin.mockRestore();cleanup.mockRestore()
+      if(previous===undefined)delete process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE;else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE=previous
+      if(scratch)fs.rmSync(scratch,{recursive:true,force:true});fs.rmSync(directory,{recursive:true,force:true})
     }
   })
   it('prepares only exact private native artifacts and selected source copies without ambient mounts', async () => {

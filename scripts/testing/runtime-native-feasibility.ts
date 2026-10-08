@@ -6,6 +6,9 @@ import os from 'node:os'
 import { createConnection } from 'node:net'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from './runtime-sandbox.js'
+import { readCodexNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/codex.js'
+import { readOpenCodeNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/opencode.js'
+import type { NativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/types.js'
 
 export type NativeProvider = 'claude' | 'codex' | 'opencode' | 'amplifier'
 export type NativeMode = 'freshclaude' | 'kilroy' | 'freshcodex' | 'freshopencode'
@@ -339,9 +342,11 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
       candidateSha: manifest.candidateSha, ownerId: harness.runId,
       execute: async (caseId) => {
         const amplifierSeed = selection.provider === 'amplifier' && ['exact-resume', 'old-writer', 'native-followup', 'current-native-turn'].includes(caseId)
+        const receiverMode = ['freshcodex', 'freshopencode'].includes(selection.mode ?? '')
+        const receiverSeed = receiverMode && ['exact-resume', 'wrong-root', 'current-native-turn'].includes(caseId)
         const paidCase = selection.case === 'approval-checkpoint'
           || (selection.provider === 'claude' && ['exact-resume', 'fork-root', 'restoration-failure-after-hook'].includes(caseId))
-          || amplifierSeed
+          || amplifierSeed || receiverSeed
         if (paidPrerequisiteFailed && paidCase) {
           throw new Error('prior native prerequisite failed; no further paid operation started')
         }
@@ -349,7 +354,8 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
         catch (error) {
           if (selection.case === 'approval-checkpoint'
             || (selection.provider === 'claude' && caseId === 'create')
-            || (selection.provider === 'amplifier' && caseId === 'create') || amplifierSeed) paidPrerequisiteFailed = true
+            || (selection.provider === 'amplifier' && caseId === 'create') || amplifierSeed
+            || (receiverMode && caseId === 'create') || receiverSeed) paidPrerequisiteFailed = true
           const reason = error instanceof Error ? error.message : 'unknown native case failure'
           harness.writeArtifact(`native-case-${caseId}-failure.json`, { severity: 'error',
             event: 'runtime.native_feasibility.case_failed', caseId, reason })
@@ -388,8 +394,8 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && caseId === 'create') {
-    return executeManagedReceiverCreate(harness, sources, selection.mode as 'freshcodex' | 'freshopencode')
+  if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume'].includes(caseId)) {
+    return executeManagedReceiverNative(harness, sources, selection.mode as 'freshcodex' | 'freshopencode', caseId)
   }
   if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
@@ -681,9 +687,9 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
   return original
 }
 
-async function executeManagedReceiverCreate(harness: RuntimeHarness,
-  sources: { name: string; path: string; sha256: string }[], mode: 'freshcodex' | 'freshopencode'): Promise<NativeExperimentOriginal> {
-  const provider = mode === 'freshcodex' ? 'codex' : 'opencode', scenario = `${mode}-create`
+async function executeManagedReceiverNative(harness: RuntimeHarness,
+  sources: { name: string; path: string; sha256: string }[], mode: 'freshcodex' | 'freshopencode', caseId: string): Promise<NativeExperimentOriginal> {
+  const provider = mode === 'freshcodex' ? 'codex' : 'opencode', scenario = `${mode}-${caseId}`
   const references = ['env_file', 'auth_file', 'ca_file'].map(suffix => {
     const source = sources.find(file => file.name === `${provider}/grants/${suffix}`)
     if (!source) throw new Error(`selected ${provider} ${suffix} reference missing`)
@@ -731,15 +737,145 @@ async function executeManagedReceiverCreate(harness: RuntimeHarness,
     || !/^[a-f0-9]{64}$/.test(namespace.executableSha256 ?? '') || !/^[a-f0-9]{64}$/.test(namespace.profileSha256 ?? '')) {
     throw new Error('actual native receiver namespace/profile/pin/TLS differs')
   }
-  const original: NativeExperimentOriginal = { caseId: 'create', ownerId: harness.runId, imageDigest: harness.imageRef,
+  const assertions = [{ name: 'actual-native-receiver-current-observation-before-input', pass: true },
+    { name: 'actual-selected-native-process-profile-uid-and-tls', pass: true }]
+  if (caseId === 'exact-resume') {
+    const receipt = await harness.adminOk(supervisor, { method: 'fresh_agent_send', params: { soulId,
+      text: 'Reply stored. Do not use any tools.' } })
+    harness.writeArtifact(`${scenario}-seed-dispatch.json`, receipt)
+    const deadline = Date.now() + 90_000
+    let before: Awaited<ReturnType<typeof captureReceiverStore>> | undefined, attempt = 0
+    while (Date.now() < deadline) {
+      try {
+        const captured = await captureReceiverStore(harness, view.containerId, provider, view.nativeSessionId, scenario, `seed-${++attempt}`)
+        if (captured.history.turns.length === 1 && captured.history.turns[0]!.text) { before = captured; break }
+      } catch (error) {
+        harness.writeArtifact(`${scenario}-seed-inspection-${attempt}-diagnostic.json`, { reason: error instanceof Error ? error.message : 'native store not yet complete' })
+      }
+      await new Promise(resolve => setTimeout(resolve, 200))
+    }
+    if (!before || before.history.turns.some(turn => turn.toolCalls.length || turn.resolvedModel !== 'gpt-5.6-luna'
+      || turn.resolvedProvider !== 'openai' || (provider === 'codex' && turn.resolvedReasoningEffort !== 'low'))) {
+      throw new Error('bounded native receiver seed did not complete with selected native profile and zero tools')
+    }
+    const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
+    harness.writeArtifact(`${scenario}-before-death-store-probe.json`, probe)
+    if (probe.data.kind !== 'reattach_ready') throw new Error('completed native receiver store was not readable before death')
+    const originalVolume = harness.broker.receipts().find(row => row.containerId === view.containerId)?.providerVolumeName
+    if (!originalVolume) throw new Error('original owned native provider volume missing')
+    await harness.killOwnedRuntimeExact(view.containerId)
+    await harness.waitForContainerExit(view.containerId)
+    const recovery = await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+    harness.writeArtifact(`${scenario}-recovery.json`, recovery)
+    const current = recovery.data.view, observed = current?.nativeIdentityObservation
+    if (recovery.data.outcome !== 'recovered' || current.launchState !== 'running' || current.recoveryState !== 'live'
+      || current.incarnationId === view.incarnationId || current.containerId === view.containerId
+      || current.nativeSessionId !== view.nativeSessionId || observed?.nativeSessionId !== view.nativeSessionId
+      || observed.incarnationId !== current.incarnationId || observed.source !== 'fresh_provider_handshake'
+      || !observed.launchNonce || observed.launchNonce === observation.launchNonce
+      || !Number.isSafeInteger(observed.evidenceRevision) || observed.evidenceRevision <= observation.evidenceRevision
+      || harness.broker.receipts().find(row => row.containerId === current.containerId)?.providerVolumeName !== originalVolume) {
+      throw new Error('native receiver replacement did not bind current identity to the original owned volume')
+    }
+    const afterNamespace = JSON.parse(await harness.execOwnedContainerAsExact(current.containerId, '65534:0',
+      ['python3', '-c', receiverNativeNamespace, provider, view.nativeSessionId, workspace]))
+    harness.writeArtifact(`${scenario}-replacement-namespace-private.json`, afterNamespace)
+    if (afterNamespace.uid !== 65534 || afterNamespace.gid !== 0 || afterNamespace.caps !== namespace.caps
+      || !afterNamespace.readOnlyRoot || afterNamespace.httpsStatus !== 200 || afterNamespace.tlsVerifyMode !== 2
+      || !afterNamespace.tlsCheckHostname || afterNamespace.nativeCwd !== workspace || afterNamespace.nativeVersion !== namespace.nativeVersion
+      || afterNamespace.executableSha256 !== namespace.executableSha256 || afterNamespace.profileSha256 !== namespace.profileSha256
+      || afterNamespace.activeNativeProcesses !== 1 || (provider === 'opencode' && afterNamespace.nativeRoot !== view.nativeSessionId)) {
+      throw new Error('native receiver replacement selected a different namespace or profile')
+    }
+    const after = await captureReceiverStore(harness, current.containerId, provider, view.nativeSessionId, scenario, 'after-recovery')
+    const sameFile = before.snapshot.path === after.snapshot.path
+      && before.snapshot.identity.slice(0, 2).every((value: string, index: number) => value === after.snapshot.identity[index])
+    // SQLite recovery can checkpoint its WAL into the same physical database.
+    // Its query-consistent native history must remain identical; JSONL also
+    // retains the original complete byte prefix on that same file.
+    const originalPrefix = provider === 'opencode' || Buffer.from(after.snapshot.bytesBase64, 'base64')
+      .subarray(0, Buffer.from(before.snapshot.bytesBase64, 'base64').length).equals(Buffer.from(before.snapshot.bytesBase64, 'base64'))
+    if (!sameFile || !originalPrefix || JSON.stringify(after.history) !== JSON.stringify(before.history)) {
+      throw new Error('original native receiver completed history changed before replacement input')
+    }
+    assertions.push({ name: 'readable-completed-native-store-before-death', pass: true },
+      { name: 'replacement-new-incarnation-same-native-root', pass: true },
+      { name: 'original-owned-volume-transcript-continuity', pass: true },
+      { name: 'same-workspace-selected-native-profile', pass: true })
+  }
+  const original: NativeExperimentOriginal = { caseId, ownerId: harness.runId, imageDigest: harness.imageRef,
     candidateSha: harness.candidateSha, nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256,
     profileSha256: createHash('sha256').update(JSON.stringify({ settings, nativeProfileSha256: namespace.profileSha256 })).digest('hex'),
     artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace-private.json`],
-    assertions: [{ name: 'actual-native-receiver-current-observation-before-input', pass: true },
-      { name: 'actual-selected-native-process-profile-uid-and-tls', pass: true }] }
+    assertions }
   harness.writeArtifact(`${scenario}-original.json`, original)
   return original
 }
+
+async function captureReceiverStore(harness: RuntimeHarness, containerId: string, provider: 'codex' | 'opencode',
+  root: string, scenario: string, label: string): Promise<{ snapshot: any; history: NativeHistory }> {
+  const snapshot = JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
+    ['python3', '-c', receiverStoreSnapshot, provider, root]))
+  harness.writeArtifact(`${scenario}-${label}-store-private.json`, snapshot)
+  if ((provider === 'codex' && snapshot.nativeRoot !== root) || !Array.isArray(snapshot.identity) || snapshot.identity.length < 2
+    || !snapshot.completeEof || !/^[a-f0-9]{64}$/.test(snapshot.sha256 ?? '')) throw new Error('actual native store capture invalid')
+  let history: NativeHistory
+  if (provider === 'codex') {
+    const bytes = Buffer.from(snapshot.bytesBase64, 'base64')
+    if (createHash('sha256').update(bytes).digest('hex') !== snapshot.sha256 || bytes.at(-1) !== 10) throw new Error('native rollout capture digest/EOF differs')
+    const directory = path.join(harness.evidenceDir, `${scenario}-${label}-native-copy`)
+    fs.mkdirSync(directory, { mode: 0o700 })
+    fs.writeFileSync(path.join(directory, `rollout-${root}.jsonl`), bytes, { mode: 0o600 })
+    history = readCodexNativeHistory(directory, root)
+  } else {
+    const bytes = Buffer.from(snapshot.querySnapshotBase64, 'base64')
+    if (createHash('sha256').update(bytes).digest('hex') !== snapshot.querySnapshotSha256) throw new Error('actual native SQLite snapshot digest differs')
+    const copy = path.join(harness.evidenceDir, `${scenario}-${label}-native-copy.db`)
+    fs.writeFileSync(copy, bytes, { mode: 0o600, flag: 'wx' })
+    history = readOpenCodeNativeHistory(copy, root)
+  }
+  if (history.schemaVersion !== 1 || history.provider !== provider || history.nativeSessionId !== root
+    || !Array.isArray(history.turns) || history.turns.some(turn => !turn.nativeEvidence || !Array.isArray(turn.toolCalls))) {
+    throw new Error('actual native history reader returned a different root or schema')
+  }
+  harness.writeArtifact(`${scenario}-${label}-history-private.json`, history)
+  return { snapshot, history }
+}
+
+export const receiverStoreSnapshot = String.raw`
+import os,sys,pathlib,json,hashlib,base64,re,sqlite3
+provider,root=sys.argv[1:];assert provider in ['codex','opencode'] and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}',root)
+assert os.getuid()==65534 and os.getgid()==0
+home=pathlib.Path('/home/freshell/provider');files=[]
+if provider=='codex':
+ directory=home/'.codex/sessions'
+ for file in directory.glob('**/*.jsonl'):
+  if root not in file.name:continue
+  assert file.is_file() and not file.is_symlink() and file.resolve()==file
+  with file.open('rb') as source:
+   first=source.readline(1024*1024+1);assert len(first)<=1024*1024
+  row=json.loads(first)
+  if row.get('type')=='session_meta' and root in [row.get('payload',{}).get('id'),row.get('payload',{}).get('session_id')]:files.append(file)
+ assert len(files)==1
+ file=files[0]
+else:file=home/'.local/share/opencode/opencode.db'
+assert file.is_file() and not file.is_symlink() and file.resolve()==file
+identity=lambda stat:[str(stat.st_dev),str(stat.st_ino),str(stat.st_size),str(stat.st_mtime_ns),str(stat.st_ctime_ns)]
+with file.open('rb') as source:
+ before=os.fstat(source.fileno());raw=source.read(8*1024*1024+1);after=os.fstat(source.fileno())
+assert len(raw)<=8*1024*1024 and identity(before)==identity(after)==identity(file.stat()) and raw
+assert provider!='codex' or raw.endswith(b'\n')
+query_snapshot=None
+if provider=='opencode':
+ for suffix in ['-wal','-shm']:
+  companion=pathlib.Path(str(file)+suffix)
+  assert not companion.exists() or companion.is_file() and not companion.is_symlink() and companion.resolve()==companion
+ with sqlite3.connect(file.as_uri()+'?mode=ro',uri=True) as source,sqlite3.connect(':memory:') as memory:
+  source.execute('PRAGMA query_only=ON');source.execute('PRAGMA trusted_schema=OFF');source.backup(memory)
+  query_snapshot=memory.serialize();assert len(query_snapshot)<=8*1024*1024
+ assert identity(after)==identity(file.stat())
+print(json.dumps({'nativeRoot':root if provider=='codex' else None,'path':str(file),'identity':identity(after),'sha256':hashlib.sha256(raw).hexdigest(),'bytesBase64':base64.b64encode(raw).decode() if provider=='codex' else None,'querySnapshotBase64':base64.b64encode(query_snapshot).decode() if query_snapshot is not None else None,'querySnapshotSha256':hashlib.sha256(query_snapshot).hexdigest() if query_snapshot is not None else None,'completeEof':True}))
+`
 
 export const receiverNativeNamespace = String.raw`
 import os,sys,json,pathlib,hashlib,subprocess,ssl,urllib.request,urllib.parse
