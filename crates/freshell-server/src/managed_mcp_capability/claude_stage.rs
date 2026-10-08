@@ -444,6 +444,65 @@ mod tests {
     };
 
     #[cfg(unix)]
+    fn execute_copied_script(path: &Path) -> std::io::Result<std::process::Output> {
+        // A parallel fork can briefly inherit a writer before close-on-exec.
+        // ETXTBSY creates no child, so retry only that transient spawn error;
+        // still execute the actual copied script and fail every other error.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match std::process::Command::new(path).output() {
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_copied_script_exec_waits_only_for_transient_owned_writer() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR")
+            .unwrap_or_else(|| std::env::temp_dir().into());
+        let owned = tempfile::tempdir_in(root).unwrap();
+        let script = owned.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'executed-complete-script'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(writer);
+        });
+        let result = execute_copied_script(&script);
+        release.join().unwrap();
+        let output = result
+            .expect("a transient inherited writer cannot make executable resource coverage flaky");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"executed-complete-script");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .unwrap();
+        let started = std::time::Instant::now();
+        let result = execute_copied_script(&script);
+        drop(writer);
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ETXTBSY));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            execute_copied_script(&script).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn managed_provider_claude_resume_selects_current_project_and_keeps_explicit_origins() {
         use freshell_platform::claude_inputs::NativeSourceRuntime;
@@ -539,11 +598,9 @@ mod tests {
             ));
             std::fs::remove_dir_all(&original).unwrap();
             std::fs::remove_dir_all(&resumed).unwrap();
-            let output = std::process::Command::new(
-                stage.join(&current.stage_relative_path).join("run.cjs"),
-            )
-            .output()
-            .unwrap();
+            let output =
+                execute_copied_script(&stage.join(&current.stage_relative_path).join("run.cjs"))
+                    .unwrap();
             assert!(
                 output.status.success(),
                 "{}",
@@ -870,7 +927,7 @@ mod tests {
                 );
                 if let Some(mount) = mount {
                     let executable = stage.join(&mount.stage_relative_path).join("run.cjs");
-                    let output = std::process::Command::new(&executable).output().unwrap();
+                    let output = execute_copied_script(&executable).unwrap();
                     assert!(
                         output.status.success(),
                         "{case}: selected {category} executable"
