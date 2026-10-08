@@ -28,7 +28,6 @@ import {
 import {
   buildPhase5LossReceipt,
   PHASE5_CAPABILITY_INVENTORY_FILE,
-  PHASE5_LOSS_ASSERTIONS_FILE,
 } from '../../../scripts/testing/runtime-phase5-loss-evidence.js'
 
 function leavesByMode(node: any, mode: string): any[] {
@@ -129,11 +128,6 @@ function waitForRunningView(
     const view = await rig.runningViewForTerminal(terminalId)
     return view?.containerId ? view : null
   }, timeoutMs)
-}
-
-function writePrivateJson(filePath: string, value: unknown): void {
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 0o600 })
-  fs.chmodSync(filePath, 0o600)
 }
 
 test.describe.serial('Phase 5 certified provider loss', () => {
@@ -308,10 +302,8 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       expect(incidentArtifact.certificateSha256).toMatch(/^[0-9a-f]{64}$/)
       expect(incidentArtifact.certificate.intentRevision).toBe(before.intentRevision)
       expect(result.view.intentRevision).toBe(before.intentRevision + 1)
-      writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_LOSS_ASSERTIONS_FILE), {
+      await rig.publishLossAssertions(result.incidentId, {
         schemaVersion: 2,
-        candidateSha: rig.runtime.candidateSha,
-        receiptRunId: rig.runtime.runId,
         caseId: 'P5-G02',
         test: { total: 1, passed: 1, failed: 0, skipped: 0 },
         identity: {
@@ -321,7 +313,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
           soulId: before.soulId,
           incarnationId: before.incarnationId,
           containerId: before.containerId,
-          hostBootId: before.hostBootId,
+          hostBootId: workerHandle.hostBootId,
           nativeSessionIdHash: incidentArtifact.certificate.nativeSessionRefHash,
           incidentId: result.incidentId,
           paneId,

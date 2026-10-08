@@ -15,7 +15,7 @@ import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
-import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type SupervisorInstance, type Phase3BrowserObservation } from '../../../../scripts/testing/runtime-sandbox.js'
+import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type SupervisorInstance, type Phase3BrowserObservation, type RuntimeLossAssertions } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 import { stopManagedRuntimeSoul } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { structuredChaosLog } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
@@ -1410,7 +1410,7 @@ describe('closed external owner control', () => {
       inventory.mockResolvedValue([row])
       const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
         createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
-      Object.assign(owned.runtime, { phase: 5, evidenceDir: directory, broker: { receipts: () => [receipt] } })
+      Object.assign(owned.runtime, { phase: 5, evidenceDir: directory, lifecyclePath: path.join(directory, 'lifecycle.jsonl'), broker: { receipts: () => [receipt] } })
       owned.supervisor = { scenarioId: 'loss-owned', containerId: 'a'.repeat(64), controlSocket: '/owned/socket',
         controlSecret: 'private-owned-control', controlSecretFile: '/owned/secret', runtimeRoot: '/owned/runtime',
         volumeName: 'owned-supervisor-volume', binaryKind: 'release' }
@@ -1450,6 +1450,23 @@ describe('closed external owner control', () => {
       const digest = createHash('sha256').update(await fsp.readFile(published)).digest('hex')
       expect(observed.artifactRef).toBe(`phase5-loss-incident:${digest}`)
       expect(JSON.stringify(wire)).not.toContain('private-body-marker')
+      const assertions: RuntimeLossAssertions = { schemaVersion: 2, caseId: 'P5-G02', test: { total: 1, passed: 1, failed: 0, skipped: 0 },
+        identity: { provider: 'opencode', providerVersion: '1.18.21', model: 'custody-only', soulId: row.soulId,
+          incarnationId: row.incarnationId, containerId: row.containerId, hostBootId: row.hostBootId,
+          nativeSessionIdHash: artifact.certificate.nativeSessionRefHash, incidentId, paneId: 'owned-pane', terminalId: 'owned-terminal' },
+        intent: { checkedRevision: 4, lossRevision: 4, endedRevision: 5 },
+        providerState: { exactAbsenceChecks: [], credentialIntegrity: [] },
+        browser: { routineNoticeCount: 0, recoveryCards: [], endedPane: {} } }
+      const assertionRef = await rig.publishLossAssertions(incidentId, assertions)
+      const assertionPath = path.join(directory, 'phase5-loss-assertions.json')
+      const assertionBytes = await fsp.readFile(assertionPath)
+      expect(JSON.parse(assertionBytes.toString())).toEqual({ ...assertions,
+        candidateSha: context.candidateSha, receiptRunId: context.runId })
+      expect((await fsp.stat(assertionPath)).mode & 0o777).toBe(0o600)
+      expect(assertionRef.artifactRef).toBe(`phase5-loss-assertions:${createHash('sha256').update(assertionBytes).digest('hex')}`)
+      await expect(owned.publishLossAssertions(incidentId, { ...assertions,
+        identity: { ...assertions.identity, nativeSessionIdHash: `sha256:${'0'.repeat(64)}` } })).rejects.toThrow(/incident/)
+      expect(await fsp.readFile(assertionPath)).toEqual(assertionBytes)
       command.mockClear()
       await expect(owned.lossIncidentEvidence('incident-foreign')).rejects.toThrow(/observed/)
       expect(command).not.toHaveBeenCalled()
