@@ -229,7 +229,7 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
       candidateSha: manifest.candidateSha, ownerId: harness.runId,
       execute: async (caseId) => {
         const paidCase = selection.case === 'approval-checkpoint'
-          || (selection.provider === 'claude' && ['exact-resume', 'restoration-failure-after-hook'].includes(caseId))
+          || (selection.provider === 'claude' && ['exact-resume', 'fork-root', 'restoration-failure-after-hook'].includes(caseId))
         if (paidPrerequisiteFailed && paidCase) {
           throw new Error('prior native prerequisite failed; no further paid operation started')
         }
@@ -275,7 +275,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'claude' && ['create', 'wrong-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
   if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
@@ -430,7 +430,8 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
   const restorationFailure = caseId === 'restoration-failure-after-hook'
-  const resumes = ['exact-resume', 'current-native-turn', 'restoration-failure-after-hook'].includes(caseId)
+  const forkRoot = caseId === 'fork-root'
+  const resumes = ['exact-resume', 'current-native-turn', 'fork-root', 'restoration-failure-after-hook'].includes(caseId)
   const nativeTimeout = caseId === 'timeout'
   const trustRefusal = caseId === 'trust-refusal'
   const unwritableSignal = caseId === 'unwritable-signal'
@@ -474,10 +475,10 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   fs.mkdirSync(userRoot, { recursive: true, mode: 0o700 })
   fs.copyFileSync(preferences.path, preferencePath)
   fs.chmodSync(preferencePath, 0o600)
-  if (restorationFailure) {
+  if (restorationFailure || forkRoot) {
     const local = path.join(workspace, '.claude'); fs.mkdirSync(local, { mode: 0o770 }); fs.chmodSync(local, 0o770)
-    const hookPath = path.join(workspace, 'native-restoration-fault.mjs')
-    fs.writeFileSync(hookPath, terminalRestorationFaultHook, { mode: 0o660 }); fs.chmodSync(hookPath, 0o660)
+    const hookPath = path.join(workspace, forkRoot ? 'native-fork-fault.mjs' : 'native-restoration-fault.mjs')
+    fs.writeFileSync(hookPath, forkRoot ? terminalForkFaultHook : terminalRestorationFaultHook, { mode: 0o660 }); fs.chmodSync(hookPath, 0o660)
     fs.writeFileSync(path.join(local, 'settings.json'), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{
       type: 'command', command: "node '" + hookPath.replaceAll("'", "'\\''") + "'",
     }] }] } }), { mode: 0o660 })
@@ -558,7 +559,7 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
     limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
     terminal: { terminalId: 'native-terminal-' + randomUUID(), streamId: 'native-stream-' + randomUUID(),
       mode: 'claude', program: 'claude', args: ['--settings', settings, '--session-id', actualRoot,
-        '--model', 'claude-haiku-4-5-20251001', '--effort', 'low'],
+        '--model', 'claude-haiku-4-5-20251001', '--effort', 'low', ...(forkRoot ? ['--fork-session'] : [])],
       env: { HOME: '/home/freshell/provider', CLAUDE_CONFIG_DIR: '/home/freshell/provider/.claude', TERM: 'xterm-256color' },
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
       providerModel: 'claude-haiku-4-5-20251001', providerReasoningEffort: 'low', providerSecretReferences: managedPreparation?.secretReferences ?? grants,
@@ -827,6 +828,12 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
     harness.writeArtifact(`${scenario}-completed-store-probe.json`, probe)
     if (probe.data.kind !== 'reattach_ready') throw new Error('completed terminal Claude store not readable before death')
+    if (forkRoot) {
+      const controlPath = path.join(workspace, 'native-fork-fault-control.json')
+      fs.writeFileSync(controlPath, JSON.stringify({ root: nativeRoot, seedSha256: seed.transcript.sha256,
+        seedBytes: Buffer.from(seed.transcript.bytesBase64, 'base64').length, identity: seed.transcript.identity.slice(0, 2) }), { mode: 0o660 })
+      fs.chmodSync(controlPath, 0o660)
+    }
     if (restorationFailure) {
       const mutation = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c', String.raw`
 import pathlib,json,hashlib,os,sys
@@ -859,10 +866,37 @@ print(json.dumps({'root':root,'beforeSha256':hashlib.sha256(raw).hexdigest(),'af
     }
     await harness.killOwnedRuntimeExact(view.containerId)
     await harness.waitForContainerExit(view.containerId)
-    const recovery = restorationFailure ? await harness.adminRaw(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+    const recovery = restorationFailure || forkRoot ? await harness.adminRaw(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
       : await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
     harness.writeArtifact(`${scenario}-recovery.json`, recovery)
-    if (restorationFailure) {
+    if (forkRoot) {
+      const faultPath = path.join(workspace, 'native-fork-fault-observation.json')
+      const deadline = Date.now() + 3_000
+      while (!fs.existsSync(faultPath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50))
+      const fault = JSON.parse(fs.readFileSync(faultPath, 'utf8'))
+      harness.writeArtifact(`${scenario}-fork-native-event-private.json`, fault)
+      const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+      harness.writeArtifact(`${scenario}-fork-current-inventory.json`, inventory)
+      const current = inventory.data.filter((row: any) => row.soulId === soulId)
+      const contained = recovery.result?.Ok?.data?.outcome === 'blocked' && current.every((row: any) =>
+        row.launchState !== 'running' && row.nativeIdentityObservation?.incarnationId !== fault.launch.incarnationId)
+      const currentNativeFork = fault.native.source === 'resume' && fault.native.session_id !== nativeRoot
+        && fault.launch.requestedNativeSessionId === nativeRoot
+        && fault.launch.incarnationId !== view.incarnationId && fault.launch.launchNonce !== namespace.hook.launch.launchNonce
+        && fault.uid === 65534 && fault.gid === 0 && fault.nativeExecutableSha256 === namespace.executableSha256
+        && fault.nativeArgv.includes('--fork-session') && fault.nativeArgv.includes('--resume')
+      const originalRetained = fault.originalPrefixSha256 === seed.transcript.sha256
+        && JSON.stringify(fault.identity) === JSON.stringify(seed.transcript.identity.slice(0, 2))
+      if (!contained || !currentNativeFork || !originalRetained) throw new Error('actual native fork root was not contained before input')
+      const input = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned blocked native fork probe. Do not use tools.\r'))
+      harness.writeArtifact(`${scenario}-fork-input-refusal.json`, input)
+      if (!input.result?.Err) throw new Error('actual native fork admitted ordinary input')
+      assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
+        { name: 'genuine-native-exact-resume-fork-selected-a-different-root', pass: currentNativeFork },
+        { name: 'original-owned-root-file-retained-across-refused-fork', pass: originalRetained },
+        { name: 'native-fork-refused-running-and-current-observation', pass: contained },
+        { name: 'native-fork-refused-ordinary-input', pass: !!input.result?.Err })
+    } else if (restorationFailure) {
       const faultPath = path.join(workspace, 'native-restoration-fault-observation.json')
       const deadline = Date.now() + 6_000
       while (!fs.existsSync(faultPath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50))
@@ -1505,6 +1539,32 @@ print(json.dumps({'nativeRoot':root,'nativePid':int(p.name),'transcript':{'ident
 
 // Reads the currently owned native child and its exact hook-selected transcript.
 // Raw bytes are saved only in the run's private artifact; reports use metadata.
+export const terminalForkFaultHook = String.raw`
+import fs from 'node:fs'
+import path from 'node:path'
+import {createHash} from 'node:crypto'
+const digest=bytes=>createHash('sha256').update(bytes).digest('hex')
+let input='';for await(const chunk of process.stdin)input+=chunk
+const native=JSON.parse(input)
+if(native.source==='resume') {
+ const workspace=process.cwd(),control=JSON.parse(fs.readFileSync(path.join(workspace,'native-fork-fault-control.json'),'utf8'))
+ const launch=JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH)
+ if(launch.requestedNativeSessionId!==control.root || native.cwd!==workspace) throw new Error('owned native fork binding mismatch')
+ if(!native.session_id || native.session_id===control.root) throw new Error('actual native fork root missing')
+ const selected='/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe',nativeExecutableSha256=digest(fs.readFileSync(selected))
+ const pids=fs.readdirSync('/proc').filter(id=>/^\d+$/.test(id)).filter(id=>{try{return digest(fs.readFileSync('/proc/'+id+'/exe'))===nativeExecutableSha256}catch{return false}})
+ if(pids.length!==1)throw new Error('current native fork writer ambiguous')
+ const pid=pids[0],nativeArgv=fs.readFileSync('/proc/'+pid+'/cmdline').toString().split('\0').filter(Boolean)
+ const file=path.resolve(path.dirname(native.transcript_path),control.root+'.jsonl'),store=path.resolve(process.env.CLAUDE_CONFIG_DIR,'projects')+path.sep
+ if(!file.startsWith(store) || !fs.lstatSync(file).isFile() || fs.lstatSync(file).isSymbolicLink())throw new Error('unowned original fork store refused')
+ const before=fs.statSync(file),original=fs.readFileSync(file),after=fs.statSync(file)
+ if(before.dev!==after.dev || before.ino!==after.ino || original.at(-1)!==10)throw new Error('native original fork store changed during capture')
+ fs.writeFileSync(path.join(workspace,'native-fork-fault-observation.json'),JSON.stringify({native,launch,nativePid:Number(pid),nativeExecutableSha256,nativeArgv,
+  uid:process.getuid(),gid:process.getgid(),originalPrefixSha256:digest(original.subarray(0,control.seedBytes)),identity:[String(after.dev),String(after.ino)]}),{mode:0o664})
+}
+process.stdout.write('{}\n')
+`
+
 export const terminalRestorationFaultHook = String.raw`
 import fs from 'node:fs'
 import path from 'node:path'

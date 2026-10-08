@@ -8,7 +8,7 @@ import { createServer } from 'node:net'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, staleNativeSignalBindingMatches, terminalRestorationFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, staleNativeSignalBindingMatches, terminalRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -27,6 +27,22 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['startup', 'wrong-requested-root', 'foreign-workspace', 'same-native-root'])('requires an actual owned different native root before recording a fork (%s)', (fault) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-fork-hook-'))
+    const hookPath = path.join(directory, 'fork.mjs')
+    fs.writeFileSync(hookPath, terminalForkFaultHook)
+    fs.writeFileSync(path.join(directory, 'native-fork-fault-control.json'), JSON.stringify({root:'original-root'}))
+    const launch = {requestedNativeSessionId:fault === 'wrong-requested-root'?'other-requested-root':'original-root'}
+    const input = JSON.stringify({source:fault === 'startup'?'startup':'resume', session_id:fault === 'same-native-root'?'original-root':'actual-fork-root', cwd:fault === 'foreign-workspace'?directory+'-other':directory})
+    try {
+      const run = () => execFileSync(process.execPath,[hookPath],{cwd:directory,input,encoding:'utf8',
+        env:{...process.env,FRESHELL_NATIVE_IDENTITY_LAUNCH:JSON.stringify(launch)},stdio:['pipe','pipe','pipe']})
+      if(fault === 'startup')expect(JSON.parse(run())).toEqual({})
+      else expect(run).toThrow(fault === 'same-native-root'?'actual native fork root missing':'owned native fork binding mismatch')
+      expect(fs.existsSync(path.join(directory,'native-fork-fault-observation.json'))).toBe(false)
+    } finally {fs.rmSync(directory,{recursive:true,force:true})}
+  })
+
   it.each(['startup', 'foreign-root', 'foreign-workspace'])('keeps native history unchanged before an owned restoration fault is bound (%s)', (fault) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-restoration-hook-'))
     const hookPath = path.join(directory, 'fault.mjs'), transcript = path.join(directory, 'owned.jsonl')
@@ -45,8 +61,8 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     } finally {fs.rmSync(directory,{recursive:true,force:true})}
   })
 
-  it('requires the owned real managed controller before a native after-hook restoration fault can seed', async () => {
-    await expect(executeManagedNativeCase({} as RuntimeHarness, [], {provider: 'claude', case: 'startup'}, 'restoration-failure-after-hook'))
+  it.each(['fork-root','restoration-failure-after-hook'])('requires the owned real managed controller before the native %s fault can seed', async (caseId) => {
+    await expect(executeManagedNativeCase({} as RuntimeHarness, [], {provider: 'claude', case: 'startup'}, caseId))
       .rejects.toThrow('actual terminal recovery requires the owned real server artifact')
   })
 
