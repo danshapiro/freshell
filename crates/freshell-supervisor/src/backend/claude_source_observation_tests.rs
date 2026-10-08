@@ -455,6 +455,22 @@ async fn provider_claude_source_helper_uses_private_bound_ipc_without_creating_s
     }
 }
 
+#[tokio::test]
+async fn provider_claude_retained_baseline_consumes_frozen_aliases_without_native_data() {
+    for mode in [
+        "retained-success",
+        "retained-terminal-success",
+        "retained-writable-report",
+        "retained-wrong-bind-source",
+        "retained-missing-report",
+        "retained-duplicate-report",
+        "retained-missing-template",
+        "retained-changed-manifest",
+    ] {
+        qualify_transport(mode).await;
+    }
+}
+
 async fn qualify_transport(mode: &'static str) {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
@@ -487,24 +503,139 @@ async fn qualify_transport(mode: &'static str) {
             daemon_id: daemon.clone(),
         },
     };
+    let retained = mode.starts_with("retained-");
+    let stage = temp.path().join("prior-stage");
+    let native_home = temp.path().join("native-home");
+    let resource_relative = ".freshell/provider-roots/frozen-hook";
+    let consumed = Arc::new(Mutex::new(None::<Vec<u8>>));
+    let owner = if retained {
+        use freshell_runtime_protocol::{IncarnationId, InstallationId, LaunchNonce};
+        std::fs::create_dir(workspace.join(".claude/hooks")).unwrap();
+        std::fs::write(
+            workspace.join(".claude/hooks/unselected-decoy"),
+            b"PRIVATE_UNSELECTED_WORKSPACE_HOOK_SENTINEL",
+        )
+        .unwrap();
+        std::fs::create_dir_all(stage.join(".freshell/resource-units/frozen-hook")).unwrap();
+        std::fs::create_dir_all(stage.join(".freshell/templates")).unwrap();
+        std::fs::create_dir_all(native_home.join(".claude/projects")).unwrap();
+        std::fs::write(
+            native_home.join(".claude/projects/native-history.jsonl"),
+            b"PRIVATE_NATIVE_HISTORY_SENTINEL",
+        )
+        .unwrap();
+        std::fs::write(
+            native_home.join(".claude/.credentials.json"),
+            b"PRIVATE_NATIVE_CREDENTIAL_SENTINEL",
+        )
+        .unwrap();
+        let manifest = b"{}";
+        std::fs::write(stage.join(".freshell/input-manifest.json"), manifest).unwrap();
+        std::fs::write(
+            stage.join(".freshell/templates/frozen-settings"),
+            r#"{"env":{"ORDINARY_MARKER":"frozen-config"}}"#,
+        )
+        .unwrap();
+        for root in [
+            native_home.join(resource_relative),
+            stage.join(".freshell/resource-units/frozen-hook"),
+        ] {
+            std::fs::create_dir_all(root.join("node_modules/frozen-dependency")).unwrap();
+            std::fs::write(root.join("resource"), b"frozen-resource").unwrap();
+            std::fs::write(
+                root.join("node_modules/frozen-dependency/index.js"),
+                "module.exports='installed-dependency'",
+            )
+            .unwrap();
+            std::fs::write(root.join("consume.cjs"), "const fs=require('node:fs');process.stdout.write(JSON.parse(fs.readFileSync(process.argv[2])).env.ORDINARY_MARKER+':'+fs.readFileSync(__dirname+'/resource')+':'+require('frozen-dependency'));").unwrap();
+        }
+        let generation = format!("grant-{}", uuid::Uuid::new_v4());
+        let context: freshell_runtime_protocol::ProviderLaunchContext = serde_json::from_value(json!({
+            "preparation":{"claude":{"mcp_args":[]}}, "config":[],
+            "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
+            "preparedInputs":{"generationId":generation,
+                "manifest":{"relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(manifest)),"sourceCount":0,"aliasCount":0,"recipeCount":0},
+                "configBinds":[{"sourceRelativePath":".freshell/templates/frozen-settings","logicalDestination":workspace.join(".claude/settings.local.json"),"effectiveDestination":workspace.join(".claude/settings.local.json")}],
+                "resourceMounts":[{"stageRelativePath":".freshell/resource-units/frozen-hook","providerRelativePath":resource_relative,"logicalDestination":workspace.join(".claude/hooks"),"effectiveDestination":workspace.join(".claude/hooks"),"kind":"directory"}]}
+        })).unwrap();
+        context.validate("claude").unwrap();
+        if mode == "retained-missing-template" {
+            std::fs::remove_file(stage.join(".freshell/templates/frozen-settings")).unwrap();
+        } else if mode == "retained-changed-manifest" {
+            std::fs::write(
+                stage.join(".freshell/input-manifest.json"),
+                b"changed ordinary manifest",
+            )
+            .unwrap();
+        }
+        let (terminal, agent) = if mode == "retained-terminal-success" {
+            (Some(serde_json::from_value(json!({
+                "terminalId":"synthetic-terminal", "streamId":"synthetic-stream", "mode":"claude", "program":"claude", "args":[], "env":{},
+                "cwd":workspace,"workspacePath":workspace,"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"synthetic-project","providerLaunchContext":context
+            })).unwrap()),None)
+        } else {
+            (None,Some(serde_json::from_value(json!({
+            "sessionId":"synthetic-session", "provider":"claude", "sessionType":"freshclaude", "runtimeVariant":"claude", "providerStoreId":"synthetic-store",
+            "cwd":workspace, "workspacePath":workspace, "runAsUid":65534, "runAsGid":0, "providerLaunchContext":context
+        })).unwrap()))
+        };
+        ClaudeSourceOwner::Retained {
+            handle: OwnedRuntimeHandle::from_registry(
+                InstallationId::new(),
+                reservation.soul_id.clone(),
+                IncarnationId::new(),
+                LaunchNonce::new(),
+                daemon.clone(),
+                "owned-native-container-must-not-stop".into(),
+                reservation.image_ref.clone(),
+                temp.path().into(),
+                reservation.binary.clone(),
+                "synthetic-owned-config-digest".into(),
+                freshell_runtime_protocol::RuntimeLimits {
+                    cpu_milli: 500,
+                    memory_bytes: 256 * 1024 * 1024,
+                    swap_bytes: 0,
+                    pids_max: 32,
+                },
+                None,
+                terminal,
+                agent,
+                "owned-retained-home".into(),
+            ),
+            recovery_source: None,
+        }
+    } else {
+        owner
+    };
     let request: ObserveClaudeSourcesRequest = serde_json::from_value(json!({
         "expectedControlEpoch":registry.control_epoch(), "soulId":soul, "provider":"claude",
         "authority":{"kind":"initial_reservation","reservationId":reservation.id},
         "workspacePath":workspace,"gitCommonDir":null,"candidate":null,
         "observationRequest":{"version":1,"requestId":uuid::Uuid::new_v4().to_string(),
-            "nativeSourceRuntime":"terminal","cwd":workspace,"home":"/home/freshell/provider",
+            "nativeSourceRuntime":if retained && mode!="retained-terminal-success" {"sdk"} else {"terminal"},"cwd":workspace,"home":"/home/freshell/provider",
             "settingSources":["local"],"selectorManifestSha256":"b".repeat(64),"planRevision":0}
     }))
     .unwrap();
+    let mut request = request;
+    if retained {
+        request.authority = ClaudeSourceAuthority::RecoveryAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+        };
+    }
     assert!(matches!(
         request.authority,
         ClaudeSourceAuthority::InitialReservation { .. }
+            | ClaudeSourceAuthority::RecoveryAttempt { .. }
     ));
     let requests = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
     let helper_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
     let listener = UnixListener::bind(temp.path().join("docker.sock")).unwrap();
     let seen = requests.clone();
     let bodies = helper_bodies.clone();
+    let consumer = consumed.clone();
+    let retained_root = native_home.clone();
+    let settings_target = workspace.join(".claude/settings.local.json");
+    let hooks_target = workspace.join(".claude/hooks");
     let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let mut jobs = JoinSet::new();
@@ -513,7 +644,7 @@ async fn qualify_transport(mode: &'static str) {
                 _ = &mut stopped => break,
                 accepted = listener.accept() => {
                     let (mut stream, _) = accepted.unwrap();
-                    let (seen, bodies, daemon) = (seen.clone(), bodies.clone(), daemon.clone());
+                    let (seen, bodies, daemon, consumer, retained_root, settings_target, hooks_target) = (seen.clone(), bodies.clone(), daemon.clone(), consumer.clone(), retained_root.clone(), settings_target.clone(), hooks_target.clone());
                     jobs.spawn(async move {
                         let mut header = Vec::new();
                         let mut byte = [0];
@@ -533,7 +664,8 @@ async fn qualify_transport(mode: &'static str) {
                         let (status, response) = if line.contains("/info ") {
                             (200, json!({"ID":daemon,"SecurityOptions":if mode=="nonrootless" {vec![]} else {vec!["name=rootless"]}}))
                         } else if line.starts_with("GET") && line.contains("/volumes/") {
-                            (if mode=="existing_initial_home" {200} else {404}, json!({}))
+                            if retained { (200,json!({"Name":"owned-retained-home","Driver":"local","Options":{},"Mountpoint":retained_root})) }
+                            else { (if mode=="existing_initial_home" {200} else {404}, json!({})) }
                         } else if line.starts_with("GET") && line.contains("/images/") {
                             (200, json!({"Config":{"Env":["ANTHROPIC_API_KEY=PRIVATE_IMAGE_CREDENTIAL_SENTINEL","PATH=/usr/bin"]}}))
                         } else if line.starts_with("POST") && line.contains("/containers/create?") {
@@ -543,12 +675,30 @@ async fn qualify_transport(mode: &'static str) {
                             match bodies.lock().unwrap().last().cloned() {
                                 Some(mut body) => {
                                     if mode=="cleanup_mismatch" && line.contains("/freshell-claude-source-") {body["User"]=json!("foreign-identity");}
-                                    (200, json!({"Id":"b".repeat(64),"Config":body,"HostConfig":body["HostConfig"],"State":{"Running":false}}))
+                                    let mut reports=body["HostConfig"]["Mounts"].as_array().unwrap().iter().map(|mount| {
+                                        json!({"Type":mount["Type"],"Destination":mount["Target"],"Source":if mount["Type"]=="volume" {json!(retained_root)} else {mount["Source"].clone()},"Name":if mount["Type"]=="volume" {mount["Source"].clone()} else {Value::Null},"RW":if mode=="retained-writable-report" && mount["Target"]==json!(hooks_target) {Some(true)} else {mount["ReadOnly"].as_bool().map(|ro|!ro)}})
+                                    }).collect::<Vec<_>>();
+                                    if mode=="retained-wrong-bind-source" {
+                                        reports.iter_mut().find(|report|report["Destination"]==json!(settings_target)).unwrap()["Source"]=json!("/synthetic/foreign-config");
+                                    } else if mode=="retained-missing-report" { reports.pop(); }
+                                    else if mode=="retained-duplicate-report" { let report=reports.iter().find(|report|report["Destination"]==json!(hooks_target)).unwrap().clone();reports.pop();reports.push(report); }
+                                    (200, json!({"Id":"b".repeat(64),"Config":body,"HostConfig":body["HostConfig"],"Mounts":reports,"State":{"Running":false}}))
                                 },
                                 None => (404, json!({})),
                             }
                         } else if line.starts_with("POST") && line.contains("/start ") {
                             let body = bodies.lock().unwrap().last().unwrap().clone();
+                            if retained {
+                                let mounts=body["HostConfig"]["Mounts"].as_array().unwrap();
+                                let config=mounts.iter().find(|mount|mount["Target"]==json!(settings_target) && mount["Type"]=="bind" && mount["ReadOnly"]==true);
+                                let resource=mounts.iter().find(|mount|mount["Target"]==json!(hooks_target) && mount["Type"]=="volume" && mount["Source"]=="owned-retained-home" && mount["ReadOnly"]==true);
+                                if let (Some(config),Some(resource))=(config,resource) {
+                                    let root=retained_root.join(resource["VolumeOptions"]["Subpath"].as_str().unwrap());
+                                    let output=std::process::Command::new("node").arg(root.join("consume.cjs")).arg(config["Source"].as_str().unwrap()).output().unwrap();
+                                    assert!(output.status.success(),"selected ordinary consumer failed");
+                                    *consumer.lock().unwrap()=Some(output.stdout);
+                                }
+                            }
                             let exchange = body["HostConfig"]["Mounts"].as_array().unwrap().iter()
                                 .find(|mount|mount["Target"]=="/run/freshell-source-exchange").unwrap()["Source"].as_str().unwrap().to_string();
                             let mut channel = UnixStream::connect(Path::new(&exchange).join("reply.sock")).await.unwrap();
@@ -602,14 +752,26 @@ async fn qualify_transport(mode: &'static str) {
         jobs.shutdown().await;
     });
     let backend = DockerEngineBackend::new(temp.path().join("docker.sock"));
-    let result = backend
-        .read_claude_source_helper(
-            &owner,
-            &request,
-            "synthetic-source-run",
-            Duration::from_millis(250),
-        )
-        .await;
+    let result = if retained {
+        backend
+            .read_claude_baseline_helper(
+                &owner,
+                &request,
+                "synthetic-source-run",
+                Duration::from_secs(3),
+                Some(&stage),
+            )
+            .await
+    } else {
+        backend
+            .read_claude_source_helper(
+                &owner,
+                &request,
+                "synthetic-source-run",
+                Duration::from_millis(250),
+            )
+            .await
+    };
     let _ = stop.send(());
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
@@ -617,7 +779,7 @@ async fn qualify_transport(mode: &'static str) {
         .unwrap();
     assert_eq!(
         result.is_ok(),
-        mode == "success",
+        mode == "success" || matches!(mode, "retained-success" | "retained-terminal-success"),
         "{mode}: unavailable, contradictory or unjoined evidence cannot be accepted"
     );
     if let Ok(reply) = result {
@@ -647,7 +809,13 @@ async fn qualify_transport(mode: &'static str) {
     let create = seen
         .iter()
         .find(|(line, _)| line.contains("/containers/create?"));
-    if matches!(mode, "nonrootless" | "existing_initial_home") {
+    if matches!(
+        mode,
+        "nonrootless"
+            | "existing_initial_home"
+            | "retained-missing-template"
+            | "retained-changed-manifest"
+    ) {
         assert!(
             create.is_none(),
             "unqualified creation namespace must not create a helper or native workload"
@@ -671,7 +839,10 @@ async fn qualify_transport(mode: &'static str) {
             .as_array()
             .unwrap()
             .iter()
-            .all(|mount| mount["Type"] == "bind" && mount["ReadOnly"] == true));
+            .all(
+                |mount| (mount["Type"] == "bind" || (retained && mount["Type"] == "volume"))
+                    && mount["ReadOnly"] == true
+            ));
     }
     if mode == "cleanup_mismatch" {
         assert!(
@@ -687,6 +858,37 @@ async fn qualify_transport(mode: &'static str) {
     assert!(
         std::fs::read(workspace.join(".claude/settings.local.json")).unwrap() == private.as_bytes()
     );
+    if retained {
+        if matches!(mode, "retained-success" | "retained-terminal-success") {
+            assert_eq!(consumed.lock().unwrap().as_deref(),Some(b"frozen-config:frozen-resource:installed-dependency".as_slice()),"retained baseline must consume the prior frozen config/resource aliases, leaving the workspace decoy unselected");
+        } else {
+            assert!(
+                consumed.lock().unwrap().is_none(),
+                "incomplete retained topology must block before any consumer"
+            );
+            assert!(!seen
+                .iter()
+                .any(|(line, _)| line.starts_with("POST") && line.contains("/start ")));
+        }
+        assert_eq!(
+            std::fs::read(workspace.join(".claude/hooks/unselected-decoy")).unwrap(),
+            b"PRIVATE_UNSELECTED_WORKSPACE_HOOK_SENTINEL"
+        );
+        assert_eq!(
+            std::fs::read(native_home.join(".claude/projects/native-history.jsonl")).unwrap(),
+            b"PRIVATE_NATIVE_HISTORY_SENTINEL"
+        );
+        assert_eq!(
+            std::fs::read(native_home.join(".claude/.credentials.json")).unwrap(),
+            b"PRIVATE_NATIVE_CREDENTIAL_SENTINEL"
+        );
+        assert!(seen.iter().all(|(_, raw)| !raw
+            .windows(b"PRIVATE_NATIVE_HISTORY_SENTINEL".len())
+            .any(|bytes| bytes == b"PRIVATE_NATIVE_HISTORY_SENTINEL")
+            && !raw
+                .windows(b"PRIVATE_NATIVE_CREDENTIAL_SENTINEL".len())
+                .any(|bytes| bytes == b"PRIVATE_NATIVE_CREDENTIAL_SENTINEL")));
+    }
 }
 
 async fn qualify_candidate_helper_transport(

@@ -12,6 +12,39 @@ fn fail(reason: &'static str) -> BackendError {
     BackendError::Unavailable(reason.into())
 }
 
+fn retained_claude_context(
+    handle: &OwnedRuntimeHandle,
+) -> Result<&freshell_runtime_protocol::ProviderLaunchContext, BackendError> {
+    let context = handle
+        .terminal()
+        .and_then(|spec| spec.provider_launch_context.as_ref())
+        .or_else(|| {
+            handle
+                .fresh_agent()
+                .and_then(|spec| spec.provider_launch_context.as_ref())
+        })
+        .ok_or_else(|| {
+            fail("Claude retained ordinary context unavailable; retain inputs and reprepare")
+        })?;
+    context.validate("claude").map_err(|_| {
+        fail("Claude retained ordinary context changed; retain inputs and reprepare")
+    })?;
+    let inputs = context.prepared_inputs.as_ref().ok_or_else(|| {
+        fail("Claude retained ordinary generation unavailable; retain inputs and reprepare")
+    })?;
+    if context
+        .mcp_capability
+        .as_ref()
+        .map(|grant| grant.grant_id.as_str())
+        != Some(inputs.generation_id.as_str())
+    {
+        return Err(fail(
+            "Claude retained ordinary generation changed; retain inputs and reprepare",
+        ));
+    }
+    Ok(context)
+}
+
 /// Ordinary candidate files use disk backing, separately from indexed secrets.
 /// The owning reader retains this identity through helper and volume cleanup.
 struct CandidateScratch {
@@ -807,6 +840,49 @@ fn owned_candidate_helper(actual: &Value, expected: &Value) -> bool {
         && owned_helper_profile(actual, expected)
 }
 
+fn verify_retained_claude_mount_reports(
+    actual: &Value,
+    expected: &Value,
+    volume: &Value,
+) -> Result<(), BackendError> {
+    let blocked = || {
+        tracing::warn!(
+            event = "provider.inputs.claude_baseline.blocked",
+            stage = "retained_source_view",
+            operation = "verify_reported_mounts",
+            cause = "incomplete_or_changed_topology",
+            "Claude retained ordinary source evidence unavailable"
+        );
+        fail("Claude retained source reported mount topology changed; retain inputs and reprepare")
+    };
+    let declared = expected["HostConfig"]["Mounts"]
+        .as_array()
+        .ok_or_else(blocked)?;
+    let reported = actual["Mounts"].as_array().ok_or_else(blocked)?;
+    if declared.len() != reported.len() || !volume["Mountpoint"].is_string() {
+        return Err(blocked());
+    }
+    for mount in declared {
+        let mut matches = reported
+            .iter()
+            .filter(|report| report["Destination"] == mount["Target"]);
+        let report = matches.next().ok_or_else(blocked)?;
+        if matches.next().is_some()
+            || mount["ReadOnly"] != true
+            || report["RW"] != false
+            || report["Type"] != mount["Type"]
+            || (mount["Type"] == "bind" && report["Source"] != mount["Source"])
+            || (mount["Type"] == "volume"
+                && (mount["Source"] != volume["Name"]
+                    || report["Name"] != volume["Name"]
+                    || report["Source"] != volume["Mountpoint"]))
+        {
+            return Err(blocked());
+        }
+    }
+    Ok(())
+}
+
 fn verify_candidate_mount_reports(
     actual: &Value,
     expected: &Value,
@@ -936,11 +1012,40 @@ impl DockerEngineBackend {
                 .read_claude_candidate_helper(owner, request, &root, test_run_id, budget)
                 .await;
         }
+        let prior_stage = match owner {
+            ClaudeSourceOwner::Initial { .. } => None,
+            ClaudeSourceOwner::Retained { handle, .. } => {
+                let context = retained_claude_context(handle)?;
+                let grant = context.mcp_capability.as_ref().unwrap();
+                Some(docker::staged_provider_root_for_grant(&grant.grant_id).map_err(|_| {
+                    fail("Claude retained frozen ordinary stage unavailable; retain inputs and reprepare")
+                })?)
+            }
+        };
+        self.read_claude_baseline_helper(
+            owner,
+            request,
+            test_run_id,
+            budget,
+            prior_stage.as_deref(),
+        )
+        .await
+    }
+
+    async fn read_claude_baseline_helper(
+        &self,
+        owner: &ClaudeSourceOwner,
+        request: &ObserveClaudeSourcesRequest,
+        test_run_id: &str,
+        budget: Duration,
+        prior_stage: Option<&Path>,
+    ) -> Result<ObservationReply, BackendError> {
         let name = format!("freshell-claude-source-{}", uuid::Uuid::new_v4());
         let mut attempted = false;
         let mut expected = None::<Value>;
         let mut directory = None::<native_auth::ExchangeDirectory>;
         let operation = async {
+            let mut retained_volume = None::<Value>;
             let (daemon, rootless) = self
                 .daemon_info()
                 .await
@@ -1012,6 +1117,7 @@ impl DockerEngineBackend {
                     {
                         return Err(fail("Claude retained HOME is unavailable; preserve native stores and repair the source"));
                     }
+                    retained_volume = Some(volume);
                     (
                         handle.installation_id(),
                         handle.soul_id(),
@@ -1066,11 +1172,31 @@ impl DockerEngineBackend {
                 json!({"Type":"bind","Source":workspace,"Target":workspace,"ReadOnly":true}),
                 json!({"Type":"bind","Source":directory.0,"Target":"/run/freshell-source-exchange","ReadOnly":true}),
             ];
-            if let Some(common) = common.filter(|common| !common.starts_with(&workspace)) {
+            if let Some(common) = common
+                .as_ref()
+                .filter(|common| !common.starts_with(&workspace))
+            {
                 mounts.push(json!({"Type":"bind","Source":common,"Target":common,"ReadOnly":true}));
             }
             let tmpfs = if let Some(volume) = retained {
                 mounts.push(json!({"Type":"volume","Source":volume,"Target":"/home/freshell/provider","ReadOnly":true,"VolumeOptions":{"NoCopy":true}}));
+                let ClaudeSourceOwner::Retained { handle, .. } = owner else {
+                    return Err(fail("Claude retained ordinary owner unavailable"));
+                };
+                let ordinary = docker::ordinary_claude_candidate_mounts(
+                    &workspace,
+                    common.as_deref(),
+                    prior_stage.ok_or_else(|| fail("Claude retained frozen ordinary stage unavailable; retain inputs and reprepare"))?,
+                    retained_claude_context(handle)?,
+                ).map_err(|_| fail("Claude retained frozen ordinary sources unavailable; retain inputs and reprepare"))?;
+                let mut aliases = prepared_inputs::mount_descriptors(&ordinary, volume)?;
+                // The workload's directories are writable. This observation
+                // reproduces their read view without allowing recovery lookup
+                // to mutate the retained ordinary or native provider store.
+                for alias in &mut aliases {
+                    alias["ReadOnly"] = json!(true);
+                }
+                mounts.extend(aliases);
                 json!({})
             } else {
                 json!({"/home/freshell/provider":"rw,nosuid,nodev,noexec,size=16m,uid=65534,gid=0,mode=0700"})
@@ -1132,6 +1258,9 @@ impl DockerEngineBackend {
                 return Err(fail(
                     "Claude source helper namespace/topology ownership changed",
                 ));
+            }
+            if let Some(volume) = &retained_volume {
+                verify_retained_claude_mount_reports(&actual, &body, volume)?;
             }
             let supervision = async {
                 let started = self
