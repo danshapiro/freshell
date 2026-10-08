@@ -703,7 +703,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (selection.provider === 'codex' && ['create', 'exact-resume', 'wrong-root', 'cancellation'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, 'codex', caseId, serverPath, servers)
   }
-  if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume', 'wrong-root'].includes(caseId)) {
+  if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume', 'wrong-root', 'cancellation'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, selection.mode as 'freshcodex' | 'freshopencode', caseId)
   }
   if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
@@ -1156,7 +1156,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     harness.writeArtifact(`${scenario}-original.json`, original)
     return original
   }
-  if (!terminal && caseId === 'wrong-root') {
+  if (!terminal && ['wrong-root', 'cancellation'].includes(caseId)) {
     const expectedRoot = provider === 'opencode' ? 'ses_' + randomUUID().replaceAll('-', '') : randomUUID()
     const faultRequest = { ...request, params: { ...request.params, nativeSessionId: expectedRoot,
       freshAgent: { ...freshAgent, nativeSessionId: expectedRoot } } }
@@ -1166,6 +1166,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     let finished = false, reply: any, failure: unknown
     const pending = harness.adminRaw(supervisor, faultRequest).then(value => { reply = value; finished = true },
       error => { failure = error; finished = true })
+    let stopPending: Promise<void> | undefined, stopReply: any, stopFailure: unknown
     try {
       let receipt: any, namespace: any, view: any
       const diagnostics: string[] = [], allocationStartedAt = Date.now(), allocationDeadline = allocationStartedAt + 6_000
@@ -1213,11 +1214,32 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       if (!receiverNativeNamespaceMatches(namespace, provider, workspace, receipt.nativeSessionId)
         || namespace.executableSha256 !== receipt.executableSha256
         || (provider === 'opencode' && namespace.nativeMessageCount !== 0)) throw new Error('actual native receiver namespace/profile/pin/TLS differs')
+      if (caseId === 'cancellation') {
+        await new Promise<void>(resolve => setImmediate(resolve))
+        if (finished) throw new Error('native receiver startup settled before ordinary Stop')
+        stopPending = harness.adminOk(supervisor, harness.stopBody(soulId)).then(value => { stopReply = value }, error => { stopFailure = error })
+        const intentDeadline = Date.now() + 1_000
+        let stoppedIntent: any
+        while (!finished && Date.now() < intentDeadline) {
+          const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+          const current = inventory.data.find((row: any) => row.soulId === soulId)
+          if (current?.desiredState === 'stopped' && current.launchState === 'starting'
+            && current.incarnationId === receipt.incarnationId && !current.nativeIdentityObservation) { stoppedIntent = current; break }
+          await new Promise(resolve => setTimeout(resolve, 25))
+        }
+        harness.writeArtifact(`${scenario}-stop-intent-before-response.json`, stoppedIntent ?? null)
+        if (!stoppedIntent || finished) throw new Error('ordinary fresh receiver Stop did not commit intent before native response')
+      }
       writeOwnedNativeReceiverControl(workspace, 'native-receiver-load-fault-release.json', {
         incarnationId: receipt.incarnationId, launchNonce: receipt.launchNonce,
         nativeSessionId: receipt.nativeSessionId, expectedRoot })
       await pending
       if (failure) throw failure
+      if (stopPending) {
+        await stopPending
+        if (stopFailure) throw stopFailure
+        harness.writeArtifact(`${scenario}-ordinary-stop.json`, stopReply)
+      }
       harness.writeArtifact(`${scenario}-launch-refusal.json`, reply)
       const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
       const current = inventory.data.find((row: any) => row.soulId === soulId)
@@ -1229,19 +1251,27 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
         : typeof reason === 'string' && reason.includes('native OpenCode loaded a different or parent-bearing root')
       if (reply.result?.Err?.code !== 'HOST_UNREACHABLE' || !nativeRefusal || !current || current.launchState === 'running'
         || current.nativeIdentityObservation) throw new Error('actual native wrong-root guard did not refuse provider startup')
+      if (caseId === 'cancellation' && (stopReply?.data?.outcome !== 'verified_empty' || current.launchState !== 'stopped'
+        || current.desiredState !== 'stopped' || current.recoveryState !== 'stopped')) {
+        throw new Error('ordinary fresh receiver Stop did not confirm empty stopped intent')
+      }
       const input = await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: { soulId, text: 'Owned wrong-root input refusal probe. Do not use tools.' } })
       harness.writeArtifact(`${scenario}-input-refusal.json`, input)
       if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('actual fresh wrong-root admitted input')
       const original: NativeExperimentOriginal = { caseId, ownerId: harness.runId, imageDigest: harness.imageRef,
         candidateSha: harness.candidateSha, nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256,
         profileSha256: createHash('sha256').update(JSON.stringify({ settings, nativeProfileSha256: namespace.profileSha256 })).digest('hex'),
-        artifactReferences: [`${scenario}-launch-refusal.json`, `${scenario}-current-native-receiver.json`, `${scenario}-namespace-private.json`, `${scenario}-input-refusal.json`],
-        assertions: [{ name: 'actual-current-native-selected-different-root', pass: true },
+        artifactReferences: [`${scenario}-launch-refusal.json`, `${scenario}-current-native-receiver.json`, `${scenario}-namespace-private.json`, `${scenario}-input-refusal.json`,
+          ...(caseId === 'cancellation' ? [`${scenario}-stop-intent-before-response.json`, `${scenario}-ordinary-stop.json`] : [])],
+        assertions: [...(caseId === 'cancellation' ? [
+          { name: 'ordinary-stop-committed-before-native-response', pass: true },
+          { name: 'ordinary-stop-confirms-empty-stopped', pass: true }] : []),
+          { name: 'actual-current-native-selected-different-root', pass: true },
           { name: 'actual-native-wrong-root-guard-refused-before-running-and-input', pass: true },
           { name: 'actual-selected-native-process-profile-uid-and-tls-before-refusal', pass: true }] }
       harness.writeArtifact(`${scenario}-original.json`, original)
       return original
-    } finally { await pending }
+    } finally { await pending; await stopPending }
   }
   if (terminal && caseId === 'wrong-root') {
     // A requested root is an expectation only: the native app-server creates
