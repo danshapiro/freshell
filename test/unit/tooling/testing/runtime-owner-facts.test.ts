@@ -262,6 +262,45 @@ describe('fixed fresh Codex controller startup facts', () => {
   })
 })
 
+describe('fixed owned session-host process state', () => {
+  it('reads the exact tracked host PID and refuses absent or unobserved enclosures', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused host state web') })
+    const enclosure = rig.runtimeEnclosureHandle(handle)
+    const container = vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: true, running: true })
+    const pid = vi.spyOn(rig.runtime, 'ownedContainerHostPidExact').mockReturnValue(process.pid)
+    await expect(rig.ownedRuntimeHostState(enclosure)).resolves.toEqual({ pid: process.pid, stopped: false })
+    expect(container).toHaveBeenCalledExactlyOnceWith(enclosure)
+    expect(pid).toHaveBeenCalledExactlyOnceWith(enclosure.containerId)
+    const descriptor = external.resolveManagedExternalDescriptor({ FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+      FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws', FRESHELL_E2E_TARGET_TOKEN: 'private-token',
+      FRESHELL_RUNTIME_EXTERNAL_RUN_ID: rig.runtime.runId, FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: rig.runtime.candidateSha })!
+    const control = external.createExternalRuntimeControl(rig, descriptor)
+    const remote = new external.ExternalManagedRuntimeRig(descriptor, async (_url, init) => (
+      new Response(JSON.stringify(await control(JSON.parse(String(init?.body)))), { status: 200 })
+    ))
+    await expect(remote.ownedRuntimeHostState(enclosure)).resolves.toEqual({ pid: process.pid, stopped: false })
+    const beforeRefusal = pid.mock.calls.length
+    await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha, scenarioId: 'browser-managed-runtime',
+      operationId: 'foreign-host-status-path', action: 'host-process-state', enclosure, pid: 1, path: '/proc/1/status' })).rejects.toThrow(/operation/)
+    expect(pid.mock.calls).toHaveLength(beforeRefusal)
+
+    const read = vi.spyOn(fsp, 'readFile')
+    try {
+      read.mockResolvedValueOnce('Name: fixture-host\nState:\tT (stopped)\n')
+      await expect(rig.ownedRuntimeHostState(enclosure)).resolves.toEqual({ pid: process.pid, stopped: true })
+      expect(read).toHaveBeenCalledWith(`/proc/${process.pid}/status`, 'utf8')
+      container.mockResolvedValue({ present: false, running: false })
+      pid.mockClear(); read.mockClear()
+      await expect(rig.ownedRuntimeHostState(enclosure)).rejects.toThrow(/running/)
+      expect(pid).not.toHaveBeenCalled()
+      expect(read).not.toHaveBeenCalled()
+      container.mockRejectedValue(new Error('recorded host boot mismatch'))
+      await expect(rig.ownedRuntimeHostState(enclosure)).rejects.toThrow(/boot mismatch/)
+      expect(pid).not.toHaveBeenCalled()
+    } finally { read.mockRestore() }
+  })
+})
+
 describe('finite Phase 4 browser receipt publication', () => {
   it('writes the existing observation privately on its owner and refuses worker paths or transcript fields', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-phase4-receipt-'))

@@ -1045,6 +1045,8 @@ export const RuntimeChaosWebOutputFactsSchema = z.object({ contentSha256: z.stri
   contentBytes: z.number().int().nonnegative(), containsFollowUpMarker: z.boolean(), containsAuthToken: z.boolean() }).strict()
 export type RuntimeChaosWebOutputFacts = z.infer<typeof RuntimeChaosWebOutputFactsSchema>
 
+export const RuntimeHostProcessStateSchema = z.object({ pid: z.number().int().positive(), stopped: z.boolean() }).strict()
+export type RuntimeHostProcessState = z.infer<typeof RuntimeHostProcessStateSchema>
 export const OwnedContainerStateSchema = z.discriminatedUnion('present', [
   z.object({ present: z.literal(false), running: z.literal(false) }).strict(),
   z.object({ present: z.literal(true), running: z.boolean() }).strict(),
@@ -1084,7 +1086,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'provider-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'provider-receipt', 'fresh-agent-launch-facts', 'container-state', 'host-process-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -4199,6 +4201,14 @@ export class ManagedRuntimeOwner {
   private heldHostKey(handle: ExactRuntimeHandle): string {
     return JSON.stringify([handle.runId, handle.candidateSha, handle.soulId, handle.incarnationId,
       handle.containerId, handle.hostBootId, handle.nativeSessionId])
+  }
+
+  async ownedRuntimeHostState(handle: RuntimeEnclosureHandle): Promise<RuntimeHostProcessState> {
+    const container = await this.ownedContainerState(handle)
+    if (!container.present || !container.running) throw new Error('exact recorded running enclosure required for host process state')
+    const pid = this.runtime.ownedContainerHostPidExact(handle.containerId)
+    const status = await fsp.readFile(`/proc/${pid}/status`, 'utf8')
+    return RuntimeHostProcessStateSchema.parse({ pid, stopped: /State:\s+T/.test(status) })
   }
 
   async holdRuntimeHost(handle: ExactRuntimeHandle): Promise<{ pid: number }> {

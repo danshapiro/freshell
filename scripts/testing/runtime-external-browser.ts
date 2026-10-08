@@ -18,7 +18,7 @@ import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, R
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema, Phase4BrowserObservationSchema,
-  FreshCodexControllerStartupFactsSchema, FreshCodexRetainedSnapshotFactsSchema, FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
+  FreshCodexControllerStartupFactsSchema, FreshCodexRetainedSnapshotFactsSchema, FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHostProcessStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
   RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
   RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
   OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, OpencodeLossRecoverySchema,
@@ -41,7 +41,7 @@ import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
-import type { FreshCodexControllerStartupFacts, FreshCodexRetainedSnapshotFacts, Phase4BrowserObservation, Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
+import type { RuntimeHostProcessState, FreshCodexControllerStartupFacts, FreshCodexRetainedSnapshotFacts, Phase4BrowserObservation, Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
 import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts, RuntimeChaosReceiptArtifact } from './runtime-sandbox.js'
 import type { OpencodeLossCredentialEvidence, OpencodeLossAbsenceEvidence, OpencodeLossRecovery, OpencodeLossIncidentEvidence } from './runtime-sandbox.js'
 import type { RuntimeLossAssertions, RuntimeLossAssertionsArtifact, RuntimeLossReceiptArtifact } from './runtime-sandbox.js'
@@ -918,6 +918,9 @@ export class ExternalManagedRuntimeRig {
   async publishFreshAgentQualification(freshAgentObservations: FreshAgentQualificationRow[]): Promise<RuntimeFreshAgentReceiptArtifacts> {
     return this.rpc('fresh-agent-receipt', RuntimeFreshAgentReceiptArtifactsSchema, { freshAgentObservations })
   }
+  async ownedRuntimeHostState(enclosure: RuntimeEnclosureHandle): Promise<RuntimeHostProcessState> {
+    return this.rpc('host-process-state', RuntimeHostProcessStateSchema, { enclosure })
+  }
   async ownedContainerState(enclosure: RuntimeEnclosureHandle): Promise<OwnedContainerState> {
     return this.rpc('container-state', OwnedContainerStateSchema, { enclosure })
   }
@@ -1421,6 +1424,10 @@ export function createExternalRuntimeControl(
       case 'fresh-agent-receipt':
         if (!request.freshAgentObservations) throw new Error('observed fresh-agent rows required')
         result = await owner.publishFreshAgentQualification(request.freshAgentObservations)
+        break
+      case 'host-process-state':
+        if (!request.enclosure) throw new Error('exact tracked runtime enclosure address required')
+        result = await owner.ownedRuntimeHostState(request.enclosure)
         break
       case 'container-state':
         if (!request.enclosure) throw new Error('exact tracked runtime enclosure address required')

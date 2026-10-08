@@ -178,6 +178,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
     const sent: any[] = []
     const received: any[] = []
     let heldHost: {containerId: string, incarnationId: string, pid: number} | undefined
+    let heldHandle: ReturnType<ManagedRuntimeBrowserRig['exactRuntimeHandle']> | undefined
     let cpuSession: Awaited<ReturnType<ReturnType<Page['context']>['newCDPSession']>> | undefined
     let profilingStarted = false
     const measurement: Record<string, unknown> = { kind: 'owned-page saved-history diagnostic', errors: [] }
@@ -370,10 +371,14 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const holdRequestedAt = Date.now()
       expect(firstObservationNotBefore - holdRequestedAt,
         'owned history/read/reload must have a measured window before STOP').toBeGreaterThanOrEqual(55_000)
-      const pid = rig.runtime.ownedContainerHostPidExact(view.containerId!)
+      heldHandle = rig.exactRuntimeHandle(view)
+      const { pid } = await rig.holdRuntimeHost(heldHandle)
       heldHost = { containerId: view.containerId!, incarnationId: view.incarnationId, pid }
-      rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGSTOP', pid)
-      await expect.poll(async () => /State:\s+T/.test(await fs.readFile(`/proc/${pid}/status`, 'utf8'))).toBe(true)
+      await expect.poll(async () => {
+        const state = await rig.ownedRuntimeHostState(rig.runtimeEnclosureHandle(view))
+        expect(state.pid).toBe(pid)
+        return state.stopped
+      }).toBe(true)
       const heldAt = Date.now()
       rig.runtime.recordLifecycle('browser.owned_host_hold', { ...heldHost, state: 'T' })
       const unavailableBaseline = sent.length
@@ -460,11 +465,15 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         bootstrapCreates: bootstrapLifecycle().filter((frame) => frame.type === 'freshAgent.create'),
         nativeSessionId: view.nativeSessionId, beforeHistory: stableProviderState, afterReload: (await fixtureState()),
         originalIdentity: canonicalIdentity, managedLaunch: launches[0], bothSourcesUnchanged: true }
-      rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGCONT', pid)
+      await rig.releaseRuntimeHost(rig.exactRuntimeHandle(view))
       const releasedAt = Date.now()
       rig.runtime.recordLifecycle('browser.owned_host_release', heldHost)
       heldHost = undefined
-      await expect.poll(async () => /State:\s+T/.test(await fs.readFile(`/proc/${pid}/status`, 'utf8'))).toBe(false)
+      await expect.poll(async () => {
+        const state = await rig.ownedRuntimeHostState(rig.runtimeEnclosureHandle(view))
+        expect(state.pid).toBe(pid)
+        return state.stopped
+      }).toBe(false)
       const resumedAt = Date.now()
       expect(resumedAt, 'exact owned host must resume before the first observer pass').toBeLessThan(firstObservationNotBefore)
       await expectOriginalConversation()
@@ -481,7 +490,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
     } finally {
       measurement.finallyEnteredAt = Date.now()
       try {
-        if (heldHost) rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGCONT', heldHost.pid)
+        if (heldHost && heldHandle) await rig.releaseRuntimeHost(heldHandle)
       } finally {
         try {
           // Resume the exact owned host before diagnostic extraction on failure.
