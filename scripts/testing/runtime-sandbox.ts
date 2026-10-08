@@ -666,6 +666,19 @@ let state = 'absent';
 try { fs.lstatSync(target); state = 'present'; } catch (error) { if (error.code !== 'ENOENT') state = 'unknown'; }
 process.stdout.write(JSON.stringify({ path: target, state, probe: 'lstat' }));
 `
+const OPENCODE_LOSS_REMOVAL_SCRIPT = String.raw`
+const fs = require('node:fs');
+for (const target of [
+  '/home/freshell/provider/.local/share/opencode/opencode.db',
+  '/home/freshell/provider/.local/share/opencode/opencode.db-wal',
+  '/home/freshell/provider/.local/share/opencode/opencode.db-shm',
+]) {
+  try { fs.unlinkSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+const checkpoints = '/home/freshell/provider/.freshell/checkpoints';
+try { fs.rmSync(checkpoints, { recursive: true }); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process.exit(2);
+`
 const OPENCODE_LOSS_CREDENTIAL_SCRIPT = String.raw`
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -717,7 +730,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -3305,6 +3318,13 @@ export class ManagedRuntimeOwner {
       return OpencodeLossAbsenceCheckSchema.parse(JSON.parse(raw))
     }))
     return OpencodeLossAbsenceEvidenceSchema.parse(rows)
+  }
+
+  async removeLossStorage(handle: ExactRuntimeHandle): Promise<void> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 loss fixture required')
+    await this.assertCurrentHandle(handle)
+    await this.assertCurrentOpenCodeEnclosure(this.runtimeEnclosureHandle(handle))
+    this.ownedContainerExec(handle.containerId, ['node', '-e', OPENCODE_LOSS_REMOVAL_SCRIPT])
   }
 
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {

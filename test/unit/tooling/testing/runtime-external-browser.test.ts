@@ -1299,6 +1299,60 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('removes only fixed resumable loss storage while retaining credentials and the diagnostic marker', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-loss-removal-'))
+    try {
+      const { owned, context, inventory, request } = fixture()
+      const row = { soulId: 'loss-soul', incarnationId: 'loss-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'loss-boot', nativeSessionId: 'loss-root', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { phase: 5, broker: { receipts: () => [receipt] } })
+      const nativePaths = ['/home/freshell/provider/.local/share/opencode/opencode.db',
+        '/home/freshell/provider/.local/share/opencode/opencode.db-wal',
+        '/home/freshell/provider/.local/share/opencode/opencode.db-shm',
+        '/home/freshell/provider/.freshell/checkpoints', '/home/freshell/provider/p5-diagnostic-only']
+      const paths = ['db', 'wal', 'shm', 'checkpoints', 'diagnostic'].map(name => path.join(directory, name))
+      const credential = path.join(directory, 'auth.json')
+      await fsp.writeFile(credential, 'private credential fixture')
+      for (const file of paths.slice(0, 3)) await fsp.writeFile(file, 'private database fixture')
+      await fsp.mkdir(paths[3])
+      await fsp.writeFile(path.join(paths[3], 'copy.db'), 'private checkpoint fixture')
+      await fsp.writeFile(paths[4], 'phase5-diagnostic-retained-no-credential')
+      const mapper = path.join(directory, 'map-loss-removal.cjs')
+      await fsp.writeFile(mapper, `const fs=require('node:fs');const names=${JSON.stringify(nativePaths)};const files=${JSON.stringify(paths)};const root=${JSON.stringify(directory + path.sep)};for(const method of ['unlinkSync','rmSync','statSync']){const original=fs[method];fs[method]=function(file,...args){const name=String(file);const index=names.indexOf(name);if(index<0&&!name.startsWith(root))throw new Error('unregistered fixture target');return original.call(fs,index<0?file:files[index],...args)}};`)
+      const exec = vi.spyOn(owned, 'ownedContainerExec').mockImplementation((_id, args) => {
+        const child = spawnSync(process.execPath, ['--require', mapper, ...args.slice(1)], { encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('fixed loss command refused')
+        return child.stdout
+      })
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+        await control(JSON.parse(String(init.body)))), { status: 200 }))
+      const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+      const handle = rig.exactRuntimeHandle(row)
+      await rig.removeLossStorage(handle)
+      for (const file of paths.slice(0, 4)) await expect(fsp.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await fsp.readFile(credential, 'utf8')).toBe('private credential fixture')
+      expect(await fsp.readFile(paths[4], 'utf8')).toBe('phase5-diagnostic-retained-no-credential')
+      await rig.removeLossStorage(handle)
+      await fsp.unlink(paths[4])
+      await expect(owned.removeLossStorage(handle)).rejects.toThrow(/refused/)
+      exec.mockClear()
+      inventory.mockResolvedValue([{ ...row, nativeSessionId: 'replacement-root' }])
+      await expect(owned.removeLossStorage(handle)).rejects.toThrow()
+      await expect(control({ ...request, action: 'loss-remove-storage', handle, path: '/foreign' })).rejects.toThrow(/operation/)
+      inventory.mockResolvedValue([{ ...row, provider: 'claude' }])
+      await expect(owned.removeLossStorage(handle)).rejects.toThrow(/OpenCode/)
+      inventory.mockResolvedValue([row])
+      Object.assign(owned.runtime, { phase: 2 })
+      await expect(owned.removeLossStorage(handle)).rejects.toThrow(/Phase 5/)
+      expect(exec).not.toHaveBeenCalled()
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
   it('runs the closed Phase3 effect operations over the same pre-native enclosure', async () => {
     const { owned, context, request } = fixture()
     const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',

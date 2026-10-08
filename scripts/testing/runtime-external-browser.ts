@@ -879,6 +879,9 @@ export class ExternalManagedRuntimeRig {
   async lossAbsenceEvidence(enclosure: RuntimeEnclosureHandle): Promise<OpencodeLossAbsenceEvidence> {
     return this.rpc('loss-absence', OpencodeLossAbsenceEvidenceSchema, { enclosure })
   }
+  async removeLossStorage(handle: ExactRuntimeHandle): Promise<void> {
+    await this.rpc('loss-remove-storage', CompletedOwnerOperationSchema, { handle })
+  }
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {
     await this.rpc('crash-provider-worker', CompletedOwnerOperationSchema, { handle })
   }
@@ -1125,6 +1128,7 @@ export function createExternalRuntimeControl(
         if (!request.enclosure) throw new Error('exact runtime enclosure required')
         result = await owner.lossAbsenceEvidence(request.enclosure)
         break
+      case 'loss-remove-storage': await owner.removeLossStorage(handle()); result = { completed: true }; break
       case 'incident-matches-soul':
         if (!request.incidentId) throw new Error('observed incident identity required')
         result = await owner.incidentMatchesSoul(handle(), request.incidentId)

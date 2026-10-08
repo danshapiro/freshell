@@ -245,21 +245,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
         ;(window as any).__FRESHELL_PHASE5_NOTICE_OBSERVATION__ = observation
       })
       await rig.crashProviderWorker(workerHandle)
-      rig.ownedContainerExec(before.containerId, [
-        'node', '-e', String.raw`
-const fs = require('node:fs');
-for (const target of [
-  '/home/freshell/provider/.local/share/opencode/opencode.db',
-  '/home/freshell/provider/.local/share/opencode/opencode.db-wal',
-  '/home/freshell/provider/.local/share/opencode/opencode.db-shm',
-]) {
-  try { fs.unlinkSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-}
-const checkpoints = '/home/freshell/provider/.freshell/checkpoints';
-try { fs.rmSync(checkpoints, { recursive: true }); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process.exit(2);
-`,
-      ])
+      await rig.removeLossStorage(workerHandle)
       const diagnosticOnlyRetained = await rig.lossDiagnosticRetained(rig.runtimeEnclosureHandle(before))
       expect(diagnosticOnlyRetained).toBe(true)
       const credentialAfter = await rig.lossCredentialEvidence(rig.runtimeEnclosureHandle(before))
