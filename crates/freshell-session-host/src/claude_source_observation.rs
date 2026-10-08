@@ -302,6 +302,304 @@ fn refresh_candidate_projection(
     .map_err(|_| candidate_projection_unavailable("ordinary_refresh"))
 }
 
+fn seed_retained_ordinary_candidate(
+    prior_generation: &str,
+    stage: &std::path::Path,
+    retained_home: &std::path::Path,
+    home: &std::path::Path,
+    current: &freshell_runtime_protocol::ProviderLaunchContext,
+    identity: (u32, u32),
+) -> Result<(), String> {
+    use std::{
+        collections::BTreeSet,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        path::{Path, PathBuf},
+    };
+    let blocked = || candidate_projection_unavailable("retained_ordinary_topology");
+    crate::verify_initialized_provider_home(retained_home, identity.0, identity.1)
+        .map_err(|_| blocked())?;
+    crate::verify_initialized_provider_home(home, identity.0, identity.1).map_err(|_| blocked())?;
+    let raw = crate::provider_input_preparation::read_private(
+        stage,
+        ".freshell/prepared-context.json",
+        freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+    )
+    .map_err(|_| blocked())?;
+    let prior: freshell_runtime_protocol::ProviderLaunchContext =
+        serde_json::from_slice(&raw).map_err(|_| blocked())?;
+    prior.validate("claude").map_err(|_| blocked())?;
+    current.validate("claude").map_err(|_| blocked())?;
+    let inputs = prior.prepared_inputs.as_ref().ok_or_else(blocked)?;
+    if inputs.generation_id != prior_generation
+        || inputs.indexed_files.is_some()
+        || inputs.manifest.source_count != 0
+        || inputs.manifest.alias_count != 0
+        || inputs.manifest.recipe_count != 0
+    {
+        return Err(blocked());
+    }
+    let manifest = crate::provider_input_preparation::read_private(
+        stage,
+        &inputs.manifest.relative_path,
+        64 * 1024 * 1024,
+    )
+    .map_err(|_| blocked())?;
+    if format!("{:x}", Sha256::digest(&manifest)) != inputs.manifest.sha256 {
+        return Err(blocked());
+    }
+    drop(manifest);
+    drop(raw);
+    let protected: BTreeSet<PathBuf> = current
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| {
+            inputs
+                .config_binds
+                .iter()
+                .map(|bind| bind.effective_destination.as_str())
+                .chain(
+                    inputs
+                        .resource_mounts
+                        .iter()
+                        .map(|unit| unit.effective_destination.as_str()),
+                )
+        })
+        .filter_map(|path| {
+            Path::new(path)
+                .strip_prefix("/home/freshell/provider")
+                .ok()
+                .map(Path::to_path_buf)
+        })
+        .collect();
+    struct Metadata {
+        path: PathBuf,
+        source: std::fs::Metadata,
+        link: Option<PathBuf>,
+        native_sibling: bool,
+    }
+    let root_uid = unsafe { libc::geteuid() };
+    // The helper keeps its saved root identity only during private preparation.
+    // Filesystem reads and the common copier use the provider's effective UID;
+    // the existing permanent transition still precedes source observation.
+    if unsafe { libc::seteuid(identity.0) } != 0 {
+        return Err(blocked());
+    }
+    let capture = (|| {
+        let raw = crate::provider_input_preparation::read_private(
+            retained_home,
+            crate::PROVIDER_PROJECTION_MANIFEST,
+            64 * 1024 * 1024,
+        )
+        .map_err(|_| blocked())?;
+        let tracked: BTreeSet<String> = serde_json::from_slice(&raw).map_err(|_| blocked())?;
+        drop(raw);
+        if tracked.len()
+            > freshell_platform::provider_environment::CopyLimits::default().max_entries
+        {
+            return Err(blocked());
+        }
+        let ordinary: Vec<PathBuf> = crate::provider_config_references(&prior)
+            .iter()
+            .map(|reference| PathBuf::from(&reference.provider_relative_path))
+            .chain(
+                inputs
+                    .resource_mounts
+                    .iter()
+                    .map(|unit| PathBuf::from(&unit.provider_relative_path)),
+            )
+            .collect();
+        if tracked.iter().any(|entry| {
+            let entry = Path::new(entry);
+            entry.as_os_str().is_empty()
+                || entry
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                || !ordinary
+                    .iter()
+                    .any(|selected| entry.starts_with(selected) || selected.starts_with(entry))
+        }) {
+            return Err(blocked());
+        }
+        let mut paths: BTreeSet<PathBuf> = tracked.iter().map(PathBuf::from).collect();
+        paths.insert(PathBuf::new());
+        for name in [
+            "",
+            "skills",
+            "commands",
+            "agents",
+            "hooks",
+            "plugins",
+            "output-styles",
+            "workflows",
+            "routines",
+            "rules",
+        ] {
+            paths.insert(Path::new(".claude").join(name));
+        }
+        for context in [&prior, current] {
+            for target in context.prepared_inputs.iter().flat_map(|inputs| {
+                inputs
+                    .config_binds
+                    .iter()
+                    .map(|bind| bind.effective_destination.as_str())
+                    .chain(
+                        inputs
+                            .resource_mounts
+                            .iter()
+                            .map(|unit| unit.effective_destination.as_str()),
+                    )
+            }) {
+                if let Ok(relative) = Path::new(target).strip_prefix("/home/freshell/provider") {
+                    for ancestor in relative.ancestors() {
+                        paths.insert(ancestor.into());
+                    }
+                }
+            }
+        }
+        let mut metadata = Vec::new();
+        let mut bytes = 0usize;
+        for relative in paths {
+            if relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                || relative.components().count() > 64
+            {
+                return Err(blocked());
+            }
+            if !relative.as_os_str().is_empty()
+                && protected.iter().any(|alias| relative.starts_with(alias))
+            {
+                continue;
+            }
+            let source = retained_home.join(&relative);
+            let observed = match std::fs::symlink_metadata(&source) {
+                Ok(value) => value,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue
+                }
+                Err(_) => return Err(blocked()),
+            };
+            if !relative.as_os_str().is_empty()
+                && !std::fs::canonicalize(source.parent().ok_or_else(blocked)?)
+                    .map_err(|_| blocked())?
+                    .starts_with(retained_home)
+            {
+                return Err(blocked());
+            }
+            let link = if observed.file_type().is_symlink() {
+                Some(std::fs::read_link(&source).map_err(|_| blocked())?)
+            } else {
+                None
+            };
+            if !observed.is_dir() && !observed.is_file() && link.is_none() {
+                return Err(blocked());
+            }
+            let native_sibling = if observed.is_dir() {
+                let mut unknown = false;
+                for entry in std::fs::read_dir(&source).map_err(|_| blocked())? {
+                    let entry = entry.map_err(|_| blocked())?;
+                    let child = relative.join(entry.file_name());
+                    if child.to_str().is_none_or(|child| !tracked.contains(child)) {
+                        unknown = true;
+                    }
+                }
+                unknown
+            } else {
+                false
+            };
+            bytes = bytes
+                .checked_add(
+                    relative.as_os_str().len()
+                        + std::mem::size_of::<Metadata>()
+                        + link.as_ref().map_or(0, |path| path.as_os_str().len()),
+                )
+                .filter(|bytes| *bytes <= 64 * 1024 * 1024)
+                .ok_or_else(blocked)?;
+            metadata.try_reserve(1).map_err(|_| blocked())?;
+            metadata.push(Metadata {
+                path: relative,
+                source: observed,
+                link,
+                native_sibling,
+            });
+        }
+        crate::copy_provider_config_references_with_ownership(
+            &prior, "claude", stage, stage, home, home, identity,
+        )
+        .map_err(|_| blocked())?;
+        Ok::<_, String>(metadata)
+    })();
+    let restored = unsafe { libc::seteuid(root_uid) } == 0;
+    if !restored {
+        return Err(candidate_projection_unavailable(
+            "retained_identity_restore",
+        ));
+    }
+    let mut metadata = capture?;
+    // Give only these owned scratch parents temporary access while restoring
+    // their recorded metadata. The read-only retained HOME is never changed.
+    for entry in metadata.iter().filter(|entry| entry.source.is_dir()) {
+        let destination = home.join(&entry.path);
+        std::fs::create_dir_all(&destination).map_err(|_| blocked())?;
+        crate::set_owner(&destination, root_uid, identity.1).map_err(|_| blocked())?;
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| blocked())?;
+        if entry.native_sibling {
+            let marker = destination.join(format!(
+                ".freshell-retained-presence-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(marker)
+                .map_err(|_| blocked())?;
+        }
+    }
+    metadata.sort_by_key(|entry| std::cmp::Reverse(entry.path.components().count()));
+    for entry in metadata {
+        let destination = home.join(&entry.path);
+        if let Some(target) = entry.link {
+            if std::fs::symlink_metadata(&destination).is_ok() {
+                std::fs::remove_file(&destination).map_err(|_| blocked())?;
+            }
+            std::os::unix::fs::symlink(target, &destination).map_err(|_| blocked())?;
+        } else if entry.source.is_file() {
+            if !destination.exists() {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination)
+                    .map_err(|_| blocked())?;
+            }
+            crate::set_owner(&destination, root_uid, identity.1).map_err(|_| blocked())?;
+            std::fs::set_permissions(
+                &destination,
+                std::fs::Permissions::from_mode(entry.source.mode() & 0o7777),
+            )
+            .map_err(|_| blocked())?;
+        } else {
+            std::fs::set_permissions(
+                &destination,
+                std::fs::Permissions::from_mode(entry.source.mode() & 0o7777),
+            )
+            .map_err(|_| blocked())?;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let name =
+            std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(|_| blocked())?;
+        if unsafe { libc::lchown(name.as_ptr(), entry.source.uid(), entry.source.gid()) } != 0 {
+            return Err(blocked());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn project_candidate(
     request: &freshell_runtime_protocol::ClaudeCandidateProjectionRequest,
@@ -412,6 +710,16 @@ pub(crate) fn serve_candidate_private() -> Result<(), String> {
     let raw =
         freshell_runtime_protocol::bounded_json_bytes(&request.source_request, MAX_REQUEST_BYTES)
             .map_err(|_| "Claude candidate source request exceeds metadata profile")?;
+    if let Some(prior) = request.publication.prior_generation_id.as_deref() {
+        seed_retained_ordinary_candidate(
+            prior,
+            Path::new("/run/freshell-retained-inputs"),
+            Path::new("/run/freshell-retained-home"),
+            home,
+            &request.provider_launch_context,
+            (65534, 0),
+        )?;
+    }
     validate_candidate_projection(
         &request,
         Path::new("/run/freshell-candidate-inputs"),
@@ -523,6 +831,190 @@ fn write_reply(reply: &ObservationReply, output: &mut impl Write) -> Result<(), 
 mod tests {
     use super::*;
     use std::io::{Cursor, Error, ErrorKind};
+
+    #[test]
+    fn claude_retained_candidate_seed_preserves_metadata_and_executes_only_frozen_ordinary_inputs()
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owned = tempfile::tempdir().unwrap();
+        let stage = owned.path().join("stage");
+        let retained = owned.path().join("retained-home");
+        let home = owned.path().join("candidate-home");
+        let workspace = owned.path().join("workspace");
+        for path in [&stage, &retained, &home, &workspace] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::create_dir_all(
+            stage.join(".freshell/resource-units/unit-0/node_modules/frozen-dependency"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(stage.join(".claude")).unwrap();
+        std::fs::write(
+            stage.join(".claude/old-settings.json"),
+            br#"{"ordinary":"frozen"}"#,
+        )
+        .unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), b"{}").unwrap();
+        std::fs::write(
+            stage.join(".freshell/resource-units/unit-0/resource"),
+            b"frozen-resource",
+        )
+        .unwrap();
+        std::fs::write(
+            stage.join(".freshell/resource-units/unit-0/node_modules/frozen-dependency/index.js"),
+            "module.exports='installed-dependency'",
+        )
+        .unwrap();
+        std::fs::write(stage.join(".freshell/resource-units/unit-0/consumer.cjs"), "process.stdout.write(require('node:fs').readFileSync(__dirname+'/resource','utf8')+':'+require('frozen-dependency'))").unwrap();
+        let generation = format!("grant-{}", uuid::Uuid::new_v4());
+        let context: freshell_runtime_protocol::ProviderLaunchContext = serde_json::from_value(serde_json::json!({
+            "preparation":{"claude":{"mcp_args":[]}}, "config":[{"root":"user_provider","relativePath":".claude/old-settings.json","providerRelativePath":".claude/old-settings.json","format":"json"}],
+            "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
+            "preparedInputs":{"generationId":generation,"manifest":{"relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(b"{}")),"sourceCount":0,"aliasCount":0,"recipeCount":0},
+                "resourceMounts":[{"stageRelativePath":".freshell/resource-units/unit-0","providerRelativePath":".freshell/provider-roots/unit-0","logicalDestination":workspace.join("selected-plugin"),"effectiveDestination":workspace.join("selected-plugin"),"kind":"directory"}]}
+        })).unwrap();
+        context.validate("claude").unwrap();
+        std::fs::write(
+            stage.join(".freshell/prepared-context.json"),
+            freshell_runtime_protocol::bounded_json_bytes(
+                &context,
+                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let identity = unsafe { (libc::geteuid(), libc::getegid()) };
+        std::fs::create_dir_all(retained.join(".freshell/provider-roots/unit-0")).unwrap();
+        crate::copy_provider_config_references_with_ownership(
+            &context, "claude", &workspace, &stage, &retained, &retained, identity,
+        )
+        .unwrap();
+        std::fs::create_dir_all(retained.join(".claude/projects")).unwrap();
+        let history = retained.join(".claude/projects/history.jsonl");
+        let auth = retained.join(".claude/.credentials.json");
+        std::fs::write(&history, b"PRIVATE_NATIVE_HISTORY_SENTINEL").unwrap();
+        std::fs::write(&auth, b"PRIVATE_NATIVE_CREDENTIAL_SENTINEL").unwrap();
+        std::fs::set_permissions(
+            retained.join(".claude"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(retained.join(".claude")).unwrap();
+        let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        for path in [&history, &auth] {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_accessed(old_access))
+                .unwrap();
+        }
+        let mut current = context.clone();
+        current.config.clear();
+        let next_generation = format!("grant-{}", uuid::Uuid::new_v4());
+        current.prepared_inputs.as_mut().unwrap().generation_id = next_generation.clone();
+        current.mcp_capability.as_mut().unwrap().grant_id = next_generation.clone();
+        seed_retained_ordinary_candidate(&generation,&stage,&retained,&home,&current,identity).expect("retained seed must reconstruct frozen ordinary inputs and actual directory metadata without reading native payloads");
+        let seeded = std::fs::metadata(home.join(".claude")).unwrap();
+        assert_eq!(
+            (seeded.uid(), seeded.gid(), seeded.mode() & 0o777),
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o777)
+        );
+        let output = std::process::Command::new("node")
+            .arg(home.join(".freshell/provider-roots/unit-0/consumer.cjs"))
+            .current_dir(&workspace)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"frozen-resource:installed-dependency");
+        crate::refresh_provider_config_references(
+            &current, "claude", &workspace, &stage, &home, identity.0, identity.1,
+        )
+        .unwrap();
+        assert!(!home.join(".claude/old-settings.json").exists());
+        assert!(home.join(".claude").is_dir(),"native siblings in retained HOME keep the category parent present after stale ordinary removal");
+        assert!(!home.join(".claude/projects").exists());
+        assert!(!home.join(".claude/.credentials.json").exists());
+        for path in [&history, &auth] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().accessed().unwrap(),
+                old_access,
+                "native payload must remain unread"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&history).unwrap(),
+            b"PRIVATE_NATIVE_HISTORY_SENTINEL"
+        );
+        assert_eq!(
+            std::fs::read(&auth).unwrap(),
+            b"PRIVATE_NATIVE_CREDENTIAL_SENTINEL"
+        );
+        let unchanged = std::fs::metadata(retained.join(".claude")).unwrap();
+        assert_eq!(
+            (unchanged.uid(), unchanged.gid(), unchanged.mode() & 0o777),
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o777)
+        );
+        let damaged = owned.path().join("damaged-candidate");
+        std::fs::create_dir(&damaged).unwrap();
+        std::fs::set_permissions(&damaged, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ledger = retained.join(crate::PROVIDER_PROJECTION_MANIFEST);
+        let mut entries: std::collections::BTreeSet<String> =
+            serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+        entries.insert(".claude/.credentials.json".into());
+        std::fs::write(&ledger, serde_json::to_vec(&entries).unwrap()).unwrap();
+        assert!(
+            seed_retained_ordinary_candidate(
+                &generation,
+                &stage,
+                &retained,
+                &damaged,
+                &current,
+                identity
+            )
+            .is_err(),
+            "damaged ordinary projection metadata must not recreate a native credential path"
+        );
+        assert!(!damaged.join(".claude/.credentials.json").exists());
+
+        let without_user = owned.path().join("retained-without-user-sources");
+        let absent_candidate = owned.path().join("candidate-without-user-sources");
+        for path in [&without_user, &absent_candidate] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::create_dir_all(without_user.join(".freshell/provider-roots/unit-0")).unwrap();
+        crate::copy_provider_config_references_with_ownership(
+            &current,
+            "claude",
+            &workspace,
+            &stage,
+            &without_user,
+            &without_user,
+            identity,
+        )
+        .unwrap();
+        std::fs::write(
+            stage.join(".freshell/prepared-context.json"),
+            freshell_runtime_protocol::bounded_json_bytes(
+                &current,
+                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        seed_retained_ordinary_candidate(
+            &next_generation,
+            &stage,
+            &without_user,
+            &absent_candidate,
+            &current,
+            identity,
+        )
+        .expect("known-absent optional user sources must remain absent");
+        assert!(!absent_candidate.join(".claude").exists());
+    }
 
     #[test]
     fn claude_candidate_projection_runs_selected_dependency_and_frozen_config_consumer() {
