@@ -8944,6 +8944,7 @@ mod tests {
     struct AbortRecordingHttp {
         next_session: AtomicUsize,
         prompts: StdMutex<Vec<String>>,
+        prompt_completions: AtomicUsize,
         aborts: StdMutex<Vec<String>>,
     }
     impl AbortRecordingHttp {
@@ -9000,7 +9001,14 @@ mod tests {
                     }
                 }
             }
-            Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+            let is_prompt = req.url.contains("/prompt_async")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            Box::pin(async move {
+                if is_prompt {
+                    self.prompt_completions.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(ServeHttpResponse::new(200, body))
+            })
         }
     }
 
@@ -11426,9 +11434,23 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
         let http = Arc::new(AbortRecordingHttp::default());
+        let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = std::time::Instant::now();
+        let diagnostic = |phase: &str, accepted: bool, manager_running: bool| {
+            eprintln!(
+                "{}",
+                json!({
+                    "severity": "info", "event": "test.opencode.accepted_stop.phase",
+                    "phase": phase, "elapsedMs": started.elapsed().as_millis(),
+                    "accepted": accepted, "managerRunning": manager_running,
+                    "promptCompletions": http.prompt_completions.load(Ordering::SeqCst),
+                    "fakeProcessKilled": killed.load(Ordering::SeqCst),
+                })
+            );
+        };
         let deps = ServeDeps {
             spawner: Arc::new(TrackedSpawner {
-                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                killed: Arc::clone(&killed),
             }),
             http: http.clone(),
             ports: Arc::new(FakeAllocator),
@@ -11439,7 +11461,7 @@ mod tests {
             .ensure_started()
             .await
             .expect("healthy fake serve starts");
-        fresh_agent.set_manager_for_test(manager).await;
+        fresh_agent.set_manager_for_test(manager.clone()).await;
         let mut st = FreshOpencodeState::new(fresh_agent);
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(registry.clone());
@@ -11464,7 +11486,25 @@ mod tests {
         // daemon-side turn still running).
         let real_id = http.await_prompt(Duration::from_secs(10));
         assert_eq!(real_id, "ses_1");
+        diagnostic(
+            "prompt_dispatched",
+            session_arc
+                .lock()
+                .await
+                .daemon_turn_accepted
+                .load(Ordering::SeqCst),
+            manager.base_url().await.is_some(),
+        );
         st.settle_local_turn_task_for_test(placeholder).await;
+        diagnostic(
+            "local_task_settled",
+            session_arc
+                .lock()
+                .await
+                .daemon_turn_accepted
+                .load(Ordering::SeqCst),
+            manager.base_url().await.is_some(),
+        );
         while rx.try_recv().is_ok() {}
 
         st.handle_kill(FreshAgentKill {
@@ -11480,6 +11520,15 @@ mod tests {
         // THE R3-2 regression: the kill issued the per-session daemon-side
         // abort for the REAL session id before declaring the reap
         // confirmed.
+        diagnostic(
+            "kill_returned",
+            session_arc
+                .lock()
+                .await
+                .daemon_turn_accepted
+                .load(Ordering::SeqCst),
+            manager.base_url().await.is_some(),
+        );
         let aborts = http.aborts.lock().unwrap().clone();
         assert_eq!(
             aborts,
