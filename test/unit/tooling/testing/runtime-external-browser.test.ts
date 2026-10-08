@@ -1196,6 +1196,37 @@ describe('closed external owner control', () => {
     await expect(control({ ...request, operationId: 'duplicate-release', action: 'release-host', handle })).rejects.toThrow(/held/)
     expect(signal).toHaveBeenCalledTimes(2)
   })
+  it.each([
+    { kind: 'chaos-approval' as const, marker: 'p5-chaos-approval-count' },
+    { kind: 'chaos-long-tool' as const, marker: 'p5-chaos-long-tool-count' },
+  ])('reads and resets only registered $kind while refusing unregistered or wrong-root requests', async ({ kind, marker }) => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'chaos-owned-soul',
+      incarnationId: 'chaos-owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'chaos-owned-boot', nativeSessionId: 'chaos-owned-native' }
+    vi.spyOn(owned, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const challenge = await owned.registerNativeChallenge(handle, kind)
+    const probe = vi.spyOn(owned, 'ownedProviderExec').mockResolvedValue('2\n')
+    const count = { ...request, operationId: 'owned-effect-count', action: 'native-effect-count', handle, challengeId: challenge.challengeId }
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.nativeChallengeEffectCount(handle, challenge.challengeId)).resolves.toBe(2)
+    expect(probe).toHaveBeenCalledExactlyOnceWith(handle.containerId, ['sh', '-lc',
+      `test -f "$HOME/${marker}" && wc -l < "$HOME/${marker}" || printf 0`])
+    probe.mockClear()
+    await expect(control({ ...count, operationId: 'unknown-effect', challengeId: 'unregistered' })).rejects.toThrow(/challenge/)
+    await expect(control({ ...count, operationId: 'foreign-effect', handle: { ...handle, nativeSessionId: 'foreign-root' } })).rejects.toThrow(/challenge/)
+    const followUp = await owned.registerNativeChallenge(handle, 'chaos-follow-up')
+    await expect(control({ ...count, operationId: 'non-effect-challenge', challengeId: followUp.challengeId })).rejects.toThrow(/effect/)
+    expect(probe).not.toHaveBeenCalled()
+    await rig.resetNativeChallengeEffect(handle, challenge.challengeId)
+    expect(probe).toHaveBeenCalledExactlyOnceWith(handle.containerId, ['rm', '-f', `/home/freshell/provider/${marker}`])
+    for (const raw of ['truncated', '-1', '9007199254740992']) {
+      probe.mockResolvedValue(raw)
+      await expect(control({ ...count, operationId: `invalid-${raw}` })).rejects.toThrow(/count/)
+    }
+  })
   it('registers a closed native challenge and refuses unknown or wrong-root probe requests before reading', async () => {
     const { owned, context, request } = fixture()
     const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'challenge-owned-soul',

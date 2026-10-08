@@ -633,7 +633,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
-    'native-challenge-register',
+    'native-challenge-register', 'native-effect-count', 'native-effect-reset',
     'synthetic-history-challenge',
     'synthetic-source-facts',
     'synthetic-source-history', 'synthetic-source-exclusions',
@@ -3204,6 +3204,28 @@ export class ManagedRuntimeOwner {
       '/home/freshell/provider/.local/share/opencode/opencode.db', handle.nativeSessionId, marker])
     return z.object({ requestIds: z.array(z.string().min(1)), resultIds: z.array(z.string().min(1)),
       replayCount: z.number().int().nonnegative() }).strict().parse(JSON.parse(raw))
+  }
+
+  private async nativeEffectMarker(handle: ExactRuntimeHandle, challengeId: string): Promise<string> {
+    const marker = await this.nativeChallengeMarker(handle, challengeId)
+    if (marker !== NativeChallengeMarkers['chaos-approval'] && marker !== NativeChallengeMarkers['chaos-long-tool']) {
+      throw new Error('registered chaos effect challenge required')
+    }
+    return marker
+  }
+
+  async nativeChallengeEffectCount(handle: ExactRuntimeHandle, challengeId: string): Promise<number> {
+    const marker = await this.nativeEffectMarker(handle, challengeId)
+    const raw = (await this.ownedProviderExec(handle.containerId, ['sh', '-lc',
+      `test -f "$HOME/${marker}" && wc -l < "$HOME/${marker}" || printf 0`])).trim()
+    const count = /^\d+$/.test(raw) ? Number(raw) : NaN
+    if (!Number.isSafeInteger(count) || count < 0) throw new Error('invalid registered chaos effect count')
+    return count
+  }
+
+  async resetNativeChallengeEffect(handle: ExactRuntimeHandle, challengeId: string): Promise<void> {
+    const marker = await this.nativeEffectMarker(handle, challengeId)
+    await this.ownedProviderExec(handle.containerId, ['rm', '-f', `/home/freshell/provider/${marker}`])
   }
 
   async nativeFollowUpMessageIds(handle: ExactRuntimeHandle, challengeId: string): Promise<string[]> {

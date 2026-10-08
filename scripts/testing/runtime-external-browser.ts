@@ -857,6 +857,12 @@ export class ExternalManagedRuntimeRig {
     return this.rpc('native-tool-evidence', z.object({ requestIds: z.array(z.string().min(1)), resultIds: z.array(z.string().min(1)),
       replayCount: z.number().int().nonnegative() }).strict(), { handle, challengeId })
   }
+  async nativeChallengeEffectCount(handle: ExactRuntimeHandle, challengeId: string): Promise<number> {
+    return this.rpc('native-effect-count', z.number().int().nonnegative(), { handle, challengeId })
+  }
+  async resetNativeChallengeEffect(handle: ExactRuntimeHandle, challengeId: string): Promise<void> {
+    await this.rpc('native-effect-reset', CompletedOwnerOperationSchema, { handle, challengeId })
+  }
   async nativeFollowUpMessageIds(handle: ExactRuntimeHandle, challengeId: string): Promise<string[]> {
     return this.rpc('native-follow-up-ids', z.array(z.string().min(1)), { handle, challengeId })
   }
@@ -1114,6 +1120,15 @@ export function createExternalRuntimeControl(
         result = await owner.registerNativeChallenge(handle(), request.challengeId)
         break
       case 'synthetic-history-challenge': result = await owner.createSyntheticOpenCodeChallenge(handle()); break
+      case 'native-effect-count':
+        if (!request.challengeId) throw new Error('registered chaos effect challenge required')
+        result = await owner.nativeChallengeEffectCount(handle(), request.challengeId)
+        break
+      case 'native-effect-reset':
+        if (!request.challengeId) throw new Error('registered chaos effect challenge required')
+        await owner.resetNativeChallengeEffect(handle(), request.challengeId)
+        result = { completed: true }
+        break
       case 'native-tool-evidence':
         if (!request.challengeId) throw new Error('registered native challenge required')
         result = await owner.nativeToolEvidence(handle(), request.challengeId)
