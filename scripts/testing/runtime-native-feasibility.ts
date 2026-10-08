@@ -388,7 +388,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
-  if (selection.provider === 'amplifier' && ['create', 'wrong-root', 'missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'amplifier' && ['create', 'wrong-root', 'missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'file-replacement', 'file-truncation', 'malformed-ack', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
     return executeManagedAmplifier(harness, sources, caseId, serverPath, servers)
   }
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
@@ -1449,6 +1449,72 @@ signal=pathlib.Path('/home/freshell/provider/.freshell/native-identity')/nonce/'
 print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'executableSha256':hashlib.sha256(p.read_bytes()).hexdigest(),'producerSha256':hashlib.sha256(producer.read_bytes()).hexdigest(),'cliVersion':m.version('amplifier-app-cli'),'coreVersion':m.version('amplifier-core'),'signalAbsent':not signal.exists(),'nativeRoot':metadata['session_id'],'parentId':metadata.get('parent_id'),'messageCount':len(loaded),'load':loaded.native_load_witness}))
 `
 
+export const amplifierNativeAckFileFault = String.raw`
+import os,pathlib,json,hashlib,sys,re
+fault=sys.argv[1];expected=json.loads(sys.argv[2]);launch=expected['launch'];nonce=launch['launchNonce']
+assert fault in ['file-replacement','file-truncation','malformed-ack'] and re.fullmatch(r'[a-zA-Z0-9_-]+',nonce)
+assert os.getuid()==65534 and os.getgid()==0
+file=pathlib.Path('/home/freshell/provider/.freshell/native-identity')/nonce/'amplifier-loaded-context.json'
+assert file.is_file() and not file.is_symlink()
+before=file.stat();raw=file.read_bytes();check=file.stat()
+identity=lambda s:[str(s.st_dev),str(s.st_ino),str(s.st_size)]
+assert identity(before)==identity(check) and raw.endswith(b'\n') and json.loads(raw)==expected
+if fault=='file-replacement':
+ temporary=file.with_name('owned-native-ack-replacement.tmp')
+ with temporary.open('xb') as out:out.write(raw);out.flush();os.fsync(out.fileno())
+ temporary.chmod(before.st_mode&0o777);temporary.replace(file)
+else:
+ with file.open('r+b') as out:
+  if fault=='file-truncation':out.truncate(len(raw)-1)
+  else:out.write(b'owned malformed native acknowledgement\n');out.truncate()
+  out.flush();os.fsync(out.fileno())
+after=file.stat();changed=file.read_bytes()
+try:json.loads(changed);valid_after=True
+except ValueError:valid_after=False
+print(json.dumps({'fault':fault,'launch':launch,'nativeRoot':expected['native']['session_id'],
+ 'uid':os.getuid(),'gid':os.getgid(),'beforeIdentity':identity(before),'afterIdentity':identity(after),
+ 'originalSha256':hashlib.sha256(raw).hexdigest(),'changedSha256':hashlib.sha256(changed).hexdigest(),
+ 'validBefore':json.loads(raw)==expected,'validAfter':valid_after}))
+`
+
+// Fixed, read-only native host Status on the current receipt-owned runtime.
+// Use the existing Hello proof and command-auth contract, never a fixture socket.
+export const amplifierNativeHostStatus = String.raw`
+import pathlib,sys,re,json,socket,struct,uuid,hmac,hashlib
+root=pathlib.Path(sys.argv[1]);incarnation=sys.argv[2]
+assert re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/r/amplif-[a-f0-9]{8}/x',str(root))
+assert re.fullmatch(r'incarnation-[a-f0-9-]{36}',incarnation)
+directory=root/incarnation;secret=(directory/'secret').read_bytes();endpoint=str(directory/'host.sock')
+def exchange(body,auth=None):
+ request_id='request-'+str(uuid.uuid4())
+ envelope={'protocolVersion':2,'requestId':request_id,'role':'supervisor','body':body}
+ if auth is not None:envelope['auth']=auth
+ raw=json.dumps(envelope).encode()
+ with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as connection:
+  connection.settimeout(5);connection.connect(endpoint);connection.sendall(struct.pack('!I',len(raw))+raw)
+  def receive(size):
+   chunks=b''
+   while len(chunks)<size:
+    part=connection.recv(size-len(chunks))
+    if not part:raise RuntimeError('owned native host frame closed early')
+    chunks+=part
+   return chunks
+  size=struct.unpack('!I',receive(4))[0];assert 0<size<=65536
+  reply=json.loads(receive(size));assert reply['requestId']==request_id
+  result=reply['result'];assert 'Ok' in result
+  return result['Ok']
+challenge=str(uuid.uuid4())
+hello=exchange({'method':'hello','params':{'incarnation_id':incarnation,'challenge':challenge}})
+assert hello['kind']=='hello';boot=hello['data']['host_boot_id']
+def proof(challenge):return hmac.new(secret,(challenge+'\0'+boot+'\0'+incarnation).encode(),hashlib.sha256).hexdigest()
+assert hmac.compare_digest(hello['data']['proof'],proof(challenge))
+status=exchange({'method':'status','params':{'incarnation_id':incarnation}},proof('command-auth'))
+assert status['kind']=='status';data=status['data'];assert data['host_boot_id']==boot
+print(json.dumps({'incarnationId':incarnation,'hostBootId':boot,'workerPid':data['worker_pid'],
+ 'executionGeneration':data['max_execution_generation'],'exited':data['exited'],
+ 'nativeSessionId':data.get('native_session_id'),'nativeIdentityObservation':data.get('native_identity_observation')}))
+`
+
 async function executeManagedAmplifier(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath: string | undefined,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[]): Promise<NativeExperimentOriginal> {
@@ -1456,6 +1522,7 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
   const wrongRoot = caseId === 'wrong-root'
   const sourceFault = ['missing-history', 'load-failure', 'missing-context-restore'].includes(caseId)
   const pendingFault = ['timeout', 'provider-exit', 'stop-cancellation'].includes(caseId)
+  const ackFault = ['file-replacement', 'file-truncation', 'malformed-ack'].includes(caseId)
   let faultImage: any
   if (sourceFault || pendingFault) {
     const descriptor = sources.find(source => source.name === 'amplifier/native-fault/startup.json')
@@ -1805,16 +1872,67 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
   }
   const assertions = [{ name: 'actual-native-loaded-context-before-zero-input', pass: observation.source === 'amplifier_native_loaded_context'
     && observation.nativeSessionId === view.nativeSessionId && observation.incarnationId === view.incarnationId }]
+  const inspectNative = async (transcriptPath: string, containerId: string, label: string, checkTls: boolean) => {
+    const snapshot = JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
+      ['/opt/amplifier-src/.venv/bin/python', '-c', amplifierNativeInspection, transcriptPath, nativeRoot, String(checkTls)]))
+    harness.writeArtifact(`${scenario}-${label}-native-private.json`, snapshot)
+    return snapshot
+  }
+  if (ackFault) {
+    const signal = JSON.parse(fs.readFileSync(path.join(harness.evidenceDir, `${scenario}-native-signal-original.json`), 'utf8'))
+    if (signal.launch.incarnationId !== view.incarnationId || signal.launch.launchNonce !== observation.launchNonce
+      || signal.launch.evidenceRevision !== observation.evidenceRevision || signal.native.session_id !== nativeRoot) {
+      throw new Error('actual Amplifier ACK before file fault differs from current observation')
+    }
+    const inspect = (label: string) => inspectNative(signal.native.load.transcript.path, view.containerId, label, label === 'before-fault')
+    const before = await inspect('before-fault')
+    if (before.nativeRoot !== nativeRoot || before.nativeCwd !== workspace || before.httpsStatus !== 200
+      || before.tlsVerifyMode !== 2 || before.tlsCheckHostname !== true || before.completedTurns !== 0 || before.toolEvents !== 0) {
+      throw new Error('actual Amplifier native UID/TLS/profile before ACK fault differs')
+    }
+    const status = async (label: string) => {
+      const value = JSON.parse(await harness.execOwnedContainerAsExact(supervisor.containerId, '0:0',
+        ['python3', '-c', amplifierNativeHostStatus, supervisor.runtimeRoot, view.incarnationId]))
+      harness.writeArtifact(`${scenario}-${label}-host-status.json`, value)
+      return value
+    }
+    const current = await status('before-fault')
+    if (current.exited || current.nativeIdentityObservation?.nativeSessionId !== nativeRoot
+      || current.nativeIdentityObservation.launchNonce !== signal.launch.launchNonce) {
+      throw new Error('authenticated Amplifier host lacks current observation before file fault')
+    }
+    const fault = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+      ['python3', '-c', amplifierNativeAckFileFault, caseId, JSON.stringify(signal)]))
+    harness.writeArtifact(`${scenario}-native-ack-fault.json`, fault)
+    const changed = fault.fault === caseId && fault.uid === 65534 && fault.gid === 0 && fault.nativeRoot === nativeRoot
+      && JSON.stringify(fault.launch) === JSON.stringify(signal.launch) && fault.validBefore
+      && (caseId === 'file-replacement'
+        ? fault.beforeIdentity[0] === fault.afterIdentity[0] && fault.beforeIdentity[1] !== fault.afterIdentity[1] && fault.originalSha256 === fault.changedSha256 && fault.validAfter
+        : fault.beforeIdentity[0] === fault.afterIdentity[0] && fault.beforeIdentity[1] === fault.afterIdentity[1] && fault.originalSha256 !== fault.changedSha256
+          && (caseId === 'file-truncation' ? Number(fault.afterIdentity[2]) < Number(fault.beforeIdentity[2]) && fault.validAfter : fault.validAfter === false))
+    if (!changed) throw new Error('actual owned Amplifier ACK file fault condition missing')
+    const after = await status('after-fault')
+    if (after.exited || after.nativeSessionId || after.nativeIdentityObservation) {
+      throw new Error('authenticated native Amplifier host retained observation after ACK fault')
+    }
+    const input = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned failed ACK input probe. Do not use tools.\r'))
+    harness.writeArtifact(`${scenario}-input-refusal.json`, input)
+    if (input.result?.Err?.code !== 'RECOVERY_BLOCKED') throw new Error('native Amplifier ACK fault admitted ordinary input')
+    const conserved = await inspect('after-fault')
+    if (conserved.nativeRoot !== nativeRoot || conserved.completedTurns !== 0 || conserved.toolEvents !== 0
+      || JSON.stringify(conserved.transcript) !== JSON.stringify(before.transcript)) {
+      throw new Error('native Amplifier ACK fault changed original history or dispatched a turn')
+    }
+    assertions.push({ name: 'actual-current-native-tls-before-ack-file-fault', pass: before.httpsStatus === 200 && before.tlsVerifyMode === 2 && before.tlsCheckHostname },
+      { name: 'actual-owned-native-ack-file-fault-executed', pass: changed },
+      { name: 'authenticated-host-revokes-mutated-native-ack', pass: !after.nativeSessionId && !after.nativeIdentityObservation && !after.exited },
+      { name: 'ordinary-input-refused-original-history-preserved', pass: input.result.Err.code === 'RECOVERY_BLOCKED' && conserved.completedTurns === 0 })
+  }
   if (resumes) {
     const signalFile = path.join(harness.evidenceDir, `${scenario}-native-signal-original.json`)
     const signal = JSON.parse(fs.readFileSync(signalFile, 'utf8'))
     const transcriptPath = signal.native.load.transcript.path
-    const inspect = async (containerId: string, label: string) => {
-      const snapshot = JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
-        ['/opt/amplifier-src/.venv/bin/python', '-c', amplifierNativeInspection, transcriptPath, nativeRoot, String(label === 'startup')]))
-      harness.writeArtifact(`${scenario}-${label}-native-private.json`, snapshot)
-      return snapshot
-    }
+    const inspect = (containerId: string, label: string) => inspectNative(transcriptPath, containerId, label, label === 'startup')
     const startup = await inspect(view.containerId, 'startup')
     if (startup.httpsStatus !== 200 || startup.tlsVerifyMode !== 2 || !startup.tlsCheckHostname) {
       throw new Error('current native Amplifier selected grant/TLS check failed')

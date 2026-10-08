@@ -1,15 +1,16 @@
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
+import { promisify } from 'node:util'
 import { describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { createServer } from 'node:net'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
-  type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
+  amplifierNativeAckFileFault, amplifierNativeHostStatus, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
 const candidateSha = 'b'.repeat(40)
@@ -27,6 +28,74 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['file-replacement', 'file-truncation', 'malformed-ack'].flatMap(fault =>
+    ['valid', 'wrong-original', 'symlink', 'wrong-uid'].map(form => [fault, form])))('executes the restricted ACK filesystem mutation (%s, %s; controlled identity only)', (fault, form) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-ack-file-'))
+    const nonce = 'current-native-nonce', signalDirectory = path.join(directory, nonce)
+    fs.mkdirSync(signalDirectory)
+    const file = path.join(signalDirectory, 'amplifier-loaded-context.json'), unrelated = path.join(directory, 'unrelated-file')
+    const value = { launch: { launchNonce: nonce, incarnationId: 'controlled-incarnation' }, native: { session_id: randomUUID() } }
+    const raw = Buffer.from(JSON.stringify(value) + '\n'); fs.writeFileSync(unrelated, raw)
+    if (form === 'symlink') fs.symlinkSync(unrelated, file); else fs.writeFileSync(file, raw)
+    const before = fs.statSync(file)
+    // Only this controlled filesystem fixture substitutes its owned directory
+    // and identity functions; managed native execution uses the unmodified code.
+    const script = "import os\nos.getuid=lambda:" + (form === 'wrong-uid' ? '0' : '65534') + "\nos.getgid=lambda:0\n"
+      + amplifierNativeAckFileFault.replace("pathlib.Path('/home/freshell/provider/.freshell/native-identity')", 'pathlib.Path(sys.argv[3])')
+    const expected = form === 'wrong-original' ? { ...value, native: { session_id: randomUUID() } } : value
+    try {
+      const run = () => execFileSync('python3', ['-c', script, fault!, JSON.stringify(expected), directory], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] })
+      if (form !== 'valid') { expect(run).toThrow(); expect(fs.readFileSync(file)).toEqual(raw) }
+      else {
+        const result = JSON.parse(run()), after = fs.statSync(file)
+        expect(result.originalSha256).toBe(createHash('sha256').update(raw).digest('hex'))
+        expect(result.changedSha256).toBe(createHash('sha256').update(fs.readFileSync(file)).digest('hex'))
+        if (fault === 'file-replacement') { expect(after.ino).not.toBe(before.ino); expect(fs.readFileSync(file)).toEqual(raw) }
+        else if (fault === 'file-truncation') { expect(after.ino).toBe(before.ino); expect(after.size).toBe(raw.length - 1); expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual(value) }
+        else { expect(after.ino).toBe(before.ino); expect(() => JSON.parse(fs.readFileSync(file, 'utf8'))).toThrow() }
+        expect(result.validAfter).toBe(fault !== 'malformed-ack')
+      }
+      expect(fs.readFileSync(unrelated)).toEqual(raw)
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+  it.each(['valid', 'wrong-proof', 'wrong-status-boot', 'wrong-request', 'oversized'])('executes the owned native host Status authentication/framing (%s; fixture only)', async (form) => {
+    const base = path.join('/tmp/frs', randomUUID().replaceAll('-', '').slice(0, 8) + '-' + randomUUID().slice(0, 3))
+    const root = path.join(base, 'r', 'amplif-aaaaaaaa', 'x'), incarnation = 'incarnation-' + randomUUID()
+    const directory = path.join(root, incarnation); fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const secret = Buffer.from(randomUUID()), boot = 'hostboot-' + randomUUID(), endpoint = path.join(directory, 'host.sock')
+    fs.writeFileSync(path.join(directory, 'secret'), secret, { mode: 0o600 })
+    const requests: any[] = []
+    const proof = (challenge: string) => createHmac('sha256', secret).update(challenge + '\0' + boot + '\0' + incarnation).digest('hex')
+    const server = createServer(socket => {
+      let buffered = Buffer.alloc(0)
+      socket.on('data', part => {
+        buffered = Buffer.concat([buffered, part])
+        if (buffered.length < 4 || buffered.length < 4 + buffered.readUInt32BE()) return
+        const request = JSON.parse(buffered.subarray(4, 4 + buffered.readUInt32BE()).toString()); requests.push(request)
+        const hello = request.body.method === 'hello'
+        const response = { requestId: form === 'wrong-request' ? 'request-other' : request.requestId, result: { Ok: hello
+          ? { kind: 'hello', data: { host_boot_id: boot, proof: form === 'wrong-proof' ? '0'.repeat(64) : proof(request.body.params.challenge) } }
+          : { kind: 'status', data: { host_boot_id: form === 'wrong-status-boot' ? 'hostboot-other' : boot,
+            worker_pid: 55, max_execution_generation: 3, exited: false, native_session_id: null, native_identity_observation: null } } } }
+        const bytes = Buffer.from(JSON.stringify(response)), frame = Buffer.alloc(4 + bytes.length)
+        frame.writeUInt32BE(form === 'oversized' ? 65_537 : bytes.length); bytes.copy(frame, 4)
+        socket.end(form === 'oversized' ? frame.subarray(0, 4) : frame)
+      })
+    })
+    await new Promise<void>(resolve => server.listen(endpoint, resolve))
+    try {
+      const run = promisify(execFile)('python3', ['-c', amplifierNativeHostStatus, root, incarnation], { timeout: 5_000 })
+      if (form !== 'valid') await expect(run).rejects.toThrow()
+      else {
+        const value = JSON.parse((await run).stdout)
+        expect(value).toEqual({ incarnationId: incarnation, hostBootId: boot, workerPid: 55, executionGeneration: 3,
+          exited: false, nativeSessionId: null, nativeIdentityObservation: null })
+        expect(requests).toHaveLength(2)
+        expect(requests[1].auth).toBe(proof('command-auth'))
+        expect(requests.every(row => row.protocolVersion === 2 && row.role === 'supervisor' && row.body.params.incarnation_id === incarnation)).toBe(true)
+      }
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); fs.rmSync(base, { recursive: true, force: true }) }
+  })
   it.each(['valid', 'wrong-digest', 'wrong-root', 'symlink', 'tool-operation'])('mutates only the exact owned completed native loader source (%s)', (fault) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'owned-native-loader-source-'))
     const project = path.join(directory, 'projects', 'owned-project'); fs.mkdirSync(project, { recursive: true })
@@ -113,6 +182,71 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
           .toBe('/owned/native-transcript')
       }
       if (fault === 'missing-signal') expect(records.has('amplifier-create-original.json')).toBe(false)
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+  it.each(['file-replacement', 'file-truncation', 'malformed-ack'].flatMap(fault =>
+    ['valid', 'host-still-observed', 'input-admitted', 'no-file-change', 'wrong-root', 'wrong-launch', 'wrong-uid', 'invalid-original', 'source-changed', 'wrong-tls', 'missing-current-status']
+      .map(form => [fault, form])))('requires actual native Amplifier ACK mutation through host status and input (%s, %s)', async (fault, form) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-ack-route-'))
+    const source = path.join(directory, 'selected-profile'); fs.writeFileSync(source, 'fixture selected profile')
+    let request: any, mutated = false
+    const launch = () => ({ incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 7,
+      executionGeneration: 3, requestedNativeSessionId: request.params.nativeSessionId })
+    const observation = () => ({ ...launch(), nativeSessionId: request.params.nativeSessionId, source: 'amplifier_native_loaded_context' })
+    const signal = () => ({ launch: launch(), native: { session_id: request.params.nativeSessionId, parent_id: null,
+      source: 'resume', producer_sha256: 'c'.repeat(64), load: { transcript: { path: '/owned/native/transcript.jsonl' } } } })
+    const records = new Map<string, unknown>()
+    const harness = { testRoot: directory, evidenceDir: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
+      startSupervisor: async () => ({ containerId: 'owned-control', runtimeRoot: '/tmp/frs/aaaaaaaa-bbb/r/amplif-aaaaaaaa/x' }),
+      terminalInputBody: () => ({ method: 'terminal_input' }), writeArtifact: (name: string, value: unknown) => records.set(name, value),
+      adminOk: async (_supervisor: unknown, input: any) => {
+        request = input
+        return { data: { view: { soulId: request.params.soulId, containerId: 'owned-amplifier', incarnationId: 'current-incarnation',
+          nativeSessionId: request.params.nativeSessionId, recoveryState: 'live', launchState: 'running', nativeIdentityObservation: observation() } } }
+      },
+      adminRaw: async () => ({ result: form === 'input-admitted' ? { Ok: {} } : { Err: { code: 'RECOVERY_BLOCKED' } } }),
+      execOwnedContainerAsExact: async (containerId: string, uid: string, argv: string[]) => {
+        if (containerId === 'owned-control') {
+          expect(uid).toBe('0:0')
+          const observed = form !== 'missing-current-status' && (!mutated || form === 'host-still-observed')
+          return JSON.stringify({ incarnationId: 'current-incarnation', exited: false, executionGeneration: 3,
+            nativeSessionId: observed ? request.params.nativeSessionId : null, nativeIdentityObservation: observed ? observation() : null })
+        }
+        expect(uid).toBe('65534:0')
+        if (argv[3] === fault) {
+          mutated = true
+          return JSON.stringify({ fault, launch: { ...launch(), launchNonce: form === 'wrong-launch' ? 'old-nonce' : launch().launchNonce },
+            nativeRoot: form === 'wrong-root' ? 'wrong-root' : request.params.nativeSessionId,
+            uid: form === 'wrong-uid' ? 0 : 65534, gid: 0, originalSha256: 'a'.repeat(64), changedSha256: fault === 'file-replacement' || form === 'no-file-change' ? 'a'.repeat(64) : 'b'.repeat(64),
+            beforeIdentity: ['1','2','100'], afterIdentity: ['1',fault === 'file-replacement' && form !== 'no-file-change' ? '3' : '2',fault === 'file-truncation' && form !== 'no-file-change' ? '99' : '100'],
+            validBefore: form !== 'invalid-original', validAfter: fault !== 'malformed-ack' || form === 'no-file-change' })
+        }
+        if (argv[3] === '/owned/native/transcript.jsonl') return JSON.stringify({ nativeRoot: request.params.nativeSessionId,
+          nativeCwd: request.params.terminal.cwd, httpsStatus: form === 'wrong-tls' ? 401 : 200, tlsVerifyMode: 2, tlsCheckHostname: true,
+          completedTurns: 0, toolEvents: 0, transcript: { completeEof: true, sha256: form === 'source-changed' && mutated ? 'changed-source' : 'same-source' } })
+        if (argv[0] === 'python3') return JSON.stringify(signal())
+        return JSON.stringify({ uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+          cliVersion: '0.1.1', coreVersion: '1.6.0', executableSha256: 'e'.repeat(64) })
+      },
+    } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', '.amplifier/settings.yaml', '.amplifier/bundles/default.yaml']
+      .map(name => ({ name: 'amplifier/' + name, path: source, sha256: 'e'.repeat(64) }))
+    try {
+      const run = executeManagedNativeCase(harness, sources, { provider: 'amplifier', case: 'startup' }, fault)
+      if (form === 'valid') {
+        const result = await run
+        expect(mutated).toBe(true)
+        expect(result.assertions.every(row => row.pass)).toBe(true)
+        expect(records.has('amplifier-' + fault + '-original.json')).toBe(true)
+      } else {
+        await expect(run).rejects.toThrow(form === 'host-still-observed' ? 'authenticated native Amplifier host retained observation after ACK fault'
+          : form === 'input-admitted' ? 'native Amplifier ACK fault admitted ordinary input'
+          : form === 'wrong-tls' ? 'actual Amplifier native UID/TLS/profile before ACK fault differs'
+          : form === 'missing-current-status' ? 'authenticated Amplifier host lacks current observation before file fault'
+          : form === 'source-changed' ? 'native Amplifier ACK fault changed original history or dispatched a turn'
+          : 'actual owned Amplifier ACK file fault condition missing')
+        expect(records.has('amplifier-' + fault + '-original.json')).toBe(false)
+      }
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
   it.each(['valid', 'requested-echo', 'old-nonce', 'old-incarnation', 'old-revision', 'old-generation', 'published', 'missing-event', 'admitted-input', 'signal-present', 'nonempty-root', 'parent-root', 'wrong-namespace'])('requires a current actual Amplifier wrong-root refusal (%s)', async (fault) => {
