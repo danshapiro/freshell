@@ -924,6 +924,9 @@ export class ExternalManagedRuntimeRig {
   async addOpenCodeQualificationSecondView(handle: ExactRuntimeHandle, expectedIntentRevision: number, expectedControlEpoch: number): Promise<void> {
     await this.rpc('opencode-qualification-second-view', CompletedOwnerOperationSchema, { handle, expectedIntentRevision, expectedControlEpoch })
   }
+  async openCodeQualificationNoticeCount(): Promise<number> {
+    return this.rpc('opencode-qualification-notice-count', z.number().int().nonnegative())
+  }
   async openCodeContinuityFirstTurnCompleted(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
     return this.rpc('opencode-continuity-first-turn', z.boolean(), { enclosure })
   }
@@ -1314,6 +1317,9 @@ export function createExternalRuntimeControl(
         if (request.expectedIntentRevision === undefined || request.expectedControlEpoch === undefined) throw new Error('exact view revision and controller epoch required')
         await owner.addOpenCodeQualificationSecondView(handle(), request.expectedIntentRevision, request.expectedControlEpoch)
         result = { completed: true }
+        break
+      case 'opencode-qualification-notice-count':
+        result = await owner.openCodeQualificationNoticeCount()
         break
       case 'opencode-continuity-effect-count':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')

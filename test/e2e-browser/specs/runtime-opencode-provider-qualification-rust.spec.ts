@@ -102,13 +102,6 @@ function waitForRunningView(
   }, timeoutMs)
 }
 
-function dataOf(result: any, expectedKind: string): any {
-  if (!result || result.kind !== expectedKind) {
-    throw new Error(`expected ${expectedKind}, got ${JSON.stringify(result)}`)
-  }
-  return result.data
-}
-
 async function waitForPaneTerminal(page: Page, paneId: string, timeoutMs = 90_000): Promise<void> {
   await page
     .locator(`[data-pane-id="${paneId}"] .xterm:visible`)
@@ -627,15 +620,8 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(writerClaim.activeClaimCount).toBe(1)
       expect(writerClaim.globalConflictingClaimCount).toBe(0)
 
-      const notices = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.pendingNoticesBody(
-          'profile:opencode-provider-qualification',
-          100,
-          await rig.controlEpoch(),
-        ),
-      ), 'pending_notices')
-      expect(notices).toHaveLength(0)
+      const noticeCount = await rig.openCodeQualificationNoticeCount()
+      expect(noticeCount).toBe(0)
 
       const firstStop = await stopManagedRuntimeSoul(rig, first.view.soulId)
       const secondStop = await stopManagedRuntimeSoul(rig, second.view.soulId)
@@ -697,7 +683,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         repairedSameSoul: afterProviderCrash.soulId === first.view.soulId,
         repairedSameNativeSession: afterProviderCrash.nativeSessionId === nativeSessionId,
         nativeRecovery: true,
-        lostNoticeCount: notices.length,
+        lostNoticeCount: noticeCount,
         oldEnclosureVerifiedEmpty: !(await rig.ownedContainerState(rig.runtimeEnclosureHandle(first.view))).running
           && !(await rig.ownedContainerState(rig.runtimeEnclosureHandle(afterHostCrash))).running,
         verifiedEmptyOrdering: {

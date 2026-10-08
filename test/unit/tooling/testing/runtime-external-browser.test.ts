@@ -1942,6 +1942,34 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('counts only the fixed qualification notices at the current epoch without returning notice bodies', async () => {
+    const { owned, context, request } = fixture()
+    Object.assign(owned.runtime, { phase: 5 })
+    const epoch = vi.spyOn(owned, 'controlEpoch').mockResolvedValue(4)
+    const admin = vi.spyOn(owned.runtime, 'adminOk').mockResolvedValue({ kind: 'pending_notices', data: [] })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const wire: unknown[] = []
+    const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
+      const reply = await control(JSON.parse(String(init.body)))
+      wire.push(reply)
+      return new Response(JSON.stringify(reply), { status: 200 })
+    })
+    await expect(rig.openCodeQualificationNoticeCount()).resolves.toBe(0)
+    expect(admin).toHaveBeenCalledWith(owned.supervisor, { method: 'pending_notices', params: {
+      profileId: 'profile:opencode-provider-qualification', limit: 100, expectedControlEpoch: 4 } })
+    epoch.mockResolvedValue(9)
+    admin.mockResolvedValue({ kind: 'pending_notices', data: [{ nativeSessionId: 'private native root', message: 'private notice body' }] })
+    await expect(rig.openCodeQualificationNoticeCount()).resolves.toBe(1)
+    expect(admin.mock.calls.at(-1)?.[1]).toMatchObject({ params: { expectedControlEpoch: 9 } })
+    expect(JSON.stringify(wire)).not.toContain('private')
+    admin.mockResolvedValue({ kind: 'pending_notices', data: { truncated: true } })
+    await expect(owned.openCodeQualificationNoticeCount()).rejects.toThrow()
+    admin.mockClear()
+    await expect(control({ ...request, action: 'opencode-qualification-notice-count', profileId: 'foreign' })).rejects.toThrow(/operation/)
+    Object.assign(owned.runtime, { phase: 2 })
+    await expect(owned.openCodeQualificationNoticeCount()).rejects.toThrow(/Phase 5/)
+    expect(admin).not.toHaveBeenCalled()
+  })
   it('applies only the fixed qualification second-view preset at the current address revision and epoch', async () => {
     const { owned, context, inventory, request } = fixture()
     Object.assign(owned.runtime, { phase: 5 })

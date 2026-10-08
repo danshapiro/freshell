@@ -981,6 +981,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'opencode-qualification-blockers',
     'opencode-replacement-readiness',
     'opencode-qualification-second-view',
+    'opencode-qualification-notice-count',
     'terminal-continuity-receipt',
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
@@ -3690,6 +3691,12 @@ export class ManagedRuntimeOwner {
     return OpencodeReplacementReadinessSchema.parse({ incarnationId: output.incarnationId, streamEpoch: output.streamEpoch,
       terminalId: output.terminalId, exited: output.exited, headSeq: output.headSeq,
       sourceReady: openCodeTerminalReady(sourceText, ['GPT-5.6 Luna', P2_OPENCODE_MODEL]) })
+  }
+  async openCodeQualificationNoticeCount(): Promise<number> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
+    const result = await this.runtime.adminOk(this.supervisor,
+      this.runtime.pendingNoticesBody('profile:opencode-provider-qualification', 100, await this.controlEpoch()))
+    return z.array(z.unknown()).parse(this.dataOf(result, 'pending_notices')).length
   }
   async addOpenCodeQualificationSecondView(handle: ExactRuntimeHandle, expectedIntentRevision: number, expectedControlEpoch: number): Promise<void> {
     if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
