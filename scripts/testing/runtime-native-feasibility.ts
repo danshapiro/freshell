@@ -880,7 +880,7 @@ print(json.dumps({'root':root,'beforeSha256':hashlib.sha256(raw).hexdigest(),'af
       const current = inventory.data.filter((row: any) => row.soulId === soulId)
       const contained = recovery.result?.Ok?.data?.outcome === 'blocked' && current.every((row: any) =>
         row.launchState !== 'running' && row.nativeIdentityObservation?.incarnationId !== fault.launch.incarnationId)
-      const currentNativeFork = fault.native.source === 'resume' && fault.native.session_id !== nativeRoot
+      const currentNativeFork = fault.native.source === 'fork' && fault.native.session_id !== nativeRoot
         && fault.launch.requestedNativeSessionId === nativeRoot
         && fault.launch.incarnationId !== view.incarnationId && fault.launch.launchNonce !== namespace.hook.launch.launchNonce
         && fault.uid === 65534 && fault.gid === 0 && fault.nativeExecutableSha256 === namespace.executableSha256
@@ -1546,7 +1546,7 @@ import {createHash} from 'node:crypto'
 const digest=bytes=>createHash('sha256').update(bytes).digest('hex')
 let input='';for await(const chunk of process.stdin)input+=chunk
 const native=JSON.parse(input)
-if(native.source==='resume') {
+if(native.source==='fork') {
  const workspace=process.cwd(),control=JSON.parse(fs.readFileSync(path.join(workspace,'native-fork-fault-control.json'),'utf8'))
  const launch=JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH)
  if(launch.requestedNativeSessionId!==control.root || native.cwd!==workspace) throw new Error('owned native fork binding mismatch')

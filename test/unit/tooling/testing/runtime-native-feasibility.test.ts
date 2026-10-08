@@ -33,7 +33,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     fs.writeFileSync(hookPath, terminalForkFaultHook)
     fs.writeFileSync(path.join(directory, 'native-fork-fault-control.json'), JSON.stringify({root:'original-root'}))
     const launch = {requestedNativeSessionId:fault === 'wrong-requested-root'?'other-requested-root':'original-root'}
-    const input = JSON.stringify({source:fault === 'startup'?'startup':'resume', session_id:fault === 'same-native-root'?'original-root':'actual-fork-root', cwd:fault === 'foreign-workspace'?directory+'-other':directory})
+    const input = JSON.stringify({source:fault === 'startup'?'startup':'fork', session_id:fault === 'same-native-root'?'original-root':'actual-fork-root', cwd:fault === 'foreign-workspace'?directory+'-other':directory})
     try {
       const run = () => execFileSync(process.execPath,[hookPath],{cwd:directory,input,encoding:'utf8',
         env:{...process.env,FRESHELL_NATIVE_IDENTITY_LAUNCH:JSON.stringify(launch)},stdio:['pipe','pipe','pipe']})
