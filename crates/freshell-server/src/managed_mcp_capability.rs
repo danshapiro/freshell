@@ -2650,6 +2650,188 @@ fn read_prepared_context(
     result
 }
 
+// These are selected issuer metadata, never original HOME or capability values.
+// Check physical size before reserving, and never allocate a growth sentinel.
+fn read_claude_candidate_metadata(
+    root: &Path,
+    relative: &str,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let blocked = || {
+        "Claude frozen candidate private metadata unavailable or exceeds profile; retain inputs and reprepare".to_string()
+    };
+    if !Path::new(relative)
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(blocked());
+    }
+    let path = root.join(relative);
+    let before = std::fs::symlink_metadata(&path).map_err(|_| blocked())?;
+    if !before.is_file()
+        || before.file_type().is_symlink()
+        || before.len() > limit as u64
+        || std::fs::canonicalize(&path).map_err(|_| blocked())? != path
+    {
+        return Err(blocked());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&path).map_err(|_| blocked())?;
+    let opened = file.metadata().map_err(|_| blocked())?;
+    let modified = before.modified().map_err(|_| blocked())?;
+    if opened.len() != before.len() || opened.modified().map_err(|_| blocked())? != modified {
+        return Err(blocked());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (opened.dev(), opened.ino()) != (before.dev(), before.ino()) {
+            return Err(blocked());
+        }
+    }
+    let length = usize::try_from(before.len()).map_err(|_| blocked())?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).map_err(|_| blocked())?;
+    bytes.resize(length, 0);
+    file.read_exact(&mut bytes).map_err(|_| blocked())?;
+    let mut extra = [0];
+    if file.read(&mut extra).map_err(|_| blocked())? != 0 {
+        return Err(blocked());
+    }
+    let after = std::fs::symlink_metadata(&path).map_err(|_| blocked())?;
+    if after.file_type().is_symlink()
+        || after.len() != before.len()
+        || after.modified().map_err(|_| blocked())? != modified
+    {
+        return Err(blocked());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (after.dev(), after.ino()) != (before.dev(), before.ino()) {
+            return Err(blocked());
+        }
+    }
+    Ok(bytes)
+}
+
+fn bind_claude_candidate_request(
+    store: &CapabilityStore,
+    directory: &Path,
+    request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+) -> Result<freshell_runtime_protocol::ObserveClaudeSourcesRequest, String> {
+    use freshell_platform::claude_inputs::{observation::CandidateBinding, ClaudeInputManifest};
+    use freshell_runtime_protocol::{
+        bounded_json_bytes, ClaudeCandidatePublication, PreparedProviderContext,
+        MAX_CONTROL_FRAME_BYTES,
+    };
+    let blocked = || {
+        "Claude frozen candidate request unavailable or changed; retain inputs and reprepare"
+            .to_string()
+    };
+    let context = &request
+        .candidate
+        .as_ref()
+        .ok_or_else(blocked)?
+        .provider_launch_context;
+    let grant = context.mcp_capability.as_ref().ok_or_else(blocked)?;
+    let generation = grant.grant_id.clone();
+    let inputs = context.prepared_inputs.as_ref().ok_or_else(blocked)?;
+    if inputs.generation_id != generation
+        || !store
+            .grants
+            .lock()
+            .unwrap()
+            .get(&generation)
+            .is_some_and(|grant| grant.soul_id == request.soul_id)
+    {
+        return Err(blocked());
+    }
+    let root = staged_provider_root_path(directory, &generation).map_err(|_| blocked())?;
+    let published = read_claude_candidate_metadata(
+        &root,
+        ".freshell/claude-candidate-binding.json",
+        MAX_CONTROL_FRAME_BYTES,
+    )?;
+    let publication: ClaudeCandidatePublication =
+        serde_json::from_slice(&published).map_err(|_| blocked())?;
+    let context_bytes = read_claude_candidate_metadata(
+        &root,
+        ".freshell/prepared-context.json",
+        MAX_CONTROL_FRAME_BYTES,
+    )?;
+    let ready_bytes = read_claude_candidate_metadata(
+        &root,
+        ".freshell/prepared-result.json",
+        MAX_CONTROL_FRAME_BYTES,
+    )?;
+    let ready: PreparedProviderContext =
+        serde_json::from_slice(&ready_bytes).map_err(|_| blocked())?;
+    let manifest_bytes =
+        read_claude_candidate_metadata(&root, &inputs.manifest.relative_path, 64 * 1024 * 1024)?;
+    let manifest: ClaudeInputManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|_| blocked())?;
+    manifest.validate().map_err(|_| blocked())?;
+    let plan = manifest.accepted_native_plan.as_ref().ok_or_else(blocked)?;
+    if format!("{:x}", Sha256::digest(&context_bytes)) != publication.prepared_context_sha256
+        || format!("{:x}", Sha256::digest(&ready_bytes)) != publication.prepared_result_sha256
+        || format!("{:x}", Sha256::digest(&manifest_bytes)) != publication.manifest_sha256
+        || publication.manifest_sha256 != inputs.manifest.sha256
+        || bounded_json_bytes(context, MAX_CONTROL_FRAME_BYTES).map_err(|_| blocked())?
+            != context_bytes
+        || bounded_json_bytes(&ready.provider_launch_context, MAX_CONTROL_FRAME_BYTES)
+            .map_err(|_| blocked())?
+            != context_bytes
+        || bounded_json_bytes(&manifest.original_selectors(), 64 * 1024 * 1024)
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+            .map_err(|_| blocked())?
+            != publication.selector_manifest_sha256
+        || request.observation_request.setting_sources != plan.observation.setting_sources
+        || request.observation_request.native_source_runtime
+            != plan.observation.native_source_runtime
+        || request.observation_request.cwd != plan.observation.cwd
+        || request.observation_request.selector_manifest_sha256 != plan.selector_manifest_sha256
+        || request.observation_request.plan_revision != plan.plan_revision
+    {
+        return Err(blocked());
+    }
+    let binding = CandidateBinding {
+        soul_id: publication.soul_id.as_str().into(),
+        generation_id: generation,
+        authority_sha256: publication.authority_sha256.clone(),
+        publication_sha256: format!("{:x}", Sha256::digest(published)),
+        manifest_sha256: publication.manifest_sha256.clone(),
+        prepared_result_sha256: publication.prepared_result_sha256.clone(),
+    };
+    if request
+        .observation_request
+        .candidate_binding
+        .as_ref()
+        .is_some_and(|prior| {
+            bounded_json_bytes(prior, MAX_CONTROL_FRAME_BYTES).ok()
+                != bounded_json_bytes(&binding, MAX_CONTROL_FRAME_BYTES).ok()
+        })
+    {
+        return Err(blocked());
+    }
+    let mut bound = request;
+    bound.candidate = Some(ready);
+    bound.observation_request.candidate_binding = Some(binding);
+    bound
+        .candidate_projection(publication)
+        .map_err(|_| blocked())?;
+    bounded_json_bytes(&bound, MAX_CONTROL_FRAME_BYTES).map_err(|_| blocked())?;
+    tracing::debug!(event="provider.inputs.claude_candidate.request_bound",soul_id=%bound.soul_id,plan_revision=bound.observation_request.plan_revision,"Frozen Claude candidate request bound to its issuer");
+    Ok(bound)
+}
+
 /// A web-server restart restores only grants whose exact incarnation remains
 /// live in the supervisor inventory. Recoverable souls retain their private
 /// OpenCode inputs before stale scopes and incarnation stages are revoked.
@@ -3454,6 +3636,32 @@ except Exception as error:
 
     #[cfg(unix)]
     #[test]
+    fn managed_provider_claude_candidate_private_metadata_keeps_inclusive_limits() {
+        for limit in [
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+            64 * 1024 * 1024,
+        ] {
+            let owned = tempfile::tempdir().unwrap();
+            let path = owned.path().join("metadata");
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_len(limit as u64).unwrap();
+            let bytes = read_claude_candidate_metadata(owned.path(), "metadata", limit)
+                .expect("supported inclusive metadata limit must remain readable");
+            assert_eq!(bytes.len(), limit);
+            drop(bytes);
+            file.set_len(limit as u64 + 1).unwrap();
+            assert!(read_claude_candidate_metadata(owned.path(), "metadata", limit).is_err());
+            assert!(
+                read_claude_candidate_metadata(owned.path(), "../metadata", limit + 1).is_err()
+            );
+            std::fs::rename(&path, owned.path().join("escaped")).unwrap();
+            std::os::unix::fs::symlink(owned.path().join("escaped"), &path).unwrap();
+            assert!(read_claude_candidate_metadata(owned.path(), "metadata", limit + 1).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn managed_provider_claude_issuer_publication_gates_owned_dependency_consumer() {
         use freshell_platform::claude_inputs::{
             observation::{observe, CandidateBinding, ObservationRequest},
@@ -3719,6 +3927,57 @@ except Exception as error:
                 .is_err());
             let replacement_projection = replacement_request.candidate_projection(replacement_publication).expect("replacement publication must bind its current authority and exact prior generation");
             std::fs::remove_dir_all(&home).unwrap();
+            for candidate in [&request, &replacement_request] {
+                let bound = bind_claude_candidate_request(&store, &directory, candidate.clone())
+                    .expect("candidate request must bind the exact frozen issuer after original HOME disappears");
+                let capability = bound
+                    .candidate
+                    .as_ref()
+                    .unwrap()
+                    .provider_launch_context
+                    .mcp_capability
+                    .as_ref()
+                    .unwrap();
+                let root = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+                let publication = serde_json::from_slice(
+                    &std::fs::read(root.join(".freshell/claude-candidate-binding.json")).unwrap(),
+                )
+                .unwrap();
+                bound.candidate_projection(publication).expect(
+                    "production request must retain complete issuer/result/authority binding",
+                );
+                for relative in [
+                    ".freshell/claude-candidate-binding.json",
+                    ".freshell/prepared-context.json",
+                    ".freshell/prepared-result.json",
+                    ".freshell/input-manifest.json",
+                ] {
+                    let path = root.join(relative);
+                    let bytes = std::fs::read(&path).unwrap();
+                    let private = b"PRIVATE_CHANGED_CANDIDATE_METADATA_SENTINEL";
+                    std::fs::write(&path, private).unwrap();
+                    let error=bind_claude_candidate_request(&store,&directory,candidate.clone())
+                        .expect_err("changed frozen metadata must block before an executable consumer is selected");
+                    assert!(!error.contains(std::str::from_utf8(private).unwrap()));
+                    std::fs::write(&path, bytes).unwrap();
+                }
+                let mut wrong = candidate.clone();
+                wrong.observation_request.setting_sources = vec![ClaudeSettingSource::Local];
+                assert!(bind_claude_candidate_request(&store, &directory, wrong).is_err());
+                let mut wrong = candidate.clone();
+                wrong
+                    .observation_request
+                    .candidate_binding
+                    .as_mut()
+                    .unwrap()
+                    .publication_sha256 = "0".repeat(64);
+                assert!(bind_claude_candidate_request(&store, &directory, wrong).is_err());
+                assert_eq!(
+                    store.grants.lock().unwrap().len(),
+                    2,
+                    "failed request binding must preserve both existing generations"
+                );
+            }
             for (stage, projection) in [
                 (&stage, &projection),
                 (&replacement_stage, &replacement_projection),
