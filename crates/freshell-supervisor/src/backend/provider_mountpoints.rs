@@ -36,7 +36,7 @@ fn owned_mountpoint_helper(actual: &Value, expected: &Value) -> bool {
         .all(|field| actual["HostConfig"][field] == expected["HostConfig"][field])
 }
 
-fn selections(mounts: &docker::TerminalMounts) -> Result<Vec<Mountpoint>, BackendError> {
+pub(super) fn selections(mounts: &docker::TerminalMounts) -> Result<Vec<Mountpoint>, BackendError> {
     let home = Path::new("/home/freshell/provider");
     let mut selected = BTreeMap::<String, bool>::new();
     let mut add = |path: &Path, directory: bool| -> Result<(), BackendError> {

@@ -6,6 +6,124 @@ use freshell_runtime_protocol::{
 use std::sync::{Arc, Mutex};
 use tokio::{net::UnixListener, task::JoinSet};
 
+#[tokio::test]
+async fn provider_claude_candidate_scratch_owns_disk_backing_and_confirmed_cleanup() {
+    for mode in [
+        "success",
+        "lost-ack",
+        "existing",
+        "conflict",
+        "wrong-labels",
+        "driver-options",
+        "wrong-daemon",
+        "still-present",
+    ] {
+        let owned = tempfile::tempdir().unwrap();
+        let daemon = DockerDaemonId::new();
+        let labels = json!({"com.freshell.soul-id":"synthetic-soul", "com.freshell.source-request-id":"synthetic-request"});
+        let mut scratch = CandidateScratch {
+            name: "freshell-claude-candidate-synthetic".into(),
+            labels: labels.clone(),
+            daemon: daemon.clone(),
+            attempted: false,
+        };
+        let present = Arc::new(Mutex::new(mode == "existing"));
+        let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let listener = UnixListener::bind(owned.path().join("docker.sock")).unwrap();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let (state, seen) = (present.clone(), calls.clone());
+        let server = tokio::spawn(async move {
+            let mut jobs = JoinSet::new();
+            loop {
+                tokio::select! {
+                    _=&mut stopped=>break,
+                    accepted=listener.accept()=>{
+                        let (mut stream,_)=accepted.unwrap();
+                        let (state,seen,labels,daemon)=(state.clone(),seen.clone(),labels.clone(),daemon.clone());
+                        jobs.spawn(async move {
+                            let mut header=Vec::new();let mut byte=[0];
+                            while !header.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).await.unwrap();header.push(byte[0]);assert!(header.len()<=32*1024);}
+                            let header=String::from_utf8(header).unwrap();let line=header.lines().next().unwrap().to_string();
+                            let length=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().trim().parse::<usize>().unwrap();
+                            assert!(length<=64*1024);let mut raw=vec![0;length];stream.read_exact(&mut raw).await.unwrap();
+                            let body=if raw.is_empty() {Value::Null} else {serde_json::from_slice(&raw).unwrap()};
+                            seen.lock().unwrap().push((line.clone(),body.clone()));
+                            let (status,value)=if line.contains("/info ") {(200,json!({"ID":if mode=="wrong-daemon" {DockerDaemonId::new()} else {daemon},"SecurityOptions":["name=rootless"]}))}
+                            else if line.starts_with("POST") && line.contains("/volumes/create ") {
+                                *state.lock().unwrap()=true;
+                                (if mode=="lost-ack" {503} else if mode=="conflict" {409} else {201},json!({"Name":body["Name"]}))
+                            } else if line.starts_with("GET") && line.contains("/volumes/") {
+                                if *state.lock().unwrap() {(200,json!({"Name":"freshell-claude-candidate-synthetic","Driver":"local","Options":if mode=="driver-options" {json!({"type":"tmpfs","o":"size=64m"})} else {json!({})},"Labels":if mode=="wrong-labels" {json!({"foreign":"owner"})} else {labels}}))} else {(404,json!({}))}
+                            } else if line.starts_with("DELETE") && line.contains("/volumes/") {if mode!="still-present" {*state.lock().unwrap()=false;}(204,json!({}))}
+                            else {(500,json!({}))};
+                            let response=value.to_string();stream.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+                        });
+                    }
+                    result=jobs.join_next(),if !jobs.is_empty()=>{result.unwrap().unwrap();}
+                }
+            }
+            jobs.shutdown().await;
+        });
+        let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
+        let created = tokio::time::timeout(
+            Duration::from_secs(2),
+            backend.create_claude_candidate_scratch(&mut scratch),
+        )
+        .await
+        .unwrap();
+        let cleaned = tokio::time::timeout(
+            Duration::from_secs(2),
+            backend.cleanup_claude_candidate_scratch(&mut scratch),
+        )
+        .await
+        .unwrap();
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            created.is_ok(),
+            matches!(mode, "success" | "still-present"),
+            "{mode}: only absent, exact ordinary backing can be accepted: {created:?}"
+        );
+        assert_eq!(
+            cleaned.is_ok(),
+            matches!(
+                mode,
+                "success" | "lost-ack" | "existing" | "conflict" | "wrong-daemon"
+            ),
+            "{mode}: cleanup must prove exact absence or retain uncertain ownership: {cleaned:?}"
+        );
+        let seen = calls.lock().unwrap();
+        let deletes = seen
+            .iter()
+            .filter(|(line, _)| line.starts_with("DELETE"))
+            .count();
+        assert_eq!(
+            deletes,
+            usize::from(matches!(mode, "success" | "lost-ack" | "still-present")),
+            "{mode}: no foreign or unqualified volume removal"
+        );
+        if let Some((_, body)) = seen
+            .iter()
+            .find(|(line, _)| line.contains("/volumes/create "))
+        {
+            assert_eq!(body["Driver"], "local");
+            assert!(
+                body["DriverOpts"]
+                    .as_object()
+                    .is_none_or(|options| options.is_empty()),
+                "ordinary resource profile cannot be lowered to secret tmpfs size"
+            );
+        }
+        assert_eq!(
+            scratch.attempted,
+            matches!(mode, "wrong-labels" | "driver-options" | "still-present")
+        );
+    }
+}
+
 #[test]
 fn provider_claude_private_candidate_metadata_enforces_inclusive_limits() {
     use std::io::Write;
@@ -284,6 +402,7 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
             let qualified = qualify_candidate_stage(&stage, &owner, &request);
             assert_eq!(qualified.is_ok(),mode=="valid","{flavor}/{runtime:?}/{mode}: physical issuer and current owner must qualify before consumer selection: {:?}",qualified.as_ref().err());
             if let Ok(projection) = qualified {
+                qualify_candidate_helper_transport(&owner, &request, &stage).await;
                 let selected = &projection
                     .provider_launch_context
                     .prepared_inputs
@@ -568,4 +687,183 @@ async fn qualify_transport(mode: &'static str) {
     assert!(
         std::fs::read(workspace.join(".claude/settings.local.json")).unwrap() == private.as_bytes()
     );
+}
+
+async fn qualify_candidate_helper_transport(
+    owner: &ClaudeSourceOwner,
+    request: &ObserveClaudeSourcesRequest,
+    stage: &Path,
+) {
+    for mode in [
+        "success",
+        "wrong-caps",
+        "lost-projection-ack",
+        "projection-timeout",
+        "volume-still-present",
+        "wrong-mount-report",
+        "wrong-resource-subpath",
+    ] {
+        let owned = tempfile::tempdir().unwrap();
+        let daemon = match owner {
+            ClaudeSourceOwner::Initial {
+                observation: InitialAuthVolumeObservation::Absent { daemon_id },
+                ..
+            } => daemon_id.clone(),
+            _ => panic!("this fixture qualifies an initial candidate"),
+        };
+        let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let containers = Arc::new(Mutex::new(BTreeMap::<String, Value>::new()));
+        let volume = Arc::new(Mutex::new(None::<Value>));
+        let listener = UnixListener::bind(owned.path().join("docker.sock")).unwrap();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let (seen, bodies, backing) = (calls.clone(), containers.clone(), volume.clone());
+        let server = tokio::spawn(async move {
+            let mut jobs = JoinSet::new();
+            let private_jobs = Arc::new(Mutex::new(Vec::<tokio::task::JoinHandle<()>>::new()));
+            loop {
+                tokio::select! {
+                    _=&mut stopped=>break,
+                    accepted=listener.accept()=>{
+                        let (mut stream,_)=accepted.unwrap();
+                        let (seen,bodies,backing,daemon,private_jobs)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone());
+                        jobs.spawn(async move {
+                            let mut header=Vec::new();let mut byte=[0];
+                            while !header.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).await.unwrap();header.push(byte[0]);assert!(header.len()<=32*1024);}
+                            let header=String::from_utf8(header).unwrap();let line=header.lines().next().unwrap().to_string();
+                            let length=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().trim().parse::<usize>().unwrap();
+                            assert!(length<=1024*1024);let mut raw=vec![0;length];stream.read_exact(&mut raw).await.unwrap();
+                            let body=if raw.is_empty(){Value::Null}else{serde_json::from_slice(&raw).unwrap()};
+                            seen.lock().unwrap().push((line.clone(),body.clone()));
+                            let (status,value)=if line.contains("/info "){(200,json!({"ID":daemon,"SecurityOptions":["name=rootless"]}))}
+                            else if line.contains("/images/"){(200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_IMAGE_CREDENTIAL_SENTINEL"]}}))}
+                            else if line.starts_with("POST") && line.contains("/volumes/create "){let actual=json!({"Name":body["Name"],"Driver":"local","Options":{},"Labels":body["Labels"],"Mountpoint":"/synthetic/ordinary-volume"});*backing.lock().unwrap()=Some(actual.clone());(201,actual)}
+                            else if line.starts_with("GET") && line.contains("/volumes/"){match backing.lock().unwrap().clone(){Some(v) if line.contains(v["Name"].as_str().unwrap())=>(200,v),_=>(404,json!({}))}}
+                            else if line.starts_with("DELETE") && line.contains("/volumes/"){assert!(bodies.lock().unwrap().is_empty(),"candidate helpers must be gone before volume deletion");if mode!="volume-still-present" {*backing.lock().unwrap()=None;}(204,json!({}))}
+                            else if line.contains("/containers/create?"){
+                                if body["Cmd"]==json!(["project-claude-candidate-private"]) {let root=body["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|m|m["Target"]=="/run/freshell-candidate-inputs").unwrap()["Source"].as_str().unwrap();assert!(!Path::new(root).join(".freshell/mcp-capability.json").exists(),"ordinary candidate input root must not expose capability credentials");}
+                                let name=line.split("name=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();let id=if body["Cmd"]==json!(["prepare-provider-mountpoints"]) {"a".repeat(64)} else {"b".repeat(64)};bodies.lock().unwrap().insert(name,json!({"Id":id,"Config":body,"HostConfig":body["HostConfig"],"State":{"Running":false}}));(if mode=="lost-projection-ack" && body["Cmd"]==json!(["project-claude-candidate-private"]) {503}else{201},json!({"Id":id}))}
+                            else if line.starts_with("GET") && line.contains("/containers/"){let key=line.split("/containers/").nth(1).unwrap().split('/').next().unwrap();let found=bodies.lock().unwrap().iter().find(|(name,v)|*name==key || v["Id"]==key).map(|(_,v)|v.clone());match found {Some(mut v)=>{
+                                let reports=v["HostConfig"]["Mounts"].as_array().unwrap().iter().map(|m|json!({"Type":m["Type"],"Destination":m["Target"],"RW":!m["ReadOnly"].as_bool().unwrap(),"Source":if m["Type"]=="volume" {json!("/synthetic/ordinary-volume")} else {m["Source"].clone()},"Name":if m["Type"]=="volume" {m["Source"].clone()} else {Value::Null}})).collect::<Vec<_>>();
+                                v["Mounts"]=json!(reports);
+                                if key.len()==64 && v["Config"]["Cmd"]==json!(["project-claude-candidate-private"]) {
+                                    if mode=="wrong-caps" {v["HostConfig"]["CapAdd"]=json!(["SYS_ADMIN"]);}
+                                    if mode=="wrong-mount-report" {v["Mounts"][0]["RW"]=json!(true);}
+                                    if mode=="wrong-resource-subpath" {let mount=v["HostConfig"]["Mounts"].as_array_mut().unwrap().iter_mut().find(|m|m["VolumeOptions"]["Subpath"].is_string()).unwrap();mount["VolumeOptions"]["Subpath"]=json!("foreign/ordinary");}
+                                } (200,v)},None=>(404,json!({}))}}
+                            else if line.starts_with("DELETE") && line.contains("/containers/"){let key=line.split("/containers/").nth(1).unwrap().split('?').next().unwrap();let name=bodies.lock().unwrap().iter().find(|(name,v)|*name==key || v["Id"]==key).map(|(name,_)|name.clone());if let Some(name)=name{bodies.lock().unwrap().remove(&name);}(204,json!({}))}
+                            else if line.contains("/start "){let id=line.split("/containers/").nth(1).unwrap().split('/').next().unwrap();let v=bodies.lock().unwrap().values().find(|v|v["Id"]==id).unwrap().clone();private_jobs.lock().unwrap().push(tokio::spawn(async move {
+                                let is_mountpoint=v["Config"]["Cmd"]==json!(["prepare-provider-mountpoints"]);
+                                let target=if is_mountpoint {"/run/freshell-input-exchange"} else {"/run/freshell-source-exchange"};
+                                let path=v["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|m|m["Target"]==target).unwrap()["Source"].as_str().unwrap();
+                                let mut channel=UnixStream::connect(Path::new(path).join("reply.sock")).await.unwrap();
+                                if !is_mountpoint && mode=="projection-timeout" {tokio::time::sleep(Duration::from_secs(10)).await;return;}
+                                let length=channel.read_u32().await.unwrap() as usize;assert!(length<=1024*1024);let mut raw=vec![0;length];channel.read_exact(&mut raw).await.unwrap();
+                                if is_mountpoint {let _:Vec<freshell_platform::provider_mountpoints::Mountpoint>=serde_json::from_slice(&raw).unwrap();channel.write_all(b"ok").await.unwrap();}
+                                else {let p:freshell_runtime_protocol::ClaudeCandidateProjectionRequest=serde_json::from_slice(&raw).unwrap();p.validate().unwrap();let source=p.source_request;let canonical=freshell_runtime_protocol::bounded_json_bytes(&source,MAX_REQUEST_BYTES).unwrap();let reply=ObservationReply {request_sha256:format!("{:x}",Sha256::digest(canonical)),observation:NativeObservation {version:1,native_source_runtime:source.native_source_runtime,setting_sources:source.setting_sources,uid:65534,euid:65534,gid:0,egid:0,supplementary_groups:vec![],cwd:source.cwd,home:Some(source.home),roots:None,local_settings:vec![],local_decision:LocalDecision::Disabled,root_uid:None,git_uid:None,claude_uid:None}};let raw=serde_json::to_vec(&reply).unwrap();channel.write_u32(raw.len() as u32).await.unwrap();channel.write_all(&raw).await.unwrap();channel.shutdown().await.unwrap();}
+                            }));(204,json!({}))}
+                            else if line.contains("/wait?"){(200,json!({"StatusCode":0}))}else{(500,json!({}))};
+                            let response=value.to_string();let _=stream.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await;
+                        });
+                    }
+                    result=jobs.join_next(),if !jobs.is_empty()=>{result.unwrap().unwrap();}
+                }
+            }
+            jobs.shutdown().await;
+            let workers = std::mem::take(&mut *private_jobs.lock().unwrap());
+            for worker in workers {
+                if !worker.is_finished() {
+                    worker.abort();
+                }
+                match worker.await {
+                    Ok(()) => {}
+                    Err(e) if e.is_cancelled() => {}
+                    Err(e) => panic!("private fixture worker failed: {e}"),
+                }
+            }
+        });
+        let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
+        let result = backend
+            .read_claude_candidate_helper(
+                owner,
+                request,
+                stage,
+                "synthetic-source-run",
+                Duration::from_millis(250),
+            )
+            .await;
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.is_ok(),
+            mode == "success",
+            "{mode}: candidate projection and confirmed owned cleanup gate evidence: {result:?}"
+        );
+        assert!(
+            containers.lock().unwrap().is_empty(),
+            "{mode}: both helpers must be removed"
+        );
+        assert_eq!(
+            volume.lock().unwrap().is_some(),
+            mode == "volume-still-present"
+        );
+        let seen = calls.lock().unwrap();
+        if matches!(
+            mode,
+            "wrong-caps" | "wrong-mount-report" | "wrong-resource-subpath"
+        ) {
+            assert!(
+                !seen
+                    .iter()
+                    .any(|(line, _)| line
+                        .contains(&format!("/containers/{}/start ", "b".repeat(64)))),
+                "{mode}: changed candidate topology must block before projection starts"
+            );
+        }
+        for (line, body) in seen.iter() {
+            assert!(!line.contains("/logs"));
+            assert!(!body
+                .to_string()
+                .contains("PRIVATE_IMAGE_CREDENTIAL_SENTINEL"));
+            if body["Cmd"] == json!(["project-claude-candidate-private"]) {
+                let root = body["HostConfig"]["Mounts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|mount| mount["Target"] == "/run/freshell-candidate-inputs")
+                    .unwrap()["Source"]
+                    .as_str()
+                    .unwrap();
+                assert!(
+                    !Path::new(root).exists(),
+                    "{mode}: owned ordinary mount skeleton must be gone after reader settlement"
+                );
+            }
+        }
+        if let Some((_, body)) = seen
+            .iter()
+            .find(|(_, body)| body["Cmd"] == json!(["project-claude-candidate-private"]))
+        {
+            assert_eq!(body["User"], "0:0");
+            assert_eq!(
+                body["HostConfig"]["CapAdd"],
+                json!(["CHOWN", "SETGID", "SETUID"])
+            );
+            assert_eq!(body["HostConfig"]["NetworkMode"], "none");
+            assert_eq!(body["HostConfig"]["ReadonlyRootfs"], true);
+            assert!(
+                body["HostConfig"]["Tmpfs"].is_null() || body["HostConfig"]["Tmpfs"] == json!({})
+            );
+            assert_eq!(body["WorkingDir"], json!(request.observation_request.cwd));
+            assert!(body["HostConfig"]["Mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["Target"] == "/run/freshell-candidate-inputs"
+                    && m["Source"] != json!(stage)
+                    && m["ReadOnly"] == true));
+        }
+    }
 }
