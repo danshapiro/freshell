@@ -858,23 +858,11 @@ fn read_prior_manifest_bytes(
         return Err("prior provider source context belongs to another owner".into());
     }
     let root = staged_provider_root_path(directory, &capability.grant_id)?;
-    let path = root.join(&inputs.manifest.relative_path);
-    if !std::fs::symlink_metadata(&path)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-        || std::fs::canonicalize(&path).map_err(|_| "prior source manifest unavailable")? != path
-    {
-        return Err("prior source manifest must be a physical private file".into());
-    }
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .map_err(|_| "prior source manifest unavailable")?
-        .take(64 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "prior source manifest read failed")?;
-    if bytes.len() > 64 * 1024 * 1024
-        || format!("{:x}", sha2::Sha256::digest(&bytes)) != inputs.manifest.sha256
-    {
+    let bytes = read_prepared_metadata(&root, &inputs.manifest.relative_path, 64 * 1024 * 1024)
+        .map_err(|_| {
+            "prior source manifest unavailable or exceeds profile; retain inputs and reprepare"
+        })?;
+    if format!("{:x}", sha2::Sha256::digest(&bytes)) != inputs.manifest.sha256 {
         return Err("prior source manifest profile or identity changed".into());
     }
     Ok(bytes)
@@ -889,30 +877,13 @@ fn read_prior_claude_inline_settings(
     digest: &str,
 ) -> Result<String, String> {
     use freshell_platform::claude_inputs::{INLINE_SETTINGS_SOURCE, MAX_NATIVE_SETTINGS_BYTES};
-    use std::io::Read;
     let capability = context
         .mcp_capability
         .as_ref()
         .ok_or("prior Claude settings generation authority unavailable")?;
-    let path =
-        staged_provider_root_path(directory, &capability.grant_id)?.join(INLINE_SETTINGS_SOURCE);
-    if !std::fs::symlink_metadata(&path)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-        || std::fs::canonicalize(&path).map_err(|_| {
-            "prior Claude inline settings unavailable; retain inputs and reprepare before dispatch"
-        })? != path
-    {
-        return Err("prior Claude inline settings unavailable or not a physical private source; retain inputs and reprepare before dispatch".into());
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .map_err(|_| "prior Claude inline settings unavailable")?
-        .take(MAX_NATIVE_SETTINGS_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "prior Claude inline settings read failed")?;
-    if bytes.len() > MAX_NATIVE_SETTINGS_BYTES {
-        return Err("prior Claude inline --settings exceeds native 2 MiB limit; retain inputs and reprepare before dispatch".into());
-    }
+    let root = staged_provider_root_path(directory, &capability.grant_id)?;
+    let bytes = read_prepared_metadata(&root, INLINE_SETTINGS_SOURCE, MAX_NATIVE_SETTINGS_BYTES)
+        .map_err(|_| "prior Claude inline settings unavailable or exceeds native 2 MiB limit; retain inputs and reprepare before dispatch")?;
     if format!("{:x}", sha2::Sha256::digest(&bytes)) != digest {
         return Err("prior Claude inline settings identity changed; retain inputs and reprepare before dispatch".into());
     }
@@ -931,41 +902,10 @@ fn read_prior_source_manifest(
     context
         .validate("opencode")
         .map_err(|_| "prior provider source context metadata invalid")?;
-    let Some(inputs) = context.prepared_inputs.as_ref() else {
+    let Some(_) = context.prepared_inputs.as_ref() else {
         return Ok(None);
     };
-    let capability = context
-        .mcp_capability
-        .as_ref()
-        .ok_or("prior source context lacks generation authority")?;
-    let owned = store
-        .grants
-        .lock()
-        .unwrap()
-        .get(&capability.grant_id)
-        .is_some_and(|grant| grant.soul_id == *soul);
-    if !owned {
-        return Err("prior provider source context belongs to another owner".into());
-    }
-    let root = staged_provider_root_path(directory, &capability.grant_id)?;
-    let path = root.join(&inputs.manifest.relative_path);
-    if !std::fs::symlink_metadata(&path)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-    {
-        return Err("prior source manifest must be a physical private file".into());
-    }
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .map_err(|_| "prior source manifest unavailable")?
-        .take(64 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "prior source manifest read failed")?;
-    if bytes.len() > 64 * 1024 * 1024
-        || format!("{:x}", sha2::Sha256::digest(&bytes)) != inputs.manifest.sha256
-    {
-        return Err("prior source manifest profile or identity changed".into());
-    }
+    let bytes = read_prior_manifest_bytes("opencode", store, directory, soul, context)?;
     let manifest: freshell_platform::opencode_recipe::SourceManifest =
         serde_json::from_slice(&bytes).map_err(|_| "prior source manifest metadata invalid")?;
     if manifest.version != 1
@@ -2470,16 +2410,8 @@ impl CapabilityStore {
         if !path.exists() {
             return Ok(None);
         }
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        std::fs::File::open(path)
-            .map_err(|_| "pending prepared result unavailable")?
-            .take((freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "pending prepared result read failed")?;
-        if bytes.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES {
-            return Err("pending prepared result exceeds metadata profile".into());
-        }
+        let bytes = read_prepared_metadata(&stage, ".freshell/prepared-result.json", freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)
+            .map_err(|_| "pending prepared result unavailable or exceeds metadata profile; retain inputs and reprepare")?;
         let result: freshell_runtime_protocol::PreparedProviderContext =
             serde_json::from_slice(&bytes)
                 .map_err(|_| "pending prepared result metadata invalid")?;
@@ -2807,17 +2739,9 @@ fn read_prepared_context(
     capability: &McpCapabilityReference,
 ) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String> {
     let result = (|| {
-        use std::io::Read;
         let stage = staged_provider_root_path(&directory, &capability.grant_id)?;
-        let mut bytes = Vec::new();
-        std::fs::File::open(stage.join(".freshell/prepared-context.json"))
-            .map_err(|_| "complete prepared provider context unavailable")?
-            .take((freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "complete prepared provider context read failed")?;
-        if bytes.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES {
-            return Err("complete prepared provider context exceeds metadata profile".into());
-        }
+        let bytes = read_prepared_metadata(&stage, ".freshell/prepared-context.json", freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)
+            .map_err(|_| "complete prepared provider context unavailable or exceeds metadata profile; retain inputs and reprepare")?;
         let context: freshell_runtime_protocol::ProviderLaunchContext =
             serde_json::from_slice(&bytes)
                 .map_err(|_| "complete prepared provider context metadata invalid")?;
@@ -2831,14 +2755,10 @@ fn read_prepared_context(
 
 // These are selected issuer metadata, never original HOME or capability values.
 // Check physical size before reserving, and never allocate a growth sentinel.
-fn read_claude_candidate_metadata(
-    root: &Path,
-    relative: &str,
-    limit: usize,
-) -> Result<Vec<u8>, String> {
+fn read_prepared_metadata(root: &Path, relative: &str, limit: usize) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let blocked = || {
-        "Claude frozen candidate private metadata unavailable or exceeds profile; retain inputs and reprepare".to_string()
+        "Selected provider private metadata unavailable or exceeds profile; retain inputs and reprepare".to_string()
     };
     if !Path::new(relative)
         .components()
@@ -2950,7 +2870,7 @@ fn bind_claude_candidate_request_and_plan(
         return Err(blocked());
     }
     let root = staged_provider_root_path(directory, &generation).map_err(|_| blocked())?;
-    let published = read_claude_candidate_metadata(
+    let published = read_prepared_metadata(
         &root,
         ".freshell/claude-candidate-binding.json",
         MAX_CONTROL_FRAME_BYTES,
@@ -2963,12 +2883,12 @@ fn bind_claude_candidate_request_and_plan(
         // and recovery authority are requalified below before any IPC.
         request.observation_request.plan_revision = publication.plan_revision;
     }
-    let context_bytes = read_claude_candidate_metadata(
+    let context_bytes = read_prepared_metadata(
         &root,
         ".freshell/prepared-context.json",
         MAX_CONTROL_FRAME_BYTES,
     )?;
-    let ready_bytes = read_claude_candidate_metadata(
+    let ready_bytes = read_prepared_metadata(
         &root,
         ".freshell/prepared-result.json",
         MAX_CONTROL_FRAME_BYTES,
@@ -2976,7 +2896,7 @@ fn bind_claude_candidate_request_and_plan(
     let ready: PreparedProviderContext =
         serde_json::from_slice(&ready_bytes).map_err(|_| blocked())?;
     let manifest_bytes =
-        read_claude_candidate_metadata(&root, &inputs.manifest.relative_path, 64 * 1024 * 1024)?;
+        read_prepared_metadata(&root, &inputs.manifest.relative_path, 64 * 1024 * 1024)?;
     let manifest: ClaudeInputManifest =
         serde_json::from_slice(&manifest_bytes).map_err(|_| blocked())?;
     manifest.validate().map_err(|_| blocked())?;
@@ -3193,6 +3113,130 @@ pub(crate) async fn scoped_auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_provider_recovery_rejects_oversized_manifest_before_payload_read() {
+        const CHILD: &str = "FRESHELL_TEST_RECOVERY_SPARSE_MANIFEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "managed_mcp_capability::tests::managed_provider_recovery_rejects_oversized_manifest_before_payload_read", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("recovery_sparse_manifest_reader_ready"),
+                "allocation fixture must execute its child reader: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            eprintln!(
+                "recovery_sparse_manifest_child_result status={} oversized_payload_read={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("oversized manifest payload was read")
+            );
+            assert!(output.status.success(), "oversized recovery metadata must reject before reading payload and preserve its generation: {}", output.status);
+            return;
+        }
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let directory = owned.path().join("control/mcp-capabilities");
+        for path in [&home.join(".codex"), &workspace, &directory] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(home.join(".codex/config.toml"), "model = 'frozen-model'\n").unwrap();
+        let native = home.join(".codex/native-history.jsonl");
+        std::fs::write(&native, "synthetic-native-store-preserved").unwrap();
+        let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+            "codex", &workspace, &home, None,
+        )
+        .unwrap()
+        .unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let grant = store
+            .issue(
+                soul.clone(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("codex", &home, &context.config)),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    launch_context: Some(&context),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let accepted = read_prepared_context(&directory, &grant).unwrap();
+        let original =
+            read_prior_manifest_bytes("codex", &store, &directory, &soul, &accepted).unwrap();
+        let manifest: freshell_platform::codex_inputs::CodexInputManifest =
+            serde_json::from_slice(&original).unwrap();
+        manifest.validate().unwrap();
+        let stage = staged_provider_root_path(&directory, &grant.grant_id).unwrap();
+        let saved_context = std::fs::read(stage.join(".freshell/prepared-context.json")).unwrap();
+        let path = stage.join(
+            &accepted
+                .prepared_inputs
+                .as_ref()
+                .unwrap()
+                .manifest
+                .relative_path,
+        );
+        let mut sparse = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        sparse.set_len(64 * 1024 * 1024 + 1).unwrap();
+        let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        sparse
+            .set_times(std::fs::FileTimes::new().set_accessed(old_access))
+            .unwrap();
+        std::io::Read::read_exact(&mut sparse, &mut [0u8; 1]).unwrap();
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().accessed().unwrap(),
+            old_access,
+            "fixture filesystem must report actual payload reads"
+        );
+        sparse
+            .set_times(std::fs::FileTimes::new().set_accessed(old_access))
+            .unwrap();
+        drop(sparse);
+        let pages: u64 = std::fs::read_to_string("/proc/self/statm")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let limit = libc::rlimit {
+            rlim_cur: pages * page_size + 8 * 1024 * 1024,
+            rlim_max: pages * page_size + 8 * 1024 * 1024,
+        };
+        println!("recovery_sparse_manifest_reader_ready");
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
+        assert!(read_prior_manifest_bytes("codex", &store, &directory, &soul, &accepted).is_err());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().accessed().unwrap(),
+            old_access,
+            "oversized manifest payload was read before its physical bound was rejected"
+        );
+        assert!(store.grants.lock().unwrap().contains_key(&grant.grant_id));
+        assert_eq!(
+            std::fs::read(stage.join(".freshell/prepared-context.json")).unwrap(),
+            saved_context
+        );
+        assert_eq!(
+            std::fs::read_to_string(native).unwrap(),
+            "synthetic-native-store-preserved"
+        );
+    }
 
     #[cfg(all(unix, feature = "managed-provider-qualification"))]
     #[test]
@@ -3859,18 +3903,16 @@ except Exception as error:
             let path = owned.path().join("metadata");
             let file = std::fs::File::create(&path).unwrap();
             file.set_len(limit as u64).unwrap();
-            let bytes = read_claude_candidate_metadata(owned.path(), "metadata", limit)
+            let bytes = read_prepared_metadata(owned.path(), "metadata", limit)
                 .expect("supported inclusive metadata limit must remain readable");
             assert_eq!(bytes.len(), limit);
             drop(bytes);
             file.set_len(limit as u64 + 1).unwrap();
-            assert!(read_claude_candidate_metadata(owned.path(), "metadata", limit).is_err());
-            assert!(
-                read_claude_candidate_metadata(owned.path(), "../metadata", limit + 1).is_err()
-            );
+            assert!(read_prepared_metadata(owned.path(), "metadata", limit).is_err());
+            assert!(read_prepared_metadata(owned.path(), "../metadata", limit + 1).is_err());
             std::fs::rename(&path, owned.path().join("escaped")).unwrap();
             std::os::unix::fs::symlink(owned.path().join("escaped"), &path).unwrap();
-            assert!(read_claude_candidate_metadata(owned.path(), "metadata", limit + 1).is_err());
+            assert!(read_prepared_metadata(owned.path(), "metadata", limit + 1).is_err());
         }
     }
 
