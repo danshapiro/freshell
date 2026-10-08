@@ -179,7 +179,7 @@ async function runOwnedReceiverLoadFault() {
   const [provider, ...argv] = process.argv.slice(2)
   nativeFaultStage = 'verify_uid'
   if (process.getuid() !== 65534 || process.getgid() !== 0) throw new Error('owned native fault UID/GID differs')
-  const cwd = process.cwd()
+  const cwd = process.env.FRESHELL_OWNED_RECEIVER_LOAD_FAULT_WORKSPACE ?? process.cwd()
   nativeFaultStage = 'read_launch_control'
   const control = JSON.parse(fs.readFileSync(path.join(cwd, 'native-receiver-load-fault-control.json'), 'utf8'))
   const workspace = receiverLoadFaultWorkspace(cwd, control, fs.statSync)
@@ -268,9 +268,10 @@ const { fileURLToPath: nativeWrapperFile } = await import('node:url')
 if (process.argv[1] && nativeWrapperFile(import.meta.url) === process.argv[1]) {
   try { await runOwnedReceiverLoadFault() }
   catch (error) {
-    if (/^\/tmp\/f[a-z0-9]+\/[a-f0-9]{8}-[a-f0-9]{3}\/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace$/.test(process.cwd())) {
+    const workspace = process.env.FRESHELL_OWNED_RECEIVER_LOAD_FAULT_WORKSPACE ?? process.cwd()
+    if (/^\/tmp\/f[a-z0-9]+\/[a-f0-9]{8}-[a-f0-9]{3}\/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace$/.test(workspace)) {
       const fs = await import('node:fs'), path = await import('node:path')
-      fs.writeFileSync(path.join(process.cwd(), 'native-receiver-load-fault-failure.json'),
+      fs.writeFileSync(path.join(workspace, 'native-receiver-load-fault-failure.json'),
         JSON.stringify({ schemaVersion: 1, severity: 'error', event: 'runtime.native_receiver_fault.failed',
           ...receiverLoadFaultFailure(error, nativeFaultStage) }), { mode: 0o664, flag: 'wx' })
     }
@@ -285,16 +286,22 @@ provider=os.path.basename(sys.argv[0])
 if provider not in ('codex','opencode'):raise RuntimeError('native receiver entry differs')
 args=sys.argv[1:]
 workspace=os.getcwd()
+owned_pattern=r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace'
 if workspace=='/workspace':
- try:
-  control=json.loads(pathlib.Path('native-receiver-load-fault-control.json').read_text())
-  declared=control.get('workspace')
-  if not isinstance(declared,str):raise RuntimeError('owned native alias binding absent')
-  actual=os.stat(workspace);selected=os.stat(declared)
-  if (actual.st_dev,actual.st_ino)!=(selected.st_dev,selected.st_ino):raise RuntimeError('owned native workspace alias differs')
-  workspace=declared
- except FileNotFoundError:pass
-owned=re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace',workspace)
+ candidates=[]
+ for row in pathlib.Path('/proc/self/mountinfo').read_text().splitlines():
+  fields=row.split();mounted=fields[4] if len(fields)>4 else ''
+  if re.fullmatch(owned_pattern,mounted) and (pathlib.Path(mounted)/'native-receiver-load-fault-control.json').is_file():candidates.append(mounted)
+ if len(candidates)>1:raise RuntimeError('owned native workspace mount ambiguous')
+ if candidates:
+  selected=candidates[0];control=json.loads((pathlib.Path(selected)/'native-receiver-load-fault-control.json').read_text())
+  launch=json.loads(os.environ.get('FRESHELL_NATIVE_IDENTITY_LAUNCH','{}'));bound=re.fullmatch(owned_pattern,selected)
+  current=(control.get('workspace')==selected and control.get('mode')==bound[1] and control.get('caseId')==bound[2]
+   and provider==bound[1].removeprefix('fresh') and bool(control.get('expectedRoot'))
+   and launch.get('requestedNativeSessionId')==control['expectedRoot'] and bool(launch.get('launchNonce')) and bool(launch.get('incarnationId')))
+  if not current:raise RuntimeError('owned native workspace launch binding differs')
+  workspace=selected;os.environ['FRESHELL_OWNED_RECEIVER_LOAD_FAULT_WORKSPACE']=selected
+owned=re.fullmatch(owned_pattern,workspace)
 native='/usr/local/bin/'+provider+'.native'
 if owned and ((provider=='codex' and 'app-server' in args) or (provider=='opencode' and args and args[0]=='serve')):
  os.execv('/usr/local/bin/node',['node','/opt/freshell-native-receiver-load-fault/native-load-fault.mjs',provider,*args])

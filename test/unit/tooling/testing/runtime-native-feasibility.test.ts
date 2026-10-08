@@ -107,6 +107,26 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(result).toEqual(fault === 'fault-sidecar' ? { route: 'fault', args: ['codex', ...args] } : { route: 'native', args })
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it.each(['owned-mounted-workspace', 'ordinary-workspace', 'wrong-current-root'])('selects the owned OpenCode HTTP workspace mount while preserving daemon cwd (%s; orchestration only)', fault => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-mount-'))
+    const workspace = path.join(directory, 'freshopencode-wrong-root-workspace'), daemon = path.join(directory, 'daemon'); fs.mkdirSync(workspace); fs.mkdirSync(daemon)
+    const original = path.join(directory, 'original.py'), dispatcher = path.join(directory, 'dispatcher.py'), entry = path.join(directory, 'opencode'), mounts = path.join(directory, 'mountinfo')
+    fs.writeFileSync(original, '#!/usr/bin/python3\nimport json,os,sys\nprint(json.dumps({"route":"native","args":sys.argv[1:],"cwd":os.getcwd()}))\n', { mode: 0o700 })
+    fs.writeFileSync(dispatcher, 'import json,os,sys\nprint(json.dumps({"route":"fault","args":sys.argv[1:],"cwd":os.getcwd(),"workspace":os.environ.get("FRESHELL_OWNED_RECEIVER_LOAD_FAULT_WORKSPACE")}))\n')
+    fs.writeFileSync(mounts, '1 0 0:1 / '+workspace+' rw - bind owned rw\n')
+    if (fault !== 'ordinary-workspace') fs.writeFileSync(path.join(workspace, 'native-receiver-load-fault-control.json'), JSON.stringify({ mode:'freshopencode', caseId:'wrong-root', expectedRoot:'ses_expected', workspace }))
+    const script = nativeReceiverLoadFaultEntry.replace("native='/usr/local/bin/'+provider+'.native'", 'native='+JSON.stringify(original))
+      .replace("'/usr/local/bin/node'", "'/usr/bin/python3'").replace("['node','/opt/freshell-native-receiver-load-fault/native-load-fault.mjs',provider,*args]", "['python3',"+JSON.stringify(dispatcher)+',provider,*args]')
+      .replace("workspace=='/workspace'", 'workspace=='+JSON.stringify(daemon)).replace("pathlib.Path('/proc/self/mountinfo')", 'pathlib.Path('+JSON.stringify(mounts)+')')
+      .replaceAll("r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace'", 'r'+JSON.stringify(workspace).replace('freshopencode-wrong-root-workspace','(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace'))
+    fs.writeFileSync(entry, script)
+    const args = ['serve','--hostname','127.0.0.1','--port','1234']
+    try {
+      const run = () => execFileSync('python3', [entry,...args], {cwd:daemon,env:{...process.env,FRESHELL_NATIVE_IDENTITY_LAUNCH:JSON.stringify({requestedNativeSessionId:fault==='wrong-current-root'?'ses_other':'ses_expected',launchNonce:'current',incarnationId:'current-inc'})},encoding:'utf8',timeout:5000,stdio:['ignore','pipe','pipe']})
+      if (fault==='wrong-current-root') expect(run).toThrow()
+      else expect(JSON.parse(run())).toEqual(fault==='owned-mounted-workspace'?{route:'fault',args:['opencode',...args],cwd:daemon,workspace}:{route:'native',args,cwd:daemon})
+    } finally {fs.rmSync(directory,{recursive:true,force:true})}
+  })
   it.each(['valid', 'foreign-path', 'wrong-provider', 'wrong-root', 'missing-nonce', 'missing-incarnation', 'wrong-case', 'missing-control'])
     ('binds the finite native receiver fault to its exact owned workspace and current launch (%s)', async fault => {
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-binding-'))
