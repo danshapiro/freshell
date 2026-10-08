@@ -91,11 +91,11 @@ fn prepare_selected_sources(
         manifest.settings_origin = Some(origin.clone());
         configurations.push((origin.clone(), origin));
     }
+    // The manifest retains original explicit selector origins. Project discovery
+    // and projection follow the current launch directory on every preparation.
     let native_cwd = observation
         .map(|observed| observed.cwd.clone())
-        .unwrap_or_else(|| {
-            std::fs::canonicalize(&manifest.cwd).unwrap_or_else(|_| manifest.cwd.clone())
-        });
+        .unwrap_or_else(|| std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()));
     let mut bases: Vec<PathBuf> = native_cwd
         .ancestors()
         .filter(|path| path.parent().is_some())
@@ -163,8 +163,8 @@ fn prepare_selected_sources(
         if let Some(observed) = observation {
             settings.extend(observed.local_settings.iter().cloned());
         } else {
-            settings.push(manifest.cwd.join(".claude/settings.local.json"));
-            settings.push(manifest.workspace.join(".claude/settings.local.json"));
+            settings.push(cwd.join(".claude/settings.local.json"));
+            settings.push(workspace.join(".claude/settings.local.json"));
         }
     }
     if observation.is_none() {
@@ -208,7 +208,7 @@ fn prepare_selected_sources(
     if project_enabled {
         for relative in RESOURCE_DIRECTORIES {
             let directories = if matches!(*relative, "hooks" | "plugins") {
-                project_resource_bases(&manifest)?
+                project_resource_bases(&manifest.original_home, &native_cwd)?
                     .iter()
                     .map(|base| base.join(".claude").join(relative))
                     .filter_map(|path| match optional(&path) {
@@ -248,7 +248,7 @@ fn prepare_selected_sources(
     }
     prepare_selected(
         "claude",
-        &manifest.cwd,
+        cwd,
         &manifest,
         configurations,
         resources,
@@ -317,10 +317,10 @@ fn native_resource_exists(path: &Path) -> Result<bool, String> {
 // The native Markdown resource loader searches upward only until HOME or the
 // nearest Git root. Memory has its own root-to-cwd search and must not share
 // this stopping rule. Startup cwd is the same accepted cwd for these loaders.
-fn project_resource_bases(manifest: &ClaudeInputManifest) -> Result<Vec<PathBuf>, String> {
+fn project_resource_bases(home: &Path, cwd: &Path) -> Result<Vec<PathBuf>, String> {
     let mut bases = Vec::new();
-    for base in manifest.cwd.ancestors() {
-        if base == manifest.original_home {
+    for base in cwd.ancestors() {
+        if base == home {
             break;
         }
         bases.push(base.to_path_buf());
@@ -442,6 +442,152 @@ mod tests {
         claude_inputs::ClaudeSettingSource,
         provider_environment::{copy_environment, CopyLimits},
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_resume_selects_current_project_and_keeps_explicit_origins() {
+        use freshell_platform::claude_inputs::NativeSourceRuntime;
+        use std::os::unix::fs::PermissionsExt;
+        for runtime in [NativeSourceRuntime::Terminal, NativeSourceRuntime::Sdk] {
+            let owned = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+                Some(root) => tempfile::Builder::new()
+                    .prefix("claude-resume-")
+                    .tempdir_in(root)
+                    .unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            let home = owned.path().join("home");
+            let original = owned.path().join("original");
+            let resumed = owned.path().join("resumed");
+            let plugin = original.join("explicit-plugin");
+            for path in [
+                &home,
+                &plugin,
+                &original.join(".claude/hooks"),
+                &resumed.join(".claude/hooks/node_modules/probe-dependency"),
+            ] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            let settings = original.join("explicit-settings.json");
+            std::fs::write(&settings, r#"{"env":{"EXPLICIT_ORIGIN":"original"}}"#).unwrap();
+            std::fs::write(plugin.join("resource"), "original-plugin-resource").unwrap();
+            std::fs::write(
+                original.join(".claude/hooks/resource"),
+                "wrong-original-project",
+            )
+            .unwrap();
+            std::fs::write(
+                resumed.join(".claude/settings.local.json"),
+                r#"{"env":{"LOCAL_ORIGIN":"resumed"}}"#,
+            )
+            .unwrap();
+            let hooks = resumed.join(".claude/hooks");
+            std::fs::write(hooks.join("resource"), "resumed-project-resource").unwrap();
+            std::fs::write(
+                hooks.join("node_modules/probe-dependency/index.js"),
+                "module.exports='installed-dependency'",
+            )
+            .unwrap();
+            std::fs::write(hooks.join("run.cjs"), "#!/usr/bin/env node\nprocess.stdout.write(require('node:fs').readFileSync(__dirname+'/resource','utf8')+':'+require('probe-dependency'))").unwrap();
+            std::fs::set_permissions(
+                hooks.join("run.cjs"),
+                std::fs::Permissions::from_mode(0o751),
+            )
+            .unwrap();
+            let manifest = ClaudeInputManifest {
+                version: 1,
+                accepted_native_plan: None,
+                native_source_runtime: Some(runtime),
+                original_home: home.clone(),
+                cwd: original.clone(),
+                workspace: original.clone(),
+                config_root: None,
+                settings_file: Some(settings.clone()),
+                settings_origin: None,
+                inline_settings_sha256: None,
+                setting_sources: vec![ClaudeSettingSource::Project, ClaudeSettingSource::Local],
+                plugin_dirs: vec![plugin.clone()],
+            };
+            let selected = prepare(&home, &resumed, &resumed, Some(&manifest), &[]).unwrap();
+            let stage = owned.path().join("stage");
+            copy_environment(&selected.selections, &stage, &[], CopyLimits::default()).unwrap();
+            let current = selected
+                .mounts
+                .iter()
+                .find(|mount| Path::new(&mount.logical_destination) == hooks)
+                .expect("resume must transport hooks from its current project directory");
+            let explicit = selected
+                .binds
+                .iter()
+                .find(|bind| Path::new(&bind.logical_destination) == settings)
+                .unwrap();
+            let local = selected
+                .binds
+                .iter()
+                .find(|bind| {
+                    Path::new(&bind.logical_destination)
+                        == resumed.join(".claude/settings.local.json")
+                })
+                .expect("resume must select local settings at its current directory");
+            let plugin_mount = selected
+                .mounts
+                .iter()
+                .find(|mount| Path::new(&mount.logical_destination) == plugin)
+                .unwrap();
+            assert!(!selected.mounts.iter().any(
+                |mount| Path::new(&mount.logical_destination) == original.join(".claude/hooks")
+            ));
+            std::fs::remove_dir_all(&original).unwrap();
+            std::fs::remove_dir_all(&resumed).unwrap();
+            let output = std::process::Command::new(
+                stage.join(&current.stage_relative_path).join("run.cjs"),
+            )
+            .output()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.stdout,
+                b"resumed-project-resource:installed-dependency"
+            );
+            assert_ne!(
+                std::fs::metadata(stage.join(&current.stage_relative_path).join("run.cjs"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+            let explicit_value: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(stage.join(&explicit.source_relative_path)).unwrap(),
+            )
+            .unwrap();
+            let local_value: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(stage.join(&local.source_relative_path)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(explicit_value["env"]["EXPLICIT_ORIGIN"], "original");
+            assert_eq!(local_value["env"]["LOCAL_ORIGIN"], "resumed");
+            assert_eq!(
+                std::fs::read(
+                    stage
+                        .join(&plugin_mount.stage_relative_path)
+                        .join("resource")
+                )
+                .unwrap(),
+                b"original-plugin-resource"
+            );
+            let retained: ClaudeInputManifest =
+                serde_json::from_slice(selected.manifest_bytes()).unwrap();
+            assert_eq!(retained.cwd, manifest.cwd);
+            assert_eq!(retained.workspace, manifest.workspace);
+            assert_eq!(retained.settings_file, manifest.settings_file);
+            assert_eq!(retained.plugin_dirs, manifest.plugin_dirs);
+        }
+    }
 
     #[cfg(unix)]
     #[test]
