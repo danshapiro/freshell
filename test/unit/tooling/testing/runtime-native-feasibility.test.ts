@@ -8,7 +8,7 @@ import { createServer } from 'node:net'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, staleNativeSignalBindingMatches, terminalRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -27,6 +27,28 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['valid', 'wrong-digest', 'wrong-root', 'symlink', 'tool-operation'])('mutates only the exact owned completed native loader source (%s)', (fault) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'owned-native-loader-source-'))
+    const project = path.join(directory, 'projects', 'owned-project'); fs.mkdirSync(project, { recursive: true })
+    const root = randomUUID(), file = path.join(project, root + '.jsonl'), target = path.join(directory, 'unrelated-source')
+    const bytes = Buffer.from(JSON.stringify({ type: 'assistant', sessionId: fault === 'wrong-root' ? randomUUID() : root,
+      message: { content: [fault === 'tool-operation' ? { type: 'tool_use', id: 'owned-tool' } : { type: 'text', text: 'controlled completed reply' }] } }) + '\n')
+    fs.writeFileSync(target, bytes); if (fault === 'symlink') fs.symlinkSync(target, file); else fs.writeFileSync(file, bytes)
+    const before = fs.statSync(file), expected = createHash('sha256').update(bytes).digest('hex')
+    const script = claudeNativeRestorationFault.replace('/home/freshell/provider/.claude/projects', path.join(directory, 'projects'))
+    try {
+      const run = () => execFileSync('python3', ['-c', script, root, fault === 'wrong-digest' ? '0'.repeat(64) : expected,
+        JSON.stringify([String(before.dev), String(before.ino)])], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] })
+      if (fault !== 'valid') { expect(run).toThrow(); expect(fs.readFileSync(file)).toEqual(bytes) }
+      else {
+        const result = JSON.parse(run()), after = fs.statSync(file)
+        expect(result.beforeSha256).toBe(expected); expect(result.afterSha256).not.toBe(expected)
+        expect([after.dev, after.ino]).toEqual([before.dev, before.ino]); expect(result.changedAssistantRows).toBe(1)
+        expect(JSON.parse(fs.readFileSync(file, 'utf8')).message.content).toBe('owned malformed native assistant')
+      }
+      expect(fs.readFileSync(target)).toEqual(bytes)
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['exact-resume', 'native-followup'])('requires the owned controller before Amplifier %s can seed', async (caseId) => {
     const start = vi.fn()
     await expect(executeManagedNativeCase({ startSupervisor: start } as unknown as RuntimeHarness, [],
@@ -579,6 +601,25 @@ const fs={readdirSync:()=>['71'],readFileSync:(file)=>{if(file.endsWith('native-
   it.each(['freshclaude','kilroy'] as const)('requires an owned pinned native fault image before %s wrong-ID can seed', async (mode) => {
     await expect(executeManagedNativeCase({} as RuntimeHarness,[],{mode,case:'startup'},'wrong-id'))
       .rejects.toThrow('owned SDK native resume-fork fault image required')
+  })
+  it.each(['freshclaude', 'kilroy'] as const)('routes %s restoration failure through genuine enabled native hooks before seeding', async (mode) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-native-restoration-route-'))
+    const launch = vi.fn(async (_supervisor: unknown, request: any) => {
+      expect(request.params.nativeSessionId).toBeUndefined()
+      expect(request.params.freshAgent.fixtureTransport).toBeUndefined()
+      expect(request.params.freshAgent.provider).toBe(mode === 'kilroy' ? 'kilroy' : 'claude')
+      const settings = JSON.parse(fs.readFileSync(path.join(request.params.freshAgent.cwd, '.claude/settings.json'), 'utf8'))
+      expect(settings.disableAllHooks).not.toBe(true)
+      expect(settings.hooks.SessionStart).toHaveLength(1)
+      throw new Error('controlled genuine native restoration seed boundary')
+    })
+    const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '', adminOk: launch } as unknown as RuntimeHarness
+    try {
+      await expect(executeManagedNativeCase(harness, ['env_file', 'ca_file'].map(suffix => ({
+        name: 'claude/grants/' + suffix, path: path.join(directory, suffix), sha256: 'e'.repeat(64),
+      })), { mode, case: 'startup' }, 'restoration-failure-after-hook')).rejects.toThrow('genuine native restoration seed boundary')
+      expect(launch).toHaveBeenCalledOnce()
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
   it.each(['freshclaude', 'kilroy'] as const)('routes finite real-native startup faults for %s without any model dispatch', async (mode) => {
     for (const caseId of ['missing-native-id', 'placeholder-id', 'disabled-hooks', 'timeout-50s', 'provider-exit', 'stop-cancellation']) {
