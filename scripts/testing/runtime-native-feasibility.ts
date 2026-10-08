@@ -29,6 +29,232 @@ export type NativeExperimentOriginal = {
 // A finite experiment image can retain the pinned ELF behind this wrapper.
 // Only exact owned resume-fault workspaces get supported native fault flags;
 // ordinary modes and argv remain unchanged. This never fabricates native IDs.
+// A finite negative image can redirect the requested native load to a real
+// native creation. Responses still come from the pinned provider unchanged;
+// this never creates a provider acknowledgement or an identity value.
+export const nativeReceiverLoadFaultWrapper = String.raw`
+export function receiverLoadFaultBinding(cwd, provider, launch, control) {
+  const owned = /^\/tmp\/f[a-z0-9]+\/[a-f0-9]{8}-[a-f0-9]{3}\/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace$/.exec(cwd)
+  if (!owned || provider !== (owned[1] === 'freshcodex' ? 'codex' : 'opencode')
+    || control?.schemaVersion !== 1 || control.mode !== owned[1] || control.caseId !== owned[2]
+    || typeof control.expectedRoot !== 'string' || !control.expectedRoot
+    || launch?.requestedNativeSessionId !== control.expectedRoot
+    || typeof launch.launchNonce !== 'string' || !launch.launchNonce
+    || typeof launch.incarnationId !== 'string' || !launch.incarnationId) {
+    throw new Error('owned native receiver load fault binding differs')
+  }
+  return { provider, mode: owned[1], caseId: owned[2], expectedRoot: control.expectedRoot,
+    incarnationId: launch.incarnationId, launchNonce: launch.launchNonce }
+}
+export function rewriteCodexNativeResume(raw, expectedRoot) {
+  let request
+  try { request = JSON.parse(raw.toString('utf8')) } catch { return raw }
+  if (!expectedRoot || request?.method !== 'thread/resume'
+    || request.params?.threadId !== expectedRoot || request.id === undefined) return raw
+  const { threadId, ...profile } = request.params
+  return Buffer.from(JSON.stringify({ ...request, method: 'thread/start', params: profile }))
+}
+export function selectedOpenCodeLoadRoot(requestedRoot, returnedNativeRoot) {
+  if (typeof returnedNativeRoot !== 'string' || !/^ses_[A-Za-z0-9]+$/.test(returnedNativeRoot)
+    || returnedNativeRoot === requestedRoot) throw new Error('actual native creation did not select a different root')
+  return returnedNativeRoot
+}
+export async function createCodexLoadProxy(options) {
+  const { WebSocket, WebSocketServer, upstreamUrl, port, expectedRoot, observe } = options
+  const server = new WebSocketServer({ host: '127.0.0.1', port, maxPayload: 1048576 })
+  await new Promise((resolve, reject) => { server.once('listening', resolve); server.once('error', reject) })
+  const peers = new Set()
+  server.on('connection', client => {
+    const upstream = new WebSocket(upstreamUrl, { maxPayload: 1048576 })
+    peers.add(upstream)
+    let pendingId, selected = false, used = false, nativeInputDispatches = 0
+    const queue = []
+    const send = (bytes, binary) => {
+      let request
+      try { request = JSON.parse(bytes.toString('utf8')) } catch { /* Unselected frames remain unchanged. */ }
+      if (request?.method === 'turn/start') nativeInputDispatches++
+      upstream.send(bytes, { binary })
+    }
+    const close = () => { upstream.terminate(); client.terminate(); peers.delete(upstream) }
+    client.on('error', close); upstream.on('error', close)
+    client.on('close', close); upstream.on('close', close)
+    upstream.on('open', () => { for (const [bytes, binary] of queue) send(bytes, binary); queue.length = 0 })
+    client.on('message', (raw, binary) => {
+      const bytes = Buffer.from(raw), rewritten = rewriteCodexNativeResume(bytes, expectedRoot)
+      if (rewritten !== bytes) {
+        if (used) return close()
+        used = true; selected = true; pendingId = JSON.parse(bytes.toString('utf8')).id
+      }
+      if (upstream.readyState === WebSocket.OPEN) send(rewritten, binary)
+      else if (queue.length < 16) queue.push([rewritten, binary])
+      else close()
+    })
+    upstream.on('message', async (raw, binary) => {
+      const bytes = Buffer.from(raw)
+      try {
+        let response
+        try { response = JSON.parse(bytes.toString('utf8')) } catch { /* Forward ordinary unselected bytes unchanged. */ }
+        if (selected && response?.id === pendingId && !response.error && response.result?.thread) {
+          const root = response.result.thread.id
+          if (typeof root !== 'string' || !root || root === expectedRoot || response.result.thread.ephemeral === true) {
+            throw new Error('actual native creation did not select a different durable root')
+          }
+          selected = false
+          await observe(root, bytes, nativeInputDispatches)
+        }
+        if (client.readyState === WebSocket.OPEN) client.send(bytes, { binary })
+      } catch { close() }
+    })
+  })
+  return { url: 'ws://127.0.0.1:' + server.address().port,
+    close: async () => { for (const client of server.clients) client.terminate(); for (const peer of peers) peer.terminate()
+      await new Promise(resolve => server.close(() => resolve())) } }
+}
+export async function createOpenCodeLoadProxy(options) {
+  const { createServer, request } = await import('node:http')
+  const { upstreamUrl, port, expectedRoot, observe } = options
+  let selectedRoot, nativeInputDispatches = 0
+  const server = createServer(async (incoming, outgoing) => {
+    try {
+      const selected = new URL(incoming.url, upstreamUrl)
+      const headers = { ...incoming.headers }; delete headers.host; delete headers['content-length']
+      const exact = selected.pathname === '/session/' + encodeURIComponent(expectedRoot)
+      if (incoming.method === 'GET' && exact) {
+        if (!selectedRoot) {
+          const created = await fetch(new URL('/session' + selected.search, upstreamUrl),
+            { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(5000) })
+          if (!created.ok) throw new Error('actual native session creation refused')
+          const bytes = Buffer.from(await created.arrayBuffer())
+          if (bytes.length > 1048576) throw new Error('actual native creation result exceeds bound')
+          selectedRoot = selectedOpenCodeLoadRoot(expectedRoot, JSON.parse(bytes.toString('utf8')).id)
+        }
+        selected.pathname = '/session/' + encodeURIComponent(selectedRoot)
+        const loaded = await fetch(selected, { headers, signal: AbortSignal.timeout(5000) })
+        const bytes = Buffer.from(await loaded.arrayBuffer())
+        if (!loaded.ok || bytes.length > 1048576 || JSON.parse(bytes.toString('utf8')).id !== selectedRoot) {
+          throw new Error('actual native loaded root differs')
+        }
+        await observe(selectedRoot, bytes, nativeInputDispatches)
+        outgoing.writeHead(loaded.status, { 'content-type': loaded.headers.get('content-type') ?? 'application/json' })
+        outgoing.end(bytes)
+        return
+      }
+      if (selectedRoot && selected.pathname.startsWith('/session/' + encodeURIComponent(expectedRoot) + '/')) {
+        selected.pathname = selected.pathname.replace('/session/' + encodeURIComponent(expectedRoot) + '/',
+          '/session/' + encodeURIComponent(selectedRoot) + '/')
+      }
+      if (incoming.method === 'POST' && /^\/session\/[^/]+\/(message|prompt_async)$/.test(selected.pathname)) nativeInputDispatches++
+      const upstream = request(selected, { method: incoming.method, headers }, reply => {
+        outgoing.writeHead(reply.statusCode ?? 502, reply.headers); reply.pipe(outgoing)
+      })
+      upstream.on('error', () => outgoing.destroy())
+      incoming.on('error', () => upstream.destroy()); incoming.pipe(upstream)
+    } catch { outgoing.writeHead(502); outgoing.end('owned native load fault refused') }
+  })
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve) })
+  return { url: 'http://127.0.0.1:' + server.address().port,
+    close: async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) } }
+}
+async function runOwnedReceiverLoadFault() {
+  const fs = await import('node:fs'), path = await import('node:path')
+  const { createHash } = await import('node:crypto'), { spawn } = await import('node:child_process')
+  const { createServer, createConnection } = await import('node:net')
+  const [provider, ...argv] = process.argv.slice(2)
+  if (process.getuid() !== 65534 || process.getgid() !== 0) throw new Error('owned native fault UID/GID differs')
+  const cwd = process.cwd()
+  const binding = receiverLoadFaultBinding(cwd, provider,
+    JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH ?? '{}'),
+    JSON.parse(fs.readFileSync(path.join(cwd, 'native-receiver-load-fault-control.json'), 'utf8')))
+  const executable = provider === 'codex'
+    ? '/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex'
+    : '/usr/local/lib/node_modules/opencode-ai/bin/opencode.exe'
+  const expectedPin = provider === 'codex' ? 'cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40'
+    : 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99'
+  if (!fs.statSync(executable).isFile() || createHash('sha256').update(fs.readFileSync(executable)).digest('hex') !== expectedPin) {
+    throw new Error('selected original native executable differs')
+  }
+  const free = createServer()
+  await new Promise(resolve => free.listen(0, '127.0.0.1', resolve))
+  const backendPort = free.address().port
+  await new Promise(resolve => free.close(resolve))
+  const args = [...argv]
+  let outerPort
+  if (provider === 'codex') {
+    const index = args.indexOf('--listen')
+    if (args.filter(arg => arg === '--listen').length !== 1 || index < 0 || !args.includes('app-server')) throw new Error('owned Codex native route differs')
+    const address = new URL(args[index + 1])
+    if (address.protocol !== 'ws:' || address.hostname !== '127.0.0.1' || !address.port) throw new Error('owned Codex listen differs')
+    outerPort = Number(address.port); args[index + 1] = 'ws://127.0.0.1:' + backendPort
+  } else {
+    const index = args.indexOf('--port'), host = args.indexOf('--hostname')
+    if (args[0] !== 'serve' || index < 0 || host < 0 || args[host + 1] !== '127.0.0.1') throw new Error('owned OpenCode native route differs')
+    outerPort = Number(args[index + 1]); args[index + 1] = String(backendPort)
+  }
+  if (!Number.isInteger(outerPort) || outerPort < 1 || outerPort > 65535) throw new Error('owned native outer port differs')
+  const child = spawn('/usr/local/bin/' + provider + '.native', args, { stdio: 'inherit' })
+  let exited = false, proxy
+  child.once('exit', () => { exited = true; proxy?.close().then(() => { process.exitCode = 1 }) })
+  child.once('error', () => { exited = true })
+  for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => child.kill(signal))
+  try {
+    const readyDeadline = Date.now() + 5000
+    while (true) {
+      if (exited) throw new Error('owned native child exited before listener')
+      const ready = await new Promise(resolve => {
+        const socket = createConnection({ host: '127.0.0.1', port: backendPort })
+        socket.once('connect', () => { socket.destroy(); resolve(true) })
+        socket.once('error', () => resolve(false))
+      })
+      if (ready) break
+      if (Date.now() >= readyDeadline) throw new Error('owned native listener timeout')
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    let observed = false
+    const observe = async (root, bytes, nativeInputDispatches) => {
+      if (observed) throw new Error('owned native load fault repeated')
+      observed = true
+      const receipt = { schemaVersion: 1, ...binding, nativeSessionId: root,
+        nativeEvidenceSha256: createHash('sha256').update(bytes).digest('hex'), executableSha256: expectedPin,
+        wrapperChildPid: child.pid, observedAt: Date.now(), nativeInputDispatches }
+      fs.writeFileSync(path.join(cwd, 'native-receiver-load-fault-observation.json'), JSON.stringify(receipt), { flag: 'wx', mode: 0o664 })
+      const deadline = Date.now() + 4000
+      while (!exited && Date.now() < deadline) {
+        try {
+          const release = JSON.parse(fs.readFileSync(path.join(cwd, 'native-receiver-load-fault-release.json'), 'utf8'))
+          if (release.incarnationId !== binding.incarnationId || release.launchNonce !== binding.launchNonce
+            || release.nativeSessionId !== root || release.expectedRoot !== binding.expectedRoot) throw new Error('owned native release binding differs')
+          return
+        } catch (error) { if (error.code !== 'ENOENT') throw error }
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      throw new Error('owned native response release timed out or child exited')
+    }
+    if (provider === 'codex') {
+      const { default: WebSocket, WebSocketServer } = await import(new URL('./ws/wrapper.mjs', import.meta.url))
+      proxy = await createCodexLoadProxy({ WebSocket, WebSocketServer, port: outerPort,
+        upstreamUrl: 'ws://127.0.0.1:' + backendPort, expectedRoot: binding.expectedRoot, observe })
+    } else proxy = await createOpenCodeLoadProxy({ port: outerPort, upstreamUrl: 'http://127.0.0.1:' + backendPort,
+      expectedRoot: binding.expectedRoot, observe })
+  } catch (error) { child.kill('SIGTERM'); throw error }
+}
+const { fileURLToPath: nativeWrapperFile } = await import('node:url')
+if (process.argv[1] && nativeWrapperFile(import.meta.url) === process.argv[1]) {
+  await runOwnedReceiverLoadFault()
+}
+`
+
+export const nativeReceiverLoadFaultEntry = String.raw`#!/usr/bin/python3
+import os,re,sys
+provider=os.path.basename(sys.argv[0])
+if provider not in ('codex','opencode'):raise RuntimeError('native receiver entry differs')
+args=sys.argv[1:]
+owned=re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace',os.getcwd())
+native='/usr/local/bin/'+provider+'.native'
+if owned and ((provider=='codex' and 'app-server' in args) or (provider=='opencode' and args and args[0]=='serve')):
+ os.execv('/usr/local/bin/node',['node','/opt/freshell-native-receiver-load-fault/native-load-fault.mjs',provider,*args])
+os.execv(native,[native,*args])
+`
+
 export const nativeSdkResumeForkWrapper = String.raw`#!/usr/bin/python3
 import hashlib,json,os,pathlib,re,sys,uuid
 native=pathlib.Path('/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude.native')
@@ -697,6 +923,16 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], mode: 'freshcodex' | 'freshopencode' | 'codex', caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
   const terminal = mode === 'codex'
+  if (!terminal && ['wrong-root', 'cancellation'].includes(caseId)) {
+    const source = sources.find(file => file.name === `${mode === 'freshcodex' ? 'codex' : 'opencode'}/native-fault/receiver-load.json`)
+    if (!source) throw new Error('owned native receiver load-fault image required')
+    const image = JSON.parse(fs.readFileSync(source.path, 'utf8'))
+    if (image.kind !== 'owned-native-receiver-load-fault-image' || image.imageDigest !== harness.imageRef
+      || image.wrapperSha256 !== createHash('sha256').update(nativeReceiverLoadFaultWrapper).digest('hex')
+      || image.entrySha256 !== createHash('sha256').update(nativeReceiverLoadFaultEntry).digest('hex')) {
+      throw new Error('owned native receiver load-fault image binding differs')
+    }
+  }
   const requiresController = terminal && caseId === 'exact-resume'
   if (requiresController && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   const provider = mode === 'freshcodex' || terminal ? 'codex' : 'opencode', scenario = `${mode}-${caseId}`
@@ -845,45 +1081,85 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
   }
   if (!terminal && caseId === 'wrong-root') {
     const expectedRoot = provider === 'opencode' ? 'ses_' + randomUUID().replaceAll('-', '') : randomUUID()
-    const faultRequest = { ...selectedRequest, params: { ...selectedRequest.params, nativeSessionId: expectedRoot } }
+    const faultRequest = { ...request, params: { ...request.params, nativeSessionId: expectedRoot,
+      freshAgent: { ...freshAgent, nativeSessionId: expectedRoot } } }
+    fs.writeFileSync(path.join(workspace, 'native-receiver-load-fault-control.json'),
+      JSON.stringify({ schemaVersion: 1, mode, caseId, expectedRoot }), { mode: 0o664, flag: 'wx' })
     harness.writeArtifact(`${scenario}-request.json`, faultRequest)
-    const launch = await harness.adminRaw(supervisor, faultRequest)
-    harness.writeArtifact(`${scenario}-launch-refusal.json`, launch)
-    const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
-    const view = inventory.data.find((row: any) => row.soulId === soulId)
-    harness.writeArtifact(`${scenario}-current-view.json`, view)
-    if (launch.result?.Err?.code !== 'RECOVERY_BLOCKED' || !view || view.launchState !== 'starting'
-      || (view.nativeSessionId && view.nativeSessionId !== expectedRoot) || view.nativeIdentityObservation || !view.incarnationId || !view.containerId) {
-      throw new Error('actual initial fresh wrong-root publication was not contained')
-    }
-    // This is the current protected actor journal produced by the real
-    // provider receiver, not the requested root or a provider-store census.
-    const receiver = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '0:0',
-      ['python3', '-c', receiverWrongRootEvidence]))
-    harness.writeArtifact(`${scenario}-current-native-receiver.json`, receiver)
-    if (receiver.schemaVersion !== 1 || receiver.provider !== provider || receiver.cwd !== workspace
-      || typeof receiver.nativeSessionId !== 'string' || !receiver.nativeSessionId || receiver.nativeSessionId === expectedRoot
-      || !Array.isArray(receiver.startedRoots) || receiver.startedRoots.length !== 1 || receiver.startedRoots[0] !== receiver.nativeSessionId
-      || receiver.commandCount !== 0 || receiver.decisionCount !== 0 || !/^[a-f0-9]{64}$/.test(receiver.sha256 ?? '')) {
-      throw new Error('actual current fresh receiver does not prove a different native root')
-    }
-    const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-      ['python3', '-c', receiverNativeNamespace, provider, receiver.nativeSessionId, workspace]))
-    harness.writeArtifact(`${scenario}-namespace-private.json`, namespace)
-    if (!receiverNativeNamespaceMatches(namespace, provider, workspace, receiver.nativeSessionId)
-      || (provider === 'opencode' && namespace.nativeMessageCount !== 0)) throw new Error('actual native receiver namespace/profile/pin/TLS differs')
-    const input = await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: { soulId, text: 'Owned wrong-root input refusal probe. Do not use tools.' } })
-    harness.writeArtifact(`${scenario}-input-refusal.json`, input)
-    if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('actual fresh wrong-root admitted input')
-    const original: NativeExperimentOriginal = { caseId, ownerId: harness.runId, imageDigest: harness.imageRef,
-      candidateSha: harness.candidateSha, nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256,
-      profileSha256: createHash('sha256').update(JSON.stringify({ settings, nativeProfileSha256: namespace.profileSha256 })).digest('hex'),
-      artifactReferences: [`${scenario}-launch-refusal.json`, `${scenario}-current-native-receiver.json`, `${scenario}-namespace-private.json`, `${scenario}-input-refusal.json`],
-      assertions: [{ name: 'actual-current-native-selected-different-root', pass: true },
-        { name: 'wrong-current-native-root-refused-before-running-and-input', pass: true },
-        { name: 'actual-selected-native-process-profile-uid-and-tls', pass: true }] }
-    harness.writeArtifact(`${scenario}-original.json`, original)
-    return original
+    let finished = false, reply: any, failure: unknown
+    const pending = harness.adminRaw(supervisor, faultRequest).then(value => { reply = value; finished = true },
+      error => { failure = error; finished = true })
+    try {
+      let receipt: any, namespace: any, view: any
+      const diagnostics: string[] = [], deadline = Date.now() + 6_000
+      while (!finished && Date.now() < deadline) {
+        const owned = harness.broker.receipts().find(row => row.soulId === soulId)
+        if (owned) {
+          try {
+            receipt = JSON.parse(await harness.execOwnedContainerAsExact(owned.containerId, '65534:0',
+              ['python3', '-c', receiverLoadFaultReceipt, workspace]))
+            const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+            view = inventory.data.find((row: any) => row.soulId === soulId)
+            if (!view || view.containerId !== owned.containerId || view.incarnationId !== receipt.incarnationId
+              || view.launchState !== 'starting' || view.nativeIdentityObservation) throw new Error('actual initial fresh wrong-root publication was not contained')
+            namespace = JSON.parse(await harness.execOwnedContainerAsExact(owned.containerId, '65534:0',
+              ['python3', '-c', receiverNativeNamespace, provider, receipt.nativeSessionId, workspace]))
+            break
+          } catch (error) { diagnostics.push(error instanceof Error ? error.message : 'current native fault capture unavailable') }
+        }
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      harness.writeArtifact(`${scenario}-capture-diagnostics.json`, diagnostics)
+      harness.writeArtifact(`${scenario}-current-native-receiver.json`, receipt ?? null)
+      harness.writeArtifact(`${scenario}-namespace-private.json`, namespace ?? null)
+      if (!view || view.launchState !== 'starting' || view.nativeIdentityObservation) {
+        await pending
+        if (failure) throw failure
+        harness.writeArtifact(`${scenario}-launch-refusal.json`, reply)
+        throw new Error('actual initial fresh wrong-root publication was not contained')
+      }
+      if (receipt?.schemaVersion !== 1 || receipt.provider !== provider || receipt.mode !== mode || receipt.caseId !== caseId
+        || receipt.expectedRoot !== expectedRoot || receipt.incarnationId !== view.incarnationId
+        || typeof receipt.nativeSessionId !== 'string' || !receipt.nativeSessionId || receipt.nativeSessionId === expectedRoot
+        || typeof receipt.launchNonce !== 'string' || !receipt.launchNonce
+        || receipt.nativeInputDispatches !== 0 || !/^[a-f0-9]{64}$/.test(receipt.nativeEvidenceSha256 ?? '')
+        || namespace?.nativeLaunch?.launchNonce !== receipt.launchNonce
+        || namespace.nativeLaunch.incarnationId !== receipt.incarnationId
+        || namespace.nativeLaunch.requestedNativeSessionId !== expectedRoot) {
+        throw new Error('actual current fresh receiver does not prove a different native root')
+      }
+      if (!receiverNativeNamespaceMatches(namespace, provider, workspace, receipt.nativeSessionId)
+        || namespace.executableSha256 !== receipt.executableSha256
+        || (provider === 'opencode' && namespace.nativeMessageCount !== 0)) throw new Error('actual native receiver namespace/profile/pin/TLS differs')
+      fs.writeFileSync(path.join(workspace, 'native-receiver-load-fault-release.json'), JSON.stringify({
+        incarnationId: receipt.incarnationId, launchNonce: receipt.launchNonce,
+        nativeSessionId: receipt.nativeSessionId, expectedRoot }), { mode: 0o664, flag: 'wx' })
+      await pending
+      if (failure) throw failure
+      harness.writeArtifact(`${scenario}-launch-refusal.json`, reply)
+      const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+      const current = inventory.data.find((row: any) => row.soulId === soulId)
+      harness.writeArtifact(`${scenario}-current-view.json`, current ?? null)
+      const reason = reply.result?.Err?.message
+      const nativeRefusal = provider === 'codex'
+        ? typeof reason === 'string' && reason.includes('codex thread/resume returned wrong thread id ' + receipt.nativeSessionId)
+          && reason.includes('(requested ' + expectedRoot + ')') && reason.includes('refusing to adopt the wrong thread')
+        : typeof reason === 'string' && reason.includes('native OpenCode loaded a different or parent-bearing root')
+      if (reply.result?.Err?.code !== 'HOST_UNREACHABLE' || !nativeRefusal || !current || current.launchState === 'running'
+        || current.nativeIdentityObservation) throw new Error('actual native wrong-root guard did not refuse provider startup')
+      const input = await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: { soulId, text: 'Owned wrong-root input refusal probe. Do not use tools.' } })
+      harness.writeArtifact(`${scenario}-input-refusal.json`, input)
+      if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('actual fresh wrong-root admitted input')
+      const original: NativeExperimentOriginal = { caseId, ownerId: harness.runId, imageDigest: harness.imageRef,
+        candidateSha: harness.candidateSha, nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256,
+        profileSha256: createHash('sha256').update(JSON.stringify({ settings, nativeProfileSha256: namespace.profileSha256 })).digest('hex'),
+        artifactReferences: [`${scenario}-launch-refusal.json`, `${scenario}-current-native-receiver.json`, `${scenario}-namespace-private.json`, `${scenario}-input-refusal.json`],
+        assertions: [{ name: 'actual-current-native-selected-different-root', pass: true },
+          { name: 'actual-native-wrong-root-guard-refused-before-running-and-input', pass: true },
+          { name: 'actual-selected-native-process-profile-uid-and-tls-before-refusal', pass: true }] }
+      harness.writeArtifact(`${scenario}-original.json`, original)
+      return original
+    } finally { await pending }
   }
   if (terminal && caseId === 'wrong-root') {
     // A requested root is an expectation only: the native app-server creates
@@ -1120,6 +1396,18 @@ if provider=='opencode':
 print(json.dumps({'nativeRoot':root if provider=='codex' else None,'path':str(file),'identity':identity(after),'sha256':hashlib.sha256(raw).hexdigest(),'bytesBase64':base64.b64encode(raw).decode() if provider=='codex' else None,'querySnapshotBase64':base64.b64encode(query_snapshot).decode() if query_snapshot is not None else None,'querySnapshotSha256':hashlib.sha256(query_snapshot).hexdigest() if query_snapshot is not None else None,'completeEof':True}))
 `
 
+export const receiverLoadFaultReceipt = String.raw`
+import pathlib,json,os,sys
+assert os.getuid()==65534 and os.getgid()==0
+file=pathlib.Path(sys.argv[1])/'native-receiver-load-fault-observation.json'
+assert file.is_file() and not file.is_symlink() and file.resolve()==file
+with file.open('rb') as source:
+ before=os.fstat(source.fileno());raw=source.read(65537);after=os.fstat(source.fileno())
+assert 0<len(raw)<=65536 and (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns)==(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns)
+value=json.loads(raw);assert isinstance(value,dict)
+print(json.dumps(value))
+`
+
 export const receiverWrongRootEvidence = String.raw`
 import pathlib,json,hashlib
 file=pathlib.Path('/run/freshell-host-actor/fresh-agent-state.json')
@@ -1171,7 +1459,7 @@ home=pathlib.Path(environment['HOME']);profiles=[]
 for name in (['.codex/config.toml'] if provider=='codex' else ['.config/opencode/opencode.json','.config/opencode/opencode.jsonc']):
  file=home/name;profiles.append({'path':name,'sha256':hashlib.sha256(file.read_bytes()).hexdigest() if file.exists() else None})
 profile_hash=hashlib.sha256(json.dumps(profiles,sort_keys=True).encode()).hexdigest()
-print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(row.split()[1] for row in pathlib.Path('/proc/self/status').read_text().splitlines() if row.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativeCwd':native_cwd,'nativeProcessCwd':str((process/'cwd').resolve()),'nativeRoot':native_info['id'] if native_info else None,'nativeMessageCount':message_count,'nativeVersion':subprocess.check_output([str(executable),'--version'],env=environment,text=True,timeout=15).strip(),'executableSha256':hashlib.sha256(executable.read_bytes()).hexdigest(),'profileSha256':profile_hash,'profileFiles':profiles,'activeNativeProcesses':len(matches),'nativePid':int(process.name),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest()}))
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(row.split()[1] for row in pathlib.Path('/proc/self/status').read_text().splitlines() if row.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativeCwd':native_cwd,'nativeProcessCwd':str((process/'cwd').resolve()),'nativeLaunch':json.loads(environment['FRESHELL_NATIVE_IDENTITY_LAUNCH']) if environment.get('FRESHELL_NATIVE_IDENTITY_LAUNCH') else None,'nativeRoot':native_info['id'] if native_info else None,'nativeMessageCount':message_count,'nativeVersion':subprocess.check_output([str(executable),'--version'],env=environment,text=True,timeout=15).strip(),'executableSha256':hashlib.sha256(executable.read_bytes()).hexdigest(),'profileSha256':profile_hash,'profileFiles':profiles,'activeNativeProcesses':len(matches),'nativePid':int(process.name),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest()}))
 `
 
 async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervisor: Awaited<ReturnType<RuntimeHarness['startSupervisor']>>,

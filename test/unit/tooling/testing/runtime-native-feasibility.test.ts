@@ -9,10 +9,11 @@ import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { createServer } from 'node:net'
 import { createServer as createHttpServer } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
+import WebSocket, { WebSocketServer } from 'ws'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
+  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeReceiverLoadFaultWrapper, nativeReceiverLoadFaultEntry, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
   amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, receiverWrongRootEvidence, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -31,6 +32,154 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it('bounds an unresponsive actual HTTP creation before reporting an owned fault refusal', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-http-timeout-'))
+    const file = path.join(directory, 'native-load-fault.mjs'); fs.writeFileSync(file, nativeReceiverLoadFaultWrapper)
+    const upstream = createHttpServer(() => {})
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+    let proxy: any
+    try {
+      const native = await import(file)
+      proxy = await native.createOpenCodeLoadProxy({ upstreamUrl: `http://127.0.0.1:${(upstream.address() as any).port}`,
+        port: 0, expectedRoot: 'ses_expected', observe: async () => { throw new Error('unresponsive native did not return identity') } })
+      const result = await fetch(`${proxy.url}/session/ses_expected`, { signal: AbortSignal.timeout(5500) })
+      expect(result.status).toBe(502); expect(await result.text()).toBe('owned native load fault refused')
+    } finally {
+      await proxy?.close(); upstream.closeAllConnections()
+      await new Promise<void>(resolve => upstream.close(() => resolve()))
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+  it.each(['fault-sidecar', 'ordinary-sidecar', 'fault-version'])('executes finite receiver entry selection while preserving ordinary native argv (%s)', fault => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-entry-'))
+    const workspace = path.join(directory, 'freshcodex-wrong-root-workspace'); fs.mkdirSync(workspace)
+    const original = path.join(directory, 'original.py'), dispatcher = path.join(directory, 'dispatcher.py'), entry = path.join(directory, 'codex')
+    fs.writeFileSync(original, '#!/usr/bin/python3\nimport json,sys\nprint(json.dumps({"route":"native","args":sys.argv[1:]}))\n', { mode: 0o700 })
+    fs.writeFileSync(dispatcher, 'import json,sys\nprint(json.dumps({"route":"fault","args":sys.argv[1:]}))\n')
+    let script = nativeReceiverLoadFaultEntry.replace("native='/usr/local/bin/'+provider+'.native'", 'native='+JSON.stringify(original))
+      .replace("'/usr/local/bin/node'", "'/usr/bin/python3'").replace("['node','/opt/freshell-native-receiver-load-fault/native-load-fault.mjs',provider,*args]", "['python3',"+JSON.stringify(dispatcher)+',provider,*args]' )
+      .replace("r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace'",
+        'r'+JSON.stringify(workspace).replace('freshcodex-wrong-root-workspace', '(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace'))
+    fs.writeFileSync(entry, script)
+    const args = fault === 'fault-version' ? ['--version'] : ['-c', 'selected_profile=true', 'app-server', '--listen', 'ws://127.0.0.1:1234']
+    try {
+      const result = JSON.parse(execFileSync('python3', [entry, ...args], { cwd: fault === 'ordinary-sidecar' ? directory : workspace, encoding: 'utf8', timeout: 5000 }))
+      expect(result).toEqual(fault === 'fault-sidecar' ? { route: 'fault', args: ['codex', ...args] } : { route: 'native', args })
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+  it.each(['valid', 'foreign-path', 'wrong-provider', 'wrong-root', 'missing-nonce', 'missing-incarnation', 'wrong-case', 'missing-control'])
+    ('binds the finite native receiver fault to its exact owned workspace and current launch (%s)', async fault => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-binding-'))
+      const file = path.join(directory, 'native-load-fault.mjs')
+      fs.writeFileSync(file, nativeReceiverLoadFaultWrapper)
+      const cwd = fault === 'foreign-path' ? '/operator/home' : '/tmp/frs/abcd1234-abc/freshcodex-wrong-root-workspace'
+      const launch = { incarnationId: fault === 'missing-incarnation' ? '' : 'current-inc',
+        launchNonce: fault === 'missing-nonce' ? '' : 'current-nonce', requestedNativeSessionId: 'expected-root' }
+      const control = fault === 'missing-control' ? null : { schemaVersion: 1, mode: 'freshcodex',
+        caseId: fault === 'wrong-case' ? 'create' : 'wrong-root', expectedRoot: fault === 'wrong-root' ? 'other-root' : 'expected-root' }
+      try {
+        const native = await import(file)
+        if (fault === 'valid') expect(native.receiverLoadFaultBinding(cwd, 'codex', launch, control)).toEqual({
+          provider: 'codex', mode: 'freshcodex', caseId: 'wrong-root', expectedRoot: 'expected-root',
+          incarnationId: 'current-inc', launchNonce: 'current-nonce' })
+        else expect(() => native.receiverLoadFaultBinding(cwd, fault === 'wrong-provider' ? 'opencode' : 'codex', launch, control)).toThrow()
+      } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+    })
+  it.each([0, 1])('holds the actual correlated Codex response unchanged and counts native input dispatches (%i)', async inputs => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-socket-'))
+    const file = path.join(directory, 'native-load-fault.mjs')
+    fs.writeFileSync(file, nativeReceiverLoadFaultWrapper)
+    const upstream = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+    await new Promise<void>(resolve => upstream.once('listening', resolve))
+    const requests: any[] = [], response = Buffer.from('{"id":7,"result":{"thread":{"id":"actual-native-root","ephemeral":false}}}')
+    upstream.on('connection', socket => socket.on('message', raw => {
+      const request = JSON.parse(raw.toString()); requests.push(request)
+      socket.send(request.method === 'turn/start' ? JSON.stringify({ id: request.id, result: {} }) : response)
+    }))
+    let client: WebSocket | undefined, proxy: any
+    let release: () => void = () => {}, captured: any
+    const held = new Promise<void>(resolve => { release = resolve })
+    try {
+      const native = await import(file)
+      proxy = await native.createCodexLoadProxy({ WebSocket, WebSocketServer,
+        upstreamUrl: `ws://127.0.0.1:${(upstream.address() as any).port}`, port: 0, expectedRoot: 'expected-root',
+        observe: async (root: string, bytes: Buffer, modelInputs: number) => { captured = { root, bytes, modelInputs }; await held } })
+      client = new WebSocket(proxy.url)
+      await new Promise<void>((resolve, reject) => { client!.once('open', resolve); client!.once('error', reject) })
+      let received: Buffer | undefined
+      const reply = new Promise<void>(resolve => client!.on('message', raw => { if (JSON.parse(raw.toString()).id === 7) { received = Buffer.from(raw as Buffer); resolve() } }))
+      if (inputs) client.send(JSON.stringify({ id: 6, method: 'turn/start', params: { threadId: 'other-native-root', input: [] } }))
+      client.send(JSON.stringify({ id: 7, method: 'thread/resume', params: { threadId: 'expected-root', model: 'selected', cwd: directory } }))
+      await vi.waitFor(() => expect(captured?.root).toBe('actual-native-root'))
+      expect(requests).toEqual([...(inputs ? [{ id: 6, method: 'turn/start', params: { threadId: 'other-native-root', input: [] } }] : []),
+        { id: 7, method: 'thread/start', params: { model: 'selected', cwd: directory } }])
+      expect(captured.modelInputs).toBe(inputs)
+      expect(received).toBeUndefined()
+      expect(captured.bytes).toEqual(response)
+      release(); await reply
+      expect(received).toEqual(response)
+    } finally {
+      release(); client?.terminate(); await proxy?.close()
+      for (const socket of upstream.clients) socket.terminate()
+      await new Promise<void>(resolve => upstream.close(() => resolve()))
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+  it('loads only an actual separately created OpenCode root through a real HTTP negative channel', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-http-'))
+    const file = path.join(directory, 'native-load-fault.mjs')
+    fs.writeFileSync(file, nativeReceiverLoadFaultWrapper)
+    const requests: string[] = [], response = '{"id":"ses_actual","parentID":null,"directory":"/owned/workspace"}'
+    const upstream = createHttpServer((request, reply) => {
+      requests.push(`${request.method} ${request.url}`)
+      reply.setHeader('content-type', 'application/json')
+      reply.end(request.method === 'POST' ? '{"id":"ses_actual"}' : response)
+    })
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+    let proxy: any, captured: any
+    try {
+      const native = await import(file)
+      proxy = await native.createOpenCodeLoadProxy({ upstreamUrl: `http://127.0.0.1:${(upstream.address() as any).port}`,
+        port: 0, expectedRoot: 'ses_expected', observe: async (root: string, bytes: Buffer) => { captured = { root, bytes } } })
+      const loaded = await fetch(`${proxy.url}/session/ses_expected?directory=%2Fowned%2Fworkspace`)
+      expect(loaded.status).toBe(200); expect(await loaded.text()).toBe(response)
+      expect(requests).toEqual(['POST /session?directory=%2Fowned%2Fworkspace', 'GET /session/ses_actual?directory=%2Fowned%2Fworkspace'])
+      expect(captured).toEqual({ root: 'ses_actual', bytes: Buffer.from(response) })
+    } finally {
+      await proxy?.close(); upstream.closeAllConnections()
+      await new Promise<void>(resolve => upstream.close(() => resolve()))
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+  it('redirects only the exact pending native Codex resume to supported actual thread creation without changing its profile', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-module-'))
+    const file = path.join(directory, 'native-load-fault.mjs')
+    fs.writeFileSync(file, nativeReceiverLoadFaultWrapper)
+    try {
+      const native = await import(file)
+      const request = Buffer.from(JSON.stringify({ id: 7, method: 'thread/resume',
+        params: { threadId: 'expected-root', cwd: '/owned/workspace', model: 'selected-native-model', sandbox: 'workspace-write', approvalPolicy: 'on-request', persistExtendedHistory: true } }))
+      const actual = JSON.parse(native.rewriteCodexNativeResume(request, 'expected-root').toString())
+      expect(actual).toEqual({ id: 7, method: 'thread/start', params: {
+        cwd: '/owned/workspace', model: 'selected-native-model', sandbox: 'workspace-write', approvalPolicy: 'on-request', persistExtendedHistory: true } })
+      for (const raw of [Buffer.from('not-json'), Buffer.from(JSON.stringify({ id: 8, method: 'thread/resume', params: { threadId: 'unrelated-root' } })),
+        Buffer.from(JSON.stringify({ id: 9, method: 'thread/read', params: { threadId: 'expected-root' } }))]) {
+        expect(native.rewriteCodexNativeResume(raw, 'expected-root')).toBe(raw)
+      }
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+  it('uses only a different actual native OpenCode creation result for its owned negative load', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-module-'))
+    const file = path.join(directory, 'native-load-fault.mjs')
+    fs.writeFileSync(file, nativeReceiverLoadFaultWrapper)
+    try {
+      const native = await import(file)
+      expect(native.selectedOpenCodeLoadRoot('ses_expected', 'ses_actual')).toBe('ses_actual')
+      for (const root of [null, '', 7, 'placeholder', 'ses_expected']) {
+        expect(() => native.selectedOpenCodeLoadRoot('ses_expected', root)).toThrow()
+      }
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it('refuses terminal Codex exact without the owned real controller before preparing a runtime', async () => {
     const directory=fs.mkdtempSync(path.join(os.tmpdir(),'codex-controller-preflight-'))
     const start=vi.fn(async()=>{throw new Error('runtime started before required controller preflight')})
@@ -177,36 +326,52 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       } else expect(() => execFileSync('python3', ['-c', script], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' })).toThrow()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['freshcodex', 'freshopencode'].flatMap(mode => ['valid', 'published', 'admitted-input', 'requested-echo', 'missing-started', 'commands-present', 'wrong-uid'].map(fault => [mode, fault])))
+  it.each(['freshcodex', 'freshopencode'].flatMap(mode => ['valid', 'published', 'admitted-input', 'requested-echo', 'missing-native-receipt', 'commands-present', 'wrong-uid'].map(fault => [mode, fault])))
     ('requires actual fresh native wrong-root receiver and refuses initial input (%s, %s; orchestration only)', async (mode, fault) => {
-      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-native-wrong-')), root = randomUUID()
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-native-wrong-')), root = mode === 'freshopencode' ? 'ses_actual' : randomUUID()
       const provider = mode === 'freshcodex' ? 'codex' : 'opencode'
-      let expected = '', soul = '', cwd = ''
-      const requests: any[] = []
+      let expected = '', soul = '', cwd = '', settle: (value: any) => void = () => {}
+      const requests: any[] = [], nonce = 'actual-current-nonce', incarnation = 'current-inc'
+      const faultSource = path.join(directory, 'fault-image.json')
+      fs.writeFileSync(faultSource, JSON.stringify({ kind: 'owned-native-receiver-load-fault-image', imageDigest,
+        wrapperSha256: createHash('sha256').update(nativeReceiverLoadFaultWrapper).digest('hex'),
+        entrySha256: createHash('sha256').update(nativeReceiverLoadFaultEntry).digest('hex') }))
       const harness = { testRoot: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
         startSupervisor: async () => ({}), writeArtifact: () => {}, inventoryBody: () => ({ method: 'inventory' }),
+        broker: { receipts: () => [{ soulId: soul, containerId: 'owned-current' }] },
         adminRaw: async (_: unknown, request: any) => {
           requests.push(request)
           if (request.method === 'launch') {
             expected = request.params.nativeSessionId; soul = request.params.soulId; cwd = request.params.freshAgent.cwd
-            expect(request.params.freshAgent.nativeSessionId).toBeUndefined()
-            return { result: { Err: { code: 'RECOVERY_BLOCKED' } } }
+            expect(request.params.freshAgent.nativeSessionId).toBe(expected)
+            return new Promise(resolve => { settle = resolve })
           }
           if (request.method === 'fresh_agent_send') return { result: { Err: { code: fault === 'admitted-input' ? 'OTHER_ERROR' : 'UNKNOWN_SOUL' } } }
           throw new Error('unexpected command')
         },
         adminOk: async () => ({ data: [{ soulId: soul, launchState: fault === 'published' ? 'running' : 'starting',
-          incarnationId: 'current-inc', containerId: 'owned-current', nativeSessionId: expected, nativeIdentityObservation: null }] }),
-        execOwnedContainerAsExact: async (_: string, uid: string) => uid === '0:0'
-          ? JSON.stringify({ schemaVersion: 1, nativeSessionId: fault === 'requested-echo' ? expected : root,
-            provider, cwd, startedRoots: fault === 'missing-started' ? [] : [root],
-            commandCount: fault === 'commands-present' ? 1 : 0, decisionCount: 0, sha256: 'a'.repeat(64) })
-          : JSON.stringify({ uid: fault === 'wrong-uid' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+          incarnationId: incarnation, containerId: 'owned-current', nativeSessionId: expected, nativeIdentityObservation: null }] }),
+        execOwnedContainerAsExact: async (_: string, uid: string, command: string[]) => {
+          expect(uid).toBe('65534:0')
+          const refusal = { result: { Err: { code: 'HOST_UNREACHABLE', message: provider === 'codex'
+            ? `codex thread/resume returned wrong thread id ${root} (requested ${expected}); refusing to adopt the wrong thread`
+            : 'native OpenCode loaded a different or parent-bearing root' } } }
+          if (command[2].includes('native-receiver-load-fault-observation.json')) {
+            if (fault === 'published') setTimeout(() => settle(refusal), 10)
+            return JSON.stringify({ schemaVersion: 1, provider, mode, caseId: 'wrong-root', expectedRoot: expected,
+              nativeSessionId: fault === 'requested-echo' ? expected : root, incarnationId: incarnation, launchNonce: nonce,
+              nativeInputDispatches: fault === 'commands-present' ? 1 : 0, nativeEvidenceSha256: fault === 'missing-native-receipt' ? null : 'a'.repeat(64), executableSha256: 'e'.repeat(64) })
+          }
+          setTimeout(() => settle(refusal), 10)
+          return JSON.stringify({ uid: fault === 'wrong-uid' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
             httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: cwd,
             nativeRoot: root, nativeMessageCount: 0, nativeVersion: provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21',
-            activeNativeProcesses: 1, executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64) }),
+            activeNativeProcesses: 1, executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64),
+            nativeLaunch: { incarnationId: incarnation, launchNonce: nonce, requestedNativeSessionId: expected } })
+        },
       } as unknown as RuntimeHarness
       const sources = ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: provider + '/grants/' + suffix, path: '/owned/' + suffix, sha256: 'e'.repeat(64) }))
+      sources.push({ name: provider + '/native-fault/receiver-load.json', path: faultSource, sha256: createHash('sha256').update(fs.readFileSync(faultSource)).digest('hex') })
       try {
         const run = executeManagedNativeCase(harness, sources, { mode: mode as 'freshcodex' | 'freshopencode', case: 'startup' }, 'wrong-root')
         if (fault === 'valid') {
