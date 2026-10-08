@@ -110,7 +110,7 @@ function providerDefinitions(): ProviderDefinition[] {
     },
   ]
   if (selected.includes('amplifier')) {
-    requireAmplifierOnecliBootstrap()
+    if (!resolveManagedExternalDescriptor(process.env)) requireAmplifierOnecliBootstrap()
     definitions.push({
       provider: 'amplifier',
       pickerName: /^Amplifier$/i,

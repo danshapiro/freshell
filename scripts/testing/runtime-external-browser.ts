@@ -53,6 +53,7 @@ import type { RuntimeProviderReceiptArtifacts } from './runtime-sandbox.js'
 import type { FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
+import { requireAmplifierOnecliBootstrap } from './runtime-amplifier-onecli.js'
 
 type OwnedProcessIdentity = { pid: number; startTicks: string; executable: string; cwd: string }
 
@@ -2122,6 +2123,7 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
     FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS: '5000', FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS: '10000',
     FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000',
   } : {}
+  if (!deterministic && !retainedArtifacts && providers.includes('amplifier')) requireAmplifierOnecliBootstrap(environment)
   return new ManagedRuntimeOwner(createExternalManagedWebFactory(selection, environment, webFactory), root, phase,
     {}, supervisorEnv, deterministic || tabs || sourceSelection || selectsPhase3Approval(selection, environment) ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
       fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {

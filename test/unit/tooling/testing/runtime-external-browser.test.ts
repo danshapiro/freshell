@@ -12,6 +12,13 @@ import { createRequire } from 'node:module'
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
 const execute = vi.fn()
+const registeredQualificationCases = vi.hoisted(() => new Map<string, Function>())
+vi.mock('../../../e2e-browser/helpers/fixtures.js', () => ({
+  test: Object.assign((title: string, callback: Function) => registeredQualificationCases.set(title, callback), {
+    describe: { serial: (_title: string, callback: () => void) => callback() }, skip: vi.fn(), setTimeout: vi.fn(),
+  }),
+  createFreshE2ePage: vi.fn(),
+}))
 
 import { runSelectedProviderQualification } from '../../../../scripts/testing/runtime-provider-qualification.js'
 import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/runtime-fresh-agent-qualification.js'
@@ -30,6 +37,55 @@ import type { ManagedTerminalStartupFacts } from '../../../../scripts/testing/ru
 beforeEach(() => execute.mockReset())
 
 describe('managed browser producers', () => {
+  it('keeps the actual selected Amplifier local guard and delegates only an admitted external case to its owner', async () => {
+    await import('../../../e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.js')
+    const callback = registeredQualificationCases.get('each explicitly selected provider produces an independent evidence-bound live row')
+    if (!callback) throw new Error('actual selected provider callback was not registered')
+    for (const key of [...runner.EXTERNAL_DESCRIPTOR_KEYS,
+      'FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE', 'FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE', 'FRESHELL_MANAGED_AMPLIFIER_ONECLI_CA_FILE']) vi.stubEnv(key, undefined)
+    vi.stubEnv('FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE', '1')
+    vi.stubEnv('FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS', 'amplifier')
+    const started = vi.spyOn(runner.ExternalManagedRuntimeRig.prototype, 'start').mockRejectedValue(new Error('admitted owner setup intercepted'))
+    const stopped = vi.spyOn(runner.ExternalManagedRuntimeRig.prototype, 'stop').mockResolvedValue({ ok: true, errors: [] })
+    try {
+      await expect(Reflect.apply(callback, undefined, [{}])).rejects.toThrow(/requires.*AMPLIFIER_ONECLI/)
+      expect(started).not.toHaveBeenCalled()
+      for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
+      await expect(Reflect.apply(callback, undefined, [{}])).rejects.toThrow(/admitted owner setup intercepted/)
+      expect(started).toHaveBeenCalledOnce()
+      expect(stopped).toHaveBeenCalledOnce()
+      vi.stubEnv('FRESHELL_E2E_TARGET_WS_URL', undefined)
+      await expect(Reflect.apply(callback, undefined, [{}])).rejects.toThrow(/complete owned external descriptor required/)
+      expect(started).toHaveBeenCalledOnce()
+    } finally { started.mockRestore(); stopped.mockRestore(); vi.unstubAllEnvs() }
+  })
+  it('refuses selected native Amplifier before owner creation when the unchanged bootstrap is missing or malformed', async () => {
+    const web = vi.fn(() => { throw new Error('native web must not start') })
+    const selection = { spec: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts', provider: 'amplifier' as const }
+    expect(() => runner.createExternalManagedRuntimeOwner(process.cwd(), selection, {}, web)).toThrow(/requires.*AMPLIFIER_ONECLI/)
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-amplifier-locality-'))
+    const file = path.join(root, 'amplifier.env')
+    await fsp.writeFile(file, 'FIXTURE_REFERENCE=owner-only\n', { mode: 0o644 })
+    await fsp.chmod(file, 0o644)
+    try {
+      expect(() => runner.createExternalManagedRuntimeOwner(process.cwd(), selection,
+        { FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE: file }, web)).toThrow(/private/)
+      expect(web).not.toHaveBeenCalled()
+      await fsp.chmod(file, 0o600)
+      const owned = runner.createExternalManagedRuntimeOwner(process.cwd(), selection,
+        { FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE: file }, web)
+      expect(owned.fixtureRegistrationFacts()).toEqual({ phase: 5, enabledProviders: ['amplifier'], freshAgentModes: [], fixtureFreshAgentModes: [] })
+      expect(web).not.toHaveBeenCalled()
+      const fixture = runner.createExternalManagedRuntimeOwner(process.cwd(), {
+        spec: 'test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts',
+      }, {}, web)
+      expect(fixture.fixtureRegistrationFacts().fixtureFreshAgentModes).toEqual(['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'])
+      const retained = runner.createExternalManagedRuntimeOwner(process.cwd(), selection, {}, web, true)
+      expect(retained.fixtureRegistrationFacts().enabledProviders).toEqual(['amplifier'])
+      const codex = runner.createExternalManagedRuntimeOwner(process.cwd(), { ...selection, provider: 'codex' }, {}, web)
+      expect(codex.fixtureRegistrationFacts().enabledProviders).toEqual(['codex'])
+    } finally { await fsp.rm(root, { recursive: true, force: true }) }
+  })
   it.each([
     { run: runSelectedProviderQualification, args: ['--provider', 'codex'], selection: '--provider', value: 'codex', spec: 'runtime-managed-provider-qualification-rust.spec.ts', live: 'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE' },
     { run: runSelectedFreshAgentQualification, args: ['--mode', 'freshcodex'], selection: '--mode', value: 'freshcodex', spec: 'runtime-fresh-agent-qualification-rust.spec.ts', live: 'FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE' },
