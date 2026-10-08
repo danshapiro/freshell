@@ -13,7 +13,7 @@ import WebSocket, { WebSocketServer } from 'ws'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeReceiverLoadFaultWrapper, nativeReceiverLoadFaultEntry, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
+  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeReceiverLoadFaultWrapper, nativeReceiverLoadFaultEntry, writeOwnedNativeReceiverControl, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
   amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, receiverWrongRootEvidence, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -32,6 +32,25 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it('publishes owned non-secret native fault controls readable by the provider under a restrictive umask', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-control-mode-'))
+    const source = path.resolve('scripts/testing/runtime-native-feasibility.ts')
+    const code = `import fs from 'node:fs';import path from 'node:path';
+      import { writeOwnedNativeReceiverControl } from ${JSON.stringify(source)};
+      process.umask(0o077);
+      const directory=process.argv[1];
+      writeOwnedNativeReceiverControl(directory,'native-receiver-load-fault-control.json',{schemaVersion:1,expectedRoot:'owned-root'});
+      const control=path.join(directory,'native-receiver-load-fault-control.json');
+      let duplicateRefused=false;
+      try {writeOwnedNativeReceiverControl(directory,'native-receiver-load-fault-control.json',{expectedRoot:'changed'})}catch{duplicateRefused=true}
+      process.stdout.write(JSON.stringify({readableByProvider:!!(fs.statSync(control).mode&0o004),
+        original:JSON.parse(fs.readFileSync(control,'utf8')),duplicateRefused}));`
+    try {
+      const result = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', code, directory],
+        { encoding: 'utf8', timeout: 5000, stdio: 'pipe' }))
+      expect(result).toEqual({ readableByProvider: true, original: { schemaVersion: 1, expectedRoot: 'owned-root' }, duplicateRefused: true })
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it('records only typed finite receiver failure metadata and excludes raw provider strings', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-error-'))
     const file = path.join(directory, 'native-load-fault.mjs'); fs.writeFileSync(file, nativeReceiverLoadFaultWrapper)

@@ -281,6 +281,17 @@ if owned and ((provider=='codex' and 'app-server' in args) or (provider=='openco
 os.execv(native,[native,*args])
 `
 
+export function writeOwnedNativeReceiverControl(workspace: string, fileName: 'native-receiver-load-fault-control.json' | 'native-receiver-load-fault-release.json', value: unknown): void {
+  const target = path.join(workspace, fileName), temporary = target + '.tmp'
+  const descriptor = fs.openSync(temporary, 'wx', 0o600)
+  try {
+    fs.writeFileSync(descriptor, JSON.stringify(value))
+    fs.fchmodSync(descriptor, 0o644)
+    // Publish the complete readable binding without replacing an old control.
+    fs.linkSync(temporary, target)
+  } finally { fs.closeSync(descriptor); fs.unlinkSync(temporary) }
+}
+
 export const nativeSdkResumeForkWrapper = String.raw`#!/usr/bin/python3
 import hashlib,json,os,pathlib,re,sys,uuid
 native=pathlib.Path('/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude.native')
@@ -1109,8 +1120,8 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     const expectedRoot = provider === 'opencode' ? 'ses_' + randomUUID().replaceAll('-', '') : randomUUID()
     const faultRequest = { ...request, params: { ...request.params, nativeSessionId: expectedRoot,
       freshAgent: { ...freshAgent, nativeSessionId: expectedRoot } } }
-    fs.writeFileSync(path.join(workspace, 'native-receiver-load-fault-control.json'),
-      JSON.stringify({ schemaVersion: 1, mode, caseId, expectedRoot }), { mode: 0o664, flag: 'wx' })
+    writeOwnedNativeReceiverControl(workspace, 'native-receiver-load-fault-control.json',
+      { schemaVersion: 1, mode, caseId, expectedRoot })
     harness.writeArtifact(`${scenario}-request.json`, faultRequest)
     let finished = false, reply: any, failure: unknown
     const pending = harness.adminRaw(supervisor, faultRequest).then(value => { reply = value; finished = true },
@@ -1157,9 +1168,9 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       if (!receiverNativeNamespaceMatches(namespace, provider, workspace, receipt.nativeSessionId)
         || namespace.executableSha256 !== receipt.executableSha256
         || (provider === 'opencode' && namespace.nativeMessageCount !== 0)) throw new Error('actual native receiver namespace/profile/pin/TLS differs')
-      fs.writeFileSync(path.join(workspace, 'native-receiver-load-fault-release.json'), JSON.stringify({
+      writeOwnedNativeReceiverControl(workspace, 'native-receiver-load-fault-release.json', {
         incarnationId: receipt.incarnationId, launchNonce: receipt.launchNonce,
-        nativeSessionId: receipt.nativeSessionId, expectedRoot }), { mode: 0o664, flag: 'wx' })
+        nativeSessionId: receipt.nativeSessionId, expectedRoot })
       await pending
       if (failure) throw failure
       harness.writeArtifact(`${scenario}-launch-refusal.json`, reply)
