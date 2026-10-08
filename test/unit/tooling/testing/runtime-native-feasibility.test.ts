@@ -8,7 +8,7 @@ import { createServer } from 'node:net'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, staleNativeSignalBindingMatches, terminalRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, staleNativeSignalBindingMatches, terminalRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -27,6 +27,24 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['ordinary-create','ordinary-resume','owned-fork','owned-duplicate','wrong-root','missing-launch','wrong-pin'])('executes only the fixed owned SDK resume-fork fault (%s)', (fault) => {
+    const root=path.join('/tmp/frs',randomUUID().slice(0,12));const workspace=path.join(root,'freshclaude-'+(fault==='ordinary-resume'?'exact-resume':'wrong-id')+'-workspace')
+    fs.mkdirSync(workspace,{recursive:true,mode:0o700})
+    const native=path.join(root,'native-child'),wrapper=path.join(root,'wrapper.py'),requested=randomUUID()
+    fs.writeFileSync(native,'#!/usr/bin/python3\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n',{mode:0o700});fs.chmodSync(native,0o700)
+    const expected=createHash('sha256').update(fs.readFileSync(native)).digest('hex')
+    const staged=nativeSdkResumeForkWrapper.replaceAll('/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude.native',native)
+      .replace('73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916',fault==='wrong-pin'?'0'.repeat(64):expected)
+    fs.writeFileSync(wrapper,staged)
+    const argv=fault==='ordinary-create'?['--model','selected-model']:['--resume',requested,'--model','selected-model',...(fault==='owned-duplicate'?['--fork-session']:[])]
+    const env={...process.env};delete env.FRESHELL_NATIVE_IDENTITY_LAUNCH
+    if(fault!=='missing-launch')env.FRESHELL_NATIVE_IDENTITY_LAUNCH=JSON.stringify({launchNonce:'current-nonce',incarnationId:'current-incarnation',requestedNativeSessionId:fault==='wrong-root'?randomUUID():requested})
+    try {
+      const run=()=>execFileSync('python3',[wrapper,...argv],{cwd:workspace,env,encoding:'utf8',stdio:['pipe','pipe','pipe']})
+      if(fault==='wrong-root'||fault==='missing-launch'||fault==='wrong-pin')expect(run).toThrow()
+      else expect(JSON.parse(run())).toEqual(fault==='owned-fork'?[...argv,'--fork-session']:argv)
+    } finally {fs.rmSync(root,{recursive:true,force:true})}
+  })
   it.each(['startup', 'wrong-requested-root', 'foreign-workspace', 'same-native-root'])('requires an actual owned different native root before recording a fork (%s)', (fault) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-fork-hook-'))
     const hookPath = path.join(directory, 'fork.mjs')

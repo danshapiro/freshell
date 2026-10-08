@@ -22,6 +22,27 @@ export type NativeExperimentOriginal = {
   assertions: { name: string; pass: boolean }[]
 }
 
+// A finite experiment image can retain the pinned ELF behind this wrapper.
+// Only the exact owned wrong-ID resume workspace gets the supported fork flag;
+// ordinary modes and argv remain unchanged. This never fabricates native IDs.
+export const nativeSdkResumeForkWrapper = String.raw`#!/usr/bin/python3
+import hashlib,json,os,pathlib,re,sys,uuid
+native=pathlib.Path('/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude.native')
+if not native.is_file() or native.is_symlink() or hashlib.sha256(native.read_bytes()).hexdigest()!='73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916':
+ raise RuntimeError('pinned original SDK child differs')
+args=sys.argv[1:]
+owned=re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/(freshclaude|kilroy)-wrong-id-workspace',os.getcwd())
+if owned and '--resume' in args:
+ launch=json.loads(os.environ.get('FRESHELL_NATIVE_IDENTITY_LAUNCH','{}'))
+ index=args.index('--resume')
+ if index+1>=len(args) or not launch.get('launchNonce') or not launch.get('incarnationId'):
+  raise RuntimeError('current owned SDK resume binding missing')
+ root=args[index+1];uuid.UUID(root)
+ if launch.get('requestedNativeSessionId')!=root:raise RuntimeError('owned SDK requested resume root differs')
+ if '--fork-session' not in args:args.append('--fork-session')
+os.execv(str(native),[str(native),*args])
+`
+
 export function staleNativeSignalBindingMatches(captured: any, priorLaunch: any, currentLaunch: any, root: string): boolean {
   return captured.hooksDisabled === true && captured.hook?.native.session_id === root
     && captured.loaded?.native.session_id === root
