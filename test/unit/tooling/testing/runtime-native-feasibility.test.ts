@@ -545,7 +545,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
         if (fault !== 'disposal-current' && fault !== 'cancellation-current' && !(loadFault && fault.endsWith('-current'))) expect((harness.writeArtifact as any).mock.calls.filter(([name]: string[]) => name.endsWith('-original.json'))).toEqual([])
       } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
     })
-  it.each(['baseline-only-resume', 'stale-observation'].flatMap(caseId => ['current', 'prior-public-view', 'wrong-candidate-receipt', 'changed-public-observation', 'wrong-host-generation', 'wrong-producer-pid', 'canonical-stopped-omission', 'owner-authenticator', 'wrong-native-binary', 'missing-baseline', 'copied-volume', 'changed-history', 'current-observation', 'changed-stale-receipt', 'unconsumed-stale-receipt', 'false-stopped-result'].map(fault => [caseId, fault])))('executes original-volume %s/%s through actual recovery and Stop ordering (controlled orchestration)', async (caseId, fault) => {
+  it.each(['baseline-only-resume', 'stale-observation'].flatMap(caseId => ['current', 'prior-public-view', 'prior-public-after-stop', 'stopped-current-observation', 'stopped-wrong-incarnation', 'stopped-running', 'stopped-intent-mismatch', 'stopped-changed-public-observation', 'wrong-candidate-receipt', 'changed-public-observation', 'wrong-host-generation', 'wrong-producer-pid', 'canonical-stopped-omission', 'owner-authenticator', 'wrong-native-binary', 'missing-baseline', 'copied-volume', 'changed-history', 'current-observation', 'changed-stale-receipt', 'unconsumed-stale-receipt', 'false-stopped-result'].map(fault => [caseId, fault])))('executes original-volume %s/%s through actual recovery and Stop ordering (controlled orchestration)', async (caseId, fault) => {
     const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12)), evidenceDir=path.join(ownedRoot,'evidence')
     fs.mkdirSync(evidenceDir,{recursive:true,mode:0o700})
     const source=prepareOwnedOpenCodeTuiSource(process.cwd(),ownedRoot,caseId,randomUUID())
@@ -553,7 +553,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
     const oldSignal={name:terminalId+'__actual.json',sha256:'c'.repeat(64),incarnationId:oldInc,launchNonce:'old-adoption',evidenceGeneration:'a'.repeat(64),nativeSessionId:root,hydrated:true,messagesRead:'success'}
     let recovered=false,stopped=false,resolveRecovery:((reply:any)=>void)|undefined
     const commands:string[]=[]
-    const candidateGeneration=fault==='prior-public-view'?1:2
+    const candidateGeneration=['prior-public-view','prior-public-after-stop'].includes(fault)?1:2
     const view=(current=false)=>({soulId:'soul-owned',incarnationId:current?newInc:oldInc,containerId:current?'current-native':'old-native',
       launchState:stopped?'stopped':current?'starting':'running',recoveryState:stopped?'stopped':'live',desiredState:stopped?'stopped':'running',
       cleanupState:stopped?'verified_empty':'none',intentRevision:stopped?2:1,executionGeneration:current?candidateGeneration:1,allocationState:'allocated',durabilityState:'unknown',
@@ -565,6 +565,11 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       executableSha256:'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99',profileSha256:'d'.repeat(64),
       nativeLaunch:{incarnationId:current?newInc:oldInc,launchNonce:current?'new-launch':'old-launch',evidenceRevision:current?2:1,
         executionGeneration:current?candidateGeneration:1,requestedNativeSessionId:root}})
+    const canceledView=()=>({...view(true),
+      ...(fault==='stopped-current-observation'?{nativeIdentityObservation:view().nativeIdentityObservation}:{}),
+      ...(fault==='stopped-wrong-incarnation'?{incarnationId:oldInc}:{}),
+      ...(fault==='stopped-running'?{launchState:'running'}:{}),
+      ...(fault==='stopped-intent-mismatch'?{intentRevision:1}:{})})
     const harness={repoRoot:process.cwd(),testRoot:ownedRoot,evidenceDir,runId:ownerId,candidateSha,imageRef:imageDigest,
       writeArtifact:vi.fn(),killOwnedRuntimeExact:async()=>{commands.push('owned-death')},waitForContainerExit:async()=>{commands.push('old-absence')},
       broker:{receipts:()=>[{soulId:'soul-owned',containerId:'old-native',incarnationId:oldInc,providerVolumeName:'original-volume'},
@@ -574,15 +579,16 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       terminalInputBody:(soulId:string,data:string)=>({method:'terminal_input',params:{soulId,data}}),
       adminRaw:async(_:unknown,body:any)=>{
         if(body.method==='recover'){commands.push('recover');recovered=true;return new Promise(resolve=>{resolveRecovery=resolve})}
-        if(body.method==='stop'){stopped=true;resolveRecovery?.({result:{Ok:{kind:'recovered',data:{outcome:'stopped',...(fault==='canonical-stopped-omission'?{}:{observedNativeSessionId:fault==='false-stopped-result'?root:null}),view:view(true)}}}});return {result:{Ok:{}}}}
+        if(body.method==='stop'){stopped=true;resolveRecovery?.({result:{Ok:{kind:'recovered',data:{outcome:'stopped',...(fault==='canonical-stopped-omission'?{}:{observedNativeSessionId:fault==='false-stopped-result'?root:null}),view:canceledView()}}}});return {result:{Ok:{}}}}
         commands.push('input');return {result:{Err:{code:'UNKNOWN_SOUL'}}}
       },
       adminOk:async(_:unknown,body:any)=>{
         if(body.method==='probe_recovery'){commands.push('probe');return {data:{kind:'resume_ready',data:{resume_spec:{providerSession:{nativeSessionId:root},
           opencodeAdoptionBaseline:fault==='missing-baseline'?null:{descriptor:{rootSessionId:root},manifestSha256:'f'.repeat(64)}}}}}}
-        if(body.method==='stop'){commands.push('stop');stopped=true;resolveRecovery?.({result:{Ok:{kind:'recovered',data:{outcome:'stopped',...(fault==='canonical-stopped-omission'?{}:{observedNativeSessionId:fault==='false-stopped-result'?root:null}),view:view(true)}}}});return {data:{outcome:'verified_empty'}}}
+        if(body.method==='stop'){commands.push('stop');stopped=true;resolveRecovery?.({result:{Ok:{kind:'recovered',data:{outcome:'stopped',...(fault==='canonical-stopped-omission'?{}:{observedNativeSessionId:fault==='false-stopped-result'?root:null}),view:canceledView()}}}});return {data:{outcome:'verified_empty'}}}
         return {data:[recovered&&!stopped?{...view(),launchState:'stopped',recoveryState:'recovering',cleanupState:'verified_empty',
-          ...(fault==='changed-public-observation'?{nativeIdentityObservation:{...view().nativeIdentityObservation,launchNonce:'changed-public'}}:{})}:view(recovered)]}
+          ...(fault==='changed-public-observation'?{nativeIdentityObservation:{...view().nativeIdentityObservation,launchNonce:'changed-public'}}:{})}:{...view(recovered&&!['prior-public-after-stop','stopped-changed-public-observation'].includes(fault)),
+          ...(stopped&&fault==='stopped-changed-public-observation'?{nativeIdentityObservation:{...view().nativeIdentityObservation,launchNonce:'changed-after-stop'}}:{})}]}
       },
       execOwnedContainerAsExact:async(container:string,_uid:string,args:string[])=>{
         if(container==='old-native')return JSON.stringify({signals:[oldSignal],cleared:caseId==='baseline-only-resume',nativePid:7,launchNonce:'old-launch'})
@@ -615,7 +621,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       const initialNamespace=namespace();if(fault==='wrong-native-binary')initialNamespace.executableSha256='b'.repeat(64)
       const execution=executeManagedOpenCodeTuiReplacementFault(harness,{runtimeRoot} as any,
         {method:'launch',params:{soulId:'soul-owned',terminal:{terminalId}}},source,view(),initialNamespace,caseId as 'baseline-only-resume'|'stale-observation')
-      if(['current','prior-public-view','canonical-stopped-omission','owner-authenticator'].includes(fault)){
+      if(['current','prior-public-view','prior-public-after-stop','canonical-stopped-omission','owner-authenticator'].includes(fault)){
         const result=await execution
         expect(commands).toEqual(['owned-death','old-absence','probe','recover','stop','input'])
         expect(result.assertions.every(assertion=>assertion.pass)).toBe(true)
@@ -624,7 +630,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
         await expect(execution).rejects.toThrow(fault==='wrong-native-binary'?'genuine initial native TUI observation/owned volume required before replacement fault'
           :fault==='missing-baseline'?'actual original native store has no verified exact adoption baseline for replacement'
           :['copied-volume','changed-history'].includes(fault)?'native TUI replacement changed original volume/root/history or reused incarnation'
-          :fault==='false-stopped-result'?'ordinary Stop did not cancel the current unobserved native launch'
+          :(fault==='false-stopped-result'||fault.startsWith('stopped-'))?'ordinary Stop did not cancel the current unobserved native launch'
           :['wrong-candidate-receipt','changed-public-observation','wrong-producer-pid'].includes(fault)?'actual pending TUI native namespace/current binding differs'
           :'actual current baseline/native gate accepted missing or stale producer evidence')
         expect((harness.writeArtifact as any).mock.calls.filter(([name]:string[])=>name.endsWith('-original.json'))).toEqual([])

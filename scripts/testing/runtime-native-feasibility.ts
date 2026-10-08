@@ -1535,14 +1535,23 @@ projection['expected']=json.loads(expected_file.read_text());print(json.dumps(pr
     const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
     const current = ManagedRuntimeSoulSchema.parse(inventory.data.find((row: any) => row.soulId === request.params.soulId))
     harness.writeArtifact(`${scenario}-current-view.json`, current)
+    const canceledCandidate = replacement ? ManagedRuntimeSoulSchema.parse(reply.result?.Ok?.data?.view) : undefined
     const replacementStopped = reply.result?.Ok?.data?.outcome === 'stopped'
       && (reply.result.Ok.data.observedNativeSessionId === undefined || reply.result.Ok.data.observedNativeSessionId === null)
-      && !reply.result.Ok.data.view?.nativeIdentityObservation
+      && canceledCandidate?.incarnationId === candidate.incarnationId && canceledCandidate.containerId === candidate.containerId
+      && canceledCandidate.executionGeneration === candidate.executionGeneration && !canceledCandidate.nativeIdentityObservation
+      && canceledCandidate.launchState === 'stopped' && canceledCandidate.desiredState === 'stopped'
+      && canceledCandidate.recoveryState === 'stopped' && canceledCandidate.cleanupState === 'verified_empty'
+      && canceledCandidate.intentRevision === current.intentRevision
+    const stoppedPublicBinding = (current.incarnationId === candidate.incarnationId
+      && current.executionGeneration === candidate.executionGeneration && !current.nativeIdentityObservation)
+      || (!!replacement && current.incarnationId === replacement.priorView.incarnationId
+        && current.containerId === replacement.priorView.containerId && current.executionGeneration === replacement.priorView.executionGeneration
+        && JSON.stringify(current.nativeIdentityObservation) === JSON.stringify(replacement.priorView.nativeIdentityObservation))
     if (!(replacement ? replacementStopped : loadFault ? ['STALE_INTENT_REVISION', 'RECOVERY_BLOCKED'].includes(reply.result?.Err?.code) : reply.result?.Err?.code === 'STALE_INTENT_REVISION')
       || stopped.data?.outcome !== 'verified_empty'
       || current.launchState !== 'stopped' || current.desiredState !== 'stopped' || current.recoveryState !== 'stopped'
-      || current.cleanupState !== 'verified_empty' || current.nativeIdentityObservation
-      || current.incarnationId !== candidate.incarnationId || current.executionGeneration !== candidate.executionGeneration
+      || current.cleanupState !== 'verified_empty' || !stoppedPublicBinding
       || current.intentRevision <= view.intentRevision) {
       throw new Error('ordinary Stop did not cancel the current unobserved native launch')
     }
@@ -1566,7 +1575,7 @@ projection['expected']=json.loads(expected_file.read_text());print(json.dumps(pr
         { name: 'unobserved-native-startup-never-admits-running-or-input', pass: (replacement
           ? view.launchState === 'stopped' && view.recoveryState === 'recovering' && view.incarnationId === replacement.priorView.incarnationId
           : view.launchState === 'starting' && !view.nativeIdentityObservation)
-          && !current.nativeIdentityObservation && input.result.Err.code === 'UNKNOWN_SOUL' },
+          && stoppedPublicBinding && input.result.Err.code === 'UNKNOWN_SOUL' },
         { name: loadFault ? 'ordinary-stop-cleans-native-read-refused-startup' : 'ordinary-stop-cancels-current-unobserved-native-startup',
           pass: stopped.data.outcome === 'verified_empty' && (replacement ? replacementStopped : loadFault || reply.result.Err.code === 'STALE_INTENT_REVISION')
             && current.intentRevision > view.intentRevision }] }
