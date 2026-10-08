@@ -172,24 +172,121 @@ pub(crate) async fn prepare_managed(
             plan_revision: observation_request.plan_revision,
             observation: observation.observation.clone(),
         });
-    crate::managed_mcp_capability::issue_prepared_provider_context(
-        "claude",
-        request.soul,
-        request.home,
-        &context,
-        crate::managed_mcp_capability::OpencodeEphemeralInput {
-            claude_manifest: Some(&manifest),
-            claude_observation: Some(&observation.observation),
-            claude_inline_settings: inline_settings,
-            claude_reservation_provider: Some(request.reservation_provider),
-            claude_git_common_dir: request.git_common_dir,
-            cwd: Some(request.cwd),
-            workspace: Some(request.workspace),
-            secret_references: Some(request.references),
-            initial_auth_reservation: Some(&reservation.reservation_id),
-            ..Default::default()
-        },
-    )
+    // Each candidate is private and unbound. Only complete, cleanup-confirmed
+    // source evidence can either accept it or authorize discarding it for the
+    // next original-selector reprepare. An uncertain reader result retains it.
+    for revision in 0..=2 {
+        let plan = manifest
+            .accepted_native_plan
+            .as_ref()
+            .ok_or("Claude accepted native plan unavailable")?;
+        if plan.plan_revision != revision {
+            return Err(
+                "Claude predispatch plan revision changed; retain inputs and reprepare".into(),
+            );
+        }
+        let prepared = crate::managed_mcp_capability::issue_prepared_provider_context(
+            "claude",
+            request.soul,
+            request.home,
+            &context,
+            crate::managed_mcp_capability::OpencodeEphemeralInput {
+                claude_manifest: Some(&manifest),
+                claude_observation: Some(&plan.observation),
+                claude_inline_settings: inline_settings,
+                claude_reservation_provider: Some(request.reservation_provider),
+                claude_git_common_dir: request.git_common_dir,
+                cwd: Some(request.cwd),
+                workspace: Some(request.workspace),
+                secret_references: Some(request.references),
+                initial_auth_reservation: Some(&reservation.reservation_id),
+                ..Default::default()
+            },
+        )?;
+        let generation = prepared
+            .prepared_inputs
+            .as_ref()
+            .ok_or("Claude prepared generation unavailable")?
+            .generation_id
+            .clone();
+        let source = freshell_platform::claude_inputs::observation::ObservationRequest {
+            version: 1,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            native_source_runtime: plan.observation.native_source_runtime,
+            cwd: plan.observation.cwd.clone(),
+            home: "/home/freshell/provider".into(),
+            setting_sources: plan.observation.setting_sources.clone(),
+            selector_manifest_sha256: plan.selector_manifest_sha256.clone(),
+            plan_revision: revision,
+            candidate_binding: None,
+        };
+        let candidate = crate::managed_mcp_capability::bind_prepared_claude_candidate(
+            ObserveClaudeSourcesRequest {
+                expected_control_epoch: None,
+                soul_id: request.soul.clone(),
+                provider: request.reservation_provider.into(),
+                authority: ClaudeSourceAuthority::InitialReservation {
+                    reservation_id: reservation.reservation_id.clone(),
+                },
+                workspace_path: request
+                    .workspace
+                    .to_str()
+                    .ok_or("Claude workspace unavailable")?
+                    .into(),
+                git_common_dir: request
+                    .git_common_dir
+                    .map(|path| {
+                        path.to_str()
+                            .map(str::to_owned)
+                            .ok_or("Claude common directory unavailable")
+                    })
+                    .transpose()?,
+                candidate: Some(PreparedProviderContext {
+                    provider_launch_context: prepared.clone(),
+                    provider_secret_references: vec![],
+                }),
+                observation_request: source,
+            },
+        );
+        let candidate = match candidate {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                crate::managed_mcp_capability::abort_prepared_claude_candidate(
+                    request.soul,
+                    &generation,
+                )?;
+                return Err(error);
+            }
+        };
+        let source = candidate.observation_request.clone();
+        let reply = match request.client.observe_claude_sources(candidate).await {
+            Ok(reply) => reply,
+            Err(_) => {
+                tracing::warn!(event="provider.inputs.claude_candidate.evidence_unavailable",soul_id=%request.soul,generation_id=%generation,plan_revision=revision,
+                    "Claude candidate evidence unavailable; retain its private inputs before reconciliation");
+                return Err("Claude candidate native source evidence unavailable; retain inputs and reprepare".into());
+            }
+        };
+        match accept_candidate_observation(
+            manifest.accepted_native_plan.as_mut().unwrap(),
+            &source,
+            &reply,
+        ) {
+            Ok(true) => return Ok(prepared),
+            Ok(false) => crate::managed_mcp_capability::abort_prepared_claude_candidate(
+                request.soul,
+                &generation,
+            )?,
+            Err(error) => {
+                crate::managed_mcp_capability::abort_prepared_claude_candidate(
+                    request.soul,
+                    &generation,
+                )?;
+                return Err(error);
+            }
+        }
+    }
+    Err("Claude native source selection exhausted two predispatch replans; retain inputs and reprepare".into())
 }
 
 fn selected_settings_file(
@@ -218,6 +315,73 @@ fn selected_settings_file(
             "Selected Claude settings source is unavailable");
         format!("Claude --settings selected file is unavailable: {error}; select an existing settings file or valid inline JSON")
     })
+}
+
+fn accept_candidate_observation(
+    plan: &mut freshell_platform::claude_inputs::AcceptedNativeSourcePlan,
+    source: &freshell_platform::claude_inputs::observation::ObservationRequest,
+    reply: &freshell_platform::claude_inputs::observation::ObservationReply,
+) -> Result<bool, String> {
+    use sha2::{Digest, Sha256};
+    plan.observation.validate()?;
+    let raw = bounded_json_bytes(
+        source,
+        freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES,
+    )
+    .map_err(|_| {
+        "Claude candidate request exceeds its finite profile; retain inputs and reprepare"
+    })?;
+    reply.validate_for_request(source, &format!("{:x}", Sha256::digest(raw)))?;
+    if source.candidate_binding.is_none()
+        || source.plan_revision != plan.plan_revision
+        || source.selector_manifest_sha256 != plan.selector_manifest_sha256
+        || source.native_source_runtime != plan.observation.native_source_runtime
+        || source.setting_sources != plan.observation.setting_sources
+        || source.cwd != plan.observation.cwd
+        || plan.observation.home.as_ref() != Some(&source.home)
+    {
+        return Err(
+            "Claude candidate accepted plan changed or is incomplete; retain inputs and reprepare"
+                .into(),
+        );
+    }
+    let identity =
+        |observation: &freshell_platform::claude_inputs::observation::NativeObservation| {
+            let mut groups = observation.supplementary_groups.clone();
+            groups.push(observation.egid);
+            groups.sort_unstable();
+            groups.dedup();
+            (
+                observation.uid,
+                observation.euid,
+                observation.gid,
+                observation.egid,
+                groups,
+            )
+        };
+    if identity(&plan.observation) != identity(&reply.observation) {
+        return Err(
+            "Claude candidate actual reader identity changed; retain inputs and reprepare".into(),
+        );
+    }
+    if plan
+        .observation
+        .require_same_selection(&reply.observation)
+        .is_ok()
+    {
+        return Ok(true);
+    }
+    if plan.plan_revision >= 2 {
+        return Err("Claude native source selection changed after two predispatch replans; retain inputs and reprepare".into());
+    }
+    plan.plan_revision += 1;
+    plan.observation = reply.observation.clone();
+    tracing::debug!(
+        event = "provider.inputs.claude_candidate.replan_required",
+        plan_revision = plan.plan_revision,
+        "Claude candidate source selection requires predispatch reprepare"
+    );
+    Ok(false)
 }
 
 fn selected_config_root(
@@ -255,6 +419,183 @@ fn selected_config_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_provider_claude_candidate_comparison_bounds_replans_and_blocks_incomplete_evidence()
+    {
+        use freshell_platform::claude_inputs::{
+            git::Roots,
+            observation::{
+                CandidateBinding, LocalDecision, NativeObservation, ObservationReply,
+                ObservationRequest,
+            },
+            AcceptedNativeSourcePlan, ClaudeSettingSource, NativeSourceRuntime,
+        };
+        use sha2::{Digest, Sha256};
+        let cwd = std::path::PathBuf::from("/workspace/nested");
+        let initial = NativeObservation {
+            version: 1,
+            native_source_runtime: NativeSourceRuntime::Terminal,
+            setting_sources: vec![ClaudeSettingSource::Project, ClaudeSettingSource::Local],
+            uid: 65534,
+            euid: 65534,
+            gid: 0,
+            egid: 0,
+            supplementary_groups: vec![],
+            cwd: cwd.clone(),
+            home: Some("/home/freshell/provider".into()),
+            roots: Some(Roots {
+                checkout: "/workspace".into(),
+                canonical: "/workspace".into(),
+            }),
+            local_settings: vec![cwd.join(".claude/settings.local.json")],
+            local_decision: LocalDecision::RootOwnerMismatch,
+            root_uid: Some(0),
+            git_uid: None,
+            claude_uid: None,
+        };
+        initial.validate().unwrap();
+        let make_source = |plan: &AcceptedNativeSourcePlan| ObservationRequest {
+            version: 1,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            native_source_runtime: plan.observation.native_source_runtime,
+            cwd: cwd.clone(),
+            home: "/home/freshell/provider".into(),
+            setting_sources: plan.observation.setting_sources.clone(),
+            selector_manifest_sha256: plan.selector_manifest_sha256.clone(),
+            plan_revision: plan.plan_revision,
+            candidate_binding: Some(CandidateBinding {
+                soul_id: "synthetic-soul".into(),
+                generation_id: format!("grant-{}", uuid::Uuid::new_v4()),
+                authority_sha256: "a".repeat(64),
+                publication_sha256: "b".repeat(64),
+                manifest_sha256: "c".repeat(64),
+                prepared_result_sha256: "d".repeat(64),
+            }),
+        };
+        let make_reply =
+            |source: &ObservationRequest, observation: NativeObservation| ObservationReply {
+                request_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(
+                        bounded_json_bytes(
+                            source,
+                            freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES
+                        )
+                        .unwrap()
+                    )
+                ),
+                observation,
+            };
+        let original = AcceptedNativeSourcePlan {
+            selector_manifest_sha256: "e".repeat(64),
+            plan_revision: 0,
+            observation: initial.clone(),
+        };
+        let mut plan = original.clone();
+        let source = make_source(&plan);
+        let mut same = initial.clone();
+        same.supplementary_groups = vec![0];
+        assert!(
+            accept_candidate_observation(&mut plan, &source, &make_reply(&source, same)).unwrap(),
+            "same effective provider identity and source selection must accept without rebuilding"
+        );
+        assert_eq!(plan.observation, original.observation);
+        assert_eq!(plan.plan_revision, original.plan_revision);
+        assert_eq!(
+            plan.selector_manifest_sha256,
+            original.selector_manifest_sha256
+        );
+        for fault in [
+            "digest",
+            "uid",
+            "groups",
+            "flags",
+            "revision",
+            "missing-binding",
+        ] {
+            let mut plan = original.clone();
+            let mut source = make_source(&plan);
+            let mut reply = make_reply(&source, initial.clone());
+            match fault {
+                "digest" => reply.request_sha256 = "f".repeat(64),
+                "uid" => {
+                    reply.observation.uid = 65535;
+                    reply.observation.euid = 65535;
+                }
+                "groups" => reply.observation.supplementary_groups = vec![7],
+                "flags" => reply.observation.setting_sources = vec![ClaudeSettingSource::Local],
+                "revision" => source.plan_revision = 1,
+                "missing-binding" => source.candidate_binding = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                accept_candidate_observation(&mut plan, &source, &reply).is_err(),
+                "{fault}: incomplete or changed namespace evidence must block without replanning"
+            );
+            assert_eq!(
+                plan.observation, original.observation,
+                "{fault}: accepted inputs must remain intact"
+            );
+            assert_eq!(plan.plan_revision, original.plan_revision);
+            assert_eq!(
+                plan.selector_manifest_sha256,
+                original.selector_manifest_sha256
+            );
+        }
+        let mut plan = original.clone();
+        for revision in 1..=3 {
+            let source = make_source(&plan);
+            let mut changed = initial.clone();
+            match revision {
+                1 => {
+                    changed.roots = Some(Roots {
+                        checkout: cwd.clone(),
+                        canonical: cwd.clone(),
+                    });
+                    changed.local_decision = LocalDecision::CwdRoot;
+                    changed.root_uid = None;
+                }
+                2 => {
+                    changed.roots = None;
+                    changed.local_decision = LocalDecision::NoRoot;
+                    changed.root_uid = None;
+                }
+                3 => {}
+                _ => unreachable!(),
+            }
+            changed.validate().unwrap();
+            let before = plan.clone();
+            let result = accept_candidate_observation(
+                &mut plan,
+                &source,
+                &make_reply(&source, changed.clone()),
+            );
+            if revision <= 2 {
+                assert!(
+                    !result.unwrap(),
+                    "changed selection must request a predispatch rebuild"
+                );
+                assert_eq!(plan.plan_revision, revision);
+                assert_eq!(plan.observation, changed);
+                assert_eq!(
+                    plan.selector_manifest_sha256,
+                    original.selector_manifest_sha256
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "third changed selection must stop at the two-replan limit"
+                );
+                assert_eq!(plan.observation, before.observation);
+                assert_eq!(plan.plan_revision, before.plan_revision);
+                assert_eq!(
+                    plan.selector_manifest_sha256,
+                    before.selector_manifest_sha256
+                );
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

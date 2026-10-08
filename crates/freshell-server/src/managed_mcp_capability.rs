@@ -2832,6 +2832,19 @@ fn bind_claude_candidate_request(
     Ok(bound)
 }
 
+pub(crate) fn bind_prepared_claude_candidate(
+    request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+) -> Result<freshell_runtime_protocol::ObserveClaudeSourcesRequest, String> {
+    bind_claude_candidate_request(store(), &capability_dir()?, request)
+}
+
+pub(crate) fn abort_prepared_claude_candidate(
+    soul: &SoulId,
+    generation: &str,
+) -> Result<(), String> {
+    store().abort_preparation(generation, soul, &capability_dir()?)
+}
+
 /// A web-server restart restores only grants whose exact incarnation remains
 /// live in the supervisor inventory. Recoverable souls retain their private
 /// OpenCode inputs before stale scopes and incarnation stages are revoked.
