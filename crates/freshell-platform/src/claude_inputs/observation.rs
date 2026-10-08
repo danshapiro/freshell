@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_REPLY_BYTES: usize = 1024 * 1024;
+const MAX_GROUP_IDS: usize = MAX_REPLY_BYTES / std::mem::size_of::<u32>();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -94,6 +95,7 @@ pub struct NativeObservation {
     pub euid: u32,
     pub gid: u32,
     pub egid: u32,
+    pub supplementary_groups: Vec<u32>,
     pub cwd: PathBuf,
     pub home: Option<PathBuf>,
     pub roots: Option<git::Roots>,
@@ -153,6 +155,7 @@ pub fn observe(
         euid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getgid() },
         egid: unsafe { libc::getegid() },
+        supplementary_groups: supplementary_groups()?,
         local_decision: LocalDecision::Disabled,
         root_uid: None,
         git_uid: None,
@@ -181,6 +184,40 @@ pub fn observe(
     }
     observation.validate()?;
     Ok(observation)
+}
+
+#[cfg(unix)]
+fn supplementary_groups() -> Result<Vec<u32>, String> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let length = usize::try_from(count)
+        .map_err(|_| "Claude actual native groups unavailable; retain inputs and reprepare")?;
+    if length > MAX_GROUP_IDS {
+        return Err(
+            "Claude actual native groups exceed the metadata profile; retain inputs and reprepare"
+                .into(),
+        );
+    }
+    let mut groups = Vec::<libc::gid_t>::new();
+    groups.try_reserve_exact(length).map_err(|_| {
+        "Claude actual native groups allocation unavailable; retain inputs and reprepare"
+    })?;
+    groups.resize(length, 0);
+    let read = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    let read = usize::try_from(read).map_err(|_| {
+        "Claude actual native groups changed or unavailable; retain inputs and reprepare"
+    })?;
+    if read > length {
+        return Err(
+            "Claude actual native groups changed before observation; retain inputs and reprepare"
+                .into(),
+        );
+    }
+    groups.truncate(read);
+    // Group order and duplicate memberships do not change native access.
+    // Keep the measured supplementary set separate from primary GID evidence.
+    groups.sort_unstable();
+    groups.dedup();
+    Ok(groups)
 }
 
 fn validate_sources(sources: &[ClaudeSettingSource]) -> Result<(), String> {
@@ -218,6 +255,7 @@ impl NativeObservation {
             || self.setting_sources != current.setting_sources
             || (self.uid, self.euid, self.gid, self.egid)
                 != (current.uid, current.euid, current.gid, current.egid)
+            || self.effective_groups() != current.effective_groups()
             || self.cwd != current.cwd
             || self.home != current.home
             || self.roots != current.roots
@@ -229,10 +267,23 @@ impl NativeObservation {
         Ok(())
     }
 
+    fn effective_groups(&self) -> Vec<u32> {
+        let mut groups = self.supplementary_groups.clone();
+        if let Err(index) = groups.binary_search(&self.egid) {
+            groups.insert(index, self.egid);
+        }
+        groups
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         validate_sources(&self.setting_sources)?;
         let local_enabled = self.setting_sources.contains(&ClaudeSettingSource::Local);
         if self.version != 1
+            || self.supplementary_groups.len() > MAX_GROUP_IDS
+            || self
+                .supplementary_groups
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
             || self.local_settings.len() > 2
             || local_enabled != (self.local_decision != LocalDecision::Disabled)
             || local_enabled != !self.local_settings.is_empty()
@@ -389,6 +440,65 @@ fn select_local(observation: &mut NativeObservation) -> LocalDecision {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_native_observation_changed_supplementary_group_blocks_agreement() {
+        let owned = tempfile::tempdir().unwrap();
+        for runtime in [NativeSourceRuntime::Terminal, NativeSourceRuntime::Sdk] {
+            let accepted = observe(owned.path(), owned.path(), runtime, &[]).unwrap();
+            accepted.require_same_selection(&accepted).unwrap();
+            let mut current = accepted.clone();
+            let added = (0..u32::MAX)
+                .find(|group| {
+                    *group != accepted.egid && !accepted.supplementary_groups.contains(group)
+                })
+                .unwrap();
+            current.supplementary_groups.push(added);
+            current.supplementary_groups.sort_unstable();
+            assert!(accepted.require_same_selection(&current).is_err(), "same UID/primary GID cannot establish identical native file access when an additional group changes");
+            let mut incomplete = serde_json::to_value(&accepted).unwrap();
+            incomplete
+                .as_object_mut()
+                .unwrap()
+                .remove("supplementaryGroups");
+            assert!(serde_json::from_value::<NativeObservation>(incomplete).is_err(), "old observations without measured groups must require reprepare, not invent an empty group set");
+        }
+    }
+
+    #[test]
+    fn claude_native_observation_rejects_incomplete_or_unbounded_group_evidence() {
+        let owned = tempfile::tempdir().unwrap();
+        let accepted = observe(
+            owned.path(),
+            owned.path(),
+            NativeSourceRuntime::Terminal,
+            &[],
+        )
+        .unwrap();
+        for groups in [vec![1, 1], vec![2, 1], vec![0; MAX_GROUP_IDS + 1]] {
+            let mut changed = accepted.clone();
+            changed.supplementary_groups = groups;
+            assert!(changed.validate().is_err());
+            assert!(accepted.require_same_selection(&changed).is_err());
+        }
+    }
+
+    #[test]
+    fn claude_native_observation_primary_group_membership_is_equivalent_when_repeated() {
+        let owned = tempfile::tempdir().unwrap();
+        for runtime in [NativeSourceRuntime::Terminal, NativeSourceRuntime::Sdk] {
+            let mut without = observe(owned.path(), owned.path(), runtime, &[]).unwrap();
+            without
+                .supplementary_groups
+                .retain(|group| *group != without.egid);
+            let mut repeated = without.clone();
+            repeated.supplementary_groups.push(repeated.egid);
+            repeated.supplementary_groups.sort_unstable();
+            assert_ne!(without.supplementary_groups, repeated.supplementary_groups);
+            without.require_same_selection(&repeated).expect("retaining the same primary group as a supplementary member must not change native group access");
+            repeated.require_same_selection(&without).unwrap();
+        }
+    }
 
     #[test]
     fn claude_native_observation_reply_cannot_be_reused_for_another_selection() {

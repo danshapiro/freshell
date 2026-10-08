@@ -135,6 +135,7 @@ async fn qualify_transport(mode: &'static str) {
                                 observation: NativeObservation {
                                     version:1,native_source_runtime:request.native_source_runtime,
                                     setting_sources:request.setting_sources,uid:65534,euid:65534,gid:0,egid:0,
+                                    supplementary_groups:vec![],
                                     local_settings:vec![request.cwd.join(".claude/settings.local.json")],
                                     cwd:request.cwd,home:Some(request.home),roots:None,
                                     local_decision:LocalDecision::NoRoot,root_uid:None,git_uid:None,claude_uid:None,

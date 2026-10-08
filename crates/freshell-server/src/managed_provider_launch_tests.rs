@@ -894,7 +894,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
  const input=JSON.parse(raw),root=path.resolve(__dirname,'..');
  const endpoint=process.env.FRESHELL_URL,token=process.env.FRESHELL_TOKEN;
  const authenticated=await new Promise(resolve=>{if(!endpoint||!token)return resolve(false);const req=http.request(new URL('/api/mcp',endpoint),{method:'POST',headers:{'x-auth-token':token}},res=>{res.resume();resolve(res.statusCode===200)});req.on('error',()=>resolve(false));req.end('{}')});
- const record={hook:input.hook_event_name==='SessionStart',physicalHome:process.env.HOME,settings:['closed-selected-settings','closed-explicit-settings'].includes(process.env.CLAUDE_SELECTED_NONCE),authenticated,scopedAlias:process.env.FRESHELL==='1',onecli:hash(process.env.ANTHROPIC_API_KEY||'')===process.argv[3],
+ const record={hook:input.hook_event_name==='SessionStart',physicalHome:process.env.HOME,nativeIdentity:{uid:process.getuid(),euid:process.geteuid(),gid:process.getgid(),egid:process.getegid(),groups:[...new Set([...process.getgroups(),process.getegid()])].sort((a,b)=>a-b)},settings:['closed-selected-settings','closed-explicit-settings'].includes(process.env.CLAUDE_SELECTED_NONCE),authenticated,scopedAlias:process.env.FRESHELL==='1',onecli:hash(process.env.ANTHROPIC_API_KEY||'')===process.argv[3],
  memory:hash(fs.readFileSync(path.join(process.env.HOME,'.claude/CLAUDE.md'))),skill:hash(fs.readFileSync(path.join(root,'skills/probe/SKILL.md'))),resource:hash(require('node:child_process').execFileSync(path.join(__dirname,'run'))),dependency:hash(require('probe-dependency'))};
  fs.writeFileSync(process.argv[2],JSON.stringify(record));
 });
@@ -1082,7 +1082,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         seed: &str,
         workspace: &Path,
         runtime: freshell_platform::claude_inputs::NativeSourceRuntime,
-    ) {
+    ) -> Value {
         use freshell_platform::claude_inputs::{observation::LocalDecision, ClaudeSettingSource};
         use std::os::unix::fs::MetadataExt;
         let cwd = workspace.join("source-observer/nested");
@@ -1143,11 +1143,16 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         assert_eq!(std::fs::read(&local).unwrap(), b"{}");
         println!(
             "provider_source_observer {}",
-            json!({"runtime":runtime,"uid":observed.uid,"gid":observed.gid,"decision":observed.local_decision,"localCount":observed.local_settings.len(),"sourceBytesPreserved":true})
+            json!({"runtime":runtime,"uid":observed.uid,"gid":observed.gid,"supplementaryGroups":observed.supplementary_groups,"decision":observed.local_decision,"localCount":observed.local_settings.len(),"sourceBytesPreserved":true})
         );
+        let mut groups = observed.supplementary_groups.clone();
+        groups.push(observed.egid);
+        groups.sort_unstable();
+        groups.dedup();
+        json!({"uid":observed.uid,"euid":observed.euid,"gid":observed.gid,"egid":observed.egid,"groups":groups})
     }
     let client = controller.runtime_client();
-    qualify_private_source_reader(
+    let terminal_identity = qualify_private_source_reader(
         &client,
         SoulId::parse(format!(
             "soul-terminal-{}",
@@ -1325,7 +1330,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         .ok()
     }
     let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-    let expected = json!({"hook":true,"physicalHome":"/home/freshell/provider","settings":true,"authenticated":true,"scopedAlias":true,"onecli":true,"memory":hash(&memory),"skill":hash(std::fs::read(plugin.join("skills/probe/SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")});
+    let expected = json!({"hook":true,"physicalHome":"/home/freshell/provider","nativeIdentity":terminal_identity,"settings":true,"authenticated":true,"scopedAlias":true,"onecli":true,"memory":hash(&memory),"skill":hash(std::fs::read(plugin.join("skills/probe/SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")});
     let imported_bytes = std::fs::read(home.join("imported-memory.md")).unwrap();
     let mut expected_imports = serde_json::Map::new();
     expected_imports.insert("imported-memory.md".into(), json!(hash(&imported_bytes)));
@@ -1557,7 +1562,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     } else {
         "claude"
     };
-    qualify_private_source_reader(
+    let fresh_identity = qualify_private_source_reader(
         &client,
         SoulId::parse(format!(
             "soul-fresh-{source_provider}-{}",
@@ -1570,6 +1575,10 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
     )
     .await;
+    assert_eq!(
+        fresh_identity, terminal_identity,
+        "both actual source readers must match the real native consumer identity"
+    );
     Arc::clone(&proxy).dispatch(HostedFreshAgentCommand::Create(serde_json::from_value(json!({"requestId":"closed-native-fresh-create","sessionType":flavor,"provider":"claude","cwd":cwd,"plugins":[plugin.to_str().unwrap()]})).unwrap())).await;
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {

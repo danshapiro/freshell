@@ -200,6 +200,7 @@ mod tests {
                     euid: 65534,
                     gid: 0,
                     egid: 0,
+                    supplementary_groups: vec![],
                     cwd: selected.cwd.clone(),
                     home: Some(selected.home.clone()),
                     roots: None,
