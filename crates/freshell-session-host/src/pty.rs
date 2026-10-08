@@ -141,6 +141,19 @@ impl HostedPty {
         let mut provider_args = crate::provider_identity_args(launch.run_as_uid, launch.run_as_gid);
         provider_args.push(launch.program.clone());
         let mut native_args = launch.args.clone();
+        // Managed images own the native pin. An updater's input prompt must
+        // never precede the provider's no-input create/resume acknowledgement.
+        if launch.mode == "codex"
+            && native_identity_launch.is_some()
+            && !native_args.windows(2).any(|pair| {
+                pair[0] == "-c" && pair[1] == "check_for_update_on_startup=false"
+            })
+        {
+            native_args.splice(
+                0..0,
+                ["-c".into(), "check_for_update_on_startup=false".into()],
+            );
+        }
         let mut statusline_settings = None;
         if launch.mode == "claude" && native_identity_launch.is_some() {
             for index in 0..native_args.len().saturating_sub(1) {

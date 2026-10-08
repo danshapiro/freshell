@@ -6286,6 +6286,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_codex_default_spawn_skips_native_update_gate_for_create_and_resume() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("owned-native-startup");
+        std::fs::write(&program, r#"#!/usr/bin/python3
+import sys
+args=sys.argv[1:]
+updates=[args[i+1] for i,arg in enumerate(args[:-1]) if arg=='-c' and args[i+1].startswith('check_for_update_on_startup=')]
+if len(updates)>1:
+ print('duplicate-update-setting');sys.exit(9)
+if updates!=['check_for_update_on_startup=false']:
+ print('native-update-input-gate');sys.exit(7)
+if '--model' not in args or args[args.index('--model')+1]!='gpt-5.6-luna':
+ print('selected-model-lost');sys.exit(8)
+if 'resume' in args and args[args.index('resume')+1]!='owned-native-root':
+ print('resume-root-lost');sys.exit(8)
+print('native-startup-without-update-input')
+"#).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root.path().join("selected-native-config");
+        std::fs::write(&config, b"ordinary selected profile remains untouched\n").unwrap();
+        for (mode, managed, resume, caller_setting, expected_exit) in [
+            ("codex", true, false, false, 0),
+            ("codex", true, true, false, 0),
+            ("codex", true, true, true, 0),
+            ("codex", false, false, false, 7),
+            ("codex", false, true, true, 0),
+            ("shell", true, false, false, 7),
+        ] {
+            let state = test_host_state();
+            let mut args = vec!["--model", "gpt-5.6-luna"];
+            if caller_setting {
+                args.extend(["-c", "check_for_update_on_startup=false"]);
+            }
+            if resume {
+                args.extend(["resume", "owned-native-root"]);
+            }
+            let launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                "terminalId":"owned-update", "streamId":"owned-update", "mode":mode, "program":program,
+                "args":args, "cwd":root.path(), "workspacePath":root.path(), "projectKey":"owned-update",
+                "cols":80, "rows":24, "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+                "env":{"HOME":root.path(),"PATH":"/usr/bin:/bin"}
+            })).unwrap();
+            let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: state.incarnation_id.clone(),
+                launch_nonce: "owned-update-launch".into(),
+                evidence_revision: 0,
+                execution_generation: 1,
+                requested_native_session_id: None,
+            };
+            let child_env = if managed {
+                std::collections::BTreeMap::from([(
+                    providers::native_identity::LAUNCH_ENV.into(),
+                    serde_json::to_string(&binding).unwrap(),
+                )])
+            } else {
+                Default::default()
+            };
+            let pty = HostedPty::spawn(
+                &state.state_dir,
+                state.incarnation_id.clone(),
+                &launch,
+                child_env,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            for _ in 0..100 {
+                if pty.exited() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(pty.exited(), "owned child must finish without user input");
+            let output = pty
+                .read_output(state.incarnation_id.clone(), 0, 65536, None)
+                .unwrap();
+            assert_eq!(
+                pty.exit_code(),
+                expected_exit,
+                "mode={mode} managed={managed} resume={resume} caller={caller_setting}: {output:?}"
+            );
+            assert!(output
+                .frames
+                .iter()
+                .any(|frame| frame.data.contains(if expected_exit == 0 {
+                    "native-startup-without-update-input"
+                } else {
+                    "native-update-input-gate"
+                })));
+            assert_eq!(
+                std::fs::read(&config).unwrap(),
+                b"ordinary selected profile remains untouched\n"
+            );
+            assert!(
+                pty.native_identity_observation().is_none(),
+                "controlled child is not provider identity evidence"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn requested_identity_is_not_provider_observation() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();

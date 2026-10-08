@@ -767,9 +767,9 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     }
   }
   const { freshAgent, ...commonParameters } = request.params
-  // The isolated image owns the native pin; an upstream update dialog must
-  // not consume input before the provider's no-input resume acknowledgement.
-  const terminalProfileArgs = ['-c', 'model_reasoning_effort="low"', '-c', 'check_for_update_on_startup=false']
+  // The managed host supplies its native pin policy; the ordinary caller
+  // selects only the existing model/effort profile.
+  const terminalProfileArgs = ['-c', 'model_reasoning_effort="low"']
   const selectedRequest = terminal ? { method: 'launch', params: { ...commonParameters,
     terminal: { terminalId: 'native-terminal-' + randomUUID(), streamId: 'native-stream-' + randomUUID(),
       mode: 'codex', program: 'codex', args: ['--model', settings.model, ...terminalProfileArgs],
