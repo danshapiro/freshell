@@ -344,7 +344,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(fs.readFileSync(path.join(store, 'transcript.jsonl'), 'utf8')).toBe('')
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation'].flatMap(fault => ['current', 'ordinary', 'wrong-cli-pin', 'wrong-producer-pin', 'missing-launch', 'wrong-root'].map(form => ({ fault, form }))))('executes the fixed owned Amplifier native startup fault $fault/$form', ({ fault, form }) => {
+  it.each(['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'parent-root'].flatMap(fault => ['current', 'ordinary', 'wrong-cli-pin', 'wrong-producer-pin', 'missing-launch', 'wrong-root'].map(form => ({ fault, form }))))('executes the fixed owned Amplifier native startup fault $fault/$form', ({ fault, form }) => {
     const pending = ['timeout', 'provider-exit', 'stop-cancellation'].includes(fault)
     const directory = path.join('/tmp/frs', randomUUID().slice(0, 8) + '-abc')
     const workspace = path.join(directory, 'amplifier-' + (form === 'ordinary' ? 'create' : fault) + '-workspace')
@@ -394,11 +394,19 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         expect(fs.readFileSync(path.join(store, 'transcript.jsonl'), 'utf8')).toBe('')
         return
       }
-      expect(result.loadFailed).toBe(['missing-history', 'load-failure'].includes(fault))
+      expect(result.loadFailed).toBe(['missing-history', 'load-failure', 'parent-root'].includes(fault))
       expect(result.hasRestore).toBe(fault !== 'missing-context-restore')
       const observed = JSON.parse(fs.readFileSync(path.join(workspace, 'native-startup-fault.json'), 'utf8'))
       expect(observed.fault).toBe(fault); expect(observed.launch).toEqual(launch)
       expect(observed.nativePid).toBeGreaterThan(1); expect(observed.originalCliSha256).toBe(cliSha)
+      if (fault === 'parent-root') {
+        expect(observed.phase).toBe('before-native-load')
+        expect(observed.originalLoad.sessionId).toBe(root); expect(observed.originalLoad.parentId).toBeNull()
+        expect(observed.nativeParent).toBeTruthy()
+        expect(JSON.parse(fs.readFileSync(path.join(store, 'metadata.json'), 'utf8')).parent_id).toBe(observed.nativeParent)
+        expect(fs.readFileSync(path.join(store, 'transcript.jsonl'), 'utf8')).toBe('')
+        expect(fs.existsSync(path.join(directory, 'signals', 'amplifier-loaded-context.json'))).toBe(false)
+      }
       if (pending) {
         expect(observed.phase).toBe('before-native-publication')
         expect(observed.nativeRoot).toBe(root); expect(observed.nativeParent).toBeNull()
@@ -407,11 +415,13 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       }
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['missing-history', 'load-failure', 'missing-context-restore'].flatMap(fault => ['current', 'missing-fault', 'old-launch', 'wrong-fault', 'wrong-phase', 'missing-native-condition', 'published', 'signal-published', 'wrong-image', 'admitted-input', 'wrong-descriptor'].map(form => ({ fault, form }))))('requires actual current owned Amplifier startup fault evidence $fault/$form', async ({ fault, form }) => {
+  it.each(['missing-history', 'load-failure', 'missing-context-restore', 'parent-root'].flatMap(fault => ['current', 'missing-fault', 'old-launch', 'wrong-fault', 'wrong-phase', 'missing-native-condition', 'published', 'signal-published', 'wrong-image', 'admitted-input', 'wrong-descriptor'].map(form => ({ fault, form }))))('requires actual current owned Amplifier startup fault evidence $fault/$form', async ({ fault, form }) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-source-fault-route-'))
     const source = path.join(directory, 'selected-profile'); fs.writeFileSync(source, 'fixture selected profile')
     const descriptor = { schemaVersion: 1, imageDigest: form === 'wrong-descriptor' ? `sha256:${'0'.repeat(64)}` : imageDigest, wrapperSourceSha: candidateSha, wrapperSha256: 'e'.repeat(64),
-      originalCliSha256: 'f'.repeat(64), producerSha256: 'c'.repeat(64), cases: ['missing-history', 'load-failure', 'missing-context-restore'] }
+      originalCliSha256: 'f'.repeat(64), producerSha256: 'c'.repeat(64), cases: fault === 'parent-root'
+        ? ['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'parent-root']
+        : ['missing-history', 'load-failure', 'missing-context-restore'] }
     const descriptorFile = path.join(directory, 'fault.json'); fs.writeFileSync(descriptorFile, JSON.stringify(descriptor))
     const records = new Map<string, unknown>(); let request: any
     const launch = () => ({ incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 7,
@@ -431,11 +441,12 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
             originalLoad: { sessionId: request.params.nativeSessionId, parentId: null, messageCount: 0 },
             transcriptAbsent: fault === 'missing-history', malformedSha256: fault === 'load-failure' ? 'd'.repeat(64) : null,
             hasRestoreBefore: true, hasRestoreAfter: false, originalContextType: 'controlled.native.Context',
+            nativeParent: fault === 'parent-root' ? randomUUID() : null,
           }
           if (form === 'old-launch') applied.launch.launchNonce = 'old-nonce'
           if (form === 'wrong-fault') applied.fault = 'another-case'
           if (form === 'wrong-phase') applied.phase = 'after-failed-restore'
-          if (form === 'missing-native-condition') { applied.transcriptAbsent = false; applied.malformedSha256 = null; applied.hasRestoreAfter = true }
+          if (form === 'missing-native-condition') { applied.transcriptAbsent = false; applied.malformedSha256 = null; applied.hasRestoreAfter = true; applied.nativeParent = null }
           if (form !== 'missing-fault') fs.writeFileSync(path.join(request.params.terminal.cwd, 'native-startup-fault.json'), JSON.stringify(applied))
           return { result: { Err: { code: 'RECOVERY_BLOCKED' } } }
         }

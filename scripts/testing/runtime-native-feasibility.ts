@@ -388,7 +388,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
-  if (selection.provider === 'amplifier' && ['create', 'wrong-root', 'missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'file-replacement', 'file-truncation', 'malformed-ack', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'amplifier' && ['create', 'wrong-root', 'missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'file-replacement', 'file-truncation', 'malformed-ack', 'parent-root', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
     return executeManagedAmplifier(harness, sources, caseId, serverPath, servers)
   }
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
@@ -1342,7 +1342,7 @@ if not native.is_file() or native.is_symlink() or hashlib.sha256(native.read_byt
 if not producer.is_file() or hashlib.sha256(producer.read_bytes()).hexdigest()!=producer_pin:
  raise RuntimeError('pinned native Amplifier producer differs')
 workspace=pathlib.Path.cwd().resolve()
-owned=re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/amplifier-(missing-history|load-failure|missing-context-restore|timeout|provider-exit|stop-cancellation)-workspace',str(workspace))
+owned=re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/amplifier-(missing-history|load-failure|missing-context-restore|timeout|provider-exit|stop-cancellation|parent-root)-workspace',str(workspace))
 if owned:
  fault=owned[1]
  from amplifier_app_cli.freshell_native_resume import managed_launch,load_native
@@ -1368,7 +1368,7 @@ if owned:
   if context is None or not callable(getattr(context,'set_messages',None)):
    raise RuntimeError('native original context restore method missing before fault')
   return context
- if fault in ['missing-history','load-failure']:
+ if fault in ['missing-history','load-failure','parent-root']:
   from amplifier_app_cli.session_store import SessionStore
   original_load=SessionStore.load
   def fault_load(store,session_id):
@@ -1377,6 +1377,20 @@ if owned:
    directory=store.base_dir/session_id
    if not directory.is_dir() or directory.is_symlink():raise RuntimeError('native owned source missing')
    original,_=load_native(store,session_id)
+   if fault=='parent-root':
+    import uuid
+    parent=str(uuid.uuid4())
+    for name in ['metadata.json','metadata.json.backup']:
+     file=directory/name
+     if file.exists():
+      if not file.is_file() or file.is_symlink():raise RuntimeError('unowned native root metadata refused')
+      metadata=json.loads(file.read_bytes())
+      if metadata.get('session_id')!=root or metadata.get('parent_id') is not None:
+       raise RuntimeError('native parent fault original root differs')
+      metadata['parent_id']=parent
+      with file.open('w',encoding='utf8') as out:json.dump(metadata,out);out.write('\n');out.flush();os.fsync(out.fileno())
+    record('before-native-load',originalLoad=original.native_load_witness,nativeParent=parent)
+    return original_load(store,session_id)
    for name in ['transcript.jsonl','transcript.jsonl.backup']:
     file=directory/name
     if file.exists():
@@ -1520,7 +1534,7 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[]): Promise<NativeExperimentOriginal> {
   const scenario = `amplifier-${caseId}`
   const wrongRoot = caseId === 'wrong-root'
-  const sourceFault = ['missing-history', 'load-failure', 'missing-context-restore'].includes(caseId)
+  const sourceFault = ['missing-history', 'load-failure', 'missing-context-restore', 'parent-root'].includes(caseId)
   const pendingFault = ['timeout', 'provider-exit', 'stop-cancellation'].includes(caseId)
   const ackFault = ['file-replacement', 'file-truncation', 'malformed-ack'].includes(caseId)
   let faultImage: any
@@ -1530,11 +1544,12 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
     const raw = fs.readFileSync(descriptor.path)
     if (createHash('sha256').update(raw).digest('hex') !== descriptor.sha256) throw new Error('Amplifier fault image descriptor changed')
     faultImage = JSON.parse(raw.toString('utf8'))
+    const cases = ['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'parent-root']
+    const admittedLengths = caseId === 'parent-root' ? [7] : pendingFault ? [6, 7] : [3, 6, 7]
     if (faultImage.schemaVersion !== 1 || faultImage.imageDigest !== harness.imageRef
       || !/^[a-f0-9]{40}$/.test(faultImage.wrapperSourceSha)
       || !['wrapperSha256', 'originalCliSha256', 'producerSha256'].every(key => /^[a-f0-9]{64}$/.test(faultImage[key]))
-      || ![...(pendingFault ? [] : [JSON.stringify(['missing-history', 'load-failure', 'missing-context-restore'])]),
-        JSON.stringify(['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation'])].includes(JSON.stringify(faultImage.cases))) {
+      || !admittedLengths.some(length => JSON.stringify(cases.slice(0, length)) === JSON.stringify(faultImage.cases))) {
       throw new Error('actual owned Amplifier fault image binding differs')
     }
   }
@@ -1780,8 +1795,9 @@ print(row[0])`, soulId]))
         if (fault.phase !== 'before-native-load' || fault.originalLoad?.sessionId !== nativeRoot || fault.originalLoad?.parentId !== null
           || fault.originalLoad?.messageCount !== 0 || !loadEvents.some(event => bindingMatches(event)
             && event.reason === 'no_complete_native_load' && event.severity === 'error')
-          || (caseId === 'missing-history' ? fault.transcriptAbsent !== true || fault.malformedSha256 !== null
-            : fault.transcriptAbsent !== false || !/^[a-f0-9]{64}$/.test(fault.malformedSha256))) {
+          || (caseId === 'parent-root' ? typeof fault.nativeParent !== 'string' || !/^[a-f0-9-]{36}$/.test(fault.nativeParent)
+            : caseId === 'missing-history' ? fault.transcriptAbsent !== true || fault.malformedSha256 !== null
+              : fault.transcriptAbsent !== false || !/^[a-f0-9]{64}$/.test(fault.malformedSha256))) {
           throw new Error('actual native Amplifier unloaded history fault missing')
         }
       }
@@ -1803,7 +1819,7 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
       return finish(namespace,
         [`${scenario}-launch.json`, `${scenario}-current-view.json`, `${scenario}-current-launch-binding.json`, `${scenario}-terminal-private.json`, `${scenario}-native-fault-private.json`, `${scenario}-namespace-native-private.json`, `${scenario}-input-refusal.json`],
         [{ name: 'actual-native-startup-fault-bound-to-current-launch', pass: bindingMatches(fault.launch) },
-          { name: caseId === 'missing-context-restore' ? 'native-context-missing-supported-restore-method' : 'native-loader-refuses-unloadable-owned-history',
+          { name: caseId === 'missing-context-restore' ? 'native-context-missing-supported-restore-method' : caseId === 'parent-root' ? 'native-loader-refuses-parent-bearing-owned-root' : 'native-loader-refuses-unloadable-owned-history',
             pass: caseId === 'missing-context-restore' ? fault.hasRestoreBefore && !fault.hasRestoreAfter : fault.phase === 'before-native-load' },
           { name: 'native-startup-fault-refuses-current-ack-running-and-input', pass: namespace.signalAbsent && view.launchState === 'starting' && !view.nativeIdentityObservation && input.result.Err.code === 'UNKNOWN_SOUL' }])
     }
