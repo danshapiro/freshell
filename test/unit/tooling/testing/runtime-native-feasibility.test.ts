@@ -86,6 +86,81 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(createHash('sha256').update(fs.readFileSync(databasePath)).digest('hex')).toBe(before)
     } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
   })
+  it.each([
+    ['root-load-error', 'current'], ['history-load-error', 'current'],
+    ...['missing', 'stale-incarnation', 'stale-nonce', 'stale-revision', 'stale-generation', 'wrong-root'].map(binding => ['root-load-error', binding]),
+  ])('runs the actual producer read refusal after supported lifecycle and owned %s/%s release (controlled APIs only)', async (fault, releaseFault) => {
+    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+    fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
+    const source = prepareOwnedOpenCodeTuiSource(process.cwd(), ownedRoot, fault, randomUUID())
+    const home = path.join(ownedRoot, 'provider'), databasePath = path.join(home, '.local/share/opencode/opencode.db')
+    fs.mkdirSync(path.dirname(databasePath), { recursive: true }); fs.copyFileSync(source.databasePath, databasePath)
+    const root = source.rootId, terminalId = 'terminal-owned', incarnationId = 'incarnation-owned', nonce = 'launch-current'
+    const directory = path.join(home, '.freshell/session-signals/opencode-adoption-diagnostics')
+    fs.mkdirSync(directory, { recursive: true })
+    fs.writeFileSync(path.join(directory, terminalId + '.native_read_pending.json'), JSON.stringify({
+      stage: 'native_read_pending', nativeSessionId: root, incarnationId, launchNonce: 'native-adoption-current', evidenceGeneration: 'a'.repeat(64),
+    }))
+    fs.writeFileSync(path.join(source.workspace, 'native-tui-fault-control.json'), JSON.stringify({ schemaVersion: 1, caseId: fault, rootSessionId: root, terminalId }))
+    if (releaseFault !== 'missing') fs.writeFileSync(path.join(source.workspace, 'native-tui-fault-release.json'), JSON.stringify({ schemaVersion: 1, caseId: fault,
+      rootSessionId: releaseFault === 'wrong-root' ? 'ses_otherRoot' : root,
+      incarnationId: releaseFault === 'stale-incarnation' ? 'previous-incarnation' : incarnationId,
+      launchNonce: releaseFault === 'stale-nonce' ? 'previous-nonce' : nonce,
+      evidenceRevision: releaseFault === 'stale-revision' ? 0 : 1,
+      executionGeneration: releaseFault === 'stale-generation' ? 0 : 1 }))
+    fs.writeFileSync(path.join(source.workspace, 'observer.mjs'), openCodeTuiDisposalObserver)
+    const driver = path.join(source.workspace, 'driver.mts')
+    fs.writeFileSync(driver, `import fs from 'node:fs';import {DatabaseSync} from 'node:sqlite';import plugin from './observer.mjs';
+import childProcess from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';
+import producer from ${JSON.stringify(path.join(process.cwd(), 'extensions/opencode/freshell-rebind-plugin.ts'))};
+process.getuid=()=>65534;process.getgid=()=>0;
+const execute=childProcess.execFileSync;
+// Controlled UID driver only; actual helper and SQL execute unchanged.
+childProcess.execFileSync=(program,args,options)=>execute(program,program==='python3'&&args[0]==='-c'
+?['-c','import os;os.getuid=lambda:65534;os.getgid=lambda:0;\\n'+args[1],...args.slice(2)]:args,options);syncBuiltinESMExports();
+const database=new DatabaseSync(${JSON.stringify(databasePath)},{readOnly:true});
+const root=${JSON.stringify(root)}, controller=new AbortController();let nativeController=new AbortController(),active=true,deactivated=0,activated=0;
+const get=async()=>{const row=database.prepare('SELECT id,parent_id,directory FROM session WHERE id=?').get(root);
+if(!row)throw new Error('controlled exact native root404');return {data:{id:row.id,parentID:row.parent_id,directory:row.directory}}};
+const messages=async()=>({data:database.prepare('SELECT id,session_id,data FROM message WHERE session_id=? ORDER BY id').all(root)
+.map(row=>({info:{...JSON.parse(row.data),id:row.id,sessionID:row.session_id},parts:[]}))});
+const cached=(await get()).data,cachedMessages=(await messages()).data.map(row=>row.info);
+const api={lifecycle:{signal:controller.signal,onDispose:()=>{}},
+plugins:{list:()=>[{id:'freshell-rebind',active,enabled:active}],deactivate:async(id)=>{if(id!=='freshell-rebind')throw Error('unexpected');deactivated++;active=false;nativeController.abort()},
+activate:async(id)=>{if(id!=='freshell-rebind')throw Error('unexpected');activated++;active=true;nativeController=new AbortController();producer.tui({...api,lifecycle:{signal:nativeController.signal,onDispose:()=>{}}});return true}},
+client:{session:{get,messages}},state:{ready:true,session:{get:()=>cached,messages:()=>cachedMessages}},
+route:{current:{name:'session',params:{sessionID:root}}},slots:{register:()=>()=>{}}};
+plugin.tui(api);await new Promise(resolve=>setTimeout(resolve,1000));controller.abort();nativeController.abort();
+const roots=database.prepare('SELECT count(*) AS count FROM session WHERE id=?').get(root).count;
+const malformed=database.prepare('SELECT count(*) AS count FROM message WHERE session_id=? AND NOT json_valid(data)').get(root).count;database.close();
+const file='native-tui-fault-result.json',refusalFile=${JSON.stringify(path.join(directory, terminalId + '.json'))};
+console.log(JSON.stringify({deactivated,activated,roots,malformed,report:fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):null,
+refusal:fs.existsSync(refusalFile)?JSON.parse(fs.readFileSync(refusalFile,'utf8')):null}));`)
+    try {
+      const result = JSON.parse(execFileSync(process.execPath, ['--import', path.join(process.cwd(), 'node_modules/tsx/dist/loader.mjs'), driver], { cwd: source.workspace,
+        env: { ...process.env, HOME: home, FRESHELL_TERMINAL_ID: terminalId,
+          FRESHELL_OPENCODE_ADOPTION_ROOT_SESSION_ID: root, FRESHELL_OPENCODE_ADOPTION_INCARNATION_ID: incarnationId,
+          FRESHELL_OPENCODE_ADOPTION_LAUNCH_NONCE: 'native-adoption-current', FRESHELL_OPENCODE_ADOPTION_EVIDENCE_GENERATION: 'a'.repeat(64),
+          FRESHELL_OPENCODE_ADOPTION_EXPECTED_EMPTY: 'false', FRESHELL_OPENCODE_ADOPTION_TAIL_MESSAGE_ID: source.lastMessageId,
+          FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify({ incarnationId, launchNonce: nonce, requestedNativeSessionId: root, evidenceRevision: 1, executionGeneration: 1 }) },
+        encoding: 'utf8', timeout: 8000 }))
+      expect(result.deactivated).toBe(1)
+      if (releaseFault !== 'current') {
+        expect(result.activated).toBe(0)
+        expect(result.report.outcome).toBe('disposed_before_store_fault')
+        expect(result.roots).toBe(1)
+        expect(result.malformed).toBe(0)
+        return
+      }
+      expect({ outcome: result.report.outcome, activated: result.activated, refusalReason: result.refusal?.reason ?? null })
+        .toEqual({ outcome: 'native_load_error_observed', activated: 1, refusalReason: fault === 'root-load-error' ? 'native_root_load_failed' : 'native_history_load_failed' })
+      expect(result.activated).toBe(1)
+      expect(result.report.refusal.reason).toBe(fault === 'root-load-error' ? 'native_root_load_failed' : 'native_history_load_failed')
+      expect(result.report.refusal.nativeSessionId).toBe(root)
+      expect(result.report.refusal.incarnationId).toBe(incarnationId)
+      expect(result.report.producerActive).toBe(true)
+    } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
+  })
   it.each(['current', 'stale-incarnation', 'stale-nonce', 'stale-generation', 'already-published', 'inactive', 'wrong-requested-root'])('uses the supported plugin manager to dispose a pending owned native read without publishing identity: %s (controlled API only)', async (fault) => {
     const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
     const workspace = path.join(ownedRoot, 'opencode-disposal-workspace'), home = path.join(ownedRoot, 'provider')

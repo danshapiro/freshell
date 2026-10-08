@@ -1974,42 +1974,75 @@ print(json.dumps({'schemaVersion':1,'caseId':case,'rootSessionId':root,'changedR
 export const openCodeTuiDisposalObserver = String.raw`
 import fs from 'node:fs'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
+const storeFaultScript = ${JSON.stringify(openCodeTuiOwnedStoreFault)}
 export default { id: 'freshell-native-qualification', tui(api) {
   const cwd = fs.realpathSync(process.cwd()), home = process.env.HOME
-  if (!/^\/tmp\/f[a-z0-9]+\/[a-f0-9-]{12}\/opencode-(disposal|baseline-only-resume)-workspace$/.test(cwd)
+  if (!/^\/tmp\/f[a-z0-9]+\/[a-f0-9-]{12}\/opencode-(disposal|baseline-only-resume|root-load-error|history-load-error)-workspace$/.test(cwd)
     || process.getuid() !== 65534 || process.getgid() !== 0 || !home) return
   const control = JSON.parse(fs.readFileSync(path.join(cwd, 'native-tui-fault-control.json'), 'utf8'))
   const launch = JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH || 'null')
   const terminal = process.env.FRESHELL_TERMINAL_ID
-  if (control.schemaVersion !== 1 || !['disposal', 'baseline-only-resume'].includes(control.caseId)
+  if (control.schemaVersion !== 1 || !['disposal', 'baseline-only-resume', 'root-load-error', 'history-load-error'].includes(control.caseId)
     || !cwd.endsWith('/opencode-' + control.caseId + '-workspace') || control.terminalId !== terminal
     || !/^[a-zA-Z0-9_-]+$/.test(terminal || '') || launch?.requestedNativeSessionId !== control.rootSessionId
     || typeof launch.incarnationId !== 'string' || typeof launch.launchNonce !== 'string') return
   const directory = path.join(home, '.freshell/session-signals')
   const progress = path.join(directory, 'opencode-adoption-diagnostics', terminal)
   const expected = path.join(directory, 'opencode-adoption', terminal + '.expected.json')
+  const loadFault = ['root-load-error', 'history-load-error'].includes(control.caseId)
   const read = file => {
     try { const stat = fs.lstatSync(file); return stat.isFile() && !stat.isSymbolicLink() && stat.size <= 65536
       ? JSON.parse(fs.readFileSync(file, 'utf8')) : null } catch { return null }
   }
-  let busy = false, settled = false, timer
+  let busy = false, settled = false, timer, disposed, storeFault, released = false
   const started = Date.now()
-  const finish = report => {
-    settled = true; clearInterval(timer)
+  const report = value => {
     fs.writeFileSync(path.join(cwd, 'native-tui-fault-result.json'), JSON.stringify({
       schemaVersion: 1, caseId: control.caseId, terminalId: terminal, incarnationId: launch.incarnationId,
-      launchNonce: launch.launchNonce, elapsedMs: Date.now() - started, ...report }), { mode: 0o600 })
+      launchNonce: launch.launchNonce, elapsedMs: Date.now() - started, ...value }), { mode: 0o600 })
+  }
+  const finish = value => {
+    settled = true; clearInterval(timer); report(value)
   }
   const tick = async () => {
     if (busy || settled || api.lifecycle.signal.aborted) return
     busy = true
     try {
-      if (read(progress + '.publication_succeeded.json')) { finish({ outcome: 'already_published' }); return }
+      if (!released && read(progress + '.publication_succeeded.json')) { finish({ outcome: 'already_published' }); return }
       const pending = read(progress + '.native_read_pending.json')
       const binding = read(expected) || { root_session_id: process.env.FRESHELL_OPENCODE_ADOPTION_ROOT_SESSION_ID,
         incarnation_id: process.env.FRESHELL_OPENCODE_ADOPTION_INCARNATION_ID,
         launch_nonce: process.env.FRESHELL_OPENCODE_ADOPTION_LAUNCH_NONCE,
         evidence_generation: process.env.FRESHELL_OPENCODE_ADOPTION_EVIDENCE_GENERATION }
+      if (loadFault && disposed) {
+        if (!released) {
+          const release = read(path.join(cwd, 'native-tui-fault-release.json'))
+          if (release?.schemaVersion !== 1 || release.caseId !== control.caseId || release.rootSessionId !== control.rootSessionId
+            || release.incarnationId !== launch.incarnationId || release.launchNonce !== launch.launchNonce
+            || release.evidenceRevision !== launch.evidenceRevision || release.executionGeneration !== launch.executionGeneration) {
+            if (Date.now() - started >= 20000) finish({ outcome: 'current_owned_fault_release_not_observed' })
+            return
+          }
+          storeFault = JSON.parse(execFileSync('python3', ['-c', storeFaultScript, control.caseId, control.rootSessionId, cwd],
+            { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }))
+          released = true
+          await api.plugins.activate('freshell-rebind')
+          if (!api.plugins.list().some(row => row.id === 'freshell-rebind' && row.active)) {
+            finish({ outcome: 'native_producer_reactivation_failed' }); return
+          }
+        }
+        const refusal = read(progress + '.json')
+        const reason = control.caseId === 'root-load-error' ? 'native_root_load_failed' : 'native_history_load_failed'
+        if (refusal?.reason === reason && refusal.nativeSessionId === control.rootSessionId
+          && refusal.incarnationId === launch.incarnationId && refusal.launchNonce === binding.launch_nonce
+          && refusal.evidenceGeneration === binding.evidence_generation) {
+          finish({ outcome: 'native_load_error_observed', ...disposed, storeFault, refusal,
+            producerActive: api.plugins.list().some(row => row.id === 'freshell-rebind' && row.active) }); return
+        }
+        if (Date.now() - started >= 20000) finish({ outcome: 'current_native_read_refusal_not_observed', storeFault })
+        return
+      }
       if (pending?.stage !== 'native_read_pending' || pending.nativeSessionId !== control.rootSessionId
         || pending.incarnationId !== launch.incarnationId || binding.root_session_id !== control.rootSessionId
         || binding.incarnation_id !== launch.incarnationId || pending.launchNonce !== binding.launch_nonce
@@ -2033,9 +2066,11 @@ export default { id: 'freshell-native-qualification', tui(api) {
         || messages.data.some(row => row?.info?.sessionID !== control.rootSessionId)) {
         finish({ outcome: 'native_root_read_failed' }); return
       }
-      finish({ outcome: 'disposed_before_publication', nativeSessionId: session.data.id,
+      disposed = { nativeSessionId: session.data.id,
         nativeMessageCount: messages.data.length, producerActive: after?.active === true,
-        adoptionLaunchNonce: pending.launchNonce, evidenceGeneration: pending.evidenceGeneration })
+        adoptionLaunchNonce: pending.launchNonce, evidenceGeneration: pending.evidenceGeneration }
+      if (loadFault) report({ outcome: 'disposed_before_store_fault', ...disposed })
+      else finish({ outcome: 'disposed_before_publication', ...disposed })
     } catch { finish({ outcome: 'supported_disposal_failed' }) }
     finally { busy = false }
   }
