@@ -394,7 +394,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'codex' && caseId === 'create') {
+  if (selection.provider === 'codex' && ['create', 'exact-resume'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, 'codex', caseId)
   }
   if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume'].includes(caseId)) {
@@ -720,13 +720,15 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
         ? { codex: { tui_args: [], sidecar_args: [] } }
         : { opencode: { project_config: [], tui_config: null, inline_config: false } }, config: [] } } } }
   const { freshAgent, ...commonParameters } = request.params
+  const terminalEffortArgs = ['-c', 'model_reasoning_effort="low"']
   const selectedRequest = terminal ? { method: 'launch', params: { ...commonParameters,
     terminal: { terminalId: 'native-terminal-' + randomUUID(), streamId: 'native-stream-' + randomUUID(),
-      mode: 'codex', program: 'codex', args: ['--model', settings.model],
+      mode: 'codex', program: 'codex', args: ['--model', settings.model, ...terminalEffortArgs],
       env: { HOME: '/home/freshell/provider', TERM: 'xterm-256color' }, cwd: workspace, workspacePath: workspace,
       runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
       providerModel: settings.model, providerReasoningEffort: 'low', providerPermissionMode: 'on-request', providerSandbox: 'workspace-write',
-      providerSecretReferences: references, providerLaunchContext: freshAgent.providerLaunchContext } } } : request
+      providerSecretReferences: references, providerLaunchContext: { ...freshAgent.providerLaunchContext,
+        preparation: { codex: { tui_args: [], sidecar_args: terminalEffortArgs } } } } } } : request
   harness.writeArtifact(`${scenario}-request.json`, selectedRequest)
   const launch = await harness.adminOk(supervisor, selectedRequest)
   harness.writeArtifact(`${scenario}-launch.json`, launch)
@@ -753,9 +755,19 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
   const assertions = [{ name: 'actual-native-receiver-current-observation-before-input', pass: true },
     { name: 'actual-selected-native-process-profile-uid-and-tls', pass: true }]
   if (caseId === 'exact-resume') {
-    const receipt = await harness.adminOk(supervisor, { method: 'fresh_agent_send', params: { soulId,
-      text: 'Reply stored. Do not use any tools.' } })
-    harness.writeArtifact(`${scenario}-seed-dispatch.json`, receipt)
+    const seedText = 'Reply stored. Do not use any tools.'
+    if (terminal) {
+      // Read ordinary current output before dispatch, then use separate paste
+      // and submit gestures through the real managed terminal controller.
+      harness.writeArtifact(`${scenario}-before-seed-terminal-private.json`, await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId)))
+      harness.writeArtifact(`${scenario}-seed-paste-dispatch.json`, await harness.adminOk(supervisor,
+        harness.terminalInputBody(soulId, '\x1b[200~' + seedText + '\x1b[201~')))
+      await new Promise(resolve => setTimeout(resolve, 100))
+      harness.writeArtifact(`${scenario}-seed-dispatch.json`, await harness.adminOk(supervisor, harness.terminalInputBody(soulId, '\r')))
+    } else {
+      harness.writeArtifact(`${scenario}-seed-dispatch.json`, await harness.adminOk(supervisor,
+        { method: 'fresh_agent_send', params: { soulId, text: seedText } }))
+    }
     const deadline = Date.now() + 90_000
     let before: Awaited<ReturnType<typeof captureReceiverStore>> | undefined, attempt = 0
     while (Date.now() < deadline) {

@@ -55,8 +55,8 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       else await expect(run).rejects.toThrow(fault === 'wrong-uid' ? 'actual native receiver namespace/profile/pin/TLS differs' : 'current managed native receiver observation missing or misbound before input')
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['freshcodex','freshopencode'].flatMap(mode => ['valid','copied-volume','wrong-incarnation','wrong-root','store-changed','profile-changed','wrong-outcome'].map(fault => [mode,fault])))('executes exact receiver recovery only after completed native history and preserves its original volume (%s, %s; controlled orchestration)', async (mode,fault) => {
-    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'receiver-exact-recovery-')), provider=mode==='freshcodex'?'codex':'opencode'
+  it.each(['freshcodex','freshopencode','codex'].flatMap(mode => ['valid','copied-volume','wrong-incarnation','wrong-root','store-changed','profile-changed','wrong-outcome'].map(fault => [mode,fault])))('executes exact receiver recovery only after completed native history and preserves its original volume (%s, %s; controlled orchestration)', async (mode,fault) => {
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'receiver-exact-recovery-')), provider=mode==='freshcodex'||mode==='codex'?'codex':'opencode'
     const root=provider==='codex'?randomUUID():'ses_ownedFixture', turn=randomUUID(), container='owned-initial', replacement='owned-replacement'
     const raw=Buffer.from([
       {type:'session_meta',payload:{id:root,model_provider:'openai'}},
@@ -70,19 +70,22 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     database.prepare('INSERT INTO message VALUES (?,?,?,?)').run('msg-owned',root,1,JSON.stringify({role:'assistant',time:{completed:1},providerID:'openai',modelID:'gpt-5.6-luna'}))
     database.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('part-owned',root,'msg-owned',1,JSON.stringify({type:'text',text:'stored'}));database.close()
     const querySnapshot=fs.readFileSync(databasePath)
-    let seeded=false,probed=false,dead=false
+    let seeded=false,probed=false,dead=false,outputRead=false,pasted=false
     const view=(current=false)=>({launchState:'running',recoveryState:'live',containerId:current?replacement:container,
       incarnationId:current&&fault!=='wrong-incarnation'?'new-inc':'initial-inc',nativeSessionId:current&&fault==='wrong-root'?'other-root':root,
       nativeIdentityObservation:{nativeSessionId:current&&fault==='wrong-root'?'other-root':root,incarnationId:current&&fault!=='wrong-incarnation'?'new-inc':'initial-inc',
-        launchNonce:current?'new-nonce':'initial-nonce',evidenceRevision:current?1:0,evidenceDigest:'a'.repeat(64),source:'fresh_provider_handshake'}})
+        launchNonce:current?'new-nonce':'initial-nonce',evidenceRevision:current?1:0,evidenceDigest:'a'.repeat(64),source:mode==='codex'?'codex_app_server':'fresh_provider_handshake'}})
     const harness={testRoot:directory,evidenceDir:directory,runId:ownerId,candidateSha,imageRef:imageDigest,
       startSupervisor:async()=>({}),writeArtifact:(name:string,value:unknown)=>fs.writeFileSync(path.join(directory,name),JSON.stringify(value)),
       probeRecoveryBody:()=>({method:'probe_recovery'}),recoverBody:()=>({method:'recover'}),
+      terminalReadOutputBody:()=>({method:'terminal_read_output'}),terminalInputBody:(_soulId:string,data:string)=>({method:'terminal_input',params:{data}}),
       broker:{receipts:()=>[{containerId:container,providerVolumeName:'owned-original-volume'},{containerId:replacement,providerVolumeName:fault==='copied-volume'?'copied-volume':'owned-original-volume'}]},
       killOwnedRuntimeExact:async()=>{expect(seeded&&probed).toBe(true);dead=true},waitForContainerExit:async()=>{expect(dead).toBe(true)},
       adminOk:async(_supervisor:unknown,request:any)=>{
         if(request.method==='launch')return{data:{view:view()}}
-        if(request.method==='fresh_agent_send'){seeded=true;return{data:{state:'dispatched'}}}
+        if(request.method==='fresh_agent_send'){expect(mode).not.toBe('codex');seeded=true;return{data:{state:'dispatched'}}}
+        if(request.method==='terminal_read_output'){outputRead=true;return{data:{frames:[]}}}
+        if(request.method==='terminal_input'){expect(mode).toBe('codex');expect(outputRead).toBe(true);if(request.params.data==='\r'){expect(pasted).toBe(true);seeded=true}else{expect(request.params.data).toContain('\x1b[200~');expect(request.params.data).toContain('\x1b[201~');pasted=true};return{data:{state:'dispatched'}}}
         if(request.method==='probe_recovery'){expect(seeded).toBe(true);probed=true;return{data:{kind:'reattach_ready'}}}
         if(request.method==='recover'){expect(dead).toBe(true);return{data:{outcome:fault==='wrong-outcome'?'reattached':'replaced',view:view(true)}}}
         throw new Error('unexpected receiver command')
@@ -99,9 +102,10 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     } as unknown as RuntimeHarness
     const sources=['env_file','auth_file','ca_file'].map(suffix=>({name:`${provider}/grants/${suffix}`,path:'/owned/'+suffix,sha256:'e'.repeat(64)}))
     try{
-      const run=executeManagedNativeCase(harness,sources,{mode:mode as 'freshcodex'|'freshopencode',case:'startup'},'exact-resume')
+      const run=executeManagedNativeCase(harness,sources,mode==='codex'?{provider:'codex',case:'startup'}:{mode:mode as 'freshcodex'|'freshopencode',case:'startup'},'exact-resume')
       if(fault==='valid'){const original=await run;expect(original.assertions.every(row=>row.pass)).toBe(true);expect(original.assertions.some(row=>row.name==='original-owned-volume-transcript-continuity')).toBe(true)}
       else await expect(run).rejects.toThrow()
+      expect(seeded).toBe(true)
     }finally{fs.rmSync(directory,{recursive:true,force:true})}
   })
   it.each(['valid', 'wrong-root', 'wrong-directory', 'parent-root', 'foreign-history', 'root-http-error', 'missing-tag'])('executes the real native session HTTP reader through an owned process fixture (%s; no provider qualification)', async (fault) => {
