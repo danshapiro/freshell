@@ -369,6 +369,38 @@ function candidateHelperBody(input: ClaudeCandidateAuthorization, role: 'mountpo
 }
 
 describe('fixed initial Claude candidate broker', () => {
+  it('observes retained sources through the exact frozen ordinary aliases and read-only owned HOME', async () => {
+    await withHttpBroker(async ({request, forwarded, broker: instance}) => {
+      const input = candidateAuthorization(), body = sourceHelperBody()
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      instance.authorizeClaudeCandidate(input)
+      body.HostConfig.Tmpfs = {}
+      body.HostConfig.Mounts.push(
+        {Type:'volume',Source:input.providerVolumeName,Target:'/home/freshell/provider',ReadOnly:true,VolumeOptions:{NoCopy:true}},
+        ...input.configurationBinds.map(bind => ({Type:'bind',Source:`${input.stageRoot}/${bind.sourceRelativePath}`,Target:bind.effectiveDestination,ReadOnly:true})),
+        ...input.resourceMounts.map(unit => ({Type:'volume',Source:input.providerVolumeName,Target:unit.effectiveDestination,ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:unit.providerRelativePath}})),
+      )
+      const before = forwarded.length
+      for (const mutation of ['home-write','foreign-home','alias-write','alias-subpath','alias-source','missing-alias','native-history']) {
+        const changed = structuredClone(body)
+        if (mutation === 'home-write') changed.HostConfig.Mounts[3].ReadOnly = false
+        if (mutation === 'foreign-home') changed.HostConfig.Mounts[3].Source = 'foreign-home'
+        if (mutation === 'alias-write') changed.HostConfig.Mounts.at(-1).ReadOnly = false
+        if (mutation === 'alias-subpath') changed.HostConfig.Mounts.at(-1).VolumeOptions.Subpath = '.claude/projects'
+        if (mutation === 'alias-source') changed.HostConfig.Mounts[4].Source = `${input.stageRoot}/.freshell/mcp-capability.json`
+        if (mutation === 'missing-alias') changed.HostConfig.Mounts.pop()
+        if (mutation === 'native-history') changed.HostConfig.Mounts.push({Type:'volume',Source:input.providerVolumeName,Target:'/history',ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:'.claude/projects'}})
+        expect((await request('POST',`/v1.47/containers/create?name=${sourceName}`,changed)).status,mutation).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST',`/v1.47/containers/create?name=${sourceName}`,body)).status).toBe(201)
+      expect((await request('GET',`/v1.47/containers/${helperId}/json`)).status).toBe(200)
+      expect((await request('POST',`/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST',`/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('DELETE',`/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
+      expect((await request('GET',`/v1.47/containers/${helperId}/json`)).status).toBe(404)
+    })
+  })
   it('qualifies retained candidates only through selected frozen inputs and read-only owned HOME', async () => {
     await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
       const input = candidateAuthorization(), generationId = 'grant-55555555-5555-4555-8555-555555555555'

@@ -960,17 +960,36 @@ export class RestrictedDockerBroker {
       || host.NetworkMode !== 'none' || host.ReadonlyRootfs !== true
       || JSON.stringify(host.CapDrop) !== JSON.stringify(['ALL']) || JSON.stringify(host.SecurityOpt) !== JSON.stringify(['no-new-privileges'])
       || host.Memory !== 256 * 1024 * 1024 || host.MemorySwap !== 256 * 1024 * 1024 || host.NanoCpus !== 500_000_000 || host.PidsLimit !== 32
-      || !equalRecord(host.LogConfig, { Type: 'none', Config: host.LogConfig?.Config }) || Object.keys(host.LogConfig?.Config ?? {}).length
-      || !equalRecord(host.Tmpfs, { '/home/freshell/provider': 'rw,nosuid,nodev,noexec,size=16m,uid=65534,gid=0,mode=0700' })) return false
+      || !equalRecord(host.LogConfig, { Type: 'none', Config: host.LogConfig?.Config }) || Object.keys(host.LogConfig?.Config ?? {}).length) return false
     const mounts = host.Mounts
-    if (!Array.isArray(mounts) || mounts.length !== 3
-      || mounts.some((mount) => !mount || Object.keys(mount).some((key) => !['Type','Source','Target','ReadOnly'].includes(key)))) return false
+    if (!Array.isArray(mounts)
+      || mounts.some((mount) => !mount || Object.keys(mount).some((key) => !['Type','Source','Target','ReadOnly','VolumeOptions'].includes(key)))) return false
     const binary = mounts.find((mount) => mount.Type === 'bind' && mount.Source === owner.hostBinaryPath && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
     const workspace = mounts.find((mount) => mount.Type === 'bind' && mount.Source === mount.Target && this.policy.allowedWorkspaceRoots?.has(mount.Source) && mount.ReadOnly === true)
     const exchange = mounts.find((mount) => mount.Type === 'bind' && mount.Target === '/run/freshell-source-exchange' && mount.ReadOnly === true
       && typeof mount.Source === 'string' && path.dirname(mount.Source) === os.tmpdir()
       && /^freshell-inputs-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(path.basename(mount.Source)))
-    return !!binary && !!workspace && !!exchange && typeof parsed.WorkingDir === 'string'
+    if (!binary || !workspace || !exchange || [binary,workspace,exchange].some(mount => mount.VolumeOptions !== undefined)) return false
+    const home = mounts.find(mount => mount.Target === '/home/freshell/provider')
+    if (home) {
+      if (!equalRecord(host.Tmpfs, {}) || home.Type !== 'volume' || home.Source !== owner.providerVolumeName
+        || home.ReadOnly !== true || !equalRecord(home.VolumeOptions,{NoCopy:true})) return false
+      // Match a previously authorized complete ordinary generation. No native
+      // store path, arbitrary alias, or original controller source is admitted.
+      const profiles = [...this.claudeCandidates.values()].filter(input => input.installationId === owner.installationId
+        && input.soulId === owner.soulId && input.providerVolumeName === owner.providerVolumeName)
+      const matches = profiles.some(input => {
+        const expected = [binary,workspace,exchange,home,
+          ...input.configurationBinds.map(bind => ({Type:'bind',Source:path.join(input.stageRoot,bind.sourceRelativePath),Target:bind.effectiveDestination,ReadOnly:true})),
+          ...input.resourceMounts.map(unit => ({Type:'volume',Source:owner.providerVolumeName,Target:unit.effectiveDestination,ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:unit.providerRelativePath}})),
+        ]
+        return mounts.length === expected.length && new Set(mounts.map(mount => mount.Target)).size === mounts.length
+          && expected.every(wanted => mounts.some(actual => ['Type','Source','Target','ReadOnly'].every(key => actual[key] === wanted[key])
+            && (wanted.Type === 'volume' ? equalRecord(actual.VolumeOptions,wanted.VolumeOptions) : actual.VolumeOptions === undefined)))
+      })
+      if (!matches) return false
+    } else if (mounts.length !== 3 || !equalRecord(host.Tmpfs, { '/home/freshell/provider': 'rw,nosuid,nodev,noexec,size=16m,uid=65534,gid=0,mode=0700' })) return false
+    return typeof parsed.WorkingDir === 'string'
       && path.normalize(parsed.WorkingDir) === parsed.WorkingDir
       && (parsed.WorkingDir === workspace.Source || isStrictDescendant(parsed.WorkingDir, workspace.Source))
   }
@@ -1000,7 +1019,9 @@ export class RestrictedDockerBroker {
       && (host.CapAdd?.length ?? 0) === 0 && host.LogConfig?.Type === 'none'
       && Array.isArray(host.Mounts) && host.Mounts.length === expected.HostConfig.Mounts.length
       && expected.HostConfig.Mounts.every((wanted: Record<string, any>) => host.Mounts.some((mount: Record<string, any>) =>
-        ['Type','Source','Target','ReadOnly'].every((key) => mount[key] === wanted[key]) && !mount.VolumeOptions))
+        ['Type','Source','Target','ReadOnly'].every((key) => mount[key] === wanted[key])
+        && (wanted.Type === 'volume' ? mount.VolumeOptions?.NoCopy === true && !mount.VolumeOptions.DriverConfig
+          && (mount.VolumeOptions.Subpath ?? '') === (wanted.VolumeOptions.Subpath ?? '') : mount.VolumeOptions === undefined)))
   }
 
   private validateInputPublisher(name:string,body:Buffer):PreparedInputAuthorization | undefined {
