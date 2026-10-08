@@ -1140,7 +1140,7 @@ async function executeManagedOpenCodeTui(harness: RuntimeHarness,
   if (launch.result?.Err || view.launchState !== 'running' || view.recoveryState !== 'live' || view.desiredState !== 'running'
     || !view.containerId || !observation || observation.source !== 'opencode_tui'
     || observation.nativeSessionId !== source.rootId || view.nativeSessionId !== source.rootId
-    || observation.incarnationId !== view.incarnationId || observation.evidenceRevision !== view.evidenceRevision) {
+    || observation.incarnationId !== view.incarnationId) {
     throw new Error('actual imported native TUI has no current admitted observation')
   }
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
@@ -1150,6 +1150,9 @@ async function executeManagedOpenCodeTui(harness: RuntimeHarness,
     || namespace.nativeVersion !== '1.18.21'
     || namespace.executableSha256 !== 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99'
     || namespace.nativeProcessCwd !== source.workspace || namespace.nativeLaunch.incarnationId !== view.incarnationId
+    // The registry's evidence counter can advance on publication. Identity
+    // binds the immutable current native launch revision, captured from the
+    // actual child, rather than that independent ledger counter.
     || namespace.nativeLaunch.launchNonce !== observation.launchNonce || namespace.nativeLaunch.evidenceRevision !== observation.evidenceRevision
     || namespace.nativeLaunch.executionGeneration !== view.executionGeneration) {
     throw new Error('actual native TUI current namespace/profile/pin/TLS differs')

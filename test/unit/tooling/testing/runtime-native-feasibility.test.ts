@@ -89,8 +89,8 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       .rejects.toThrow('selected OpenCode native transfer stage required')
     expect(harness.writeArtifact).not.toHaveBeenCalled()
   })
-  it.each(['requested-echo', 'previous-incarnation', 'stale-revision'])(
-    'executes the owned import/launch orchestration and refuses a %s before native qualification inspection', async fault => {
+  it.each(['requested-echo', 'previous-incarnation', 'stale-revision', 'ledger-advanced'])(
+    'executes owned import/launch orchestration with %s without inventing qualification', async fault => {
       const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
       const evidenceDir = path.join(ownedRoot, 'evidence')
       fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 })
@@ -98,7 +98,14 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       fs.writeFileSync(stage, 'orchestration fixture only', { mode: 0o500 })
       let root = '', sourcePath = '', launchRequest: any
       const transferCalls: any[] = []
-      const inspect = vi.fn()
+      const inspect = vi.fn(async () => {
+        if (fault === 'ledger-advanced') throw new Error('controlled native inspection reached')
+        return JSON.stringify({ uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+          httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: launchRequest.params.terminal.cwd,
+          nativeProcessCwd: launchRequest.params.terminal.cwd, nativeVersion: '1.18.21', nativeRoot: root,
+          activeNativeProcesses: 1, executableSha256: 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99', profileSha256: 'd'.repeat(64),
+          nativeLaunch: { incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 2, executionGeneration: 1 } })
+      })
       const harness = {
         repoRoot: process.cwd(), testRoot: ownedRoot, evidenceDir, runId: randomUUID(), candidateSha, imageRef: imageDigest,
         writeArtifact: vi.fn(), startTransferProvider: () => ({ containerId: 'fixture-exporter' }),
@@ -119,7 +126,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
             nativeSessionId: root, evidenceRevision: 2, successfulRecoveriesInWindow: 0,
             ...(fault === 'requested-echo' ? {} : { nativeIdentityObservation: { nativeSessionId: root,
               incarnationId: fault === 'previous-incarnation' ? 'previous-incarnation' : 'current-incarnation',
-              launchNonce: 'current-nonce', evidenceRevision: fault === 'stale-revision' ? 1 : 2,
+              launchNonce: 'current-nonce', evidenceRevision: ['stale-revision', 'ledger-advanced'].includes(fault) ? 1 : 2,
               source: 'opencode_tui', evidenceDigest: 'c'.repeat(64) } }),
           }] }
         },
@@ -128,12 +135,14 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       try {
         await expect(executeManagedNativeCase(harness, [{ name: 'opencode/native-preparation/transfer-stage.bin', path: stage, sha256: 'd'.repeat(64) },
           ...['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: 'opencode/grants/' + suffix, path: stage, sha256: 'd'.repeat(64) }))],
-        { provider: 'opencode', case: 'startup' }, 'null-slot')).rejects.toThrow('no current admitted observation')
+        { provider: 'opencode', case: 'startup' }, 'null-slot')).rejects.toThrow(fault === 'ledger-advanced' ? 'controlled native inspection reached'
+          : fault === 'stale-revision' ? 'actual native TUI current namespace/profile/pin/TLS differs' : 'no current admitted observation')
         expect(launchRequest.params.terminal.resumeSessionId).toBe(root)
         expect(launchRequest.params.terminal.opencodeTransfer.rootSessionId).toBe(root)
         expect(transferCalls.map(row => row.action)).toEqual(['begin', 'chunk', 'finalize'])
         expect(Buffer.from(transferCalls[1].data.data, 'base64')).toEqual(fs.readFileSync(sourcePath))
-        expect(inspect).not.toHaveBeenCalled()
+        expect(inspect).toHaveBeenCalledTimes(['stale-revision', 'ledger-advanced'].includes(fault) ? 1 : 0)
+        expect((harness.writeArtifact as any).mock.calls.filter(([name]: string[]) => name.endsWith('-original.json'))).toEqual([])
       } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
     })
   it.each(['ordinary', 'parity'])('keeps Codex transcript Enter-bound while the %s producer selects its native startup boundary', async route => {
