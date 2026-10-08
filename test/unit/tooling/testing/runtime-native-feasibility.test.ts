@@ -115,6 +115,51 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       if (fault === 'missing-signal') expect(records.has('amplifier-create-original.json')).toBe(false)
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it.each(['matching', 'wrong-root', 'parent-root', 'missing-root'])('executes the pinned Amplifier producer with current native root diagnostics (%s)', (fault) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-native-root-event-'))
+    const patch = fs.readFileSync(path.join(process.cwd(), 'extensions/amplifier/freshell-native-resume.patch'), 'utf8')
+    const section = patch.split('+++ b/amplifier_app_cli/freshell_native_resume.py\n')[1]!.split('--- a/amplifier_app_cli/runtime/config.py')[0]!
+    const source = section.split('\n').filter(line => line.startsWith('+')).map(line => line.slice(1)).join('\n') + '\n'
+    const module = path.join(directory, 'native_producer.py'); fs.writeFileSync(module, source)
+    const requested = randomUUID(), actual = fault === 'wrong-root' ? randomUUID() : fault === 'missing-root' ? '' : requested
+    const script = String.raw`import asyncio,contextlib,importlib.util,io,json,os,pathlib,sys,types
+module_file,directory,requested,actual,fault=sys.argv[1:]
+spec=importlib.util.spec_from_file_location('actual_producer',module_file);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+root=pathlib.Path(directory);store=root/'owned-store';session_dir=store/actual;session_dir.mkdir(parents=True)
+(session_dir/'transcript.jsonl').write_text('')
+(session_dir/'metadata.json').write_text(json.dumps({'session_id':actual,'parent_id':None}))
+loaded,_=module.load_native(types.SimpleNamespace(base_dir=store),actual)
+class Context:
+ def __init__(self):self.messages=[]
+ async def set_messages(self,messages):self.messages=list(messages)
+ async def get_messages(self):return self.messages
+context=Context();asyncio.run(context.set_messages(loaded))
+class Session:
+ session_id=actual;parent_id='existing-parent' if fault=='parent-root' else None;cleaned=False
+ coordinator={'context':context}
+ async def cleanup(self):self.cleaned=True
+session=Session();signal_dir=root/'current-signal'
+os.environ['FRESHELL_NATIVE_IDENTITY_LAUNCH']=json.dumps({'incarnationId':'current-incarnation','launchNonce':'current-nonce','evidenceRevision':7,'executionGeneration':3,'requestedNativeSessionId':requested})
+os.environ['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR']=str(signal_dir)
+capture=io.StringIO();failure=None
+with contextlib.redirect_stderr(capture):
+ try:asyncio.run(module.publish_initialized(session,types.SimpleNamespace(is_resume=True,initial_transcript=loaded)))
+ except ValueError as error:failure=str(error)
+print(json.dumps({'events':[json.loads(line) for line in capture.getvalue().splitlines()], 'cleaned':session.cleaned,'published':(signal_dir/'amplifier-loaded-context.json').exists(),'failed':failure is not None}))`
+    try {
+      const result = JSON.parse(execFileSync('python3', ['-c', script, module, directory, requested, actual, fault], { encoding: 'utf8' }))
+      const refusals = result.events.filter((event: any) => event.event === 'amplifier.native_root.refused')
+      if (fault === 'wrong-root') {
+        expect(refusals).toHaveLength(1)
+        expect(refusals[0]).toEqual({ severity: 'error', event: 'amplifier.native_root.refused', reason: 'native_root_mismatch',
+          incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 7, executionGeneration: 3, nativeSessionId: actual })
+        expect(refusals[0].nativeSessionId).not.toBe(requested)
+      } else expect(refusals).toHaveLength(0)
+      expect(result.published).toBe(fault === 'matching')
+      expect(result.cleaned).toBe(fault !== 'matching')
+      expect(result.failed).toBe(fault !== 'matching')
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['split','sdk-inline','wrong-root','duplicate','missing','lookalike'])('correlates the exact actual native resume argv root (%s)', form=>{
     const root=randomUUID(),argv=form==='split'?['--resume',root]:form==='sdk-inline'?['--resume='+root]:form==='wrong-root'?['--resume='+randomUUID()]:form==='duplicate'?['--resume',root,'--resume='+root]:form==='missing'?['--resume']:['--resume-session-at='+root]
     expect(nativeResumeRootInArgv(argv,root)).toBe(form==='split'||form==='sdk-inline')

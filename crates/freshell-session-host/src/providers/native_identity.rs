@@ -206,7 +206,7 @@ pub fn read_amplifier_observation(
         || !native["parent_id"].is_null()
         || native["cli_pin"] != "1873aa980535c99a743b17172e4231833f6c8741"
         || native["producer_sha256"]
-            != "6980829983d6b691f05382360f428ae437edc26a65594a559e20c726980987be"
+            != "1682141140822739c4cd88b7314c3b0daff7ccae1ffb55b7b72f235759123690"
         || load["sessionId"] != root
         || !load["parentId"].is_null()
     {
@@ -267,7 +267,7 @@ mod tests {
             "eofSha256":"a".repeat(64)});
         let mut value = serde_json::json!({"launch":launch,"native":{"session_id":"native-root",
             "parent_id":null,"source":"resume","cli_pin":"1873aa980535c99a743b17172e4231833f6c8741",
-            "producer_sha256":"6980829983d6b691f05382360f428ae437edc26a65594a559e20c726980987be",
+            "producer_sha256":"1682141140822739c4cd88b7314c3b0daff7ccae1ffb55b7b72f235759123690",
             "load":{"sessionId":"native-root","parentId":null,"transcript":witness,
                 "metadata":witness,"messageCount":0},"acceptedMessageCount":0}});
         let read = |value: &Value| {
