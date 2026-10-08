@@ -768,7 +768,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     const recovery = await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
     harness.writeArtifact(`${scenario}-recovery.json`, recovery)
     const current = recovery.data.view, observed = current?.nativeIdentityObservation
-    if (recovery.data.outcome !== 'recovered' || current.launchState !== 'running' || current.recoveryState !== 'live'
+    if (recovery.data.outcome !== 'replaced' || current.launchState !== 'running' || current.recoveryState !== 'live'
       || current.incarnationId === view.incarnationId || current.containerId === view.containerId
       || current.nativeSessionId !== view.nativeSessionId || observed?.nativeSessionId !== view.nativeSessionId
       || observed.incarnationId !== current.incarnationId || observed.source !== 'fresh_provider_handshake'

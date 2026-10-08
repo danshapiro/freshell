@@ -31,7 +31,7 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
-  it.each(['freshcodex','freshopencode'].flatMap(mode => ['valid','copied-volume','wrong-incarnation','wrong-root','store-changed','profile-changed'].map(fault => [mode,fault])))('executes exact receiver recovery only after completed native history and preserves its original volume (%s, %s; controlled orchestration)', async (mode,fault) => {
+  it.each(['freshcodex','freshopencode'].flatMap(mode => ['valid','copied-volume','wrong-incarnation','wrong-root','store-changed','profile-changed','wrong-outcome'].map(fault => [mode,fault])))('executes exact receiver recovery only after completed native history and preserves its original volume (%s, %s; controlled orchestration)', async (mode,fault) => {
     const directory=fs.mkdtempSync(path.join(os.tmpdir(),'receiver-exact-recovery-')), provider=mode==='freshcodex'?'codex':'opencode'
     const root=provider==='codex'?randomUUID():'ses_ownedFixture', turn=randomUUID(), container='owned-initial', replacement='owned-replacement'
     const raw=Buffer.from([
@@ -60,7 +60,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         if(request.method==='launch')return{data:{view:view()}}
         if(request.method==='fresh_agent_send'){seeded=true;return{data:{state:'dispatched'}}}
         if(request.method==='probe_recovery'){expect(seeded).toBe(true);probed=true;return{data:{kind:'reattach_ready'}}}
-        if(request.method==='recover'){expect(dead).toBe(true);return{data:{outcome:'recovered',view:view(true)}}}
+        if(request.method==='recover'){expect(dead).toBe(true);return{data:{outcome:fault==='wrong-outcome'?'reattached':'replaced',view:view(true)}}}
         throw new Error('unexpected receiver command')
       },
       execOwnedContainerAsExact:async(id:string,_uid:string,argv:string[])=>{
