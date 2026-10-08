@@ -43,6 +43,37 @@ if owned and '--resume' in args:
 os.execv(str(native),[str(native),*args])
 `
 
+// Finite negative image only: use the real observed native acknowledgement,
+// then fault exactly its projected ID before the existing Rust normalizer and
+// native receiver. Never substitute these frames for positive identity proof.
+export function stageSdkInitFieldFault(source: string): string {
+  const original = String.raw`emit({ type: 'sdk.session.init', sessionId, cliSessionId: observation.nativeSessionId,
+        cwd: observation.native.cwd, model: req.model, nativeIdentityEvidence: {
+          launch, digest: observation.evidenceDigest, source: observation.native.source, queryGeneration: generation,
+        } })`
+  if (source.split(original).length !== 2) throw new Error('pinned native SDK init publisher differs')
+  return source.replace(original, String.raw`const nativeInit = { type: 'sdk.session.init', sessionId, cliSessionId: observation.nativeSessionId,
+        cwd: observation.native.cwd, model: req.model, nativeIdentityEvidence: {
+          launch, digest: observation.evidenceDigest, source: observation.native.source, queryGeneration: generation,
+        } }
+      const fieldFault = /^\/tmp\/f[a-z0-9]+\/[a-f0-9]{8}-[a-f0-9]{3}\/(freshclaude|kilroy)-(missing-native-id|placeholder-id)-workspace$/.exec(req.cwd || '')
+      if (fieldFault) {
+        const control = JSON.parse(await readFile(join(req.cwd, 'native-init-field-fault-control.json'), 'utf8'))
+        if (req.resumeSessionId || launch?.requestedNativeSessionId !== null || !launch?.launchNonce || !launch?.incarnationId
+          || control.mode !== fieldFault[1] || control.caseId !== fieldFault[2]
+          || !observation.nativeSessionId || observation.nativeSessionId === sessionId) {
+          throw new Error('owned native init field fault binding differs')
+        }
+        const actualNativeSessionId = nativeInit.cliSessionId
+        if (fieldFault[2] === 'missing-native-id') delete nativeInit.cliSessionId
+        else nativeInit.cliSessionId = sessionId
+        const { writeFile } = await import('node:fs/promises')
+        await writeFile(join(req.cwd, 'native-init-field-fault-observation.json'),
+          JSON.stringify({ caseId: fieldFault[2], mode: fieldFault[1], actualNativeSessionId, frame: nativeInit }), { mode: 0o660 })
+      }
+      emit(nativeInit)`)
+}
+
 export function staleNativeSignalBindingMatches(captured: any, priorLaunch: any, currentLaunch: any, root: string): boolean {
   return captured.hooksDisabled === true && captured.hook?.native.session_id === root
     && captured.loaded?.native.session_id === root
