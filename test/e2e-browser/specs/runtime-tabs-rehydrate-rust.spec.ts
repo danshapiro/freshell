@@ -12,7 +12,7 @@ import { expect, type Page } from '@playwright/test'
 import WebSocket from 'ws'
 
 import { test } from '../helpers/fixtures.js'
-import { ManagedRuntimeBrowserRig, createManagedRuntimeBrowserRig, type FreshCodexHistoryMeasurementError } from '../helpers/managed-runtime.js'
+import { ManagedRuntimeBrowserRig, createManagedRuntimeBrowserRig, type FreshCodexHistoryMeasurementError, type FreshCodexHistoryMeasurementFinish } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { runtimeBrowserPost as apiPost, pruneRuntimeBrowserLayout } from '../helpers/runtime-browser-api.js'
 import { LAYOUT_WINDOW_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
@@ -177,10 +177,12 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
     const received: any[] = []
     let heldHost: {containerId: string, incarnationId: string, pid: number} | undefined
     let heldHandle: ReturnType<ManagedRuntimeBrowserRig['exactRuntimeHandle']> | undefined
+    let historyEnclosure: ReturnType<ManagedRuntimeBrowserRig['runtimeEnclosureHandle']> | undefined
     let cpuSession: Awaited<ReturnType<ReturnType<Page['context']>['newCDPSession']>> | undefined
     let profilingStarted = false
     const measurementErrors: FreshCodexHistoryMeasurementError[] = []
     const measurement: Record<string, unknown> = { kind: 'owned-page saved-history diagnostic', errors: measurementErrors }
+    const measurementFinish: FreshCodexHistoryMeasurementFinish = { errors: measurementErrors }
     // Keep only asset names and route classes, never auth queries or native text.
     const scriptLabel = (url: string) => {
       if (!url) return 'native-or-anonymous'
@@ -220,6 +222,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       ), 90_000)
       expect(view.containerId).toBeTruthy()
       expect(view.nativeSessionId).toBeTruthy()
+      historyEnclosure = rig.runtimeEnclosureHandle(view)
       const seededHistory = await rig.prepareFreshCodexSavedHistory(rig.exactRuntimeHandle(view))
       expect(seededHistory.bytes).toBeGreaterThan(1024 * 1024)
       const fixtureState = () => rig.fixtureNativeState(rig.exactRuntimeHandle(view))
@@ -400,10 +403,12 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       measurement.browserBeforeReload = browserBeforeReload
       const cpuStartRequestedAt = Date.now()
       measurement.cpuStartRequestedAt = cpuStartRequestedAt
+      measurementFinish.cpuStartRequestedAt = cpuStartRequestedAt
       await cpuSession.send('Profiler.start')
       profilingStarted = true
       const cpuStartedAt = Date.now()
       measurement.cpuStartedAt = cpuStartedAt
+      measurementFinish.cpuStartedAt = cpuStartedAt
       await rig.startFreshCodexSavedHistoryMeasurement(rig.exactRuntimeHandle(view), {
         kind: 'owned-page saved-history diagnostic', errors: measurementErrors, browserBeforeReload, cpuStartRequestedAt, cpuStartedAt,
       })
@@ -494,9 +499,13 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
           if (cpuSession) {
             try {
               if (profilingStarted) {
-                measurement.cpuStopRequestedAt = Date.now()
+                const cpuStopRequestedAt = Date.now()
+                measurement.cpuStopRequestedAt = cpuStopRequestedAt
+                measurementFinish.cpuStopRequestedAt = cpuStopRequestedAt
                 const { profile } = await cpuSession.send('Profiler.stop')
-                measurement.cpuStoppedAt = Date.now()
+                const cpuStoppedAt = Date.now()
+                measurement.cpuStoppedAt = cpuStoppedAt
+                measurementFinish.cpuStoppedAt = cpuStoppedAt
                 const nodes = new Map<number, any>(profile.nodes.map((node: any) => [node.id, node]))
                 const parents = new Map<number, number>()
                 for (const node of profile.nodes) for (const child of node.children ?? []) parents.set(child, node.id)
@@ -593,11 +602,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
               }, Number(measurement.finallyEnteredAt))
             } catch { measurementErrors.push('owned perf audit extraction failed') }
             rig.runtime.writeBrowserArtifact('saved-history-render-measurement', measurement)
-            rig.runtime.recordLifecycle('browser.saved_history_measurement.finished', {
-              cpuStartRequestedAt: measurement.cpuStartRequestedAt, cpuStartedAt: measurement.cpuStartedAt,
-              cpuStopRequestedAt: measurement.cpuStopRequestedAt, cpuStoppedAt: measurement.cpuStoppedAt,
-              errors: measurementErrors,
-            })
+            if (!historyEnclosure) throw new Error('recorded saved-history enclosure is unavailable')
+            await rig.finishFreshCodexSavedHistoryMeasurement(historyEnclosure, measurementFinish)
           }
         } finally {
           const cleanup = await rig.stop()

@@ -929,6 +929,11 @@ export const FreshCodexHistoryMeasurementStartSchema = z.object({ kind: z.litera
   cpuStartRequestedAt: z.number(), cpuStartedAt: z.number(),
 }).strict()
 export type FreshCodexHistoryMeasurementStart = z.infer<typeof FreshCodexHistoryMeasurementStartSchema>
+export const FreshCodexHistoryMeasurementFinishSchema = z.object({ cpuStartRequestedAt: z.number().optional(),
+  cpuStartedAt: z.number().optional(), cpuStopRequestedAt: z.number().optional(), cpuStoppedAt: z.number().optional(),
+  errors: z.array(FreshCodexHistoryMeasurementErrorSchema),
+}).strict()
+export type FreshCodexHistoryMeasurementFinish = z.infer<typeof FreshCodexHistoryMeasurementFinishSchema>
 export const FreshCodexSavedHistoryOwnershipFactsSchema = z.object({
   receiptContainerIds: z.array(z.string()), startCount: z.number().int().nonnegative(),
   launches: z.array(z.object({ event: z.literal('supervisor.launch_running'), at: z.union([z.number(), z.string()]),
@@ -1085,7 +1090,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-measurement-finish', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
     'provider-volume', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
@@ -1130,6 +1135,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   phase3Browser: Phase3BrowserObservationSchema.optional(),
   phase4Browser: Phase4BrowserObservationSchema.optional(),
   historyMeasurementStart: FreshCodexHistoryMeasurementStartSchema.optional(),
+  historyMeasurementFinish: FreshCodexHistoryMeasurementFinishSchema.optional(),
   chaosLogs: RuntimeChaosLogsSchema.optional(),
   chaosEvidence: RuntimeChaosEvidenceSchema.optional(),
   lossAssertions: RuntimeLossAssertionsSchema.optional(),
@@ -4287,6 +4293,13 @@ export class ManagedRuntimeOwner {
     await this.assertCurrentHandle(handle)
     const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
     if (row?.provider !== 'codex' || row.freshAgentSessionType !== 'freshcodex') throw new Error('exact fresh Codex history fixture required')
+  }
+
+  async finishFreshCodexSavedHistoryMeasurement(enclosure: RuntimeEnclosureHandle, input: FreshCodexHistoryMeasurementFinish): Promise<void> {
+    if (this.runtime.phase !== 3 || !this.fixtureFreshAgentModes.includes('freshcodex')) throw new Error('registered Phase 3 fresh Codex history fixture required')
+    await this.ownedContainerState(enclosure)
+    const measurement = FreshCodexHistoryMeasurementFinishSchema.parse(input)
+    this.runtime.recordLifecycle('browser.saved_history_measurement.finished', measurement)
   }
 
   async startFreshCodexSavedHistoryMeasurement(handle: ExactRuntimeHandle, input: FreshCodexHistoryMeasurementStart): Promise<void> {
