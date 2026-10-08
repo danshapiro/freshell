@@ -7,6 +7,33 @@ use freshell_runtime_protocol::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SignalFileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    eof_sha256: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CapturedSignal {
+    identity: SignalFileIdentity,
+    value: Value,
+}
+
+/// One native publisher writes one immutable ACK for this launch. Retain the
+/// actual file and complete EOF binding across host status reads; a changed ACK
+/// cannot recover identity within the same launch by restoring old JSON bytes.
+#[derive(Default)]
+pub struct AmplifierObservationReader {
+    first: Option<SignalFileIdentity>,
+    refused: bool,
+}
+
 pub const LAUNCH_ENV: &str = "FRESHELL_NATIVE_IDENTITY_LAUNCH";
 pub const SIGNAL_DIR_ENV: &str = "FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR";
 
@@ -75,6 +102,75 @@ fn read_signal(path: &std::path::Path) -> Result<Option<Value>, String> {
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|_| "native signal is malformed".into())
+}
+
+#[cfg(unix)]
+fn capture_signal(path: &std::path::Path) -> Result<Option<CapturedSignal>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let start = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("native signal is unreadable".into()),
+    };
+    if !start.is_file() || start.len() > 65_536 {
+        return Err("native signal is not a bounded regular file".into());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| "native signal open failed")?;
+    let opened = file.metadata().map_err(|_| "native signal stat failed")?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(65_537)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "native signal read failed")?;
+    let end = file.metadata().map_err(|_| "native signal stat failed")?;
+    let current =
+        std::fs::symlink_metadata(path).map_err(|_| "native signal disappeared during read")?;
+    let stat = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    if !opened.is_file()
+        || !current.is_file()
+        || bytes.len() > 65_536
+        || bytes.len() as u64 != end.len()
+        || stat(&start) != stat(&opened)
+        || stat(&opened) != stat(&end)
+        || stat(&end) != stat(&current)
+    {
+        return Err("native signal changed during read".into());
+    }
+    let value = serde_json::from_slice(&bytes).map_err(|_| "native signal is malformed")?;
+    Ok(Some(CapturedSignal {
+        identity: SignalFileIdentity {
+            device: end.dev(),
+            inode: end.ino(),
+            length: end.len(),
+            modified_seconds: end.mtime(),
+            modified_nanoseconds: end.mtime_nsec(),
+            changed_seconds: end.ctime(),
+            changed_nanoseconds: end.ctime_nsec(),
+            eof_sha256: format!("{:x}", Sha256::digest(&bytes)),
+        },
+        value,
+    }))
+}
+
+#[cfg(not(unix))]
+fn capture_signal(_path: &std::path::Path) -> Result<Option<CapturedSignal>, String> {
+    Err("native signal capture requires the managed Unix provider boundary".into())
 }
 
 pub fn read_claude_observation(
@@ -150,47 +246,108 @@ fn read_signal_as_provider(
     let value = if uid == unsafe { libc::geteuid() } && gid == unsafe { libc::getegid() } {
         read_signal(path)?
     } else {
-        let executable =
-            std::env::current_exe().map_err(|_| "native reader executable unavailable")?;
-        let output = std::process::Command::new("/usr/bin/setpriv")
-            .args(crate::provider_identity_args(uid, gid))
-            .arg(executable)
-            .arg("native-identity-read")
-            .arg("--path")
-            .arg(path)
-            .output()
-            .map_err(|_| "native reader did not start")?;
-        if !output.status.success() {
-            return Err("native reader failed under provider identity".into());
-        }
-        serde_json::from_slice::<Option<Value>>(&output.stdout)
+        serde_json::from_slice::<Option<Value>>(&provider_signal_read(path, uid, gid, false)?)
             .map_err(|_| "native reader returned malformed signal")?
     };
     Ok(value)
 }
 
-pub fn run_signal_read_worker(args: &[String]) -> Result<(), String> {
-    if args.len() != 2 || args[0] != "--path" {
-        return Err("native reader requires one current signal path".into());
-    }
-    let signal = read_signal(std::path::Path::new(&args[1]))?;
-    println!(
-        "{}",
-        serde_json::to_string(&signal).map_err(|_| "native signal encoding failed")?
-    );
-    Ok(())
-}
-
-pub fn read_amplifier_observation(
+fn provider_signal_read(
     path: &std::path::Path,
     uid: u32,
     gid: u32,
+    capture: bool,
+) -> Result<Vec<u8>, String> {
+    let executable = std::env::current_exe().map_err(|_| "native reader executable unavailable")?;
+    let mut command = std::process::Command::new("/usr/bin/setpriv");
+    command
+        .args(crate::provider_identity_args(uid, gid))
+        .arg(executable)
+        .arg("native-identity-read")
+        .arg("--path")
+        .arg(path);
+    if capture {
+        command.arg("--capture");
+    }
+    let output = command
+        .output()
+        .map_err(|_| "native reader did not start")?;
+    if !output.status.success() {
+        return Err("native reader failed under provider identity".into());
+    }
+    Ok(output.stdout)
+}
+
+pub fn run_signal_read_worker(args: &[String]) -> Result<(), String> {
+    if !matches!(args.len(), 2 | 3)
+        || args[0] != "--path"
+        || (args.len() == 3 && args[2] != "--capture")
+    {
+        return Err("native reader requires one current signal path".into());
+    }
+    let path = std::path::Path::new(&args[1]);
+    let encoded = if args.len() == 3 {
+        serde_json::to_string(&capture_signal(path)?)
+    } else {
+        serde_json::to_string(&read_signal(path)?)
+    }
+    .map_err(|_| "native signal encoding failed")?;
+    println!("{encoded}");
+    Ok(())
+}
+
+impl AmplifierObservationReader {
+    pub fn read(
+        &mut self,
+        path: &std::path::Path,
+        uid: u32,
+        gid: u32,
+        launch: &NativeIdentityLaunch,
+        expected_source: &str,
+    ) -> Result<Option<NativeIdentityObservation>, String> {
+        if self.refused {
+            return Err("native Amplifier signal changed within launch".into());
+        }
+        let captured = if uid == unsafe { libc::geteuid() } && gid == unsafe { libc::getegid() } {
+            capture_signal(path)
+        } else {
+            (|| {
+                serde_json::from_slice::<Option<CapturedSignal>>(&provider_signal_read(
+                    path, uid, gid, true,
+                )?)
+                .map_err(|_| "native reader returned malformed capture".into())
+            })()
+        };
+        let captured = match captured {
+            Ok(Some(captured)) => captured,
+            Ok(None) if self.first.is_none() => return Ok(None),
+            Ok(None) => {
+                self.refused = true;
+                return Err("native Amplifier signal disappeared within launch".into());
+            }
+            Err(reason) => {
+                self.refused = true;
+                return Err(reason);
+            }
+        };
+        if self
+            .first
+            .as_ref()
+            .is_some_and(|first| first != &captured.identity)
+        {
+            self.refused = true;
+            return Err("native Amplifier signal changed within launch".into());
+        }
+        self.first.get_or_insert(captured.identity);
+        validate_amplifier_observation(&captured.value, launch, expected_source)
+    }
+}
+
+fn validate_amplifier_observation(
+    value: &Value,
     launch: &NativeIdentityLaunch,
     expected_source: &str,
 ) -> Result<Option<NativeIdentityObservation>, String> {
-    let Some(value) = read_signal_as_provider(path, uid, gid)? else {
-        return Ok(None);
-    };
     let actual: NativeIdentityLaunch = serde_json::from_value(value["launch"].clone())
         .map_err(|_| "native Amplifier signal lacks a typed launch")?;
     let native = &value["native"];
@@ -243,13 +400,108 @@ pub fn read_amplifier_observation(
         launch,
         root,
         NativeIdentitySource::AmplifierNativeLoadedContext,
-        &value,
+        value,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amplifier_ack_file_replacement_truncation_or_reset_cannot_recertify_identity() {
+        let mut refused = Vec::new();
+        for fault in [
+            "replacement",
+            "truncation",
+            "reset",
+            "disappearance",
+            "malformed",
+            "oversized",
+            "symlink",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("amplifier-loaded-context.json");
+            let launch = NativeIdentityLaunch {
+                incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+                launch_nonce: "current".into(),
+                evidence_revision: 7,
+                execution_generation: 3,
+                requested_native_session_id: Some("native-root".into()),
+            };
+            let witness = serde_json::json!({"path":"/native/transcript.jsonl","device":1,"inode":2,
+                "size":0,"mtimeNs":1,"ctimeNs":1,"eofSha256":"a".repeat(64)});
+            let mut value = serde_json::json!({"launch":launch,"native":{"session_id":"native-root",
+                "parent_id":null,"source":"resume","cli_pin":"1873aa980535c99a743b17172e4231833f6c8741",
+                "producer_sha256":"1682141140822739c4cd88b7314c3b0daff7ccae1ffb55b7b72f235759123690",
+                "load":{"sessionId":"native-root","parentId":null,"transcript":witness,
+                    "metadata":witness,"messageCount":0},"acceptedMessageCount":0}});
+            let mut bytes = serde_json::to_vec(&value).unwrap();
+            bytes.extend_from_slice(b"\n \n");
+            std::fs::write(&path, &bytes).unwrap();
+            let mut reader = AmplifierObservationReader::default();
+            let mut read = || {
+                reader
+                    .read(
+                        &path,
+                        unsafe { libc::geteuid() },
+                        unsafe { libc::getegid() },
+                        &launch,
+                        "resume",
+                    )
+                    .ok()
+                    .flatten()
+            };
+            assert!(read().is_some(), "first current native acknowledgement");
+            assert!(read().is_some(), "unchanged native ACK remains observed");
+            match fault {
+                "replacement" => {
+                    let replacement = path.with_extension("replacement");
+                    std::fs::write(&replacement, &bytes).unwrap();
+                    std::fs::rename(replacement, &path).unwrap();
+                }
+                "truncation" => {
+                    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                    file.set_len((bytes.len() - 3) as u64).unwrap();
+                }
+                "reset" => {
+                    value["native"]["acceptedMessageCount"] = serde_json::json!(1);
+                    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "disappearance" => std::fs::remove_file(&path).unwrap(),
+                "malformed" => std::fs::write(&path, b"owned invalid envelope\n").unwrap(),
+                "oversized" => std::fs::write(&path, vec![b' '; 65_537]).unwrap(),
+                "symlink" => {
+                    let old = path.with_extension("original");
+                    std::fs::rename(&path, &old).unwrap();
+                    std::os::unix::fs::symlink(old, &path).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            refused.push((fault, read().is_none()));
+            if path.exists() {
+                std::fs::remove_file(&path).unwrap();
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(
+                read().is_none(),
+                "restoring old bytes must not repair this launch"
+            );
+        }
+        assert_eq!(
+            refused,
+            vec![
+                ("replacement", true),
+                ("truncation", true),
+                ("reset", true),
+                ("disappearance", true),
+                ("malformed", true),
+                ("oversized", true),
+                ("symlink", true)
+            ],
+            "no replaced, truncated or reset native ACK may recertify identity"
+        );
+    }
 
     #[test]
     fn amplifier_observation_requires_current_native_loaded_context() {
@@ -272,16 +524,30 @@ mod tests {
                 "metadata":witness,"messageCount":0},"acceptedMessageCount":0}});
         let read = |value: &Value| {
             std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
-            read_amplifier_observation(
-                &path,
-                unsafe { libc::geteuid() },
-                unsafe { libc::getegid() },
-                &launch,
-                "resume",
-            )
-            .unwrap()
+            AmplifierObservationReader::default()
+                .read(
+                    &path,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                    &launch,
+                    "resume",
+                )
+                .unwrap()
         };
         let observed = read(&value).expect("accepted actual native loader/context observation");
+        let missing = path.with_extension("not-yet-created");
+        let mut reader = AmplifierObservationReader::default();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        assert!(reader
+            .read(&missing, uid, gid, &launch, "resume")
+            .unwrap()
+            .is_none());
+        std::fs::write(&missing, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(reader
+            .read(&missing, uid, gid, &launch, "resume")
+            .unwrap()
+            .is_some());
         assert_eq!(observed.native_session_id, "native-root");
         assert_eq!(
             observed.source,

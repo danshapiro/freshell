@@ -56,6 +56,7 @@ pub struct HostedPty {
     native_identity_launch: Option<freshell_runtime_protocol::NativeIdentityLaunch>,
     provider_mode: String,
     native_signal: Option<(PathBuf, u32, u32, String)>,
+    amplifier_signal_reader: Mutex<crate::providers::native_identity::AmplifierObservationReader>,
     native_cwd: PathBuf,
     opencode_adoption: Option<Arc<Mutex<OpenCodeAdoptionGate>>>,
     codex: Option<CodexLifecycle>,
@@ -314,6 +315,7 @@ impl HostedPty {
             native_identity_launch,
             provider_mode: launch.mode.clone(),
             native_signal,
+            amplifier_signal_reader: Mutex::default(),
             native_cwd: PathBuf::from(&launch.cwd),
             opencode_adoption,
             codex,
@@ -458,9 +460,10 @@ impl HostedPty {
         let launch = self.native_identity_launch.as_ref()?;
         if let Some((path, uid, gid, source)) = self.native_signal.as_ref() {
             let result = if self.provider_mode == "amplifier" {
-                crate::providers::native_identity::read_amplifier_observation(
-                    path, *uid, *gid, launch, source,
-                )
+                self.amplifier_signal_reader
+                    .lock()
+                    .map_err(|_| "native Amplifier reader state unavailable".to_string())
+                    .and_then(|mut reader| reader.read(path, *uid, *gid, launch, source))
             } else {
                 crate::providers::native_identity::read_claude_observation(
                     path,
@@ -475,7 +478,7 @@ impl HostedPty {
                 Ok(observation) if !self.exited() => observation,
                 Ok(_) => None,
                 Err(reason) => {
-                    tracing::warn!(incarnation_id=%launch.incarnation_id,launch_nonce=%launch.launch_nonce,provider=%self.provider_mode,reason,"managed_provider.native_identity_blocked");
+                    tracing::warn!(incarnation_id=%launch.incarnation_id,launch_nonce=%launch.launch_nonce,evidence_revision=launch.evidence_revision,execution_generation=launch.execution_generation,provider=%self.provider_mode,reason,"managed_provider.native_identity_blocked");
                     None
                 }
             };
