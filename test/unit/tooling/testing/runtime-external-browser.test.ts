@@ -1942,6 +1942,47 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('checks private replacement source readiness on the exact owner stream without exposing terminal text', async () => {
+    const { owned, context, inventory, request } = fixture()
+    Object.assign(owned.runtime, { phase: 5 })
+    const row = { soulId: 'readiness-soul', incarnationId: 'readiness-incarnation', containerId: 'b'.repeat(64),
+      hostBootId: 'readiness-boot', terminalId: 'readiness-terminal', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+    inventory.mockResolvedValue([row])
+    const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+      createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: '/private/readiness/runtime' }
+    Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+    vi.spyOn(owned, 'controlEpoch').mockResolvedValue(4)
+    const output = { incarnationId: row.incarnationId, streamEpoch: 'owned-host-stream', terminalId: row.terminalId,
+      exited: false, headSeq: 12, frames: [{ streamEpoch: 'owned-host-stream', terminalId: row.terminalId,
+        data: '\x1b[?2004hBuild GPT-5.6 Luna\nprivate terminal conversation body' }] }
+    const admin = vi.spyOn(owned.runtime, 'adminOk').mockResolvedValue({ kind: 'terminal_output', data: output })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const wire: unknown[] = []
+    const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
+      const reply = await control(JSON.parse(String(init.body)))
+      wire.push(reply)
+      return new Response(JSON.stringify(reply), { status: 200 })
+    })
+    const enclosure = rig.runtimeEnclosureHandle(row)
+    await expect(rig.openCodeReplacementReadiness(enclosure, row.terminalId)).resolves.toEqual({ incarnationId: row.incarnationId,
+      streamEpoch: 'owned-host-stream', terminalId: row.terminalId, exited: false, headSeq: 12, sourceReady: true })
+    expect(admin).toHaveBeenCalledWith(owned.supervisor, { method: 'terminal_read_output', params: {
+      soulId: row.soulId, afterSeq: 0, maxBytes: 256 * 1024, expectedControlEpoch: 4 } })
+    expect(JSON.stringify(wire)).not.toContain('private')
+    expect(JSON.stringify(wire)).not.toContain('Build')
+    output.frames[0].data += '\x1b[?2004l'
+    expect(await rig.openCodeReplacementReadiness(enclosure, row.terminalId)).toMatchObject({ sourceReady: false })
+    output.frames[0].streamEpoch = 'foreign-stream'
+    await expect(owned.openCodeReplacementReadiness(enclosure, row.terminalId)).rejects.toThrow(/frame.*ownership/)
+    output.frames[0].streamEpoch = output.streamEpoch
+    output.incarnationId = 'foreign-incarnation'
+    await expect(owned.openCodeReplacementReadiness(enclosure, row.terminalId)).rejects.toThrow(/source.*identity/)
+    admin.mockClear()
+    inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement-boot' }])
+    await expect(owned.openCodeReplacementReadiness(enclosure, row.terminalId)).rejects.toThrow(/current/)
+    await expect(control({ ...request, action: 'opencode-replacement-readiness', enclosure, path: '/foreign' })).rejects.toThrow(/operation/)
+    expect(admin).not.toHaveBeenCalled()
+  })
   it('executes only the existing fixed OpenCode blocker matrix on the owner and refuses failed prerequisites', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-qualification-blockers-'))
     try {

@@ -26,6 +26,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema,
   OpencodeContinuityStartupFactsSchema, OpencodeContinuityFirstReplySchema, RuntimeTerminalContinuityObservationSchema,
   OpencodeQualificationStartupFactsSchema,
+  OpencodeReplacementReadinessSchema,
   requireOpenCodeOnecliBootstrap, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
@@ -718,7 +719,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'continuityObservation'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'continuityObservation' | 'qualificationTerminalId'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -916,6 +917,9 @@ export class ExternalManagedRuntimeRig {
   }
   async runOpenCodeQualificationBlockers(): Promise<string[]> {
     return this.rpc('opencode-qualification-blockers', z.array(z.string().min(1)).length(3))
+  }
+  async openCodeReplacementReadiness(enclosure: RuntimeEnclosureHandle, qualificationTerminalId: string): Promise<z.infer<typeof OpencodeReplacementReadinessSchema>> {
+    return this.rpc('opencode-replacement-readiness', OpencodeReplacementReadinessSchema, { enclosure, qualificationTerminalId })
   }
   async openCodeContinuityFirstTurnCompleted(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
     return this.rpc('opencode-continuity-first-turn', z.boolean(), { enclosure })
@@ -1298,6 +1302,10 @@ export function createExternalRuntimeControl(
         break
       case 'opencode-qualification-blockers':
         result = await owner.runOpenCodeQualificationBlockers()
+        break
+      case 'opencode-replacement-readiness':
+        if (!request.enclosure || !request.qualificationTerminalId) throw new Error('exact OpenCode enclosure and observed terminal required')
+        result = await owner.openCodeReplacementReadiness(request.enclosure, request.qualificationTerminalId)
         break
       case 'opencode-continuity-effect-count':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')

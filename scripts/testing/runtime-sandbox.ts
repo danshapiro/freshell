@@ -880,6 +880,11 @@ export const OpencodeQualificationStartupFactsSchema = z.object({
   limits: z.object({ cpuMax: z.string(), memoryMax: z.string(), swapMax: z.string(), pidsMax: z.string() }).strict(),
 }).strict()
 export type OpencodeQualificationStartupFacts = z.infer<typeof OpencodeQualificationStartupFactsSchema>
+export const OpencodeReplacementReadinessSchema = z.object({
+  incarnationId: z.string().min(1), streamEpoch: z.string().min(1), terminalId: z.string().min(1),
+  exited: z.boolean(), headSeq: z.union([z.number().int().nonnegative(), z.string().regex(/^\d+$/)]), sourceReady: z.boolean(),
+}).strict()
+export type OpencodeReplacementReadiness = z.infer<typeof OpencodeReplacementReadinessSchema>
 const TerminalContinuityIdentitySchema = z.object({
   soulId: z.string().min(1), incarnationId: z.string().min(1),
   containerId: z.string().regex(/^[a-f0-9]{64}$/), hostBootId: z.string().min(1),
@@ -974,6 +979,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'opencode-qualification-startup',
     'opencode-qualification-limits',
     'opencode-qualification-blockers',
+    'opencode-replacement-readiness',
     'terminal-continuity-receipt',
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
@@ -1009,6 +1015,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   lossAssertions: RuntimeLossAssertionsSchema.optional(),
   freshAgentObservations: z.array(RuntimeFreshAgentObservationSchema).optional(),
   continuityObservation: RuntimeTerminalContinuityObservationSchema.optional(),
+  qualificationTerminalId: z.string().min(1).max(200).optional(),
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
@@ -3660,6 +3667,28 @@ export class ManagedRuntimeOwner {
     const raw = this.ownedContainerExec(handle.containerId, ['sh', '-lc',
       `printf '{"cpuMax":"%s","memoryMax":"%s","swapMax":"%s","pidsMax":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/memory.swap.max)" "$(cat /sys/fs/cgroup/pids.max)"`])
     return OpencodeQualificationStartupFactsSchema.shape.limits.parse(JSON.parse(raw))
+  }
+  async openCodeReplacementReadiness(handle: RuntimeEnclosureHandle, terminalId: string): Promise<OpencodeReplacementReadiness> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    const result = await this.runtime.adminOk(this.supervisor,
+      this.runtime.terminalReadOutputBody(handle.soulId, 0, 256 * 1024, await this.controlEpoch()))
+    const output = OpencodeReplacementReadinessSchema.omit({ sourceReady: true }).extend({
+      frames: z.array(z.object({ streamEpoch: z.string(), terminalId: z.string(), data: z.string() }).passthrough()).optional(),
+    }).passthrough().parse(this.dataOf(result, 'terminal_output'))
+    const sourceText = (output.frames ?? []).map(frame => {
+      if (frame.streamEpoch !== output.streamEpoch || frame.terminalId !== terminalId) {
+        throw new Error('replacement prompt frame has mismatched ownership')
+      }
+      return frame.data
+    }).join('').slice(-512 * 1024)
+    if (output.incarnationId !== handle.incarnationId || output.terminalId !== terminalId) {
+      throw new Error('replacement source identity does not match the current owner')
+    }
+    const { openCodeTerminalReady } = await import('./provider-native-history.js')
+    return OpencodeReplacementReadinessSchema.parse({ incarnationId: output.incarnationId, streamEpoch: output.streamEpoch,
+      terminalId: output.terminalId, exited: output.exited, headSeq: output.headSeq,
+      sourceReady: openCodeTerminalReady(sourceText, ['GPT-5.6 Luna', P2_OPENCODE_MODEL]) })
   }
   async runOpenCodeQualificationBlockers(): Promise<string[]> {
     if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')

@@ -26,7 +26,6 @@ import {
   hasOpenCodePromptModelText,
   nativeTurnProof,
   openCodeCredentialFailureMessage,
-  openCodeTerminalReady,
   OPENCODE_NATIVE_HISTORY_SCRIPT,
   selectNativeAssistantTurn,
   type NativeAssistantTurn,
@@ -299,17 +298,8 @@ async function waitForReplacementPrompt(
     // The host epoch is distinct from the supervisor's stable launch ID. Read
     // it once after the browser reports the changed stream, so the QA probe
     // does not compete with the server's live output poll.
-    const output = dataOf(await rig.runtime.adminOk(
-      rig.supervisor,
-      rig.runtime.terminalReadOutputBody(view.soulId, 0, 256 * 1024, await rig.controlEpoch()),
-    ), 'terminal_output')
-    const sourceText = (output.frames ?? []).map((frame: { streamEpoch: string; terminalId: string; data: string }) => {
-      if (frame.streamEpoch !== output.streamEpoch || frame.terminalId !== terminalId) {
-        throw new Error('replacement prompt frame has mismatched ownership')
-      }
-      return frame.data
-    }).join('').slice(-512 * 1024)
-    const sourceReady = openCodeTerminalReady(sourceText, modelTexts)
+    const output = await rig.openCodeReplacementReadiness(rig.runtimeEnclosureHandle(view), terminalId)
+    const sourceReady = output.sourceReady
     diagnostic = {
       ...diagnostic,
       sourceIncarnationId: output.incarnationId,
