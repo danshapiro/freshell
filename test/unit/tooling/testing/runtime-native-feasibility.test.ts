@@ -27,6 +27,37 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['exact-resume', 'native-followup'])('requires the owned controller before Amplifier %s can seed', async (caseId) => {
+    const start = vi.fn()
+    await expect(executeManagedNativeCase({ startSupervisor: start } as unknown as RuntimeHarness, [],
+      { provider: 'amplifier', case: 'startup' }, caseId)).rejects.toThrow('actual terminal recovery requires the owned real server artifact')
+    expect(start).not.toHaveBeenCalled()
+  })
+  it('preserves selected Amplifier create profile and refuses a missing follow-up controller before workspace allocation', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-case-route-'))
+    const source = path.join(directory, 'selected-profile'); fs.writeFileSync(source, 'fixture-only selected profile')
+    const workspaces: string[] = []
+    const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '',
+      adminOk: async (_supervisor: unknown, request: any) => {
+        workspaces.push(request.params.terminal.cwd)
+        expect(request.params.terminal.providerBootstrapFiles).toBeUndefined()
+        expect(request.params.terminal.providerLaunchContext.config.map((file: any) => file.providerRelativePath))
+          .toEqual(['.amplifier/settings.yaml', '.amplifier/bundles/default.yaml'])
+        throw new Error('controlled native Amplifier launch boundary')
+      } } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', '.amplifier/settings.yaml', '.amplifier/bundles/default.yaml']
+      .map(name => ({ name: 'amplifier/' + name, path: source, sha256: 'e'.repeat(64) }))
+    try {
+      await expect(executeManagedNativeCase(harness, sources, { provider: 'amplifier', case: 'startup' }, 'create'))
+        .rejects.toThrow('controlled native Amplifier launch boundary')
+      // The next independent harness uses the same parent; it must not reuse
+      // the prior case's source/profile/workspace directory.
+      await expect(executeManagedNativeCase(harness, sources, { provider: 'amplifier', case: 'native-turn' }, 'current-native-turn'))
+        .rejects.toThrow('actual terminal recovery requires the owned real server artifact')
+      expect(workspaces).toEqual([path.join(directory, 'amplifier-create-workspace')])
+      expect(fs.existsSync(path.join(directory, 'amplifier-current-native-turn-workspace'))).toBe(false)
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['ordinary-create','ordinary-resume','owned-fork','owned-duplicate','wrong-root','missing-launch','wrong-pin'])('executes only the fixed owned SDK resume-fork fault (%s)', (fault) => {
     const root=path.join('/tmp/frs',randomUUID().slice(0,12));const workspace=path.join(root,'freshclaude-'+(fault==='ordinary-resume'?'exact-resume':'wrong-id')+'-workspace')
     fs.mkdirSync(workspace,{recursive:true,mode:0o700})
