@@ -481,6 +481,7 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
     fs.writeFileSync(path.join(local, 'settings.json'), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{
       type: 'command', command: "node '" + hookPath.replaceAll("'", "'\\''") + "'",
     }] }] } }), { mode: 0o660 })
+    fs.chmodSync(path.join(local, 'settings.json'), 0o660)
   }
   if (trustRefusal) {
     const profile = JSON.parse(fs.readFileSync(preferencePath, 'utf8'))
