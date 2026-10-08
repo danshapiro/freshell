@@ -253,10 +253,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       const exactAbsenceChecks = await rig.lossAbsenceEvidence(rig.runtimeEnclosureHandle(before))
       expect(exactAbsenceChecks.every((row) => row.state === 'absent')).toBe(true)
 
-      const result = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.recoverBody(before.soulId, 'provider_exit', await rig.controlEpoch()),
-      ), 'recovery')
+      const result = await rig.recoverLoss(workerHandle)
       expect(result.outcome).toBe('lost')
       expect(result.incidentId).toMatch(/^incident-/)
       expect(result.view.cleanupState).toBe('verified_empty')

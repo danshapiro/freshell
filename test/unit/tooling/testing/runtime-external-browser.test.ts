@@ -1353,6 +1353,46 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('requests the fixed loss recovery with the owner epoch and projects only its observed fields', async () => {
+    const { owned, context, inventory, request } = fixture()
+    const row = { soulId: 'recovery-soul', incarnationId: 'recovery-incarnation', containerId: 'b'.repeat(64),
+      hostBootId: 'recovery-boot', nativeSessionId: 'recovery-root', provider: 'opencode', launchState: 'running', intentRevision: 4 }
+    inventory.mockResolvedValue([row])
+    const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+      createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: '/owned/runtime' }
+    Object.assign(owned.runtime, { phase: 5, broker: { receipts: () => [receipt] } })
+    const epoch = vi.spyOn(owned, 'controlEpoch').mockResolvedValue(12)
+    const observed = { outcome: 'lost', incidentId: 'incident-observed', view: { cleanupState: 'verified_empty',
+      nativeSessionId: row.nativeSessionId, intentRevision: 5 } }
+    const admin = vi.spyOn(owned.runtime, 'adminOk').mockResolvedValue({ kind: 'recovery', data: {
+      ...observed, privateDiagnostics: 'owner-only', view: { ...observed.view, privateConfig: 'owner-only' } } })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const wire: unknown[] = []
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      const reply = await control(JSON.parse(String(init.body)))
+      wire.push(reply)
+      return new Response(JSON.stringify(reply), { status: 200 })
+    })
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    const handle = rig.exactRuntimeHandle(row)
+    await expect(rig.recoverLoss(handle)).resolves.toEqual(observed)
+    expect(admin.mock.calls[0][1]).toEqual({ method: 'recover', params: { soulId: row.soulId,
+      trigger: 'provider_exit', expectedControlEpoch: 12 } })
+    expect(JSON.stringify(wire)).not.toContain('owner-only')
+    admin.mockResolvedValue({ kind: 'recovery', data: { ...observed, outcome: 'blocked' } })
+    await expect(rig.recoverLoss(handle)).resolves.toMatchObject({ outcome: 'blocked' })
+    admin.mockResolvedValue({ kind: 'recovery', data: { ...observed, view: { ...observed.view, intentRevision: -1 } } })
+    await expect(owned.recoverLoss(handle)).rejects.toThrow()
+    admin.mockResolvedValue({ kind: 'health', data: observed })
+    await expect(owned.recoverLoss(handle)).rejects.toThrow(/expected recovery/)
+    admin.mockClear()
+    epoch.mockClear()
+    inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement-boot' }])
+    await expect(owned.recoverLoss(handle)).rejects.toThrow(/current/)
+    await expect(control({ ...request, action: 'loss-recover', handle, trigger: 'explicit_request' })).rejects.toThrow(/operation/)
+    expect(epoch).not.toHaveBeenCalled()
+    expect(admin).not.toHaveBeenCalled()
+  })
   it('runs the closed Phase3 effect operations over the same pre-native enclosure', async () => {
     const { owned, context, request } = fixture()
     const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',
