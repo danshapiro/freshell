@@ -497,8 +497,12 @@ async fn apply_prepared_callback(
             AcceptedOrigins::Claude(manifest) => (
                 &manifest.original_home,
                 OpencodeEphemeralInput {
-                    cwd: Some(&manifest.cwd),
-                    workspace: Some(&manifest.workspace),
+                    cwd: Some(callback.cwd.as_deref().ok_or(
+                        "Claude current launch directory unavailable; retain inputs and reprepare",
+                    )?),
+                    workspace: Some(callback.workspace.as_deref().ok_or(
+                        "Claude current workspace unavailable; retain inputs and reprepare",
+                    )?),
                     claude_manifest: Some(manifest),
                     claude_inline_settings: inline_settings.as_deref(),
                     claude_reservation_provider: callback
@@ -7107,18 +7111,40 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         use freshell_runtime_protocol::{
             PreparedProviderContext, ProviderLaunchContext, ProviderPreparation,
         };
-        let owned = tempfile::tempdir().unwrap();
+        let owned = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+            Some(root) => tempfile::tempdir_in(root).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
         let home = owned.path().join("original-home");
         let selected = owned.path().join("selected-config");
         let wrong = owned.path().join("current-home");
         let workspace = owned.path().join("workspace");
+        let resume_cwd = workspace.join("resume");
+        let resumed_hooks = resume_cwd.join(".claude/hooks");
         for path in [
             &selected.join("skills/probe"),
             &home,
             &wrong.join(".claude"),
             &workspace,
+            &resumed_hooks.join("node_modules/resume-dependency"),
         ] {
             std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(resumed_hooks.join("resource"), "resumed-hook-resource").unwrap();
+        std::fs::write(
+            resumed_hooks.join("node_modules/resume-dependency/index.js"),
+            "module.exports='resumed-installed-dependency'",
+        )
+        .unwrap();
+        std::fs::write(resumed_hooks.join("consume.cjs"), "#!/usr/bin/env node\nprocess.stdout.write(require('node:fs').readFileSync(__dirname+'/resource','utf8')+':'+require('resume-dependency'))").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                resumed_hooks.join("consume.cjs"),
+                std::fs::Permissions::from_mode(0o750),
+            )
+            .unwrap();
         }
         std::fs::write(
             selected.join("settings.json"),
@@ -7189,7 +7215,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             .unwrap();
         let context = read_prepared_context(&directory, &prior).unwrap();
         assert!(context.prepared_inputs.is_some());
-        let callback=serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,"provider":"claude","workspace":workspace,"cwd":workspace,"priorContext":context,"providerSecretReferences":[]})).unwrap();
+        let callback=serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,"provider":"claude","workspace":workspace,"cwd":resume_cwd,"priorContext":context,"providerSecretReferences":[]})).unwrap();
         let client = freshell_runtime_client::RuntimeClient::new(
             owned.path().join("unused.sock"),
             "fixture-control",
@@ -7260,6 +7286,26 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             .arg(stage.join(INLINE_SETTINGS_SOURCE)).arg(stage.join(&mount.stage_relative_path).join("probe")).output().unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"retained-inline:retained-original-resource");
+        let hook_mount = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| Path::new(&mount.logical_destination) == resumed_hooks)
+            .expect(
+                "recovery callback must transport project hooks from its actual resume directory",
+            );
+        std::fs::remove_dir_all(&resume_cwd).unwrap();
+        let output = std::process::Command::new(
+            stage
+                .join(&hook_mount.stage_relative_path)
+                .join("consume.cjs"),
+        )
+        .output()
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            b"resumed-hook-resource:resumed-installed-dependency"
+        );
         let accepted = ready
             .provider_launch_context
             .mcp_capability
