@@ -12,6 +12,219 @@ fn fail(reason: &'static str) -> BackendError {
     BackendError::Unavailable(reason.into())
 }
 
+fn qualify_candidate_stage(
+    root: &Path,
+    owner: &ClaudeSourceOwner,
+    request: &ObserveClaudeSourcesRequest,
+) -> Result<freshell_runtime_protocol::ClaudeCandidateProjectionRequest, BackendError> {
+    use freshell_platform::claude_inputs::ClaudeInputManifest;
+    use freshell_runtime_protocol::{
+        bounded_json_bytes, ClaudeCandidatePublication, MAX_CONTROL_FRAME_BYTES,
+    };
+    let blocked =
+        || fail("Claude candidate publication changed or unavailable; retain inputs and reprepare");
+    request.validate().map_err(|_| blocked())?;
+    let binding = request
+        .observation_request
+        .candidate_binding
+        .as_ref()
+        .ok_or_else(blocked)?;
+    let publication_bytes = read_candidate_metadata(
+        root,
+        ".freshell/claude-candidate-binding.json",
+        MAX_CONTROL_FRAME_BYTES,
+    )?;
+    if format!("{:x}", Sha256::digest(&publication_bytes)) != binding.publication_sha256 {
+        return Err(blocked());
+    }
+    let publication: ClaudeCandidatePublication =
+        serde_json::from_slice(&publication_bytes).map_err(|_| blocked())?;
+    let projection = request
+        .candidate_projection(publication)
+        .map_err(|_| blocked())?;
+    let published = &projection.publication;
+    match owner {
+        ClaudeSourceOwner::Initial { reservation, .. } => {
+            if reservation.soul_id != request.soul_id
+                || reservation.provider != request.provider
+                || published.initial_reservation_id.as_deref() != Some(reservation.id.as_str())
+                || published.registry_attempt_id.is_some()
+                || published.prior_generation_id.is_some()
+                || published.intent_revision != 1
+            {
+                return Err(blocked());
+            }
+        }
+        ClaudeSourceOwner::Retained {
+            handle,
+            recovery_source,
+        } => {
+            let expected = recovery_source.as_ref().ok_or_else(blocked)?;
+            expected.validate().map_err(|_| blocked())?;
+            let context = handle
+                .terminal()
+                .and_then(|spec| spec.provider_launch_context.as_ref())
+                .or_else(|| {
+                    handle
+                        .fresh_agent()
+                        .and_then(|spec| spec.provider_launch_context.as_ref())
+                });
+            if handle.soul_id() != &request.soul_id
+                || published.initial_reservation_id.is_some()
+                || published.provider != expected.provider
+                || published.git_common_dir != expected.git_common_dir
+                || published.authority_sha256 != expected.authority_sha256
+                || published.registry_attempt_id.as_ref() != Some(&expected.registry_attempt_id)
+                || published.intent_revision != expected.intent_revision
+                || published.prior_generation_id.as_deref()
+                    != Some(expected.prior_generation_id.as_str())
+                || context
+                    .and_then(|context| context.prepared_inputs.as_ref())
+                    .map(|inputs| inputs.generation_id.as_str())
+                    != Some(expected.prior_generation_id.as_str())
+            {
+                return Err(blocked());
+            }
+        }
+    }
+    let inputs = projection
+        .provider_launch_context
+        .prepared_inputs
+        .as_ref()
+        .ok_or_else(blocked)?;
+    for (relative, digest) in [
+        (
+            ".freshell/prepared-context.json",
+            published.prepared_context_sha256.as_str(),
+        ),
+        (
+            ".freshell/prepared-result.json",
+            published.prepared_result_sha256.as_str(),
+        ),
+    ] {
+        let bytes = read_candidate_metadata(root, relative, MAX_CONTROL_FRAME_BYTES)?;
+        if format!("{:x}", Sha256::digest(bytes)) != digest {
+            return Err(blocked());
+        }
+    }
+    let manifest_bytes =
+        read_candidate_metadata(root, &inputs.manifest.relative_path, 64 * 1024 * 1024)?;
+    if format!("{:x}", Sha256::digest(&manifest_bytes)) != published.manifest_sha256 {
+        return Err(blocked());
+    }
+    let manifest: ClaudeInputManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|_| blocked())?;
+    manifest.validate().map_err(|_| blocked())?;
+    let plan = manifest.accepted_native_plan.as_ref().ok_or_else(blocked)?;
+    let selectors = bounded_json_bytes(&manifest.original_selectors(), 64 * 1024 * 1024)
+        .map_err(|_| blocked())?;
+    let source = &request.observation_request;
+    if plan.selector_manifest_sha256 != format!("{:x}", Sha256::digest(selectors))
+        || plan.selector_manifest_sha256 != source.selector_manifest_sha256
+        || plan.plan_revision != source.plan_revision
+        || manifest.workspace != Path::new(&request.workspace_path)
+        || manifest.setting_sources != source.setting_sources
+        || plan.observation.setting_sources != source.setting_sources
+        || plan.observation.native_source_runtime != source.native_source_runtime
+        || plan.observation.cwd != source.cwd
+        || plan.observation.home.as_deref() != Some(source.home.as_path())
+        || (
+            plan.observation.uid,
+            plan.observation.euid,
+            plan.observation.gid,
+            plan.observation.egid,
+        ) != (65534, 65534, 0, 0)
+    {
+        return Err(blocked());
+    }
+    docker::ordinary_claude_candidate_mounts(
+        Path::new(&request.workspace_path),
+        request.git_common_dir.as_deref().map(Path::new),
+        root,
+        &projection.provider_launch_context,
+    )
+    .map_err(|_| blocked())?;
+    Ok(projection)
+}
+
+fn read_candidate_metadata(
+    root: &Path,
+    relative: &str,
+    limit: usize,
+) -> Result<Vec<u8>, BackendError> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let blocked = || {
+        fail("Claude candidate private metadata unavailable or exceeds profile; retain inputs and reprepare")
+    };
+    if !Path::new(relative)
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+        || canonical_dir(root).map_err(|_| blocked())? != root
+    {
+        return Err(blocked());
+    }
+    let path = root.join(relative);
+    let before = std::fs::symlink_metadata(&path).map_err(|_| blocked())?;
+    if !before.is_file()
+        || before.file_type().is_symlink()
+        || before.len() > limit as u64
+        || std::fs::canonicalize(&path).map_err(|_| blocked())? != path
+    {
+        return Err(blocked());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|_| blocked())?;
+    let opened = file.metadata().map_err(|_| blocked())?;
+    if (opened.dev(), opened.ino(), opened.len()) != (before.dev(), before.ino(), before.len()) {
+        return Err(blocked());
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(before.len() as usize)
+        .map_err(|_| blocked())?;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut chunk).map_err(|_| blocked())?;
+        if count == 0 {
+            break;
+        }
+        let next = bytes
+            .len()
+            .checked_add(count)
+            .filter(|length| *length <= limit)
+            .ok_or_else(blocked)?;
+        if next > bytes.capacity() {
+            bytes.try_reserve_exact(count).map_err(|_| blocked())?;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    let after = std::fs::symlink_metadata(&path).map_err(|_| blocked())?;
+    if bytes.len() > limit
+        || after.file_type().is_symlink()
+        || (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec(),
+        ) != (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec(),
+        )
+        || bytes.len() as u64 != before.len()
+    {
+        return Err(blocked());
+    }
+    Ok(bytes)
+}
+
 fn owned_helper(actual: &Value, expected: &Value) -> bool {
     input_publisher::owned_helper(actual, expected)
         && actual["Config"]["WorkingDir"] == expected["WorkingDir"]
@@ -86,6 +299,17 @@ impl DockerEngineBackend {
             .validate()
             .map_err(|_| fail("Claude source request invalid"))?;
         if request.candidate.is_some() {
+            let grant = request
+                .candidate
+                .as_ref()
+                .and_then(|candidate| candidate.provider_launch_context.mcp_capability.as_ref())
+                .ok_or_else(|| {
+                    fail("Claude candidate grant unavailable; retain inputs and reprepare")
+                })?;
+            let root = docker::staged_provider_root_for_grant(&grant.grant_id).map_err(|_| {
+                fail("Claude candidate stage unavailable; retain inputs and reprepare")
+            })?;
+            qualify_candidate_stage(&root, owner, request)?;
             return Err(fail("Claude candidate source topology is not yet qualified; retain inputs and reprepare"));
         }
         let name = format!("freshell-claude-source-{}", uuid::Uuid::new_v4());

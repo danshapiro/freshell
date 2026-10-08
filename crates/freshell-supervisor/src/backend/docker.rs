@@ -246,6 +246,52 @@ struct PreparedInputMounts {
     indexed_files: Option<freshell_runtime_protocol::IndexedProviderFiles>,
 }
 
+/// The ordinary subset of the workload's existing prepared mount plan. This
+/// does not resolve credentials, read a capability file, or consult user HOME.
+pub(super) fn ordinary_claude_candidate_mounts(
+    workspace: &Path,
+    git_common_dir: Option<&Path>,
+    stage: &Path,
+    context: &ProviderLaunchContext,
+) -> Result<TerminalMounts, String> {
+    context.validate("claude").map_err(|error| error.message)?;
+    let inputs = context
+        .prepared_inputs
+        .as_ref()
+        .ok_or("Claude candidate ordinary inputs unavailable")?;
+    if inputs.indexed_files.is_some()
+        || inputs.manifest.source_count != 0
+        || inputs.manifest.alias_count != 0
+        || inputs.manifest.recipe_count != 0
+    {
+        return Err("Claude candidate contains unavailable ordinary file selections".into());
+    }
+    if canonical_dir(workspace, "candidate workspace")? != workspace
+        || canonical_dir(stage, "candidate stage")? != stage
+    {
+        return Err("Claude candidate ordinary namespace changed".into());
+    }
+    if let Some(common) = git_common_dir {
+        if canonical_dir(common, "candidate common directory")? != common {
+            return Err("Claude candidate ordinary common directory changed".into());
+        }
+    }
+    let prepared = prepared_input_mounts(workspace, Some(stage), Some(inputs))?;
+    Ok(TerminalMounts {
+        workspace: workspace.into(),
+        git_common_dir: git_common_dir.map(Path::to_path_buf),
+        provider_bootstrap_files: vec![],
+        provider_secret_files: vec![],
+        indexed_secret_sources: Default::default(),
+        provider_user_root: Some(stage.into()),
+        mcp_capability_file: None,
+        input_manifest: prepared.input_manifest,
+        config_binds: prepared.config_binds,
+        resource_mounts: prepared.resource_mounts,
+        indexed_files: None,
+    })
+}
+
 fn prepared_input_mounts(
     workspace: &Path,
     root: Option<&Path>,
