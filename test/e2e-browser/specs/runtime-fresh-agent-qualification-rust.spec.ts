@@ -9,7 +9,6 @@ import { expect, type Page } from '@playwright/test'
 
 import {
   FRESH_AGENT_INGRESS_INVENTORY,
-  validateFreshAgentIngressInventory,
 } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
 import type { FreshAgentQualificationRow } from '../../../scripts/testing/fresh-agent-qualification-receipt.js'
 import {
@@ -235,7 +234,6 @@ test.describe.serial('authentic fresh-agent qualification', () => {
     test.skip(process.env[FRESH_AGENT_QUALIFICATION_LIVE_ENV] !== '1', `set ${FRESH_AGENT_QUALIFICATION_LIVE_ENV}=1 explicitly`)
     test.setTimeout(3_600_000)
     const definitions = selectedDefinitions()
-    validateFreshAgentIngressInventory(process.cwd())
     const rig = new ManagedRuntimeBrowserRig(process.cwd(), 5, {}, {
       FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750',
     }, 'release', {
@@ -245,6 +243,7 @@ test.describe.serial('authentic fresh-agent qualification', () => {
         model: row.model, effort: row.effort === 'provider-default' ? undefined : row.effort,
       }])),
     })
+    await rig.validateFreshAgentIngressInventory()
     const rows: FreshAgentQualificationRow[] = []
     try {
       const info = await rig.start()

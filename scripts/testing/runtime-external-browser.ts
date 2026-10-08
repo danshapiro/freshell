@@ -858,6 +858,9 @@ export class ExternalManagedRuntimeRig {
   async freshAgentLaunchFacts(enclosure: RuntimeEnclosureHandle): Promise<FreshAgentLaunchFacts> {
     return this.rpc('fresh-agent-launch-facts', FreshAgentLaunchFactsSchema, { enclosure })
   }
+  async validateFreshAgentIngressInventory(): Promise<void> {
+    await this.rpc('fresh-agent-ingresses', CompletedOwnerOperationSchema)
+  }
   async ownedContainerState(enclosure: RuntimeEnclosureHandle): Promise<OwnedContainerState> {
     return this.rpc('container-state', OwnedContainerStateSchema, { enclosure })
   }
@@ -1208,6 +1211,7 @@ export function createExternalRuntimeControl(
         if (!request.enclosure) throw new Error('exact current runtime enclosure address required')
         result = await owner.freshAgentLaunchFacts(request.enclosure)
         break
+      case 'fresh-agent-ingresses': await owner.validateFreshAgentIngressInventory(); result = { completed: true }; break
       case 'container-state':
         if (!request.enclosure) throw new Error('exact tracked runtime enclosure address required')
         result = await owner.ownedContainerState(request.enclosure)

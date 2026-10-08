@@ -1496,6 +1496,28 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('validates fresh-agent ingress sources on the owner checkout without a browser-selected root', async () => {
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused ingress web') }, process.cwd(), 5)
+    const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.validateFreshAgentIngressInventory()).resolves.toBeUndefined()
+    await expect(control({ runId: context.runId, candidateSha: context.candidateSha, operationId: 'foreign-ingress-root',
+      action: 'fresh-agent-ingresses', repoRoot: '/foreign/checkout' })).rejects.toThrow(/operation/)
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-empty-ingress-root-'))
+    try {
+      for (const args of [['init'], ['commit', '--allow-empty', '-m', 'Private ingress validation fixture']]) {
+        const child = spawnSync('git', args, { cwd: directory, encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('private ingress fixture Git setup failed')
+      }
+      const missing = new ManagedRuntimeOwner(() => { throw new Error('unused missing ingress web') }, directory, 5)
+      await expect(missing.validateFreshAgentIngressInventory()).rejects.toThrow()
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
   it('runs the closed Phase3 effect operations over the same pre-native enclosure', async () => {
     const { owned, context, request } = fixture()
     const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',
