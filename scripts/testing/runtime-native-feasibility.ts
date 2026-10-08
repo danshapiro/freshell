@@ -388,7 +388,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
-  if (selection.provider === 'amplifier' && ['create', 'wrong-root', 'missing-history', 'load-failure', 'missing-context-restore', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'amplifier' && ['create', 'wrong-root', 'missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
     return executeManagedAmplifier(harness, sources, caseId, serverPath, servers)
   }
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
@@ -1455,8 +1455,9 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
   const scenario = `amplifier-${caseId}`
   const wrongRoot = caseId === 'wrong-root'
   const sourceFault = ['missing-history', 'load-failure', 'missing-context-restore'].includes(caseId)
+  const pendingFault = ['timeout', 'provider-exit', 'stop-cancellation'].includes(caseId)
   let faultImage: any
-  if (sourceFault) {
+  if (sourceFault || pendingFault) {
     const descriptor = sources.find(source => source.name === 'amplifier/native-fault/startup.json')
     if (!descriptor) throw new Error('actual owned Amplifier fault image descriptor missing')
     const raw = fs.readFileSync(descriptor.path)
@@ -1465,7 +1466,8 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
     if (faultImage.schemaVersion !== 1 || faultImage.imageDigest !== harness.imageRef
       || !/^[a-f0-9]{40}$/.test(faultImage.wrapperSourceSha)
       || !['wrapperSha256', 'originalCliSha256', 'producerSha256'].every(key => /^[a-f0-9]{64}$/.test(faultImage[key]))
-      || JSON.stringify(faultImage.cases) !== JSON.stringify(['missing-history', 'load-failure', 'missing-context-restore'])) {
+      || ![...(pendingFault ? [] : [JSON.stringify(['missing-history', 'load-failure', 'missing-context-restore'])]),
+        JSON.stringify(['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation'])].includes(JSON.stringify(faultImage.cases))) {
       throw new Error('actual owned Amplifier fault image binding differs')
     }
   }
@@ -1557,6 +1559,113 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
       artifactReferences, assertions }
     harness.writeArtifact(`${scenario}-original.json`, original)
     return original
+  }
+  if (pendingFault) {
+    const startedAt = Date.now()
+    let finished = false, result: any, launchError: unknown
+    const pending = harness.adminRaw(supervisor, request).then(reply => { result = reply; finished = true },
+      error => { launchError = error; finished = true })
+    const faultPath = path.join(workspace, 'native-startup-fault.json')
+    const captureDeadline = Date.now() + 6_000
+    let receipt: ReturnType<typeof harness.broker.receipts>[number] | undefined
+    while (!finished && Date.now() < captureDeadline) {
+      receipt = harness.broker.receipts().find(row => row.soulId === soulId)
+      if (receipt && fs.existsSync(faultPath)) break
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    if (!receipt || !fs.existsSync(faultPath) || finished) {
+      await pending
+      harness.writeArtifact(`${scenario}-unexpected-launch.json`, { result, error: String(launchError ?? '') })
+      throw new Error('actual native Amplifier pause unavailable before startup fault')
+    }
+    const fault = JSON.parse(fs.readFileSync(faultPath, 'utf8'))
+    harness.writeArtifact(`${scenario}-before-fault-native-private.json`, fault)
+    const launch = JSON.parse(await harness.execOwnedContainerAsExact(supervisor.containerId, '0:0',
+      ['python3', '-c', String.raw`import sqlite3,sys
+c=sqlite3.connect('file:/var/lib/freshell-supervisor/runtime.sqlite3?mode=ro',uri=True)
+c.execute('PRAGMA query_only=ON')
+row=c.execute('SELECT native_identity_launch FROM incarnations WHERE soul_id=? AND launch_state=?',(sys.argv[1],'starting')).fetchone()
+assert row and row[0]
+print(row[0])`, soulId]))
+    harness.writeArtifact(`${scenario}-before-fault-current-binding.json`, launch)
+    const currentFault = fault.event === 'test.amplifier.native_startup_fault.applied' && fault.severity === 'warning'
+      && fault.fault === caseId && fault.phase === 'before-native-publication'
+      && fault.launch?.incarnationId === launch.incarnationId && fault.launch.launchNonce === launch.launchNonce
+      && fault.launch.evidenceRevision === launch.evidenceRevision && fault.launch.executionGeneration === launch.executionGeneration
+      && fault.launch.requestedNativeSessionId === nativeRoot && launch.requestedNativeSessionId === nativeRoot
+      && fault.nativeRoot === nativeRoot && fault.nativeParent === null
+      && fault.originalLoad?.sessionId === nativeRoot && fault.originalLoad?.parentId === null
+      && Number.isSafeInteger(fault.originalLoad?.messageCount) && Number.isSafeInteger(fault.acceptedMessageCount)
+      && fault.acceptedMessageCount >= fault.originalLoad.messageCount && fault.acceptedMessageCount - fault.originalLoad.messageCount <= 1
+      && Number.isSafeInteger(fault.nativePid) && fault.nativePid > 1 && fault.uid === 65534 && fault.gid === 0
+      && fault.caps === '0000000000000000' && fault.readOnlyRoot && fault.nativeCwd === workspace
+      && fault.originalCliSha256 === faultImage.originalCliSha256 && fault.producerSha256 === faultImage.producerSha256
+    if (!currentFault) { await pending; throw new Error('actual current Amplifier pre-publication fault binding differs') }
+    const before = JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId, '65534:0',
+      ['/opt/amplifier-src/.venv/bin/python', '-c', amplifierNativeInspection, fault.originalLoad.transcript.path, nativeRoot, 'true']))
+    harness.writeArtifact(`${scenario}-before-fault-profile-private.json`, before)
+    const source = fault.originalLoad.transcript
+    const sameLoadedSource = [source.device, source.inode, source.size].every(Number.isSafeInteger)
+      && JSON.stringify(before.transcript?.identity?.slice(0, 3)) === JSON.stringify([source.device, source.inode, source.size].map(String))
+      && /^[a-f0-9]{64}$/.test(source.eofSha256) && before.transcript?.sha256 === source.eofSha256
+    if (finished || before.nativePid !== fault.nativePid || before.nativeRoot !== nativeRoot || before.nativeCwd !== workspace
+      || before.httpsStatus !== 200 || before.tlsVerifyMode !== 2 || before.tlsCheckHostname !== true
+      || before.cliVersion !== '0.1.1' || before.coreVersion !== '1.6.0'
+      || before.executableSha256 !== faultImage.wrapperSha256 || before.originalCliSha256 !== faultImage.originalCliSha256
+      || before.producerSha256 !== faultImage.producerSha256
+      || !sameLoadedSource || before.transcript?.completeEof !== true || before.completedTurns !== 0 || before.toolEvents !== 0) {
+      await pending
+      throw new Error('actual unobserved Amplifier UID/TLS/profile unavailable before fault')
+    }
+    let stopped: any, exited: any
+    if (caseId === 'provider-exit') harness.killOwnedRuntimePidExact(receipt.containerId, fault.nativePid, 'TERM')
+    else if (caseId === 'stop-cancellation') {
+      stopped = await harness.adminOk(supervisor, harness.stopBody(soulId))
+      harness.writeArtifact(`${scenario}-ordinary-stop.json`, stopped)
+    }
+    await pending
+    if (launchError) throw launchError
+    const elapsedMs = Date.now() - startedAt
+    harness.writeArtifact(`${scenario}-launch.json`, result)
+    harness.writeArtifact(`${scenario}-launch-timing.json`, { elapsedMs })
+    if (result.result?.Err?.code !== (caseId === 'stop-cancellation' ? 'STALE_INTENT_REVISION' : 'RECOVERY_BLOCKED')) {
+      throw new Error('Amplifier pending startup fault published launch success')
+    }
+    const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+    harness.writeArtifact(`${scenario}-inventory.json`, inventory)
+    const view = inventory.data.find((row: any) => row.soulId === soulId)
+    harness.writeArtifact(`${scenario}-current-view.json`, view)
+    if (!view || view.incarnationId !== launch.incarnationId || view.nativeIdentityObservation
+      || view.launchState !== (caseId === 'stop-cancellation' ? 'stopped' : 'starting')) {
+      throw new Error('Amplifier pending fault published Running or native observation')
+    }
+    if (caseId === 'provider-exit') {
+      const deadline = Date.now() + 3_000
+      do {
+        exited = JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId, '65534:0',
+          ['python3', '-c', "import pathlib,json,sys;print(json.dumps({'nativeExited':not (pathlib.Path('/proc')/sys.argv[1]/'exe').exists()}))", String(fault.nativePid)]))
+        if (exited.nativeExited) break
+        await new Promise(resolve => setTimeout(resolve, 50))
+      } while (Date.now() < deadline)
+      harness.writeArtifact(`${scenario}-native-exit.json`, exited)
+      if (exited.nativeExited !== true) throw new Error('owned Amplifier native PID remained alive after exit fault')
+    } else if (caseId === 'stop-cancellation') {
+      if (stopped?.data?.outcome !== 'verified_empty' || view.desiredState !== 'stopped' || view.recoveryState !== 'stopped') {
+        throw new Error('ordinary Amplifier Stop did not confirm empty stopped intent')
+      }
+    } else if (elapsedMs < 8_000 || elapsedMs >= 50_000) {
+      throw new Error('actual Amplifier native startup wait was not bounded by the existing deadline')
+    }
+    const input = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned failed startup input probe. Do not use tools.\r'))
+    harness.writeArtifact(`${scenario}-input-refusal.json`, input)
+    if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('Amplifier pending startup fault admitted input')
+    return finish(before,
+      [`${scenario}-launch.json`, `${scenario}-before-fault-native-private.json`, `${scenario}-before-fault-current-binding.json`, `${scenario}-before-fault-profile-private.json`, `${scenario}-current-view.json`, `${scenario}-input-refusal.json`],
+      [{ name: 'actual-native-load-and-context-before-owned-startup-fault', pass: currentFault && before.nativeRoot === nativeRoot },
+        { name: 'actual-current-native-selected-profile-uid-tls-before-fault', pass: before.httpsStatus === 200 && before.tlsVerifyMode === 2 && before.tlsCheckHostname },
+        { name: caseId === 'provider-exit' ? 'exact-owned-native-provider-pid-exited' : caseId === 'stop-cancellation' ? 'ordinary-stop-confirmed-empty-stopped-intent' : 'existing-native-startup-wait-bounded-without-input',
+          pass: caseId === 'provider-exit' ? exited.nativeExited : caseId === 'stop-cancellation' ? stopped.data.outcome === 'verified_empty' && view.desiredState === 'stopped' : elapsedMs >= 8_000 && elapsedMs < 50_000 },
+        { name: 'pending-native-startup-fault-blocks-running-observation-and-input', pass: !view.nativeIdentityObservation && view.launchState !== 'running' && input.result.Err.code === 'UNKNOWN_SOUL' }])
   }
   if (wrongRoot || sourceFault) {
     const result = await harness.adminRaw(supervisor, request)
@@ -2099,7 +2208,7 @@ print(json.dumps({'fault':fault,'originalSha256':hashlib.sha256(raw).hexdigest()
 `
 
 const amplifierNativeInspection = String.raw`
-import pathlib,os,json,hashlib,sys,base64,ssl,urllib.request
+import pathlib,os,json,hashlib,sys,base64,ssl,urllib.request,importlib.metadata as native_metadata
 file=pathlib.Path(sys.argv[1]);root=sys.argv[2];check_tls=sys.argv[3]=='true';assert file.name=='transcript.jsonl' and file.parent.name==root
 with file.open('rb') as f:
  before=os.fstat(f.fileno());raw=f.read();after=os.fstat(f.fileno())
@@ -2138,10 +2247,16 @@ for source in [settings.paths.global_settings,settings.paths.project_settings,se
  if body is not None:assert isinstance(yaml.safe_load(body) or {},dict)
  settings_files.append({'path':str(source),'bytesBase64':base64.b64encode(body).decode() if body is not None else None})
 native_settings_sha=hashlib.sha256(json.dumps(expand_env_vars(settings.get_merged_settings()),sort_keys=True,separators=(',',':')).encode()).hexdigest()
+cli=pathlib.Path('/opt/amplifier-src/.venv/bin/amplifier');original_cli=cli.with_name('amplifier.native')
+producer=pathlib.Path('/opt/amplifier-src/amplifier_app_cli/freshell_native_resume.py')
+native_versions={'cliVersion':native_metadata.version('amplifier-app-cli'),'coreVersion':native_metadata.version('amplifier-core'),
+ 'executableSha256':hashlib.sha256(cli.read_bytes()).hexdigest(),
+ 'originalCliSha256':hashlib.sha256((original_cli if original_cli.exists() else cli).read_bytes()).hexdigest(),
+ 'producerSha256':hashlib.sha256(producer.read_bytes()).hexdigest()}
 assistants=[m for m in messages if m.get('role')=='assistant']
 def text(m):
  c=m.get('content');return c if isinstance(c,str) else ''.join(p.get('text','') for p in (c or []) if isinstance(p,dict) and p.get('type')=='text')
-print(json.dumps({'nativeRoot':root,'nativePid':int(p.name),'transcript':{'identity':identity(after),'sha256':hashlib.sha256(raw).hexdigest(),'completeEof':not raw or raw.endswith(b'\n'),'bytesBase64':base64.b64encode(raw).decode()},'eventsBytesBase64':base64.b64encode(event_raw).decode(),'metadata':meta,'completedTurns':sum(e.get('event')=='cleanup:store_end' for e in events),'toolEvents':sum(str(e.get('event','')).startswith('tool:') for e in events),'responses':[e.get('data') for e in events if e.get('event')=='llm:response'],'lastAssistantText':text(assistants[-1]) if assistants else '', 'profileFiles':profile,'nativeCwd':native_cwd,'nativeSettingsSha256':native_settings_sha,'nativeSettingsFiles':settings_files,'httpsStatus':status,'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname}))
+print(json.dumps({**native_versions,'nativeRoot':root,'nativePid':int(p.name),'transcript':{'identity':identity(after),'sha256':hashlib.sha256(raw).hexdigest(),'completeEof':not raw or raw.endswith(b'\n'),'bytesBase64':base64.b64encode(raw).decode()},'eventsBytesBase64':base64.b64encode(event_raw).decode(),'metadata':meta,'completedTurns':sum(e.get('event')=='cleanup:store_end' for e in events),'toolEvents':sum(str(e.get('event','')).startswith('tool:') for e in events),'responses':[e.get('data') for e in events if e.get('event')=='llm:response'],'lastAssistantText':text(assistants[-1]) if assistants else '', 'profileFiles':profile,'nativeCwd':native_cwd,'nativeSettingsSha256':native_settings_sha,'nativeSettingsFiles':settings_files,'httpsStatus':status,'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname}))
 `
 
 // Reads the currently owned native child and its exact hook-selected transcript.

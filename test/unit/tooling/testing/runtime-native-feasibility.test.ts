@@ -336,6 +336,96 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       }
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it.each(['timeout', 'provider-exit', 'stop-cancellation'].flatMap(fault =>
+    ['valid', 'wrong-cli-version', 'wrong-core-version', 'wrong-wrapper', 'wrong-native-cli', 'wrong-producer', 'missing-version', 'changed-source-identity', 'changed-source-eof', 'early-timeout', 'native-still-alive', 'stop-unconfirmed']
+      .map(form => [fault, form])))('executes current owned Amplifier pending launch containment (%s, %s)', async (fault, form) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-pending-route-'))
+    const source = path.join(directory, 'selected-profile'); fs.writeFileSync(source, 'fixture selected profile')
+    const descriptor = { schemaVersion: 1, imageDigest, wrapperSourceSha: candidateSha, wrapperSha256: 'e'.repeat(64),
+      originalCliSha256: 'f'.repeat(64), producerSha256: 'c'.repeat(64), cases: ['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation'] }
+    const file = path.join(directory, 'fault-image.json'); fs.writeFileSync(file, JSON.stringify(descriptor))
+    let now = 1_000_000, request: any, release: ((value: any) => void) | undefined, completion: ReturnType<typeof setTimeout> | undefined
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    const records = new Map<string, unknown>(), killed = vi.fn()
+    const launch = () => ({ incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 7,
+      executionGeneration: 3, requestedNativeSessionId: request.params.nativeSessionId })
+    const view = () => ({ soulId: request.params.soulId, incarnationId: 'current-incarnation', containerId: 'owned-amplifier',
+      launchState: fault === 'stop-cancellation' ? 'stopped' : 'starting', desiredState: fault === 'stop-cancellation' ? 'stopped' : 'running', recoveryState: fault === 'stop-cancellation' ? 'stopped' : 'live', executionGeneration: 3 })
+    const harness = { testRoot: directory, evidenceDir: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
+      startSupervisor: async () => ({ containerId: 'owned-control' }), broker: { receipts: () => [{ soulId: request?.params.soulId, containerId: 'owned-amplifier' }] },
+      inventoryBody: () => ({ method: 'inventory' }), terminalReadOutputBody: () => ({ method: 'terminal_read_output' }),
+      terminalInputBody: () => ({ method: 'terminal_input' }), stopBody: () => ({ method: 'stop' }),
+      writeArtifact: (name: string, value: unknown) => records.set(name, value),
+      killOwnedRuntimePidExact: (containerId: string, pid: number, signal: string) => {
+        killed(containerId, pid, signal); release!({ result: { Err: { code: 'RECOVERY_BLOCKED' } } })
+      },
+      adminRaw: (_supervisor: unknown, input: any) => {
+        if (input.method !== 'launch') return Promise.resolve({ result: { Err: { code: 'UNKNOWN_SOUL' } } })
+        request = input
+        fs.writeFileSync(path.join(input.params.terminal.cwd, 'native-startup-fault.json'), JSON.stringify({
+          severity: 'warning', event: 'test.amplifier.native_startup_fault.applied', fault, phase: 'before-native-publication',
+          launch: launch(), nativePid: 55, uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+          nativeCwd: input.params.terminal.cwd, originalCliSha256: descriptor.originalCliSha256, producerSha256: descriptor.producerSha256,
+          nativeRoot: input.params.nativeSessionId, nativeParent: null, originalLoad: { sessionId: input.params.nativeSessionId,
+            parentId: null, messageCount: 0, transcript: { path: '/owned/native/transcript.jsonl', device: 1, inode: 2, size: 0, mtimeNs: 3, ctimeNs: 4, eofSha256: 'd'.repeat(64) } }, acceptedMessageCount: 0,
+        }))
+        return new Promise(resolve => { release = resolve })
+      },
+      adminOk: async (_supervisor: unknown, input: any) => {
+        if (input.method === 'stop') {
+          release!({ result: { Err: { code: 'STALE_INTENT_REVISION' } } })
+          return { data: { outcome: form === 'stop-unconfirmed' ? 'unknown' : 'verified_empty', view: view() } }
+        }
+        return input.method === 'inventory' ? { data: [view()] } : { data: { frames: [] } }
+      },
+      execOwnedContainerAsExact: async (containerId: string, uid: string, argv: string[]) => {
+        if (containerId === 'owned-control') {
+          const database = path.join(directory, 'controlled-runtime.sqlite3')
+          execFileSync('python3', ['-c', "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('CREATE TABLE incarnations(soul_id TEXT, launch_state TEXT, native_identity_launch TEXT)'); c.executemany('INSERT INTO incarnations VALUES (?,?,?)',[(sys.argv[2],'stopped','{}'),(sys.argv[2],'starting',sys.argv[3])]); c.commit()", database, request.params.soulId, JSON.stringify(launch())])
+          return execFileSync(argv[0]!, ['-c', argv[2]!.replace('file:/var/lib/freshell-supervisor/runtime.sqlite3?mode=ro', 'file:' + database + '?mode=ro'), ...argv.slice(3)], { encoding: 'utf8' })
+        }
+        expect(uid).toBe('65534:0')
+        if (argv[3] === '/owned/native/transcript.jsonl') {
+          completion = setTimeout(() => { now += form === 'early-timeout' ? 7_000 : 9_000; release!({ result: { Err: { code: 'RECOVERY_BLOCKED' } } }) }, 0)
+          return JSON.stringify({ nativeRoot: request.params.nativeSessionId, nativePid: 55,
+            cliVersion: form === 'missing-version' ? undefined : form === 'wrong-cli-version' ? '0.0.0' : '0.1.1',
+            coreVersion: form === 'wrong-core-version' ? '0.0.0' : '1.6.0',
+            executableSha256: form === 'wrong-wrapper' ? '0'.repeat(64) : descriptor.wrapperSha256,
+            originalCliSha256: form === 'wrong-native-cli' ? '0'.repeat(64) : descriptor.originalCliSha256,
+            producerSha256: form === 'wrong-producer' ? '0'.repeat(64) : descriptor.producerSha256,
+            httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: request.params.terminal.cwd,
+            metadata: { session_id: request.params.nativeSessionId, parent_id: null }, completedTurns: 0, toolEvents: 0,
+            transcript: { completeEof: true, identity: [form === 'changed-source-identity' ? '9' : '1','2','0','3','4'], sha256: form === 'changed-source-eof' ? '0'.repeat(64) : 'd'.repeat(64) }, profileFiles: [] })
+        }
+        if (form === 'native-still-alive') now += 3_000
+        return JSON.stringify({ nativeExited: form !== 'native-still-alive' })
+      },
+    } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', '.amplifier/settings.yaml', '.amplifier/bundles/default.yaml']
+      .map(name => ({ name: 'amplifier/' + name, path: source, sha256: 'e'.repeat(64) }))
+    sources.push({ name: 'amplifier/native-fault/startup.json', path: file, sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex') })
+    try {
+      const run = executeManagedNativeCase(harness, sources, { provider: 'amplifier', case: 'startup' }, fault)
+      const refusal = !['valid', 'early-timeout', 'native-still-alive', 'stop-unconfirmed'].includes(form)
+        ? 'actual unobserved Amplifier UID/TLS/profile unavailable before fault'
+        : form === 'early-timeout' && fault === 'timeout' ? 'actual Amplifier native startup wait was not bounded by the existing deadline'
+        : form === 'native-still-alive' && fault === 'provider-exit' ? 'owned Amplifier native PID remained alive after exit fault'
+        : form === 'stop-unconfirmed' && fault === 'stop-cancellation' ? 'ordinary Amplifier Stop did not confirm empty stopped intent' : undefined
+      if (refusal) {
+        await expect(run).rejects.toThrow(refusal)
+        if (refusal === 'actual unobserved Amplifier UID/TLS/profile unavailable before fault') expect(killed).not.toHaveBeenCalled()
+        expect(records.has('amplifier-' + fault + '-original.json')).toBe(false)
+      } else {
+        const original = await run
+        expect(original.assertions.every(row => row.pass)).toBe(true)
+        expect(original.nativeVersion).toBe('amplifier-app-cli 0.1.1; amplifier-core 1.6.0')
+        expect(original.executableSha256).toBe(descriptor.wrapperSha256)
+        expect(killed).toHaveBeenCalledTimes(fault === 'provider-exit' ? 1 : 0)
+        if (fault === 'provider-exit') expect(killed).toHaveBeenCalledWith('owned-amplifier', 55, 'TERM')
+        expect(records.has('amplifier-' + fault + '-original.json')).toBe(true)
+      }
+    } finally { if (completion) clearTimeout(completion); clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['matching', 'wrong-root', 'parent-root', 'missing-root'])('executes the pinned Amplifier producer with current native root diagnostics (%s)', (fault) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-native-root-event-'))
     const patch = fs.readFileSync(path.join(process.cwd(), 'extensions/amplifier/freshell-native-resume.patch'), 'utf8')
