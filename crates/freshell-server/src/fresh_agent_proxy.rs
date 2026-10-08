@@ -527,6 +527,7 @@ impl HostedFreshAgentProxy {
                     native_source_runtime:
                         freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
                     reservation_provider: provider.as_str(),
+                    git_common_dir: git_common_dir(&workspace).as_deref(),
                     selected_settings: None,
                     client: &self.client,
                     soul: &soul,

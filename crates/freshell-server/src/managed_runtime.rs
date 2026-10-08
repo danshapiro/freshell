@@ -273,6 +273,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                         native_source_runtime:
                             freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
                         reservation_provider: "claude",
+                        git_common_dir: git_common_dir.as_deref(),
                         selected_settings: selected_claude_settings.as_deref(),
                         client: &self.client,
                         soul: &soul_id,

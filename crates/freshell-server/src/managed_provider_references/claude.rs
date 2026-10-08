@@ -13,6 +13,7 @@ pub(crate) struct ClaudePreparation<'a> {
     pub home: &'a Path,
     pub cwd: &'a Path,
     pub workspace: &'a Path,
+    pub git_common_dir: Option<&'a Path>,
     pub original: &'a (dyn Fn(&str) -> Option<String> + Sync),
     pub args: &'a [String],
     pub plugins: &'a [String],
@@ -110,6 +111,62 @@ pub(crate) async fn prepare_managed(
     {
         return Err("Claude selected resource reservation does not match this creation".into());
     }
+    let observation_request = freshell_platform::claude_inputs::observation::ObservationRequest {
+        version: 1,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        native_source_runtime: request.native_source_runtime,
+        cwd: std::fs::canonicalize(request.cwd)
+            .map_err(|_| "Claude native cwd is unavailable; retain inputs and reprepare")?,
+        home: "/home/freshell/provider".into(),
+        setting_sources: manifest.setting_sources.clone(),
+        selector_manifest_sha256: {
+            use sha2::{Digest, Sha256};
+            let bytes = bounded_json_bytes(
+                &manifest,
+                freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES,
+            )
+            .map_err(|_| "Claude selector metadata exceeds its finite profile")?;
+            format!("{:x}", Sha256::digest(bytes))
+        },
+        plan_revision: 0,
+    };
+    let observation_request_sha256 = {
+        use sha2::{Digest, Sha256};
+        let bytes = bounded_json_bytes(
+            &observation_request,
+            freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES,
+        )
+        .map_err(|_| "Claude source request exceeds its finite profile")?;
+        format!("{:x}", Sha256::digest(bytes))
+    };
+    let observation = request
+        .client
+        .observe_claude_sources(ObserveClaudeSourcesRequest {
+            expected_control_epoch: None,
+            soul_id: request.soul.clone(),
+            provider: request.reservation_provider.into(),
+            authority: ClaudeSourceAuthority::InitialReservation {
+                reservation_id: reservation.reservation_id.clone(),
+            },
+            workspace_path: request
+                .workspace
+                .to_str()
+                .ok_or("Claude workspace is not UTF-8; retain inputs and reprepare")?
+                .into(),
+            git_common_dir: request
+                .git_common_dir
+                .map(|path| {
+                    path.to_str().map(str::to_owned).ok_or(
+                        "Claude git common directory is not UTF-8; retain inputs and reprepare",
+                    )
+                })
+                .transpose()?,
+            candidate: None,
+            observation_request: observation_request.clone(),
+        })
+        .await
+        .map_err(|_| "Claude native source evidence is unavailable; retain inputs and reprepare")?;
+    observation.validate_for_request(&observation_request, &observation_request_sha256)?;
     crate::managed_mcp_capability::issue_prepared_provider_context(
         "claude",
         request.soul,
@@ -117,6 +174,7 @@ pub(crate) async fn prepare_managed(
         &context,
         crate::managed_mcp_capability::OpencodeEphemeralInput {
             claude_manifest: Some(&manifest),
+            claude_observation: Some(&observation.observation),
             claude_inline_settings: inline_settings,
             cwd: Some(request.cwd),
             workspace: Some(request.workspace),
@@ -190,6 +248,182 @@ fn selected_config_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_provider_claude_initial_source_failure_blocks_before_stage_and_dispatch() {
+        use freshell_supervisor::{
+            backend::{
+                BackendCreated, BackendError, BackendInspection, ClaudeSourceOwner,
+                CreateRuntimeSpec, RuntimeBackend,
+            },
+            registry::{OwnedInputReservation, OwnedRuntimeHandle, Registry},
+            service::{serve_control, Supervisor, SupervisorConfig},
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct UnavailableSources {
+            daemon: DockerDaemonId,
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl RuntimeBackend for UnavailableSources {
+            async fn observe_initial_auth_volume(
+                &self,
+                _: &OwnedInputReservation,
+            ) -> Result<InitialAuthVolumeObservation, BackendError> {
+                Ok(InitialAuthVolumeObservation::Absent {
+                    daemon_id: self.daemon.clone(),
+                })
+            }
+            async fn observe_claude_sources(
+                &self,
+                owner: &ClaudeSourceOwner,
+                request: &ObserveClaudeSourcesRequest,
+                _: &str,
+            ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError>
+            {
+                assert!(matches!(owner, ClaudeSourceOwner::Initial { .. }));
+                assert_eq!(request.provider, "claude");
+                assert_eq!(
+                    request.observation_request.native_source_runtime,
+                    freshell_platform::claude_inputs::NativeSourceRuntime::Terminal
+                );
+                assert_eq!(
+                    request.observation_request.setting_sources,
+                    vec![freshell_platform::claude_inputs::ClaudeSettingSource::Local]
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(BackendError::Unavailable(
+                    "synthetic fixed reader unavailable".into(),
+                ))
+            }
+            async fn create_stopped(
+                &self,
+                _: &CreateRuntimeSpec,
+            ) -> Result<BackendCreated, BackendError> {
+                unreachable!()
+            }
+            async fn start_host(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+                unreachable!()
+            }
+            async fn inspect(
+                &self,
+                _: &OwnedRuntimeHandle,
+            ) -> Result<BackendInspection, BackendError> {
+                unreachable!()
+            }
+            async fn request_stop(
+                &self,
+                _: &OwnedRuntimeHandle,
+                _: u64,
+            ) -> Result<(), BackendError> {
+                unreachable!()
+            }
+            async fn force_stop(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+                unreachable!()
+            }
+            async fn verify_empty(&self, _: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+                unreachable!()
+            }
+            async fn list_known(
+                &self,
+                _: &[OwnedRuntimeHandle],
+            ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+                unreachable!()
+            }
+            async fn read_limits(
+                &self,
+                _: &OwnedRuntimeHandle,
+            ) -> Result<RuntimeLimits, BackendError> {
+                unreachable!()
+            }
+            async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+                unreachable!()
+            }
+        }
+        let owned = tempfile::tempdir().unwrap();
+        let binary = owned.path().join("host");
+        std::fs::write(&binary, "synthetic immutable host artifact").unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let selected = home.join(".claude/settings.json");
+        let private = br#"{"env":{"SYNTHETIC_PRIVATE":"preserve-original-source"}}"#;
+        std::fs::write(&selected, private).unwrap();
+        let registry = Registry::open(owned.path().join("registry"), None).unwrap();
+        let backend = Arc::new(UnavailableSources {
+            daemon: DockerDaemonId::new(),
+            calls: AtomicUsize::new(0),
+        });
+        let socket = owned.path().join("control.sock");
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            backend.clone(),
+            SupervisorConfig {
+                runtime_root: owned.path().join("runtime"),
+                control_socket_path: socket.clone(),
+                host_binary_path: binary,
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "synthetic-source-unavailable".into(),
+                control_secret: "synthetic-control-secret".into(),
+                lifecycle_log: owned.path().join("lifecycle.jsonl"),
+                admission: freshell_supervisor::admission::AdmissionPolicy::default(),
+            },
+        )
+        .unwrap();
+        let task = tokio::spawn({
+            let socket = socket.clone();
+            async move { serve_control(supervisor, &socket).await }
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !socket.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let client = freshell_runtime_client::RuntimeClient::new(
+                socket.clone(),
+                "synthetic-control-secret",
+            );
+            let soul = SoulId::new();
+            prepare_managed(ClaudePreparation {
+                client: &client,
+                soul: &soul,
+                creation_seed: "synthetic-initial-source",
+                native_source_runtime:
+                    freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+                reservation_provider: "claude",
+                selected_settings: None,
+                home: &home,
+                cwd: &workspace,
+                workspace: &workspace,
+                git_common_dir: None,
+                original: &|_| None,
+                args: &["--setting-sources".into(), "local".into()],
+                plugins: &[],
+                references: &[],
+            })
+            .await
+        })
+        .await;
+        task.abort();
+        assert!(
+            task.await.unwrap_err().is_cancelled(),
+            "join the owned control service before assertions"
+        );
+        let result =
+            result.expect("initial preparation must return within its finite test deadline");
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1,
+            "authoritative source evidence must be requested before private staging or grant publication");
+        let error = result.unwrap_err();
+        assert!(error.contains("retain inputs and reprepare"), "{error}");
+        assert!(!error.contains("preserve-original-source"));
+        assert!(registry.inventory().await.unwrap().is_empty());
+        assert_eq!(std::fs::read(selected).unwrap(), private);
+    }
 
     #[test]
     fn managed_provider_claude_settings_lookup_failure_keeps_private_document_out_of_errors_and_logs(

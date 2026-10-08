@@ -41,6 +41,8 @@ pub(crate) use tests::{qualify_claude_linked_sources, qualify_claude_local_setti
 pub(crate) struct OpencodeEphemeralInput<'a> {
     pub codex_manifest: Option<&'a freshell_platform::codex_inputs::CodexInputManifest>,
     pub claude_manifest: Option<&'a freshell_platform::claude_inputs::ClaudeInputManifest>,
+    pub claude_observation:
+        Option<&'a freshell_platform::claude_inputs::observation::NativeObservation>,
     pub claude_inline_settings: Option<&'a str>,
     pub amplifier_manifest: Option<&'a freshell_platform::amplifier_inputs::AmplifierInputManifest>,
     pub inline_config: Option<&'a str>,
@@ -1392,16 +1394,32 @@ fn stage_provider_root(
                     opencode_input.amplifier_manifest,
                 )?
             } else if provider == "claude" {
-                claude_stage::prepare(
-                    home,
-                    opencode_input.cwd.unwrap_or(home),
-                    opencode_input
-                        .workspace
-                        .or(opencode_input.cwd)
-                        .unwrap_or(home),
-                    opencode_input.claude_manifest,
-                    &excluded,
-                )?
+                if let Some(observation) = opencode_input.claude_observation {
+                    claude_stage::prepare_with_native_observation(
+                        home,
+                        opencode_input.cwd.unwrap_or(home),
+                        opencode_input
+                            .workspace
+                            .or(opencode_input.cwd)
+                            .unwrap_or(home),
+                        opencode_input
+                            .claude_manifest
+                            .ok_or("Claude native source observation lacks original selectors")?,
+                        observation,
+                        &excluded,
+                    )?
+                } else {
+                    claude_stage::prepare(
+                        home,
+                        opencode_input.cwd.unwrap_or(home),
+                        opencode_input
+                            .workspace
+                            .or(opencode_input.cwd)
+                            .unwrap_or(home),
+                        opencode_input.claude_manifest,
+                        &excluded,
+                    )?
+                }
             } else {
                 ordinary_stage::prepare(
                     home,
