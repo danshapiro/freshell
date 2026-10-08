@@ -429,6 +429,10 @@ async fn apply_prepared_callback(
         provider,
         callback.prior_context.as_ref(),
     )? {
+        if let Some(plan) = &current_claude_plan {
+            confirm_claude_callback_candidate(&callback, store, directory, client, plan, &reply)
+                .await?;
+        }
         return freshell_runtime_protocol::bounded_json_bytes(
             &reply,
             freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
@@ -539,11 +543,14 @@ async fn apply_prepared_callback(
             ),
         };
         context.config.clear();
-        let references = callback.provider_secret_references.unwrap_or_default();
+        let references = callback
+            .provider_secret_references
+            .clone()
+            .unwrap_or_default();
         input.launch_context = Some(&context);
         input.secret_references = Some(&references);
         let capability = store.issue_replacement_with_inputs(
-            callback.soul_id,
+            callback.soul_id.clone(),
             directory,
             endpoint.into(),
             Some((provider, original_home, &context.config)),
@@ -556,6 +563,10 @@ async fn apply_prepared_callback(
         reply
             .validate(provider)
             .map_err(|_| "replacement ordinary context metadata invalid")?;
+        if let Some(plan) = &current_claude_plan {
+            confirm_claude_callback_candidate(&callback, store, directory, client, plan, &reply)
+                .await?;
+        }
         return freshell_runtime_protocol::bounded_json_bytes(
             &reply,
             freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
@@ -745,6 +756,75 @@ async fn apply_prepared_callback(
         freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
     )
     .map_err(|_| "replacement provider context exceeds control metadata profile".into())
+}
+
+async fn confirm_claude_callback_candidate(
+    callback: &CapabilityCallback,
+    store: &CapabilityStore,
+    directory: &Path,
+    client: &freshell_runtime_client::RuntimeClient,
+    plan: &freshell_platform::claude_inputs::AcceptedNativeSourcePlan,
+    ready: &freshell_runtime_protocol::PreparedProviderContext,
+) -> Result<(), String> {
+    use freshell_platform::claude_inputs::observation::ObservationRequest;
+    use freshell_runtime_protocol::{ClaudeSourceAuthority, ObserveClaudeSourcesRequest};
+    let binding = callback
+        .claude_recovery_source
+        .as_ref()
+        .ok_or("Claude current candidate recovery provenance unavailable")?;
+    let source = ObservationRequest {
+        version: 1,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        native_source_runtime: plan.observation.native_source_runtime,
+        cwd: plan.observation.cwd.clone(),
+        home: "/home/freshell/provider".into(),
+        setting_sources: plan.observation.setting_sources.clone(),
+        selector_manifest_sha256: plan.selector_manifest_sha256.clone(),
+        plan_revision: plan.plan_revision,
+        candidate_binding: None,
+    };
+    let request = bind_claude_candidate_request(
+        store,
+        directory,
+        ObserveClaudeSourcesRequest {
+            expected_control_epoch: None,
+            soul_id: callback.soul_id.clone(),
+            provider: binding.provider.clone(),
+            authority: ClaudeSourceAuthority::RecoveryAttempt {
+                attempt_id: callback
+                    .auth_lookup_authority
+                    .as_ref()
+                    .ok_or("Claude current candidate source scope unavailable")?
+                    .clone(),
+            },
+            workspace_path: callback
+                .workspace
+                .as_ref()
+                .and_then(|path| path.to_str())
+                .ok_or("Claude current candidate workspace unavailable")?
+                .into(),
+            git_common_dir: binding.git_common_dir.clone(),
+            candidate: Some(ready.clone()),
+            observation_request: source,
+        },
+    )?;
+    let source = request.observation_request.clone();
+    let reply = client.observe_claude_sources(request).await.map_err(|_| {
+        tracing::warn!(event="provider.inputs.claude_candidate.evidence_unavailable",soul_id=%callback.soul_id,
+            plan_revision=plan.plan_revision,
+            "Claude recovery candidate evidence unavailable; both private generations retained");
+        "Claude current candidate native source evidence unavailable; retain inputs and reprepare"
+    })?;
+    let mut compared = plan.clone();
+    if crate::managed_provider_references::claude::accept_candidate_observation(
+        &mut compared,
+        &source,
+        &reply,
+    )? {
+        Ok(())
+    } else {
+        Err("Claude current candidate source selection changed; retain inputs and reprepare".into())
+    }
 }
 
 fn read_prior_manifest_bytes(
@@ -6903,7 +6983,9 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
     #[tokio::test]
     async fn managed_provider_claude_pending_replay_requires_current_source_authority() {
         use freshell_platform::claude_inputs::{
-            ClaudeInputManifest, ClaudeSettingSource, NativeSourceRuntime,
+            observation::{LocalDecision, NativeObservation},
+            AcceptedNativeSourcePlan, ClaudeInputManifest, ClaudeSettingSource,
+            NativeSourceRuntime,
         };
         use freshell_runtime_protocol::{
             bounded_json_bytes, ClaudeRecoverySourceBinding, ClaudeSourceAuthority,
@@ -6945,7 +7027,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             mcp_capability: None,
             prepared_inputs: None,
         };
-        let manifest = ClaudeInputManifest {
+        let mut manifest = ClaudeInputManifest {
             version: 1,
             native_source_runtime: Some(NativeSourceRuntime::Terminal),
             original_home: home.clone(),
@@ -6959,8 +7041,40 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             plugin_dirs: vec![plugin.clone()],
             accepted_native_plan: None,
         };
+        let original_observation = NativeObservation {
+            version: 1,
+            native_source_runtime: NativeSourceRuntime::Terminal,
+            setting_sources: manifest.setting_sources.clone(),
+            uid: 65534,
+            euid: 65534,
+            gid: 0,
+            egid: 0,
+            supplementary_groups: vec![],
+            cwd: cwd.clone(),
+            home: Some("/home/freshell/provider".into()),
+            roots: None,
+            local_decision: LocalDecision::NoRoot,
+            root_uid: None,
+            git_uid: None,
+            claude_uid: None,
+            local_settings: vec![cwd.join(".claude/settings.local.json")],
+        };
+        manifest.accepted_native_plan = Some(AcceptedNativeSourcePlan {
+            selector_manifest_sha256: format!(
+                "{:x}",
+                Sha256::digest(
+                    bounded_json_bytes(&manifest.original_selectors(), 64 * 1024 * 1024).unwrap()
+                )
+            ),
+            plan_revision: 0,
+            observation: original_observation.clone(),
+        });
+        let initial_reservation = uuid::Uuid::new_v4().to_string();
         let input = OpencodeEphemeralInput {
             claude_manifest: Some(&manifest),
+            claude_observation: Some(&original_observation),
+            claude_reservation_provider: Some("claude"),
+            initial_auth_reservation: Some(&initial_reservation),
             cwd: Some(&cwd),
             workspace: Some(&cwd),
             launch_context: Some(&context),
@@ -6978,24 +7092,6 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             )
             .unwrap();
         let prior_context = read_prepared_context(&directory, &prior).unwrap();
-        let replacement = store
-            .issue_replacement_with_inputs(
-                soul.clone(),
-                &directory,
-                endpoint.into(),
-                Some(("claude", &home, &[])),
-                OpencodeEphemeralInput {
-                    launch_context: Some(&prior_context),
-                    ..input
-                },
-            )
-            .unwrap();
-        let prior_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
-        let pending_stage = staged_provider_root_path(&directory, &replacement.grant_id).unwrap();
-        let prior_before =
-            std::fs::read(prior_stage.join(".freshell/prepared-context.json")).unwrap();
-        let pending_before =
-            std::fs::read(pending_stage.join(".freshell/prepared-result.json")).unwrap();
         let scope = uuid::Uuid::new_v4().to_string();
         let authority = ClaudeSourceAuthority::RecoveryAttempt {
             attempt_id: scope.clone(),
@@ -7011,6 +7107,26 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             intent_revision: 2,
             prior_generation_id: prior.grant_id.clone(),
         };
+        let replacement = store
+            .issue_replacement_with_inputs(
+                soul.clone(),
+                &directory,
+                endpoint.into(),
+                Some(("claude", &home, &[])),
+                OpencodeEphemeralInput {
+                    launch_context: Some(&prior_context),
+                    initial_auth_reservation: None,
+                    claude_recovery_source: Some(&binding),
+                    ..input
+                },
+            )
+            .unwrap();
+        let prior_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+        let pending_stage = staged_provider_root_path(&directory, &replacement.grant_id).unwrap();
+        let prior_before =
+            std::fs::read(prior_stage.join(".freshell/prepared-context.json")).unwrap();
+        let pending_before =
+            std::fs::read(pending_stage.join(".freshell/prepared-result.json")).unwrap();
         let callback = serde_json::to_vec(&serde_json::json!({
             "action":"issue", "controlSecret":"fixture-control", "soulId":soul,
             "provider":"claude", "cwd":cwd, "workspace":cwd, "priorContext":prior_context,
@@ -7046,7 +7162,14 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             pending_before
         );
         assert_eq!(store.grants.lock().unwrap().len(), 2);
-        for fault in ["digest", "identity", "none", "replacement"] {
+        let mut replacement_snapshot = None;
+        for fault in [
+            "digest",
+            "identity",
+            "none",
+            "replacement",
+            "candidate_digest",
+        ] {
             use freshell_platform::claude_inputs::observation::{
                 LocalDecision, NativeObservation, ObservationReply,
             };
@@ -7068,6 +7191,10 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 let mut value: serde_json::Value = serde_json::from_slice(&callback).unwrap();
                 value["cwd"] = serde_json::to_value(&resumed).unwrap();
                 serde_json::to_vec(&value).unwrap()
+            } else if fault == "candidate_digest" {
+                let mut value: serde_json::Value = serde_json::from_slice(&callback).unwrap();
+                value["cwd"] = serde_json::to_value(&resumed).unwrap();
+                serde_json::to_vec(&value).unwrap()
             } else {
                 callback.clone()
             };
@@ -7075,32 +7202,40 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
             let expected_scope = scope.clone();
             let expected_soul = soul.clone();
-            let expected_cwd = if fault == "replacement" {
+            let expected_cwd = if matches!(fault, "replacement" | "candidate_digest") {
                 resumed.clone()
             } else {
                 cwd.clone()
             };
+            let (settled, mut stop_reader) = tokio::sync::oneshot::channel();
             let reader = tokio::spawn(async move {
                 tokio::time::timeout(std::time::Duration::from_secs(5), async move {
-                    for operation in 0..2 {
-                        let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut observations = Vec::new();
+                    loop {
+                        let (mut socket, _) = tokio::select! {
+                            _ = &mut stop_reader => break,
+                            accepted = listener.accept() => accepted.unwrap(),
+                        };
                         let request: Envelope<AdminCommand> = read_frame(&mut socket).await.unwrap();
                         assert_eq!(request.auth.as_deref(), Some("fixture-control"));
-                        let result = match (operation, request.body) {
-                            (0, AdminCommand::Health) => AdminResult::Health {
+                        let result = match request.body {
+                            AdminCommand::Health => AdminResult::Health {
                                 control_epoch: 1, installation_id: InstallationId::parse("installation-fixture").unwrap(),
                             },
-                            (1, AdminCommand::ObserveClaudeSources(request)) => {
+                            AdminCommand::ObserveClaudeSources(request) => {
                                 assert_eq!(request.expected_control_epoch, Some(1));
                                 assert_eq!(request.soul_id, expected_soul);
                                 assert!(matches!(request.authority, ClaudeSourceAuthority::RecoveryAttempt { attempt_id } if attempt_id == expected_scope));
                                 assert_eq!(request.observation_request.cwd, expected_cwd);
-                                assert!(request.candidate.is_none());
+                                let candidate = request.candidate.is_some();
+                                observations.push(candidate);
+                                assert!(observations.len() <= 4, "only one baseline plus three finite candidate revisions are permitted");
+                                assert_eq!(request.candidate.is_some(), request.observation_request.candidate_binding.is_some());
                                 let selected = request.observation_request;
                                 let raw = bounded_json_bytes(&selected, freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES).unwrap();
                                 // This synthetic reply qualifies IPC validation, not an actual native reader.
                                 AdminResult::ClaudeSourceObservation(ObservationReply {
-                                    request_sha256: if fault == "digest" { "0".repeat(64) } else { format!("{:x}", Sha256::digest(raw)) },
+                                    request_sha256: if fault == "digest" || (fault == "candidate_digest" && candidate) { "0".repeat(64) } else { format!("{:x}", Sha256::digest(raw)) },
                                     observation: NativeObservation {
                                         version: 1, native_source_runtime: selected.native_source_runtime,
                                         setting_sources: selected.setting_sources, uid: if fault == "identity" { 0 } else { 65534 },
@@ -7115,7 +7250,8 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                         };
                         write_frame(&mut socket, &AdminReply { request_id: request.request_id, result: Ok(result) }).await.unwrap();
                     }
-                }).await.unwrap();
+                    observations
+                }).await.unwrap()
             });
             let client =
                 freshell_runtime_client::RuntimeClient::new(socket_path, "fixture-control");
@@ -7129,7 +7265,17 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 &client,
             )
             .await;
-            reader.await.unwrap();
+            let _ = settled.send(());
+            let observations = reader.await.unwrap();
+            if matches!(fault, "none" | "replacement" | "candidate_digest") {
+                assert_eq!(observations, vec![false, true], "both pending replay and new replacement must confirm their actual candidate before any consumer");
+            } else {
+                assert_eq!(
+                    observations,
+                    vec![false],
+                    "failed current source evidence must stop before candidate work"
+                );
+            }
             if fault == "none" {
                 assert_eq!(
                     serde_json::from_slice::<serde_json::Value>(&result.unwrap()).unwrap(),
@@ -7170,6 +7316,16 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                     !pending_stage.exists(),
                     "deliberately aborted private generation stays removed"
                 );
+                let path = stage.join(".freshell/prepared-result.json");
+                let bytes = std::fs::read(&path).unwrap();
+                replacement_snapshot = Some((path, bytes));
+            } else if fault == "candidate_digest" {
+                assert!(
+                    result.is_err(),
+                    "incomplete candidate evidence cannot return a prepared result"
+                );
+                let (path, bytes) = replacement_snapshot.as_ref().unwrap();
+                assert_eq!(&std::fs::read(path).unwrap(), bytes);
             } else {
                 assert!(
                     result.is_err(),
@@ -7180,7 +7336,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 std::fs::read(prior_stage.join(".freshell/prepared-context.json")).unwrap(),
                 prior_before
             );
-            if fault != "replacement" {
+            if matches!(fault, "digest" | "identity" | "none") {
                 assert_eq!(
                     std::fs::read(pending_stage.join(".freshell/prepared-result.json")).unwrap(),
                     pending_before

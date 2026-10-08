@@ -317,7 +317,7 @@ fn selected_settings_file(
     })
 }
 
-fn accept_candidate_observation(
+pub(crate) fn accept_candidate_observation(
     plan: &mut freshell_platform::claude_inputs::AcceptedNativeSourcePlan,
     source: &freshell_platform::claude_inputs::observation::ObservationRequest,
     reply: &freshell_platform::claude_inputs::observation::ObservationReply,
