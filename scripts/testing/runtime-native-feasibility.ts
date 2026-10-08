@@ -397,7 +397,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (selection.provider === 'codex' && ['create', 'exact-resume', 'wrong-root'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, 'codex', caseId, serverPath, servers)
   }
-  if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume'].includes(caseId)) {
+  if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume', 'wrong-root'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, selection.mode as 'freshcodex' | 'freshopencode', caseId)
   }
   if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
@@ -777,6 +777,48 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
       providerModel: settings.model, providerReasoningEffort: 'low', providerPermissionMode: 'on-request', providerSandbox: 'workspace-write',
       providerSecretReferences: managedPreparation?.secretReferences ?? references, providerLaunchContext: managedPreparation?.context ?? freshAgent.providerLaunchContext } } } : request
+  if (!terminal && caseId === 'wrong-root') {
+    const expectedRoot = provider === 'opencode' ? 'ses_' + randomUUID().replaceAll('-', '') : randomUUID()
+    const faultRequest = { ...selectedRequest, params: { ...selectedRequest.params, nativeSessionId: expectedRoot } }
+    harness.writeArtifact(`${scenario}-request.json`, faultRequest)
+    const launch = await harness.adminRaw(supervisor, faultRequest)
+    harness.writeArtifact(`${scenario}-launch-refusal.json`, launch)
+    const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+    const view = inventory.data.find((row: any) => row.soulId === soulId)
+    harness.writeArtifact(`${scenario}-current-view.json`, view)
+    if (launch.result?.Err?.code !== 'RECOVERY_BLOCKED' || !view || view.launchState !== 'starting'
+      || (view.nativeSessionId && view.nativeSessionId !== expectedRoot) || view.nativeIdentityObservation || !view.incarnationId || !view.containerId) {
+      throw new Error('actual initial fresh wrong-root publication was not contained')
+    }
+    // This is the current protected actor journal produced by the real
+    // provider receiver, not the requested root or a provider-store census.
+    const receiver = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '0:0',
+      ['python3', '-c', receiverWrongRootEvidence]))
+    harness.writeArtifact(`${scenario}-current-native-receiver.json`, receiver)
+    if (receiver.schemaVersion !== 1 || receiver.provider !== provider || receiver.cwd !== workspace
+      || typeof receiver.nativeSessionId !== 'string' || !receiver.nativeSessionId || receiver.nativeSessionId === expectedRoot
+      || !Array.isArray(receiver.startedRoots) || receiver.startedRoots.length !== 1 || receiver.startedRoots[0] !== receiver.nativeSessionId
+      || receiver.commandCount !== 0 || receiver.decisionCount !== 0 || !/^[a-f0-9]{64}$/.test(receiver.sha256 ?? '')) {
+      throw new Error('actual current fresh receiver does not prove a different native root')
+    }
+    const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+      ['python3', '-c', receiverNativeNamespace, provider, receiver.nativeSessionId, workspace]))
+    harness.writeArtifact(`${scenario}-namespace-private.json`, namespace)
+    if (!receiverNativeNamespaceMatches(namespace, provider, workspace, receiver.nativeSessionId)
+      || (provider === 'opencode' && namespace.nativeMessageCount !== 0)) throw new Error('actual native receiver namespace/profile/pin/TLS differs')
+    const input = await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: { soulId, text: 'Owned wrong-root input refusal probe. Do not use tools.' } })
+    harness.writeArtifact(`${scenario}-input-refusal.json`, input)
+    if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('actual fresh wrong-root admitted input')
+    const original: NativeExperimentOriginal = { caseId, ownerId: harness.runId, imageDigest: harness.imageRef,
+      candidateSha: harness.candidateSha, nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256,
+      profileSha256: createHash('sha256').update(JSON.stringify({ settings, nativeProfileSha256: namespace.profileSha256 })).digest('hex'),
+      artifactReferences: [`${scenario}-launch-refusal.json`, `${scenario}-current-native-receiver.json`, `${scenario}-namespace-private.json`, `${scenario}-input-refusal.json`],
+      assertions: [{ name: 'actual-current-native-selected-different-root', pass: true },
+        { name: 'wrong-current-native-root-refused-before-running-and-input', pass: true },
+        { name: 'actual-selected-native-process-profile-uid-and-tls', pass: true }] }
+    harness.writeArtifact(`${scenario}-original.json`, original)
+    return original
+  }
   if (terminal && caseId === 'wrong-root') {
     // A requested root is an expectation only: the native app-server creates
     // its own different thread with no resume selector and no model input.
@@ -1004,6 +1046,17 @@ if provider=='opencode':
   query_snapshot=memory.serialize();assert len(query_snapshot)<=8*1024*1024
  assert identity(after)==identity(file.stat())
 print(json.dumps({'nativeRoot':root if provider=='codex' else None,'path':str(file),'identity':identity(after),'sha256':hashlib.sha256(raw).hexdigest(),'bytesBase64':base64.b64encode(raw).decode() if provider=='codex' else None,'querySnapshotBase64':base64.b64encode(query_snapshot).decode() if query_snapshot is not None else None,'querySnapshotSha256':hashlib.sha256(query_snapshot).hexdigest() if query_snapshot is not None else None,'completeEof':True}))
+`
+
+export const receiverWrongRootEvidence = String.raw`
+import pathlib,json,hashlib
+file=pathlib.Path('/run/freshell-host-actor/fresh-agent-state.json')
+assert file.is_file() and not file.is_symlink() and file.resolve()==file
+raw=file.read_bytes();assert len(raw)<=32*1024*1024
+state=json.loads(raw);profile=state['profile'];events=state['events']
+assert isinstance(events,list) and isinstance(state['commands'],dict) and isinstance(state['decisions'],dict)
+roots=[item['event']['data']['native_session_id'] for item in events if item['event']['kind']=='started']
+print(json.dumps({'schemaVersion':state['schemaVersion'],'provider':profile['provider'],'cwd':profile['cwd'],'nativeSessionId':profile.get('nativeSessionId'),'startedRoots':roots,'commandCount':len(state['commands']),'decisionCount':len(state['decisions']),'sha256':hashlib.sha256(raw).hexdigest()}))
 `
 
 export const receiverNativeNamespace = String.raw`

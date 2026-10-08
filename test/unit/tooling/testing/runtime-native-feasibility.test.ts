@@ -13,7 +13,7 @@ import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
-  amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
+  amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, receiverWrongRootEvidence, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
 const candidateSha = 'b'.repeat(40)
@@ -111,6 +111,65 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         : 'actual current Codex receipt does not prove a different native root')
     } finally { fs.rmSync(directory, { recursive:true, force:true }) }
   })
+  it.each(['valid', 'malformed', 'symlink'])('executes the real protected current receiver journal projection (%s)', fault => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-current-receiver-projection-'))
+    const file = path.join(directory, 'fresh-agent-state.json'), original = path.join(directory, 'original.json')
+    const root = randomUUID()
+    const state = { schemaVersion: 1, profile: { provider: 'codex', cwd: directory, nativeSessionId: root },
+      commands: {}, decisions: {}, events: [{ sequence: 1, event: { kind: 'started', data: { native_session_id: root } } }] }
+    fs.writeFileSync(original, JSON.stringify(state))
+    if (fault === 'symlink') fs.symlinkSync(original, file)
+    else fs.writeFileSync(file, fault === 'malformed' ? '{invalid' : JSON.stringify(state))
+    const script = receiverWrongRootEvidence.replace("pathlib.Path('/run/freshell-host-actor/fresh-agent-state.json')", 'pathlib.Path(' + JSON.stringify(file) + ')')
+    try {
+      if (fault === 'valid') {
+        const evidence = JSON.parse(execFileSync('python3', ['-c', script], { encoding: 'utf8', timeout: 5000 }))
+        expect(evidence).toEqual({ schemaVersion: 1, provider: 'codex', cwd: directory, nativeSessionId: root,
+          startedRoots: [root], commandCount: 0, decisionCount: 0, sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex') })
+      } else expect(() => execFileSync('python3', ['-c', script], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' })).toThrow()
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+  it.each(['freshcodex', 'freshopencode'].flatMap(mode => ['valid', 'published', 'admitted-input', 'requested-echo', 'missing-started', 'commands-present', 'wrong-uid'].map(fault => [mode, fault])))
+    ('requires actual fresh native wrong-root receiver and refuses initial input (%s, %s; orchestration only)', async (mode, fault) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-native-wrong-')), root = randomUUID()
+      const provider = mode === 'freshcodex' ? 'codex' : 'opencode'
+      let expected = '', soul = '', cwd = ''
+      const requests: any[] = []
+      const harness = { testRoot: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
+        startSupervisor: async () => ({}), writeArtifact: () => {}, inventoryBody: () => ({ method: 'inventory' }),
+        adminRaw: async (_: unknown, request: any) => {
+          requests.push(request)
+          if (request.method === 'launch') {
+            expected = request.params.nativeSessionId; soul = request.params.soulId; cwd = request.params.freshAgent.cwd
+            expect(request.params.freshAgent.nativeSessionId).toBeUndefined()
+            return { result: { Err: { code: 'RECOVERY_BLOCKED' } } }
+          }
+          if (request.method === 'fresh_agent_send') return { result: { Err: { code: fault === 'admitted-input' ? 'OTHER_ERROR' : 'UNKNOWN_SOUL' } } }
+          throw new Error('unexpected command')
+        },
+        adminOk: async () => ({ data: [{ soulId: soul, launchState: fault === 'published' ? 'running' : 'starting',
+          incarnationId: 'current-inc', containerId: 'owned-current', nativeSessionId: expected, nativeIdentityObservation: null }] }),
+        execOwnedContainerAsExact: async (_: string, uid: string) => uid === '0:0'
+          ? JSON.stringify({ schemaVersion: 1, nativeSessionId: fault === 'requested-echo' ? expected : root,
+            provider, cwd, startedRoots: fault === 'missing-started' ? [] : [root],
+            commandCount: fault === 'commands-present' ? 1 : 0, decisionCount: 0, sha256: 'a'.repeat(64) })
+          : JSON.stringify({ uid: fault === 'wrong-uid' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+            httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: cwd,
+            nativeRoot: root, nativeMessageCount: 0, nativeVersion: provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21',
+            activeNativeProcesses: 1, executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64) }),
+      } as unknown as RuntimeHarness
+      const sources = ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: provider + '/grants/' + suffix, path: '/owned/' + suffix, sha256: 'e'.repeat(64) }))
+      try {
+        const run = executeManagedNativeCase(harness, sources, { mode: mode as 'freshcodex' | 'freshopencode', case: 'startup' }, 'wrong-root')
+        if (fault === 'valid') {
+          expect((await run).assertions.every(row => row.pass)).toBe(true)
+          expect(expected).not.toBe(root); expect(requests.map(row => row.method)).toEqual(['launch', 'fresh_agent_send'])
+        } else await expect(run).rejects.toThrow(fault === 'published' ? 'actual initial fresh wrong-root publication was not contained'
+          : fault === 'admitted-input' ? 'actual fresh wrong-root admitted input'
+          : fault === 'wrong-uid' ? 'actual native receiver namespace/profile/pin/TLS differs'
+          : 'actual current fresh receiver does not prove a different native root')
+      } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+    })
   it.each(['freshcodex','freshopencode','codex'].flatMap(mode => ['valid','copied-volume','wrong-incarnation','wrong-root','store-changed','profile-changed','wrong-outcome'].map(fault => [mode,fault])))('executes exact receiver recovery only after completed native history and preserves its original volume (%s, %s; controlled orchestration)', async (mode,fault) => {
     const directory=fs.mkdtempSync(path.join(os.tmpdir(),'receiver-exact-recovery-')), provider=mode==='freshcodex'||mode==='codex'?'codex':'opencode'
     const root=provider==='codex'?randomUUID():'ses_ownedFixture', turn=randomUUID(), container='owned-initial', replacement='owned-replacement'
