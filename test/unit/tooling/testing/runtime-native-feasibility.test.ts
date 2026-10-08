@@ -142,7 +142,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       expect(harness.writeArtifact).not.toHaveBeenCalled()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['requested-echo', 'previous-incarnation', 'stale-revision', 'ledger-advanced', 'disposal-already-published', 'disposal-current'])(
+  it.each(['requested-echo', 'previous-incarnation', 'stale-revision', 'ledger-advanced', 'disposal-already-published', 'disposal-current', 'cancellation-current', 'cancellation-wrong-result', 'cancellation-old-intent'])(
     'executes owned import/launch orchestration with %s without inventing qualification', async fault => {
       const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
       const evidenceDir = path.join(ownedRoot, 'evidence')
@@ -167,7 +167,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
           nativeProcessCwd: launchRequest.params.terminal.cwd, nativeVersion: '1.18.21', nativeRoot: root,
           nativeMessageCount: 2,
           activeNativeProcesses: 1, executableSha256: 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99', profileSha256: 'd'.repeat(64),
-          nativeLaunch: { incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 2, executionGeneration: 1 } })
+          nativeLaunch: { incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 2, executionGeneration: 1, requestedNativeSessionId: root } })
       })
       const harness = {
         repoRoot: process.cwd(), testRoot: ownedRoot, evidenceDir, runId: randomUUID(), candidateSha, imageRef: imageDigest,
@@ -185,29 +185,31 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
         terminalInputBody: (soulId: string, data: string) => ({ method: 'terminal_input', params: { soulId, data } }),
         adminRaw: async (_supervisor: unknown, request: any) => {
           if (request.method === 'terminal_input') { commandOrder.push('input'); return { result: { Err: { code: 'UNKNOWN_SOUL' } } } }
-          if (request.method === 'stop') { stopCalls++; resolveLaunch?.({ result: { Err: { code: 'STALE_INTENT' } } }); return { result: { Ok: {} } } }
+          if (request.method === 'stop') { stopCalls++; resolveLaunch?.({ result: { Err: { code: 'STALE_INTENT_REVISION' } } }); return { result: { Ok: {} } } }
           launchRequest = request
-          if (fault.startsWith('disposal-')) {
-            const selected = request.params.terminal.providerLaunchContext.config[0]
-            try {
-              const config = JSON.parse(fs.readFileSync(path.join(sourceHome, '.config/opencode', selected.relativePath), 'utf8'))
-              selectionReadable = config.plugin.length === 1 && fs.statSync(new URL(config.plugin[0])).isFile()
-            } catch { selectionReadable = false }
+          if (fault.startsWith('disposal-') || fault.startsWith('cancellation-')) {
+            if (fault.startsWith('disposal-')) {
+              const selected = request.params.terminal.providerLaunchContext.config[0]
+              try {
+                const config = JSON.parse(fs.readFileSync(path.join(sourceHome, '.config/opencode', selected.relativePath), 'utf8'))
+                selectionReadable = config.plugin.length === 1 && fs.statSync(new URL(config.plugin[0])).isFile()
+              } catch { selectionReadable = false }
+            }
             return new Promise(resolve => { resolveLaunch = resolve })
           }
           return { result: { Ok: {} } }
         },
         adminOk: async (_supervisor: unknown, request: any) => {
           if (request.method === 'stop') {
-            commandOrder.push('stop'); stopCalls++; stopped = true; resolveLaunch?.({ result: { Err: { code: 'STALE_INTENT' } } })
+            commandOrder.push('stop'); stopCalls++; stopped = true; resolveLaunch?.({ result: { Err: { code: fault === 'cancellation-wrong-result' ? 'RECOVERY_BLOCKED' : 'STALE_INTENT_REVISION' } } })
             return { data: { outcome: 'verified_empty' } }
           }
           if (request.method === 'open_code_transfer') { transferCalls.push(request.params); return { fixtureOnly: true } }
-          return { data: [{ soulId: launchRequest.params.soulId, incarnationId: 'current-incarnation', launchState: stopped ? 'stopped' : fault.startsWith('disposal-') ? 'starting' : 'running',
-            cleanupState: 'none', intentRevision: 1, executionGeneration: 1, containerId: 'fixture-host',
+          return { data: [{ soulId: launchRequest.params.soulId, incarnationId: 'current-incarnation', launchState: stopped ? 'stopped' : fault.startsWith('disposal-') || fault.startsWith('cancellation-') ? 'starting' : 'running',
+            cleanupState: stopped ? 'verified_empty' : 'none', intentRevision: stopped && fault !== 'cancellation-old-intent' ? 2 : 1, executionGeneration: 1, containerId: 'fixture-host',
             desiredState: stopped ? 'stopped' : 'running', recoveryState: stopped ? 'stopped' : 'live', durabilityState: 'unknown', allocationState: 'allocated',
             nativeSessionId: root, evidenceRevision: 2, successfulRecoveriesInWindow: 0,
-            ...(fault === 'requested-echo' || fault.startsWith('disposal-') ? {} : { nativeIdentityObservation: { nativeSessionId: root,
+            ...(fault === 'requested-echo' || fault.startsWith('disposal-') || fault.startsWith('cancellation-') ? {} : { nativeIdentityObservation: { nativeSessionId: root,
               incarnationId: fault === 'previous-incarnation' ? 'previous-incarnation' : 'current-incarnation',
               launchNonce: 'current-nonce', evidenceRevision: ['stale-revision', 'ledger-advanced'].includes(fault) ? 1 : 2,
               source: 'opencode_tui', evidenceDigest: 'c'.repeat(64) } }),
@@ -218,21 +220,22 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       try {
         const execution = executeManagedNativeCase(harness, [{ name: 'opencode/native-preparation/transfer-stage.bin', path: stage, sha256: 'd'.repeat(64) },
           ...['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: 'opencode/grants/' + suffix, path: stage, sha256: 'd'.repeat(64) }))],
-        { provider: 'opencode', case: 'startup' }, fault.startsWith('disposal-') ? 'disposal' : 'null-slot')
-        if (fault === 'disposal-current') {
+        { provider: 'opencode', case: 'startup' }, fault.startsWith('cancellation-') ? 'cancellation' : fault.startsWith('disposal-') ? 'disposal' : 'null-slot')
+        if (fault === 'disposal-current' || fault === 'cancellation-current') {
           await execution
           expect(commandOrder).toEqual(['stop', 'input'])
-        } else await expect(execution).rejects.toThrow(fault === 'disposal-already-published' ? 'supported native TUI disposal was not observed before publication'
+        } else await expect(execution).rejects.toThrow(fault.startsWith('cancellation-') ? 'ordinary Stop did not cancel the current unobserved native launch'
+          : fault === 'disposal-already-published' ? 'supported native TUI disposal was not observed before publication'
           : fault === 'ledger-advanced' ? 'controlled native inspection reached'
           : fault === 'stale-revision' ? 'actual native TUI current namespace/profile/pin/TLS differs' : 'no current admitted observation')
         expect(launchRequest.params.terminal.resumeSessionId).toBe(root)
         expect(launchRequest.params.terminal.opencodeTransfer.rootSessionId).toBe(root)
         expect(transferCalls.map(row => row.action)).toEqual(['begin', 'chunk', 'finalize'])
         expect(Buffer.from(transferCalls[1].data.data, 'base64')).toEqual(fs.readFileSync(sourcePath))
-        expect(inspect).toHaveBeenCalledTimes(fault === 'disposal-current' ? 2 : ['stale-revision', 'ledger-advanced', 'disposal-already-published'].includes(fault) ? 1 : 0)
+        expect(inspect).toHaveBeenCalledTimes(fault === 'disposal-current' ? 2 : fault.startsWith('cancellation-') || ['stale-revision', 'ledger-advanced', 'disposal-already-published'].includes(fault) ? 1 : 0)
         if (fault.startsWith('disposal-')) expect(selectionReadable).toBe(true)
-        expect(stopCalls).toBe(fault.startsWith('disposal-') ? 1 : 0)
-        if (fault !== 'disposal-current') expect((harness.writeArtifact as any).mock.calls.filter(([name]: string[]) => name.endsWith('-original.json'))).toEqual([])
+        expect(stopCalls).toBe(fault.startsWith('disposal-') || fault.startsWith('cancellation-') ? 1 : 0)
+        if (fault !== 'disposal-current' && fault !== 'cancellation-current') expect((harness.writeArtifact as any).mock.calls.filter(([name]: string[]) => name.endsWith('-original.json'))).toEqual([])
       } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
     })
   it.each(['ordinary', 'parity'])('keeps Codex transcript Enter-bound while the %s producer selects its native startup boundary', async route => {
