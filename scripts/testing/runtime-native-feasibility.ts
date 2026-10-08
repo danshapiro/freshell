@@ -263,7 +263,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'claude' && ['create', 'wrong-root', 'disabled-hooks', 'trust-refusal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'claude' && ['create', 'wrong-root', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
   if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
@@ -420,6 +420,7 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   const resumes = ['exact-resume', 'current-native-turn'].includes(caseId)
   const nativeTimeout = caseId === 'timeout'
   const trustRefusal = caseId === 'trust-refusal'
+  const unwritableSignal = caseId === 'unwritable-signal'
   const providerExit = caseId === 'provider-exit'
   const stopCancellation = caseId === 'stop-cancellation'
   const startupFault = providerExit || stopCancellation
@@ -450,6 +451,15 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
     fs.writeFileSync(preferencePath, JSON.stringify(profile), { mode: 0o600 })
   }
   if (hooksDisabled) fs.writeFileSync(path.join(userRoot, 'settings.json'), JSON.stringify({ disableAllHooks: true }), { mode: 0o600 })
+  if (unwritableSignal) {
+    const hookPath = path.join(workspace, 'native-unwritable-signal.sh')
+    fs.writeFileSync(hookPath, 'set -eu\nmkdir -p -- "$FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR"\nchmod 500 -- "$FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR"\nprintf \'%s\\n\' \'{}\'\n', { mode: 0o660 })
+    fs.chmodSync(hookPath, 0o660)
+    const command = "sh '" + hookPath.replaceAll("'", "'\\''") + "'"
+    fs.writeFileSync(path.join(userRoot, 'settings.json'), JSON.stringify({ hooks: {
+      SessionStart: [{ hooks: [{ type: 'command', command }] }],
+    } }), { mode: 0o600 })
+  }
   const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release',
     env: { HOME: home, FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude' } })
   const soulId = 'soul-' + randomUUID()
@@ -515,13 +525,13 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
       providerModel: 'claude-haiku-4-5-20251001', providerReasoningEffort: 'low', providerSecretReferences: managedPreparation?.secretReferences ?? grants,
       providerLaunchContext: managedPreparation?.context ?? { preparation: { claude: { mcp_args: [] } }, config: [{ root: 'user_provider',
         relativePath: '.claude.json', providerRelativePath: '.claude/.claude.json', format: 'json' },
-        ...(hooksDisabled ? [{ root: 'user_provider', relativePath: 'settings.json', providerRelativePath: '.claude/settings.json', format: 'json' }] : [])] } } } }
+        ...(hooksDisabled || unwritableSignal ? [{ root: 'user_provider', relativePath: 'settings.json', providerRelativePath: '.claude/settings.json', format: 'json' }] : [])] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
   const inspectTerminalNative = async (containerId: string) => JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
-    ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : trustRefusal ? ['trust-refusal'] : [])]))
+    ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : trustRefusal ? ['trust-refusal'] : unwritableSignal ? ['unwritable-signal'] : [])]))
   const wrongRoot = caseId === 'wrong-root'
-  const startupRefusal = wrongRoot || hooksDisabled || trustRefusal
-  const refusalReason = trustRefusal ? 'unaccepted native trust' : nativeTimeout ? 'native startup timeout'
+  const startupRefusal = wrongRoot || hooksDisabled || trustRefusal || unwritableSignal
+  const refusalReason = unwritableSignal ? 'unwritable current native signal directory' : trustRefusal ? 'unaccepted native trust' : nativeTimeout ? 'native startup timeout'
     : providerExit ? 'exited native provider' : stopCancellation ? 'cancelled native startup'
       : hooksDisabled ? 'disabled native hooks' : 'wrong current native root'
   const launchStartedAt = Date.now()
@@ -635,12 +645,14 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
   if (startupRefusal ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
   const namespace = beforeFault ?? await inspectTerminalNative(view.containerId)
   harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
-  const noCallbacks = hooksDisabled || trustRefusal
+  const noCallbacks = hooksDisabled || trustRefusal || unwritableSignal
   const selectedModel = noCallbacks ? namespace.nativeArgv?.[namespace.nativeArgv.indexOf('--model') + 1] : namespace.loaded?.native?.model?.id
   const selectedCwd = noCallbacks ? namespace.nativeCwd : namespace.loaded?.native?.workspace?.current_dir
   const loaderMatches = noCallbacks
     ? namespace.hook === null && namespace.loaded === null
-      && (trustRefusal ? namespace.nativePreferences?.workspaceTrust === false : namespace.hooksDisabled === true)
+      && (trustRefusal ? namespace.nativePreferences?.workspaceTrust === false : unwritableSignal
+        ? namespace.signalWritable === false && namespace.signalMode === '0o500' && namespace.hooksDisabled !== true
+        : namespace.hooksDisabled === true)
     : namespace.loaded?.native?.version === '2.1.263' && namespace.loaded.native.session_id === actualRoot
       && JSON.stringify(namespace.loaded.launch) === JSON.stringify(namespace.hook.launch)
   if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
@@ -658,7 +670,7 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     harness.writeArtifact(`${scenario}-pre-input-store-probe.json`, await harness.adminOk(supervisor,
       harness.probeRecoveryBody(soulId)))
   }
-  const assertions = startupRefusal ? [{ name: trustRefusal ? 'actual-native-trust-refused-before-running-and-input'
+  const assertions = startupRefusal ? [{ name: unwritableSignal ? 'actual-native-signal-write-refused-before-running-and-input' : trustRefusal ? 'actual-native-trust-refused-before-running-and-input'
     : nativeTimeout ? 'bounded-actual-native-startup-timeout-before-running-and-input'
       : providerExit ? 'actual-native-provider-exit-refused-before-running-and-input'
         : stopCancellation ? 'ordinary-stop-cancels-native-startup-before-running-and-input'
@@ -679,7 +691,8 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     // admissible target. Inspect actual provider state separately.
     const nativeStateSafe = startupFault ? namespace.completedTurns === 0 && namespace.toolEvents === 0
       : JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
-        && (noCallbacks ? (!after.hook && !after.loaded && (trustRefusal ? after.nativePreferences?.workspaceTrust === false : after.hooksDisabled === true)
+        && (noCallbacks ? (!after.hook && !after.loaded && (trustRefusal ? after.nativePreferences?.workspaceTrust === false
+          : unwritableSignal ? after.signalWritable === false && after.signalMode === '0o500' && after.hooksDisabled !== true : after.hooksDisabled === true)
           && after.completedTurns === 0 && after.toolEvents === 0)
           : (actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
             && after.loaded.native.context_window.total_input_tokens === 0 && after.loaded.native.context_window.total_output_tokens === 0))
@@ -1342,7 +1355,7 @@ print(json.dumps({'nativeRoot':root,'nativePid':int(p.name),'transcript':{'ident
 const claudeNativeInspection = String.raw`
 import pathlib,os,json,hashlib,ssl,urllib.parse,urllib.request,subprocess,sys,base64
 root=sys.argv[1];required=sys.argv[2]=='true';terminal=len(sys.argv)>3 and sys.argv[3]=='terminal'
-missing_callbacks=terminal and len(sys.argv)>4 and sys.argv[4] in ['disabled-hooks','trust-refusal']
+missing_callbacks=terminal and len(sys.argv)>4 and sys.argv[4] in ['disabled-hooks','trust-refusal','unwritable-signal']
 selected=pathlib.Path('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe' if terminal else '/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude')
 expected=hashlib.sha256(selected.read_bytes()).hexdigest();matches=[]
 for p in pathlib.Path('/proc').iterdir():
@@ -1383,7 +1396,7 @@ last_text=''.join(part.get('text','') for part in (assistants[-1].get('message',
 preferences=json.loads((home/'.claude.json').read_text()) if terminal else None
 native_preferences={key:preferences.get(key) for key in ['theme','hasCompletedOnboarding']} if preferences else None
 if native_preferences is not None:native_preferences['workspaceTrust']=preferences.get('projects',{}).get(str(cwd),{}).get('hasTrustDialogAccepted')
-print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':hook['native']['session_id'] if hook else None,'hook':hook,'loaded':loaded,'hooksDisabled':settings.get('disableAllHooks'),'nativeArgv':native_argv,'nativeCwd':str((p/'cwd').resolve()),'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'nativePreferences':native_preferences,'completedTurns':len(completed_ids),'toolEvents':tool_events,'lastAssistantText':last_text,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':hook['native']['session_id'] if hook else None,'hook':hook,'loaded':loaded,'hooksDisabled':settings.get('disableAllHooks'),'signalDirectory':str(signal_dir),'signalWritable':os.access(signal_dir,os.W_OK),'signalMode':oct(signal_dir.stat().st_mode&0o777) if signal_dir.exists() else None,'nativeArgv':native_argv,'nativeCwd':str((p/'cwd').resolve()),'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'nativePreferences':native_preferences,'completedTurns':len(completed_ids),'toolEvents':tool_events,'lastAssistantText':last_text,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
 `
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

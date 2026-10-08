@@ -27,6 +27,33 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it('makes only the owned current signal directory unwritable through the actual ordinary startup hook', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-unwritable-'))
+    const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
+    const signal = path.join(directory, 'current-signal')
+    const sibling = path.join(directory, 'unrelated-signal'); fs.mkdirSync(sibling); fs.writeFileSync(path.join(sibling, 'retained'), 'unchanged')
+    let home = ''
+    const launch = vi.fn(async (_supervisor: unknown, request: any) => {
+      const selected = request.params.terminal.providerLaunchContext.config.find((file: any) => file.providerRelativePath === '.claude/settings.json')
+      const settings = JSON.parse(fs.readFileSync(path.join(home, '.claude', selected.relativePath), 'utf8'))
+      expect(settings.disableAllHooks).not.toBe(true)
+      const command = settings.hooks.SessionStart[0].hooks[0].command
+      execFileSync('/bin/sh', ['-c', command], { env: { ...process.env, FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR: signal } })
+      expect(fs.statSync(signal).mode & 0o222).toBe(0)
+      expect(fs.readFileSync(path.join(sibling, 'retained'), 'utf8')).toBe('unchanged')
+      throw new Error('controlled unwritable native launch boundary')
+    })
+    const harness = { testRoot: directory, startSupervisor: async (options: any) => { home = options.env.HOME; return {} },
+      writeArtifact: () => '', adminRaw: launch, adminOk: launch } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({
+      name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
+    try {
+      await expect(executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, 'unwritable-signal'))
+        .rejects.toThrow('controlled unwritable native launch boundary')
+      expect(launch).toHaveBeenCalledOnce()
+    } finally { if (fs.existsSync(signal)) fs.chmodSync(signal, 0o700); fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+
   it('submits terminal Claude paste and Enter separately before qualifying the completed native seed', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-claude-native-input-'))
     const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
@@ -218,12 +245,15 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
   it.each(['create', 'wrong-root', 'wrong-root-admitted', 'wrong-root-published', 'wrong-root-late-published',
     'disabled-hooks', 'disabled-hooks-admitted', 'disabled-hooks-published',
     'trust-refusal', 'trust-refusal-no-prompt', 'trust-refusal-admitted', 'trust-refusal-published',
+    'unwritable-signal', 'unwritable-signal-writable', 'unwritable-signal-admitted', 'unwritable-signal-published',
     'timeout', 'timeout-too-fast', 'timeout-admitted', 'timeout-published'])('refreshes the current host and protects the terminal %s verdict', async (fault) => {
     const caseId = fault === 'create' ? 'create' : fault.startsWith('disabled-hooks') ? 'disabled-hooks'
-      : fault.startsWith('trust-refusal') ? 'trust-refusal' : fault.startsWith('timeout') ? 'timeout' : 'wrong-root'
-    const noCallbacks = ['disabled-hooks', 'trust-refusal', 'timeout'].includes(caseId)
+      : fault.startsWith('trust-refusal') ? 'trust-refusal' : fault.startsWith('unwritable-signal') ? 'unwritable-signal'
+        : fault.startsWith('timeout') ? 'timeout' : 'wrong-root'
+    const noCallbacks = ['disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout'].includes(caseId)
     const reason = caseId === 'disabled-hooks' ? 'disabled native hooks' : caseId === 'trust-refusal' ? 'unaccepted native trust'
-      : caseId === 'timeout' ? 'native startup timeout' : 'wrong current native root'
+      : caseId === 'unwritable-signal' ? 'unwritable current native signal directory'
+        : caseId === 'timeout' ? 'native startup timeout' : 'wrong current native root'
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-observation-refresh-'))
     const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
     let request: any
@@ -257,6 +287,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
           tlsVerifyMode: 2, tlsCheckHostname: true, version: '2.1.263', executableSha256: 'f'.repeat(64), profileFiles: [],
           transcript: null, hooksDisabled: caseId === 'disabled-hooks' || caseId === 'timeout', completedTurns: 0, toolEvents: 0,
           nativePreferences: { workspaceTrust: caseId !== 'trust-refusal' },
+          signalWritable: fault === 'unwritable-signal-writable', signalMode: '0o500',
           nativeArgv: request.params.terminal.args, nativeCwd: request.params.terminal.cwd,
           hook: noCallbacks ? null : { launch: {}, native: { session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1] } },
           loaded: noCallbacks ? null : { launch: {}, native: { version: '2.1.263', session_id: request.params.terminal.args[request.params.terminal.args.indexOf('--session-id') + 1],
@@ -267,6 +298,10 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
     try {
       const execution = executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, caseId)
+      if (fault === 'unwritable-signal-writable') {
+        await expect(execution).rejects.toThrow('actual terminal Claude pin/profile/namespace/TLS differs')
+        return
+      }
       if (fault === 'trust-refusal-no-prompt' || fault === 'timeout-too-fast') {
         await expect(execution).rejects.toThrow(fault === 'trust-refusal-no-prompt' ? 'actual native trust prompt unavailable' : 'native startup timeout did not respect its bounded wait')
         return
