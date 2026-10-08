@@ -553,7 +553,7 @@ describe('fixed owned saved-history preservation artifact', () => {
     vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: true, running: true })
     vi.spyOn(rig, 'freshCodexSavedHistoryUnchanged').mockResolvedValue(true)
     const coincident = vi.spyOn(rig, 'coincidentFreshCodexHistoryUnchanged').mockResolvedValue(true)
-    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const record = vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
     const state = { nativeSessionId: current.nativeSessionId, pendingDecisionId: null, dispatchCount: 1, completionCount: 1 }
     const privateState = { ...state, schemaVersion: 1, createProfile: { fixtureTransport: true, privateReference: 'owner-only-profile' } }
     vi.spyOn(rig.runtime, 'fixtureNativeState').mockImplementation(async (_instance, address, capture) => {
@@ -610,11 +610,22 @@ describe('fixed owned saved-history preservation artifact', () => {
       await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha, scenarioId: 'browser-managed-runtime',
         operationId: 'foreign-history-preservation-path', action: 'freshcodex-history-preservation-artifact', handle: current,
         historyPreservation: input, outputPath: '/foreign/history' })).rejects.toThrow(/operation/)
+      record.mockClear()
       await expect(rig.publishFreshCodexSavedHistoryPreservation(current, { ...input, beforeHistory: { ...state, completionCount: 99 } })).rejects.toThrow(/captured/)
+      expect(record).toHaveBeenLastCalledWith('external.saved_history_preservation_refused', {
+        severity: 'warn', ...current, stage: 'captured_states',
+      })
 
       coincident.mockResolvedValue(false)
       await expect(rig.publishFreshCodexSavedHistoryPreservation(current, input)).rejects.toThrow(/unchanged/)
+      expect(record).toHaveBeenLastCalledWith('external.saved_history_preservation_refused', {
+        severity: 'warn', ...current, stage: 'history_sources',
+      })
       await expect(rig.publishFreshCodexSavedHistoryPreservation(current, { ...input, transcript: 'private text' })).rejects.toThrow()
+      expect(record).toHaveBeenLastCalledWith('external.saved_history_preservation_refused', {
+        severity: 'warn', ...current, stage: 'input_validation',
+      })
+      expect(JSON.stringify(record.mock.calls)).not.toMatch(/owner-only|private text|privateReference|transcript/)
       expect(await fsp.readFile(file, 'utf8')).toBe(raw)
       vi.spyOn(rig.runtime, 'fixtureNativeState').mockImplementation(async (_instance, address, capture) => {
         capture?.({ ...privateState, createProfile: { fixtureTransport: true, privateReference: 'conflicting-profile' } })

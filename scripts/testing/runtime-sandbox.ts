@@ -4546,41 +4546,55 @@ export class ManagedRuntimeOwner {
   }
 
   async publishFreshCodexSavedHistoryPreservation(handle: ExactRuntimeHandle, input: FreshCodexSavedHistoryPreservation): Promise<{ artifactRef: string }> {
-    await this.assertFreshCodexSavedHistoryFixture(handle)
-    const data = FreshCodexSavedHistoryPreservationSchema.parse(input)
-    if (data.nativeSessionId !== handle.nativeSessionId || data.heldHost.containerId !== handle.containerId
-      || data.heldHost.incarnationId !== handle.incarnationId || data.originalIdentity.soulId !== handle.soulId
-      || data.originalIdentity.sessionRef.provider !== 'codex' || data.originalIdentity.sessionRef.sessionId !== handle.nativeSessionId) {
-      throw new Error('exact observed saved-history identity required')
+    let stage = 'current_fixture'
+    try {
+      await this.assertFreshCodexSavedHistoryFixture(handle)
+      stage = 'input_validation'
+      const data = FreshCodexSavedHistoryPreservationSchema.parse(input)
+      stage = 'identity'
+      if (data.nativeSessionId !== handle.nativeSessionId || data.heldHost.containerId !== handle.containerId
+        || data.heldHost.incarnationId !== handle.incarnationId || data.originalIdentity.soulId !== handle.soulId
+        || data.originalIdentity.sessionRef.provider !== 'codex' || data.originalIdentity.sessionRef.sessionId !== handle.nativeSessionId) {
+        throw new Error('exact observed saved-history identity required')
+      }
+      stage = 'captured_states'
+      const beforeHistory = this.savedHistoryFixtureStates.get(JSON.stringify(data.beforeHistory))
+      const afterReload = this.savedHistoryFixtureStates.get(JSON.stringify(data.afterReload))
+      if (!beforeHistory || !afterReload) throw new Error('captured private fixture states required before history publication')
+      stage = 'history_sources'
+      if (!await this.freshCodexSavedHistoryUnchanged(handle) || !await this.coincidentFreshCodexHistoryUnchanged(handle)) {
+        throw new Error('both observed history sources must remain unchanged')
+      }
+      stage = 'managed_launch'
+      const lifecycle = await this.readOwnedLifecycle()
+      const managedLaunch = lifecycle.filter(event => event.event === data.managedLaunch.event && event.at === data.managedLaunch.at
+        && z.object({ soulId: z.string(), incarnationId: z.string(), containerId: z.string(), workerLaunchCount: z.number() }).parse(event.data).soulId === handle.soulId).at(-1)
+      const observedLaunch = FreshCodexSavedHistoryOwnershipFactsSchema.shape.launches.element.parse(managedLaunch)
+      if (observedLaunch.data.incarnationId !== handle.incarnationId || observedLaunch.data.containerId !== handle.containerId
+        || observedLaunch.data.workerLaunchCount !== data.managedLaunch.data.workerLaunchCount) throw new Error('observed owned launch required')
+      stage = 'controller_reattachment'
+      const controller = lifecycle.filter(event => event.event === 'browser.owned_controller_reattached'
+        && z.object({ completedAt: z.number() }).parse(event.data).completedAt === data.observerWindow.controllerReattachment.completedAt).at(-1)
+      if (!controller) throw new Error('recorded owned controller reattachment required')
+      const observedController = FreshCodexControllerReattachmentSchema.parse(controller.data)
+      if (observedController.currentControllerId !== data.observerWindow.controllerReattachment.currentControllerId
+        || observedController.reattached.soulId !== handle.soulId || observedController.reattached.incarnationId !== handle.incarnationId) {
+        throw new Error('recorded controller differs from the observed history runtime')
+      }
+      stage = 'startup_window'
+      if (observedController.startupFinished.at !== data.observerWindow.startupFinished.at) throw new Error('observed startup timestamp differs from its history window')
+      const privateStartup = z.object({ startupFinished: z.unknown() }).parse(controller.data).startupFinished
+      stage = 'artifact_write'
+      const target = this.runtime.writeBrowserArtifact('owned-host-history-preservation', { ...data, beforeHistory, afterReload, managedLaunch,
+        observerWindow: { ...data.observerWindow, controllerReattachment: controller.data, startupFinished: privateStartup } })
+      fs.chmodSync(target, 0o600)
+      const artifactRef = `owned-host-history-preservation:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
+      this.runtime.recordLifecycle('external.saved_history_preservation_artifact', { severity: 'info', ...handle, artifactRef })
+      return { artifactRef }
+    } catch (error) {
+      this.runtime.recordLifecycle('external.saved_history_preservation_refused', { severity: 'warn', ...handle, stage })
+      throw error
     }
-    const beforeHistory = this.savedHistoryFixtureStates.get(JSON.stringify(data.beforeHistory))
-    const afterReload = this.savedHistoryFixtureStates.get(JSON.stringify(data.afterReload))
-    if (!beforeHistory || !afterReload) throw new Error('captured private fixture states required before history publication')
-    if (!await this.freshCodexSavedHistoryUnchanged(handle) || !await this.coincidentFreshCodexHistoryUnchanged(handle)) {
-      throw new Error('both observed history sources must remain unchanged')
-    }
-    const lifecycle = await this.readOwnedLifecycle()
-    const managedLaunch = lifecycle.filter(event => event.event === data.managedLaunch.event && event.at === data.managedLaunch.at
-      && z.object({ soulId: z.string(), incarnationId: z.string(), containerId: z.string(), workerLaunchCount: z.number() }).parse(event.data).soulId === handle.soulId).at(-1)
-    const observedLaunch = FreshCodexSavedHistoryOwnershipFactsSchema.shape.launches.element.parse(managedLaunch)
-    if (observedLaunch.data.incarnationId !== handle.incarnationId || observedLaunch.data.containerId !== handle.containerId
-      || observedLaunch.data.workerLaunchCount !== data.managedLaunch.data.workerLaunchCount) throw new Error('observed owned launch required')
-    const controller = lifecycle.filter(event => event.event === 'browser.owned_controller_reattached'
-      && z.object({ completedAt: z.number() }).parse(event.data).completedAt === data.observerWindow.controllerReattachment.completedAt).at(-1)
-    if (!controller) throw new Error('recorded owned controller reattachment required')
-    const observedController = FreshCodexControllerReattachmentSchema.parse(controller.data)
-    if (observedController.currentControllerId !== data.observerWindow.controllerReattachment.currentControllerId
-      || observedController.reattached.soulId !== handle.soulId || observedController.reattached.incarnationId !== handle.incarnationId) {
-      throw new Error('recorded controller differs from the observed history runtime')
-    }
-    if (observedController.startupFinished.at !== data.observerWindow.startupFinished.at) throw new Error('observed startup timestamp differs from its history window')
-    const privateStartup = z.object({ startupFinished: z.unknown() }).parse(controller.data).startupFinished
-    const target = this.runtime.writeBrowserArtifact('owned-host-history-preservation', { ...data, beforeHistory, afterReload, managedLaunch,
-      observerWindow: { ...data.observerWindow, controllerReattachment: controller.data, startupFinished: privateStartup } })
-    fs.chmodSync(target, 0o600)
-    const artifactRef = `owned-host-history-preservation:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
-    this.runtime.recordLifecycle('external.saved_history_preservation_artifact', { severity: 'info', ...handle, artifactRef })
-    return { artifactRef }
   }
 
   async publishFreshCodexSavedHistoryMeasurement(enclosure: RuntimeEnclosureHandle, input: FreshCodexSavedHistoryMeasurement): Promise<{ artifactRef: string }> {
