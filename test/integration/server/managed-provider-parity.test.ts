@@ -438,7 +438,7 @@ describe('ordinary and managed terminal provider parity', () => {
       }).catch(async error => {
         throw new Error(`${String(error)}; probe=${JSON.stringify(probe)}; inventory=${JSON.stringify(await rig.inventory())}`)
       })
-      rig.runtime.killOwnedRuntimeExact(before.containerId!)
+      await rig.crashRuntimeHost(rig.exactRuntimeHandle(before))
       const after = await waitFor(`${provider} replacement incarnation`, async () => {
         const view = await rig.runningViewForTerminal(managedTerminalId!)
         return view?.containerId && view.incarnationId !== before.incarnationId
@@ -539,7 +539,7 @@ describe('ordinary and managed terminal provider parity', () => {
     fs.rmSync(path.join(workspace, '.opencode/opencode.json'))
     const editedTui = '{ // changed before replacement\n  "theme": "light"\n}\n'
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), editedTui)
-    rig.runtime.killOwnedRuntimeExact(before.containerId)
+    await rig.crashRuntimeHost(rig.exactRuntimeHandle(before))
     const after = await waitFor('replacement OpenCode incarnation', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
       return view?.containerId && view.incarnationId !== before.incarnationId ? view : undefined
@@ -613,13 +613,13 @@ describe('ordinary and managed terminal provider parity', () => {
     })
     await wire.wait(frame => frame.type === 'terminal.meta.updated'
       && frame.upsert?.some((row: any) => row.terminalId === terminalId && row.sessionId === switchedId), 30_000)
-    await waitFor('switched OpenCode exact resume evidence', async () => {
+    const switched = await waitFor('switched OpenCode exact resume evidence', async () => {
       const view = (await rig.inventory()).find((row: any) => row.terminalId === terminalId)
       return view?.nativeSessionId === switchedId && view?.durabilityState === 'resume_captured' ? view : undefined
     }, 20_000).catch(async error => {
       throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; supervisor: ${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-4000)}`)
     })
-    rig.runtime.killOwnedRuntimeExact(before.containerId)
+    await rig.crashRuntimeHost(rig.exactRuntimeHandle(switched))
     const after = await waitFor('replacement OpenCode incarnation after native switch', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
       return view?.containerId && view.incarnationId !== before.incarnationId ? view : undefined
@@ -656,7 +656,7 @@ describe('ordinary and managed terminal provider parity', () => {
     await rig.web.kill()
     const editedTui = '{ // changed while web is down\n  "theme": "solarized"\n}\n'
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), editedTui)
-    rig.runtime.killOwnedRuntimeExact(before.containerId)
+    await rig.crashRuntimeHost(rig.exactRuntimeHandle(before))
     await rig.restartWebGracefully()
     const after = await waitFor('replacement after web restart', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
