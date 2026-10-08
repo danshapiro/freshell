@@ -877,6 +877,7 @@ describe('default export (TuiPluginModule)', () => {
       }) }
     const abort = new AbortController()
     try {
+      const initialAt = Date.now()
       plugin.tui({
         state: { ready: true, session: { get: () => session, messages: () => [] } },
         client: { session: { create, get: async () => ({ data: session }), messages: async () => ({ data: [] }) } },
@@ -892,7 +893,10 @@ describe('default export (TuiPluginModule)', () => {
       const diagnostics = join(dirname(file), 'opencode-native-diagnostics')
       const publication = JSON.parse(readFileSync(join(diagnostics, 'publication_succeeded.json'), 'utf8'))
       expect(publication).toMatchObject({ severity: 'info', nativeSessionId: root,
-        incarnationId: launch.incarnationId, launchNonce: launch.launchNonce, observedAtMs: Date.now() })
+        incarnationId: launch.incarnationId, launchNonce: launch.launchNonce, observedAtMs: initialAt })
+      const duplicate = JSON.parse(readFileSync(join(diagnostics, 'duplicate.json'), 'utf8'))
+      expect(duplicate).toMatchObject({ severity: 'info', observedAtMs: Date.now(), nativeSessionId: root,
+        trigger: 'poll', launchNonce: launch.launchNonce })
       expect(existsSync(join(diagnostics, 'native_create_settled.json'))).toBe(mode === 'create')
       if (mode === 'create') {
         const created = JSON.parse(readFileSync(join(diagnostics, 'native_create_settled.json'), 'utf8'))

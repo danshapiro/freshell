@@ -696,7 +696,7 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
   let lastEvidence: string | null = null
   let lastRefusal: string | undefined
   type ProgressStage = 'in_flight' | 'native_create_pending' | 'native_create_settled'
-    | 'native_read_pending' | 'native_read_settled' | 'refused' | 'publication_succeeded'
+    | 'native_read_pending' | 'native_read_settled' | 'refused' | 'publication_succeeded' | 'duplicate'
   // Retain each last actual phase under this launch, including busy renderer
   // wake-ups. These body-free diagnostics never serve as identity evidence.
   const progress = (stage: ProgressStage, reason?: string): void => {
@@ -788,7 +788,11 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
         messages_read: active.length === 0 ? 'empty_confirmed' : 'success',
         active_message_count: active.length, tail_message_id: tail,
       } })
-      if (evidence !== lastEvidence) write(directory, 'opencode-loaded', evidence)
+      if (evidence === lastEvidence) {
+        progress('duplicate')
+        return
+      }
+      write(directory, 'opencode-loaded', evidence)
       lastEvidence = evidence
       progress('publication_succeeded')
     } catch { refuse('native_loader_or_publication_failed') }
