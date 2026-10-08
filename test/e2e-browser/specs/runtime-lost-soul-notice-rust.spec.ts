@@ -23,7 +23,6 @@ import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import {
-  captureRuntimeReceiptCandidate,
   sha256,
 } from '../../../scripts/testing/runtime-phase5-evidence-common.js'
 import {
@@ -182,13 +181,13 @@ test.describe.serial('Phase 5 certified provider loss', () => {
     test.skip(process.env.FRESHELL_RUNTIME_PHASE5_LIVE !== '1', 'set FRESHELL_RUNTIME_PHASE5_LIVE=1 for the live loss receipt')
     test.setTimeout(1_200_000)
 
-    const candidateBefore = captureRuntimeReceiptCandidate(process.cwd())
     const rig = new ManagedRuntimeBrowserRig(
       process.cwd(),
       5,
       {},
       { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000' },
     )
+    const candidateBefore = await rig.captureCandidateIntegrity()
     let receiptReady = false
     try {
       const info = await rig.start()
@@ -452,7 +451,7 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
       runtimeImage: rig.runtime.imageRef,
       receiptRunId: rig.runtime.runId,
       candidateBefore,
-      candidateAfter: captureRuntimeReceiptCandidate(rig.repoRoot),
+      candidateAfter: await rig.captureCandidateIntegrity(),
     })
     const receiptPath = rig.writePhase5LossReceipt(receipt)
     expect(sha256(fs.readFileSync(receiptPath))).toMatch(/^[0-9a-f]{64}$/)

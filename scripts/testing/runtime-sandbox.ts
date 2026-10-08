@@ -610,6 +610,9 @@ export type RuntimeWebProcessFacts = z.infer<typeof RuntimeWebProcessFactsSchema
 export const RuntimeSupervisorProcessFactsSchema = z.object({ containerId: z.string().regex(/^[a-f0-9]{64}$/),
   pid: z.number().int().min(2) }).strict()
 export type RuntimeSupervisorProcessFacts = z.infer<typeof RuntimeSupervisorProcessFactsSchema>
+export const RuntimeCandidateIntegritySchema = z.object({ sha: z.string().regex(/^[a-f0-9]{40}$/), dirty: z.boolean(),
+  diffHash: z.string().regex(/^[a-f0-9]{64}$/), statusHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict()
+export type RuntimeCandidateIntegrity = z.infer<typeof RuntimeCandidateIntegritySchema>
 export const RuntimeChaosWebOutputFactsSchema = z.object({ contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
   contentBytes: z.number().int().nonnegative(), containsFollowUpMarker: z.boolean(), containsAuthToken: z.boolean() }).strict()
 export type RuntimeChaosWebOutputFacts = z.infer<typeof RuntimeChaosWebOutputFactsSchema>
@@ -636,7 +639,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
     'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
@@ -2870,6 +2873,12 @@ export class ManagedRuntimeOwner {
     if (!this.supervisor) throw new Error('owned supervisor process is not prepared')
     const containerId = RuntimeSupervisorProcessFactsSchema.shape.containerId.parse(this.supervisor.containerId)
     return RuntimeSupervisorProcessFactsSchema.parse({ containerId, pid: this.runtime.ownedContainerHostPidExact(containerId) })
+  }
+
+  async captureCandidateIntegrity(): Promise<RuntimeCandidateIntegrity> {
+    const { captureRuntimeReceiptCandidate } = await import('./runtime-phase5-evidence-common.js')
+    return RuntimeCandidateIntegritySchema.refine(value => value.sha === this.runtime.candidateSha, 'owned candidate changed')
+      .parse(captureRuntimeReceiptCandidate(this.repoRoot))
   }
 
   async chaosWebOutputFacts(handle: ExactRuntimeHandle, challengeId: string): Promise<RuntimeChaosWebOutputFacts> {

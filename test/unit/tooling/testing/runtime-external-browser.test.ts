@@ -1013,6 +1013,52 @@ describe('closed external owner control', () => {
       containerId: first })).rejects.toThrow(/operation/)
     expect(inspect).not.toHaveBeenCalled()
   })
+  it('observes actual owner Git integrity without exposing its working diff or accepting another root', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-candidate-integrity-'))
+    try {
+      const git = (...args: string[]) => {
+        const result = spawnSync('git', args, { cwd: directory, encoding: 'utf8' })
+        expect(result.status, result.stderr).toBe(0)
+      }
+      git('init', '--quiet')
+      await fsp.writeFile(path.join(directory, 'owned.txt'), 'initial owned content\n')
+      git('add', 'owned.txt')
+      git('commit', '--quiet', '-m', 'Create owned integrity fixture')
+      const owned = new ManagedRuntimeOwner(() => { throw new Error('unused integrity web') }, directory)
+      const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const replies: unknown[] = []
+      const transport = vi.fn(async (_url: string, init: RequestInit) => {
+        const reply = await control(JSON.parse(String(init.body)))
+        replies.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+      const clean = await rig.captureCandidateIntegrity()
+      const empty = createHash('sha256').update('').digest('hex')
+      expect(clean).toEqual({ sha: context.candidateSha, dirty: false, diffHash: empty, statusHash: empty })
+      await fsp.writeFile(path.join(directory, 'owned.txt'), 'owner-private-change\n')
+      const dirty = await rig.captureCandidateIntegrity()
+      expect(dirty).toMatchObject({ sha: context.candidateSha, dirty: true })
+      expect(dirty.diffHash).not.toBe(empty)
+      expect(dirty.statusHash).not.toBe(empty)
+      expect(JSON.stringify(replies)).not.toContain('owner-private-change')
+      await fsp.writeFile(path.join(directory, 'private-untracked.txt'), 'owner-private-untracked-content')
+      const untracked = await rig.captureCandidateIntegrity()
+      expect(untracked.dirty).toBe(true)
+      expect(untracked.diffHash).toBe(dirty.diffHash)
+      expect(untracked.statusHash).not.toBe(dirty.statusHash)
+      expect(JSON.stringify(replies)).not.toContain('private-untracked')
+      const request = { runId: context.runId, candidateSha: context.candidateSha, scenarioId: 'browser-managed-runtime',
+        operationId: 'foreign-integrity-root', action: 'candidate-integrity', repoRoot: '/foreign/root' }
+      await expect(control(request)).rejects.toThrow(/operation/)
+      git('add', 'owned.txt')
+      git('commit', '--quiet', '-m', 'Change owned candidate fixture')
+      await expect(owned.captureCandidateIntegrity()).rejects.toThrow()
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
   it('compares an observed incident to the exact owned soul without exposing its summary', async () => {
     const { owned, context, request } = fixture()
     const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'incident-owned-soul',

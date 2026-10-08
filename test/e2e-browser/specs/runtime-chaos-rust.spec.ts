@@ -9,7 +9,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { expect, type Page } from '@playwright/test'
 
-import { captureRuntimeReceiptCandidate, sha256 } from '../../../scripts/testing/runtime-phase5-evidence-common.js'
+import { sha256 } from '../../../scripts/testing/runtime-phase5-evidence-common.js'
 import {
   buildPhase5ChaosReceipt,
   PHASE5_CHAOS_ASSERTIONS_FILE,
@@ -173,7 +173,6 @@ test.describe.serial('Phase 5 runtime chaos', () => {
     test.skip(process.env.FRESHELL_RUNTIME_PHASE5_CHAOS_LIVE !== '1', 'set FRESHELL_RUNTIME_PHASE5_CHAOS_LIVE=1 for the chaos receipt')
     test.setTimeout(2_400_000)
 
-    const candidateBefore = captureRuntimeReceiptCandidate(process.cwd())
     const rig = new ManagedRuntimeBrowserRig(
       process.cwd(),
       5,
@@ -184,6 +183,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '1000',
       },
     )
+    const candidateBefore = await rig.captureCandidateIntegrity()
     const webCycles: Record<string, unknown>[] = []
     const supervisorCycles: Record<string, unknown>[] = []
     const browserLogs: StructuredChaosLog[] = []
@@ -510,7 +510,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       runtimeImage: rig.runtime.imageRef,
       receiptRunId: rig.runtime.runId,
       candidateBefore,
-      candidateAfter: captureRuntimeReceiptCandidate(rig.repoRoot),
+      candidateAfter: await rig.captureCandidateIntegrity(),
     })
     const receiptPath = rig.writePhase5ChaosReceipt(receipt)
     expect(sha256(fs.readFileSync(receiptPath))).toMatch(/^[0-9a-f]{64}$/)
