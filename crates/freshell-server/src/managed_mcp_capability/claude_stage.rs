@@ -626,6 +626,130 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_git_native_trim_preserves_selected_and_unselected_resources() {
+        use freshell_platform::claude_inputs::NativeSourceRuntime;
+        for runtime in [NativeSourceRuntime::Terminal, NativeSourceRuntime::Sdk] {
+            for field in ["marker", "common", "backlink"] {
+                for (case, padding, main_selected) in
+                    [("bom", "\u{feff} \t", true), ("nel", "\u{85}", false)]
+                {
+                    let owned = tempfile::tempdir().unwrap();
+                    let home = owned.path().join("home");
+                    let main = owned.path().join("main");
+                    let checkout = owned.path().join("checkout");
+                    let cwd = checkout.join("nested");
+                    let gitdir = main.join(".git/worktrees/fixture");
+                    for directory in [&home, &cwd, &gitdir] {
+                        std::fs::create_dir_all(directory).unwrap();
+                    }
+                    let sources = [
+                        (
+                            "marker",
+                            checkout.join(".git"),
+                            format!("gitdir: {}", gitdir.display()),
+                        ),
+                        ("common", gitdir.join("commondir"), "../..".into()),
+                        (
+                            "backlink",
+                            gitdir.join("gitdir"),
+                            checkout.join(".git").to_str().unwrap().to_string(),
+                        ),
+                    ]
+                    .map(|(kind, path, raw)| {
+                        let raw = if kind == field {
+                            format!("{padding}{raw}{padding}\n")
+                        } else {
+                            format!("{raw}\n")
+                        };
+                        std::fs::write(&path, &raw).unwrap();
+                        (path, raw)
+                    });
+                    for (root, nonce) in [(&cwd, "cwd-source"), (&main, "canonical-source")] {
+                        let commands = root.join(".claude/commands");
+                        std::fs::create_dir_all(commands.join("node_modules/probe-dependency"))
+                            .unwrap();
+                        std::fs::write(commands.join("resource"), nonce).unwrap();
+                        std::fs::write(
+                            commands.join("node_modules/probe-dependency/index.js"),
+                            "module.exports='installed-dependency'",
+                        )
+                        .unwrap();
+                        std::fs::write(commands.join("consume.cjs"), "process.stdout.write(require('node:fs').readFileSync(__dirname+'/resource','utf8')+':'+require('probe-dependency'))").unwrap();
+                    }
+                    let poison = main.join(".claude/commands/unselected-broken-link");
+                    if !main_selected {
+                        std::os::unix::fs::symlink("missing-native-unselected-resource", &poison)
+                            .unwrap();
+                    }
+                    let manifest = ClaudeInputManifest {
+                        version: 1,
+                        native_source_runtime: Some(runtime),
+                        original_home: home.clone(),
+                        cwd: cwd.clone(),
+                        workspace: checkout.clone(),
+                        config_root: None,
+                        settings_file: None,
+                        settings_origin: None,
+                        inline_settings_sha256: None,
+                        setting_sources: vec![ClaudeSettingSource::Project],
+                        plugin_dirs: vec![],
+                    };
+                    let selected = prepare(&home, &cwd, &checkout, Some(&manifest), &[]).unwrap();
+                    let canonical = main.join(".claude/commands");
+                    assert_eq!(
+                        selected
+                            .mounts
+                            .iter()
+                            .any(|mount| Path::new(&mount.logical_destination) == canonical),
+                        main_selected,
+                        "{runtime:?}/{field}/{case}: native-effective canonical command selection"
+                    );
+                    let stage = owned.path().join("stage");
+                    copy_environment(&selected.selections, &stage, &[], CopyLimits::default())
+                        .unwrap();
+                    for (root, nonce, enabled) in [
+                        (&cwd, "cwd-source", true),
+                        (&main, "canonical-source", main_selected),
+                    ] {
+                        if !enabled {
+                            continue;
+                        }
+                        let commands = root.join(".claude/commands");
+                        let mount = selected
+                            .mounts
+                            .iter()
+                            .find(|mount| Path::new(&mount.logical_destination) == commands)
+                            .unwrap();
+                        let output = std::process::Command::new("node")
+                            .arg(stage.join(&mount.stage_relative_path).join("consume.cjs"))
+                            .output()
+                            .unwrap();
+                        assert!(output.status.success());
+                        assert_eq!(
+                            output.stdout,
+                            format!("{nonce}:installed-dependency").as_bytes()
+                        );
+                        assert_eq!(
+                            std::fs::read_to_string(commands.join("resource")).unwrap(),
+                            nonce
+                        );
+                    }
+                    for (path, raw) in sources {
+                        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+                    }
+                    if !main_selected {
+                        assert_eq!(
+                            std::fs::read_link(poison).unwrap(),
+                            Path::new("missing-native-unselected-resource")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn managed_provider_claude_git_lossy_source_view_limit_preserves_prior_copied_resources() {
         let owned = tempfile::tempdir().unwrap();

@@ -4489,13 +4489,68 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             custom_common,
             broken_backlink,
             pointer_symlink,
+            pointer_padding,
         ) in [
-            ("missing", false, false, false, false, false),
-            ("empty-checkout", true, false, false, false, false),
-            ("nested", false, true, false, false, false),
-            ("custom-common", false, false, true, false, false),
-            ("wrong-backlink", false, true, false, true, false),
-            ("pointer-symlink", false, true, false, false, true),
+            ("missing", false, false, false, false, false, None),
+            ("empty-checkout", true, false, false, false, false, None),
+            ("nested", false, true, false, false, false, None),
+            ("custom-common", false, false, true, false, false, None),
+            ("wrong-backlink", false, true, false, true, false, None),
+            ("pointer-symlink", false, true, false, false, true, None),
+            (
+                "bom-marker",
+                false,
+                false,
+                false,
+                false,
+                false,
+                Some(("marker", "\u{feff} \t", true)),
+            ),
+            (
+                "bom-common",
+                false,
+                false,
+                false,
+                false,
+                false,
+                Some(("common", "\u{feff} \t", true)),
+            ),
+            (
+                "bom-backlink",
+                false,
+                false,
+                false,
+                false,
+                false,
+                Some(("backlink", "\u{feff} \t", true)),
+            ),
+            (
+                "nel-marker",
+                false,
+                true,
+                false,
+                false,
+                false,
+                Some(("marker", "\u{85}", false)),
+            ),
+            (
+                "nel-common",
+                false,
+                true,
+                false,
+                false,
+                false,
+                Some(("common", "\u{85}", false)),
+            ),
+            (
+                "nel-backlink",
+                false,
+                true,
+                false,
+                false,
+                false,
+                Some(("backlink", "\u{85}", false)),
+            ),
         ] {
             let fixture = base.join("linked-sources").join(case);
             let home = fixture.join("source-home");
@@ -4522,6 +4577,16 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 format!("{}\n", checkout.join(".git").display()),
             )
             .unwrap();
+            if let Some((field, padding, _)) = pointer_padding {
+                let path = match field {
+                    "marker" => checkout.join(".git"),
+                    "common" => gitdir.join("commondir"),
+                    "backlink" => gitdir.join("gitdir"),
+                    _ => unreachable!(),
+                };
+                let raw = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(path, format!("{padding}{raw}{padding}")).unwrap();
+            }
             if broken_backlink {
                 let other = fixture.join("other-checkout");
                 std::fs::create_dir(&other).unwrap();
@@ -4616,7 +4681,10 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 .unwrap();
                 originals.push((logical.to_path_buf(), archive));
             }
-            let expected_main = !empty_checkout && !broken_backlink && !pointer_symlink;
+            let expected_main = !empty_checkout
+                && !broken_backlink
+                && !pointer_symlink
+                && pointer_padding.is_none_or(|(_, _, selected)| selected);
             if expected_main {
                 let output = std::process::Command::new(main_commands.join("run.cjs"))
                     .output()

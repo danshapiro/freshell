@@ -40,14 +40,10 @@ fn linked_root(checkout: &Path, runtime: NativeSourceRuntime) -> Result<Option<P
     let Some(marker) = read_pointer(&checkout.join(".git"))? else {
         return Ok(None);
     };
-    let Some(pointer) = marker
-        .trim()
-        .trim_start_matches('\u{feff}')
-        .strip_prefix("gitdir:")
-    else {
+    let Some(pointer) = native_trim(&marker).strip_prefix("gitdir:") else {
         return Ok(None);
     };
-    let pointer = pointer.trim();
+    let pointer = native_trim(pointer);
     if unsafe_pointer(pointer, checkout, checkout, runtime) {
         return Ok(None);
     }
@@ -59,7 +55,7 @@ fn linked_root(checkout: &Path, runtime: NativeSourceRuntime) -> Result<Option<P
     let Some(common) = read_pointer(&common_file)? else {
         return Ok(None);
     };
-    let common = common.trim();
+    let common = native_trim(&common);
     if unsafe_pointer(common, &gitdir, &gitdir, runtime) {
         return Ok(None);
     }
@@ -74,7 +70,7 @@ fn linked_root(checkout: &Path, runtime: NativeSourceRuntime) -> Result<Option<P
     let Some(backlink) = read_pointer(&backlink_file)? else {
         return Ok(None);
     };
-    let backlink = backlink.trim();
+    let backlink = native_trim(&backlink);
     if unsafe_network(backlink, checkout, runtime)
         || unsafe_traversal(backlink, &gitdir, checkout, runtime)
     {
@@ -144,13 +140,33 @@ fn read_pointer(path: &Path) -> Result<Option<String>, String> {
             lossy_utf8_view(&bytes, limit).map_err(|_| over_limit())?
         }
     };
-    if raw.trim().len() > 64 * 1024 {
+    if native_trim(&raw).len() > 64 * 1024 {
         return Err(format!(
             "Claude Git selection pointer {} exceeds the 64 KiB path profile; retain inputs and repair the selected metadata",
             path.display()
         ));
     }
     Ok(Some(raw))
+}
+
+// Both pinned native runtimes use String.trim: BOM is whitespace, NEL is not.
+fn native_trim(raw: &str) -> &str {
+    raw.trim_matches(|character| {
+        matches!(
+            character,
+            '\u{0009}'..='\u{000d}'
+                | '\u{0020}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+        )
+    })
 }
 
 // Native replacement groups are admitted before allocation. Reserve the exact
