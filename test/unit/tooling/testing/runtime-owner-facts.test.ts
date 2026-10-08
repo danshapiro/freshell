@@ -1322,6 +1322,36 @@ describe('run-scoped owner operation settlement', () => {
 })
 
 describe('current handle admission before owner mutation', () => {
+  it.each([
+    { provider: 'claude', version: '2.1.263', process: '42 /usr/bin/claude --model haiku --effort low', identities: ['haiku', 'low'], effortAbsent: false },
+    { provider: 'codex', version: '0.147.0', process: '42 /usr/bin/codex -m gpt-5.6-luna --reasoning-effort low', identities: ['low', 'gpt-5.6-luna'], effortAbsent: false },
+    { provider: 'opencode', version: '1.18.21', process: '42 /usr/bin/opencode --model openai/gpt-5.6-luna', identities: ['openai/gpt-5.6-luna'], effortAbsent: true },
+    { provider: 'amplifier', version: '0.1.1', process: '42 /usr/bin/amplifier resume', identities: [], effortAbsent: true },
+  ])('projects fixed terminal startup facts for $provider without exposing the process table', async ({ provider, version, process, identities, effortAbsent }) => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused startup web') }, path.resolve('.'), 5,
+      {}, {}, 'release', { enabledProviders: [provider], freshAgentModes: [] })
+    const current = rig.runtimeEnclosureHandle(handle)
+    const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...current, provider, launchState: 'running', intentRevision: 1 }])
+    Object.defineProperty(rig.runtime, 'broker', { value: { receipts: () => [current] } })
+    const limits = { cpuMax: '50000 100000', memoryMax: '268435456', swapMax: '0', pidsMax: '32' }
+    const probe = vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (_container, args) => args[0] === 'ps'
+      ? `${process}\n43 private-unrelated-process --secret private-value` : args[0] === 'node' ? JSON.stringify(limits) : `${version} (provider)\n`)
+    await expect(rig.managedTerminalStartupFacts(current)).resolves.toEqual({ provider, version: `${version} (provider)\n`,
+      providerProcessPresent: true, processIdentities: identities, reasoningFlagsAbsent: effortAbsent, limits })
+    expect(probe).toHaveBeenLastCalledWith(current.containerId, ['ps', '-eo', 'pid,args'])
+    if (provider === 'amplifier') expect(probe).toHaveBeenNthCalledWith(1, current.containerId,
+      ['/opt/amplifier-src/.venv/bin/python', '-c', 'import importlib.metadata as m; print(m.version("amplifier-app-cli"))'])
+    else expect(probe).toHaveBeenNthCalledWith(1, current.containerId, [provider, '--version'])
+    probe.mockImplementation(async (_container, args) => args[0] === 'ps' ? `42 ${provider}-impostor --model fake-haiku --reasoning-effort=not-low` : args[0] === 'node' ? JSON.stringify(limits) : version)
+    await expect(rig.managedTerminalStartupFacts(current)).resolves.toMatchObject({ providerProcessPresent: false, processIdentities: [], reasoningFlagsAbsent: false })
+    probe.mockClear()
+    inventory.mockResolvedValue([{ ...current, provider: 'foreign-provider', launchState: 'running', intentRevision: 1 }])
+    await expect(rig.managedTerminalStartupFacts(current)).rejects.toThrow(/registered.*terminal/)
+    expect(probe).not.toHaveBeenCalled()
+    inventory.mockResolvedValue([{ ...current, provider, hostBootId: 'replacement-boot', launchState: 'running', intentRevision: 1 }])
+    await expect(rig.managedTerminalStartupFacts(current)).rejects.toThrow(/current.*enclosure/)
+    expect(probe).not.toHaveBeenCalled()
+  })
   it('reads the registered terminal provider notice count with the current controller fence', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused terminal web') }, process.cwd(), 5,
       {}, {}, 'release', { enabledProviders: ['codex'], freshAgentModes: [] })

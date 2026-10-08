@@ -25,7 +25,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema,
   RuntimeProviderReceiptArtifactsSchema, RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema,
   OpencodeContinuityStartupFactsSchema, OpencodeContinuityFirstReplySchema, RuntimeTerminalContinuityObservationSchema,
-  OpencodeQualificationStartupFactsSchema,
+  OpencodeQualificationStartupFactsSchema, ManagedTerminalStartupFactsSchema,
   OpencodeReplacementReadinessSchema,
   OpencodeReadinessConfirmationSchema,
   OpencodeReadinessDiagnosticSchema,
@@ -48,6 +48,7 @@ import type { RuntimeLossAssertions, RuntimeLossAssertionsArtifact, RuntimeLossR
 import type { RuntimeFreshAgentReceiptArtifacts, RuntimeOwnershipFacts, RuntimeTerminalChildFacts } from './runtime-sandbox.js'
 import type { OpencodeContinuityStartupFacts } from './runtime-sandbox.js'
 import type { ProviderQualificationRow } from './provider-qualification-receipt.js'
+import type { ManagedTerminalStartupFacts } from './runtime-sandbox.js'
 import type { RuntimeProviderReceiptArtifacts } from './runtime-sandbox.js'
 import type { FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
@@ -871,6 +872,9 @@ export class ExternalManagedRuntimeRig {
   async managedProviderPendingNoticeCount(handle: ExactRuntimeHandle): Promise<number> {
     return this.rpc('managed-provider-notice-count', z.number().int().nonnegative(), { handle })
   }
+  async managedTerminalStartupFacts(handle: RuntimeEnclosureHandle): Promise<ManagedTerminalStartupFacts> {
+    return this.rpc('managed-terminal-startup', ManagedTerminalStartupFactsSchema, { enclosure: this.runtimeEnclosureHandle(handle) })
+  }
   async chaosHostFacts(handle: ExactRuntimeHandle): Promise<RuntimeHostFacts> {
     return this.rpc('host-facts', z.object({ workerPid: z.number().int().positive(), workerLaunchCount: z.number().int().nonnegative(),
       limits: z.object({ cpuMax: z.string().regex(/^(?:max|\d+) \d+$/), memoryMax: z.string().regex(/^(?:max|\d+)$/),
@@ -1505,6 +1509,10 @@ export function createExternalRuntimeControl(
       case 'fixture-worker': result = await owner.fixtureWorkerFacts(handle()); break
       case 'provider-volume': result = await owner.providerVolumeFacts(handle()); break
       case 'managed-provider-notice-count': result = await owner.managedProviderPendingNoticeCount(handle()); break
+      case 'managed-terminal-startup':
+        if (!request.enclosure) throw new Error('current registered terminal enclosure required')
+        result = await owner.managedTerminalStartupFacts(request.enclosure)
+        break
       case 'fixture-decision-allow':
         if (!request.challengeId) throw new Error('actual pending fixture decision required')
         await owner.allowFixtureDecision(handle(), request.challengeId)

@@ -1184,6 +1184,15 @@ export const OwnedContainerStateSchema = z.discriminatedUnion('present', [
 ])
 export type OwnedContainerState = z.infer<typeof OwnedContainerStateSchema>
 
+export const ManagedTerminalStartupFactsSchema = z.object({
+  provider: z.enum(['claude', 'codex', 'opencode', 'amplifier']),
+  version: z.string().max(200).regex(/\b\d+\.\d+\.\d+\b/), providerProcessPresent: z.boolean(),
+  processIdentities: z.array(z.enum(['haiku', 'low', 'gpt-5.6-luna', 'openai/gpt-5.6-luna'])).max(4),
+  reasoningFlagsAbsent: z.boolean(),
+  limits: OpencodeQualificationStartupFactsSchema.shape.limits,
+}).strict()
+export type ManagedTerminalStartupFacts = z.infer<typeof ManagedTerminalStartupFactsSchema>
+
 export const Phase3BrowserObservationSchema = z.object({
   browserInteraction: z.boolean(), provider: z.literal('opencode'), providerVersion: z.string().regex(/^\d+\.\d+\.\d+$/),
   model: z.string().min(1).max(200), paneId: z.string().min(1).max(200), terminalId: z.string().min(1).max(200),
@@ -1201,7 +1210,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-preservation-artifact', 'freshcodex-history-measurement-artifact', 'freshcodex-controller-reattachment', 'freshcodex-history-measurement-finish', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
-    'provider-volume', 'managed-provider-notice-count', 'fixture-decision-allow',
+    'provider-volume', 'managed-terminal-startup', 'managed-provider-notice-count', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
     'opencode-qualification-blockers',
@@ -4396,12 +4405,35 @@ export class ManagedRuntimeOwner {
     return { providerVolumeName: receipts[0].providerVolumeName }
   }
 
-  async managedProviderPendingNoticeCount(handle: ExactRuntimeHandle): Promise<number> {
-    await this.assertCurrentHandle(handle)
+  private async currentManagedTerminal(handle: RuntimeEnclosureHandle): Promise<ManagedRuntimeView & { provider: ManagedTerminalStartupFacts['provider'] }> {
     const row = await this.currentRuntimeEnclosure(handle)
     if (!row.provider || !this.enabledProviders.includes(row.provider) || row.freshAgentSessionType) {
       throw new Error('registered managed terminal provider required')
     }
+    return { ...row, provider: ManagedTerminalStartupFactsSchema.shape.provider.parse(row.provider) }
+  }
+
+  async managedTerminalStartupFacts(handle: RuntimeEnclosureHandle): Promise<ManagedTerminalStartupFacts> {
+    const { provider } = await this.currentManagedTerminal(handle)
+    const versionCommand = provider === 'amplifier'
+      ? ['/opt/amplifier-src/.venv/bin/python', '-c', 'import importlib.metadata as m; print(m.version("amplifier-app-cli"))']
+      : [provider, '--version']
+    const version = await this.ownedProviderExec(handle.containerId, versionCommand)
+    const limits = JSON.parse(await this.ownedProviderExec(handle.containerId, ['node', '-e',
+      "const fs=require('node:fs');const root='/sys/fs/cgroup/';process.stdout.write(JSON.stringify({cpuMax:fs.readFileSync(root+'cpu.max','utf8').trim(),memoryMax:fs.readFileSync(root+'memory.max','utf8').trim(),swapMax:fs.readFileSync(root+'memory.swap.max','utf8').trim(),pidsMax:fs.readFileSync(root+'pids.max','utf8').trim()}))",
+    ]))
+    const processTable = await this.ownedProviderExec(handle.containerId, ['ps', '-eo', 'pid,args'])
+    const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const processIdentities = (['haiku', 'low', 'gpt-5.6-luna', P2_OPENCODE_MODEL] as const)
+      .filter(identity => new RegExp(`(?:^|[\\s=:'"])${escape(identity)}(?:$|[\\s'"])`, 'm').test(processTable))
+    return ManagedTerminalStartupFactsSchema.parse({ provider, version, limits,
+      providerProcessPresent: new RegExp(`(?:^|\\s)(?:/[^\\s]*/)?${escape(provider)}(?:$|\\s)`, 'm').test(processTable),
+      processIdentities, reasoningFlagsAbsent: !/(?:^|\s)--(?:reasoning-)?effort(?:=|\s)/m.test(processTable) })
+  }
+
+  async managedProviderPendingNoticeCount(handle: ExactRuntimeHandle): Promise<number> {
+    await this.assertCurrentHandle(handle)
+    const row = await this.currentManagedTerminal(handle)
     const result = await this.runtime.adminOk(this.supervisor, this.runtime.pendingNoticesBody(
       `profile:managed-provider-qualification:${row.provider}`, 100, await this.controlEpoch(),
     ))

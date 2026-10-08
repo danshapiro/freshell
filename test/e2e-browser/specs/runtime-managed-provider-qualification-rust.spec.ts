@@ -24,7 +24,7 @@ import { test, createFreshE2ePage } from '../helpers/fixtures.js'
 import { ExternalServer } from '../helpers/external-target.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
-import { RuntimeHarness, type AdminReply } from '../../../scripts/testing/runtime-sandbox.js'
+import { RuntimeHarness, type AdminReply, type ManagedTerminalStartupFacts } from '../../../scripts/testing/runtime-sandbox.js'
 import {
   runTask2RetainedFixture,
   type Task2RetainedBrowserContext,
@@ -181,14 +181,6 @@ function regexEscape(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-function expectExactProcessIdentity(processTable: string, identity: string): void {
-  expect(processTable).toMatch(new RegExp(`(?:^|[\\s=:'"])${regexEscape(identity)}(?:$|[\\s'"])`, 'm'))
-}
-
-function expectActualProviderProcess(processTable: string, binary: string): void {
-  expect(processTable).toMatch(new RegExp(`(?:^|\\s)(?:/[^\\s]*/)?${regexEscape(binary)}(?:$|\\s)`, 'm'))
-}
-
 async function executeAndAwaitNonceOutput(
   page: Page,
   paneId: string,
@@ -296,11 +288,10 @@ async function createProviderPane(
   return { paneId: leaf.id, terminalId: leaf.content.terminalId, view }
 }
 
-async function limitEvidence(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): Promise<ProviderQualificationRow['limitEvidence']> {
+function limitEvidence(view: ManagedRuntimeView, actual: ManagedTerminalStartupFacts['limits']): ProviderQualificationRow['limitEvidence'] {
   if (!view.containerId) throw new Error('managed runtime has no container for limit evidence')
   const expected = view.effectiveLimits
   if (!expected) throw new Error('managed runtime has no effective limits')
-  const actual = (await rig.chaosHostFacts(rig.exactRuntimeHandle(view))).limits
   expect(actual.cpuMax).toBe(`${expected.cpuMilli * 100} 100000`)
   expect(actual.memoryMax).toBe(String(expected.memoryBytes))
   expect(actual.swapMax).toBe(String(expected.swapBytes))
@@ -329,17 +320,17 @@ async function qualifyProvider(
   const created = await createProviderPane(page, harness, rig, tabId, definition)
   if (!created.view.containerId) throw new Error(`${definition.provider} view has no owned container`)
 
-  const version = (await rig.ownedProviderExec(created.view.containerId, definition.versionCommand))
-  expect(version).toMatch(definition.versionPattern)
-  const processTable = rig.ownedContainerProcessTable(created.view.containerId)
-  expectActualProviderProcess(processTable, definition.processBinary)
+  const startup = await rig.managedTerminalStartupFacts(rig.runtimeEnclosureHandle(created.view))
+  expect(startup.provider).toBe(definition.processBinary)
+  expect(startup.version).toMatch(definition.versionPattern)
+  expect(startup.providerProcessPresent).toBe(true)
   for (const identity of definition.processIdentityNeedles) {
-    expectExactProcessIdentity(processTable, identity)
+    expect(startup.processIdentities).toContain(identity)
   }
   if (definition.reasoningEffort === 'provider-default') {
-    expect(processTable).not.toMatch(/(?:^|\s)--(?:reasoning-)?effort(?:=|\s)/m)
+    expect(startup.reasoningFlagsAbsent).toBe(true)
   }
-  const exactLimits = await limitEvidence(rig, created.view)
+  const exactLimits = limitEvidence(created.view, startup.limits)
   expect(exactLimits.swapMax).toBe('0')
 
   const nonce = `codename-${randomBytes(16).toString('hex')}`

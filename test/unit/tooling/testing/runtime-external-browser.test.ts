@@ -25,6 +25,7 @@ import { structuredChaosLog } from '../../../e2e-browser/helpers/runtime-chaos-e
 import type { BrokerReceipt } from '../../../../scripts/testing/runtime-test-broker.js'
 import type { ProviderQualificationRow } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import type { FreshAgentQualificationRow } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
+import type { ManagedTerminalStartupFacts } from '../../../../scripts/testing/runtime-sandbox.js'
 
 beforeEach(() => execute.mockReset())
 
@@ -2930,6 +2931,12 @@ describe('external finite fixture client', () => {
     await expect(observation).resolves.toBe(2)
     count.mockResolvedValue(-1)
     await expect(rig.managedProviderPendingNoticeCount(handle)).rejects.toThrow()
+    const startup: ManagedTerminalStartupFacts = { provider: 'codex', version: 'codex-cli 0.147.0\n', providerProcessPresent: true,
+      processIdentities: ['low', 'gpt-5.6-luna'], reasoningFlagsAbsent: false,
+      limits: { cpuMax: '50000 100000', memoryMax: '268435456', swapMax: '0', pidsMax: '32' } }
+    const launch = vi.spyOn(owned, 'managedTerminalStartupFacts').mockResolvedValue(startup)
+    await expect(rig.managedTerminalStartupFacts(handle)).resolves.toEqual(startup)
+    expect(launch).toHaveBeenCalledExactlyOnceWith(rig.runtimeEnclosureHandle(handle))
   })
   it('retries a lost mutation reply with the same operation ID and settles owner cleanup once', async () => {
     const owned = new ManagedRuntimeOwner(() => { throw new Error('web factory unused in RPC unit') })
