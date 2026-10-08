@@ -541,7 +541,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       // Session-host/container loss: exact old enclosure must be empty before
       // the new incarnation becomes the sole writer.
       const beforeHostCrashStreamId = await paneStreamId(harness, tabId, first.paneId)
-      rig.runtime.killOwnedRuntimeExact(first.view.containerId)
+      await rig.crashRuntimeHost(rig.exactRuntimeHandle({ ...first.view, nativeSessionId }))
       const afterHostCrash = await waitForRunningView(
         rig,
         first.terminalId,
@@ -551,7 +551,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       if (!afterHostCrash.containerId) throw new Error('host-crash replacement lacks container')
       expect(afterHostCrash.soulId).toBe(first.view.soulId)
       expect(afterHostCrash.nativeSessionId).toBe(nativeSessionId)
-      expect(rig.runtime.isContainerRunning(first.view.containerId)).toBe(false)
+      expect((await rig.ownedContainerState(rig.runtimeEnclosureHandle(first.view))).running).toBe(false)
       await waitForPaneIncarnation(
         harness,
         tabId,
@@ -593,7 +593,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       if (!afterProviderCrash.containerId) throw new Error('provider-crash replacement lacks container')
       expect(afterProviderCrash.soulId).toBe(first.view.soulId)
       expect(afterProviderCrash.nativeSessionId).toBe(nativeSessionId)
-      expect(rig.runtime.isContainerRunning(afterHostCrash.containerId)).toBe(false)
+      expect((await rig.ownedContainerState(rig.runtimeEnclosureHandle(afterHostCrash))).running).toBe(false)
       await waitForPaneIncarnation(
         harness,
         tabId,
@@ -693,7 +693,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       const claimAfterStop = await rig.writerClaimFacts(writerHandle)
       expect(claimAfterStop.activeClaimCount).toBe(0)
       expect(claimAfterStop.globalConflictingClaimCount).toBe(0)
-      const oldContainerRunningAfterStop = rig.runtime.isContainerRunning(afterProviderCrash.containerId!)
+      const oldContainerRunningAfterStop = (await rig.ownedContainerState(rig.runtimeEnclosureHandle(afterProviderCrash))).running
       expect(oldContainerRunningAfterStop).toBe(false)
       expect((await rig.ownershipFacts()).unsafeBrokerAttempts).toBe(0)
 
@@ -717,7 +717,7 @@ test.describe.serial('OpenCode provider qualification', () => {
           sameSoul: afterHostCrash.soulId === first.view.soulId,
           sameNativeSession: afterHostCrash.nativeSessionId === nativeSessionId,
           newIncarnation: afterHostCrash.incarnationId !== first.view.incarnationId,
-          oldEnclosureVerifiedEmpty: !rig.runtime.isContainerRunning(first.view.containerId),
+          oldEnclosureVerifiedEmpty: !(await rig.ownedContainerState(rig.runtimeEnclosureHandle(first.view))).running,
           recalledNonce,
           followUpCompleted: providerFollowUpCompleted,
           workspaceOrToolReadUsed: nativeTurnProofs.some((proof) => proof.toolCallCount > 0),
@@ -744,8 +744,8 @@ test.describe.serial('OpenCode provider qualification', () => {
         repairedSameNativeSession: afterProviderCrash.nativeSessionId === nativeSessionId,
         nativeRecovery: true,
         lostNoticeCount: notices.length,
-        oldEnclosureVerifiedEmpty: !rig.runtime.isContainerRunning(first.view.containerId)
-          && !rig.runtime.isContainerRunning(afterHostCrash.containerId),
+        oldEnclosureVerifiedEmpty: !(await rig.ownedContainerState(rig.runtimeEnclosureHandle(first.view))).running
+          && !(await rig.ownedContainerState(rig.runtimeEnclosureHandle(afterHostCrash))).running,
         verifiedEmptyOrdering: {
           stopOutcome: firstStop.outcome,
           activeClaimCountAfterStop: claimAfterStop.activeClaimCount,
