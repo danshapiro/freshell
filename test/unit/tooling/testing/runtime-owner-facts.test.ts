@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import * as owner from '../../../../scripts/testing/runtime-sandbox.js'
+import * as external from '../../../../scripts/testing/runtime-external-browser.js'
 import { execFileSync } from 'node:child_process'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
@@ -109,6 +110,52 @@ describe('fixed fresh-agent launch observations', () => {
       await expect(rig.freshAgentLaunchFacts(enclosure)).rejects.toThrow(/current|enclosure/)
       expect(probe).not.toHaveBeenCalled()
     } finally { await fsp.rm(root, { recursive: true, force: true }) }
+  })
+})
+
+describe('finite Phase 4 browser receipt publication', () => {
+  it('writes the existing observation privately on its owner and refuses worker paths or transcript fields', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-phase4-receipt-'))
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused phase4 web') }, process.cwd(), 4)
+    const file = path.join(root, 'phase4.json')
+    vi.stubEnv('FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT', file)
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const browser = { browserInteraction: true, coldStartAgents: 3, restartCycles: 3, deterministicPlacement: true,
+      singleViewPerIntent: true, existingLayoutPreserved: true, focusStable: false,
+      expectedFocus: { activeTabId: 'saved-tab', activePaneId: 'saved-pane' },
+      focusObservations: [{ stage: 'rehydration', activeTabId: 'other-tab', activePaneId: null }],
+      sameSoulIds: true, noBlankSubstitution: true, closeViewKeepsAgent: true,
+      closeViewNotRecreatedAfterInventoryRefresh: true, stopAgentStopsRuntime: true, oldClientNoDuplicate: true,
+      initialSoulIds: ['soul1', 'soul2', 'soul3'], expectedTabIds: ['tab1', 'tab2', 'tab3'],
+      expectedPaneIds: ['pane1', 'pane2', 'pane3'], browserTabId: 'saved-tab', createdTabIds: ['tab1', 'tab2', 'tab3'] }
+    try {
+      const result = await rig.publishPhase4BrowserReceipt(browser)
+      const raw = await fsp.readFile(file, 'utf8')
+      expect(JSON.parse(raw)).toEqual({ schemaVersion: 1, status: 'PASS', candidateSha: rig.runtime.candidateSha, browser })
+      expect(JSON.parse(raw).browser.focusStable).toBe(false)
+      expect((await fsp.stat(file)).mode & 0o777).toBe(0o600)
+      const { createHash } = await import('node:crypto')
+      expect(result).toEqual({ artifactRef: `phase4-browser:${createHash('sha256').update(raw).digest('hex')}` })
+      expect(JSON.stringify(result)).not.toContain(root)
+      const descriptor = external.resolveManagedExternalDescriptor({ FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+        FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws', FRESHELL_E2E_TARGET_TOKEN: 'private-token',
+        FRESHELL_RUNTIME_EXTERNAL_RUN_ID: rig.runtime.runId, FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: rig.runtime.candidateSha })!
+      const control = external.createExternalRuntimeControl(rig, descriptor)
+      const remote = new external.ExternalManagedRuntimeRig(descriptor, async (_url, init) => (
+        new Response(JSON.stringify(await control(JSON.parse(String(init?.body)))), { status: 200 })
+      ))
+      await expect(remote.publishPhase4BrowserReceipt(browser)).resolves.toEqual(result)
+      expect(await fsp.readFile(file, 'utf8')).toBe(raw)
+      await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha, operationId: 'foreign-phase4-path', scenarioId: 'browser-managed-runtime',
+        action: 'phase4-browser-receipt', phase4Browser: browser, outputPath: '/foreign/file' })).rejects.toThrow(/operation/)
+      await expect(control({ runId: 'foreign', candidateSha: descriptor.candidateSha, operationId: 'foreign-phase4-run', scenarioId: 'browser-managed-runtime',
+        action: 'phase4-browser-receipt', phase4Browser: browser })).rejects.toThrow(/owned run/)
+      await expect(rig.publishPhase4BrowserReceipt({ ...browser, transcript: 'private text' })).rejects.toThrow()
+      await expect(rig.publishPhase4BrowserReceipt({ ...browser, outputPath: '/foreign/file' })).rejects.toThrow()
+      const other = new owner.ManagedRuntimeOwner(() => { throw new Error('unused phase3 web') }, process.cwd(), 3)
+      await expect(other.publishPhase4BrowserReceipt(browser)).rejects.toThrow(/Phase 4/)
+      expect(await fsp.readFile(file, 'utf8')).toBe(raw)
+    } finally { vi.unstubAllEnvs(); await fsp.rm(root, { recursive: true, force: true }) }
   })
 })
 

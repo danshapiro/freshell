@@ -17,7 +17,7 @@ import path from 'node:path'
 import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
-  SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema,
+  SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema, Phase4BrowserObservationSchema,
   FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
   RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
   RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
@@ -41,7 +41,7 @@ import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
-import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
+import type { Phase4BrowserObservation, Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
 import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts, RuntimeChaosReceiptArtifact } from './runtime-sandbox.js'
 import type { OpencodeLossCredentialEvidence, OpencodeLossAbsenceEvidence, OpencodeLossRecovery, OpencodeLossIncidentEvidence } from './runtime-sandbox.js'
 import type { RuntimeLossAssertions, RuntimeLossAssertionsArtifact, RuntimeLossReceiptArtifact } from './runtime-sandbox.js'
@@ -724,7 +724,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -905,6 +905,10 @@ export class ExternalManagedRuntimeRig {
   }
   async phase3ApprovalEffectCount(enclosure: RuntimeEnclosureHandle): Promise<number> {
     return this.rpc('phase3-effect-count', z.number().int().min(-1), { enclosure })
+  }
+  async publishPhase4BrowserReceipt(phase4Browser: Phase4BrowserObservation): Promise<{ artifactRef: string }> {
+    return this.rpc('phase4-browser-receipt', z.object({ artifactRef: z.string().regex(/^phase4-browser:[a-f0-9]{64}$/) }).strict(),
+      { phase4Browser: Phase4BrowserObservationSchema.parse(phase4Browser) })
   }
   async publishPhase3BrowserReceipt(handle: ExactRuntimeHandle, browser: Phase3BrowserObservation): Promise<{ artifactRef: string }> {
     return this.rpc('phase3-browser-receipt', z.object({ artifactRef: z.string().regex(/^phase3-browser:[a-f0-9]{64}$/) }).strict(),
@@ -1407,6 +1411,10 @@ export function createExternalRuntimeControl(
       case 'phase3-effect-count':
         if (!request.enclosure) throw new Error('exact current runtime enclosure address required')
         result = await owner.phase3ApprovalEffectCount(request.enclosure)
+        break
+      case 'phase4-browser-receipt':
+        if (!request.phase4Browser) throw new Error('closed Phase 4 browser observation required')
+        result = await owner.publishPhase4BrowserReceipt(request.phase4Browser)
         break
       case 'phase3-browser-receipt':
         if (!request.phase3Browser) throw new Error('closed Phase 3 browser observation required')

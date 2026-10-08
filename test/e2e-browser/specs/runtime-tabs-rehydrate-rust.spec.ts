@@ -14,7 +14,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import { test } from '../helpers/fixtures.js'
-import { ManagedRuntimeBrowserRig } from '../helpers/managed-runtime.js'
+import { ManagedRuntimeBrowserRig, createManagedRuntimeBrowserRig } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { runtimeBrowserPost as apiPost, pruneRuntimeBrowserLayout } from '../helpers/runtime-browser-api.js'
 import { LAYOUT_WINDOW_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
@@ -622,7 +622,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
   test('P4-G08: controller inventory reconstructs views without duplicating souls', async ({ page }) => {
     test.setTimeout(900_000)
 
-    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 4)
+    const rig = createManagedRuntimeBrowserRig(process.cwd(), 4)
     let oldClient: RawWsClient | undefined
     try {
       const info = await rig.start()
@@ -844,7 +844,6 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const receipt = {
         schemaVersion: 1,
         status: 'PASS',
-        candidateSha: rig.runtime.candidateSha,
         browser: {
           browserInteraction: true,
           coldStartAgents: initialSoulIds.length,
@@ -887,9 +886,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       }
       expect(receipt.browser.focusObservations).toHaveLength(4)
       expect(receipt.browser.focusStable).toBe(true)
-      const receiptPath = rig.writePhase4BrowserReceipt(receipt)
+      const published = await rig.publishPhase4BrowserReceipt(receipt.browser)
       // eslint-disable-next-line no-console
-      console.log(`[P4-G08] runtime tab rehydration receipt: ${receiptPath}`)
+      console.log(`[P4-G08] runtime tab rehydration receipt: ${published.artifactRef}`)
     } finally {
       oldClient?.close()
       const cleanup = await rig.stop()

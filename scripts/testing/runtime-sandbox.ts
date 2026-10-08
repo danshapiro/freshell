@@ -921,6 +921,17 @@ export const OpencodeQualificationTurnSchema = z.object({ messageId: z.string().
   }).strict(),
 }).strict()
 export type OpencodeQualificationTurn = z.infer<typeof OpencodeQualificationTurnSchema>
+export const Phase4BrowserObservationSchema = z.object({
+  browserInteraction: z.boolean(), coldStartAgents: z.number().int().nonnegative(), restartCycles: z.number().int().nonnegative(),
+  deterministicPlacement: z.boolean(), singleViewPerIntent: z.boolean(), existingLayoutPreserved: z.boolean(), focusStable: z.boolean(),
+  expectedFocus: z.object({ activeTabId: z.string(), activePaneId: z.string() }).strict(),
+  focusObservations: z.array(z.object({ stage: z.string(), activeTabId: z.string(), activePaneId: z.string().nullable() }).strict()),
+  sameSoulIds: z.boolean(), noBlankSubstitution: z.boolean(), closeViewKeepsAgent: z.boolean(),
+  closeViewNotRecreatedAfterInventoryRefresh: z.boolean(), stopAgentStopsRuntime: z.boolean(), oldClientNoDuplicate: z.boolean(),
+  initialSoulIds: z.array(z.string()), expectedTabIds: z.array(z.string()), expectedPaneIds: z.array(z.string()),
+  browserTabId: z.string(), createdTabIds: z.array(z.string()),
+}).strict()
+export type Phase4BrowserObservation = z.infer<typeof Phase4BrowserObservationSchema>
 export const RuntimeProviderObservationSchema: z.ZodType<ProviderQualificationRow> = z.object({
   provider: z.string().min(1), modes: z.array(z.string().min(1)), providerVersion: z.string().min(1),
   model: z.string().min(1), reasoningEffort: z.string().min(1), nativeSessionId: z.string().min(1),
@@ -1068,7 +1079,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'synthetic-source-history', 'synthetic-source-exclusions',
     'synthetic-source-adoption',
     'synthetic-source-follow-up',
-    'phase3-browser-receipt',
+    'phase3-browser-receipt', 'phase4-browser-receipt',
     'retained-start', 'retained-status', 'retained-observed', 'retained-finish',
   ]),
   handle: z.object({
@@ -1085,6 +1096,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   expectedIntentRevision: z.number().int().nonnegative().optional(),
   generation: z.number().int().nonnegative().optional(),
   phase3Browser: Phase3BrowserObservationSchema.optional(),
+  phase4Browser: Phase4BrowserObservationSchema.optional(),
   chaosLogs: RuntimeChaosLogsSchema.optional(),
   chaosEvidence: RuntimeChaosEvidenceSchema.optional(),
   lossAssertions: RuntimeLossAssertionsSchema.optional(),
@@ -4496,6 +4508,16 @@ export class ManagedRuntimeOwner {
     fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
     fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
     return target
+  }
+
+  async publishPhase4BrowserReceipt(input: Phase4BrowserObservation): Promise<{ artifactRef: string }> {
+    if (this.runtime.phase !== 4) throw new Error('Phase 4 browser fixture required')
+    const browser = Phase4BrowserObservationSchema.parse(input)
+    const target = this.writePhase4BrowserReceipt({ schemaVersion: 1, status: 'PASS', candidateSha: this.runtime.candidateSha, browser })
+    const sha256 = createHash('sha256').update(fs.readFileSync(target)).digest('hex')
+    const artifactRef = `phase4-browser:${sha256}`
+    this.runtime.recordLifecycle('external.phase4_browser_receipt', { severity: 'info', artifactRef, artifactPath: target, sha256 })
+    return { artifactRef }
   }
 
   writePhase4BrowserReceipt(value: unknown): string {
