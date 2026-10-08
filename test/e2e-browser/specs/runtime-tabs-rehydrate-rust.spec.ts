@@ -12,7 +12,7 @@ import { expect, type Page } from '@playwright/test'
 import WebSocket from 'ws'
 
 import { test } from '../helpers/fixtures.js'
-import { ManagedRuntimeBrowserRig, createManagedRuntimeBrowserRig } from '../helpers/managed-runtime.js'
+import { ManagedRuntimeBrowserRig, createManagedRuntimeBrowserRig, type FreshCodexHistoryMeasurementError } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { runtimeBrowserPost as apiPost, pruneRuntimeBrowserLayout } from '../helpers/runtime-browser-api.js'
 import { LAYOUT_WINDOW_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
@@ -179,8 +179,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
     let heldHandle: ReturnType<ManagedRuntimeBrowserRig['exactRuntimeHandle']> | undefined
     let cpuSession: Awaited<ReturnType<ReturnType<Page['context']>['newCDPSession']>> | undefined
     let profilingStarted = false
-    const measurement: Record<string, unknown> = { kind: 'owned-page saved-history diagnostic', errors: [] }
-    const measurementErrors = measurement.errors as string[]
+    const measurementErrors: FreshCodexHistoryMeasurementError[] = []
+    const measurement: Record<string, unknown> = { kind: 'owned-page saved-history diagnostic', errors: measurementErrors }
     // Keep only asset names and route classes, never auth queries or native text.
     const scriptLabel = (url: string) => {
       if (!url) return 'native-or-anonymous'
@@ -396,12 +396,17 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const reloadReceivedBaseline = received.length
       cpuSession = await page.context().newCDPSession(page)
       await cpuSession.send('Profiler.enable')
-      measurement.browserBeforeReload = await page.evaluate(() => ({ timeOrigin: performance.timeOrigin, now: performance.now() }))
-      measurement.cpuStartRequestedAt = Date.now()
+      const browserBeforeReload = await page.evaluate(() => ({ timeOrigin: performance.timeOrigin, now: performance.now() }))
+      measurement.browserBeforeReload = browserBeforeReload
+      const cpuStartRequestedAt = Date.now()
+      measurement.cpuStartRequestedAt = cpuStartRequestedAt
       await cpuSession.send('Profiler.start')
       profilingStarted = true
-      measurement.cpuStartedAt = Date.now()
-      rig.runtime.recordLifecycle('browser.saved_history_measurement.started', measurement)
+      const cpuStartedAt = Date.now()
+      measurement.cpuStartedAt = cpuStartedAt
+      await rig.startFreshCodexSavedHistoryMeasurement(rig.exactRuntimeHandle(view), {
+        kind: 'owned-page saved-history diagnostic', errors: measurementErrors, browserBeforeReload, cpuStartRequestedAt, cpuStartedAt,
+      })
       await page.reload()
       await harness.waitForHarness()
       await harness.waitForConnection()

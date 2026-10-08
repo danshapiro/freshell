@@ -348,6 +348,39 @@ describe('fixed fresh Codex saved-history ownership facts', () => {
   })
 })
 
+describe('fixed saved-history measurement lifecycle', () => {
+  it('records the same browser timing metadata only for the registered fixture', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused measurement web') }, process.cwd(), 3,
+      {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...current, provider: 'codex', freshAgentSessionType: 'freshcodex', launchState: 'running', intentRevision: 1 }])
+    const record = vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const measurement: owner.FreshCodexHistoryMeasurementStart = { kind: 'owned-page saved-history diagnostic', errors: [], browserBeforeReload: { timeOrigin: 1, now: 2 },
+      cpuStartRequestedAt: 3, cpuStartedAt: 4 }
+    await rig.startFreshCodexSavedHistoryMeasurement(current, measurement)
+    expect(record).toHaveBeenCalledExactlyOnceWith('browser.saved_history_measurement.started', measurement)
+    const descriptor = external.resolveManagedExternalDescriptor({ FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+      FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws', FRESHELL_E2E_TARGET_TOKEN: 'private-token',
+      FRESHELL_RUNTIME_EXTERNAL_RUN_ID: rig.runtime.runId, FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: rig.runtime.candidateSha })!
+    const control = external.createExternalRuntimeControl(rig, descriptor)
+    const remote = new external.ExternalManagedRuntimeRig(descriptor, async (_url, init) => (
+      new Response(JSON.stringify(await control(JSON.parse(String(init?.body)))), { status: 200 })
+    ))
+    await remote.startFreshCodexSavedHistoryMeasurement(current, measurement)
+    expect(record).toHaveBeenNthCalledWith(2, 'browser.saved_history_measurement.started', measurement)
+    await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha, scenarioId: 'browser-managed-runtime',
+      operationId: 'foreign-measurement-body', action: 'freshcodex-history-measurement-start', handle: current,
+      historyMeasurementStart: { ...measurement, errors: ['private conversation text'] } })).rejects.toThrow(/operation/)
+
+    await expect(rig.startFreshCodexSavedHistoryMeasurement(current, { ...measurement, transcript: 'private text' })).rejects.toThrow()
+    expect(record).toHaveBeenCalledTimes(2)
+    inventory.mockResolvedValue([{ ...current, provider: 'codex', freshAgentSessionType: 'freshclaude', launchState: 'running', intentRevision: 1 }])
+    await expect(rig.startFreshCodexSavedHistoryMeasurement(current, measurement)).rejects.toThrow(/fixture/)
+    expect(record).toHaveBeenCalledTimes(2)
+  })
+})
+
 describe('finite Phase 4 browser receipt publication', () => {
   it('writes the existing observation privately on its owner and refuses worker paths or transcript fields', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-phase4-receipt-'))

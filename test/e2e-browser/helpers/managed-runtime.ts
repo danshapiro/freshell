@@ -13,6 +13,7 @@ export {
   type RuntimeTerminalContinuityObservation,
   type OpencodeQualificationTurn, type OpencodeQualificationProofStage,
   type OpencodeReadinessDiagnostic,
+  type FreshCodexHistoryMeasurementError,
 } from '../../../scripts/testing/runtime-sandbox.js'
 
 /** The browser fixture supplies its owned web process to the shared owner. */

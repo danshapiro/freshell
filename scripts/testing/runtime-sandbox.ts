@@ -921,6 +921,14 @@ export const OpencodeQualificationTurnSchema = z.object({ messageId: z.string().
   }).strict(),
 }).strict()
 export type OpencodeQualificationTurn = z.infer<typeof OpencodeQualificationTurnSchema>
+const FreshCodexHistoryMeasurementErrorSchema = z.enum(['owned CPU profile stop/extraction failed',
+  'owned CPU profiler disable failed', 'owned CDP detach failed', 'owned perf audit extraction failed'])
+export type FreshCodexHistoryMeasurementError = z.infer<typeof FreshCodexHistoryMeasurementErrorSchema>
+export const FreshCodexHistoryMeasurementStartSchema = z.object({ kind: z.literal('owned-page saved-history diagnostic'),
+  errors: z.array(FreshCodexHistoryMeasurementErrorSchema), browserBeforeReload: z.object({ timeOrigin: z.number(), now: z.number() }).strict(),
+  cpuStartRequestedAt: z.number(), cpuStartedAt: z.number(),
+}).strict()
+export type FreshCodexHistoryMeasurementStart = z.infer<typeof FreshCodexHistoryMeasurementStartSchema>
 export const FreshCodexSavedHistoryOwnershipFactsSchema = z.object({
   receiptContainerIds: z.array(z.string()), startCount: z.number().int().nonnegative(),
   launches: z.array(z.object({ event: z.literal('supervisor.launch_running'), at: z.union([z.number(), z.string()]),
@@ -1077,7 +1085,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
     'provider-volume', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
@@ -1121,6 +1129,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   generation: z.number().int().nonnegative().optional(),
   phase3Browser: Phase3BrowserObservationSchema.optional(),
   phase4Browser: Phase4BrowserObservationSchema.optional(),
+  historyMeasurementStart: FreshCodexHistoryMeasurementStartSchema.optional(),
   chaosLogs: RuntimeChaosLogsSchema.optional(),
   chaosEvidence: RuntimeChaosEvidenceSchema.optional(),
   lossAssertions: RuntimeLossAssertionsSchema.optional(),
@@ -4278,6 +4287,12 @@ export class ManagedRuntimeOwner {
     await this.assertCurrentHandle(handle)
     const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
     if (row?.provider !== 'codex' || row.freshAgentSessionType !== 'freshcodex') throw new Error('exact fresh Codex history fixture required')
+  }
+
+  async startFreshCodexSavedHistoryMeasurement(handle: ExactRuntimeHandle, input: FreshCodexHistoryMeasurementStart): Promise<void> {
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    const measurement = FreshCodexHistoryMeasurementStartSchema.parse(input)
+    this.runtime.recordLifecycle('browser.saved_history_measurement.started', measurement)
   }
 
   private async readOwnedLifecycle() {
