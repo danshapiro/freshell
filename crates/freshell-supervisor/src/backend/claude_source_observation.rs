@@ -768,6 +768,9 @@ fn read_candidate_metadata(
 }
 
 fn owned_helper_profile(actual: &Value, expected: &Value) -> bool {
+    let empty_tmpfs = |value: &Value| {
+        value.is_null() || value.as_object().is_some_and(|mounts| mounts.is_empty())
+    };
     input_publisher::owned_helper(actual, expected)
         && actual["Config"]["WorkingDir"] == expected["WorkingDir"]
         && [
@@ -780,10 +783,14 @@ fn owned_helper_profile(actual: &Value, expected: &Value) -> bool {
             "MemorySwap",
             "NanoCpus",
             "PidsLimit",
-            "Tmpfs",
         ]
         .iter()
         .all(|key| actual["HostConfig"][key] == expected["HostConfig"][key])
+        // Docker reports an empty create-time map as null. Both mean no
+        // tmpfs mount; a populated map still requires exact equality.
+        && (actual["HostConfig"]["Tmpfs"] == expected["HostConfig"]["Tmpfs"]
+            || (empty_tmpfs(&actual["HostConfig"]["Tmpfs"])
+                && empty_tmpfs(&expected["HostConfig"]["Tmpfs"])))
 }
 
 fn owned_helper(actual: &Value, expected: &Value) -> bool {

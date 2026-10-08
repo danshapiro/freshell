@@ -696,6 +696,8 @@ async fn qualify_candidate_helper_transport(
 ) {
     for mode in [
         "success",
+        "docker-empty-tmpfs",
+        "unexpected-tmpfs",
         "wrong-caps",
         "lost-projection-ack",
         "projection-timeout",
@@ -749,7 +751,9 @@ async fn qualify_candidate_helper_transport(
                             else if line.starts_with("GET") && line.contains("/containers/"){let key=line.split("/containers/").nth(1).unwrap().split('/').next().unwrap();let found=bodies.lock().unwrap().iter().find(|(name,v)|*name==key || v["Id"]==key).map(|(_,v)|v.clone());match found {Some(mut v)=>{
                                 let reports=v["HostConfig"]["Mounts"].as_array().unwrap().iter().map(|m|json!({"Type":m["Type"],"Destination":m["Target"],"RW":!m["ReadOnly"].as_bool().unwrap(),"Source":if m["Type"]=="volume" {json!("/synthetic/ordinary-volume")} else {m["Source"].clone()},"Name":if m["Type"]=="volume" {m["Source"].clone()} else {Value::Null}})).collect::<Vec<_>>();
                                 v["Mounts"]=json!(reports);
+                                if mode=="docker-empty-tmpfs" && v["Config"]["Cmd"]==json!(["project-claude-candidate-private"]) {v["HostConfig"]["Tmpfs"]=Value::Null;}
                                 if key.len()==64 && v["Config"]["Cmd"]==json!(["project-claude-candidate-private"]) {
+                                    if mode=="unexpected-tmpfs" {v["HostConfig"]["Tmpfs"]=json!({"/foreign":"rw,size=1m"});}
                                     if mode=="wrong-caps" {v["HostConfig"]["CapAdd"]=json!(["SYS_ADMIN"]);}
                                     if mode=="wrong-mount-report" {v["Mounts"][0]["RW"]=json!(true);}
                                     if mode=="wrong-resource-subpath" {let mount=v["HostConfig"]["Mounts"].as_array_mut().unwrap().iter_mut().find(|m|m["VolumeOptions"]["Subpath"].is_string()).unwrap();mount["VolumeOptions"]["Subpath"]=json!("foreign/ordinary");}
@@ -802,7 +806,7 @@ async fn qualify_candidate_helper_transport(
             .unwrap();
         assert_eq!(
             result.is_ok(),
-            mode == "success",
+            matches!(mode, "success" | "docker-empty-tmpfs"),
             "{mode}: candidate projection and confirmed owned cleanup gate evidence: {result:?}"
         );
         assert!(
@@ -816,7 +820,7 @@ async fn qualify_candidate_helper_transport(
         let seen = calls.lock().unwrap();
         if matches!(
             mode,
-            "wrong-caps" | "wrong-mount-report" | "wrong-resource-subpath"
+            "unexpected-tmpfs" | "wrong-caps" | "wrong-mount-report" | "wrong-resource-subpath"
         ) {
             assert!(
                 !seen
