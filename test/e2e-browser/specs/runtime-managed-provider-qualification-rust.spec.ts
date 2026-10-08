@@ -296,14 +296,11 @@ async function createProviderPane(
   return { paneId: leaf.id, terminalId: leaf.content.terminalId, view }
 }
 
-function limitEvidence(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): ProviderQualificationRow['limitEvidence'] {
+async function limitEvidence(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): Promise<ProviderQualificationRow['limitEvidence']> {
   if (!view.containerId) throw new Error('managed runtime has no container for limit evidence')
-  const expected = (view as any).effectiveLimits
+  const expected = view.effectiveLimits
   if (!expected) throw new Error('managed runtime has no effective limits')
-  const actual = JSON.parse(rig.ownedContainerExec(view.containerId, [
-    'sh', '-lc',
-    `printf '{"cpuMax":"%s","memoryMax":"%s","swapMax":"%s","pidsMax":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/memory.swap.max)" "$(cat /sys/fs/cgroup/pids.max)"`,
-  ]))
+  const actual = (await rig.chaosHostFacts(rig.exactRuntimeHandle(view))).limits
   expect(actual.cpuMax).toBe(`${expected.cpuMilli * 100} 100000`)
   expect(actual.memoryMax).toBe(String(expected.memoryBytes))
   expect(actual.swapMax).toBe(String(expected.swapBytes))
@@ -342,7 +339,7 @@ async function qualifyProvider(
   if (definition.reasoningEffort === 'provider-default') {
     expect(processTable).not.toMatch(/(?:^|\s)--(?:reasoning-)?effort(?:=|\s)/m)
   }
-  const exactLimits = limitEvidence(rig, created.view)
+  const exactLimits = await limitEvidence(rig, created.view)
   expect(exactLimits.swapMax).toBe('0')
 
   const nonce = `codename-${randomBytes(16).toString('hex')}`
@@ -361,11 +358,12 @@ async function qualifyProvider(
     (await rig.runningViewForTerminal(created.terminalId))?.nativeSessionId
   ), 120_000)
   expect(inventoryNativeId).toBe(nativeSessionId)
-  rig.runtime.killOwnedRuntimeExact(created.view.containerId)
+  const initialEnclosure = rig.runtimeEnclosureHandle(created.view)
+  await rig.crashRuntimeHost(rig.exactRuntimeHandle(created.view))
   const afterHostLoss = await waitForReplacement(rig, created.terminalId, created.view.incarnationId)
   expect(afterHostLoss.soulId).toBe(created.view.soulId)
   expect(afterHostLoss.nativeSessionId).toBe(nativeSessionId)
-  expect(rig.runtime.isContainerRunning(created.view.containerId)).toBe(false)
+  expect((await rig.ownedContainerState(initialEnclosure)).running).toBe(false)
 
   await executeAndAwaitNonceOutput(
     page,
@@ -377,6 +375,7 @@ async function qualifyProvider(
 
   if (!afterHostLoss.containerId) throw new Error('host-loss replacement has no owned container')
   const workerHandle = rig.exactRuntimeHandle(afterHostLoss)
+  const hostLossEnclosure = rig.runtimeEnclosureHandle(afterHostLoss)
   const pid = (await rig.chaosHostFacts(workerHandle)).workerPid
   expect(pid).toBeGreaterThan(1)
   await rig.crashProviderWorker(workerHandle)
@@ -384,7 +383,7 @@ async function qualifyProvider(
   expect(afterProviderLoss.soulId).toBe(created.view.soulId)
   expect(afterProviderLoss.nativeSessionId).toBe(nativeSessionId)
   expect(afterProviderLoss.profile).toBe(created.view.profile)
-  expect(rig.runtime.isContainerRunning(afterHostLoss.containerId)).toBe(false)
+  expect((await rig.ownedContainerState(hostLossEnclosure)).running).toBe(false)
 
   await executeAndAwaitNonceOutput(
     page,
@@ -412,7 +411,7 @@ async function qualifyProvider(
   const claimAfterStop = await rig.writerClaimFacts(writerHandle)
   expect(claimAfterStop.activeClaimCount).toBe(0)
   expect(claimAfterStop.globalConflictingClaimCount).toBe(0)
-  const oldContainerRunningAfterStop = rig.runtime.isContainerRunning(afterProviderLoss.containerId!)
+  const oldContainerRunningAfterStop = (await rig.ownedContainerState(rig.runtimeEnclosureHandle(afterProviderLoss))).running
   expect(oldContainerRunningAfterStop).toBe(false)
   expect((await rig.ownershipFacts()).unsafeBrokerAttempts).toBe(0)
   const providerReceipt = rig.runtime.broker.receipts()
@@ -478,8 +477,8 @@ async function qualifyProvider(
     followUpCompleted: true,
     onlyOneWriter: runningWriters.length === 1,
     writerClaim,
-    oldEnclosureVerifiedEmpty: !rig.runtime.isContainerRunning(created.view.containerId)
-      && !rig.runtime.isContainerRunning(afterHostLoss.containerId),
+    oldEnclosureVerifiedEmpty: !(await rig.ownedContainerState(initialEnclosure)).running
+      && !(await rig.ownedContainerState(hostLossEnclosure)).running,
     verifiedEmptyOrdering: {
       stopOutcome: stopped.outcome,
       activeClaimCountAfterStop: claimAfterStop.activeClaimCount,
@@ -492,7 +491,7 @@ async function qualifyProvider(
       sameSoul: afterHostLoss.soulId === created.view.soulId,
       sameNativeSession: afterHostLoss.nativeSessionId === nativeSessionId,
       newIncarnation: afterHostLoss.incarnationId !== created.view.incarnationId,
-      oldEnclosureVerifiedEmpty: !rig.runtime.isContainerRunning(created.view.containerId),
+      oldEnclosureVerifiedEmpty: !(await rig.ownedContainerState(initialEnclosure)).running,
       recalledNonce: true,
       followUpCompleted: true,
       workspaceOrToolReadUsed: nativeTurnProofs.some((proof) => proof.toolCallCount > 0),
