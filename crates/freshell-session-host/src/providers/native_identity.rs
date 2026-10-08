@@ -238,6 +238,66 @@ pub fn read_claude_observation(
     ))
 }
 
+pub fn read_opencode_observation(
+    path: &std::path::Path,
+    uid: u32,
+    gid: u32,
+    launch: &NativeIdentityLaunch,
+) -> Result<Option<NativeIdentityObservation>, String> {
+    let Some(value) = read_signal_as_provider(path, uid, gid)? else {
+        return Ok(None);
+    };
+    let actual: NativeIdentityLaunch = serde_json::from_value(value["launch"].clone())
+        .map_err(|_| "native OpenCode signal lacks a typed launch")?;
+    if &actual != launch {
+        return Ok(None);
+    }
+    let native = &value["native"];
+    if native["source"] != "opencode-tui-native-loader"
+        || native["hydrated"] != true
+        || native.get("parent_id").is_none()
+        || !native["parent_id"].is_null()
+    {
+        return Ok(None);
+    }
+    let Some(root) = native["session_id"].as_str().filter(|root| {
+        root.strip_prefix("ses_")
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    }) else {
+        return Ok(None);
+    };
+    let Some(count) = native["active_message_count"].as_u64() else {
+        return Ok(None);
+    };
+    let tail = native["tail_message_id"].as_str();
+    if count == 0 {
+        if native["messages_read"] != "empty_confirmed"
+            || native.get("tail_message_id").is_none()
+            || !native["tail_message_id"].is_null()
+        {
+            return Ok(None);
+        }
+    } else if native["messages_read"] != "success"
+        || !tail.is_some_and(|tail| {
+            tail.strip_prefix("msg_").is_some_and(|id| {
+                !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+        })
+    {
+        return Ok(None);
+    }
+    Ok(bind_provider_observation(
+        launch,
+        root,
+        NativeIdentitySource::OpencodeTui,
+        &serde_json::json!({"launch":actual,"native":{
+            "source":"opencode-tui-native-loader","session_id":root,"parent_id":null,
+            "hydrated":true,"messages_read":native["messages_read"],"active_message_count":count,
+            "tail_message_id":tail,
+        }}),
+    ))
+}
+
 fn read_signal_as_provider(
     path: &std::path::Path,
     uid: u32,

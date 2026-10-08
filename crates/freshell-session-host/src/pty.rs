@@ -198,7 +198,9 @@ impl HostedPty {
                 .entry("HOME".into())
                 .or_insert_with(|| freshell_agent_runtime::PROVIDER_HOME.into());
         }
-        let native_signal = if matches!(launch.mode.as_str(), "claude" | "amplifier") {
+        let native_signal = if matches!(launch.mode.as_str(), "claude" | "amplifier")
+            || (launch.mode == "opencode" && opencode_adoption.is_none())
+        {
             native_identity_launch
                 .as_ref()
                 .map(|binding| {
@@ -212,10 +214,10 @@ impl HostedPty {
                         crate::providers::native_identity::SIGNAL_DIR_ENV.into(),
                         directory.to_string_lossy().into(),
                     );
-                    let name = if launch.mode == "amplifier" {
-                        "amplifier-loaded-context.json"
-                    } else {
-                        "session-start.json"
+                    let name = match launch.mode.as_str() {
+                        "amplifier" => "amplifier-loaded-context.json",
+                        "opencode" => "opencode-loaded.json",
+                        _ => "session-start.json",
                     };
                     Ok::<_, String>((
                         directory.join(name),
@@ -264,7 +266,10 @@ impl HostedPty {
         // Codex must report the thread identity through its app-server proxy;
         // do not treat the requested resume id as provider-observed evidence.
         let native_session_id = Arc::new(Mutex::new(None));
-        if launch.mode == "opencode" && launch.resume_session_id.is_none() {
+        if launch.mode == "opencode"
+            && launch.resume_session_id.is_none()
+            && native_identity_launch.is_none()
+        {
             spawn_opencode_identity_watcher(
                 launch,
                 launch_floor_ms,
@@ -285,7 +290,7 @@ impl HostedPty {
                     pty.kill();
                     return Err(error);
                 }
-            } else {
+            } else if native_identity_launch.is_none() {
                 spawn_opencode_signal_relay(
                     &launch.terminal_id,
                     launch.run_as_uid,
@@ -472,7 +477,11 @@ impl HostedPty {
         }
         let launch = self.native_identity_launch.as_ref()?;
         if let Some((path, uid, gid, source)) = self.native_signal.as_ref() {
-            let result = if self.provider_mode == "amplifier" {
+            let result = if self.provider_mode == "opencode" {
+                crate::providers::native_identity::read_opencode_observation(
+                    path, *uid, *gid, launch,
+                )
+            } else if self.provider_mode == "amplifier" {
                 self.amplifier_signal_reader
                     .lock()
                     .map_err(|_| "native Amplifier reader state unavailable".to_string())

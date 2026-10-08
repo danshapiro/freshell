@@ -6568,6 +6568,192 @@ print('native-startup-without-update-input')
     }
 
     #[tokio::test]
+    async fn managed_nonadoption_opencode_status_requires_current_native_loader() {
+        use std::os::unix::fs::PermissionsExt;
+        for resume in [false, true] {
+            let owned = tempfile::tempdir().unwrap();
+            let program = owned.path().join("controlled-native-provider");
+            std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let state = test_host_state();
+            let root = "ses_hostroot1";
+            let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: state.incarnation_id.clone(),
+                launch_nonce: "nonadoption-native-current".into(),
+                evidence_revision: 3,
+                execution_generation: 2,
+                requested_native_session_id: resume.then(|| root.into()),
+            };
+            let launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"nonadoption-opencode", "streamId":"nonadoption-opencode", "mode":"opencode",
+            "program":program, "args":if resume {vec!["--session",root]} else {vec![]}, "resumeSessionId":resume.then_some(root),
+            "cwd":owned.path(), "workspacePath":owned.path(), "projectKey":"controlled-native-loader",
+            "cols":80, "rows":24, "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+            "env":{"HOME":owned.path(),"PATH":"/usr/bin:/bin","XDG_DATA_HOME":owned.path().join(".local/share")}
+        })).unwrap();
+            let pty = HostedPty::spawn(
+                &state.state_dir,
+                state.incarnation_id.clone(),
+                &launch,
+                std::collections::BTreeMap::from([(
+                    providers::native_identity::LAUNCH_ENV.into(),
+                    serde_json::to_string(&binding).unwrap(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            *state.pty.lock().await = Some(pty);
+            let directory = owned
+                .path()
+                .join(".freshell/native-identity/nonadoption-native-current");
+            std::fs::create_dir_all(&directory).unwrap();
+            let file = directory.join("opencode-loaded.json");
+            let native = serde_json::json!({"source":"opencode-tui-native-loader","session_id":root,
+            "parent_id":null,"hydrated":true,"messages_read":"empty_confirmed","active_message_count":0,"tail_message_id":null});
+            let mut wrong = binding.clone();
+            wrong.launch_nonce = "previous-native-launch".into();
+            let mut variants = vec![
+                (
+                    "stale launch",
+                    serde_json::json!({"launch":wrong,"native":native}),
+                    false,
+                ),
+                (
+                    "wrong root",
+                    serde_json::json!({"launch":binding,"native":{"session_id":if resume {"ses_otherroot"} else {"local_placeholder"},"source":"opencode-tui-native-loader",
+                "parent_id":null,"hydrated":true,"messages_read":"empty_confirmed","active_message_count":0,"tail_message_id":null}}),
+                    false,
+                ),
+                (
+                    "current native loader",
+                    serde_json::json!({"launch":binding,"native":native}),
+                    true,
+                ),
+            ];
+            for (case, field, value) in [
+                ("wrong source", "source", serde_json::json!("route-only")),
+                ("parent root", "parent_id", serde_json::json!("ses_parent1")),
+                ("not hydrated", "hydrated", serde_json::json!(false)),
+                (
+                    "failed native read",
+                    "messages_read",
+                    serde_json::json!("failed"),
+                ),
+                (
+                    "wrong count type",
+                    "active_message_count",
+                    serde_json::json!("0"),
+                ),
+                (
+                    "nonempty claimed empty",
+                    "active_message_count",
+                    serde_json::json!(1),
+                ),
+                (
+                    "empty claimed message",
+                    "tail_message_id",
+                    serde_json::json!("msg_invented1"),
+                ),
+            ] {
+                let mut refused = native.clone();
+                refused[field] = value;
+                variants.push((
+                    case,
+                    serde_json::json!({"launch":binding,"native":refused}),
+                    false,
+                ));
+            }
+            for (case, field, value) in [
+                ("old revision", "evidenceRevision", serde_json::json!(2)),
+                (
+                    "old execution generation",
+                    "executionGeneration",
+                    serde_json::json!(1),
+                ),
+                (
+                    "old incarnation",
+                    "incarnationId",
+                    serde_json::json!("incarnation-previous"),
+                ),
+            ] {
+                let mut refused = serde_json::to_value(&binding).unwrap();
+                refused[field] = value;
+                variants.push((
+                    case,
+                    serde_json::json!({"launch":refused,"native":native}),
+                    false,
+                ));
+            }
+            let mut results = Vec::new();
+            for (case, value, accepted) in variants {
+                std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+                let status = dispatch(
+                    authenticated_host_envelope(
+                        &state,
+                        HostCommand::Status {
+                            incarnation_id: state.incarnation_id.clone(),
+                        },
+                    ),
+                    &state,
+                )
+                .await
+                .unwrap();
+                let input = dispatch(
+                    authenticated_host_envelope(
+                        &state,
+                        HostCommand::TerminalInput {
+                            incarnation_id: state.incarnation_id.clone(),
+                            request_id: RequestId::new(),
+                            data: "controlled input".into(),
+                        },
+                    ),
+                    &state,
+                )
+                .await;
+                results.push((case, status, input, accepted));
+            }
+            state.pty.lock().await.take().unwrap().stop().await;
+            for (case, status, input, accepted) in results {
+                let HostResult::Status {
+                    native_identity_observation,
+                    native_session_id,
+                    opencode_adoption,
+                    ..
+                } = status
+                else {
+                    panic!("actual host status required")
+                };
+                assert_eq!(native_identity_observation.is_some(), accepted, "{case}");
+                assert_eq!(
+                    native_session_id.as_deref(),
+                    accepted.then_some(root),
+                    "{case}"
+                );
+                assert_eq!(opencode_adoption, OpenCodeAdoptionStatus::NotRequired);
+                if accepted {
+                    assert!(
+                        matches!(
+                            input,
+                            Ok(HostResult::TerminalInput {
+                                state: freshell_runtime_protocol::CommandState::Completed
+                            })
+                        ),
+                        "{case}: {input:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        input.unwrap_err().code,
+                        RuntimeErrorCode::RecoveryBlocked,
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn requested_identity_is_not_provider_observation() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();

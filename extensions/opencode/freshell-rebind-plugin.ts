@@ -55,7 +55,7 @@ type TuiSlotContribution = {
 }
 
 interface AdoptionTuiApi {
-  route?: { current?: unknown }
+  route?: { current?: unknown; navigate?: (route: { type: 'session'; sessionID: string }) => void }
   state?: {
     ready?: unknown
     part?: (messageId: string) => unknown
@@ -66,13 +66,22 @@ interface AdoptionTuiApi {
   }
   client?: {
       session?: {
-        get?: (parameters: { sessionID: string; limit?: number }, options: { throwOnError: true }) => Promise<unknown>
+        create?: (parameters: Record<string, never>, options: { throwOnError: true }) => Promise<unknown>
+        get?: (parameters: { sessionID: string }, options: { throwOnError: true }) => Promise<unknown>
         messages?: (
-          parameters: { sessionID: string },
+          parameters: { sessionID: string; limit?: number },
           options: { throwOnError: true },
         ) => Promise<unknown>
       }
   }
+}
+
+interface NativeLaunch {
+  incarnationId: string
+  launchNonce: string
+  evidenceRevision: number
+  executionGeneration: number
+  requestedNativeSessionId: string | null
 }
 
 export interface EmitterDeps {
@@ -329,6 +338,25 @@ function activeMessages(value: unknown, sessionId: string, revertValue: unknown)
   return value.slice(0, index + (typeof revert.partID === 'string' ? 1 : 0))
 }
 
+function revertReference(value: unknown): string {
+  const record = asRecord(value)
+  return JSON.stringify({ messageID: record?.messageID ?? null, partID: record?.partID ?? null })
+}
+
+function nativeTailPartsHydrated(api: AdoptionTuiApi, rows: unknown[], revertValue: unknown, tail: string): boolean {
+  const parts = asRecord(rows.find(row => asRecord(asRecord(row)?.info)?.id === tail))?.parts
+  if (!Array.isArray(parts)) return false
+  if (parts.length === 0) return true
+  const readParts = api.state?.part
+  const hydrated = typeof readParts === 'function' ? readParts.call(api.state, tail) : null
+  if (!Array.isArray(hydrated)) return false
+  const ids = new Set(hydrated.map(part => asRecord(part)?.id))
+  const boundary = asRecord(revertValue)?.partID
+  const end = typeof boundary === 'string' ? parts.findIndex(part => asRecord(part)?.id === boundary) : parts.length
+  return end >= 0 && parts.slice(0, end).every(part => typeof asRecord(part)?.id === 'string'
+    && ids.has(asRecord(part)?.id))
+}
+
 function exactObjectKeys(value: Record<string, unknown>, keys: string[]): boolean {
   const actual = Object.keys(value).sort()
   const expected = [...keys].sort()
@@ -524,11 +552,7 @@ export function createObservationEmitter(
         if ('failure' in read) refuse(current, read.failure)
         messagesRead = 'failed'
       } else {
-        const revert = (value: unknown) => {
-          const record = asRecord(value)
-          return JSON.stringify({ messageID: record?.messageID ?? null, partID: record?.partID ?? null })
-        }
-        if (revert(native.session.revert) !== revert(selected?.revert)) return refuse(current, 'revert_not_hydrated')
+        if (revertReference(native.session.revert) !== revertReference(selected?.revert)) return refuse(current, 'revert_not_hydrated')
         const nativeActive = activeMessages(native.messages.map((row) => asRecord(row)?.info), current.rootSessionId, native.session.revert)
         if (!nativeActive || !hydratedMessages) return refuse(current, 'history_not_hydrated')
         if (current.expectedEmpty) {
@@ -551,15 +575,8 @@ export function createObservationEmitter(
             if (deps.signal?.aborted) return
             return refuse(current, 'tail_not_hydrated', { ...history, nativeTuiPageMessageCount })
           }
-          const tail = native.messages.find((row) => asRecord(asRecord(row)?.info)?.id === current.tailMessageId)
-          const parts = asRecord(tail)?.parts as unknown[]
-          if (parts.length) {
-            const hydrated = typeof state.part === 'function' ? state.part(current.tailMessageId!) : null
-            if (!Array.isArray(hydrated)) return refuse(current, 'parts_not_hydrated')
-            const ids = new Set(hydrated.map((part) => asRecord(part)?.id))
-            const boundary = asRecord(native.session.revert)?.partID
-            const partIndex = typeof boundary === 'string' ? parts.findIndex((part) => asRecord(part)?.id === boundary) : parts.length
-            if (partIndex < 0 || parts.slice(0, partIndex).some((part) => typeof asRecord(part)?.id !== 'string' || !ids.has(asRecord(part)?.id))) return refuse(current, 'parts_not_hydrated')
+          if (!nativeTailPartsHydrated(api, native.messages, native.session.revert, current.tailMessageId!)) {
+            return refuse(current, 'parts_not_hydrated')
           }
           messagesRead = 'success'
         }
@@ -597,6 +614,115 @@ export function createObservationEmitter(
     } finally {
       inFlight = false
     }
+  }
+}
+
+/** Ordinary managed roots use the native loader, without an import baseline.
+ * Creation is one supported native API call before input; an uncertain call
+ * is never retried. The returned root still needs the same V1/TUI hydration
+ * conjunction before it can be observed. Imported roots retain their separate
+ * baseline gate above.
+ */
+function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) => Promise<void> {
+  let launch: NativeLaunch
+  let directory: string
+  try {
+    const value = asRecord(JSON.parse(deps.env.FRESHELL_NATIVE_IDENTITY_LAUNCH ?? ''))
+    const home = deps.env.HOME
+    if (!value || !home || !exactObjectKeys(value, ['incarnationId', 'launchNonce', 'evidenceRevision',
+      'executionGeneration', 'requestedNativeSessionId']) || typeof value.incarnationId !== 'string'
+      || !SAFE_BINDING_RE.test(value.incarnationId) || typeof value.launchNonce !== 'string'
+      || !/^[A-Za-z0-9_-]+$/.test(value.launchNonce) || !Number.isSafeInteger(value.evidenceRevision)
+      || (value.evidenceRevision as number) < 0 || !Number.isSafeInteger(value.executionGeneration)
+      || (value.executionGeneration as number) < 1 || (value.requestedNativeSessionId !== null
+        && (typeof value.requestedNativeSessionId !== 'string' || !SESSION_ID_RE.test(value.requestedNativeSessionId)))) {
+      return async () => {}
+    }
+    launch = value as unknown as NativeLaunch
+    directory = join(home, '.freshell/native-identity', launch.launchNonce)
+    if (deps.env.FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR !== directory) return async () => {}
+  } catch { return async () => {} }
+  const write = deps.writeFile ?? defaultWriteFile
+  let root = launch.requestedNativeSessionId
+  let createAttempted = false
+  let inFlight = false
+  let lastEvidence: string | null = null
+  let lastRefusal: string | undefined
+  const withdraw = (reason: string): void => {
+    if (lastEvidence === null) return
+    try {
+      write(directory, 'opencode-loaded', JSON.stringify({ launch, native: {
+        source: 'opencode-tui-native-loader', session_id: root, hydrated: false, reason,
+      } }))
+      lastEvidence = null
+    } catch { /* A failed withdrawal cannot create new observation evidence. */ }
+  }
+  deps.signal?.addEventListener('abort', () => withdraw('disposed'), { once: true })
+  const refuse = (reason: string): void => {
+    withdraw(reason)
+    if (deps.signal?.aborted || reason === lastRefusal) return
+    try {
+      write(directory, 'opencode-refused', JSON.stringify({
+        event: 'runtime.opencode.native_loader_refused', severity: 'warning',
+        terminalId: deps.env.FRESHELL_TERMINAL_ID ?? null, nativeSessionId: root,
+        incarnationId: launch.incarnationId, launchNonce: launch.launchNonce,
+        evidenceRevision: launch.evidenceRevision, executionGeneration: launch.executionGeneration, reason,
+      }))
+      lastRefusal = reason
+    } catch { /* Reporting cannot admit input or break the native renderer. */ }
+  }
+  return async (apiValue: unknown): Promise<void> => {
+    if (deps.signal?.aborted || inFlight) return
+    inFlight = true
+    try {
+      const api = asRecord(apiValue) as unknown as AdoptionTuiApi | null
+      if (!api || api.state?.ready !== true) return refuse('tui_not_ready')
+      if (root === null) {
+        const create = api.client?.session?.create
+        const navigate = api.route?.navigate
+        if (createAttempted) return refuse('native_create_unconfirmed')
+        if (typeof create !== 'function' || typeof navigate !== 'function') return refuse('native_create_api_unavailable')
+        createAttempted = true
+        const response = asRecord(await create.call(api.client!.session, {}, { throwOnError: true }))
+        if (deps.signal?.aborted) return
+        const created = asRecord(response?.data)
+        if (response?.error || typeof created?.id !== 'string' || !SESSION_ID_RE.test(created.id)
+          || !sessionIsExactRoot(created, created.id)) return refuse('native_create_unconfirmed')
+        root = created.id
+        navigate.call(api.route, { type: 'session', sessionID: root })
+      }
+      if (currentRouteSessionId(api.route?.current) !== root) return refuse('route_not_selected')
+      const get = api.state?.session?.get
+      const messages = api.state?.session?.messages
+      if (typeof get !== 'function' || typeof messages !== 'function') return refuse('tui_session_api_unavailable')
+      if (!sessionIsExactRoot(get(root), root)) return refuse('tui_root_not_loaded')
+      const native = await readNativeHistory(api, root)
+      if (deps.signal?.aborted) return
+      if ('failure' in native) return refuse(native.failure)
+      const selected = asRecord(get(root))
+      if (api.state?.ready !== true || currentRouteSessionId(api.route?.current) !== root
+        || !sessionIsExactRoot(selected, root)) return refuse('tui_context_changed')
+      if (revertReference(native.session.revert) !== revertReference(selected?.revert)) return refuse('revert_not_hydrated')
+      const active = activeMessages(native.messages.map(row => asRecord(row)?.info), root, native.session.revert)
+      const hydrated = activeMessages(messages(root), root, selected?.revert)
+      if (!active || !hydrated) return refuse('history_not_hydrated')
+      const tail = lastActiveMessageId(active, root)
+      if (active.length === 0 ? hydrated.length !== 0 : lastActiveMessageId(hydrated, root) !== tail) {
+        return refuse('tail_not_hydrated')
+      }
+      if (tail !== null && !nativeTailPartsHydrated(api, native.messages, native.session.revert, tail)) {
+        return refuse('parts_not_hydrated')
+      }
+      if (deps.signal?.aborted) return
+      const evidence = JSON.stringify({ launch, native: {
+        source: 'opencode-tui-native-loader', session_id: root, parent_id: null, hydrated: true,
+        messages_read: active.length === 0 ? 'empty_confirmed' : 'success',
+        active_message_count: active.length, tail_message_id: tail,
+      } })
+      if (evidence !== lastEvidence) write(directory, 'opencode-loaded', evidence)
+      lastEvidence = evidence
+    } catch { refuse('native_loader_or_publication_failed') }
+    finally { inFlight = false }
   }
 }
 
@@ -638,10 +764,11 @@ export default {
         /* no onDispose */
       }
       const managedAdoption = hasAdoptionExpectation(env)
-      const emitLegacy = managedAdoption ? undefined : createEmitter({ env })
+      const managedNative = env.FRESHELL_NATIVE_IDENTITY_LAUNCH !== undefined
+      const emitLegacy = managedAdoption || managedNative ? undefined : createEmitter({ env })
       const emitObservation = managedAdoption
         ? createObservationEmitter({ env, signal: cancellation.signal })
-        : undefined
+        : managedNative ? createNativeObservationEmitter({ env, signal: cancellation.signal }) : undefined
       // Unmanaged panes keep their route/slot rebind signal. For managed
       // launches, these edges only trigger a fresh TUI-state check; their
       // route and slot arguments never qualify as adoption evidence. The
