@@ -12,10 +12,11 @@ import { createRequire } from 'node:module'
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
 const execute = vi.fn()
-const registeredQualificationCases = vi.hoisted(() => new Map<string, Function>())
+const registeredManagedBrowserCases = vi.hoisted(() => new Map<string, Function>())
 vi.mock('../../../e2e-browser/helpers/fixtures.js', () => ({
-  test: Object.assign((title: string, callback: Function) => registeredQualificationCases.set(title, callback), {
-    describe: { serial: (_title: string, callback: () => void) => callback() }, skip: vi.fn(), setTimeout: vi.fn(),
+  test: Object.assign((title: string, callback: Function) => registeredManagedBrowserCases.set(title, callback), {
+    describe: Object.assign((_title: string, callback: () => void) => callback(), { serial: (_title: string, callback: () => void) => callback() }),
+    skip: vi.fn(), setTimeout: vi.fn(),
   }),
   createFreshE2ePage: vi.fn(),
 }))
@@ -33,13 +34,58 @@ import type { BrokerReceipt } from '../../../../scripts/testing/runtime-test-bro
 import type { ProviderQualificationRow } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import type { FreshAgentQualificationRow } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
 import type { ManagedTerminalStartupFacts } from '../../../../scripts/testing/runtime-sandbox.js'
+import * as managedBrowser from '../../../e2e-browser/helpers/managed-runtime.js'
+import { TestHarness } from '../../../e2e-browser/helpers/test-harness.js'
 
 beforeEach(() => execute.mockReset())
 
 describe('managed browser producers', () => {
+  it('retains existing sanitized saved-history audit after an early failure without a CPU session', async () => {
+    await import('../../../e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.js')
+    const callback = registeredManagedBrowserCases.get('managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth')
+    if (!callback) throw new Error('actual saved-history callback was not registered')
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused diagnostic web') }, process.cwd(), 3, {}, {}, 'test',
+      { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
+    const row = { soulId: 'diagnostic-soul', incarnationId: 'diagnostic-incarnation', hostBootId: 'diagnostic-boot',
+      containerId: 'b'.repeat(64), nativeSessionId: 'diagnostic-root', freshAgentSessionType: 'freshcodex', provider: 'codex',
+      launchState: 'running', intentRevision: 1 }
+    const factory = vi.spyOn(managedBrowser, 'createManagedRuntimeBrowserRig').mockReturnValue(owned)
+    vi.spyOn(owned, 'start').mockResolvedValue({ baseUrl: 'http://127.0.0.1:3399', wsUrl: 'ws://127.0.0.1:3399/ws',
+      token: 'owned-fixture-token', port: 3399, pid: 42, homeDir: '/owned-diagnostic', configDir: '/owned-diagnostic',
+      logsDir: '/owned-diagnostic/logs', debugLogPath: '/owned-diagnostic/logs/server.log', runtimeRoot: process.cwd() })
+    vi.spyOn(owned, 'inventory').mockResolvedValue([row])
+    vi.spyOn(owned, 'prepareFreshCodexSavedHistory').mockResolvedValue({ bytes: 2 * 1024 * 1024 })
+    vi.spyOn(owned, 'fixtureNativeState').mockRejectedValue(new Error('early owned fixture boundary failed'))
+    const publish = vi.spyOn(owned, 'publishFreshCodexSavedHistoryMeasurement').mockResolvedValue({ artifactRef: 'private-diagnostic' })
+    const finish = vi.spyOn(owned, 'finishFreshCodexSavedHistoryMeasurement').mockResolvedValue(undefined)
+    const stop = vi.spyOn(owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
+    const ready = vi.spyOn(TestHarness.prototype, 'waitForHarness').mockResolvedValue(undefined)
+    const connected = vi.spyOn(TestHarness.prototype, 'waitForConnection').mockResolvedValue(undefined)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 200 })))
+    vi.stubGlobal('window', { __FRESHELL_TEST_HARNESS__: {
+      getState: () => ({ tabs: { activeTabId: 'tab-owned' }, panes: { layouts: { 'tab-owned': {
+        id: 'pane-owned', type: 'leaf', content: { kind: 'fresh-agent', sessionId: 'session-owned' },
+      } } } }),
+      getPerfAuditSnapshot: () => ({ perfEvents: [{ event: 'fresh_agent.snapshot_request', stage: 'display_committed',
+        accepted: false, live: true, requestSerial: 2, revision: 3, privateBody: 'omit owned transcript' }] }),
+    } })
+    const page = { routeWebSocket: async () => undefined, goto: async () => undefined,
+      getByRole: () => ({ click: async () => undefined }),
+      evaluate: async (fn: Function, argument: unknown) => Reflect.apply(fn, undefined, [argument]) }
+    try {
+      await expect(Reflect.apply(callback, undefined, [{ page }])).rejects.toThrow(/early owned fixture boundary failed/)
+      expect(publish).toHaveBeenCalledOnce()
+      expect(publish.mock.calls[0][1]).toMatchObject({ audit: { requestRecordCount: 1, requestRecords: [
+        { sequence: 0, stage: 'display_committed', accepted: false, live: true, requestSerial: 2, revision: 3 },
+      ] } })
+      expect(JSON.stringify(publish.mock.calls)).not.toContain('omit owned transcript')
+      expect(finish).toHaveBeenCalledOnce()
+      expect(stop).toHaveBeenCalledOnce()
+    } finally { factory.mockRestore(); ready.mockRestore(); connected.mockRestore(); vi.unstubAllGlobals() }
+  })
   it('keeps the actual selected Amplifier local guard and delegates only an admitted external case to its owner', async () => {
     await import('../../../e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.js')
-    const callback = registeredQualificationCases.get('each explicitly selected provider produces an independent evidence-bound live row')
+    const callback = registeredManagedBrowserCases.get('each explicitly selected provider produces an independent evidence-bound live row')
     if (!callback) throw new Error('actual selected provider callback was not registered')
     for (const key of [...runner.EXTERNAL_DESCRIPTOR_KEYS,
       'FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE', 'FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE', 'FRESHELL_MANAGED_AMPLIFIER_ONECLI_CA_FILE']) vi.stubEnv(key, undefined)
