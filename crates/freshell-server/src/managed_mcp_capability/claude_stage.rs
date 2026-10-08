@@ -61,6 +61,7 @@ fn prepare_selected_sources(
 ) -> Result<Preparation, String> {
     let mut manifest = accepted.cloned().unwrap_or_else(|| ClaudeInputManifest {
         version: 1,
+        accepted_native_plan: None,
         native_source_runtime: Some(
             freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
         ),
@@ -487,6 +488,7 @@ mod tests {
             std::fs::write(&unselected, poison).unwrap();
             let manifest = ClaudeInputManifest {
                 version: 1,
+                accepted_native_plan: None,
                 native_source_runtime: Some(runtime),
                 original_home: home.clone(),
                 cwd: cwd.clone(),
@@ -568,6 +570,7 @@ mod tests {
             .unwrap();
             let manifest = ClaudeInputManifest {
                 version: 1,
+                accepted_native_plan: None,
                 native_source_runtime: Some(
                     freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
                 ),
@@ -689,6 +692,7 @@ mod tests {
             }
             let manifest = ClaudeInputManifest {
                 version: 1,
+                accepted_native_plan: None,
                 native_source_runtime: Some(
                     freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
                 ),
@@ -817,6 +821,7 @@ mod tests {
                     }
                     let manifest = ClaudeInputManifest {
                         version: 1,
+                        accepted_native_plan: None,
                         native_source_runtime: Some(runtime),
                         original_home: home.clone(),
                         cwd: cwd.clone(),
@@ -899,6 +904,7 @@ mod tests {
         std::fs::write(cwd.join(".git"), "ordinary native checkout marker\n").unwrap();
         let manifest = ClaudeInputManifest {
             version: 1,
+            accepted_native_plan: None,
             native_source_runtime: Some(freshell_platform::claude_inputs::NativeSourceRuntime::Sdk),
             original_home: home.clone(),
             cwd: cwd.clone(),
@@ -1037,6 +1043,7 @@ mod tests {
         .unwrap();
         let mut manifest = ClaudeInputManifest {
             version: 1,
+            accepted_native_plan: None,
             native_source_runtime: Some(freshell_platform::claude_inputs::NativeSourceRuntime::Sdk),
             original_home: home.clone(),
             cwd: cwd.clone(),
@@ -1184,6 +1191,7 @@ mod tests {
         std::fs::write(project.join("commands/probe.mjs"), "import {readFileSync} from 'node:fs';process.stdout.write(readFileSync(new URL('./resource',import.meta.url)))").unwrap();
         let mut manifest = ClaudeInputManifest {
             version: 1,
+            accepted_native_plan: None,
             native_source_runtime: Some(
                 freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
             ),

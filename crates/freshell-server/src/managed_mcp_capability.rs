@@ -3381,6 +3381,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         std::fs::write(selected.join("commands/probe.mjs"), "import {readFileSync} from 'node:fs';process.stdout.write(readFileSync(new URL('./resource',import.meta.url)))").unwrap();
         let manifest = ClaudeInputManifest {
             version: 1,
+            accepted_native_plan: None,
             native_source_runtime: Some(
                 freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
             ),
@@ -3471,6 +3472,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         std::os::unix::fs::symlink(&selected, &alias).unwrap();
         let manifest = ClaudeInputManifest {
             version: 1,
+            accepted_native_plan: None,
             native_source_runtime: Some(
                 freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
             ),
@@ -3620,6 +3622,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         };
         let mut manifest = ClaudeInputManifest {
             version: 1,
+            accepted_native_plan: None,
             native_source_runtime: Some(
                 freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
             ),
@@ -4856,6 +4859,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             }
             let manifest = ClaudeInputManifest {
                 version: 1,
+                accepted_native_plan: None,
                 native_source_runtime: Some(NativeSourceRuntime::Sdk),
                 original_home: home.clone(),
                 cwd: cwd.clone(),
@@ -6055,6 +6059,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         };
         let manifest = freshell_platform::claude_inputs::ClaudeInputManifest {
             version: 1,
+            accepted_native_plan: None,
             native_source_runtime: Some(
                 freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
             ),

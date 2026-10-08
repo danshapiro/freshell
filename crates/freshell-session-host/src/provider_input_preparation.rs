@@ -31,6 +31,69 @@ fn read_private(root: &Path, relative: &str, limit: usize) -> Result<Vec<u8>, St
     }
     Ok(bytes)
 }
+
+pub(crate) fn final_claude_source_request(
+    context: Option<&ProviderLaunchContext>,
+    stage: &Path,
+    cwd: &Path,
+    home: &Path,
+    runtime: freshell_platform::claude_inputs::NativeSourceRuntime,
+) -> Result<
+    Option<(
+        freshell_platform::claude_inputs::observation::ObservationRequest,
+        freshell_platform::claude_inputs::observation::NativeObservation,
+    )>,
+    String,
+> {
+    use freshell_platform::claude_inputs::{observation::ObservationRequest, ClaudeInputManifest};
+    use sha2::{Digest, Sha256};
+    let Some(context) = context.filter(|context| context.preparation.provider() == "claude") else {
+        return Ok(None);
+    };
+    let Some(inputs) = context.prepared_inputs.as_ref() else {
+        return Ok(None);
+    };
+    context.validate("claude").map_err(|error| error.message)?;
+    let bytes = read_private(stage, &inputs.manifest.relative_path, 64 * 1024 * 1024)?;
+    if format!("{:x}", Sha256::digest(&bytes)) != inputs.manifest.sha256 {
+        return Err("Claude prepared generation changed; retain inputs and reprepare".into());
+    }
+    let manifest: ClaudeInputManifest = serde_json::from_slice(&bytes)
+        .map_err(|_| "Claude prepared generation is invalid; retain inputs and reprepare")?;
+    manifest.validate().map_err(str::to_string)?;
+    let plan = manifest
+        .accepted_native_plan
+        .as_ref()
+        .ok_or("Claude native source evidence is unrecorded; retain inputs and reprepare")?;
+    let selectors = freshell_runtime_protocol::bounded_json_bytes(
+        &manifest.original_selectors(),
+        64 * 1024 * 1024,
+    )
+    .map_err(|_| "Claude original selectors exceed the private profile")?;
+    if plan.selector_manifest_sha256 != format!("{:x}", Sha256::digest(selectors))
+        || plan.observation.native_source_runtime != runtime
+        || plan.observation.cwd != cwd
+        || plan.observation.home.as_deref() != Some(home)
+    {
+        return Err(
+            "Claude original selection or native launch view changed; retain inputs and reprepare"
+                .into(),
+        );
+    }
+    let request = ObservationRequest {
+        version: 1,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        native_source_runtime: runtime,
+        cwd: cwd.into(),
+        home: home.into(),
+        setting_sources: manifest.setting_sources,
+        selector_manifest_sha256: plan.selector_manifest_sha256.clone(),
+        plan_revision: plan.plan_revision,
+    };
+    request.validate()?;
+    Ok(Some((request, plan.observation.clone())))
+}
+
 pub fn prepare(
     context: Option<&ProviderLaunchContext>,
     secrets: &mut ResolvedProviderSecrets,
@@ -334,6 +397,157 @@ mod tests {
     use freshell_platform::opencode_recipe::*;
     use freshell_runtime_protocol::*;
     use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn provider_secret_claude_final_source_gate_blocks_unrecorded_generation_and_keeps_private_inputs(
+    ) {
+        let owned = tempfile::tempdir().unwrap();
+        std::fs::create_dir(owned.path().join(".freshell")).unwrap();
+        let manifest = serde_json::json!({
+            "version":1,"nativeSourceRuntime":"terminal",
+            "originalHome":owned.path(),"cwd":owned.path(),"workspace":owned.path(),
+            "settingSources":["local"],"pluginDirs":[],
+        });
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(owned.path().join(".freshell/input-manifest.json"), &bytes).unwrap();
+        let generation = format!("grant-{}", uuid::Uuid::new_v4());
+        let context: ProviderLaunchContext = serde_json::from_value(serde_json::json!({
+            "preparation":{"claude":{"mcp_args":[]}},
+            "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000",
+                "providerRelativePath":".freshell/mcp-capability.json"},
+            "preparedInputs":{"generationId":generation,"manifest":{
+                "relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(&bytes)),
+                "sourceCount":0,"aliasCount":0,"recipeCount":0}}
+        })).unwrap();
+        let error = final_claude_source_request(Some(&context), owned.path(), owned.path(), owned.path(),
+            freshell_platform::claude_inputs::NativeSourceRuntime::Terminal)
+            .expect_err("a prepared Claude generation without actual source evidence must block before dispatch");
+        assert!(error.contains("retain inputs and reprepare"), "{error}");
+        let error = crate::claude_source_observation::verify_final(
+            Some(&context),
+            owned.path(),
+            owned.path(),
+            owned.path(),
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+            freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+        )
+        .await
+        .expect_err("the actual final host gate cannot bypass unrecorded native source evidence");
+        assert!(error.contains("retain inputs and reprepare"), "{error}");
+        assert_eq!(
+            std::fs::read(owned.path().join(".freshell/input-manifest.json")).unwrap(),
+            bytes
+        );
+        assert!(final_claude_source_request(
+            None,
+            owned.path(),
+            owned.path(),
+            owned.path(),
+            freshell_platform::claude_inputs::NativeSourceRuntime::Terminal
+        )
+        .unwrap()
+        .is_none());
+    }
+    #[test]
+    fn provider_secret_claude_final_source_request_keeps_enriched_origin_and_frozen_original_selectors(
+    ) {
+        use freshell_platform::claude_inputs::{
+            observation::observe, AcceptedNativeSourcePlan, ClaudeInputManifest,
+            ClaudeSettingSource, NativeSourceRuntime,
+        };
+        for runtime in [NativeSourceRuntime::Terminal, NativeSourceRuntime::Sdk] {
+            let owned = tempfile::tempdir().unwrap();
+            let original_home = owned.path().join("original-home");
+            let home = owned.path().join("provider-home");
+            let workspace = owned.path().join("workspace");
+            let cwd = workspace.join("nested");
+            let stage = owned.path().join("stage");
+            for directory in [&original_home, &home, &cwd, &stage.join(".freshell")] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            let selected = original_home.join("selected.json");
+            let selected_bytes = br#"{"env":{"SYNTHETIC_PRIVATE":"frozen-original-selector"}}"#;
+            std::fs::write(&selected, selected_bytes).unwrap();
+            let mut manifest = ClaudeInputManifest {
+                version: 1,
+                native_source_runtime: Some(runtime),
+                original_home: original_home.clone(),
+                cwd: cwd.clone(),
+                workspace: workspace.clone(),
+                config_root: None,
+                settings_file: Some(selected.clone()),
+                settings_origin: None,
+                inline_settings_sha256: None,
+                setting_sources: vec![ClaudeSettingSource::Local],
+                plugin_dirs: vec![],
+                accepted_native_plan: None,
+            };
+            let original = freshell_runtime_protocol::bounded_json_bytes(
+                &manifest.original_selectors(),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+            let observed = observe(&cwd, &home, runtime, &manifest.setting_sources).unwrap();
+            assert_eq!(observed.uid, unsafe { libc::getuid() });
+            manifest.settings_origin = Some(std::fs::canonicalize(&selected).unwrap());
+            manifest.accepted_native_plan = Some(AcceptedNativeSourcePlan {
+                selector_manifest_sha256: format!("{:x}", Sha256::digest(original)),
+                plan_revision: 0,
+                observation: observed.clone(),
+            });
+            let bytes =
+                freshell_runtime_protocol::bounded_json_bytes(&manifest, 64 * 1024 * 1024).unwrap();
+            std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+            let generation = format!("grant-{}", uuid::Uuid::new_v4());
+            let mut context: ProviderLaunchContext = serde_json::from_value(serde_json::json!({
+                "preparation":{"claude":{"mcp_args":[]}},
+                "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000",
+                    "providerRelativePath":".freshell/mcp-capability.json"},
+                "preparedInputs":{"generationId":generation,"manifest":{
+                    "relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(&bytes)),
+                    "sourceCount":0,"aliasCount":0,"recipeCount":0}}
+            })).unwrap();
+            std::fs::rename(&original_home, owned.path().join("preserved-original-home")).unwrap();
+            let (request, expected) =
+                final_claude_source_request(Some(&context), &stage, &cwd, &home, runtime)
+                    .unwrap()
+                    .expect("accepted selection does not rescan unavailable original sources");
+            let actual = observe(
+                &request.cwd,
+                &request.home,
+                request.native_source_runtime,
+                &request.setting_sources,
+            )
+            .unwrap();
+            expected.require_same_selection(&actual).unwrap();
+            assert_eq!(expected, observed);
+            assert!(final_claude_source_request(
+                Some(&context),
+                &stage,
+                &workspace,
+                &home,
+                runtime
+            )
+            .is_err());
+            // A new descriptor SHA cannot authorize changing frozen original selectors.
+            manifest.cwd = workspace.clone();
+            let changed =
+                freshell_runtime_protocol::bounded_json_bytes(&manifest, 64 * 1024 * 1024).unwrap();
+            std::fs::write(stage.join(".freshell/input-manifest.json"), &changed).unwrap();
+            context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+                format!("{:x}", Sha256::digest(changed));
+            let error = final_claude_source_request(Some(&context), &stage, &cwd, &home, runtime)
+                .unwrap_err();
+            assert!(error.contains("retain inputs and reprepare"));
+            assert!(!error.contains("frozen-original-selector"));
+            assert_eq!(
+                std::fs::read(owned.path().join("preserved-original-home/selected.json")).unwrap(),
+                selected_bytes
+            );
+        }
+    }
+
     #[test]
     fn provider_secret_claude_inline_settings_consumes_accepted_private_source() {
         use freshell_platform::claude_inputs::{ClaudeInputManifest, INLINE_SETTINGS_SOURCE};
@@ -343,6 +557,7 @@ mod tests {
         std::fs::write(owned.path().join(INLINE_SETTINGS_SOURCE), raw).unwrap();
         let manifest = ClaudeInputManifest {
             version: 1,
+            accepted_native_plan: None,
             native_source_runtime: Some(
                 freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
             ),
@@ -441,6 +656,7 @@ mod tests {
         std::fs::create_dir(owned.path().join(".freshell")).unwrap();
         let manifest = freshell_platform::claude_inputs::ClaudeInputManifest {
             version: 1,
+            accepted_native_plan: None,
             native_source_runtime: Some(
                 freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
             ),

@@ -99,6 +99,16 @@ pub struct ClaudeInputManifest {
     #[serde(default = "default_setting_sources")]
     pub setting_sources: Vec<ClaudeSettingSource>,
     pub plugin_dirs: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_native_plan: Option<AcceptedNativeSourcePlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptedNativeSourcePlan {
+    pub selector_manifest_sha256: String,
+    pub plan_revision: u8,
+    pub observation: observation::NativeObservation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +161,14 @@ pub fn default_setting_sources() -> Vec<ClaudeSettingSource> {
     ]
 }
 impl ClaudeInputManifest {
+    /// Selection precedes file-origin enrichment and the accepted native plan.
+    pub fn original_selectors(&self) -> Self {
+        let mut selected = self.clone();
+        selected.settings_origin = None;
+        selected.accepted_native_plan = None;
+        selected
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.native_source_runtime.is_none() {
             return Err("Claude native source runtime is unrecorded; retain inputs and reprepare before dispatch");
@@ -171,6 +189,25 @@ impl ClaudeInputManifest {
                 .any(|(index, source)| self.setting_sources[..index].contains(source))
         {
             return Err("accepted Claude discovery context profile exceeded");
+        }
+        if let Some(plan) = &self.accepted_native_plan {
+            if plan.plan_revision > 2
+                || plan.selector_manifest_sha256.len() != 64
+                || !plan
+                    .selector_manifest_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                || Some(plan.observation.native_source_runtime) != self.native_source_runtime
+                || plan.observation.setting_sources != self.setting_sources
+                || plan.observation.home.is_none()
+                || plan.observation.uid != plan.observation.euid
+                || plan.observation.gid != plan.observation.egid
+                || plan.observation.validate().is_err()
+            {
+                return Err(
+                    "accepted Claude native source plan is incomplete; retain inputs and reprepare",
+                );
+            }
         }
         for path in [&self.original_home, &self.cwd, &self.workspace]
             .into_iter()

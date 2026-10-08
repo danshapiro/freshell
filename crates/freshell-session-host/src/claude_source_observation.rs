@@ -6,6 +6,136 @@ use freshell_platform::claude_inputs::observation::{
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
+pub(crate) async fn verify_final(
+    context: Option<&freshell_runtime_protocol::ProviderLaunchContext>,
+    stage: &std::path::Path,
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+    uid: u32,
+    gid: u32,
+    runtime: freshell_platform::claude_inputs::NativeSourceRuntime,
+) -> Result<(), String> {
+    use freshell_runtime_protocol::{
+        bounded_json_bytes, read_frame_with_limit, write_frame_with_limit,
+    };
+    use tokio::io::AsyncReadExt;
+    let Some((request, expected)) = crate::provider_input_preparation::final_claude_source_request(
+        context, stage, cwd, home, runtime,
+    )?
+    else {
+        return Ok(());
+    };
+    if (expected.uid, expected.euid, expected.gid, expected.egid) != (uid, uid, gid, gid) {
+        return Err("Claude actual provider identity differs from accepted inputs; retain inputs and reprepare".into());
+    }
+    let raw = bounded_json_bytes(&request, MAX_REQUEST_BYTES)
+        .map_err(|_| "Claude final source request exceeds its finite metadata profile")?;
+    let request_sha256 = format!("{:x}", Sha256::digest(raw));
+    let executable = std::env::current_exe().map_err(|_| {
+        "Claude final source reader artifact unavailable; retain inputs and reprepare"
+    })?;
+    let mut command = tokio::process::Command::new("/usr/bin/setpriv");
+    command
+        .args(crate::provider_identity_args(uid, gid))
+        .arg(executable)
+        .arg("observe-claude-sources")
+        .current_dir(cwd)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let started = std::time::Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|_| "Claude final source reader could not start; retain inputs and reprepare")?;
+    let reader_pid = child.id();
+    tracing::info!(
+        event = "provider.inputs.native_final.started",
+        provider = "claude",
+        stage = "session_host",
+        reader_pid,
+        uid,
+        gid,
+        "Observing final native provider source selection"
+    );
+    let exchange = async {
+        let mut input = child
+            .stdin
+            .take()
+            .ok_or("Claude final source pipe unavailable")?;
+        let mut output = child
+            .stdout
+            .take()
+            .ok_or("Claude final source pipe unavailable")?;
+        write_frame_with_limit(&mut input, &request, MAX_REQUEST_BYTES)
+            .await
+            .map_err(|_| "Claude final source request incomplete")?;
+        drop(input);
+        let reply: ObservationReply = read_frame_with_limit(&mut output, MAX_REPLY_BYTES)
+            .await
+            .map_err(|_| {
+                "Claude final source evidence unavailable or exceeds its finite profile"
+            })?;
+        let mut trailing = [0];
+        if output
+            .read(&mut trailing)
+            .await
+            .map_err(|_| "Claude final reader completion unavailable")?
+            != 0
+        {
+            return Err("Claude final reader emitted extra evidence");
+        }
+        Ok(reply)
+    };
+    let exchange = tokio::time::timeout(std::time::Duration::from_secs(20), exchange).await;
+    let cleanup = async {
+        if !matches!(&exchange, Ok(Ok(_))) {
+            child
+                .kill()
+                .await
+                .map_err(|_| "Claude final source reader termination failed")?;
+        }
+        child
+            .wait()
+            .await
+            .map_err(|_| "Claude final source reader join failed")
+    };
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), cleanup).await;
+    let result = (|| {
+        let status = status.map_err(|_| "Claude final source reader cleanup timed out")??;
+        let reply = exchange.map_err(|_| "Claude final source reader timed out")??;
+        if !status.success() {
+            return Err("Claude final source reader failed without complete evidence".to_string());
+        }
+        reply.validate_for_request(&request, &request_sha256)?;
+        expected.require_same_selection(&reply.observation)
+    })();
+    match &result {
+        Ok(()) => tracing::info!(
+            event = "provider.inputs.native_final.completed",
+            provider = "claude",
+            stage = "session_host",
+            reader_pid,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Final native provider source selection agrees"
+        ),
+        Err(reason) => {
+            tracing::warn!(event="provider.inputs.native_final.blocked",provider="claude",stage="session_host",
+            reader_pid,elapsed_ms=started.elapsed().as_millis() as u64,cause=%reason,"Final native provider source selection unavailable or changed")
+        }
+    }
+    result.map_err(|reason| {
+        if reason.contains("retain inputs and reprepare") {
+            reason
+        } else {
+            format!("{reason}; retain inputs and reprepare")
+        }
+    })
+}
+
 pub(crate) fn serve_stdio() -> Result<(), String> {
     exchange(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
 }

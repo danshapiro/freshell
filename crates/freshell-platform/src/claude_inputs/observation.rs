@@ -214,7 +214,16 @@ impl NativeObservation {
     pub fn require_same_selection(&self, current: &Self) -> Result<(), String> {
         self.validate()?;
         current.validate()?;
-        if self != current {
+        if self.native_source_runtime != current.native_source_runtime
+            || self.setting_sources != current.setting_sources
+            || (self.uid, self.euid, self.gid, self.egid)
+                != (current.uid, current.euid, current.gid, current.egid)
+            || self.cwd != current.cwd
+            || self.home != current.home
+            || self.roots != current.roots
+            || self.local_decision != current.local_decision
+            || self.local_settings != current.local_settings
+        {
             return Err("Claude native source selection changed before dispatch; retain inputs and reprepare".into());
         }
         Ok(())
@@ -493,6 +502,30 @@ mod tests {
             assert!(error.contains("retain inputs and reprepare"));
             assert!(!error.contains("canonical-private-synthetic"));
             assert_eq!(std::fs::read(prior).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn claude_native_final_selection_accepts_provider_owned_directory_without_changing_local_predicate(
+    ) {
+        for runtime in [NativeSourceRuntime::Terminal, NativeSourceRuntime::Sdk] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let root = owned.path().join("root");
+            let cwd = root.join("nested");
+            for directory in [&home, &root.join(".git"), &cwd] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            let accepted = observe(&cwd, &home, runtime, &[ClaudeSettingSource::Local]).unwrap();
+            assert_eq!(accepted.local_decision, LocalDecision::QualifiedCanonical);
+            assert!(accepted.claude_uid.is_none());
+            std::fs::create_dir(root.join(".claude")).unwrap();
+            let current = observe(&cwd, &home, runtime, &[ClaudeSettingSource::Local]).unwrap();
+            assert_eq!(current.claude_uid, Some(unsafe { libc::getuid() }));
+            assert_eq!(current.local_decision, accepted.local_decision);
+            assert_eq!(current.local_settings, accepted.local_settings);
+            accepted.require_same_selection(&current)
+                .expect("an owned empty directory leaves the native absent-or-owned predicate and ordered candidates unchanged");
         }
     }
 

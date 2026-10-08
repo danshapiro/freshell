@@ -1062,6 +1062,20 @@ async fn grant_execution(
                     format!("prepare managed provider: {error}"),
                 )
             })?;
+            claude_source_observation::verify_final(
+                prepared.terminal.provider_launch_context.as_ref(),
+                &state
+                    .provider_config_paths
+                    .private_mount
+                    .join("user-provider"),
+                Path::new(&prepared.terminal.cwd),
+                &state.provider_config_paths.provider_home,
+                prepared.terminal.run_as_uid,
+                prepared.terminal.run_as_gid,
+                freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+            )
+            .await
+            .map_err(|error| RuntimeError::new(RuntimeErrorCode::ProviderInputsChanged, error))?;
             consume_grant(&mut persisted)?;
             let prepared = providers::start_terminal_sidecar(prepared)
                 .await
@@ -1189,6 +1203,20 @@ async fn grant_execution(
             )
             .await
             .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+            claude_source_observation::verify_final(
+                launch.provider_launch_context.as_ref(),
+                &state
+                    .provider_config_paths
+                    .private_mount
+                    .join("user-provider"),
+                Path::new(&launch.cwd),
+                &state.provider_config_paths.provider_home,
+                launch.run_as_uid,
+                launch.run_as_gid,
+                freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
+            )
+            .await
+            .map_err(|error| RuntimeError::new(RuntimeErrorCode::ProviderInputsChanged, error))?;
             consume_grant(&mut persisted)?;
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;

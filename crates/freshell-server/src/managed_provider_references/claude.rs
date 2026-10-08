@@ -60,8 +60,9 @@ pub(crate) async fn prepare_managed(
         }
         plugin_dirs.push(path);
     }
-    let manifest = freshell_platform::claude_inputs::ClaudeInputManifest {
+    let mut manifest = freshell_platform::claude_inputs::ClaudeInputManifest {
         version: 1,
+        accepted_native_plan: None,
         native_source_runtime: Some(request.native_source_runtime),
         original_home: request.home.into(),
         cwd: request.cwd.into(),
@@ -121,11 +122,8 @@ pub(crate) async fn prepare_managed(
         setting_sources: manifest.setting_sources.clone(),
         selector_manifest_sha256: {
             use sha2::{Digest, Sha256};
-            let bytes = bounded_json_bytes(
-                &manifest,
-                freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES,
-            )
-            .map_err(|_| "Claude selector metadata exceeds its finite profile")?;
+            let bytes = bounded_json_bytes(&manifest, 64 * 1024 * 1024)
+                .map_err(|_| "Claude selector metadata exceeds its finite profile")?;
             format!("{:x}", Sha256::digest(bytes))
         },
         plan_revision: 0,
@@ -167,6 +165,12 @@ pub(crate) async fn prepare_managed(
         .await
         .map_err(|_| "Claude native source evidence is unavailable; retain inputs and reprepare")?;
     observation.validate_for_request(&observation_request, &observation_request_sha256)?;
+    manifest.accepted_native_plan =
+        Some(freshell_platform::claude_inputs::AcceptedNativeSourcePlan {
+            selector_manifest_sha256: observation_request.selector_manifest_sha256,
+            plan_revision: observation_request.plan_revision,
+            observation: observation.observation.clone(),
+        });
     crate::managed_mcp_capability::issue_prepared_provider_context(
         "claude",
         request.soul,
@@ -361,6 +365,20 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let socket = owned.path().join("control.sock");
+        let plugins = (0..5000)
+            .map(|index| {
+                workspace
+                    .join(format!("selected-plugin-{index:04}-{}", "x".repeat(40)))
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            plugins.iter().map(String::len).sum::<usize>()
+                > freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES
+        );
+        assert!(plugins.iter().map(String::len).sum::<usize>() < MAX_SOURCE_EVENT_BYTES);
         let supervisor = Supervisor::new(
             registry.clone(),
             backend.clone(),
@@ -403,7 +421,7 @@ mod tests {
                 git_common_dir: None,
                 original: &|_| None,
                 args: &["--setting-sources".into(), "local".into()],
-                plugins: &[],
+                plugins: &plugins,
                 references: &[],
             })
             .await
