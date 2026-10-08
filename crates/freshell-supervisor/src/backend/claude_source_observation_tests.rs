@@ -176,6 +176,7 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
     ] {
         for mode in [
             "valid",
+            "retained-current-workspace",
             "missing-resource",
             "wrong-soul",
             "wrong-reservation",
@@ -198,6 +199,9 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
             let stage = owned.path().join("stage");
             std::fs::create_dir(&workspace).unwrap();
             std::fs::create_dir(&original).unwrap();
+            let retained = mode == "retained-current-workspace";
+            let prior_workspace = owned.path().join("original-workspace");
+            std::fs::create_dir(&prior_workspace).unwrap();
             std::fs::create_dir_all(stage.join(".freshell")).unwrap();
             let resource = stage.join(".freshell/resource-units/unit-0/probe");
             std::fs::create_dir_all(resource.join("node_modules/frozen-dependency")).unwrap();
@@ -208,7 +212,11 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
             .unwrap();
             std::fs::write(
                 resource.join("consumer.cjs"),
-                "process.stdout.write(require('frozen-dependency'))",
+                if retained {
+                    "process.stdout.write(require('frozen-dependency')+':'+process.cwd())"
+                } else {
+                    "process.stdout.write(require('frozen-dependency'))"
+                },
             )
             .unwrap();
             let binary = owned.path().join("synthetic-host");
@@ -233,8 +241,16 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
                 version: 1,
                 native_source_runtime: Some(runtime),
                 original_home: original.clone(),
-                cwd: workspace.clone(),
-                workspace: workspace.clone(),
+                cwd: if retained {
+                    prior_workspace.clone()
+                } else {
+                    workspace.clone()
+                },
+                workspace: if retained {
+                    prior_workspace.clone()
+                } else {
+                    workspace.clone()
+                },
                 config_root: None,
                 settings_file: None,
                 settings_origin: None,
@@ -304,21 +320,36 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
             } else {
                 soul
             };
-            let context:ProviderLaunchContext=serde_json::from_value(json!({
+            let mut context:ProviderLaunchContext=serde_json::from_value(json!({
                 "preparation":{"claude":{"mcp_args":[]}},"config":[],
                 "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
                 "preparedInputs":{"generationId":generation,"initialAuthReservation":reservation_id,
                     "manifest":{"relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(&manifest_bytes)),"sourceCount":0,"aliasCount":0,"recipeCount":0},
                     "resourceMounts":[{"stageRelativePath":".freshell/resource-units/unit-0","providerRelativePath":".freshell/provider-roots/unit-0","logicalDestination":"/home/freshell/provider/.claude/skills","effectiveDestination":"/home/freshell/provider/.claude/skills","kind":"directory"}]}
             })).unwrap();
+            if retained {
+                context
+                    .prepared_inputs
+                    .as_mut()
+                    .unwrap()
+                    .initial_auth_reservation = None;
+            }
             let ready = PreparedProviderContext {
                 provider_launch_context: context.clone(),
                 provider_secret_references: vec![],
             };
             let result_bytes = bounded_json_bytes(&ready, MAX_CONTROL_FRAME_BYTES).unwrap();
             let context_bytes = bounded_json_bytes(&context, MAX_CONTROL_FRAME_BYTES).unwrap();
-            let authority = ClaudeSourceAuthority::InitialReservation {
-                reservation_id: reservation_id.clone(),
+            let attempt = freshell_runtime_protocol::RecoveryAttemptId::new();
+            let prior_generation = format!("grant-{}", uuid::Uuid::new_v4());
+            let authority = if retained {
+                ClaudeSourceAuthority::RecoveryAttempt {
+                    attempt_id: uuid::Uuid::new_v4().to_string(),
+                }
+            } else {
+                ClaudeSourceAuthority::InitialReservation {
+                    reservation_id: reservation_id.clone(),
+                }
             };
             let publication = ClaudeCandidatePublication {
                 version: 1,
@@ -330,10 +361,10 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
                         bounded_json_bytes(&authority, MAX_CONTROL_FRAME_BYTES).unwrap()
                     )
                 ),
-                initial_reservation_id: Some(reservation_id),
-                registry_attempt_id: None,
-                intent_revision: 1,
-                prior_generation_id: None,
+                initial_reservation_id: if retained { None } else { Some(reservation_id) },
+                registry_attempt_id: retained.then_some(attempt.clone()),
+                intent_revision: if retained { 2 } else { 1 },
+                prior_generation_id: retained.then_some(prior_generation.clone()),
                 generation_id: generation.clone(),
                 manifest_sha256: format!("{:x}", Sha256::digest(&manifest_bytes)),
                 prepared_context_sha256: format!("{:x}", Sha256::digest(&context_bytes)),
@@ -352,7 +383,7 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
                 "observationRequest":{"version":1,"requestId":uuid::Uuid::new_v4().to_string(),"nativeSourceRuntime":runtime,"cwd":workspace,"home":"/home/freshell/provider","settingSources":["user"],"selectorManifestSha256":selector,"planRevision":0,
                     "candidateBinding":{"soulId":candidate_soul,"generationId":generation,"authoritySha256":publication.authority_sha256,"publicationSha256":format!("{:x}",Sha256::digest(&publication_bytes)),"manifestSha256":publication.manifest_sha256,"preparedResultSha256":publication.prepared_result_sha256}}
             })).unwrap();
-            request.candidate_projection(publication).expect("coherent wire fixture must pass metadata shape checks before physical/owner qualification");
+            request.candidate_projection(publication.clone()).expect("coherent wire fixture must pass metadata shape checks before physical/owner qualification");
             std::fs::write(stage.join(".freshell/input-manifest.json"), manifest_bytes).unwrap();
             std::fs::write(stage.join(".freshell/prepared-context.json"), context_bytes).unwrap();
             std::fs::write(stage.join(".freshell/prepared-result.json"), result_bytes).unwrap();
@@ -399,10 +430,72 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
                     daemon_id: DockerDaemonId::new(),
                 },
             };
+            let owner = if retained {
+                use freshell_runtime_protocol::{IncarnationId, InstallationId, LaunchNonce};
+                let ClaudeSourceOwner::Initial {
+                    reservation,
+                    observation: InitialAuthVolumeObservation::Absent { daemon_id },
+                } = owner
+                else {
+                    unreachable!()
+                };
+                let mut prior_context = context.clone();
+                prior_context.mcp_capability.as_mut().unwrap().grant_id = prior_generation.clone();
+                prior_context
+                    .prepared_inputs
+                    .as_mut()
+                    .unwrap()
+                    .generation_id = prior_generation.clone();
+                prior_context.validate("claude").unwrap();
+                let (terminal, agent) = if runtime == NativeSourceRuntime::Terminal {
+                    (Some(serde_json::from_value(json!({"terminalId":"retained-terminal","streamId":"retained-stream","mode":"claude","program":"claude","args":[],"env":{},"cwd":prior_workspace,"workspacePath":prior_workspace,"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"retained-project","providerLaunchContext":prior_context})).unwrap()),None)
+                } else {
+                    (None,Some(serde_json::from_value(json!({"sessionId":"retained-session","provider":flavor,"sessionType":if flavor=="kilroy" {"kilroy"} else {"freshclaude"},"runtimeVariant":"claude","providerStoreId":"retained-store","cwd":prior_workspace,"workspacePath":prior_workspace,"runAsUid":65534,"runAsGid":0,"providerLaunchContext":prior_context})).unwrap()))
+                };
+                ClaudeSourceOwner::Retained {
+                    handle: OwnedRuntimeHandle::from_registry(
+                        InstallationId::new(),
+                        reservation.soul_id,
+                        IncarnationId::new(),
+                        LaunchNonce::new(),
+                        daemon_id,
+                        "retained-owned-container".into(),
+                        reservation.image_ref,
+                        owned.path().into(),
+                        reservation.binary,
+                        "retained-config-digest".into(),
+                        freshell_runtime_protocol::RuntimeLimits {
+                            cpu_milli: 500,
+                            memory_bytes: 256 * 1024 * 1024,
+                            swap_bytes: 0,
+                            pids_max: 32,
+                        },
+                        None,
+                        terminal,
+                        agent,
+                        "retained-owned-home".into(),
+                    ),
+                    recovery_source: Some(freshell_runtime_protocol::ClaudeRecoverySourceBinding {
+                        provider: flavor.into(),
+                        git_common_dir: None,
+                        authority_sha256: publication.authority_sha256,
+                        registry_attempt_id: attempt,
+                        intent_revision: 2,
+                        prior_generation_id: prior_generation,
+                    }),
+                }
+            } else {
+                owner
+            };
+            if retained {
+                std::fs::remove_dir(&prior_workspace).unwrap();
+            }
             let qualified = qualify_candidate_stage(&stage, &owner, &request);
-            assert_eq!(qualified.is_ok(),mode=="valid","{flavor}/{runtime:?}/{mode}: physical issuer and current owner must qualify before consumer selection: {:?}",qualified.as_ref().err());
+            assert_eq!(qualified.is_ok(),mode=="valid" || retained,"{flavor}/{runtime:?}/{mode}: physical issuer and current owner must qualify before consumer selection: {:?}",qualified.as_ref().err());
             if let Ok(projection) = qualified {
-                qualify_candidate_helper_transport(&owner, &request, &stage).await;
+                if !retained {
+                    qualify_candidate_helper_transport(&owner, &request, &stage).await;
+                }
                 let selected = &projection
                     .provider_launch_context
                     .prepared_inputs
@@ -421,7 +514,15 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
                     .output()
                     .unwrap();
                 assert!(output.status.success());
-                assert_eq!(output.stdout, b"qualified-frozen-dependency");
+                if retained {
+                    assert_eq!(
+                        output.stdout,
+                        format!("qualified-frozen-dependency:{}", workspace.display()).as_bytes()
+                    );
+                    assert!(!prior_workspace.exists());
+                } else {
+                    assert_eq!(output.stdout, b"qualified-frozen-dependency");
+                }
             } else {
                 assert!(!qualified
                     .unwrap_err()

@@ -697,7 +697,11 @@ fn qualify_candidate_stage(
     if plan.selector_manifest_sha256 != format!("{:x}", Sha256::digest(selectors))
         || plan.selector_manifest_sha256 != source.selector_manifest_sha256
         || plan.plan_revision != source.plan_revision
-        || manifest.workspace != Path::new(&request.workspace_path)
+        // Recovery retains creation-time selector origins. Its current
+        // projection workspace is bound by the issuer and recovery owner
+        // above, rather than replacing the frozen selector workspace.
+        || (matches!(owner, ClaudeSourceOwner::Initial { .. })
+            && manifest.workspace != Path::new(&request.workspace_path))
         || manifest.setting_sources != source.setting_sources
         || plan.observation.setting_sources != source.setting_sources
         || plan.observation.native_source_runtime != source.native_source_runtime
