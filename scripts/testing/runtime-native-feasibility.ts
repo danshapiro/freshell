@@ -1415,6 +1415,11 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
   const result = await harness.adminOk(supervisor, request)
   harness.writeArtifact(`${scenario}-launch.json`, result)
   let view = result.data.view
+  const captureNativeSignal = async () => {
+    const signal = await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c',
+      "import pathlib,json; signals=[]\nfor p in pathlib.Path('/proc').iterdir():\n if not p.name.isdigit():continue\n try:\n  env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(bytes([0])) if b'=' in v)\n  if 'FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR' in env:signals.append(pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'])/'amplifier-loaded-context.json')\n except (OSError,ValueError):continue\nassert len(set(signals))==1\nprint(next(iter(set(signals))).read_text())"])
+    fs.writeFileSync(path.join(harness.evidenceDir, `${scenario}-native-signal-original.json`), signal, { mode: 0o600 })
+  }
   const deadline = Date.now() + 50_000
   while (!view.nativeIdentityObservation && Date.now() < deadline) {
     harness.writeArtifact(`${scenario}-terminal-private.json`,
@@ -1422,9 +1427,7 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
     harness.writeArtifact(`${scenario}-store-probe.json`,
       await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId)))
     try {
-      const signal = await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c',
-        "import pathlib,json; signals=[]\nfor p in pathlib.Path('/proc').iterdir():\n if not p.name.isdigit():continue\n try:\n  env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(bytes([0])) if b'=' in v)\n  if 'FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR' in env:signals.append(pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'])/'amplifier-loaded-context.json')\n except (OSError,ValueError):continue\nassert len(set(signals))==1\nprint(next(iter(set(signals))).read_text())"])
-      fs.writeFileSync(path.join(harness.evidenceDir, `${scenario}-native-signal-original.json`), signal, { mode: 0o600 })
+      await captureNativeSignal()
     } catch { /* The producer may not yet have completed load/context restore. */ }
     const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
     harness.writeArtifact(`${scenario}-inventory.json`, inventory)
@@ -1437,6 +1440,7 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
   if (!observation || !view.nativeSessionId || view.recoveryState !== 'live'
     || observation.nativeSessionId !== view.nativeSessionId || observation.incarnationId !== view.incarnationId
     || observation.source !== 'amplifier_native_loaded_context') throw new Error('current managed Amplifier no-input acknowledgement missing')
+  await captureNativeSignal()
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
     ['/opt/amplifier-src/.venv/bin/python', '-c',
       "import os,json,pathlib,hashlib,importlib.metadata as m; p=pathlib.Path('/opt/amplifier-src/.venv/bin/amplifier'); producer=pathlib.Path('/opt/amplifier-src/amplifier_app_cli/freshell_native_resume.py'); print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'executableSha256':hashlib.sha256(p.read_bytes()).hexdigest(),'producerSha256':hashlib.sha256(producer.read_bytes()).hexdigest(),'cliVersion':m.version('amplifier-app-cli'),'coreVersion':m.version('amplifier-core')}))"]))

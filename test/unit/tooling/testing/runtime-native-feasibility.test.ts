@@ -80,6 +80,41 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(fs.existsSync(path.join(directory, 'amplifier-current-native-turn-workspace'))).toBe(false)
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it.each(['valid', 'missing-signal'])('captures actual Amplifier acknowledgement when launch already observed it (%s)', async (fault) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-initial-observation-'))
+    const source = path.join(directory, 'selected-profile'); fs.writeFileSync(source, 'fixture selected profile')
+    const capture = vi.fn(async (_container: string, uid: string, argv: string[]) => {
+      expect(uid).toBe('65534:0')
+      if (argv[0] === 'python3') {
+        if (fault === 'missing-signal') throw new Error('owned native signal unreadable')
+        return JSON.stringify({ launch: { incarnationId: 'current-incarnation' }, native: { load: { transcript: { path: '/owned/native-transcript' } } } })
+      }
+      return JSON.stringify({ uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+        cliVersion: '0.1.1', coreVersion: '1.6.0', executableSha256: 'e'.repeat(64) })
+    })
+    const records = new Map<string, unknown>()
+    const harness = { testRoot: directory, evidenceDir: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
+      startSupervisor: async () => ({}), execOwnedContainerAsExact: capture,
+      writeArtifact: (name: string, value: unknown) => records.set(name, value),
+      adminOk: async (_supervisor: unknown, request: any) => ({ data: { view: {
+        containerId: 'owned-amplifier', incarnationId: 'current-incarnation', recoveryState: 'live', nativeSessionId: request.params.nativeSessionId,
+        nativeIdentityObservation: { incarnationId: 'current-incarnation', nativeSessionId: request.params.nativeSessionId, source: 'amplifier_native_loaded_context' },
+      } } }),
+    } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', '.amplifier/settings.yaml', '.amplifier/bundles/default.yaml']
+      .map(name => ({ name: 'amplifier/' + name, path: source, sha256: 'e'.repeat(64) }))
+    try {
+      const result = executeManagedNativeCase(harness, sources, { provider: 'amplifier', case: 'startup' }, 'create')
+      if (fault === 'missing-signal') await expect(result).rejects.toThrow('owned native signal unreadable')
+      else {
+        expect((await result).assertions.every(row => row.pass)).toBe(true)
+        expect(capture.mock.calls.filter(row => row[2][0] === 'python3')).toHaveLength(1)
+        expect(JSON.parse(fs.readFileSync(path.join(directory, 'amplifier-create-native-signal-original.json'), 'utf8')).native.load.transcript.path)
+          .toBe('/owned/native-transcript')
+      }
+      if (fault === 'missing-signal') expect(records.has('amplifier-create-original.json')).toBe(false)
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['split','sdk-inline','wrong-root','duplicate','missing','lookalike'])('correlates the exact actual native resume argv root (%s)', form=>{
     const root=randomUUID(),argv=form==='split'?['--resume',root]:form==='sdk-inline'?['--resume='+root]:form==='wrong-root'?['--resume='+randomUUID()]:form==='duplicate'?['--resume',root,'--resume='+root]:form==='missing'?['--resume']:['--resume-session-at='+root]
     expect(nativeResumeRootInArgv(argv,root)).toBe(form==='split'||form==='sdk-inline')
