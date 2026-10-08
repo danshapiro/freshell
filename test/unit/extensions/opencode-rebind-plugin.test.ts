@@ -855,6 +855,50 @@ describe('default export (TuiPluginModule)', () => {
     } finally { abort.abort(); rmSync(home, { recursive: true, force: true }) }
   })
 
+  it.each(['hydrated', 'unloaded', 'changed-route', 'not-ready', 'wrong-native-root', 'disposed'])
+    ('overlaps exact native history reading with TUI hydration and requires their current conjunction: %s', async (condition) => {
+    const home = mkdtempSync(join(tmpdir(), 'freshell-native-opencode-overlap-'))
+    const root = 'ses_overlaproot1'
+    const launch = { incarnationId: 'incarnation-overlap1', launchNonce: 'launch-overlap1', evidenceRevision: 4,
+      executionGeneration: 2, requestedNativeSessionId: root }
+    const directory = join(home, '.freshell/native-identity', launch.launchNonce)
+    vi.stubEnv('HOME', home)
+    vi.stubEnv('FRESHELL_NATIVE_IDENTITY_LAUNCH', JSON.stringify(launch))
+    vi.stubEnv('FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR', directory)
+    const session = { id: root, parentID: null }
+    let hydrated = false
+    let finish!: (value: unknown) => void
+    const pending = new Promise(resolve => { finish = resolve })
+    const get = vi.fn(() => pending)
+    const abort = new AbortController()
+    const state = { ready: true, session: { get: () => hydrated ? session : undefined, messages: () => [] } }
+    const route = { current: { name: 'session', params: { sessionID: root } } }
+    try {
+      plugin.tui({ state,
+        client: { session: { get, messages: async () => ({ data: [] }) } },
+        route, lifecycle: { signal: abort.signal } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(get).toHaveBeenCalledOnce()
+      expect(existsSync(join(directory, 'opencode-loaded.json'))).toBe(false)
+      await vi.advanceTimersByTimeAsync(75)
+      hydrated = condition !== 'unloaded'
+      if (condition === 'changed-route') route.current.params.sessionID = 'ses_otherroot1'
+      if (condition === 'not-ready') state.ready = false
+      if (condition === 'disposed') abort.abort()
+      finish({ data: condition === 'wrong-native-root' ? { ...session, id: 'ses_otherroot1' } : session })
+      await vi.advanceTimersByTimeAsync(0)
+      if (condition !== 'hydrated') {
+        expect(existsSync(join(directory, 'opencode-loaded.json'))).toBe(false)
+        expect(existsSync(join(directory, 'opencode-native-diagnostics/publication_succeeded.json'))).toBe(false)
+        return
+      }
+      expect(JSON.parse(readFileSync(join(directory, 'opencode-loaded.json'), 'utf8'))).toMatchObject({ launch,
+        native: { session_id: root, hydrated: true, active_message_count: 0 } })
+      const publication = JSON.parse(readFileSync(join(directory, 'opencode-native-diagnostics/publication_succeeded.json'), 'utf8'))
+      expect(publication.observedAtMs).toBe(Date.now())
+    } finally { abort.abort(); rmSync(home, { recursive: true, force: true }) }
+  })
+
   it.each(['create', 'resume'])('observes managed nonadoption native %s before input through the actual TUI loader', async (mode) => {
     const home = mkdtempSync(join(tmpdir(), 'freshell-native-opencode-'))
     const root = 'ses_nativeroot1'

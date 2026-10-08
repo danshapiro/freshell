@@ -762,15 +762,16 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
       const get = api.state?.session?.get
       const messages = api.state?.session?.messages
       if (typeof get !== 'function' || typeof messages !== 'function') return refuse('tui_session_api_unavailable')
-      if (!sessionIsExactRoot(get(root), root)) return refuse('tui_root_not_loaded')
+      // Read the exact native root while the TUI hydrates it. Publication
+      // still requires the current selected root and complete history below.
       progress('native_read_pending')
       const native = await readNativeHistory(api, root)
       if (deps.signal?.aborted) return
       progress('native_read_settled')
       if ('failure' in native) return refuse(native.failure)
       const selected = asRecord(get(root))
-      if (api.state?.ready !== true || currentRouteSessionId(api.route?.current) !== root
-        || !sessionIsExactRoot(selected, root)) return refuse('tui_context_changed')
+      if (!sessionIsExactRoot(selected, root)) return refuse('tui_root_not_loaded')
+      if (api.state?.ready !== true || currentRouteSessionId(api.route?.current) !== root) return refuse('tui_context_changed')
       if (revertReference(native.session.revert) !== revertReference(selected?.revert)) return refuse('revert_not_hydrated')
       const active = activeMessages(native.messages.map(row => asRecord(row)?.info), root, native.session.revert)
       const hydrated = activeMessages(messages(root), root, selected?.revert)
