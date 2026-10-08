@@ -807,11 +807,12 @@ async fn confirm_claude_callback_candidate(
             candidate: Some(ready.clone()),
             observation_request: source,
         },
+        true,
     )?;
     let source = request.observation_request.clone();
     let reply = client.observe_claude_sources(request).await.map_err(|_| {
         tracing::warn!(event="provider.inputs.claude_candidate.evidence_unavailable",soul_id=%callback.soul_id,
-            plan_revision=plan.plan_revision,
+            plan_revision=source.plan_revision,
             "Claude recovery candidate evidence unavailable; both private generations retained");
         "Claude current candidate native source evidence unavailable; retain inputs and reprepare"
     })?;
@@ -2905,13 +2906,15 @@ fn bind_claude_candidate_request(
     directory: &Path,
     request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
 ) -> Result<freshell_runtime_protocol::ObserveClaudeSourcesRequest, String> {
-    bind_claude_candidate_request_and_plan(store, directory, request).map(|(request, _)| request)
+    bind_claude_candidate_request_and_plan(store, directory, request, false)
+        .map(|(request, _)| request)
 }
 
 fn bind_claude_candidate_request_and_plan(
     store: &CapabilityStore,
     directory: &Path,
-    request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+    mut request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+    use_frozen_revision: bool,
 ) -> Result<
     (
         freshell_runtime_protocol::ObserveClaudeSourcesRequest,
@@ -2954,6 +2957,12 @@ fn bind_claude_candidate_request_and_plan(
     )?;
     let publication: ClaudeCandidatePublication =
         serde_json::from_slice(&published).map_err(|_| blocked())?;
+    if use_frozen_revision {
+        // A fresh baseline has no prepared revision yet. Same-scope replay
+        // retains the issuer's frozen count; all publication/manifest hashes
+        // and recovery authority are requalified below before any IPC.
+        request.observation_request.plan_revision = publication.plan_revision;
+    }
     let context_bytes = read_claude_candidate_metadata(
         &root,
         ".freshell/prepared-context.json",
@@ -6998,6 +7007,12 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
 
     #[tokio::test]
     async fn managed_provider_claude_pending_replay_requires_current_source_authority() {
+        for frozen_revision in 0..=2 {
+            qualify_claude_pending_replay_source_authority(frozen_revision).await;
+        }
+    }
+
+    async fn qualify_claude_pending_replay_source_authority(frozen_revision: u8) {
         use freshell_platform::claude_inputs::{
             observation::{LocalDecision, NativeObservation},
             AcceptedNativeSourcePlan, ClaudeInputManifest, ClaudeSettingSource,
@@ -7082,7 +7097,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                     bounded_json_bytes(&manifest.original_selectors(), 64 * 1024 * 1024).unwrap()
                 )
             ),
-            plan_revision: 0,
+            plan_revision: frozen_revision,
             observation: original_observation.clone(),
         });
         let initial_reservation = uuid::Uuid::new_v4().to_string();
@@ -7245,6 +7260,9 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                                 assert!(matches!(request.authority, ClaudeSourceAuthority::RecoveryAttempt { attempt_id } if attempt_id == expected_scope));
                                 assert_eq!(request.observation_request.cwd, expected_cwd);
                                 let candidate = request.candidate.is_some();
+                                assert_eq!(request.observation_request.plan_revision,
+                                    if candidate && !matches!(fault, "replacement" | "candidate_digest") { frozen_revision } else { 0 },
+                                    "same-scope pending replay must retain its frozen revision; new preparation starts at zero");
                                 observations.push(candidate);
                                 assert!(observations.len() <= 4, "only one baseline plus three finite candidate revisions are permitted");
                                 assert_eq!(request.candidate.is_some(), request.observation_request.candidate_binding.is_some());
