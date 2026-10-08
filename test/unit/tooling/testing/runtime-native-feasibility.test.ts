@@ -8,7 +8,7 @@ import { createServer } from 'node:net'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, staleNativeSignalBindingMatches, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, staleNativeSignalBindingMatches, terminalRestorationFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -27,6 +27,29 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['startup', 'foreign-root', 'foreign-workspace'])('keeps native history unchanged before an owned restoration fault is bound (%s)', (fault) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-restoration-hook-'))
+    const hookPath = path.join(directory, 'fault.mjs'), transcript = path.join(directory, 'owned.jsonl')
+    fs.writeFileSync(hookPath, terminalRestorationFaultHook)
+    fs.writeFileSync(transcript, 'owned history retained\n')
+    fs.writeFileSync(path.join(directory, 'native-restoration-fault-control.json'), JSON.stringify({root:'owned-root'}))
+    const launch = {requestedNativeSessionId:'owned-root'}
+    const input = JSON.stringify({source:fault === 'startup'?'startup':'resume', session_id:fault === 'foreign-root'?'other-root':'owned-root', cwd:fault === 'foreign-workspace'?directory+'-other':directory, transcript_path:transcript})
+    try {
+      const run = () => execFileSync(process.execPath, [hookPath], {cwd:directory,input,encoding:'utf8',
+        env:{...process.env,FRESHELL_NATIVE_IDENTITY_LAUNCH:JSON.stringify(launch)},stdio:['pipe','pipe','pipe']})
+      if(fault === 'startup') expect(JSON.parse(run())).toEqual({})
+      else expect(run).toThrow('owned native resume binding mismatch')
+      expect(fs.readFileSync(transcript, 'utf8')).toBe('owned history retained\n')
+      expect(fs.existsSync(path.join(directory, 'native-restoration-fault-observation.json'))).toBe(false)
+    } finally {fs.rmSync(directory,{recursive:true,force:true})}
+  })
+
+  it('requires the owned real managed controller before a native after-hook restoration fault can seed', async () => {
+    await expect(executeManagedNativeCase({} as RuntimeHarness, [], {provider: 'claude', case: 'startup'}, 'restoration-failure-after-hook'))
+      .rejects.toThrow('actual terminal recovery requires the owned real server artifact')
+  })
+
   it.each(['valid', 'current-nonce', 'current-incarnation', 'wrong-root', 'wrong-loaded-root', 'missing-loaded', 'wrong-active-launch', 'hooks-enabled', 'missing-prior-nonce'])('requires the actual old/current native signal binding for the stale fault (%s)', (fault) => {
     const prior = { launchNonce: 'old-launch', incarnationId: 'old-incarnation' }
     const current = { launchNonce: 'current-launch', incarnationId: 'current-incarnation' }

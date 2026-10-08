@@ -229,7 +229,7 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
       candidateSha: manifest.candidateSha, ownerId: harness.runId,
       execute: async (caseId) => {
         const paidCase = selection.case === 'approval-checkpoint'
-          || (selection.provider === 'claude' && caseId === 'exact-resume')
+          || (selection.provider === 'claude' && ['exact-resume', 'restoration-failure-after-hook'].includes(caseId))
         if (paidPrerequisiteFailed && paidCase) {
           throw new Error('prior native prerequisite failed; no further paid operation started')
         }
@@ -275,7 +275,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'claude' && ['create', 'wrong-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'claude' && ['create', 'wrong-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
   if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
@@ -429,7 +429,8 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
 async function executeManagedTerminalClaude(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  const resumes = ['exact-resume', 'current-native-turn'].includes(caseId)
+  const restorationFailure = caseId === 'restoration-failure-after-hook'
+  const resumes = ['exact-resume', 'current-native-turn', 'restoration-failure-after-hook'].includes(caseId)
   const nativeTimeout = caseId === 'timeout'
   const trustRefusal = caseId === 'trust-refusal'
   const unwritableSignal = caseId === 'unwritable-signal'
@@ -473,6 +474,14 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   fs.mkdirSync(userRoot, { recursive: true, mode: 0o700 })
   fs.copyFileSync(preferences.path, preferencePath)
   fs.chmodSync(preferencePath, 0o600)
+  if (restorationFailure) {
+    const local = path.join(workspace, '.claude'); fs.mkdirSync(local, { mode: 0o770 }); fs.chmodSync(local, 0o770)
+    const hookPath = path.join(workspace, 'native-restoration-fault.mjs')
+    fs.writeFileSync(hookPath, terminalRestorationFaultHook, { mode: 0o660 }); fs.chmodSync(hookPath, 0o660)
+    fs.writeFileSync(path.join(local, 'settings.json'), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{
+      type: 'command', command: "node '" + hookPath.replaceAll("'", "'\\''") + "'",
+    }] }] } }), { mode: 0o660 })
+  }
   if (trustRefusal) {
     const profile = JSON.parse(fs.readFileSync(preferencePath, 'utf8'))
     profile.projects ??= {}; profile.projects[workspace] ??= {}
@@ -787,10 +796,46 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
     harness.writeArtifact(`${scenario}-completed-store-probe.json`, probe)
     if (probe.data.kind !== 'reattach_ready') throw new Error('completed terminal Claude store not readable before death')
+    if (restorationFailure) {
+      const controlPath = path.join(workspace, 'native-restoration-fault-control.json')
+      fs.writeFileSync(controlPath, JSON.stringify({ root: nativeRoot, seedSha256: seed.transcript.sha256,
+        seedBytes: Buffer.from(seed.transcript.bytesBase64, 'base64').length }), { mode: 0o660 }); fs.chmodSync(controlPath, 0o660)
+    }
     await harness.killOwnedRuntimeExact(view.containerId)
     await harness.waitForContainerExit(view.containerId)
-    const recovery = await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+    const recovery = restorationFailure ? await harness.adminRaw(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+      : await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
     harness.writeArtifact(`${scenario}-recovery.json`, recovery)
+    if (restorationFailure) {
+      const faultPath = path.join(workspace, 'native-restoration-fault-observation.json')
+      const deadline = Date.now() + 6_000
+      while (!fs.existsSync(faultPath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50))
+      const fault = JSON.parse(fs.readFileSync(faultPath, 'utf8'))
+      harness.writeArtifact(`${scenario}-restoration-fault-private.json`, fault)
+      const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+      harness.writeArtifact(`${scenario}-after-restoration-failure-inventory.json`, inventory)
+      const current = inventory.data.find((row: any) => row.soulId === soulId)
+      const input = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned failed restoration input probe. Do not use tools.\r'))
+      harness.writeArtifact(`${scenario}-after-restoration-failure-input-refusal.json`, input)
+      const contained = recovery.result?.Err?.code === 'RECOVERY_BLOCKED' && current?.launchState !== 'running'
+        && !current?.nativeIdentityObservation
+      const inputRefused = !!input.result?.Err
+      const nativeExitedUnloaded = fault.nativeExited === true && fault.loadedSha256 === null
+      const currentHook = fault.hook.native.source === 'resume' && fault.hook.native.session_id === nativeRoot
+        && fault.hook.launch.requestedNativeSessionId === nativeRoot
+        && fault.hook.launch.launchNonce !== namespace.hook.launch.launchNonce
+        && fault.hook.launch.incarnationId !== view.incarnationId
+      const ownedFault = fault.beforePrefixSha256 === seed.transcript.sha256 && fault.beforeSha256 !== fault.afterSha256
+        && fault.changedAssistantRows >= 1 && fault.uid === 65534 && fault.gid === 0
+        && fault.nativeExecutableSha256 === namespace.executableSha256
+      if (!contained || !inputRefused || !nativeExitedUnloaded || !currentHook || !ownedFault) {
+        throw new Error('actual native hook/restoration failure was not contained before input')
+      }
+      assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
+        { name: 'genuine-current-resume-hook-before-native-restoration-failure', pass: currentHook && ownedFault },
+        { name: 'native-restoration-exit-without-loaded-context-or-running-publication', pass: nativeExitedUnloaded && contained },
+        { name: 'failed-native-restoration-refuses-ordinary-input', pass: inputRefused })
+    } else {
     const replacement = recovery.data.view
     if (recovery.data.outcome !== 'replaced' || replacement.incarnationId === view.incarnationId
       || replacement.nativeSessionId !== nativeRoot || replacement.recoveryState !== 'live'
@@ -818,6 +863,7 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
       if (recalled.lastAssistantText.trim() !== marker || recalled.toolEvents !== 0) throw new Error('terminal Claude native restored context/tool-free recall differs')
       assertions.push({ name: 'actual-restored-context-private-marker-recall', pass: recalled.lastAssistantText.trim() === marker },
         { name: 'native-turns-requested-no-tools', pass: seed.toolEvents === 0 && recalled.toolEvents === 0 })
+    }
     }
   }
   const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
@@ -1400,6 +1446,64 @@ print(json.dumps({'nativeRoot':root,'nativePid':int(p.name),'transcript':{'ident
 
 // Reads the currently owned native child and its exact hook-selected transcript.
 // Raw bytes are saved only in the run's private artifact; reports use metadata.
+export const terminalRestorationFaultHook = String.raw`
+import fs from 'node:fs'
+import path from 'node:path'
+import {createHash} from 'node:crypto'
+import {spawn} from 'node:child_process'
+import {fileURLToPath} from 'node:url'
+const digest=bytes=>createHash('sha256').update(bytes).digest('hex')
+const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms))
+if(process.argv[2]==='--observe') {
+ const config=JSON.parse(process.argv[3]);const deadline=Date.now()+5000
+ while(Date.now()<deadline) {
+  const present=fs.existsSync('/proc/'+config.nativePid+'/exe')
+  const loaded=path.join(config.signalDirectory,'statusline-loaded.json')
+  if(!present || fs.existsSync(loaded)) {
+   const observation={...config, nativeExited:!present, loadedSha256:fs.existsSync(loaded)?digest(fs.readFileSync(loaded)):null}
+   fs.writeFileSync(config.observationPath,JSON.stringify(observation),{mode:0o664});break
+  }
+  await pause(10)
+ }
+} else {
+ let input='';for await(const chunk of process.stdin)input+=chunk
+ const native=JSON.parse(input)
+ if(native.source==='resume') {
+  const workspace=process.cwd(), control=JSON.parse(fs.readFileSync(path.join(workspace,'native-restoration-fault-control.json'),'utf8'))
+  const launch=JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH)
+  if(native.session_id!==control.root || launch.requestedNativeSessionId!==control.root || native.cwd!==workspace) throw new Error('owned native resume binding mismatch')
+  const signalDirectory=process.env.FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR
+  const signal=path.join(signalDirectory,'session-start.json'),deadline=Date.now()+3000
+  while(!fs.existsSync(signal) && Date.now()<deadline) await pause(10)
+  const hook=JSON.parse(fs.readFileSync(signal,'utf8'))
+  if(JSON.stringify(hook.launch)!==JSON.stringify(launch) || hook.native.session_id!==control.root || hook.native.source!=='resume') throw new Error('current genuine native hook missing')
+  const transcript=path.resolve(native.transcript_path),store=path.resolve(process.env.CLAUDE_CONFIG_DIR,'projects')+path.sep
+  if(!transcript.startsWith(store) || path.basename(transcript)!==control.root+'.jsonl' || !fs.lstatSync(transcript).isFile()) throw new Error('unowned transcript fault refused')
+  const original=fs.readFileSync(transcript)
+  if(original.at(-1)!==10 || digest(original.subarray(0,control.seedBytes))!==control.seedSha256) throw new Error('owned original native seed changed')
+  let changedAssistantRows=0
+  const rows=original.toString('utf8').trimEnd().split('\n').map(line=>JSON.parse(line))
+  for(const row of rows) if(row.type==='assistant') {
+   if(row.sessionId!==control.root || !Array.isArray(row.message?.content) || row.message.content.some(part=>part.type==='tool_use')) throw new Error('non-solo tool-free native seed refused')
+   row.message.content=42;changedAssistantRows++
+  }
+  if(!changedAssistantRows)throw new Error('completed native assistant missing')
+  const selected='/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe'
+  const nativeExecutableSha256=digest(fs.readFileSync(selected))
+  const pids=fs.readdirSync('/proc').filter(id=>/^\d+$/.test(id)).filter(id=>{try{return digest(fs.readFileSync('/proc/'+id+'/exe'))===nativeExecutableSha256}catch{return false}})
+  if(pids.length!==1)throw new Error('current native writer ambiguous')
+  const modified=Buffer.from(rows.map(row=>JSON.stringify(row)+'\n').join(''))
+  fs.writeFileSync(transcript,modified)
+  const config={hook,signalDirectory,nativePid:Number(pids[0]),nativeExecutableSha256,uid:process.getuid(),gid:process.getgid(),
+   beforeSha256:digest(original),beforePrefixSha256:digest(original.subarray(0,control.seedBytes)),afterSha256:digest(fs.readFileSync(transcript)),changedAssistantRows,
+   observationPath:path.join(workspace,'native-restoration-fault-observation.json')}
+  const observer=spawn(process.execPath,[fileURLToPath(import.meta.url),'--observe',JSON.stringify(config)],{stdio:'ignore'})
+  observer.unref()
+ }
+ process.stdout.write('{}\n')
+}
+`
+
 const claudeNativeInspection = String.raw`
 import pathlib,os,json,hashlib,ssl,urllib.parse,urllib.request,subprocess,sys,base64
 root=sys.argv[1];required=sys.argv[2]=='true';terminal=len(sys.argv)>3 and sys.argv[3]=='terminal'
