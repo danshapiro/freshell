@@ -926,11 +926,16 @@ async fn grant_execution(
         None
     };
 
-    persisted.max_control_epoch = control_epoch;
-    persisted.max_execution_generation = execution_generation;
-    persisted.grant_id = Some(grant_id.clone());
-    persisted.worker_pid = None;
-    write_state(&state.state_dir, &persisted).map_err(registry_like_error)?;
+    // Selection-affecting projection and provider preparation can still fail
+    // safely. Persist consumption only at the native dispatch boundary; once
+    // spawning is attempted, uncertain delivery must never authorize a replay.
+    let consume_grant = |persisted: &mut PersistedHostState| {
+        persisted.max_control_epoch = control_epoch;
+        persisted.max_execution_generation = execution_generation;
+        persisted.grant_id = Some(grant_id.clone());
+        persisted.worker_pid = None;
+        write_state(&state.state_dir, persisted).map_err(registry_like_error)
+    };
 
     let (pid, evidence, native_session_id) = match (fixture, terminal, fresh_agent) {
         (Some(fixture), None, None) => {
@@ -965,6 +970,7 @@ async fn grant_execution(
                         .arg(&resume.provider_session.native_session_id);
                 }
             }
+            consume_grant(&mut persisted)?;
             let child = command.spawn().map_err(|e| {
                 RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
@@ -1047,6 +1053,10 @@ async fn grant_execution(
                     format!("prepare managed provider: {error}"),
                 )
             })?;
+            consume_grant(&mut persisted)?;
+            let prepared = providers::start_terminal_sidecar(prepared)
+                .await
+                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             let terminal = prepared.terminal;
             let hosted = HostedPty::spawn(
                 &state.state_dir,
@@ -1170,6 +1180,7 @@ async fn grant_execution(
             )
             .await
             .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+            consume_grant(&mut persisted)?;
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             let actor = providers::open_hosted_fresh_agent(&state.state_dir, launch.clone())
@@ -4633,6 +4644,169 @@ mod tests {
         let persisted = state.persisted.lock().await;
         assert!(persisted.grant_id.is_none(),"source preflight failure must leave the grant unconsumed and safe to reprepare before dispatch");
         assert_eq!(persisted.worker_launch_count, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_secret_projection_failure_keeps_grant_retryable_and_prior_inputs() {
+        for route in ["terminal", "fresh"] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("provider-home");
+            std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+            let prior = home.join(".config/opencode/opencode.json");
+            std::fs::write(&prior, b"prior-accepted-source").unwrap();
+            let context = freshell_runtime_protocol::ProviderLaunchContext {
+                preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
+                    project_config: vec![freshell_runtime_protocol::ProviderConfigReference {
+                        root: freshell_runtime_protocol::ProviderConfigRoot::Workspace,
+                        relative_path: "opencode.json".into(),
+                        provider_relative_path: ".config/opencode/opencode.json".into(),
+                        format: "json".into(),
+                    }],
+                    tui_config: None,
+                    tui_source: None,
+                    inline_config: false,
+                },
+                prepared_inputs: None,
+                mcp_capability: None,
+                config: Vec::new(),
+            };
+            context.validate("opencode").unwrap();
+            let mut state = test_host_state();
+            Arc::get_mut(&mut state).unwrap().provider_config_paths = ProviderConfigPaths {
+                private_mount: owned.path().join("private"),
+                provider_home: home,
+            };
+            let cwd = owned.path().to_str().unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+            let session_type = if route == "terminal" {
+                "opencode"
+            } else {
+                "freshopencode"
+            };
+            let runtime_variant = if route == "terminal" {
+                "managed_terminal_pty"
+            } else {
+                "opencode"
+            };
+            let resume: ResumeSpec = serde_json::from_value(serde_json::json!({
+                "providerSession":{"provider":"opencode","providerStoreId":"synthetic-store","nativeSessionId":"ses_projection_retry"},
+                "mode":session_type,"runtimeVariant":runtime_variant,"program":"/usr/bin/true","resumeArgv":[],
+                "providerHome":"/home/freshell/provider","cwd":cwd,"workspacePath":cwd,
+                "identityProvenance":"provider_observed","durablePosition":{},"creationSeedRef":"synthetic-seed",
+                "checkpointRevision":0,"allocationState":"verified_durable","evidenceRevision":1,"neverDispatched":false,
+            })).unwrap();
+            let terminal = (route == "terminal").then(|| serde_json::from_value(serde_json::json!({
+                "terminalId":"synthetic-projection","streamId":"synthetic-stream","mode":"opencode","program":"/usr/bin/true","args":[],"env":{},
+                "cwd":cwd,"workspacePath":cwd,"runAsUid":uid,"runAsGid":gid,"cols":80,"rows":24,"projectKey":"synthetic",
+                "providerLaunchContext":context,
+            })).unwrap());
+            let fresh = (route == "fresh").then(|| serde_json::from_value(serde_json::json!({
+                "sessionId":"synthetic-projection","provider":"opencode","sessionType":session_type,"runtimeVariant":runtime_variant,
+                "providerStoreId":"synthetic-store","cwd":cwd,"workspacePath":cwd,"runAsUid":uid,"runAsGid":gid,
+                "providerLaunchContext":context,
+            })).unwrap());
+            let grant = GrantId::new();
+            for attempt in 0..2 {
+                let error = grant_execution(
+                    &state,
+                    GrantExecutionRequest {
+                        soul_id: SoulId::new(),
+                        control_epoch: 1,
+                        execution_generation: 1,
+                        grant_id: grant.clone(),
+                        fixture: None,
+                        provider_path_inputs: Default::default(),
+                        terminal: terminal.clone(),
+                        fresh_agent: fresh.clone(),
+                        resume_spec: Some(resume.clone()),
+                    },
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error.code,
+                    RuntimeErrorCode::HostUnreachable,
+                    "{route}/{attempt}: retry must reach the source preparation failure"
+                );
+                assert!(
+                    error
+                        .message
+                        .starts_with("select .config/opencode/opencode.json:"),
+                    "{route}: actual common-copy failure: {}",
+                    error.message
+                );
+                let persisted = state.persisted.lock().await;
+                assert!(
+                    persisted.grant_id.is_none(),
+                    "{route}: failed projection cannot consume the execution grant"
+                );
+                assert_eq!(persisted.worker_launch_count, 0);
+                assert!(persisted.worker_pid.is_none());
+                assert_eq!(std::fs::read(&prior).unwrap(), b"prior-accepted-source");
+            }
+            assert!(state.pty.lock().await.is_none());
+            assert!(state.fresh_agent.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_secret_spawn_attempt_remains_consumed_after_launch_failure() {
+        for provider in ["opencode", "codex"] {
+            let owned = tempfile::tempdir().unwrap();
+            let cwd = owned.path().to_str().unwrap();
+            let program = owned.path().join("missing-owned-launcher");
+            let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"synthetic-spawn","streamId":"synthetic-stream","mode":provider,
+            "program":program,"args":[],"env":{"FRESHELL_OPENCODE_REBIND":"0"},"cwd":cwd,"workspacePath":cwd,
+            "runAsUid":unsafe { libc::geteuid() },"runAsGid":unsafe { libc::getegid() },
+            "cols":80,"rows":24,"projectKey":"synthetic",
+        }))
+        .unwrap();
+            let resume: ResumeSpec = serde_json::from_value(serde_json::json!({
+            "providerSession":{"provider":provider,"providerStoreId":"synthetic-store","nativeSessionId":"ses_synthetic_spawn"},
+            "mode":provider,"runtimeVariant":"managed_terminal_pty","program":program,"resumeArgv":[],
+            "environment":{"FRESHELL_OPENCODE_REBIND":"0"},
+            "providerHome":"/home/freshell/provider","cwd":cwd,"workspacePath":cwd,
+            "identityProvenance":"provider_observed","durablePosition":{},"creationSeedRef":"synthetic-seed",
+            "checkpointRevision":0,"allocationState":"verified_durable","evidenceRevision":1,"neverDispatched":false,
+        })).unwrap();
+            let state = test_host_state();
+            let grant = GrantId::new();
+            for (attempt, expected) in [
+                RuntimeErrorCode::HostUnreachable,
+                RuntimeErrorCode::StaleExecutionGrant,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let error = grant_execution(
+                    &state,
+                    GrantExecutionRequest {
+                        soul_id: SoulId::new(),
+                        control_epoch: 1,
+                        execution_generation: 1,
+                        grant_id: grant.clone(),
+                        fixture: None,
+                        provider_path_inputs: Default::default(),
+                        terminal: Some(terminal.clone()),
+                        fresh_agent: None,
+                        resume_spec: Some(resume.clone()),
+                    },
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error.code, expected,
+                    "{provider}/{attempt}: failed native dispatch remains fenced"
+                );
+                let persisted = state.persisted.lock().await;
+                assert_eq!(persisted.grant_id.as_ref(), Some(&grant));
+                assert_eq!(persisted.worker_launch_count, 0);
+                assert!(persisted.worker_pid.is_none());
+            }
+            assert!(state.pty.lock().await.is_none());
+        }
     }
 
     #[tokio::test]

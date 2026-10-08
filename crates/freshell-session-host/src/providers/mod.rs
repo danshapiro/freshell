@@ -270,26 +270,29 @@ pub async fn prepare_terminal(
     // Keep the persisted/validated launch recipe separate from the final
     // child-only settings argument, just as credential environment is separate.
     apply_terminal_context(&mut terminal)?;
-    if terminal.mode == "codex" {
-        let mut sidecar_env = terminal.env.clone();
-        sidecar_env.extend(child_env.clone());
-        let prepared = codex::prepare(&terminal, &sidecar_env).await?;
-        let mut args = prepared.remote_args.to_vec();
-        args.extend(terminal.args);
-        terminal.args = args;
-        return Ok(PreparedTerminal {
-            terminal,
-            codex: Some(prepared),
-            child_env,
-            claude_settings: None,
-        });
-    }
     Ok(PreparedTerminal {
         terminal,
         codex: None,
         child_env,
         claude_settings: selected_claude_settings.map(str::to_owned),
     })
+}
+
+/// Codex's app-server is native execution. The host calls this only after
+/// consuming the grant, alongside the terminal process dispatch.
+pub async fn start_terminal_sidecar(
+    mut prepared: PreparedTerminal,
+) -> Result<PreparedTerminal, String> {
+    if prepared.terminal.mode == "codex" {
+        let mut sidecar_env = prepared.terminal.env.clone();
+        sidecar_env.extend(prepared.child_env.clone());
+        let codex = codex::prepare(&prepared.terminal, &sidecar_env).await?;
+        let mut args = codex.remote_args.to_vec();
+        args.extend(prepared.terminal.args);
+        prepared.terminal.args = args;
+        prepared.codex = Some(codex);
+    }
+    Ok(prepared)
 }
 
 async fn prepare_scoped_mcp_environment(
@@ -721,6 +724,33 @@ mod provider_secret_context_tests {
     use freshell_runtime_protocol::{
         McpCapabilityReference, ProviderLaunchContext, ProviderPreparation,
     };
+
+    #[tokio::test]
+    async fn provider_secret_codex_preparation_defers_native_dispatch() {
+        let owned = tempfile::tempdir().unwrap();
+        // A native process could not start from this cwd. Preparation must
+        // still finish without dispatching it before the grant is consumed.
+        let cwd = owned.path().join("missing-native-cwd");
+        let terminal = serde_json::from_value(serde_json::json!({
+            "terminalId":"synthetic-codex", "streamId":"synthetic-stream", "mode":"codex", "program":"codex",
+            "args":["--model","synthetic-model"],"cwd":cwd,"workspacePath":owned.path(),
+            "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"synthetic",
+            "env":{}
+        })).unwrap();
+        let secrets = std::collections::BTreeMap::from([(
+            "SYNTHETIC_CREDENTIAL".into(),
+            "synthetic-child-only-value".into(),
+        )]);
+        let prepared = prepare_terminal(terminal, &secrets, None, None)
+            .await
+            .expect("source preparation cannot dispatch the Codex app-server");
+        assert_eq!(prepared.terminal.args, ["--model", "synthetic-model"]);
+        assert!(prepared.codex.is_none());
+        assert_eq!(prepared.child_env, secrets);
+        assert!(!serde_json::to_string(&prepared.terminal)
+            .unwrap()
+            .contains("synthetic-child-only-value"));
+    }
 
     #[tokio::test]
     async fn provider_secret_inline_configuration_stays_only_in_actual_child_environment() {
