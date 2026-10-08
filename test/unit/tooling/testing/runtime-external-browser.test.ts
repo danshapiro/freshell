@@ -1522,6 +1522,10 @@ process.exit(0);\n`
     expect(result.child.status).toBe(1)
     expect(result.operations.some(row => row.args.includes('execute'))).toBe(true)
     expect(result.events.some(row => row.event === 'managed_external_job_execution')).toBe(false)
+    expect(result.events.find(row => row.event === 'managed_external_execution_image_refused')).toMatchObject({
+      observedContainerCount: 1, observedImages: ['foreign.example/image:latest'],
+      expectedImage: `us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e@sha256:${'b'.repeat(64)}`,
+    })
     expect(result.events.find(row => row.event === 'managed_external_job_cleanup')).toMatchObject({ ok: true })
   })
 
@@ -1533,6 +1537,16 @@ process.exit(0);\n`
     expect(result.operations.some(row => row.args.includes('describe') && row.args.includes('jobs'))).toBe(false)
     expect(result.events).toEqual([])
     expect(result.child.status).toBe(1)
+  })
+  it('omits a malformed image value from refusal diagnostics and still cleans its owned job', async () => {
+    const result = await launch(true, `sha256:${'b'.repeat(64)}`, undefined, 'credential-must-not-leak')
+    expect(result.child.status).toBe(1)
+    expect(result.events.find(row => row.event === 'managed_external_execution_image_refused')).toMatchObject({
+      observedContainerCount: 1, observedImages: [null],
+    })
+    expect(result.child.stdout).not.toContain('credential-must-not-leak')
+    expect(result.events.some(row => row.event === 'managed_external_job_execution')).toBe(false)
+    expect(result.events.find(row => row.event === 'managed_external_job_cleanup')).toMatchObject({ ok: true })
   })
 })
 

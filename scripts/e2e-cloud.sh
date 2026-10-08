@@ -782,11 +782,25 @@ cmd_run() {
       echo "[e2e-cloud] ERROR: observed execution differs from the exact owned job." >&2
       exit 1
     fi
-    local managed_execution_image
-    if ! managed_execution_image=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" --format=json | \
-      jq -er --arg executionName "$execution_id" --arg image "$IMAGE_REMOTE" '
+    local managed_execution_image managed_execution_json
+    if ! managed_execution_json=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" --format=json); then
+      managed_execution_json=null
+    fi
+    if ! managed_execution_image=$(jq -er --arg executionName "$execution_id" --arg image "$IMAGE_REMOTE" '
         select(.metadata.name == $executionName) | .spec.template.spec.containers
-        | select(length == 1 and .[0].image == $image) | .[0].image'); then
+        | select(length == 1 and .[0].image == $image) | .[0].image' <<< "$managed_execution_json"); then
+      jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+        --arg jobName "$RUN_JOB_NAME" --arg executionName "$execution_id" --arg expectedImage "$IMAGE_REMOTE" \
+        --argjson observed "$managed_execution_json" '
+        def name: if type == "string" and test("^[A-Za-z0-9_./-]{1,300}$") then . else null end;
+        def image: if type == "string" and test("^([a-z0-9.-]+(/[A-Za-z0-9._-]+)+(:[A-Za-z0-9._-]+|@sha256:[a-f0-9]{64})|sha256:[a-f0-9]{64})$") then . else null end;
+        ($observed | if type == "object" then . else {} end) as $object
+        | $object.spec.template.spec.containers as $containers
+        | {severity:"error", event:"managed_external_execution_image_refused", runId:$runId, candidateSha:$candidateSha,
+          jobName:$jobName, executionName:$executionName, expectedImage:$expectedImage,
+          observedName:($object.metadata.name | name),
+          observedContainerCount:(if ($containers | type) == "array" then ($containers | length) else null end),
+          observedImages:(if ($containers | type) == "array" then ($containers | map(if type == "object" then .image | image else null end)) else null end)}'
       echo "[e2e-cloud] ERROR: exact owned execution image observation is unavailable or changed." >&2
       exit 1
     fi
