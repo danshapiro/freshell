@@ -524,6 +524,8 @@ impl HostedFreshAgentProxy {
             let original = |name: &str| std::env::var(name).ok();
             let context = crate::managed_provider_references::claude::prepare_managed(
                 crate::managed_provider_references::claude::ClaudePreparation {
+                    native_source_runtime:
+                        freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
                     reservation_provider: provider.as_str(),
                     selected_settings: None,
                     client: &self.client,

@@ -343,6 +343,9 @@ mod tests {
         std::fs::write(owned.path().join(INLINE_SETTINGS_SOURCE), raw).unwrap();
         let manifest = ClaudeInputManifest {
             version: 1,
+            native_source_runtime: Some(
+                freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+            ),
             original_home: "/absent-home".into(),
             cwd: "/absent-cwd".into(),
             workspace: "/absent-cwd".into(),
@@ -438,6 +441,9 @@ mod tests {
         std::fs::create_dir(owned.path().join(".freshell")).unwrap();
         let manifest = freshell_platform::claude_inputs::ClaudeInputManifest {
             version: 1,
+            native_source_runtime: Some(
+                freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+            ),
             original_home: "/absent-original-home".into(),
             cwd: "/absent-original-workspace".into(),
             workspace: "/absent-original-workspace".into(),

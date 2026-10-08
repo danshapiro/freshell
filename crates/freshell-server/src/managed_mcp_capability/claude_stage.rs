@@ -23,6 +23,9 @@ pub(super) fn prepare(
 ) -> Result<Preparation, String> {
     let mut manifest = accepted.cloned().unwrap_or_else(|| ClaudeInputManifest {
         version: 1,
+        native_source_runtime: Some(
+            freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+        ),
         original_home: home.into(),
         cwd: cwd.into(),
         workspace: workspace.into(),
@@ -49,14 +52,13 @@ pub(super) fn prepare(
         manifest.settings_origin = Some(origin.clone());
         configurations.push((origin.clone(), origin));
     }
-    let mut bases: Vec<PathBuf> = manifest
-        .cwd
+    let native_cwd = std::fs::canonicalize(&manifest.cwd).unwrap_or_else(|_| manifest.cwd.clone());
+    let mut bases: Vec<PathBuf> = native_cwd
         .ancestors()
         .filter(|path| path.parent().is_some())
         .map(Path::to_path_buf)
         .collect();
-    bases.sort();
-    bases.dedup();
+    bases.reverse();
     let config_root = manifest.config_root();
     let user_settings = config_root.join("settings.json");
     let user_enabled = manifest
@@ -68,6 +70,26 @@ pub(super) fn prepare(
     let local_enabled = manifest
         .setting_sources
         .contains(&ClaudeSettingSource::Local);
+    let roots = if project_enabled {
+        freshell_platform::claude_inputs::git::roots(
+            &native_cwd,
+            manifest
+                .native_source_runtime
+                .ok_or("Claude native source runtime is unrecorded")?,
+        )
+        .inspect_err(|reason| {
+            tracing::warn!(
+                event = "provider.inputs.preparation.blocked",
+                provider = "claude",
+                stage = "controller",
+                operation = "select_native_git_roots",
+                reason,
+                "Claude native Git source selection could not be prepared"
+            );
+        })?
+    } else {
+        None
+    };
     if user_enabled && optional(&user_settings)? {
         configurations.push((user_settings.clone(), canonical(&user_settings)?));
     }
@@ -104,11 +126,18 @@ pub(super) fn prepare(
         }
     }
     for base in bases {
+        let excluded_project = roots.as_ref().is_some_and(|roots| {
+            use freshell_platform::claude_inputs::git::contained;
+            roots.checkout != roots.canonical
+                && contained(&roots.checkout, &roots.canonical)
+                && contained(&base, &roots.canonical)
+                && !contained(&base, &roots.checkout)
+        });
         for (enabled, relative) in [
-            (project_enabled, "CLAUDE.md"),
+            (project_enabled && !excluded_project, "CLAUDE.md"),
             (local_enabled, "CLAUDE.local.md"),
-            (project_enabled, ".claude/CLAUDE.md"),
-            (project_enabled, ".claude/rules"),
+            (project_enabled && !excluded_project, ".claude/CLAUDE.md"),
+            (project_enabled && !excluded_project, ".claude/rules"),
         ] {
             if !enabled {
                 continue;
@@ -126,13 +155,33 @@ pub(super) fn prepare(
         }
     }
     if project_enabled {
-        for base in project_resource_bases(&manifest)? {
-            for relative in RESOURCE_DIRECTORIES {
-                let logical = base.join(".claude").join(relative);
-                if optional(&logical)? {
-                    resources.push(logical);
-                }
-            }
+        for relative in RESOURCE_DIRECTORIES {
+            let directories = if matches!(*relative, "hooks" | "plugins") {
+                project_resource_bases(&manifest)?
+                    .iter()
+                    .map(|base| base.join(".claude").join(relative))
+                    .filter_map(|path| match optional(&path) {
+                        Ok(true) => Some(Ok(path)),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            } else {
+                project_resource_directories(&native_cwd, roots.as_ref(), relative).inspect_err(
+                    |reason| {
+                        tracing::warn!(
+                            event = "provider.inputs.preparation.blocked",
+                            provider = "claude",
+                            stage = "controller",
+                            operation = "select_project_resources",
+                            directory = *relative,
+                            reason,
+                            "Selected Claude project resources could not be prepared"
+                        );
+                    },
+                )?
+            };
+            resources.extend(directories);
         }
     }
     for plugin in &manifest.plugin_dirs {
@@ -154,6 +203,64 @@ pub(super) fn prepare(
         resources,
         |path| manifest.runtime_path(path),
     )
+}
+
+// The ordinary native initializer sets projectRoot to realpath(launch cwd).
+// The Markdown loader chooses fallback independently for each category;
+// requested workspace is not another source root.
+fn project_resource_directories(
+    cwd: &Path,
+    roots: Option<&freshell_platform::claude_inputs::git::Roots>,
+    relative: &str,
+) -> Result<Vec<PathBuf>, String> {
+    use freshell_platform::claude_inputs::git;
+    let mut directories = Vec::new();
+    for base in cwd.ancestors() {
+        if git::lexical(base) == Path::new("/home/freshell/provider") {
+            break;
+        }
+        let directory = base.join(".claude").join(relative);
+        if native_resource_exists(&directory)? {
+            directories.push(directory);
+        }
+        if roots.is_some_and(|roots| roots.checkout == base) {
+            break;
+        }
+    }
+    if let Some(roots) = roots {
+        if roots.checkout != roots.canonical {
+            let checkout = roots.checkout.join(".claude").join(relative);
+            if !directories.contains(&checkout) {
+                let fallback = roots.canonical.join(".claude").join(relative);
+                if !directories.contains(&fallback) && native_resource_exists(&fallback)? {
+                    directories.push(fallback);
+                }
+            }
+        }
+    }
+    Ok(directories)
+}
+fn native_resource_exists(path: &Path) -> Result<bool, String> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ENFILE) => {
+            tracing::warn!(event="provider.inputs.resource_scan.skipped",provider="claude",stage="controller",operation="stat_project_directory",path=%path.display(),cause=%error,"Native Claude resource directory scan exhausted the file table");
+            Ok(false)
+        }
+        Err(error) => Err(format!(
+            "Claude project resource discovery {} metadata failed: {error}",
+            path.display()
+        )),
+    }
 }
 
 // The native Markdown resource loader searches upward only until HOME or the
@@ -178,7 +285,7 @@ fn project_resource_bases(manifest: &ClaudeInputManifest) -> Result<Vec<PathBuf>
                 return Err(format!(
                     "Claude project resource discovery {} metadata failed: {error}",
                     base.display()
-                ))
+                ));
             }
         }
     }
@@ -329,6 +436,9 @@ mod tests {
             .unwrap();
             let manifest = ClaudeInputManifest {
                 version: 1,
+                native_source_runtime: Some(
+                    freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+                ),
                 original_home: home.clone(),
                 cwd: cwd.clone(),
                 workspace: cwd.clone(),
@@ -377,6 +487,370 @@ mod tests {
                 std::fs::read_link(unselected.join(".claude/commands")).unwrap(),
                 Path::new("missing-unselected-commands")
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_linked_resources_select_fallback_per_native_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        for (case, checkout_commands, nested_commands, checkout_agents, custom_common) in [
+            ("missing", false, false, false, false),
+            ("empty-commands", true, false, false, false),
+            ("nested-commands", false, true, false, false),
+            ("independent-agents", true, true, false, true),
+            ("empty-agents", false, false, true, false),
+        ] {
+            let owned = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+                Some(root) => tempfile::Builder::new()
+                    .prefix("claude-linked-resources-")
+                    .tempdir_in(root)
+                    .unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            let home = owned.path().join("home");
+            let main = owned.path().join("main");
+            let common = if custom_common {
+                main.clone()
+            } else {
+                main.join(".git")
+            };
+            let checkout = owned.path().join("checkout");
+            let cwd = checkout.join("nested");
+            let gitdir = common.join("worktrees/fixture");
+            for path in [&home, &cwd, &gitdir] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            std::fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", gitdir.display()),
+            )
+            .unwrap();
+            std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+            std::fs::write(
+                gitdir.join("gitdir"),
+                format!("{}\n", checkout.join(".git").display()),
+            )
+            .unwrap();
+            for category in ["commands", "agents"] {
+                let root = main.join(".claude").join(category);
+                std::fs::create_dir_all(root.join("node_modules/probe-dependency")).unwrap();
+                std::fs::write(root.join("resource"), format!("{case}-{category}")).unwrap();
+                std::fs::write(
+                    root.join("node_modules/probe-dependency/index.js"),
+                    "module.exports='installed-dependency'",
+                )
+                .unwrap();
+                let executable = root.join("run.cjs");
+                std::fs::write(&executable, "#!/usr/bin/env node\nprocess.stdout.write(require('node:fs').readFileSync(__dirname+'/resource','utf8')+':'+require('probe-dependency'))").unwrap();
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o750))
+                    .unwrap();
+            }
+            if checkout_commands {
+                std::fs::create_dir_all(checkout.join(".claude/commands")).unwrap();
+            }
+            if checkout_agents {
+                std::fs::create_dir_all(checkout.join(".claude/agents")).unwrap();
+            }
+            if nested_commands {
+                std::fs::create_dir_all(cwd.join(".claude/commands")).unwrap();
+            }
+            let manifest = ClaudeInputManifest {
+                version: 1,
+                native_source_runtime: Some(
+                    freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+                ),
+                original_home: home.clone(),
+                cwd: cwd.clone(),
+                workspace: checkout.clone(),
+                config_root: None,
+                settings_file: None,
+                settings_origin: None,
+                inline_settings_sha256: None,
+                setting_sources: vec![ClaudeSettingSource::Project],
+                plugin_dirs: vec![],
+            };
+            let selected = prepare(&home, &cwd, &checkout, Some(&manifest), &[]).unwrap();
+            let stage = owned.path().join("stage");
+            copy_environment(&selected.selections, &stage, &[], CopyLimits::default()).unwrap();
+            for (category, suppressed) in
+                [("commands", checkout_commands), ("agents", checkout_agents)]
+            {
+                let root = main.join(".claude").join(category);
+                let mount = selected
+                    .mounts
+                    .iter()
+                    .find(|mount| Path::new(&mount.logical_destination) == root);
+                assert_eq!(
+                    mount.is_none(),
+                    suppressed,
+                    "{case}: native fallback for {category}"
+                );
+                if let Some(mount) = mount {
+                    let executable = stage.join(&mount.stage_relative_path).join("run.cjs");
+                    let output = std::process::Command::new(&executable).output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{case}: selected {category} executable"
+                    );
+                    assert_eq!(
+                        output.stdout,
+                        format!("{case}-{category}:installed-dependency").as_bytes()
+                    );
+                    assert_eq!(
+                        std::fs::metadata(&executable).unwrap().permissions().mode() & 0o111,
+                        0o110
+                    );
+                }
+                assert_eq!(
+                    std::fs::read_to_string(root.join("resource")).unwrap(),
+                    format!("{case}-{category}")
+                );
+                assert_eq!(
+                    std::fs::metadata(root.join("run.cjs"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o750
+                );
+            }
+            assert_eq!(
+                selected
+                    .mounts
+                    .iter()
+                    .any(|mount| Path::new(&mount.logical_destination)
+                        == cwd.join(".claude/commands")),
+                nested_commands
+            );
+        }
+    }
+
+    #[test]
+    fn managed_provider_claude_git_lossy_source_view_limit_preserves_prior_copied_resources() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let commands = cwd.join(".claude/commands");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(commands.join("resource"), "retained-selected-resource").unwrap();
+        std::fs::write(
+            commands.join("consume.cjs"),
+            "process.stdout.write(require('node:fs').readFileSync(__dirname+'/resource'))",
+        )
+        .unwrap();
+        std::fs::write(cwd.join(".git"), "ordinary native checkout marker\n").unwrap();
+        let manifest = ClaudeInputManifest {
+            version: 1,
+            native_source_runtime: Some(freshell_platform::claude_inputs::NativeSourceRuntime::Sdk),
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            workspace: cwd.clone(),
+            config_root: None,
+            settings_file: None,
+            settings_origin: None,
+            inline_settings_sha256: None,
+            setting_sources: vec![ClaudeSettingSource::Project],
+            plugin_dirs: vec![],
+        };
+        let prior = prepare(&home, &cwd, &cwd, Some(&manifest), &[]).unwrap();
+        let stage = owned.path().join("prior-copy");
+        copy_environment(&prior.selections, &stage, &[], CopyLimits::default()).unwrap();
+        let mount = prior
+            .mounts
+            .iter()
+            .find(|mount| Path::new(&mount.logical_destination) == commands)
+            .unwrap();
+        let consume = || {
+            let output = std::process::Command::new("node")
+                .arg(stage.join(&mount.stage_relative_path).join("consume.cjs"))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"retained-selected-resource");
+        };
+        consume();
+        let mut expanded = b"gitdir: ".to_vec();
+        expanded.resize(6 * 1024 * 1024, 0xff);
+        std::fs::write(cwd.join(".git"), &expanded).unwrap();
+        let error = prepare(&home, &cwd, &cwd, Some(&manifest), &[])
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("16 MiB source-view"),
+            "UTF-8 replacement expansion must be admitted before allocating a transformed view: {error}"
+        );
+        assert!(
+            !error.contains('\u{fffd}'),
+            "the rejected source must not enter errors"
+        );
+        consume();
+        assert_eq!(std::fs::read(cwd.join(".git")).unwrap(), expanded);
+        assert_eq!(
+            std::fs::read_to_string(commands.join("resource")).unwrap(),
+            "retained-selected-resource"
+        );
+        // Native trimming may consume a complete admitted view. One extra
+        // input byte must fail without disturbing the already accepted copy.
+        let maximum = freshell_platform::provider_input_profiles::MAX_SOURCE_VIEW_BYTES as usize;
+        for (size, admitted) in [(maximum - 1, true), (maximum, true), (maximum + 1, false)] {
+            let source = vec![b' '; size];
+            std::fs::write(cwd.join(".git"), &source).unwrap();
+            let next = prepare(&home, &cwd, &cwd, Some(&manifest), &[]);
+            if admitted {
+                let next = next.unwrap();
+                let destination = owned.path().join(format!("admitted-{size}"));
+                copy_environment(&next.selections, &destination, &[], CopyLimits::default())
+                    .unwrap();
+                let mount = next
+                    .mounts
+                    .iter()
+                    .find(|mount| Path::new(&mount.logical_destination) == commands)
+                    .unwrap();
+                let output = std::process::Command::new("node")
+                    .arg(
+                        destination
+                            .join(&mount.stage_relative_path)
+                            .join("consume.cjs"),
+                    )
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"retained-selected-resource");
+            } else {
+                assert!(next.err().unwrap().contains("16 MiB source-view"));
+            }
+            consume();
+            assert_eq!(std::fs::read(cwd.join(".git")).unwrap(), source);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_nested_linked_memory_retains_local_and_excludes_main_project_imports(
+    ) {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let main = owned.path().join("main");
+        let intermediate = main.join("checkouts");
+        let checkout = intermediate.join("linked");
+        let cwd = checkout.join("nested");
+        let gitdir = main.join(".git/worktrees/linked");
+        for path in [&home, &cwd, &gitdir] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            gitdir.join("gitdir"),
+            format!("{}\n", checkout.join(".git").display()),
+        )
+        .unwrap();
+        for ancestor in [&main, &intermediate] {
+            std::fs::create_dir_all(ancestor.join(".claude/rules")).unwrap();
+            std::fs::write(ancestor.join("CLAUDE.md"), "@missing-main-project.md\n").unwrap();
+            std::fs::write(
+                ancestor.join(".claude/CLAUDE.md"),
+                "@../missing-main-dotclaude.md\n",
+            )
+            .unwrap();
+            std::fs::write(
+                ancestor.join(".claude/rules/unselected.md"),
+                "@missing-unselected-rule.md\n",
+            )
+            .unwrap();
+            std::fs::write(ancestor.join("CLAUDE.local.md"), "@local-resource.md\n").unwrap();
+            std::fs::write(
+                ancestor.join("local-resource.md"),
+                "selected-local-ancestor",
+            )
+            .unwrap();
+        }
+        std::fs::write(owned.path().join("CLAUDE.md"), "@above-main.md\n").unwrap();
+        std::fs::write(owned.path().join("above-main.md"), "selected-above-main").unwrap();
+        std::fs::write(checkout.join("CLAUDE.md"), "@checkout-resource.md\n").unwrap();
+        std::fs::write(
+            checkout.join("checkout-resource.md"),
+            "selected-checkout-project",
+        )
+        .unwrap();
+        let mut manifest = ClaudeInputManifest {
+            version: 1,
+            native_source_runtime: Some(freshell_platform::claude_inputs::NativeSourceRuntime::Sdk),
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            workspace: checkout.clone(),
+            config_root: None,
+            settings_file: None,
+            settings_origin: None,
+            inline_settings_sha256: None,
+            setting_sources: vec![ClaudeSettingSource::Project, ClaudeSettingSource::Local],
+            plugin_dirs: vec![],
+        };
+        for local_enabled in [true, false] {
+            if !local_enabled {
+                manifest.setting_sources = vec![ClaudeSettingSource::Project];
+            }
+            let selected = prepare(&home, &cwd, &checkout, Some(&manifest), &[])
+                .expect("native-excluded main project memory must not resolve its broken imports");
+            let stage = owned.path().join(if local_enabled {
+                "with-local"
+            } else {
+                "without-local"
+            });
+            copy_environment(&selected.selections, &stage, &[], CopyLimits::default()).unwrap();
+            for (path, nonce) in [
+                (owned.path().join("above-main.md"), "selected-above-main"),
+                (
+                    checkout.join("checkout-resource.md"),
+                    "selected-checkout-project",
+                ),
+            ] {
+                let mount = selected
+                    .mounts
+                    .iter()
+                    .find(|mount| Path::new(&mount.logical_destination) == path)
+                    .unwrap();
+                let output = std::process::Command::new("node")
+                    .args([
+                        "-e",
+                        "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))",
+                    ])
+                    .arg(stage.join(&mount.stage_relative_path))
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert_eq!(output.stdout, nonce.as_bytes());
+            }
+            for ancestor in [&main, &intermediate] {
+                let local = selected.mounts.iter().find(|mount| {
+                    Path::new(&mount.logical_destination) == ancestor.join("local-resource.md")
+                });
+                assert_eq!(local.is_some(), local_enabled);
+                if let Some(local) = local {
+                    let output = std::process::Command::new("node").args(["-e", "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))"]).arg(stage.join(&local.stage_relative_path)).output().unwrap();
+                    assert!(output.status.success());
+                    assert_eq!(output.stdout, b"selected-local-ancestor");
+                }
+                assert!(!selected
+                    .mounts
+                    .iter()
+                    .any(|mount| Path::new(&mount.logical_destination)
+                        == ancestor.join("CLAUDE.md")
+                        || Path::new(&mount.logical_destination)
+                            == ancestor.join(".claude/CLAUDE.md")
+                        || Path::new(&mount.logical_destination)
+                            == ancestor.join(".claude/rules")));
+                assert_eq!(
+                    std::fs::read_to_string(ancestor.join("CLAUDE.md")).unwrap(),
+                    "@missing-main-project.md\n"
+                );
+            }
         }
     }
 
@@ -454,6 +928,9 @@ mod tests {
         std::fs::write(project.join("commands/probe.mjs"), "import {readFileSync} from 'node:fs';process.stdout.write(readFileSync(new URL('./resource',import.meta.url)))").unwrap();
         let mut manifest = ClaudeInputManifest {
             version: 1,
+            native_source_runtime: Some(
+                freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+            ),
             original_home: home.clone(),
             cwd: cwd.clone(),
             workspace: cwd.clone(),

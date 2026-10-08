@@ -270,6 +270,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 };
                 let context = crate::managed_provider_references::claude::prepare_managed(
                     crate::managed_provider_references::claude::ClaudePreparation {
+                        native_source_runtime:
+                            freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
                         reservation_provider: "claude",
                         selected_settings: selected_claude_settings.as_deref(),
                         client: &self.client,

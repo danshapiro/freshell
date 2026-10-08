@@ -7,6 +7,7 @@ pub(crate) struct ClaudePreparation<'a> {
     pub client: &'a freshell_runtime_client::RuntimeClient,
     pub soul: &'a SoulId,
     pub creation_seed: &'a str,
+    pub native_source_runtime: freshell_platform::claude_inputs::NativeSourceRuntime,
     pub reservation_provider: &'a str,
     pub selected_settings: Option<&'a str>,
     pub home: &'a Path,
@@ -60,6 +61,7 @@ pub(crate) async fn prepare_managed(
     }
     let manifest = freshell_platform::claude_inputs::ClaudeInputManifest {
         version: 1,
+        native_source_runtime: Some(request.native_source_runtime),
         original_home: request.home.into(),
         cwd: request.cwd.into(),
         workspace: request.workspace.into(),

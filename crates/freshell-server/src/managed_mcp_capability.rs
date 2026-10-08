@@ -34,6 +34,9 @@ mod claude_stage;
 mod ordinary_stage;
 mod source_stage;
 
+#[cfg(all(test, unix, feature = "managed-provider-qualification"))]
+pub(crate) use tests::qualify_claude_linked_sources;
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct OpencodeEphemeralInput<'a> {
     pub codex_manifest: Option<&'a freshell_platform::codex_inputs::CodexInputManifest>,
@@ -3360,6 +3363,9 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         std::fs::write(selected.join("commands/probe.mjs"), "import {readFileSync} from 'node:fs';process.stdout.write(readFileSync(new URL('./resource',import.meta.url)))").unwrap();
         let manifest = ClaudeInputManifest {
             version: 1,
+            native_source_runtime: Some(
+                freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+            ),
             original_home: home.clone(),
             cwd: cwd.clone(),
             workspace: cwd.clone(),
@@ -3447,6 +3453,9 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         std::os::unix::fs::symlink(&selected, &alias).unwrap();
         let manifest = ClaudeInputManifest {
             version: 1,
+            native_source_runtime: Some(
+                freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+            ),
             original_home: home.clone(),
             cwd: cwd.clone(),
             workspace: cwd.clone(),
@@ -3593,6 +3602,9 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         };
         let mut manifest = ClaudeInputManifest {
             version: 1,
+            native_source_runtime: Some(
+                freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+            ),
             original_home: home.clone(),
             cwd: cwd.clone(),
             workspace: cwd.clone(),
@@ -4454,6 +4466,243 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         assert!(staged_provider_root_path(&directory, &prior.grant_id)
             .unwrap()
             .is_dir());
+    }
+
+    #[cfg(feature = "managed-provider-qualification")]
+    pub(crate) async fn qualify_claude_linked_sources(base: &Path) {
+        use freshell_platform::{
+            claude_inputs::{ClaudeInputManifest, ClaudeSettingSource, NativeSourceRuntime},
+            provider_environment::{copy_environment, CopyLimits, CopySelection},
+        };
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let script = base.join("linked-catalog-probe.mjs");
+        std::fs::write(
+            &script,
+            include_str!("managed_provider_claude_catalog_probe.mjs"),
+        )
+        .unwrap();
+        for (
+            case,
+            empty_checkout,
+            nested_commands,
+            custom_common,
+            broken_backlink,
+            pointer_symlink,
+        ) in [
+            ("missing", false, false, false, false, false),
+            ("empty-checkout", true, false, false, false, false),
+            ("nested", false, true, false, false, false),
+            ("custom-common", false, false, true, false, false),
+            ("wrong-backlink", false, true, false, true, false),
+            ("pointer-symlink", false, true, false, false, true),
+        ] {
+            let fixture = base.join("linked-sources").join(case);
+            let home = fixture.join("source-home");
+            let main = fixture.join("main");
+            let common = if custom_common {
+                main.clone()
+            } else {
+                main.join(".git")
+            };
+            let checkout = fixture.join("checkout");
+            let cwd = checkout.join("nested");
+            let gitdir = common.join("worktrees/fixture");
+            for directory in [&home, &cwd, &gitdir] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            std::fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", gitdir.display()),
+            )
+            .unwrap();
+            std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+            std::fs::write(
+                gitdir.join("gitdir"),
+                format!("{}\n", checkout.join(".git").display()),
+            )
+            .unwrap();
+            if broken_backlink {
+                let other = fixture.join("other-checkout");
+                std::fs::create_dir(&other).unwrap();
+                std::fs::write(other.join(".git"), "unrelated").unwrap();
+                std::fs::write(
+                    gitdir.join("gitdir"),
+                    format!("{}\n", other.join(".git").display()),
+                )
+                .unwrap();
+            }
+            if pointer_symlink {
+                std::fs::rename(gitdir.join("commondir"), gitdir.join("ordinary-pointer")).unwrap();
+                symlink("ordinary-pointer", gitdir.join("commondir")).unwrap();
+            }
+            let main_commands = main.join(".claude/commands");
+            let main_name = format!("selected-main-{case}");
+            std::fs::create_dir_all(main_commands.join("node_modules/probe-dependency")).unwrap();
+            std::fs::write(main_commands.join(format!("{main_name}.md")), format!("---\ndescription: {case} native source nonce\n---\nComplete selected command resource.\n")).unwrap();
+            std::fs::write(main_commands.join("resource"), format!("{case}-resource")).unwrap();
+            std::fs::write(
+                main_commands.join("node_modules/probe-dependency/index.js"),
+                "module.exports='installed-dependency'",
+            )
+            .unwrap();
+            std::fs::write(main_commands.join("run.cjs"), "#!/usr/bin/env node\nprocess.stdout.write(require('node:fs').readFileSync(__dirname+'/resource','utf8')+':'+require('probe-dependency'))").unwrap();
+            std::fs::set_permissions(
+                main_commands.join("run.cjs"),
+                std::fs::Permissions::from_mode(0o750),
+            )
+            .unwrap();
+            if empty_checkout {
+                std::fs::create_dir_all(checkout.join(".claude/commands")).unwrap();
+            }
+            let nested_name = format!("selected-nested-{case}");
+            if nested_commands {
+                std::fs::create_dir_all(cwd.join(".claude/commands")).unwrap();
+                std::fs::write(
+                    cwd.join(".claude/commands")
+                        .join(format!("{nested_name}.md")),
+                    "---\ndescription: Nested native source nonce\n---\nNested command.\n",
+                )
+                .unwrap();
+            }
+            let manifest = ClaudeInputManifest {
+                version: 1,
+                native_source_runtime: Some(NativeSourceRuntime::Sdk),
+                original_home: home.clone(),
+                cwd: cwd.clone(),
+                workspace: checkout.clone(),
+                config_root: None,
+                settings_file: None,
+                settings_origin: None,
+                inline_settings_sha256: None,
+                setting_sources: vec![ClaudeSettingSource::Project],
+                plugin_dirs: vec![],
+            };
+            let selected =
+                claude_stage::prepare(&home, &cwd, &checkout, Some(&manifest), &[]).unwrap();
+            let stage = fixture.join("controller-copy");
+            copy_environment(&selected.selections, &stage, &[], CopyLimits::default()).unwrap();
+            let host_copy = fixture.join("host-copy");
+            let host_sources = selected
+                .mounts
+                .iter()
+                .map(|mount| CopySelection {
+                    source: stage.join(&mount.stage_relative_path),
+                    destination_relative: mount.provider_relative_path.clone().into(),
+                })
+                .collect::<Vec<_>>();
+            copy_environment(&host_sources, &host_copy, &[], CopyLimits::default()).unwrap();
+            let mut originals = Vec::new();
+            for mount in &selected.mounts {
+                let logical = Path::new(&mount.logical_destination);
+                assert!(
+                    logical.starts_with(&fixture),
+                    "native catalog qualifier selects only its fixture"
+                );
+                let archive = logical.with_file_name(format!(
+                    "{}-original",
+                    logical.file_name().unwrap().to_str().unwrap()
+                ));
+                std::fs::rename(logical, &archive).unwrap();
+                copy_environment(
+                    &[CopySelection {
+                        source: host_copy.join(&mount.provider_relative_path),
+                        destination_relative: logical.file_name().unwrap().into(),
+                    }],
+                    logical.parent().unwrap(),
+                    &[],
+                    CopyLimits::default(),
+                )
+                .unwrap();
+                originals.push((logical.to_path_buf(), archive));
+            }
+            let expected_main = !empty_checkout && !broken_backlink && !pointer_symlink;
+            if expected_main {
+                let output = std::process::Command::new(main_commands.join("run.cjs"))
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert_eq!(
+                    output.stdout,
+                    format!("{case}-resource:installed-dependency").as_bytes()
+                );
+                assert_eq!(
+                    std::fs::metadata(main_commands.join("run.cjs"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o111,
+                    0o110
+                );
+            }
+            let mut child = tokio::process::Command::new("node")
+                .arg(&script)
+                .arg(&cwd)
+                .arg(&main_name)
+                .arg(&nested_name)
+                .current_dir(&cwd)
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("HOME", "/home/freshell/provider")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(25), stdout.next_line()).await;
+            // No native worker may overlap the next case or original restoration.
+            stop_codex_source_child(&mut child).await;
+            let line = received
+                .expect("bounded genuine native supportedCommands response")
+                .unwrap()
+                .expect("native catalog receipt");
+            let receipt: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                receipt["failed"], false,
+                "classified model-free catalog failed for {case}"
+            );
+            assert_eq!(receipt["uid"], 65534);
+            assert_eq!(receipt["gid"], 0);
+            assert_eq!(receipt["defaultChild"], true);
+            assert_eq!(receipt["zeroPrompts"], true);
+            assert_eq!(
+                receipt["mainSelected"], expected_main,
+                "native main catalog selection {case}"
+            );
+            assert_eq!(
+                receipt["nestedSelected"], nested_commands,
+                "native nested catalog selection {case}"
+            );
+            for (logical, archive) in originals {
+                assert!(logical.starts_with(&fixture));
+                if logical.is_dir() {
+                    std::fs::remove_dir_all(&logical).unwrap();
+                } else {
+                    std::fs::remove_file(&logical).unwrap();
+                }
+                std::fs::rename(archive, logical).unwrap();
+            }
+            assert_eq!(
+                std::fs::read_to_string(main_commands.join("resource")).unwrap(),
+                format!("{case}-resource")
+            );
+            assert_eq!(
+                std::fs::metadata(main_commands.join("run.cjs"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o750
+            );
+            println!(
+                "provider_source_selection {}",
+                serde_json::json!({"provider":"claude","case":case,"uid":65534,"gid":0,"ownedGroupJoined":true,"digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&receipt).unwrap()))})
+            );
+        }
     }
 
     #[cfg(feature = "managed-provider-qualification")]
@@ -5514,6 +5763,9 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         };
         let manifest = freshell_platform::claude_inputs::ClaudeInputManifest {
             version: 1,
+            native_source_runtime: Some(
+                freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+            ),
             original_home: home.clone(),
             cwd: workspace.clone(),
             workspace: workspace.clone(),

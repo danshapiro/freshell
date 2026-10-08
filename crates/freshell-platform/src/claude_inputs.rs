@@ -2,6 +2,15 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod git;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSourceRuntime {
+    Terminal,
+    Sdk,
+}
+
 /// Durable argv names this owned selection; its source and declaring origin
 /// are recorded in the private accepted manifest, never as raw settings JSON.
 pub const MANAGED_SETTINGS_ARGUMENT: &str = ".freshell/claude-selected-settings";
@@ -73,6 +82,8 @@ pub fn selected_settings_argument(args: &[String]) -> Option<&str> {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaudeInputManifest {
     pub version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_source_runtime: Option<NativeSourceRuntime>,
     pub original_home: PathBuf,
     pub cwd: PathBuf,
     pub workspace: PathBuf,
@@ -140,6 +151,9 @@ pub fn default_setting_sources() -> Vec<ClaudeSettingSource> {
 }
 impl ClaudeInputManifest {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.native_source_runtime.is_none() {
+            return Err("Claude native source runtime is unrecorded; retain inputs and reprepare before dispatch");
+        }
         if self.version != 1
             || (self.settings_origin.is_some() && self.settings_file.is_none())
             || self.inline_settings_sha256.as_ref().is_some_and(|digest| {

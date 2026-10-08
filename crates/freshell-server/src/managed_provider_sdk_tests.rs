@@ -1,8 +1,8 @@
 //! Genuine default SDK startup qualification in the closed provider sandbox.
 use sha2::{Digest, Sha256};
 
-#[test]
-fn managed_provider_claude_default_sdk_initializes_fixed_mcp_without_a_prompt() {
+#[tokio::test]
+async fn managed_provider_claude_default_sdk_initializes_fixed_mcp_without_a_prompt() {
     let root = std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR")
         .expect("native SDK qualification requires its owned executable sandbox");
     let fixture = tempfile::Builder::new()
@@ -57,4 +57,5 @@ fn managed_provider_claude_default_sdk_initializes_fixed_mcp_without_a_prompt() 
             "digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&receipt).unwrap())),
         })
     );
+    crate::managed_mcp_capability::qualify_claude_linked_sources(fixture.path()).await;
 }
