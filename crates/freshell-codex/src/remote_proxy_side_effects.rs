@@ -34,6 +34,7 @@ pub enum SideEffectError {
     EphemeralThread,
     IdNotPendingFork,
     IdNotPendingThreadStart,
+    IdNotPendingThreadResume,
     MalformedJson,
     MissingParentThreadId,
     MissingRolloutPath,
@@ -71,6 +72,7 @@ pub struct CandidateThread {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateSource {
     ThreadStartResponse,
+    ThreadResumeResponse,
     ThreadStartedNotification,
     ThreadForkResponse,
 }
@@ -357,19 +359,50 @@ pub fn extract_thread_start_response_candidate(
     raw: &[u8],
     options: &ThreadStartResponseOptions<'_>,
 ) -> SideEffectResult<RemoteProxyCandidate> {
+    extract_correlated_thread_response_candidate(
+        raw,
+        options.pending_thread_start_request_ids,
+        CandidateSource::ThreadStartResponse,
+        SideEffectError::IdNotPendingThreadStart,
+    )
+}
+
+/// A successful response to this connection's pending native `thread/resume`.
+/// The returned thread, never the requested ID, supplies the candidate.
+pub fn extract_thread_resume_response_candidate(
+    raw: &[u8],
+    pending_thread_resume_request_ids: &std::collections::HashSet<crate::protocol::RequestId>,
+) -> SideEffectResult<RemoteProxyCandidate> {
+    extract_correlated_thread_response_candidate(
+        raw,
+        pending_thread_resume_request_ids,
+        CandidateSource::ThreadResumeResponse,
+        SideEffectError::IdNotPendingThreadResume,
+    )
+}
+
+fn extract_correlated_thread_response_candidate(
+    raw: &[u8],
+    pending: &std::collections::HashSet<crate::protocol::RequestId>,
+    source: CandidateSource,
+    unmatched_id: SideEffectError,
+) -> SideEffectResult<RemoteProxyCandidate> {
     let root = scan_root_object(raw)?;
     if has_any_duplicate_key(&root.entries, &["id", "result"]) {
         return Err(SideEffectError::UnsafeDuplicateKey);
     }
-
     let id = extract_top_level_id(raw, &root.entries)?;
-    if !options.pending_thread_start_request_ids.contains(&id) {
-        return Err(SideEffectError::IdNotPendingThreadStart);
+    if !pending.contains(&id) {
+        return Err(unmatched_id);
     }
-
+    if source == CandidateSource::ThreadResumeResponse
+        && find_entry(&root.entries, "error").is_some()
+    {
+        return Err(SideEffectError::UnsupportedShape);
+    }
     let extracted = extract_result_thread(raw, &root.entries)?;
     Ok(RemoteProxyCandidate {
-        source: CandidateSource::ThreadStartResponse,
+        source,
         thread: extracted.thread,
     })
 }
@@ -1102,6 +1135,27 @@ mod tests {
         assert_eq!(extracted.thread.id, "thread-start");
         assert_eq!(extracted.thread.path.as_deref(), Some(ROLLOUT_PATH));
         assert!(!extracted.thread.ephemeral);
+    }
+
+    #[test]
+    fn native_resume_response_uses_only_correlated_actual_result_with_truthful_provenance() {
+        let pending = HashSet::from([RequestId::Int(7)]);
+        let candidate = extract_thread_resume_response_candidate(
+            br#"{"id":7,"result":{"thread":{"id":"loaded-root","ephemeral":false}}}"#,
+            &pending,
+        )
+        .unwrap();
+        assert_eq!(candidate.source, CandidateSource::ThreadResumeResponse);
+        assert_eq!(candidate.thread.id, "loaded-root");
+        for raw in [
+            br#"{"id":8,"result":{"thread":{"id":"foreign-root"}}}"#.as_slice(),
+            br#"{"id":7,"id":8,"result":{"thread":{"id":"duplicate-root"}}}"#.as_slice(),
+            br#"{"id":7,"error":{"code":-1},"result":{"thread":{"id":"failed-root"}}}"#.as_slice(),
+            br#"{"id":7,"result":{"thread":{"id":""}}}"#.as_slice(),
+            br#"{"id":7,"result":{"thread":{"id":42}}}"#.as_slice(),
+        ] {
+            assert!(extract_thread_resume_response_candidate(raw, &pending).is_err());
+        }
     }
 
     #[test]
