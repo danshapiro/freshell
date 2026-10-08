@@ -274,6 +274,101 @@ function authHelperBody(): any {
   return body
 }
 
+const sourceName = 'freshell-claude-source-11111111-1111-4111-8111-111111111111'
+function sourceAuthorization() {
+  const installationId = 'installation-one', soulId = 'soul-initial'
+  return {
+    installationId, soulId,
+    providerVolumeName: `freshell-provider-${createHash('sha256').update(`${installationId}\0${soulId}`).digest('hex').slice(0, 24)}`,
+    imageRef: 'sha256:fixture-image', hostBinaryPath: '/tmp/owned/freshell-session-host',
+    binarySha256: 'a'.repeat(64), daemonId: 'fixture-daemon',
+  }
+}
+function sourceHelperBody(): any {
+  const owner = sourceAuthorization()
+  return {
+    Image: owner.imageRef, User: '65534:0', Tty: false, WorkingDir: '/workspace/nested',
+    Entrypoint: ['/runtime/freshell-session-host'], Cmd: ['observe-claude-sources-private'],
+    Env: ['PATH=', 'HOME=/home/freshell/provider'],
+    Labels: {
+      'com.freshell.installation-id': owner.installationId,
+      'com.freshell.soul-id': owner.soulId,
+      'com.freshell.runtime-test-run-id': 'run-one',
+      'com.freshell.source-request-id': '22222222-2222-4222-8222-222222222222',
+      'com.freshell.source-binary-sha256': owner.binarySha256,
+    },
+    HostConfig: {
+      NetworkMode: 'none', ReadonlyRootfs: true, CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges'],
+      Memory: 256 * 1024 * 1024, MemorySwap: 256 * 1024 * 1024, NanoCpus: 500_000_000, PidsLimit: 32,
+      LogConfig: { Type: 'none', Config: {} },
+      Tmpfs: { '/home/freshell/provider': 'rw,nosuid,nodev,noexec,size=16m,uid=65534,gid=0,mode=0700' },
+      Mounts: [
+        { Type: 'bind', Source: owner.hostBinaryPath, Target: '/runtime/freshell-session-host', ReadOnly: true },
+        { Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true },
+        { Type: 'bind', Source: '/tmp/freshell-inputs-33333333-3333-4333-8333-333333333333', Target: '/run/freshell-source-exchange', ReadOnly: true },
+      ],
+    },
+  }
+}
+
+describe('scoped Claude source observer broker', () => {
+  it('allows the reserved fixed reader and exact private lifecycle without creating initial HOME or exposing logs', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      const body = sourceHelperBody()
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, body)).status).toBe(403)
+      expect(forwarded).toHaveLength(0)
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      for (const mutate of [
+        (value: any) => { value.User = '0:0' },
+        (value: any) => { value.Cmd.push('PRIVATE_SOURCE_SENTINEL') },
+        (value: any) => { value.Env.push('SECRET=PRIVATE_SOURCE_SENTINEL') },
+        (value: any) => { value.WorkingDir = '/outside' },
+        (value: any) => { value.Labels['com.freshell.soul-id'] = 'foreign' },
+        (value: any) => { value.Labels['com.freshell.source-binary-sha256'] = 'b'.repeat(64) },
+        (value: any) => { value.HostConfig.CapAdd = ['SYS_ADMIN'] },
+        (value: any) => { value.HostConfig.NetworkMode = 'host' },
+        (value: any) => { value.HostConfig.Tmpfs['/home/freshell/provider'] = 'rw,size=128m' },
+        (value: any) => { value.HostConfig.Mounts[1].ReadOnly = false },
+        (value: any) => { value.HostConfig.Mounts.push({ Type: 'bind', Source: '/operator-home', Target: '/outside', ReadOnly: true }) },
+        (value: any) => { value.HostConfig.LogConfig.Type = 'json-file' },
+      ]) {
+        const changed = structuredClone(body); mutate(changed)
+        expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, changed)).status).toBe(403)
+        expect(forwarded).toHaveLength(0)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, body)).status).toBe(201)
+      expect(instance.receiptIds().has(helperId)).toBe(true)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(200)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      const before = forwarded.length
+      for (const [method, url] of [
+        ['GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=1`],
+        ['POST', `/v1.47/containers/${helperId}/stop`],
+        ['POST', `/v1.47/containers/${sourceName}/start`],
+        ['POST', `/v1.47/containers/${helperId}/exec`],
+      ]) {
+        expect((await request(method, url)).status).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('DELETE', `/v1.47/containers/${sourceName}?force=1`)).status).toBe(204)
+      expect(forwarded.some((operation) => operation.url === '/v1.47/volumes/create')).toBe(false)
+      expect(JSON.stringify(instance.eventsSnapshot())).not.toContain('PRIVATE_SOURCE_SENTINEL')
+    })
+  })
+  it('retains exact-name cleanup after lost acknowledgement and refuses changed source helper ownership', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance, loseHelperAck, replaceHelperInspection }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      loseHelperAck()
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, sourceHelperBody())).status).toBe(503)
+      expect((await request('GET', `/v1.47/containers/${sourceName}/json`)).status).toBe(200)
+      replaceHelperInspection()
+      expect((await request('DELETE', `/v1.47/containers/${sourceName}?force=1`)).status).toBe(403)
+      expect(forwarded.filter((operation) => operation.method === 'DELETE')).toEqual([])
+    })
+  })
+})
+
 describe('receipt-owned auth exchange HTTP routes', () => {
   it('allows only the fixed private helper, lifecycle and ownership inspection with Docker logs disabled', async () => {
     await withHttpBroker(async ({ request, forwarded }) => {
@@ -475,8 +570,9 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     if (req.method==='GET' && req.url?.startsWith('/v1.47/volumes/freshell-inputs-') && indexedVolumeMetadata) {
       res.statusCode=200;res.end(JSON.stringify(indexedVolumeMetadata));return;
     }
-    if (req.method==='GET' && req.url?.includes('-publisher/json')) {
-      const config=forwarded.findLast((request)=>request.url.includes('/containers/create?') && request.body?.Cmd?.[0]==='publish-provider-inputs')!.body;
+    if (req.method==='GET' && (req.url?.includes('-publisher/json') || req.url?.includes('/freshell-claude-source-'))) {
+      const command=req.url?.includes('/freshell-claude-source-')?'observe-claude-sources-private':'publish-provider-inputs';
+      const config=forwarded.findLast((request)=>request.url.includes('/containers/create?') && request.body?.Cmd?.[0]===command)!.body;
       const inspected=structuredClone(config);
       inspected.Labels['org.opencontainers.image.version']='24.04';
       for (const mount of inspected.HostConfig.Mounts) if (mount.ReadOnly===false) delete mount.ReadOnly;

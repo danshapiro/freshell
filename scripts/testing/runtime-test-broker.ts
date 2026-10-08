@@ -169,6 +169,7 @@ export class RestrictedDockerBroker {
   private readonly knownContainerIds = new Set<string>()
   private readonly receiptsById = new Map<string, BrokerReceipt>()
   private readonly historyHelpers = new Map<string, { owner: BrokerReceipt; containerId?: string; kind: 'history' | 'auth' }>()
+  private readonly claudeSourceHelpers = new Map<string, { expected: Record<string, any>; containerId?: string }>()
   private readonly events: BrokerEvent[] = []
   private server?: http.Server
   private stopFailuresRemaining = 0
@@ -249,7 +250,7 @@ export class RestrictedDockerBroker {
   }
 
   receiptIds(): Set<string> {
-    return new Set([...this.knownContainerIds, ...[...this.historyHelpers.values(),...this.inputPublishers.values()].flatMap((helper) => helper.containerId ? [helper.containerId] : [])])
+    return new Set([...this.knownContainerIds, ...[...this.historyHelpers.values(),...this.inputPublishers.values(),...this.claudeSourceHelpers.values()].flatMap((helper) => helper.containerId ? [helper.containerId] : [])])
   }
 
   eventsSnapshot(): BrokerEvent[] {
@@ -375,6 +376,33 @@ export class RestrictedDockerBroker {
     }
 
     const helperTarget = url.match(/^\/v1\.47\/containers\/([^/?]+)(?:\/(start|wait|logs|json))?(?:\?.*)?$/)
+    const sourceEntry = helperTarget && [...this.claudeSourceHelpers].find(([name, helper]) => (
+      helperTarget[1] === name || helperTarget[1] === helper.containerId
+    ))
+    if (sourceEntry) {
+      const [name, helper] = sourceEntry
+      const targetName = helperTarget![1]
+      const exactId = targetName === helper.containerId
+      const deleting = method === 'DELETE' && url === `${DOCKER_API_PREFIX}/containers/${targetName}?force=1`
+      if (deleting) {
+        const inspected = await this.forward({ method: 'GET', url: `${DOCKER_API_PREFIX}/containers/${targetName}/json`, headers: {} } as IncomingMessage, Buffer.alloc(0))
+        let actual: Record<string, any> = {}
+        try { actual = JSON.parse(inspected.body.toString()) } catch {}
+        if (inspected.statusCode !== 404 && (inspected.statusCode !== 200 || !this.ownedClaudeSourceHelper(actual, helper.expected))) {
+          this.block(response, method, url, 403, 'Claude source helper cleanup ownership changed', true)
+          return
+        }
+      }
+      if (deleting
+        || (method === 'GET' && url === `${DOCKER_API_PREFIX}/containers/${targetName}/json`)
+        || (method === 'POST' && exactId && [
+          `${DOCKER_API_PREFIX}/containers/${targetName}/start`,
+          `${DOCKER_API_PREFIX}/containers/${targetName}/wait?condition=not-running`,
+        ].includes(url))) {
+        await this.forwardAndReply(request, response, body, { destructive: method !== 'GET', containerId: helper.containerId, helperName: name })
+        return
+      }
+    }
     const publisher=helperTarget && [...this.inputPublishers].find(([name,publisher])=>helperTarget[1]===name || helperTarget[1]===publisher.containerId)
     if (publisher) {
       const [name,owned]=publisher
@@ -430,6 +458,30 @@ export class RestrictedDockerBroker {
 
     if (method === 'POST' && url.startsWith(`${DOCKER_API_PREFIX}/containers/create?`)) {
       const name = new URL(url, 'http://docker').searchParams.get('name') ?? ''
+      if (name.startsWith('freshell-claude-source-')) {
+        if (!/^freshell-claude-source-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(name)
+          || !this.validateClaudeSourceHelper(body) || this.claudeSourceHelpers.has(name)) {
+          this.block(response, method, url, 403, 'Claude source helper must match its exact owned fixed reader', false)
+          return
+        }
+        const helper: { expected: Record<string, any>; containerId?: string } = { expected: JSON.parse(body.toString()) }
+        this.claudeSourceHelpers.set(name, helper)
+        try {
+          const forwarded = await this.forward(request, body)
+          if (forwarded.statusCode === 201) {
+            const parsed = JSON.parse(forwarded.body.toString())
+            if (typeof parsed.Id !== 'string' || !/^[a-f0-9]{64}$/.test(parsed.Id) || this.receiptIds().has(parsed.Id)) throw new Error('invalid Claude source helper identity')
+            helper.containerId = parsed.Id
+          }
+          this.record({ method, url, decision: 'forward', destructive: false, unsafeAttempt: false, helperName: name, containerId: helper.containerId, requestDigest: sha256(body) })
+          replyDocker(response, forwarded)
+        } catch {
+          this.record({ method, url, decision: 'forward', reason: 'Claude source helper acknowledgement unavailable', destructive: false, unsafeAttempt: false, helperName: name, requestDigest: sha256(body) })
+          response.statusCode = 503
+          response.end(JSON.stringify({ message: 'Claude source helper acknowledgement unavailable; exact named ownership inspection required' }))
+        }
+        return
+      }
       const mountpointHelper=/^freshell-mountpoints-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(name)
       if (/^freshell-inputs-[a-f0-9]{24}-publisher$/.test(name) || mountpointHelper) {
         const input=mountpointHelper ? this.validateMountpointHelper(body) : this.validateInputPublisher(name,body)
@@ -689,6 +741,59 @@ export class RestrictedDockerBroker {
       && input.hostBinaryPath === hostBinaryPath && input.providerVolumeName === providerVolumeName);
     if ((host.Mounts?.length || prepared.length) && !prepared.some((input)=>preparedMountsMatch(host.Mounts ?? [],input))) return { ok: false, reason: 'typed mounts differ from this attempt owned prepared input set' }
     return { ok: true, incarnationId, soulId, imageRef, runtimeDir, hostBinaryPath, ...(providerVolumeName ? { providerVolumeName } : {}), ...(workspacePath ? { workspacePath } : {}) }
+  }
+
+  private validateClaudeSourceHelper(body: Buffer): boolean {
+    let parsed: Record<string, any>
+    try { parsed = JSON.parse(body.toString()) } catch { return false }
+    const labels = parsed.Labels ?? {}
+    const owner = [...this.initialProviderVolumes.values()].find((input) => input.installationId === labels['com.freshell.installation-id']
+      && input.soulId === labels['com.freshell.soul-id'] && input.imageRef === parsed.Image
+      && input.binarySha256 === labels['com.freshell.source-binary-sha256'])
+    if (!owner || parsed.User !== '65534:0' || parsed.Tty !== false
+      || JSON.stringify(parsed.Entrypoint) !== JSON.stringify(['/runtime/freshell-session-host'])
+      || JSON.stringify(parsed.Cmd) !== JSON.stringify(['observe-claude-sources-private'])
+      || !privateHelperEnvironment(parsed.Env, true)
+      || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(labels['com.freshell.source-request-id'])
+      || !equalRecord(labels, {
+        'com.freshell.installation-id': owner.installationId, 'com.freshell.soul-id': owner.soulId,
+        'com.freshell.runtime-test-run-id': this.policy.testRunId,
+        'com.freshell.source-request-id': labels['com.freshell.source-request-id'],
+        'com.freshell.source-binary-sha256': owner.binarySha256,
+      })) return false
+    const host = parsed.HostConfig ?? {}
+    if (Object.keys(parsed).some((key) => !['Image','User','Tty','WorkingDir','Labels','Entrypoint','Cmd','Env','HostConfig'].includes(key))
+      || Object.keys(host).some((key) => !['NetworkMode','ReadonlyRootfs','CapDrop','SecurityOpt','Memory','MemorySwap','NanoCpus','PidsLimit','LogConfig','Tmpfs','Mounts'].includes(key))
+      || host.NetworkMode !== 'none' || host.ReadonlyRootfs !== true
+      || JSON.stringify(host.CapDrop) !== JSON.stringify(['ALL']) || JSON.stringify(host.SecurityOpt) !== JSON.stringify(['no-new-privileges'])
+      || host.Memory !== 256 * 1024 * 1024 || host.MemorySwap !== 256 * 1024 * 1024 || host.NanoCpus !== 500_000_000 || host.PidsLimit !== 32
+      || !equalRecord(host.LogConfig, { Type: 'none', Config: host.LogConfig?.Config }) || Object.keys(host.LogConfig?.Config ?? {}).length
+      || !equalRecord(host.Tmpfs, { '/home/freshell/provider': 'rw,nosuid,nodev,noexec,size=16m,uid=65534,gid=0,mode=0700' })) return false
+    const mounts = host.Mounts
+    if (!Array.isArray(mounts) || mounts.length !== 3
+      || mounts.some((mount) => !mount || Object.keys(mount).some((key) => !['Type','Source','Target','ReadOnly'].includes(key)))) return false
+    const binary = mounts.find((mount) => mount.Type === 'bind' && mount.Source === owner.hostBinaryPath && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
+    const workspace = mounts.find((mount) => mount.Type === 'bind' && mount.Source === mount.Target && this.policy.allowedWorkspaceRoots?.has(mount.Source) && mount.ReadOnly === true)
+    const exchange = mounts.find((mount) => mount.Type === 'bind' && mount.Target === '/run/freshell-source-exchange' && mount.ReadOnly === true
+      && typeof mount.Source === 'string' && path.dirname(mount.Source) === os.tmpdir()
+      && /^freshell-inputs-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(path.basename(mount.Source)))
+    return !!binary && !!workspace && !!exchange && typeof parsed.WorkingDir === 'string'
+      && path.normalize(parsed.WorkingDir) === parsed.WorkingDir
+      && (parsed.WorkingDir === workspace.Source || isStrictDescendant(parsed.WorkingDir, workspace.Source))
+  }
+
+  private ownedClaudeSourceHelper(actual: Record<string, any>, expected: Record<string, any>): boolean {
+    const config = actual.Config ?? {}, host = actual.HostConfig ?? {}
+    const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
+    return ['Image','User','Tty','WorkingDir'].every((key) => config[key] === expected[key])
+      && ['Entrypoint','Cmd'].every((key) => same(config[key], expected[key]))
+      && ownedHelperLabels(config.Labels, expected.Labels)
+      && Array.isArray(config.Env) && same([...config.Env].sort(), [...expected.Env].sort())
+      && ['NetworkMode','ReadonlyRootfs','CapDrop','SecurityOpt','Memory','MemorySwap','NanoCpus','PidsLimit','Tmpfs'].every((key) => same(host[key], expected.HostConfig[key]))
+      && (host.CapAdd?.length ?? 0) === 0 && host.LogConfig?.Type === 'none'
+      && Array.isArray(host.Mounts) && host.Mounts.length === expected.HostConfig.Mounts.length
+      && expected.HostConfig.Mounts.every((wanted: Record<string, any>) => host.Mounts.some((mount: Record<string, any>) =>
+        ['Type','Source','Target','ReadOnly'].every((key) => mount[key] === wanted[key]) && !mount.VolumeOptions))
   }
 
   private validateInputPublisher(name:string,body:Buffer):PreparedInputAuthorization | undefined {
