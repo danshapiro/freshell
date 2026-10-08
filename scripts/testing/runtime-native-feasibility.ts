@@ -691,7 +691,9 @@ async function executeManagedReceiverCreate(harness: RuntimeHarness,
   })
   const workspace = path.join(harness.testRoot, `${scenario}-workspace`)
   fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
-  const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release' })
+  const sourceHome = path.join(harness.testRoot, 'native-source', provider, scenario)
+  fs.mkdirSync(path.join(sourceHome, provider === 'codex' ? '.codex' : '.config/opencode'), { recursive: true, mode: 0o700 })
+  const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release', env: { HOME: sourceHome } })
   const storeId = 'store-' + randomUUID(), soulId = 'soul-' + randomUUID()
   const request = { method: 'launch', params: { soulId, provider, providerStoreId: storeId,
     creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: scenario,

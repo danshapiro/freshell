@@ -51,7 +51,12 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64), nativeRoot: root, activeNativeProcesses: 1 })
     })
     const records = new Map<string, unknown>()
-    const harness = { testRoot: directory, runId: ownerId, candidateSha, imageRef: imageDigest, startSupervisor: async () => ({}),
+    const start = vi.fn(async (options: any) => {
+      expect(options.env.HOME).toBe(path.join(directory, 'native-source', provider, `${mode}-create`))
+      expect(fs.statSync(path.join(options.env.HOME, provider === 'codex' ? '.codex' : '.config/opencode')).isDirectory()).toBe(true)
+      return {}
+    })
+    const harness = { testRoot: directory, runId: ownerId, candidateSha, imageRef: imageDigest, startSupervisor: start,
       adminOk: launch, execOwnedContainerAsExact: capture, writeArtifact: (name: string, value: unknown) => records.set(name, value) } as unknown as RuntimeHarness
     try {
       const run = executeManagedNativeCase(harness, sources, { mode: mode as 'freshcodex' | 'freshopencode', case: 'startup' }, 'create')
