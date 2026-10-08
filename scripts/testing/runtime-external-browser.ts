@@ -875,6 +875,11 @@ export class ExternalManagedRuntimeRig {
   async terminalWebCycleCompleted(enclosure: RuntimeEnclosureHandle, challengeId: string): Promise<boolean> {
     return this.rpc('terminal-web-cycle', z.boolean(), { enclosure, challengeId })
   }
+  async captureTerminalContinuityDiagnostics(enclosure: RuntimeEnclosureHandle): Promise<{ artifactRef: string }> {
+    return this.rpc('terminal-continuity-diagnostics', z.object({
+      artifactRef: z.string().regex(/^terminal-continuity-diagnostics:[a-f0-9]{64}$/),
+    }).strict(), { enclosure })
+  }
   async publishFreshAgentQualification(freshAgentObservations: FreshAgentQualificationRow[]): Promise<RuntimeFreshAgentReceiptArtifacts> {
     return this.rpc('fresh-agent-receipt', RuntimeFreshAgentReceiptArtifactsSchema, { freshAgentObservations })
   }
@@ -1160,6 +1165,10 @@ export function createExternalRuntimeControl(
       case 'terminal-web-cycle':
         if (!request.enclosure || !request.challengeId) throw new Error('exact terminal enclosure and cycle marker required')
         result = await owner.terminalWebCycleCompleted(request.enclosure, request.challengeId)
+        break
+      case 'terminal-continuity-diagnostics':
+        if (!request.enclosure) throw new Error('exact terminal enclosure required')
+        result = await owner.captureTerminalContinuityDiagnostics(request.enclosure)
         break
       case 'candidate-integrity': result = await owner.captureCandidateIntegrity(); break
       case 'web-process-facts': result = await owner.webProcessFacts(); break

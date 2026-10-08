@@ -206,17 +206,14 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
             managedRuntime: window.__FRESHELL_TEST_HARNESS__?.getState()?.managedRuntime,
           })).catch(() => null)
           const webProcess = await rig.webProcessFacts().catch(() => null)
-          const output = rig.web.capturedOutput()
+          const ownerDiagnostics = await rig.captureTerminalContinuityDiagnostics(childEnclosure)
           const terminalText = await terminal.getVisibleText(pane.terminalId).catch(() => '')
           throw new Error(`${error instanceof Error ? error.message : String(error)}; diagnostics=${JSON.stringify({
             cycle, lastHeartbeat, connection, webProcess,
             paneContent: findTerminalLeaves(await harness.getPaneLayout(pane.tabId))[0]?.content,
             wsEvents: wsEvents.slice(-100),
             terminalTail: terminalText.slice(-800),
-            ownedProcesses: rig.ownedContainerProcessTable(originalIdentity.containerId).slice(-1200),
-            hostLogsTail: rig.runtime.containerLogs(originalIdentity.containerId).slice(-1200),
-            webStdoutTail: output.stdout.slice(-1500),
-            webStderrTail: output.stderr.slice(-1500),
+            ownerDiagnostics,
           })}`)
         }
 

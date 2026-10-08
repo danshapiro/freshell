@@ -950,6 +950,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   action: z.enum([
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
+    'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
     'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
@@ -3352,6 +3353,20 @@ export class ManagedRuntimeOwner {
     const actual = (await this.ownedProviderExec(handle.containerId, ['sh', '-lc',
       `cat ${JSON.stringify(`/home/freshell/provider/p2-web-cycle-${cycle}`)} 2>/dev/null || true`])).trim()
     return actual === marker
+  }
+  async captureTerminalContinuityDiagnostics(handle: RuntimeEnclosureHandle): Promise<{ artifactRef: string }> {
+    if (this.runtime.phase !== 2) throw new Error('Phase 2 terminal continuity fixture required')
+    await this.currentRuntimeEnclosure(handle)
+    if (!this.web) throw new Error('owned web process is not prepared')
+    const output = this.web.capturedOutput()
+    const target = this.runtime.writeArtifact('terminal-continuity-diagnostics.json', {
+      ...handle, ownedProcesses: this.ownedContainerProcessTable(handle.containerId).slice(-1200),
+      hostLogsTail: this.runtime.containerLogs(handle.containerId).slice(-1200),
+      webStdoutTail: output.stdout.slice(-1500), webStderrTail: output.stderr.slice(-1500),
+    })
+    const artifactRef = `terminal-continuity-diagnostics:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
+    this.runtime.recordLifecycle('external.terminal_continuity_diagnostics_captured', { severity: 'info', artifactRef, ...handle })
+    return { artifactRef }
   }
 
   async incidentMatchesSoul(handle: ExactRuntimeHandle, incidentId: string): Promise<boolean> {

@@ -1704,6 +1704,48 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('captures fixed terminal continuity diagnostics privately and returns their actual artifact hash', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-terminal-diagnostics-'))
+    try {
+      const { owned, context, inventory, request } = fixture()
+      const row = { soulId: 'diagnostic-soul', incarnationId: 'diagnostic-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'diagnostic-boot', provider: 'shell', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { evidenceDir: directory, broker: { receipts: () => [receipt] } })
+      Object.assign(owned, { web: { capturedOutput: () => ({ stdout: 'private web stdout', stderr: 'private web stderr' }) } })
+      const processes = vi.spyOn(owned, 'ownedContainerProcessTable').mockReturnValue('private owned process table')
+      const logs = vi.spyOn(owned.runtime, 'containerLogs').mockReturnValue('private owned host log')
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const wire: unknown[] = []
+      const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      const enclosure = rig.runtimeEnclosureHandle(row)
+      const result = await rig.captureTerminalContinuityDiagnostics(enclosure)
+      const filename = path.join(directory, 'terminal-continuity-diagnostics.json')
+      const bytes = await fsp.readFile(filename)
+      expect(result).toEqual({ artifactRef: `terminal-continuity-diagnostics:${createHash('sha256').update(bytes).digest('hex')}` })
+      expect((await fsp.stat(filename)).mode & 0o777).toBe(0o600)
+      expect(JSON.parse(bytes.toString())).toMatchObject({ runId: context.runId, candidateSha: context.candidateSha,
+        containerId: row.containerId, hostBootId: row.hostBootId, ownedProcesses: 'private owned process table',
+        hostLogsTail: 'private owned host log', webStdoutTail: 'private web stdout', webStderrTail: 'private web stderr' })
+      expect(JSON.stringify(wire)).not.toContain('private')
+      logs.mockImplementationOnce(() => { throw new Error('owned host log read failed') })
+      await expect(owned.captureTerminalContinuityDiagnostics(enclosure)).rejects.toThrow(/host log read failed/)
+      processes.mockClear(); logs.mockClear()
+      inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement' }])
+      await expect(owned.captureTerminalContinuityDiagnostics(enclosure)).rejects.toThrow(/current/)
+      await expect(control({ ...request, action: 'terminal-continuity-diagnostics', enclosure, path: '/foreign' })).rejects.toThrow(/operation/)
+      expect(processes).not.toHaveBeenCalled()
+      expect(logs).not.toHaveBeenCalled()
+      Object.assign(owned.runtime, { phase: 3 })
+      await expect(owned.captureTerminalContinuityDiagnostics(enclosure)).rejects.toThrow(/Phase 2/)
+    } finally { await fsp.rm(directory, { recursive: true, force: true }) }
+  })
   it('observes only fixed current terminal web-cycle markers through the owner', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-terminal-cycle-'))
     try {
