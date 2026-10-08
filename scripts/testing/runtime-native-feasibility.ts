@@ -756,7 +756,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
   if (selection.provider === 'opencode' && selection.case === 'startup') {
-    return executeManagedOpenCodeTui(harness, sources, caseId)
+    return executeManagedOpenCodeTui(harness, sources, caseId, serverPath, servers)
   }
   if (selection.provider === 'codex' && ['create', 'exact-resume', 'wrong-root', 'cancellation'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, 'codex', caseId, serverPath, servers)
@@ -1055,14 +1055,17 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
 }
 
 async function executeManagedOpenCodeTui(harness: RuntimeHarness,
-  sources: { name: string; path: string; sha256: string }[], caseId: string): Promise<NativeExperimentOriginal> {
+  sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath?: string,
+  servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
+  const replacementFault = caseId === 'baseline-only-resume' || caseId === 'stale-observation'
+  if (replacementFault && !serverPath) throw new Error('actual native OpenCode replacement requires the owned real server artifact')
   const stageSource = sources.find(file => file.name === 'opencode/native-preparation/transfer-stage.bin')
   if (!stageSource) throw new Error('selected OpenCode native transfer stage required')
-  if (!['null-slot', 'v1-empty', 'v2-empty-is-not-v1-empty', 'full-revert', 'part-revert', 'disposal', 'cancellation', 'root-load-error', 'history-load-error'].includes(caseId)) {
+  if (!['null-slot', 'v1-empty', 'v2-empty-is-not-v1-empty', 'full-revert', 'part-revert', 'disposal', 'cancellation', 'root-load-error', 'history-load-error', 'baseline-only-resume', 'stale-observation'].includes(caseId)) {
     throw new Error(`actual native OpenCode TUI case has no qualified execution path: ${caseId}`)
   }
   const scenario = `opencode-${caseId}`
-  const tuiObserver = ['disposal', 'root-load-error', 'history-load-error'].includes(caseId)
+  const tuiObserver = ['disposal', 'root-load-error', 'history-load-error', 'baseline-only-resume', 'stale-observation'].includes(caseId)
   const source = prepareOwnedOpenCodeTuiSource(harness.repoRoot, harness.testRoot, caseId, harness.runId + '-' + caseId)
   const digest = (bytes: Buffer | string): string => createHash('sha256').update(bytes).digest('hex')
   const stage = path.join(harness.testRoot, scenario + '-transfer-stage')
@@ -1127,6 +1130,49 @@ async function executeManagedOpenCodeTui(harness: RuntimeHarness,
     if (!selected) throw new Error('selected OpenCode native grant reference missing')
     return { sourcePath: selected.path, profile: 'opencode_onecli_' + (suffix === 'env_file' ? 'environment' : suffix) }
   })
+  let managedPreparation: any
+  if (replacementFault && serverPath) {
+    const { RustServer } = await import('../../test/e2e-browser/helpers/rust-server.js')
+    const server = new RustServer({ homeDir: sourceHome, preserveHomeOnStop: true,
+      env: { FRESHELL_BIND_HOST: '0.0.0.0', FRESHELL_MANAGED_RUNTIME_V1: '1',
+        FRESHELL_RUNTIME_CONTROL_SOCKET: supervisor.controlSocket,
+        FRESHELL_RUNTIME_CONTROL_SECRET_FILE: supervisor.controlSecretFile,
+        FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: references[0]!.sourcePath,
+        FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: references[1]!.sourcePath,
+        FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: references[2]!.sourcePath },
+      stripEnvPrefixes: ['GEMINI_', 'GOOGLE_API_KEY', 'ANTHROPIC_', 'CLAUDE_', 'OPENAI_', 'LUNAROUTE_'],
+      setupHome: async selectedHome => {
+        const config = path.join(selectedHome, '.freshell'); fs.mkdirSync(config, { recursive: true, mode: 0o700 })
+        fs.writeFileSync(path.join(config, 'config.json'), JSON.stringify({ version: 1, settings: {
+          defaultCwd: source.workspace, codingCli: { enabledProviders: ['opencode'], providers: { opencode: { model: 'openai/gpt-5.6-luna' } } },
+        } }), { mode: 0o600 })
+      } })
+    const owned = { server, scope: scenario, pid: undefined as number | undefined }; servers.push(owned)
+    const previous = process.env.FRESHELL_E2E_RUST_SERVER_BIN
+    process.env.FRESHELL_E2E_RUST_SERVER_BIN = serverPath
+    try {
+      const info = await server.start(); owned.pid = info.pid
+      harness.writeArtifact(`${scenario}-server-private.json`, { ...info, ...server.processEvidence(),
+        executableSha256: digest(fs.readFileSync(serverPath)) })
+    } finally {
+      if (previous === undefined) delete process.env.FRESHELL_E2E_RUST_SERVER_BIN
+      else process.env.FRESHELL_E2E_RUST_SERVER_BIN = previous
+    }
+    managedPreparation = await new Promise((resolve, reject) => {
+      const socket = createConnection(path.join(path.dirname(supervisor.controlSocket), 'mcp.sock')), chunks: Buffer[] = []
+      socket.setTimeout(5000, () => socket.destroy(new Error('actual OpenCode native capability issue timed out')))
+      socket.once('connect', () => socket.end(JSON.stringify({ action: 'issue', controlSecret: supervisor.controlSecret,
+        soulId, incarnationId: null, grantId: null, provider: 'opencode', tuiSource: null, workspace: source.workspace, cwd: source.workspace })))
+      socket.on('data', (chunk: Buffer) => chunks.push(chunk)); socket.once('error', reject)
+      socket.once('end', () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))) } catch { reject(new Error('actual OpenCode native capability issue failed')) }
+      })
+    })
+    harness.writeArtifact(`${scenario}-managed-preparation-private.json`, managedPreparation)
+    if (!managedPreparation.context?.mcpCapability || !managedPreparation.secretReferences?.length) {
+      throw new Error('actual OpenCode native managed capability/preparation missing')
+    }
+  }
   const request = harness.launchBody({ soulId, provider: 'opencode', providerStoreId: soulId,
     nativeSessionId: source.rootId, creationSeedRef: 'owned-native-' + harness.runId,
     projectKey: scenario, profile: 'custom', limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
@@ -1138,7 +1184,7 @@ async function executeManagedOpenCodeTui(harness: RuntimeHarness,
       args: ['--session', source.rootId, '--model', 'openai/gpt-5.6-luna'], cwd: source.workspace,
       workspacePath: source.workspace, projectKey: scenario, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30,
       resumeSessionId: source.rootId, opencodeTransfer: descriptor, opencodeTransferAttemptId: attempt,
-      providerSecretReferences: references, providerLaunchContext: {
+      providerSecretReferences: managedPreparation?.secretReferences ?? references, providerLaunchContext: managedPreparation?.context ?? {
         preparation: { opencode: { project_config: [], tui_config: null, inline_config: false } },
         config: tuiObserver ? [{ root: 'user_provider', relativePath: 'tui.json',
           providerRelativePath: '.config/opencode/tui.json', format: 'json' }] : [],
@@ -1196,6 +1242,9 @@ print(json.dumps(records))
     || adoption.messagesRead !== (source.expectedActiveMessageIds.length ? 'success' : 'empty_confirmed')) {
     throw new Error('actual pinned TUI active V1/revert hydration differs from current host evidence')
   }
+  if (caseId === 'baseline-only-resume' || caseId === 'stale-observation') {
+    return executeManagedOpenCodeTuiReplacementFault(harness, supervisor, request, source, view, namespace, caseId)
+  }
   const publication: any = Object.values(signals).find((row: any) => row.stage === 'publication_succeeded')
   const assertion = (name: string, pass: boolean) => ({ name, pass })
   const assertions = [assertion('current-native-tui-observation-before-any-input', observation.incarnationId === view.incarnationId),
@@ -1217,13 +1266,86 @@ print(json.dumps(records))
   return original
 }
 
+// Read only the actual managed TUI signal envelopes. The baseline-only
+// fault removes these already captured owned receipts; stale keeps their
+// original bytes. Neither path writes a provider acknowledgement.
+const openCodeTuiSignalMetadata = String.raw`
+import os,pathlib,json,hashlib,re
+assert os.getuid()==65534 and os.getgid()==0
+home=pathlib.Path(os.environ['HOME']);assert home==pathlib.Path('/home/freshell/provider')
+def native_signal_metadata(terminal,native_root):
+ assert re.fullmatch(r'[A-Za-z0-9_-]+',terminal) and re.fullmatch(r'ses_[A-Za-z0-9]+',native_root)
+ directory=home/'.freshell/session-signals/opencode-adoption';records=[]
+ for file in sorted(directory.glob(terminal+'__*.json')):
+  assert file.is_file() and not file.is_symlink() and file.stat().st_size<=65536
+  raw=file.read_bytes();frame=json.loads(raw);observation=frame.get('adoption_observation')
+  if not isinstance(observation,dict) or frame.get('source')!='opencode-tui-plugin':continue
+  assert frame.get('session_id')==native_root and observation.get('root_session_id')==native_root
+  records.append({'name':file.name,'sha256':hashlib.sha256(raw).hexdigest(),'nativeSessionId':native_root,
+   'incarnationId':observation.get('incarnation_id'),'launchNonce':observation.get('launch_nonce'),
+   'evidenceGeneration':observation.get('evidence_generation'),'hydrated':observation.get('hydrated'),
+   'messagesRead':observation.get('messages_read')})
+ return records
+`
+
+export async function executeManagedOpenCodeTuiReplacementFault(harness: RuntimeHarness,
+  supervisor: Awaited<ReturnType<RuntimeHarness['startSupervisor']>>, request: any,
+  source: ReturnType<typeof prepareOwnedOpenCodeTuiSource>, view: any, namespace: any,
+  caseId: 'baseline-only-resume' | 'stale-observation'): Promise<NativeExperimentOriginal> {
+  const scenario = `opencode-${caseId}`, observation = view.nativeIdentityObservation
+  const prior = harness.broker.receipts().find(row => row.soulId === request.params.soulId && row.containerId === view.containerId)
+  if (!prior?.providerVolumeName || view.launchState !== 'running' || !observation
+    || observation.source !== 'opencode_tui' || observation.nativeSessionId !== source.rootId
+    || observation.incarnationId !== view.incarnationId || namespace.nativeLaunch.incarnationId !== view.incarnationId
+    || observation.launchNonce !== namespace.nativeLaunch.launchNonce || observation.evidenceRevision !== namespace.nativeLaunch.evidenceRevision
+    || namespace.nativeLaunch.executionGeneration !== view.executionGeneration
+    || namespace.executableSha256 !== 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99'
+    || !receiverNativeNamespaceMatches(namespace, 'opencode', source.workspace, source.rootId)) {
+    throw new Error('genuine initial native TUI observation/owned volume required before replacement fault')
+  }
+  const captured = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c',
+    openCodeTuiSignalMetadata + String.raw`
+import sys
+terminal,root,incarnation,case=sys.argv[1:];assert case in ['baseline-only-resume','stale-observation']
+records=native_signal_metadata(terminal,root)
+assert records and all(row['incarnationId']==incarnation and row['hydrated'] is True and row['messagesRead']=='success' for row in records)
+if case=='baseline-only-resume':
+ for row in records:(home/'.freshell/session-signals/opencode-adoption'/row['name']).unlink()
+print(json.dumps({'signals':records,'cleared':case=='baseline-only-resume'}))
+`, request.params.terminal.terminalId, source.rootId, view.incarnationId, caseId]))
+  harness.writeArtifact(`${scenario}-original-native-signals.json`, captured)
+  if (!Array.isArray(captured.signals) || !captured.signals.length || captured.cleared !== (caseId === 'baseline-only-resume')
+    || captured.signals.some((row: any) => row.incarnationId !== view.incarnationId || row.nativeSessionId !== source.rootId
+      || row.hydrated !== true || row.messagesRead !== 'success' || !/^[a-f0-9]{64}$/.test(row.sha256 ?? ''))) {
+    throw new Error('genuine original native TUI signal capture differs')
+  }
+  fs.writeFileSync(path.join(source.workspace, 'native-tui-fault-control.json'), JSON.stringify({ schemaVersion: 1,
+    caseId, rootSessionId: source.rootId, terminalId: request.params.terminal.terminalId,
+    previousIncarnationId: view.incarnationId }), { mode: 0o644 })
+  fs.chmodSync(path.join(source.workspace, 'native-tui-fault-control.json'), 0o644)
+  await harness.killOwnedRuntimeExact(view.containerId)
+  await harness.waitForContainerExit(view.containerId)
+  const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(request.params.soulId))
+  harness.writeArtifact(`${scenario}-original-volume-resume-probe.json`, probe)
+  const spec = probe.data?.kind === 'resume_ready' ? probe.data.data?.resume_spec : null
+  if (spec?.providerSession?.nativeSessionId !== source.rootId
+    || spec.opencodeAdoptionBaseline?.descriptor?.rootSessionId !== source.rootId
+    || !/^[a-f0-9]{64}$/.test(spec.opencodeAdoptionBaseline.manifestSha256 ?? '')) {
+    throw new Error('actual original native store has no verified exact adoption baseline for replacement')
+  }
+  return executeManagedOpenCodeTuiPending(harness, supervisor, harness.recoverBody(request.params.soulId, 'host_unreachable'),
+    source, scenario, caseId, { priorView: view, priorNamespace: namespace, priorVolume: prior.providerVolumeName,
+      priorSignals: captured.signals, terminalId: request.params.terminal.terminalId })
+}
+
 async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
   supervisor: Awaited<ReturnType<RuntimeHarness['startSupervisor']>>, request: any,
   source: ReturnType<typeof prepareOwnedOpenCodeTuiSource>, scenario: string,
-  caseId: 'disposal' | 'cancellation' | 'root-load-error' | 'history-load-error'): Promise<NativeExperimentOriginal> {
+  caseId: 'disposal' | 'cancellation' | 'root-load-error' | 'history-load-error' | 'baseline-only-resume' | 'stale-observation',
+  replacement?: { priorView: any; priorNamespace: any; priorVolume: string; priorSignals: any[]; terminalId: string }): Promise<NativeExperimentOriginal> {
   const disposal = caseId === 'disposal'
   const loadFault = caseId === 'root-load-error' || caseId === 'history-load-error'
-  const observer = disposal || loadFault
+  const observer = disposal || loadFault || !!replacement
   const pendingOutcome = loadFault ? 'disposed_before_store_fault' : 'disposed_before_publication'
   const readObserver = "import pathlib,json,sys;p=pathlib.Path(sys.argv[1])/'native-tui-fault-result.json';assert p.is_file() and not p.is_symlink() and p.stat().st_size<=65536;print(p.read_text())"
   let finished = false, reply: any, failure: unknown, stopped: any
@@ -1234,7 +1356,7 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
   try {
     const deadline = Date.now() + 30000
     while (!finished && Date.now() < deadline) {
-      const owned = harness.broker.receipts().find(row => row.soulId === request.params.soulId)
+      const owned = [...harness.broker.receipts()].reverse().find(row => row.soulId === request.params.soulId)
       if (owned) {
         try {
           const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
@@ -1277,6 +1399,42 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
     // Capture the unadmitted native store before Stop. Input serializes with
     // the launch, so first cancel that wait through the ordinary Stop intent.
     harness.writeArtifact(`${scenario}-unadmitted-view-before-stop.json`, view)
+    let replacementStatus: any
+    if (replacement) {
+      const currentReceipt = harness.broker.receipts().find(row => row.containerId === view.containerId && row.soulId === request.params.soulId)
+      if (view.incarnationId === replacement.priorView.incarnationId || view.executionGeneration <= replacement.priorView.executionGeneration
+        || currentReceipt?.providerVolumeName !== replacement.priorVolume
+        || JSON.stringify(namespace.activeMessageIds) !== JSON.stringify(replacement.priorNamespace.activeMessageIds)) {
+        throw new Error('native TUI replacement changed original volume/root/history or reused incarnation')
+      }
+      // Use the actual framed/authenticated Status contract inside this exact
+      // owned host namespace, after its provider receipt has been inspected.
+      const statusScript = amplifierNativeHostStatus
+        .replace("assert re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/r/amplif-[a-f0-9]{8}/x',str(root))", "assert root==pathlib.Path('/run/freshell')")
+        .replace('directory=root/incarnation;', 'directory=root;')
+        .replace("'nativeSessionId':data.get('native_session_id'),", "'opencodeAdoption':data.get('opencode_adoption'),'nativeSessionId':data.get('native_session_id'),")
+        .replace('print(json.dumps({', 'projection={')
+        .replace("'nativeIdentityObservation':data.get('native_identity_observation')}))", "'nativeIdentityObservation':data.get('native_identity_observation')}")
+      replacementStatus = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c',
+        statusScript + openCodeTuiSignalMetadata + String.raw`
+terminal,native_root=sys.argv[3:];projection['signals']=native_signal_metadata(terminal,native_root)
+expected_file=home/'.freshell/session-signals/opencode-adoption'/(terminal+'.expected.json')
+assert expected_file.is_file() and not expected_file.is_symlink() and expected_file.stat().st_size<=65536
+projection['expected']=json.loads(expected_file.read_text());print(json.dumps(projection))
+`, '/run/freshell', view.incarnationId, replacement.terminalId, source.rootId]))
+      harness.writeArtifact(`${scenario}-authenticated-current-baseline-gate.json`, replacementStatus)
+      const expected = replacementStatus.expected
+      if (replacementStatus.incarnationId !== view.incarnationId || replacementStatus.executionGeneration !== view.executionGeneration
+        || replacementStatus.exited !== false || replacementStatus.nativeSessionId || replacementStatus.nativeIdentityObservation
+        || replacementStatus.opencodeAdoption?.state !== 'awaiting_observation'
+        || expected?.root_session_id !== source.rootId || expected.incarnation_id !== view.incarnationId
+        || expected.launch_nonce !== report.adoptionLaunchNonce || expected.evidence_generation !== report.evidenceGeneration
+        || (caseId === 'baseline-only-resume' ? replacementStatus.signals?.length !== 0
+          : JSON.stringify(replacementStatus.signals) !== JSON.stringify(replacement.priorSignals)
+            || replacementStatus.signals.some((row: any) => row.incarnationId === view.incarnationId || row.launchNonce === expected.launch_nonce))) {
+        throw new Error('actual current baseline/native gate accepted missing or stale producer evidence')
+      }
+    }
     let nativeFault: any
     if (loadFault) {
       fs.writeFileSync(path.join(source.workspace, 'native-tui-fault-release.json'), JSON.stringify({ schemaVersion: 1,
@@ -1322,7 +1480,10 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
     const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
     const current = ManagedRuntimeSoulSchema.parse(inventory.data.find((row: any) => row.soulId === request.params.soulId))
     harness.writeArtifact(`${scenario}-current-view.json`, current)
-    if (!(loadFault ? ['STALE_INTENT_REVISION', 'RECOVERY_BLOCKED'].includes(reply.result?.Err?.code) : reply.result?.Err?.code === 'STALE_INTENT_REVISION')
+    const replacementStopped = reply.result?.Ok?.data?.outcome === 'stopped'
+      && (reply.result.Ok.data.observedNativeSessionId === undefined || reply.result.Ok.data.observedNativeSessionId === null)
+      && !reply.result.Ok.data.view?.nativeIdentityObservation
+    if (!(replacement ? replacementStopped : loadFault ? ['STALE_INTENT_REVISION', 'RECOVERY_BLOCKED'].includes(reply.result?.Err?.code) : reply.result?.Err?.code === 'STALE_INTENT_REVISION')
       || stopped.data?.outcome !== 'verified_empty'
       || current.launchState !== 'stopped' || current.desiredState !== 'stopped' || current.recoveryState !== 'stopped'
       || current.cleanupState !== 'verified_empty' || current.nativeIdentityObservation
@@ -1335,17 +1496,21 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
     if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('disposed native TUI admitted ordinary input')
     const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
       nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256, profileSha256: namespace.profileSha256,
-      artifactReferences: [...(observer ? [`${scenario}-supported-disposal.json`] : []),
+      artifactReferences: [...(replacement ? [`${scenario}-original-native-signals.json`, `${scenario}-original-volume-resume-probe.json`,
+        `${scenario}-authenticated-current-baseline-gate.json`] : []), ...(observer ? [`${scenario}-supported-disposal.json`] : []),
         ...(loadFault ? [`${scenario}-native-read-refusal.json`, `${scenario}-unadmitted-view-after-fault.json`] : []), `${scenario}-namespace-native-private.json`,
         `${scenario}-unadmitted-view-before-stop.json`, `${scenario}-input-refusal.json`, `${scenario}-ordinary-stop.json`],
-      assertions: [...(disposal ? [{ name: 'supported-real-plugin-scope-disposed-before-publication', pass: report.outcome === 'disposed_before_publication' }] : []),
+      assertions: [...(replacement ? [{ name: 'actual-new-incarnation-original-volume-and-verified-baseline',
+          pass: view.incarnationId !== replacement.priorView.incarnationId },
+        { name: caseId === 'stale-observation' ? 'genuine-original-native-receipts-refused-in-current-host' : 'verified-baseline-without-native-receipt-remains-unobserved',
+          pass: replacementStatus.opencodeAdoption.state === 'awaiting_observation' && !replacementStatus.nativeIdentityObservation }] : []), ...(disposal ? [{ name: 'supported-real-plugin-scope-disposed-before-publication', pass: report.outcome === 'disposed_before_publication' }] : []),
         ...(loadFault ? [{ name: 'actual-pinned-native-current-root-history-read-refusal', pass: nativeFault.outcome === 'native_load_error_observed'
           && nativeFault.refusal.reason === (caseId === 'root-load-error' ? 'native_root_load_failed' : 'native_history_load_failed') }] : []),
         { name: 'actual-native-pinned-current-root-store-and-normal-uid-tls', pass: namespace.nativeMessageCount === 2 },
         { name: 'unobserved-native-startup-never-admits-running-or-input', pass: view.launchState === 'starting'
           && !view.nativeIdentityObservation && !current.nativeIdentityObservation && input.result.Err.code === 'UNKNOWN_SOUL' },
         { name: loadFault ? 'ordinary-stop-cleans-native-read-refused-startup' : 'ordinary-stop-cancels-current-unobserved-native-startup',
-          pass: stopped.data.outcome === 'verified_empty' && (loadFault || reply.result.Err.code === 'STALE_INTENT_REVISION')
+          pass: stopped.data.outcome === 'verified_empty' && (replacement ? replacementStopped : loadFault || reply.result.Err.code === 'STALE_INTENT_REVISION')
             && current.intentRevision > view.intentRevision }] }
     harness.writeArtifact(`${scenario}-original.json`, original)
     return original

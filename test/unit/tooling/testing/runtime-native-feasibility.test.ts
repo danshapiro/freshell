@@ -15,6 +15,7 @@ import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   prepareOwnedOpenCodeTuiSource,
   openCodeTuiDisposalObserver,
+  executeManagedOpenCodeTuiReplacementFault,
   openCodeTuiOwnedStoreFault,
   runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeReceiverLoadFaultWrapper, nativeReceiverLoadFaultEntry, writeOwnedNativeReceiverControl, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
   amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, receiverWrongRootEvidence, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
@@ -305,6 +306,68 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       expect(harness.writeArtifact).not.toHaveBeenCalled()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it.each(['baseline-only-resume', 'stale-observation'])('requires the owned real controller before %s prepares or launches a native replacement', async caseId => {
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'opencode-controller-refusal-'))
+    const stage=path.join(directory,'stage');fs.writeFileSync(stage,'controlled artifact')
+    const harness={testRoot:directory,repoRoot:process.cwd(),writeArtifact:vi.fn(),startTransferProvider:vi.fn()} as unknown as RuntimeHarness
+    try{
+      await expect(executeManagedNativeCase(harness,[{name:'opencode/native-preparation/transfer-stage.bin',path:stage,sha256:'a'.repeat(64)}],
+        {provider:'opencode',case:'startup'},caseId)).rejects.toThrow('actual native OpenCode replacement requires the owned real server artifact')
+      expect(harness.startTransferProvider).not.toHaveBeenCalled()
+      expect(harness.writeArtifact).not.toHaveBeenCalled()
+    }finally{fs.rmSync(directory,{recursive:true,force:true})}
+  })
+  it.each(['baseline-only-resume', 'stale-observation'].flatMap(caseId => ['current', 'missing-capability'].map(fault => [caseId, fault])))('issues scoped %s/%s preparation through the owned Unix controller before native launch (controlled transport only)', async (caseId, fault) => {
+    const ownedRoot=path.join('/tmp/frs',randomUUID().slice(0,12)),evidenceDir=path.join(ownedRoot,'evidence')
+    fs.mkdirSync(evidenceDir,{recursive:true,mode:0o700})
+    const stage=path.join(ownedRoot,'stage');fs.writeFileSync(stage,'controlled artifact only',{mode:0o500})
+    let root='',sourcePath='',sourceHome='',launched:any,issue:any,selectionRead=false
+    const controller=createServer(socket=>{
+      const chunks:Buffer[]=[];socket.on('data',chunk=>chunks.push(chunk));socket.on('end',()=>{
+        issue=JSON.parse(Buffer.concat(chunks).toString())
+        socket.end(JSON.stringify({context:{preparation:{opencode:{project_config:[],tui_config:null,inline_config:false}},
+          config:[{root:'user_provider',relativePath:'tui.json',providerRelativePath:'.config/opencode/tui.json',format:'json'}],
+          ...(fault==='current'?{mcpCapability:{grantId:'controlled-owned-grant'}}:{})},
+          secretReferences:['environment','auth_file','ca_file'].map(suffix=>({sourcePath:stage,profile:'opencode_onecli_'+suffix}))}))
+      })
+    })
+    await new Promise<void>(resolve=>controller.listen(path.join(ownedRoot,'mcp.sock'),resolve))
+    const previousBinary=process.env.FRESHELL_E2E_RUST_SERVER_BIN
+    const start=vi.spyOn(RustServer.prototype,'start').mockImplementation(async()=>{
+      expect(process.env.FRESHELL_E2E_RUST_SERVER_BIN).toBe(stage)
+      const config=JSON.parse(fs.readFileSync(path.join(sourceHome,'.config/opencode/tui.json'),'utf8'))
+      selectionRead=fs.statSync(new URL(config.plugin[0])).isFile()
+      return {pid:undefined} as any
+    })
+    const serverEvidence=vi.spyOn(RustServer.prototype,'processEvidence').mockReturnValue({} as any)
+    const servers:any[]=[]
+    const harness={repoRoot:process.cwd(),testRoot:ownedRoot,evidenceDir,runId:ownerId,candidateSha,imageRef:imageDigest,
+      writeArtifact:vi.fn(),startTransferProvider:()=>({containerId:'controlled-exporter'}),
+      copyTransferFileExact:async(_:string,file:string)=>{sourcePath=file},
+      writeTransferRequest:(_:string,_name:string,value:any)=>{root=value.rootSessionId},execTransferProviderExact:()=>JSON.stringify({controlled:true}),
+      captureTransferFileExact:async(_:string,name:string,file:string)=>fs.writeFileSync(file,name.includes('descriptor')?JSON.stringify({rootSessionId:root}):fs.readFileSync(sourcePath)),
+      startSupervisor:async(options:any)=>{sourceHome=options.env.HOME;return {controlSocket:path.join(ownedRoot,'supervisor.sock'),controlSecretFile:path.join(ownedRoot,'secret'),controlSecret:'controlled-owned-secret'}},
+      launchBody:(params:any)=>({method:'launch',params}),inventoryBody:()=>({method:'inventory'}),
+      adminRaw:async(_:unknown,body:any)=>{launched=body;return {result:{Err:{code:'RECOVERY_BLOCKED'}}}},
+      adminOk:async(_:unknown,body:any)=>body.method==='open_code_transfer'?{controlled:true}:{data:[{soulId:launched.params.soulId,
+        incarnationId:'controlled-incarnation',launchState:'starting',recoveryState:'live',desiredState:'running',cleanupState:'none',intentRevision:1,
+        executionGeneration:1,allocationState:'allocated',durabilityState:'unknown',evidenceRevision:1,successfulRecoveriesInWindow:0}]},
+    } as unknown as RuntimeHarness
+    try{
+      await expect(executeManagedNativeCase(harness,[{name:'opencode/native-preparation/transfer-stage.bin',path:stage,sha256:'a'.repeat(64)},
+        ...['env_file','auth_file','ca_file'].map(suffix=>({name:'opencode/grants/'+suffix,path:stage,sha256:'a'.repeat(64)}))],
+        {provider:'opencode',case:'startup'},caseId,stage,servers)).rejects.toThrow(fault==='current'
+          ?'actual imported native TUI has no current admitted observation':'actual OpenCode native managed capability/preparation missing')
+      expect(issue.provider).toBe('opencode');expect(issue.action).toBe('issue');expect(issue.soulId).toMatch(/^soul-/)
+      expect(issue.workspace).toBe(issue.cwd);expect(issue.incarnationId).toBe(null)
+      expect(selectionRead).toBe(true);expect(servers).toHaveLength(1)
+      if(fault==='current'){
+        expect(launched.params.terminal.providerLaunchContext.mcpCapability.grantId).toBe('controlled-owned-grant')
+        expect(launched.params.terminal.providerSecretReferences).toHaveLength(3)
+      }else expect(launched).toBeUndefined()
+      expect(process.env.FRESHELL_E2E_RUST_SERVER_BIN).toBe(previousBinary)
+    }finally{start.mockRestore();serverEvidence.mockRestore();await new Promise<void>(resolve=>controller.close(()=>resolve()));fs.rmSync(ownedRoot,{recursive:true,force:true})}
+  })
   it.each(['requested-echo', 'previous-incarnation', 'stale-revision', 'ledger-advanced', 'disposal-already-published', 'disposal-current', 'cancellation-current', 'cancellation-wrong-result', 'cancellation-old-intent', 'root-load-error-current', 'history-load-error-current', 'root-load-error-wrong-pid', 'root-load-error-stale-refusal', 'root-load-error-wrong-reason', 'history-load-error-store-unchanged', 'history-load-error-producer-disabled'])(
     'executes owned import/launch orchestration with %s without inventing qualification', async fault => {
       const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
@@ -424,6 +487,76 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
         if (fault !== 'disposal-current' && fault !== 'cancellation-current' && !(loadFault && fault.endsWith('-current'))) expect((harness.writeArtifact as any).mock.calls.filter(([name]: string[]) => name.endsWith('-original.json'))).toEqual([])
       } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
     })
+  it.each(['baseline-only-resume', 'stale-observation'].flatMap(caseId => ['current', 'canonical-stopped-omission', 'wrong-native-binary', 'missing-baseline', 'copied-volume', 'changed-history', 'current-observation', 'changed-stale-receipt', 'false-stopped-result'].map(fault => [caseId, fault])))('executes original-volume %s/%s through actual recovery and Stop ordering (controlled orchestration)', async (caseId, fault) => {
+    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12)), evidenceDir=path.join(ownedRoot,'evidence')
+    fs.mkdirSync(evidenceDir,{recursive:true,mode:0o700})
+    const source=prepareOwnedOpenCodeTuiSource(process.cwd(),ownedRoot,caseId,randomUUID())
+    const root=source.rootId,oldInc='incarnation-'+randomUUID(),newInc='incarnation-'+randomUUID(),terminalId='terminal-owned'
+    const oldSignal={name:terminalId+'__actual.json',sha256:'c'.repeat(64),incarnationId:oldInc,launchNonce:'old-adoption',evidenceGeneration:'a'.repeat(64),nativeSessionId:root,hydrated:true,messagesRead:'success'}
+    let recovered=false,stopped=false,resolveRecovery:((reply:any)=>void)|undefined
+    const commands:string[]=[]
+    const view=(current=false)=>({soulId:'soul-owned',incarnationId:current?newInc:oldInc,containerId:current?'current-native':'old-native',
+      launchState:stopped?'stopped':current?'starting':'running',recoveryState:stopped?'stopped':'live',desiredState:stopped?'stopped':'running',
+      cleanupState:stopped?'verified_empty':'none',intentRevision:stopped?2:1,executionGeneration:current?2:1,allocationState:'allocated',durabilityState:'unknown',
+      nativeSessionId:root,evidenceRevision:3,successfulRecoveriesInWindow:0,
+      ...(current?{}:{nativeIdentityObservation:{nativeSessionId:root,incarnationId:oldInc,launchNonce:'old-launch',evidenceRevision:1,source:'opencode_tui',evidenceDigest:'e'.repeat(64)}})})
+    const namespace=(current=false)=>({uid:65534,gid:0,caps:'0000000000000000',readOnlyRoot:true,httpsStatus:200,tlsVerifyMode:2,tlsCheckHostname:true,
+      nativeCwd:source.workspace,nativeProcessCwd:source.workspace,nativeVersion:'1.18.21',nativeRoot:root,nativeMessageCount:2,
+      activeMessageIds:source.expectedActiveMessageIds,nativePid:current?8:7,activeNativeProcesses:1,
+      executableSha256:'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99',profileSha256:'d'.repeat(64),
+      nativeLaunch:{incarnationId:current?newInc:oldInc,launchNonce:current?'new-launch':'old-launch',evidenceRevision:current?2:1,
+        executionGeneration:current?2:1,requestedNativeSessionId:root}})
+    const harness={repoRoot:process.cwd(),testRoot:ownedRoot,evidenceDir,runId:ownerId,candidateSha,imageRef:imageDigest,
+      writeArtifact:vi.fn(),killOwnedRuntimeExact:async()=>{commands.push('owned-death')},waitForContainerExit:async()=>{commands.push('old-absence')},
+      broker:{receipts:()=>[{soulId:'soul-owned',containerId:'old-native',providerVolumeName:'original-volume'},
+        ...(recovered?[{soulId:'soul-owned',containerId:'current-native',providerVolumeName:fault==='copied-volume'?'copied-volume':'original-volume'}]:[])]},
+      probeRecoveryBody:(soulId:string)=>({method:'probe_recovery',params:{soulId}}),recoverBody:(soulId:string)=>({method:'recover',params:{soulId}}),
+      inventoryBody:()=>({method:'inventory'}),stopBody:(soulId:string)=>({method:'stop',params:{soulId}}),
+      terminalInputBody:(soulId:string,data:string)=>({method:'terminal_input',params:{soulId,data}}),
+      adminRaw:async(_:unknown,body:any)=>{
+        if(body.method==='recover'){commands.push('recover');recovered=true;return new Promise(resolve=>{resolveRecovery=resolve})}
+        if(body.method==='stop'){stopped=true;resolveRecovery?.({result:{Ok:{kind:'recovered',data:{outcome:'stopped',...(fault==='canonical-stopped-omission'?{}:{observedNativeSessionId:fault==='false-stopped-result'?root:null}),view:view(true)}}}});return {result:{Ok:{}}}}
+        commands.push('input');return {result:{Err:{code:'UNKNOWN_SOUL'}}}
+      },
+      adminOk:async(_:unknown,body:any)=>{
+        if(body.method==='probe_recovery'){commands.push('probe');return {data:{kind:'resume_ready',data:{resume_spec:{providerSession:{nativeSessionId:root},
+          opencodeAdoptionBaseline:fault==='missing-baseline'?null:{descriptor:{rootSessionId:root},manifestSha256:'f'.repeat(64)}}}}}}
+        if(body.method==='stop'){commands.push('stop');stopped=true;resolveRecovery?.({result:{Ok:{kind:'recovered',data:{outcome:'stopped',...(fault==='canonical-stopped-omission'?{}:{observedNativeSessionId:fault==='false-stopped-result'?root:null}),view:view(true)}}}});return {data:{outcome:'verified_empty'}}}
+        return {data:[view(recovered)]}
+      },
+      execOwnedContainerAsExact:async(container:string,_uid:string,args:string[])=>{
+        if(container==='old-native')return JSON.stringify({signals:[oldSignal],cleared:caseId==='baseline-only-resume'})
+        if(args.includes('opencode'))return JSON.stringify({...namespace(true),...(fault==='changed-history'?{activeMessageIds:[]}: {})})
+        if(args.includes('/run/freshell'))return JSON.stringify({incarnationId:newInc,executionGeneration:2,exited:false,nativeSessionId:null,nativeIdentityObservation:fault==='current-observation'?{source:'opencode_tui'}:null,
+          opencodeAdoption:{state:'awaiting_observation'},signals:caseId==='stale-observation'?[{...oldSignal,...(fault==='changed-stale-receipt'?{sha256:'b'.repeat(64)}:{})}]:fault==='changed-stale-receipt'?[oldSignal]:[],
+          expected:{root_session_id:root,incarnation_id:newInc,launch_nonce:'new-adoption',evidence_generation:'a'.repeat(64)}})
+        return JSON.stringify({outcome:'disposed_before_publication',incarnationId:newInc,launchNonce:'new-launch',nativeSessionId:root,
+          nativePid:8,nativeMessageCount:2,producerActive:false,adoptionLaunchNonce:'new-adoption',evidenceGeneration:'a'.repeat(64)})
+      }
+    } as unknown as RuntimeHarness
+    try{
+      const initialNamespace=namespace();if(fault==='wrong-native-binary')initialNamespace.executableSha256='b'.repeat(64)
+      const execution=executeManagedOpenCodeTuiReplacementFault(harness,{runtimeRoot:path.join(ownedRoot,'r/openco-12345678/x')} as any,
+        {method:'launch',params:{soulId:'soul-owned',terminal:{terminalId}}},source,view(),initialNamespace,caseId as 'baseline-only-resume'|'stale-observation')
+      if(['current','canonical-stopped-omission'].includes(fault)){
+        const result=await execution
+        expect(commands).toEqual(['owned-death','old-absence','probe','recover','stop','input'])
+        expect(result.assertions.every(assertion=>assertion.pass)).toBe(true)
+      }else{
+        await expect(execution).rejects.toThrow(fault==='wrong-native-binary'?'genuine initial native TUI observation/owned volume required before replacement fault'
+          :fault==='missing-baseline'?'actual original native store has no verified exact adoption baseline for replacement'
+          :['copied-volume','changed-history'].includes(fault)?'native TUI replacement changed original volume/root/history or reused incarnation'
+          :fault==='false-stopped-result'?'ordinary Stop did not cancel the current unobserved native launch'
+          :'actual current baseline/native gate accepted missing or stale producer evidence')
+        expect((harness.writeArtifact as any).mock.calls.filter(([name]:string[])=>name.endsWith('-original.json'))).toEqual([])
+        if(!['wrong-native-binary','missing-baseline'].includes(fault))expect(stopped).toBe(true)
+      }
+      if(fault!=='wrong-native-binary'){
+        const control=JSON.parse(fs.readFileSync(path.join(source.workspace,'native-tui-fault-control.json'),'utf8'))
+        expect(control.previousIncarnationId).toBe(oldInc)
+      }
+    }finally{fs.rmSync(ownedRoot,{recursive:true,force:true})}
+  })
   it.each(['ordinary', 'parity'])('keeps Codex transcript Enter-bound while the %s producer selects its native startup boundary', async route => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'parity-codex-startup-'))
     const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
