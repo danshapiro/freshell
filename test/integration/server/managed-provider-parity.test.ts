@@ -221,6 +221,23 @@ function makeReadableTree(directory: string): void {
   }
 }
 
+function writeAmplifierParityInputs(homeDir: string): void {
+  const directory = path.join(homeDir, '.amplifier')
+  for (const [relative, content] of [
+    ['config.yaml', 'parity_setting: true\n'],
+    ['bundles/parity-bundle.yaml', 'name: parity\n'],
+    // The selected-profile worker prepares settings.yaml from this local bundle.
+    ['bundles/default.yaml', JSON.stringify({
+      name: 'default',
+      providers: [{ module: 'provider-vllm', config: { default_model: 'glm-5.3' } }],
+    }) + '\n'],
+  ]) {
+    const target = path.join(directory, relative)
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, content)
+  }
+}
+
 describe('ordinary and managed terminal provider parity', () => {
   let rig: ManagedRuntimeBrowserRig
   let workspace: string
@@ -293,7 +310,6 @@ describe('ordinary and managed terminal provider parity', () => {
       ['.claude', 'settings.json', JSON.stringify({ paritySetting: true })],
       ['.codex', 'config.toml', 'parity_setting = true\n'],
       ['custom-xdg/opencode', 'opencode.jsonc', '{ "plugin": ["file://user-parity-plugin.js"] }\n'],
-      ['.amplifier', 'config.yaml', 'parity_setting: true\n'],
     ]) {
       const location = path.join(rig.info.homeDir, directory)
       fs.mkdirSync(location, { recursive: true })
@@ -303,12 +319,12 @@ describe('ordinary and managed terminal provider parity', () => {
       ['.claude', 'plugins/parity-plugin.txt', 'claude parity plugin\n'],
       ['.codex', 'skills/parity/SKILL.md', 'codex parity skill\n'],
       ['custom-xdg/opencode', 'plugins/parity-plugin.js', 'export default { name: "parity" }\n'],
-      ['.amplifier', 'bundles/parity-bundle.yaml', 'name: parity\n'],
     ]) {
       const target = path.join(rig.info.homeDir, directory, relative)
       fs.mkdirSync(path.dirname(target), { recursive: true })
       fs.writeFileSync(target, content)
     }
+    writeAmplifierParityInputs(rig.info.homeDir)
   }, 900_000)
 
   beforeEach(() => {
