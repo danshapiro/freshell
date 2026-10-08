@@ -534,7 +534,8 @@ export class OwnedManagedRuntimeRelay {
     let length = 0
     for await (const chunk of request) {
       length += Buffer.byteLength(chunk)
-      if (length > 64 * 1024) throw new Error('owned request exceeds its bound')
+      // Closed diagnostic DTOs include bounded CPU stacks and snapshot audit records.
+      if (length > 2 * 1024 * 1024) throw new Error('owned request exceeds its bound')
       chunks.push(Buffer.from(chunk))
     }
     return Buffer.concat(chunks)

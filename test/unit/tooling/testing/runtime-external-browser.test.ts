@@ -578,6 +578,40 @@ describe('candidate-bound Cloud execution events', () => {
 })
 
 describe('owned stable relay admission and lifetime (transport unit coverage only)', () => {
+  it('admits the existing bounded CPU diagnostic and then finishes the owner over actual HTTP', async () => {
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused relay diagnostic web') })
+    const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
+    const enclosure = owned.runtimeEnclosureHandle({ soulId: 'diagnostic-soul', incarnationId: 'diagnostic-incarnation',
+      containerId: 'b'.repeat(64), hostBootId: 'diagnostic-boot' })
+    const publish = vi.spyOn(owned, 'publishFreshCodexSavedHistoryMeasurement').mockResolvedValue({ artifactRef: 'diagnostic-record' })
+    const stop = vi.spyOn(owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
+    vi.spyOn(owned.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const relay = new runner.OwnedManagedRuntimeRelay({ token: context.token, backend: () => 'http://127.0.0.1:1', control })
+    const frame = { functionName: 'f'.repeat(120), script: 'owned-asset.js', line: 1, column: 1 }
+    const measurement = { kind: 'owned-page saved-history diagnostic', errors: [], cpu: {
+      startTimeUs: 1, endTimeUs: 2, sampledDurationMs: 1, sampleCount: 1,
+      topLeaves: Array.from({ length: 80 }, () => ({ ...frame, samples: 1, durationMs: 1,
+        stack: Array.from({ length: 20 }, () => ({ ...frame })) })), seconds: [],
+    } }
+    const post = async (body: unknown) => fetch(`${relay.localUrl}/__managed_runtime`, { method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-auth-token': context.token }, body: JSON.stringify(body) })
+    const base = { runId: context.runId, candidateSha: context.candidateSha, scenarioId: 'browser-managed-runtime' }
+    try {
+      await relay.start()
+      relay.setOrigin(context.baseUrl)
+      const request = { ...base, operationId: 'large-diagnostic', action: 'freshcodex-history-measurement-artifact', enclosure, historyMeasurement: measurement }
+      expect(Buffer.byteLength(JSON.stringify(request))).toBeGreaterThan(64 * 1024)
+      const response = await post(request)
+      expect(response.status).toBe(200)
+      expect(await response.json()).toMatchObject({ result: { artifactRef: 'diagnostic-record' } })
+      expect(publish).toHaveBeenCalledOnce()
+      const finish = await post({ ...base, operationId: 'finish-after-diagnostic', action: 'finish' })
+      expect(finish.status).toBe(200)
+      expect(await finish.json()).toMatchObject({ result: { ok: true } })
+      expect(stop).toHaveBeenCalledOnce()
+    } finally { await relay.stop() }
+  })
   it('keeps one origin across backend replacement and records exact auth/Origin refusal', async () => {
     const servers: http.Server[] = []
     async function backend(label: string): Promise<string> {
