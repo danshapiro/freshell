@@ -1,4 +1,4 @@
-import { ManagedRuntimeOwner, runtimeWebStripPrefixes } from '../../../scripts/testing/runtime-sandbox.js'
+import { ManagedRuntimeOwner, runtimeWebStripPrefixes, requireOpenCodeOnecliBootstrap } from '../../../scripts/testing/runtime-sandbox.js'
 import { RustServer } from './rust-server.js'
 import type { E2eServerInfo } from './server-fixture-support.js'
 import { resolveManagedExternalDescriptor } from '../../../scripts/testing/runtime-external-browser.js'
@@ -33,6 +33,19 @@ export function createManagedRuntimeBrowserRig(...args: ConstructorParameters<ty
     phase: args[1] ?? 2, enabledProviders: [...configured.enabledProviders],
     freshAgentModes: [...(configured.freshAgentModes ?? [])], fixtureFreshAgentModes: [...(configured.fixtureFreshAgentModes ?? [])],
   })
+}
+
+/** Remote setup reads private grants in its owner; local setup preserves the same validator. */
+export function createManagedOpenCodeRuntimeBrowserRig(...args: ConstructorParameters<typeof ManagedRuntimeBrowserRig>): ManagedFixtureRig {
+  if (resolveManagedExternalDescriptor(process.env)) return createManagedRuntimeBrowserRig(...args)
+  const bootstrap = requireOpenCodeOnecliBootstrap(process.env,
+    args[1] === 5 ? 'OpenCode provider qualification' : 'P2-G04')
+  const configured: ConstructorParameters<typeof ManagedRuntimeBrowserRig> = [...args]
+  configured[2] = { ...args[2], FRESHELL_BIND_HOST: '0.0.0.0',
+    FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: bootstrap.authFile,
+    FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: bootstrap.environmentFile,
+    FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: bootstrap.caFile }
+  return new ManagedRuntimeBrowserRig(...configured)
 }
 
 /** Observe the exact current address and revisions before sending the finite Stop request. */

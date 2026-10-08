@@ -15,9 +15,9 @@ import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
-import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type SupervisorInstance, type Phase3BrowserObservation, type RuntimeLossAssertions } from '../../../../scripts/testing/runtime-sandbox.js'
+import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type SupervisorInstance, type Phase3BrowserObservation, type RuntimeLossAssertions, type RuntimeWebConstructOptions } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
-import { stopManagedRuntimeSoul } from '../../../e2e-browser/helpers/managed-runtime.js'
+import { stopManagedRuntimeSoul, createManagedOpenCodeRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { structuredChaosLog } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
 import type { BrokerReceipt } from '../../../../scripts/testing/runtime-test-broker.js'
 import type { FreshAgentQualificationRow } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
@@ -79,6 +79,50 @@ const descriptor = {
 const smokeSpec = 'test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts'
 
 describe('selected production owner registration', () => {
+  it('keeps private bootstrap reads out of the external browser while preserving local setup refusal', () => {
+    for (const key of Object.keys(descriptor)) vi.stubEnv(key, undefined)
+    vi.stubEnv('FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE', undefined)
+    try {
+      expect(() => createManagedOpenCodeRuntimeBrowserRig()).toThrow(/FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE/)
+      for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
+      vi.stubEnv('FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE', '/missing-private-owner-grant')
+      expect(createManagedOpenCodeRuntimeBrowserRig()).toBeInstanceOf(runner.ExternalManagedRuntimeRig)
+    } finally { vi.unstubAllEnvs() }
+  })
+  it('requires host-private OpenCode bootstrap only for selected native continuity and qualification web setup', async () => {
+    const native = { spec: 'test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts', grep: 'P2-G04' }
+    const web = vi.fn(() => { throw new Error('owned web factory intercepted') })
+    expect(() => runner.createExternalManagedWebFactory(native, {}, web)).toThrow(/FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE/)
+    expect(() => runner.createExternalManagedWebFactory({ ...native, grep: 'P2-G01' }, {}, web)).not.toThrow()
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-owner-bootstrap-'))
+    try {
+      const auth = path.join(directory, 'auth.json'), environmentFile = path.join(directory, 'environment.env'), ca = path.join(directory, 'ca.pem')
+      await fsp.writeFile(auth, JSON.stringify({ openai: { type: 'oauth', access: 'onecli-managed', refresh: 'onecli-managed', expires: Date.now() + 7_200_000 } }), { mode: 0o600 })
+      await fsp.writeFile(environmentFile, [
+        'HTTPS_PROXY=http://unit.invalid:8080', 'https_proxy=http://unit.invalid:8080',
+        'HTTP_PROXY=http://unit.invalid:8080', 'http_proxy=http://unit.invalid:8080',
+        'OPENAI_BASE_URL=https://api.openai.com/v1', 'NODE_EXTRA_CA_CERTS=/home/freshell/provider/.config/onecli/gateway-ca.pem',
+        'NODE_USE_ENV_PROXY=1', 'NO_PROXY=127.0.0.1,localhost',
+      ].join('\n'), { mode: 0o600 })
+      await fsp.writeFile(ca, 'private unit CA fixture; no TLS use', { mode: 0o600 })
+      const environment = { FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: auth,
+        FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: environmentFile, FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: ca }
+      const options: RuntimeWebConstructOptions = { binary: process.execPath, repoRoot: process.cwd(), candidateSha: 'a'.repeat(40),
+        buildDirty: false, setupHome: async () => undefined, preserveHomeOnStop: false, env: { PORT: '3399' } }
+      const selections: runner.ExternalBrowserSelection[] = [native, { spec: 'test/e2e-browser/specs/runtime-opencode-provider-qualification-rust.spec.ts', provider: 'opencode' }]
+      for (const selection of selections) {
+        const capture = vi.fn((input: RuntimeWebConstructOptions) => { throw Object.assign(new Error('owned web factory intercepted'), { input }) })
+        const factory = runner.createExternalManagedWebFactory(selection, environment, capture)
+        expect(() => factory(options)).toThrow(/intercepted/)
+        expect(capture.mock.calls[0][0].env).toMatchObject({ ...environment, PORT: '3399', FRESHELL_BIND_HOST: '0.0.0.0' })
+      }
+      await fsp.chmod(ca, 0o644)
+      expect(() => runner.createExternalManagedWebFactory(native, environment, web)).toThrow(/private/)
+      expect(web).not.toHaveBeenCalled()
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
   it('preserves the all-mode fixture observer interval on an actual supervisor replacement', async () => {
     const owner = runner.createExternalManagedRuntimeOwner(process.cwd(), {
       spec: 'test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts',

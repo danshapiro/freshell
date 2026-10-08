@@ -24,7 +24,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, OpencodeLossRecoverySchema,
   OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema,
   RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema,
-  OpencodeContinuityStartupFactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  OpencodeContinuityStartupFactsSchema, requireOpenCodeOnecliBootstrap, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -1836,6 +1836,17 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
   const preset: Record<string, string> = selectsPhase3Approval(selection, environment) ? {
     FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION: 'ask', FRESHELL_MANAGED_RECOVERY_TEST_DELAY_MS: '7000',
   } : {}
+  const spec = path.basename(selection.spec)
+  const continuityTitle = 'Phase 2 managed runtime continuity › P2-G04: OpenAI-authenticated OpenCode tool turn survives web replacement in one native session'
+  if (spec === 'runtime-opencode-provider-qualification-rust.spec.ts'
+    || (spec === 'runtime-terminal-continuity-rust.spec.ts' && (!selection.grep || new RegExp(selection.grep).test(continuityTitle)))) {
+    const bootstrap = requireOpenCodeOnecliBootstrap(environment,
+      spec === 'runtime-opencode-provider-qualification-rust.spec.ts' ? 'OpenCode provider qualification' : 'P2-G04')
+    Object.assign(preset, { FRESHELL_BIND_HOST: '0.0.0.0',
+      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: bootstrap.authFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: bootstrap.environmentFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: bootstrap.caFile })
+  }
   return options => webFactory({ ...options, env: { ...options.env, ...preset } })
 }
 
