@@ -178,7 +178,7 @@ describe('createObservationEmitter', () => {
     session?: Record<string, unknown> | undefined
     tuiMessages?: unknown
     nativeMessages?: unknown
-    nativeRead?: () => Promise<unknown>
+    nativeRead?: (parameters: { sessionID: string; limit?: number }, options?: { throwOnError: true }) => Promise<unknown>
   } = {}) => {
     const sessionId = options.sessionId ?? rootSessionId
     const session = options.session === undefined
@@ -257,6 +257,39 @@ describe('createObservationEmitter', () => {
     })
     expect(JSON.stringify(refusal.mock.calls)).not.toContain('private')
     expect(writes).toHaveLength(0)
+  })
+  it.each(['empty-page', 'hydrated-page', 'page-load-failure'])('distinguishes the actual TUI limit100 read from empty synced state (%s)', async fault => {
+    const refusal = vi.fn()
+    const api = makeApi({ tuiMessages: [] })
+    const messages = [{ info: { id: tailMessageId, sessionID: rootSessionId }, parts: [] }]
+    const nativeRead = vi.fn(async (parameters: { sessionID: string; limit?: number }) => {
+      if (parameters.limit === 100) {
+        if (fault === 'page-load-failure') throw new Error('private native page failure')
+        return { data: fault === 'empty-page' ? [] : messages }
+      }
+      return { data: messages }
+    })
+    api.client.session.messages = nativeRead
+    await createObservationEmitter({ ...deps(), onRefusal: refusal })(api)
+    expect(refusal).toHaveBeenCalledOnce()
+    expect(refusal.mock.calls[0][0]).toMatchObject({ reason: 'tail_not_hydrated', nativeActiveMessageCount: 1,
+      tuiActiveMessageCount: 0, nativeTuiPageMessageCount: fault === 'page-load-failure' ? null : fault === 'empty-page' ? 0 : 1 })
+    expect(nativeRead.mock.calls.map(call => call[0])).toEqual([{ sessionID: rootSessionId }, { sessionID: rootSessionId, limit: 100 }])
+    expect(JSON.stringify(refusal.mock.calls)).not.toContain('private')
+    expect(writes).toHaveLength(0)
+  })
+  it('keeps a disposed pending TUI page diagnostic from publishing a late identity or refusal', async () => {
+    const signal = new AbortController(), refusal = vi.fn()
+    let release: (value: unknown) => void = () => {}
+    const pending = new Promise(resolve => { release = resolve })
+    const api = makeApi({ tuiMessages: [], nativeRead: async parameters => parameters.limit === 100 ? pending : {
+      data: [{ info: { id: tailMessageId, sessionID: rootSessionId }, parts: [] }],
+    } })
+    const nativeRead = vi.spyOn(api.client.session, 'messages')
+    const observing = createObservationEmitter({ ...deps(), signal: signal.signal, onRefusal: refusal })(api)
+    await vi.waitFor(() => expect(nativeRead).toHaveBeenCalledTimes(2))
+    signal.abort(); release({ data: [] }); await observing
+    expect(writes).toHaveLength(0); expect(refusal).not.toHaveBeenCalled()
   })
   it.each(['not-ready', 'root-load', 'history-load', 'tail', 'parts'])('records a bounded body-free current native refusal (%s)', async (fault) => {
     const refusal = vi.fn()

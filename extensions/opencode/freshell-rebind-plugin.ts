@@ -66,7 +66,7 @@ interface AdoptionTuiApi {
   }
   client?: {
       session?: {
-        get?: (parameters: { sessionID: string }, options: { throwOnError: true }) => Promise<unknown>
+        get?: (parameters: { sessionID: string; limit?: number }, options: { throwOnError: true }) => Promise<unknown>
         messages?: (
           parameters: { sessionID: string },
           options: { throwOnError: true },
@@ -103,6 +103,7 @@ export type NativeObservationRefusal = {
   reason: NativeRefusalReason
   nativeActiveMessageCount?: number
   tuiActiveMessageCount?: number
+  nativeTuiPageMessageCount?: number | null
 }
 
 export function extractSessionId(value: unknown): string | null {
@@ -471,7 +472,7 @@ export function createObservationEmitter(
   let lastRefusal: string | null = null
   let inFlight = false
   const refuse = (current: AdoptionExpectation, reason: NativeRefusalReason,
-    history?: { nativeActiveMessageCount: number; tuiActiveMessageCount: number }): void => {
+    history?: { nativeActiveMessageCount: number; tuiActiveMessageCount: number; nativeTuiPageMessageCount?: number | null }): void => {
     if (deps.signal?.aborted) return
     const record: NativeObservationRefusal = {
       severity: 'warning', event: 'runtime.opencode.native_observation_refused',
@@ -536,7 +537,20 @@ export function createObservationEmitter(
         } else {
           const history = { nativeActiveMessageCount: nativeActive.length, tuiActiveMessageCount: hydratedMessages.length }
           if (lastActiveMessageId(nativeActive, current.rootSessionId) !== current.tailMessageId) return refuse(current, 'native_tail_mismatch', history)
-          if (lastActiveMessageId(hydratedMessages, current.rootSessionId) !== current.tailMessageId) return refuse(current, 'tail_not_hydrated', history)
+          if (lastActiveMessageId(hydratedMessages, current.rootSessionId) !== current.tailMessageId) {
+            // The pinned TUI hydrates through this bounded V1 page. Its read
+            // result distinguishes native pagination from missing UI sync;
+            // it never substitutes for the actual hydrated state above.
+            let nativeTuiPageMessageCount: number | null = null
+            try {
+              const page = await api.client!.session!.messages!(
+                { sessionID: current.rootSessionId, limit: 100 }, { throwOnError: true },
+              )
+              nativeTuiPageMessageCount = nativeMessagesFromResult(page)?.length ?? null
+            } catch { /* A page read failure stays unobserved without exposing provider strings. */ }
+            if (deps.signal?.aborted) return
+            return refuse(current, 'tail_not_hydrated', { ...history, nativeTuiPageMessageCount })
+          }
           const tail = native.messages.find((row) => asRecord(asRecord(row)?.info)?.id === current.tailMessageId)
           const parts = asRecord(tail)?.parts as unknown[]
           if (parts.length) {
