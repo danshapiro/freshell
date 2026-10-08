@@ -1479,6 +1479,46 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('keeps the fixed chaos JSON artifacts with the owner and supplies actual candidate/run identity', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-chaos-json-'))
+    try {
+      const { owned, context, request } = fixture()
+      Object.assign(owned.runtime, { evidenceDir: directory, lifecyclePath: path.join(directory, 'lifecycle.jsonl') })
+      vi.spyOn(owned, 'assertCurrentHandle').mockResolvedValue(undefined)
+      const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'json-owned-soul',
+        incarnationId: 'json-owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'json-owned-boot', nativeSessionId: 'json-owned-native' }
+      const evidence = { providerEvents: { schemaVersion: 1, provider: 'opencode', nativeSessionId: handle.nativeSessionId,
+        observedMarker: 'transport fixture, no native qualification' },
+        assertions: { schemaVersion: 1, caseId: 'P5-G09', identity: { soulId: handle.soulId, incarnationId: handle.incarnationId,
+          containerId: handle.containerId, hostBootId: handle.hostBootId, nativeSessionId: handle.nativeSessionId },
+        candidateSha: 'caller-value', receiptRunId: 'caller-value', observations: ['transport fixture only'] } }
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+        await control(JSON.parse(String(init.body)))), { status: 200 }))
+      const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+      const references = await rig.publishChaosEvidence(handle, evidence)
+      const assertions = JSON.parse(await fsp.readFile(path.join(directory, 'phase5-chaos-assertions.json'), 'utf8'))
+      expect(assertions).toMatchObject({ candidateSha: context.candidateSha, receiptRunId: context.runId,
+        observations: evidence.assertions.observations })
+      for (const [fileName, artifactRef] of [['phase5-chaos-provider-events.json', references.providerEventsArtifactRef],
+        ['phase5-chaos-assertions.json', references.assertionsArtifactRef]]) {
+        const file = path.join(directory, fileName)
+        expect((await fsp.stat(file)).mode & 0o777).toBe(0o600)
+        expect(artifactRef).toBe(`${fileName.slice(0, -5)}:${createHash('sha256').update(await fsp.readFile(file)).digest('hex')}`)
+      }
+      expect(JSON.stringify(references)).not.toContain(directory)
+      const before = await fsp.readFile(path.join(directory, 'phase5-chaos-provider-events.json'))
+      await expect(control({ ...request, action: 'chaos-evidence', handle, chaosEvidence: {
+        ...evidence, providerEvents: { ...evidence.providerEvents, nativeSessionId: 'foreign-root' } } })).rejects.toThrow(/identity|root/)
+      await expect(control({ ...request, operationId: 'foreign-chaos-json-address', action: 'chaos-evidence', handle,
+        chaosEvidence: { ...evidence, assertions: { ...evidence.assertions, identity: { ...evidence.assertions.identity, hostBootId: 'foreign-boot' } } } })).rejects.toThrow(/identity|address/)
+      await expect(control({ ...request, operationId: 'foreign-chaos-json-path', action: 'chaos-evidence', handle,
+        chaosEvidence: evidence, filePath: '/foreign/evidence.json' })).rejects.toThrow(/operation/)
+      expect(await fsp.readFile(path.join(directory, 'phase5-chaos-provider-events.json'))).toEqual(before)
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
   it('creates synthetic history only for the registered OpenCode fixture and returns observed row identities', async () => {
     const owned = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3, {}, {}, 'test', {
       enabledProviders: [], freshAgentModes: ['freshopencode'], fixtureFreshAgentModes: ['freshopencode'],

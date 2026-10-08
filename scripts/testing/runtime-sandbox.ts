@@ -627,6 +627,19 @@ export const RuntimeChaosLogArtifactsSchema = z.object({
   browserArtifactRef: z.string().regex(/^phase5-chaos-browser-log:[a-f0-9]{64}$/),
 }).strict()
 export type RuntimeChaosLogArtifacts = z.infer<typeof RuntimeChaosLogArtifactsSchema>
+export const RuntimeChaosEvidenceSchema = z.object({
+  providerEvents: z.object({ schemaVersion: z.literal(1), provider: z.literal('opencode'), nativeSessionId: z.string().min(1) }).passthrough(),
+  assertions: z.object({ schemaVersion: z.literal(1), caseId: z.literal('P5-G09'), identity: z.object({
+    soulId: z.string().min(1), incarnationId: z.string().min(1), containerId: z.string().regex(/^[a-f0-9]{64}$/),
+    hostBootId: z.string().min(1), nativeSessionId: z.string().min(1),
+  }).passthrough() }).passthrough(),
+}).strict()
+export type RuntimeChaosEvidence = z.infer<typeof RuntimeChaosEvidenceSchema>
+export const RuntimeChaosEvidenceArtifactsSchema = z.object({
+  providerEventsArtifactRef: z.string().regex(/^phase5-chaos-provider-events:[a-f0-9]{64}$/),
+  assertionsArtifactRef: z.string().regex(/^phase5-chaos-assertions:[a-f0-9]{64}$/),
+}).strict()
+export type RuntimeChaosEvidenceArtifacts = z.infer<typeof RuntimeChaosEvidenceArtifactsSchema>
 
 export function writePrivateRuntimeChaosJsonl(filePath: string, rows: readonly RuntimeChaosLog[]): void {
   if (rows.length === 0) throw new Error('refusing to persist an empty chaos log')
@@ -666,7 +679,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
-    'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs',
+    'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence',
     'synthetic-history-challenge',
     'synthetic-source-facts',
     'synthetic-source-history', 'synthetic-source-exclusions',
@@ -690,6 +703,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   generation: z.number().int().nonnegative().optional(),
   phase3Browser: Phase3BrowserObservationSchema.optional(),
   chaosLogs: RuntimeChaosLogsSchema.optional(),
+  chaosEvidence: RuntimeChaosEvidenceSchema.optional(),
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
@@ -3321,6 +3335,28 @@ export class ManagedRuntimeOwner {
     const artifacts = { serverArtifactRef: `phase5-chaos-server-log:${createHash('sha256').update(fs.readFileSync(server)).digest('hex')}`,
       browserArtifactRef: `phase5-chaos-browser-log:${createHash('sha256').update(fs.readFileSync(browser)).digest('hex')}` }
     this.runtime.recordLifecycle('external.chaos_logs_published', { severity: 'info', ...artifacts })
+    return artifacts
+  }
+
+  async publishChaosEvidence(handle: ExactRuntimeHandle, input: RuntimeChaosEvidence): Promise<RuntimeChaosEvidenceArtifacts> {
+    await this.assertCurrentHandle(handle)
+    const evidence = RuntimeChaosEvidenceSchema.parse(input)
+    if (evidence.providerEvents.nativeSessionId !== handle.nativeSessionId) throw new Error('chaos provider root identity differs')
+    const identity = evidence.assertions.identity
+    if (identity.soulId !== handle.soulId || identity.incarnationId !== handle.incarnationId
+      || identity.containerId !== handle.containerId || identity.hostBootId !== handle.hostBootId
+      || identity.nativeSessionId !== handle.nativeSessionId) throw new Error('chaos observed address identity differs')
+    const { schemaVersion, ...observations } = evidence.assertions
+    const assertions = { schemaVersion, candidateSha: this.runtime.candidateSha, receiptRunId: this.runtime.runId, ...observations }
+    assertions.candidateSha = this.runtime.candidateSha
+    assertions.receiptRunId = this.runtime.runId
+    const provider = path.join(this.runtime.evidenceDir, 'phase5-chaos-provider-events.json')
+    const browser = path.join(this.runtime.evidenceDir, 'phase5-chaos-assertions.json')
+    writePrivateJson(provider, evidence.providerEvents)
+    writePrivateJson(browser, assertions)
+    const artifacts = { providerEventsArtifactRef: `phase5-chaos-provider-events:${createHash('sha256').update(fs.readFileSync(provider)).digest('hex')}`,
+      assertionsArtifactRef: `phase5-chaos-assertions:${createHash('sha256').update(fs.readFileSync(browser)).digest('hex')}` }
+    this.runtime.recordLifecycle('external.chaos_evidence_published', { severity: 'info', ...artifacts })
     return artifacts
   }
 

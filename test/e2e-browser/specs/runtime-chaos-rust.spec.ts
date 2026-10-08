@@ -12,8 +12,6 @@ import { expect, type Page } from '@playwright/test'
 import { sha256 } from '../../../scripts/testing/runtime-phase5-evidence-common.js'
 import {
   buildPhase5ChaosReceipt,
-  PHASE5_CHAOS_ASSERTIONS_FILE,
-  PHASE5_CHAOS_PROVIDER_EVENTS_FILE,
 } from '../../../scripts/testing/runtime-phase5-chaos-evidence.js'
 import { test } from '../helpers/fixtures.js'
 import {
@@ -29,7 +27,6 @@ import {
   nativeFollowUpMessageIds,
   nativeToolEvidence,
   structuredChaosLog,
-  writePrivateJson,
   type ChaosRuntimeObservation,
   type StructuredChaosLog,
 } from '../helpers/runtime-chaos-evidence.js'
@@ -442,7 +439,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         contentBytes: capturedServer.contentBytes, redacted: true,
       })
       await rig.publishChaosLogs(nativeHandle, { server: serverLogs, browser: browserLogs })
-      writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_CHAOS_PROVIDER_EVENTS_FILE), {
+      await rig.publishChaosEvidence(nativeHandle, { providerEvents: {
         schemaVersion: 1,
         provider: 'opencode',
         nativeSessionId: providerSessionId,
@@ -454,11 +451,8 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         },
         longTool: longToolEvidence,
         followUp: { messageIds: followUpMessageIds, completedCount: followUpMessageIds.length },
-      })
-      writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_CHAOS_ASSERTIONS_FILE), {
+      }, assertions: {
         schemaVersion: 1,
-        candidateSha: rig.runtime.candidateSha,
-        receiptRunId: rig.runtime.runId,
         caseId: 'P5-G09',
         test: { total: 1, passed: 1, failed: 0, skipped: 0 },
         identity: {
@@ -489,7 +483,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
           matchingNoticeIds,
         },
         followUp: { nativeMessageId: followUpMessageIds[0], completed: true },
-      })
+      } })
       receiptReady = true
     } finally {
       const cleanup = await rig.stop()
