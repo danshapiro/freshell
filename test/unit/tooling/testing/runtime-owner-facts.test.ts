@@ -264,8 +264,13 @@ describe('fixed fresh Codex controller startup facts', () => {
 
 describe('fixed owned session-host process state', () => {
   it('reads the exact tracked host PID and refuses absent or unobserved enclosures', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused host state web') })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused host state web') }, process.cwd(), 3,
+      {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     const enclosure = rig.runtimeEnclosureHandle(handle)
+    const current = { ...handle, ...enclosure }
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const signal = vi.spyOn(rig, 'signalOwnedSessionHostExact').mockReturnValue(process.pid)
+    const record = vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
     const container = vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: true, running: true })
     const pid = vi.spyOn(rig.runtime, 'ownedContainerHostPidExact').mockReturnValue(process.pid)
     await expect(rig.ownedRuntimeHostState(enclosure)).resolves.toEqual({ pid: process.pid, stopped: false })
@@ -286,9 +291,26 @@ describe('fixed owned session-host process state', () => {
 
     const read = vi.spyOn(fsp, 'readFile')
     try {
+      read.mockResolvedValueOnce('Name: unheld-host\nState:\tT (stopped)\n')
+      await rig.ownedRuntimeHostState(enclosure)
+      expect(record).not.toHaveBeenCalled()
+      await rig.holdRuntimeHost(current)
+      record.mockClear()
       read.mockResolvedValueOnce('Name: fixture-host\nState:\tT (stopped)\n')
       await expect(rig.ownedRuntimeHostState(enclosure)).resolves.toEqual({ pid: process.pid, stopped: true })
       expect(read).toHaveBeenCalledWith(`/proc/${process.pid}/status`, 'utf8')
+      expect(record).toHaveBeenCalledExactlyOnceWith('browser.owned_host_hold', {
+        containerId: current.containerId, incarnationId: current.incarnationId, pid: process.pid, state: 'T',
+      })
+      read.mockResolvedValueOnce('Name: fixture-host\nState:\tT (stopped)\n')
+      await rig.ownedRuntimeHostState(enclosure)
+      expect(record).toHaveBeenCalledTimes(1)
+      await rig.releaseRuntimeHost(current)
+      expect(signal).toHaveBeenLastCalledWith(current.containerId, current.incarnationId, 'SIGCONT', process.pid)
+      expect(record).toHaveBeenLastCalledWith('browser.owned_host_release', {
+        containerId: current.containerId, incarnationId: current.incarnationId, pid: process.pid,
+      })
+
       container.mockResolvedValue({ present: false, running: false })
       pid.mockClear(); read.mockClear()
       await expect(rig.ownedRuntimeHostState(enclosure)).rejects.toThrow(/running/)

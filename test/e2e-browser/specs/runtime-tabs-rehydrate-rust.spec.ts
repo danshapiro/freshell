@@ -378,7 +378,6 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         return state.stopped
       }).toBe(true)
       const heldAt = Date.now()
-      rig.runtime.recordLifecycle('browser.owned_host_hold', { ...heldHost, state: 'T' })
       const unavailableBaseline = sent.length
       const unavailable = await fetch(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${view.nativeSessionId}`, {
         headers: { 'x-auth-token': info.token },
@@ -470,7 +469,6 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         originalIdentity: canonicalIdentity, managedLaunch: launches[0], bothSourcesUnchanged: true }
       await rig.releaseRuntimeHost(rig.exactRuntimeHandle(view))
       const releasedAt = Date.now()
-      rig.runtime.recordLifecycle('browser.owned_host_release', heldHost)
       heldHost = undefined
       await expect.poll(async () => {
         const state = await rig.ownedRuntimeHostState(rig.runtimeEnclosureHandle(view))

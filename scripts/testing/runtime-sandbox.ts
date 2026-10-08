@@ -3117,6 +3117,7 @@ export class ManagedRuntimeOwner {
   private qualificationSupervisorBin: string | undefined
   private stopSettlement?: Promise<{ ok: boolean; errors: string[] }>
   private readonly heldHosts = new Map<string, { handle: ExactRuntimeHandle; pid: number }>()
+  private readonly recordedHistoryHolds = new Set<string>()
   private readonly nativeChallenges = new Map<string, { soulId: string; nativeSessionId: string; marker: string }>()
   private readonly providerProbes = new Map<string, { child?: ChildProcess; settlement: Promise<string> }>()
   private syntheticSource?: { source: SyntheticSource; root: string; nonce: string }
@@ -4226,12 +4227,25 @@ export class ManagedRuntimeOwner {
       handle.containerId, handle.hostBootId, handle.nativeSessionId])
   }
 
+  private savedHistoryHostLifecycleEnabled(): boolean {
+    return this.runtime.phase === 3 && this.enabledProviders.length === 0
+      && this.fixtureFreshAgentModes.length === 1 && this.fixtureFreshAgentModes[0] === 'freshcodex'
+  }
+
   async ownedRuntimeHostState(handle: RuntimeEnclosureHandle): Promise<RuntimeHostProcessState> {
     const container = await this.ownedContainerState(handle)
     if (!container.present || !container.running) throw new Error('exact recorded running enclosure required for host process state')
     const pid = this.runtime.ownedContainerHostPidExact(handle.containerId)
     const status = await fsp.readFile(`/proc/${pid}/status`, 'utf8')
-    return RuntimeHostProcessStateSchema.parse({ pid, stopped: /State:\s+T/.test(status) })
+    const state = RuntimeHostProcessStateSchema.parse({ pid, stopped: /State:\s+T/.test(status) })
+    const held = [...this.heldHosts.entries()].find(([, value]) => value.handle.containerId === handle.containerId
+      && value.handle.incarnationId === handle.incarnationId && value.handle.hostBootId === handle.hostBootId && value.pid === pid)
+    if (this.savedHistoryHostLifecycleEnabled() && state.stopped && held && !this.recordedHistoryHolds.has(held[0])) {
+      this.runtime.recordLifecycle('browser.owned_host_hold', { containerId: handle.containerId,
+        incarnationId: handle.incarnationId, pid, state: 'T' })
+      this.recordedHistoryHolds.add(held[0])
+    }
+    return state
   }
 
   async holdRuntimeHost(handle: ExactRuntimeHandle): Promise<{ pid: number }> {
@@ -4249,7 +4263,13 @@ export class ManagedRuntimeOwner {
     if (!held) throw new Error('exact recorded held host required')
     this.signalOwnedSessionHostExact(handle.containerId, handle.incarnationId, 'SIGCONT', held.pid)
     this.heldHosts.delete(key)
-    this.runtime.recordLifecycle('external.host_released', { severity: 'info', ...handle, pid: held.pid })
+    try {
+      this.runtime.recordLifecycle('external.host_released', { severity: 'info', ...handle, pid: held.pid })
+      if (this.savedHistoryHostLifecycleEnabled() && this.recordedHistoryHolds.has(key)) {
+        this.runtime.recordLifecycle('browser.owned_host_release', { containerId: handle.containerId,
+          incarnationId: handle.incarnationId, pid: held.pid })
+      }
+    } finally { this.recordedHistoryHolds.delete(key) }
   }
 
   async providerVolumeFacts(handle: ExactRuntimeHandle): Promise<{ providerVolumeName: string }> {
