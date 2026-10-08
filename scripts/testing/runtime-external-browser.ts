@@ -2004,6 +2004,24 @@ async function verifyExternalManagedTransport(descriptor: ManagedExternalDescrip
   throw new Error('owned HTTPS/WSS provenance and admission readiness failed')
 }
 
+const TABS_CASE_TITLES = [
+  'managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth',
+  'P4-G08: controller inventory reconstructs views without duplicating souls',
+] as const
+
+function tabsCaseSelections(selection: ExternalBrowserSelection): Array<ExternalBrowserSelection & { grep: string }> {
+  const fullTitles = TABS_CASE_TITLES.map(title => `Phase 4 managed-runtime tab rehydration › ${title}`)
+  const selected = TABS_CASE_TITLES.filter((_title, index) => !selection.grep || new RegExp(selection.grep).test(fullTitles[index]))
+  if (!selected.length) throw new Error('external browser selected zero requested tabs cases')
+  if (selection.grep) {
+    const patterns = /[()\\]/.test(selection.grep) ? [selection.grep] : selection.grep.split('|')
+    if (patterns.some(pattern => !fullTitles.some(title => new RegExp(pattern).test(title)))) {
+      throw new Error('external browser selected zero cases for a requested tabs title')
+    }
+  }
+  return selected.map(title => ({ ...selection, grep: title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }))
+}
+
 function selectsSyntheticSource(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv): boolean {
   const title = 'managed OpenCode source-to-soul resume › imports only the selected synthetic conversation and reopens under its native ID'
   return path.basename(selection.spec) === 'runtime-provider-resurrection-rust.spec.ts'
@@ -2043,17 +2061,24 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
   environment: NodeJS.ProcessEnv, webFactory: RuntimeWebFactory, retainedArtifacts = false): ManagedRuntimeOwner {
   const fixture = path.basename(selection.spec) === 'runtime-fresh-agent-fixture-rust.spec.ts'
   const smoke = path.basename(selection.spec) === 'runtime-external-target-smoke-rust.spec.ts'
-  const deterministic = fixture || smoke
+  const tabs = path.basename(selection.spec) === 'runtime-tabs-rehydrate-rust.spec.ts'
+  const tabsCases = tabs ? tabsCaseSelections(selection) : []
+  if (tabs && tabsCases.length !== 1) throw new Error('tabs cases require separate owned registrations')
+  const history = tabs && new RegExp(tabsCases[0].grep).test(TABS_CASE_TITLES[0])
+  const deterministic = fixture || smoke || history
   const sourceSelection = selectsSyntheticSource(selection, environment)
-  const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : smoke ? ['freshopencode'] : selection.mode ? [selection.mode] : []
+  const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : smoke ? ['freshopencode'] : history ? ['freshcodex'] : selection.mode ? [selection.mode] : []
   const providers = deterministic || selection.mode ? [] : selection.provider ? [selection.provider] : ['opencode']
   const phase = deterministic ? 3 : selection.provider || selection.mode ? 5
     : path.basename(selection.spec).includes('resurrection') ? 3
       : path.basename(selection.spec).includes('rehydrate') ? 4
         : /chaos|lost-soul/.test(selection.spec) ? 5 : 2
-  const supervisorEnv: Record<string, string> = fixture ? { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '250' } : {}
+  const supervisorEnv: Record<string, string> = fixture ? { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '250' } : history ? {
+    FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS: '5000', FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS: '10000',
+    FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000',
+  } : {}
   return new ManagedRuntimeOwner(createExternalManagedWebFactory(selection, environment, webFactory), root, phase,
-    {}, supervisorEnv, deterministic || sourceSelection || selectsPhase3Approval(selection, environment) ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
+    {}, supervisorEnv, deterministic || tabs || sourceSelection || selectsPhase3Approval(selection, environment) ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
       fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
       bootstrapProviders: deterministic || retainedArtifacts ? [] : sourceSelection ? ['opencode']
         : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
@@ -2211,8 +2236,21 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
 }
 
 export async function runExternalBrowserCli(args: readonly string[], environment: NodeJS.ProcessEnv = process.env,
-  owner: ExternalBrowserLifecycle = new ManagedExternalBrowserLifecycle(process.cwd(), environment), signal?: AbortSignal): Promise<ExternalBrowserCounts> {
-  return dispatchOwnedExternalBrowser(parseExternalBrowserArguments(args, environment), environment, owner, signal)
+  owner?: ExternalBrowserLifecycle, signal?: AbortSignal): Promise<ExternalBrowserCounts> {
+  const selection = parseExternalBrowserArguments(args, environment)
+  const selections = path.basename(selection.spec) === 'runtime-tabs-rehydrate-rust.spec.ts' ? tabsCaseSelections(selection) : [selection]
+  const counts: ExternalBrowserCounts = { selected: 0, executed: 0, passed: 0, failed: 0, skipped: 0, timedOut: 0 }
+  for (const selected of selections) {
+    const result = await dispatchOwnedExternalBrowser(selected, environment,
+      owner ?? new ManagedExternalBrowserLifecycle(process.cwd(), environment), signal)
+    counts.selected += result.selected
+    counts.executed += result.executed
+    counts.passed += result.passed
+    counts.failed += result.failed
+    counts.skipped += result.skipped
+    counts.timedOut += result.timedOut
+  }
+  return counts
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

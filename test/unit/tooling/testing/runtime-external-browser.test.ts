@@ -127,6 +127,24 @@ describe('selected production owner registration', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('preserves the saved-history registered fixture profile and observer preset', async () => {
+    const owned = runner.createExternalManagedRuntimeOwner(process.cwd(), {
+      spec: 'test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts', grep: 'already-live attach',
+    }, {}, () => { throw new Error('unused saved-history web') })
+    expect(owned.fixtureRegistrationFacts()).toEqual({ phase: 3, enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
+    const previous: SupervisorInstance = { scenarioId: 'history-owner', containerId: 'b'.repeat(64),
+      volumeName: 'owned-history-volume', controlSocket: '/owned/control.sock', controlSecret: 'fixture-test-secret',
+      controlSecretFile: '/owned/control-secret', runtimeRoot: '/owned/runtime', binaryKind: 'test' }
+    owned.supervisor = previous
+    vi.spyOn(owned.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+    vi.spyOn(owned.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    const launch = vi.spyOn(owned.runtime, 'startSupervisor').mockResolvedValue({ ...previous, containerId: 'c'.repeat(64) })
+    await owned.restartSupervisor()
+    expect(launch).toHaveBeenCalledWith(expect.objectContaining({ binaryKind: 'test', env: {
+      FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS: '5000', FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS: '10000',
+      FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000',
+    } }))
+  })
   it('preserves the all-mode fixture observer interval on an actual supervisor replacement', async () => {
     const owner = runner.createExternalManagedRuntimeOwner(process.cwd(), {
       spec: 'test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts',
@@ -205,6 +223,39 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     }
     return { owned, child, cases }
   }
+  it('executes both tabs owner profiles separately without losing either case', async () => {
+    const spec = 'test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts'
+    const cases = [
+      { id: 'saved-history', file: spec, title: 'Phase 4 managed-runtime tab rehydration › managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth' },
+      { id: 'rehydration', file: spec, title: 'Phase 4 managed-runtime tab rehydration › P4-G08: controller inventory reconstructs views without duplicating souls' },
+    ]
+    const owned = { start: vi.fn().mockResolvedValue(descriptor), list: vi.fn().mockResolvedValue(cases),
+      child: vi.fn(async (_command: string, args: string[]) => {
+        const grepIndex = args.indexOf('--grep')
+        const selected = cases.filter(row => grepIndex < 0 || new RegExp(args[grepIndex + 1]).test(row.title))
+        return { exitCode: 0, cases: selected.map(row => ({ ...row, status: 'passed' as const })) }
+      }), finish: vi.fn().mockResolvedValue({ ok: true, errors: [] }), abort: vi.fn().mockResolvedValue({ ok: true, errors: [] }) }
+    await expect(runner.runExternalBrowserCli(['--spec', spec], { FRESHELL_E2E_BACKEND: 'cloud' }, owned)).resolves.toEqual({
+      selected: 2, executed: 2, passed: 2, failed: 0, skipped: 0, timedOut: 0 })
+    expect(owned.start).toHaveBeenCalledTimes(2)
+    expect(owned.finish).toHaveBeenCalledTimes(2)
+    expect(owned.child).toHaveBeenCalledTimes(2)
+    expect(owned.finish.mock.invocationCallOrder[0]).toBeLessThan(owned.start.mock.invocationCallOrder[1])
+    expect(owned.child.mock.calls.every(call => call[1].includes('--grep'))).toBe(true)
+    const profiles = owned.start.mock.calls.map(([selection]) => runner.createExternalManagedRuntimeOwner(process.cwd(), selection, {}, () => { throw new Error('unused profile web') }).fixtureRegistrationFacts())
+    expect(profiles).toEqual([{ phase: 3, enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] },
+      { phase: 4, enabledProviders: ['opencode'], freshAgentModes: [], fixtureFreshAgentModes: [] }])
+    owned.start.mockClear()
+    await expect(runner.runExternalBrowserCli(['--spec', spec, '--grep', 'already-live attach|nonexistent requested title'],
+      { FRESHELL_E2E_BACKEND: 'cloud' }, owned)).rejects.toThrow(/zero/)
+    expect(owned.start).not.toHaveBeenCalled()
+    await expect(runner.runExternalBrowserCli(['--spec', spec, '--grep', 'P4-G08'], { FRESHELL_E2E_BACKEND: 'cloud' }, owned)).resolves.toMatchObject({ selected: 1, executed: 1, passed: 1 })
+    expect(owned.start).toHaveBeenCalledTimes(1)
+    owned.start.mockClear()
+    owned.finish.mockResolvedValueOnce({ ok: false, errors: ['owned fixture cleanup failure'] })
+    await expect(runner.runExternalBrowserCli(['--spec', spec], { FRESHELL_E2E_BACKEND: 'cloud' }, owned)).rejects.toThrow(/cleanup/)
+    expect(owned.start).toHaveBeenCalledTimes(1)
+  })
   it('lists first, executes the exact configured child and publishes counts only after owned cleanup', async () => {
     const { owned, child } = lifecycle()
     const receipt = await runner.dispatchOwnedExternalBrowser({ spec: smokeSpec }, { FRESHELL_E2E_BACKEND: 'cloud' }, owned)
