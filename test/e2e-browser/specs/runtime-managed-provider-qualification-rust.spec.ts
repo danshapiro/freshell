@@ -419,7 +419,7 @@ async function qualifyProvider(
   expect(claimAfterStop.globalConflictingClaimCount).toBe(0)
   const oldContainerRunningAfterStop = rig.runtime.isContainerRunning(afterProviderLoss.containerId!)
   expect(oldContainerRunningAfterStop).toBe(false)
-  expect(rig.runtime.broker.unsafeAttempts()).toHaveLength(0)
+  expect((await rig.ownershipFacts()).unsafeBrokerAttempts).toBe(0)
   const providerReceipt = rig.runtime.broker.receipts()
     .find((candidate) => candidate.containerId === afterProviderLoss.containerId)
   if (!providerReceipt?.providerVolumeName) throw new Error('stopped soul has no exact provider-volume receipt')
@@ -475,7 +475,7 @@ async function qualifyProvider(
       && (definition.provider !== 'opencode'
         || `${proof.resolvedProvider}/${proof.resolvedModel}` === definition.model)
     )),
-    releaseBinary: rig.supervisor.binaryKind === 'release',
+    releaseBinary: (await rig.ownershipFacts()).supervisorBinaryKind === 'release',
     nativeRecovery: true,
     exactNativeRecovery: afterHostLoss.nativeSessionId === nativeSessionId
       && afterProviderLoss.nativeSessionId === nativeSessionId,

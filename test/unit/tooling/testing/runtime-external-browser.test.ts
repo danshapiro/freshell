@@ -1571,6 +1571,37 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('observes current owner broker counts and supervisor identity without exposing receipts or secrets', async () => {
+    const { owned, context, request } = fixture()
+    owned.supervisor = { scenarioId: 'facts-owned', containerId: 'a'.repeat(64), controlSocket: '/owned/socket',
+      controlSecret: 'private-facts-control', controlSecretFile: '/owned/secret', runtimeRoot: '/owned/runtime',
+      volumeName: 'owned-facts-volume', binaryKind: 'release' }
+    const receipt: BrokerReceipt = { containerId: 'b'.repeat(64), soulId: 'facts-soul', incarnationId: 'facts-incarnation',
+      createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: '/private/facts/runtime' }
+    const receipts = [receipt]
+    const attempts: string[] = []
+    Object.assign(owned.runtime, { broker: { receipts: () => receipts, unsafeAttempts: () => attempts } })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const wire: unknown[] = []
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      const reply = await control(JSON.parse(String(init.body)))
+      wire.push(reply)
+      return new Response(JSON.stringify(reply), { status: 200 })
+    })
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.ownershipFacts()).resolves.toEqual({ receiptCount: 1, unsafeBrokerAttempts: 0,
+      supervisorContainerId: owned.supervisor.containerId, supervisorBinaryKind: 'release' })
+    receipts.push({ ...receipt, containerId: 'e'.repeat(64) })
+    attempts.push('private unsafe attempt fixture')
+    owned.supervisor = { ...owned.supervisor, containerId: 'f'.repeat(64), binaryKind: 'test' }
+    await expect(rig.ownershipFacts()).resolves.toEqual({ receiptCount: 2, unsafeBrokerAttempts: 1,
+      supervisorContainerId: owned.supervisor.containerId, supervisorBinaryKind: 'test' })
+    expect(JSON.stringify(wire)).not.toContain('private')
+    expect(JSON.stringify(wire)).not.toContain('facts-soul')
+    await expect(control({ ...request, action: 'ownership-facts', containerId: '0'.repeat(64) })).rejects.toThrow(/operation/)
+    owned.supervisor = { ...owned.supervisor, containerId: 'short-container' }
+    await expect(owned.ownershipFacts()).rejects.toThrow()
+  })
   it('runs the closed Phase3 effect operations over the same pre-native enclosure', async () => {
     const { owned, context, request } = fixture()
     const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',

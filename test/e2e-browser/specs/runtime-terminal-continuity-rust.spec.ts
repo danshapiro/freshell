@@ -224,7 +224,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         hostBootId: initialView.hostBootId,
         childPid,
       }
-      const receiptCount = rig.runtime.broker.receipts().length
+      const receiptCount = (await rig.ownershipFacts()).receiptCount
       let outputAdvanced = false
       let lastHeartbeat = Number(seeded.match(/P2_HEARTBEAT:(\d+)/g)?.at(-1)?.split(':')[1] ?? -1)
 
@@ -245,7 +245,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         expect(view?.incarnationId).toBe(originalIdentity.incarnationId)
         expect(view?.containerId).toBe(originalIdentity.containerId)
         expect(view?.hostBootId).toBe(originalIdentity.hostBootId)
-        expect(rig.runtime.broker.receipts()).toHaveLength(receiptCount)
+        expect((await rig.ownershipFacts()).receiptCount).toBe(receiptCount)
         expect(rig.ownedContainerHasPid(originalIdentity.containerId, childPid)).toBe(true)
 
         const failWithDiagnostics = async (error: unknown): Promise<never> => {

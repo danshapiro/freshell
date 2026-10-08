@@ -706,7 +706,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(claimAfterStop.globalConflictingClaimCount).toBe(0)
       const oldContainerRunningAfterStop = rig.runtime.isContainerRunning(afterProviderCrash.containerId!)
       expect(oldContainerRunningAfterStop).toBe(false)
-      expect(rig.runtime.broker.unsafeAttempts()).toHaveLength(0)
+      expect((await rig.ownershipFacts()).unsafeBrokerAttempts).toBe(0)
 
       providerRow = {
         provider: 'opencode',
@@ -764,7 +764,7 @@ test.describe.serial('OpenCode provider qualification', () => {
           oldContainerRunningAfterStop,
         },
         followUpCompleted: providerFollowUpCompleted,
-        releaseBinary: rig.supervisor.binaryKind === 'release',
+        releaseBinary: (await rig.ownershipFacts()).supervisorBinaryKind === 'release',
       }
       expect((providerRow.nonceRecovery as { recalledNonce: boolean }).recalledNonce).toBe(true)
       expect(providerRow.onlyOneWriter).toBe(true)

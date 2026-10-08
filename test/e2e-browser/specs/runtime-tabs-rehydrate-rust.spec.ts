@@ -350,7 +350,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         .split('\n').filter(Boolean).map((line) => JSON.parse(line))
       // Finish healthy preparation before starting this owned controller's
       // first observation window. Its startup must reattach the original host.
-      const oldControllerId = rig.supervisor.containerId
+      const oldControllerId = (await rig.ownershipFacts()).supervisorContainerId
       const oldControlEpoch = await rig.controlEpoch()
       const controllerSentBaseline = sent.length
       const controllerRestartStartedAt = Date.now()
@@ -378,8 +378,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(controllerReady.data).toMatchObject({ controlEpoch: controllerHealth.control_epoch,
         installationId: controllerHealth.installation_id })
       expect(controllerReady.data.controlEpoch).toBeGreaterThan(oldControlEpoch)
-      expect(rig.supervisor.containerId).not.toBe(oldControllerId)
-      const controllerReattachment = { oldControllerId, currentControllerId: rig.supervisor.containerId,
+      expect((await rig.ownershipFacts()).supervisorContainerId).not.toBe(oldControllerId)
+      const controllerReattachment = { oldControllerId, currentControllerId: (await rig.ownershipFacts()).supervisorContainerId,
         oldControlEpoch, currentControlEpoch: controllerReady.data.controlEpoch, controllerRestartStartedAt,
         controllerReady, startupFinished, reattached, completedAt: Date.now() }
       rig.runtime.recordLifecycle('browser.owned_controller_reattached', controllerReattachment)
@@ -818,7 +818,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       if (!compatibilitySoul?.terminalCreateRequestId || !compatibilitySoul?.terminalId) {
         throw new Error('compatibility soul lacks durable terminal/create identity')
       }
-      const receiptCountBefore = rig.runtime.broker.receipts().length
+      const receiptCountBefore = (await rig.ownershipFacts()).receiptCount
       oldClient = await RawWsClient.connect(info.baseUrl, info.token)
       oldClient.send({
         type: 'terminal.create',
@@ -837,7 +837,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         'compatibility terminal.created',
       )
       expect(createdReply.terminalId).toBe(compatibilitySoul.terminalId)
-      expect(rig.runtime.broker.receipts()).toHaveLength(receiptCountBefore)
+      expect((await rig.ownershipFacts()).receiptCount).toBe(receiptCountBefore)
       expect(latestSoul(await rig.inventorySnapshot(), compatibilitySoulId)?.launchState).toBe('running')
 
       const finalState = await browserState(page)
@@ -877,7 +877,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
           ),
           stopAgentStopsRuntime: stopOutcome.soul.launchState === 'stopped',
           oldClientNoDuplicate: createdReply.terminalId === compatibilitySoul.terminalId
-            && rig.runtime.broker.receipts().length === receiptCountBefore,
+            && (await rig.ownershipFacts()).receiptCount === receiptCountBefore,
           initialSoulIds,
           expectedTabIds,
           expectedPaneIds,

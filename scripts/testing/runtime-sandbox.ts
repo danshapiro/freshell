@@ -716,6 +716,11 @@ export const RuntimeFreshAgentReceiptArtifactsSchema = z.object({
   rowCount: z.number().int().positive(), artifactRefs: z.array(z.string().regex(/^fresh-agent-qualification:[a-f0-9]{64}$/)).nonempty(),
 }).strict()
 export type RuntimeFreshAgentReceiptArtifacts = z.infer<typeof RuntimeFreshAgentReceiptArtifactsSchema>
+export const RuntimeOwnershipFactsSchema = z.object({
+  receiptCount: z.number().int().nonnegative(), unsafeBrokerAttempts: z.number().int().nonnegative(),
+  supervisorContainerId: z.string().regex(/^[a-f0-9]{64}$/), supervisorBinaryKind: z.enum(['test', 'release']),
+}).strict()
+export type RuntimeOwnershipFacts = z.infer<typeof RuntimeOwnershipFactsSchema>
 const OPENCODE_LOSS_ABSENCE_SCRIPT = String.raw`
 const fs = require('node:fs');
 const target = process.argv[1];
@@ -784,7 +789,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
     'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
@@ -3156,6 +3161,11 @@ export class ManagedRuntimeOwner {
     const health = await this.runtime.adminOk(this.supervisor, { method: 'health' })
     const data = this.dataOf(health, 'health')
     return data.controlEpoch ?? data.control_epoch
+  }
+  async ownershipFacts(): Promise<RuntimeOwnershipFacts> {
+    return RuntimeOwnershipFactsSchema.parse({ receiptCount: this.runtime.broker.receipts().length,
+      unsafeBrokerAttempts: this.runtime.broker.unsafeAttempts().length,
+      supervisorContainerId: this.supervisor.containerId, supervisorBinaryKind: this.supervisor.binaryKind })
   }
 
   async incidentMatchesSoul(handle: ExactRuntimeHandle, incidentId: string): Promise<boolean> {
