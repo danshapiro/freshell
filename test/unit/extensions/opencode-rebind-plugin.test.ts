@@ -2,7 +2,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import plugin, {
   createEmitter,
@@ -812,6 +812,49 @@ describe('default export (TuiPluginModule)', () => {
     vi.unstubAllEnvs()
   })
 
+  it('records current native read and busy wake timing without publishing unqualified identity', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'freshell-native-opencode-progress-'))
+    const root = 'ses_progressroot1'
+    const launch = { incarnationId: 'incarnation-progress1', launchNonce: 'launch-progress1', evidenceRevision: 4,
+      executionGeneration: 2, requestedNativeSessionId: root }
+    const directory = join(home, '.freshell/native-identity', launch.launchNonce)
+    vi.stubEnv('HOME', home)
+    vi.stubEnv('FRESHELL_NATIVE_IDENTITY_LAUNCH', JSON.stringify(launch))
+    vi.stubEnv('FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR', directory)
+    const session = { id: root, parentID: null }
+    let finish!: (value: unknown) => void
+    const pending = new Promise(resolve => { finish = resolve })
+    const get = vi.fn(() => pending)
+    const renderers: Record<string, (context: unknown, props: unknown) => unknown> = {}
+    const abort = new AbortController()
+    const progress = (stage: string) => JSON.parse(readFileSync(join(directory, 'opencode-native-diagnostics', stage + '.json'), 'utf8'))
+    try {
+      plugin.tui({ state: { ready: true, session: { get: () => session, messages: () => [] } },
+        client: { session: { get, messages: async () => ({ data: [] }) } },
+        route: { current: { name: 'session', params: { sessionID: root } } },
+        slots: { register: ({ slots }: { slots: typeof renderers }) => { Object.assign(renderers, slots) } },
+        lifecycle: { signal: abort.signal } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(get).toHaveBeenCalledOnce()
+      expect(progress('native_read_pending')).toMatchObject({ severity: 'info', nativeSessionId: root,
+        incarnationId: launch.incarnationId, launchNonce: launch.launchNonce, evidenceRevision: 4, executionGeneration: 2,
+        trigger: 'initial' })
+      await vi.advanceTimersByTimeAsync(75)
+      expect(renderers.session_prompt({}, {})).toBeNull()
+      const busy = progress('in_flight')
+      expect(busy.trigger).toBe('session_prompt')
+      expect(busy.observedAtMs).toBe(Date.now())
+      expect(busy.elapsedMs).toBe(75)
+      expect(existsSync(join(directory, 'opencode-loaded.json'))).toBe(false)
+      finish({ error: 'private transcript or provider error', data: { ...session, id: 'ses_otherroot1' } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(progress('native_read_settled').observedAtMs).toBe(Date.now())
+      expect(progress('refused')).toMatchObject({ severity: 'warning', reason: 'native_root_load_failed' })
+      expect(existsSync(join(directory, 'opencode-loaded.json'))).toBe(false)
+      expect(JSON.stringify(progress('refused'))).not.toContain('private transcript or provider error')
+    } finally { abort.abort(); rmSync(home, { recursive: true, force: true }) }
+  })
+
   it.each(['create', 'resume'])('observes managed nonadoption native %s before input through the actual TUI loader', async (mode) => {
     const home = mkdtempSync(join(tmpdir(), 'freshell-native-opencode-'))
     const root = 'ses_nativeroot1'
@@ -846,6 +889,20 @@ describe('default export (TuiPluginModule)', () => {
       expect(existsSync(file)).toBe(true)
       expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ launch,
         native: { session_id: root, parent_id: null, hydrated: true, messages_read: 'empty_confirmed', active_message_count: 0 } })
+      const diagnostics = join(dirname(file), 'opencode-native-diagnostics')
+      const publication = JSON.parse(readFileSync(join(diagnostics, 'publication_succeeded.json'), 'utf8'))
+      expect(publication).toMatchObject({ severity: 'info', nativeSessionId: root,
+        incarnationId: launch.incarnationId, launchNonce: launch.launchNonce, observedAtMs: Date.now() })
+      expect(existsSync(join(diagnostics, 'native_create_settled.json'))).toBe(mode === 'create')
+      if (mode === 'create') {
+        const created = JSON.parse(readFileSync(join(diagnostics, 'native_create_settled.json'), 'utf8'))
+        expect(created.nativeSessionId).toBe(root)
+        expect(created.observedAtMs).toBeLessThanOrEqual(publication.observedAtMs)
+      }
+      abort.abort()
+      const publishedDiagnostics = readdirSync(diagnostics).map(name => readFileSync(join(diagnostics, name), 'utf8'))
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(readdirSync(diagnostics).map(name => readFileSync(join(diagnostics, name), 'utf8'))).toEqual(publishedDiagnostics)
       const legacy = join(home, '.freshell/session-signals/opencode')
       expect(readdirSync(legacy).map(name => JSON.parse(readFileSync(join(legacy, name), 'utf8')))).toEqual([
         { hello: true, source: 'opencode-tui-plugin' },

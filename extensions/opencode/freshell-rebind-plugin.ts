@@ -690,10 +690,27 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
   } catch { return async () => {} }
   const write = deps.writeFile ?? defaultWriteFile
   let root = launch.requestedNativeSessionId
+  const now = deps.now ?? Date.now
   let createAttempted = false
   let inFlight = false
   let lastEvidence: string | null = null
   let lastRefusal: string | undefined
+  type ProgressStage = 'in_flight' | 'native_create_pending' | 'native_create_settled'
+    | 'native_read_pending' | 'native_read_settled' | 'refused' | 'publication_succeeded'
+  // Retain each last actual phase under this launch, including busy renderer
+  // wake-ups. These body-free diagnostics never serve as identity evidence.
+  const progress = (stage: ProgressStage, reason?: string): void => {
+    if (deps.signal?.aborted) return
+    try {
+      defaultWriteFile(join(directory, 'opencode-native-diagnostics'), stage, JSON.stringify({
+        event: 'runtime.opencode.native_loader_progress', severity: reason ? 'warning' : 'info', stage,
+        observedAtMs: now(), terminalId: deps.env.FRESHELL_TERMINAL_ID ?? null,
+        nativeSessionId: root, incarnationId: launch.incarnationId, launchNonce: launch.launchNonce,
+        evidenceRevision: launch.evidenceRevision, executionGeneration: launch.executionGeneration,
+        inFlight, ...(reason ? { reason } : {}), ...(deps.wakeContext?.() ?? {}),
+      }))
+    } catch { /* Reporting failure cannot release input or change native state. */ }
+  }
   const withdraw = (reason: string): void => {
     if (lastEvidence === null) return
     try {
@@ -706,6 +723,7 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
   deps.signal?.addEventListener('abort', () => withdraw('disposed'), { once: true })
   const refuse = (reason: string): void => {
     withdraw(reason)
+    progress('refused', reason)
     if (deps.signal?.aborted || reason === lastRefusal) return
     try {
       write(directory, 'opencode-refused', JSON.stringify({
@@ -718,7 +736,8 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
     } catch { /* Reporting cannot admit input or break the native renderer. */ }
   }
   return async (apiValue: unknown): Promise<void> => {
-    if (deps.signal?.aborted || inFlight) return
+    if (deps.signal?.aborted) return
+    if (inFlight) { progress('in_flight'); return }
     inFlight = true
     try {
       const api = asRecord(apiValue) as unknown as AdoptionTuiApi | null
@@ -729,12 +748,14 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
         if (createAttempted) return refuse('native_create_unconfirmed')
         if (typeof create !== 'function' || typeof navigate !== 'function') return refuse('native_create_api_unavailable')
         createAttempted = true
+        progress('native_create_pending')
         const response = asRecord(await create.call(api.client!.session, {}, { throwOnError: true }))
         if (deps.signal?.aborted) return
         const created = asRecord(response?.data)
         if (response?.error || typeof created?.id !== 'string' || !SESSION_ID_RE.test(created.id)
           || !sessionIsExactRoot(created, created.id)) return refuse('native_create_unconfirmed')
         root = created.id
+        progress('native_create_settled')
         navigate.call(api.route, 'session', { sessionID: root })
       }
       if (currentRouteSessionId(api.route?.current) !== root) return refuse('route_not_selected')
@@ -742,8 +763,10 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
       const messages = api.state?.session?.messages
       if (typeof get !== 'function' || typeof messages !== 'function') return refuse('tui_session_api_unavailable')
       if (!sessionIsExactRoot(get(root), root)) return refuse('tui_root_not_loaded')
+      progress('native_read_pending')
       const native = await readNativeHistory(api, root)
       if (deps.signal?.aborted) return
+      progress('native_read_settled')
       if ('failure' in native) return refuse(native.failure)
       const selected = asRecord(get(root))
       if (api.state?.ready !== true || currentRouteSessionId(api.route?.current) !== root
@@ -767,6 +790,7 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
       } })
       if (evidence !== lastEvidence) write(directory, 'opencode-loaded', evidence)
       lastEvidence = evidence
+      progress('publication_succeeded')
     } catch { refuse('native_loader_or_publication_failed') }
     finally { inFlight = false }
   }
