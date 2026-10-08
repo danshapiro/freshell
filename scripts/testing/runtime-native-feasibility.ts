@@ -32,12 +32,18 @@ if not native.is_file() or native.is_symlink() or hashlib.sha256(native.read_byt
  raise RuntimeError('pinned original SDK child differs')
 args=sys.argv[1:]
 owned=re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/(freshclaude|kilroy)-wrong-id-workspace',os.getcwd())
-if owned and '--resume' in args:
+roots=[]
+if owned:
+ for index,arg in enumerate(args):
+  if arg=='--resume':
+   if index+1>=len(args):raise RuntimeError('native resume argument missing')
+   roots.append(args[index+1])
+  elif arg.startswith('--resume='):roots.append(arg.split('=',1)[1])
+if owned and roots:
  launch=json.loads(os.environ.get('FRESHELL_NATIVE_IDENTITY_LAUNCH','{}'))
- index=args.index('--resume')
- if index+1>=len(args) or not launch.get('launchNonce') or not launch.get('incarnationId'):
-  raise RuntimeError('current owned SDK resume binding missing')
- root=args[index+1];uuid.UUID(root)
+ if len(roots)!=1 or not launch.get('launchNonce') or not launch.get('incarnationId'):
+  raise RuntimeError('current owned SDK resume binding missing or ambiguous')
+ root=roots[0];uuid.UUID(root)
  if launch.get('requestedNativeSessionId')!=root:raise RuntimeError('owned SDK requested resume root differs')
  if '--fork-session' not in args:args.append('--fork-session')
 os.execv(str(native),[str(native),*args])
@@ -46,6 +52,12 @@ os.execv(str(native),[str(native),*args])
 // Finite negative image only: use the real observed native acknowledgement,
 // then fault exactly its projected ID before the existing Rust normalizer and
 // native receiver. Never substitute these frames for positive identity proof.
+export function nativeResumeRootInArgv(argv: readonly string[], root: string): boolean {
+  const roots = argv.flatMap((arg, index) => arg === '--resume' ? [argv[index + 1]]
+    : arg.startsWith('--resume=') ? [arg.slice('--resume='.length)] : [])
+  return roots.length === 1 && roots[0] === root
+}
+
 export function stageSdkInitFieldFault(source: string): string {
   const original = String.raw`emit({ type: 'sdk.session.init', sessionId, cliSessionId: observation.nativeSessionId,
         cwd: observation.native.cwd, model: req.model, nativeIdentityEvidence: {
@@ -579,7 +591,7 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
         && fault.launch.requestedNativeSessionId === view.nativeSessionId
         && fault.launch.incarnationId !== view.incarnationId && fault.launch.launchNonce !== namespace.hook.launch.launchNonce
         && fault.uid === 65534 && fault.gid === 0 && fault.nativeExecutableSha256 === namespace.executableSha256
-        && fault.nativeArgv.includes('--fork-session') && fault.nativeArgv.includes('--resume')
+        && fault.nativeArgv.includes('--fork-session') && nativeResumeRootInArgv(fault.nativeArgv, view.nativeSessionId)
       const retained = fault.originalPrefixSha256 === before.transcript.sha256
         && JSON.stringify(fault.identity) === JSON.stringify(before.transcript.identity.slice(0, 2))
       const blocked = recovery.result?.Ok?.data?.outcome === 'blocked' && current.length > 0
@@ -755,7 +767,8 @@ async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervis
   const original={caseId,ownerId:harness.runId,candidateSha:harness.candidateSha,imageDigest:harness.imageRef,
     nativeVersion:namespace.version,executableSha256:namespace.executableSha256,
     profileSha256:createHash('sha256').update(JSON.stringify({settings,nativeProfile:namespace.profileFiles})).digest('hex'),
-    artifactReferences:[`${scenario}-pre-fault-native-private.json`,`${scenario}-launch.json`,`${scenario}-current-inventory.json`,`${scenario}-input-refusal.json`],
+    artifactReferences:[`${scenario}-pre-fault-native-private.json`,`${scenario}-launch.json`,`${scenario}-current-inventory.json`,`${scenario}-input-refusal.json`,
+      ...(fieldFault ? [`${scenario}-native-field-normalized-private.json`, `${scenario}-sdk-init-field-image-private.json`] : [])],
     assertions:[{name:'actual-default-sdk-child-normal-uid-tls-current-launch',pass:actualNamespace},
       {name:'actual-native-startup-fault-remains-unobserved',pass:nativeFault},
       {name:'native-fault-refuses-running-current-observation-and-input',pass:!!input.result.Err},

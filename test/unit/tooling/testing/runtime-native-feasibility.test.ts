@@ -8,7 +8,7 @@ import { createServer } from 'node:net'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -80,7 +80,11 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(fs.existsSync(path.join(directory, 'amplifier-current-native-turn-workspace'))).toBe(false)
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['ordinary-create','ordinary-resume','owned-fork','owned-duplicate','wrong-root','missing-launch','wrong-pin'])('executes only the fixed owned SDK resume-fork fault (%s)', (fault) => {
+  it.each(['split','sdk-inline','wrong-root','duplicate','missing','lookalike'])('correlates the exact actual native resume argv root (%s)', form=>{
+    const root=randomUUID(),argv=form==='split'?['--resume',root]:form==='sdk-inline'?['--resume='+root]:form==='wrong-root'?['--resume='+randomUUID()]:form==='duplicate'?['--resume',root,'--resume='+root]:form==='missing'?['--resume']:['--resume-session-at='+root]
+    expect(nativeResumeRootInArgv(argv,root)).toBe(form==='split'||form==='sdk-inline')
+  })
+  it.each(['split','sdk-inline'].flatMap(form=>['ordinary-create','ordinary-resume','owned-fork','owned-duplicate','wrong-root','missing-launch','wrong-pin'].map(fault=>({form,fault}))))('executes only the fixed owned SDK resume-fork fault $form/$fault', ({form,fault}) => {
     const root=path.join('/tmp/frs',randomUUID().slice(0,12));const workspace=path.join(root,'freshclaude-'+(fault==='ordinary-resume'?'exact-resume':'wrong-id')+'-workspace')
     fs.mkdirSync(workspace,{recursive:true,mode:0o700})
     const native=path.join(root,'native-child'),wrapper=path.join(root,'wrapper.py'),requested=randomUUID()
@@ -89,13 +93,25 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     const staged=nativeSdkResumeForkWrapper.replaceAll('/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude.native',native)
       .replace('73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916',fault==='wrong-pin'?'0'.repeat(64):expected)
     fs.writeFileSync(wrapper,staged)
-    const argv=fault==='ordinary-create'?['--model','selected-model']:['--resume',requested,'--model','selected-model',...(fault==='owned-duplicate'?['--fork-session']:[])]
+    const argv=fault==='ordinary-create'?['--model','selected-model']:[...(form==='sdk-inline'?['--resume='+requested]:['--resume',requested]),'--model','selected-model',...(fault==='owned-duplicate'?['--fork-session']:[])]
     const env={...process.env};delete env.FRESHELL_NATIVE_IDENTITY_LAUNCH
     if(fault!=='missing-launch')env.FRESHELL_NATIVE_IDENTITY_LAUNCH=JSON.stringify({launchNonce:'current-nonce',incarnationId:'current-incarnation',requestedNativeSessionId:fault==='wrong-root'?randomUUID():requested})
     try {
       const run=()=>execFileSync('python3',[wrapper,...argv],{cwd:workspace,env,encoding:'utf8',stdio:['pipe','pipe','pipe']})
       if(fault==='wrong-root'||fault==='missing-launch'||fault==='wrong-pin')expect(run).toThrow()
       else expect(JSON.parse(run())).toEqual(fault==='owned-fork'?[...argv,'--fork-session']:argv)
+    } finally {fs.rmSync(root,{recursive:true,force:true})}
+  })
+  it.each(['ambiguous-root','missing-root','ordinary-malformed'])('fences ambiguous owned SDK resume and preserves ordinary argv (%s)',fault=>{
+    const root=path.join('/tmp/frs',randomUUID().slice(0,12)),workspace=path.join(root,`kilroy-${fault==='ordinary-malformed'?'exact-resume':'wrong-id'}-workspace`)
+    fs.mkdirSync(workspace,{recursive:true});const child=path.join(root,'child'),wrapper=path.join(root,'wrapper.py'),requested=randomUUID()
+    fs.writeFileSync(child,'#!/usr/bin/python3\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n',{mode:0o700});fs.chmodSync(child,0o700)
+    fs.writeFileSync(wrapper,nativeSdkResumeForkWrapper.replaceAll('/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude.native',child).replace('73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916',createHash('sha256').update(fs.readFileSync(child)).digest('hex')))
+    const argv=fault==='ambiguous-root'?['--resume='+requested,'--resume',requested]:['--resume']
+    try {
+      const run=()=>execFileSync('python3',[wrapper,...argv],{cwd:workspace,env:{...process.env,FRESHELL_NATIVE_IDENTITY_LAUNCH:JSON.stringify({launchNonce:'current',incarnationId:'current',requestedNativeSessionId:requested})},encoding:'utf8',stdio:['pipe','pipe','pipe']})
+      if(fault==='ordinary-malformed')expect(JSON.parse(run())).toEqual(argv)
+      else expect(run).toThrow()
     } finally {fs.rmSync(root,{recursive:true,force:true})}
   })
   it.each(['default-home','selected-config','foreign-store','changed-file'])('executes native fork observation against the actual selected owned store (%s)', (fault) => {
@@ -679,6 +695,7 @@ const fs={readdirSync:()=>['71'],readFileSync:(file)=>{if(file.endsWith('native-
     try {
       const original=await executeManagedNativeCase(harness,[...['env_file','ca_file'].map(suffix=>({name:'claude/grants/'+suffix,path:path.join(directory,suffix),sha256:'e'.repeat(64)})),{name:'claude/native-fault/sdk-init-fields.json',path:markerFile,sha256:createHash('sha256').update(fs.readFileSync(markerFile)).digest('hex')}],{mode,case:'startup'},caseId)
       expect(original.assertions.every(item=>item.pass)).toBe(true)
+      expect(original.artifactReferences).toContain(`${mode}-${caseId}-native-field-normalized-private.json`)
     } finally {fs.rmSync(directory,{recursive:true,force:true})}
   })
   it.each(['image','pin','sdk','original-publisher','patched-publisher','installed-publisher','installed-sdk'])('rejects incomplete native field image admission before launch (%s)',async fault=>{
