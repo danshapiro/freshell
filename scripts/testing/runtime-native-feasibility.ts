@@ -1330,6 +1330,23 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
   return original
 }
 
+export const amplifierWrongRootInspection = String.raw`
+import os,json,pathlib,hashlib,importlib.metadata as m,sys
+os.chdir(sys.argv[1]);actual_root,nonce=sys.argv[2:]
+from types import SimpleNamespace
+from amplifier_app_cli.freshell_native_resume import load_native
+slug=str(pathlib.Path.cwd().resolve()).replace('/', '-').replace(chr(92), '-').replace(':', '')
+if not slug.startswith('-'):slug='-'+slug
+directory=pathlib.Path('/home/freshell/provider/.amplifier/projects')/slug/'sessions'/actual_root
+assert directory.is_dir() and not directory.is_symlink()
+for name in ['transcript.jsonl','metadata.json']:
+ assert (directory/name).is_file() and not (directory/name).is_symlink()
+loaded,metadata=load_native(SimpleNamespace(base_dir=directory.parent),actual_root)
+p=pathlib.Path('/opt/amplifier-src/.venv/bin/amplifier');producer=pathlib.Path('/opt/amplifier-src/amplifier_app_cli/freshell_native_resume.py')
+signal=pathlib.Path('/home/freshell/provider/.freshell/native-identity')/nonce/'amplifier-loaded-context.json'
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'executableSha256':hashlib.sha256(p.read_bytes()).hexdigest(),'producerSha256':hashlib.sha256(producer.read_bytes()).hexdigest(),'cliVersion':m.version('amplifier-app-cli'),'coreVersion':m.version('amplifier-core'),'signalAbsent':not signal.exists(),'nativeRoot':metadata['session_id'],'parentId':metadata.get('parent_id'),'messageCount':len(loaded),'load':loaded.native_load_witness}))
+`
+
 async function executeManagedAmplifier(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath: string | undefined,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[]): Promise<NativeExperimentOriginal> {
@@ -1456,16 +1473,7 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
       throw new Error('current actual Amplifier wrong native root evidence missing or stale')
     }
     const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-      ['/opt/amplifier-src/.venv/bin/python', '-c', String.raw`
-import os,json,pathlib,hashlib,importlib.metadata as m,sys
-os.chdir(sys.argv[1]);actual_root,nonce=sys.argv[2:]
-from amplifier_app_cli.session_store import SessionStore
-from amplifier_app_cli.freshell_native_resume import load_native
-loaded,metadata=load_native(SessionStore(),actual_root)
-p=pathlib.Path('/opt/amplifier-src/.venv/bin/amplifier');producer=pathlib.Path('/opt/amplifier-src/amplifier_app_cli/freshell_native_resume.py')
-signal=pathlib.Path('/home/freshell/provider/.freshell/native-identity')/nonce/'amplifier-loaded-context.json'
-print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'executableSha256':hashlib.sha256(p.read_bytes()).hexdigest(),'producerSha256':hashlib.sha256(producer.read_bytes()).hexdigest(),'cliVersion':m.version('amplifier-app-cli'),'coreVersion':m.version('amplifier-core'),'signalAbsent':not signal.exists(),'nativeRoot':metadata['session_id'],'parentId':metadata.get('parent_id'),'messageCount':len(loaded),'load':loaded.native_load_witness}))
-`, workspace, actualRoot, launch.launchNonce]))
+      ['/opt/amplifier-src/.venv/bin/python', '-c', amplifierWrongRootInspection, workspace, actualRoot, launch.launchNonce]))
     harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
     if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
       || !namespace.readOnlyRoot || namespace.cliVersion !== '0.1.1' || namespace.coreVersion !== '1.6.0'

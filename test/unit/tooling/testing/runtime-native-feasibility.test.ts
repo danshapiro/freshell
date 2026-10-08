@@ -8,7 +8,7 @@ import { createServer } from 'node:net'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -171,6 +171,42 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
           : 'current actual Amplifier wrong native root evidence missing or stale')
         expect(records.has('amplifier-wrong-root-original.json')).toBe(false)
       }
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+  it.each(['exact', 'wrong-project', 'symlink'])('inspects only the exact owned Amplifier root without constructing a store under Docker default HOME (%s)', (fault) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-readonly-root-'))
+    const packageRoot = path.join(directory, 'native'), pkg = path.join(packageRoot, 'amplifier_app_cli')
+    const home = path.join(directory, 'provider'), defaultHome = path.join(directory, 'unused-default-home')
+    const root = randomUUID(), store = path.join(home, '.amplifier', 'projects', fault === 'wrong-project' ? 'foreign-project' : directory.replaceAll('/', '-'), 'sessions', root)
+    fs.mkdirSync(pkg, { recursive: true }); fs.mkdirSync(store, { recursive: true })
+    fs.mkdirSync(path.join(packageRoot, '.venv', 'bin'), { recursive: true })
+    fs.writeFileSync(path.join(packageRoot, '.venv', 'bin', 'amplifier'), 'fixture native console')
+    const patch = fs.readFileSync(path.join(process.cwd(), 'extensions/amplifier/freshell-native-resume.patch'), 'utf8')
+    const section = patch.split('+++ b/amplifier_app_cli/freshell_native_resume.py\n')[1]!.split('--- a/amplifier_app_cli/runtime/config.py')[0]!
+    fs.writeFileSync(path.join(pkg, 'freshell_native_resume.py'), section.split('\n').filter(line => line.startsWith('+')).map(line => line.slice(1)).join('\n') + '\n')
+    fs.writeFileSync(path.join(pkg, 'session_store.py'), 'class SessionStore:\n def __init__(self):raise RuntimeError("inspection must not create a SessionStore")\n')
+    for (const [name, version] of [['amplifier-app-cli', '0.1.1'], ['amplifier-core', '1.6.0']]) {
+      const dist = path.join(packageRoot, name.replaceAll('-', '_') + '-' + version + '.dist-info'); fs.mkdirSync(dist)
+      fs.writeFileSync(path.join(dist, 'METADATA'), `Name: ${name}\nVersion: ${version}\n`)
+    }
+    fs.writeFileSync(path.join(store, 'metadata.json'), JSON.stringify({ session_id: root, parent_id: null }))
+    fs.writeFileSync(path.join(store, 'transcript.jsonl'), '')
+    if (fault === 'symlink') {
+      const metadata = path.join(store, 'metadata.json'); fs.renameSync(metadata, path.join(directory, 'foreign-metadata.json'))
+      fs.symlinkSync(path.join(directory, 'foreign-metadata.json'), metadata)
+    }
+    const script = amplifierWrongRootInspection.replaceAll('/opt/amplifier-src', packageRoot).replaceAll('/home/freshell/provider', home)
+    try {
+      const read = () => execFileSync('python3', ['-c', script, directory, root, 'current-nonce'], {
+        encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, HOME: defaultHome, PYTHONPATH: packageRoot },
+      })
+      if (fault !== 'exact') { expect(read).toThrow('AssertionError'); expect(fs.existsSync(defaultHome)).toBe(false); return }
+      const result = JSON.parse(read())
+      expect(result.nativeRoot).toBe(root); expect(result.parentId).toBeNull()
+      expect(result.messageCount).toBe(0); expect(result.signalAbsent).toBe(true)
+      expect(result.load.transcript.path).toBe(path.join(store, 'transcript.jsonl'))
+      expect(fs.existsSync(defaultHome)).toBe(false)
+      expect(fs.readFileSync(path.join(store, 'transcript.jsonl'), 'utf8')).toBe('')
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
   it.each(['matching', 'wrong-root', 'parent-root', 'missing-root'])('executes the pinned Amplifier producer with current native root diagnostics (%s)', (fault) => {
