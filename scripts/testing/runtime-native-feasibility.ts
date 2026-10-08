@@ -767,10 +767,12 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     }
   }
   const { freshAgent, ...commonParameters } = request.params
-  const terminalEffortArgs = ['-c', 'model_reasoning_effort="low"']
+  // The isolated image owns the native pin; an upstream update dialog must
+  // not consume input before the provider's no-input resume acknowledgement.
+  const terminalProfileArgs = ['-c', 'model_reasoning_effort="low"', '-c', 'check_for_update_on_startup=false']
   const selectedRequest = terminal ? { method: 'launch', params: { ...commonParameters,
     terminal: { terminalId: 'native-terminal-' + randomUUID(), streamId: 'native-stream-' + randomUUID(),
-      mode: 'codex', program: 'codex', args: ['--model', settings.model, ...terminalEffortArgs],
+      mode: 'codex', program: 'codex', args: ['--model', settings.model, ...terminalProfileArgs],
       env: { HOME: '/home/freshell/provider', TERM: 'xterm-256color' }, cwd: workspace, workspacePath: workspace,
       runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
       providerModel: settings.model, providerReasoningEffort: 'low', providerPermissionMode: 'on-request', providerSandbox: 'workspace-write',
