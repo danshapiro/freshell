@@ -74,6 +74,40 @@ export function stageSdkInitFieldFault(source: string): string {
       emit(nativeInit)`)
 }
 
+export function nativeSdkInitFieldFaultMatches(mode: NativeMode, caseId: string, receipt: any, namespace: any, actor: any): boolean {
+  if (!['freshclaude', 'kilroy'].includes(mode) || !['missing-native-id', 'placeholder-id'].includes(caseId)
+    || receipt?.mode !== mode || receipt.caseId !== caseId || !namespace?.hook || !Array.isArray(actor?.events)) return false
+  const launch = namespace.nativeLaunch, frame = receipt.frame
+  const sameLaunch = (actual: any) => !!actual && !!launch
+    && ['incarnationId', 'launchNonce', 'evidenceRevision', 'executionGeneration', 'requestedNativeSessionId']
+      .every(key => actual[key] === launch[key])
+  const root = receipt.actualNativeSessionId
+  if (typeof root !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(root)
+    || namespace.nativeRoot !== root || namespace.hook.native?.session_id !== root
+    || namespace.hook.native?.source !== 'startup' || !sameLaunch(namespace.hook.launch)
+    || !launch?.incarnationId || !launch.launchNonce || launch.requestedNativeSessionId !== null
+    || !Number.isSafeInteger(launch.evidenceRevision) || launch.evidenceRevision < 1
+    || !Number.isSafeInteger(launch.executionGeneration) || launch.executionGeneration < 1
+    || frame?.type !== 'sdk.session.init' || typeof frame.sessionId !== 'string' || !frame.sessionId
+    || frame.sessionId === root || namespace.hook.native.cwd !== frame.cwd
+    || actor.profile?.cwd !== frame.cwd || actor.profile?.provider !== (mode === 'kilroy' ? 'kilroy' : 'claude')
+    || actor.profile?.nativeSessionId !== null || actor.events.some((entry: any) => entry.event?.kind === 'started')) return false
+  const evidenceMatches = (event: any) => sameLaunch(event?.nativeIdentityEvidence?.launch)
+    && /^[a-f0-9]{64}$/i.test(namespace.hookSha256 ?? '')
+    && event.nativeIdentityEvidence.digest === namespace.hookSha256
+    && event.nativeIdentityEvidence.source === namespace.hook.native.source
+    && Number.isSafeInteger(event.nativeIdentityEvidence.queryGeneration) && event.nativeIdentityEvidence.queryGeneration > 0
+  const fieldMatches = (event: any) => caseId === 'missing-native-id'
+    ? !Object.prototype.hasOwnProperty.call(event, 'cliSessionId')
+    : event.cliSessionId === frame.sessionId && !/^[a-f0-9-]{36}$/i.test(event.cliSessionId)
+  if (!evidenceMatches(frame) || !fieldMatches(frame)) return false
+  const normalized = actor.events.filter((entry: any) => entry.event?.kind === 'provider')
+    .map((entry: any) => entry.event.data?.payload?.event).filter((event: any) => event?.type === 'freshAgent.session.init')
+  return normalized.length === 1 && normalized.every((event: any) => evidenceMatches(event) && fieldMatches(event)
+    && event.sessionId === frame.sessionId && event.cwd === frame.cwd && event.model === frame.model
+    && event.nativeIdentityEvidence.queryGeneration === frame.nativeIdentityEvidence.queryGeneration)
+}
+
 export function staleNativeSignalBindingMatches(captured: any, priorLaunch: any, currentLaunch: any, root: string): boolean {
   return captured.hooksDisabled === true && captured.hook?.native.session_id === root
     && captured.loaded?.native.session_id === root
@@ -353,6 +387,21 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
     }
   }
   if (wrongId && !sdkForkImage) throw new Error('owned SDK native resume-fork fault image required')
+  const fieldFault = ['missing-native-id', 'placeholder-id'].includes(caseId)
+  const fieldSource = sources.find(file => file.name === 'claude/native-fault/sdk-init-fields.json')
+  let sdkFieldImage: any
+  if (fieldSource) {
+    sdkFieldImage = JSON.parse(fs.readFileSync(fieldSource.path, 'utf8'))
+    const publisher = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '../../crates/freshell-claude-sidecar/index.mjs'), 'utf8')
+    if (sdkFieldImage.kind !== 'owned-sdk-native-init-field-fault-image' || sdkFieldImage.imageDigest !== harness.imageRef
+      || sdkFieldImage.originalExecutableSha256 !== '73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916'
+      || sdkFieldImage.sdkVersion !== '0.3.237'
+      || sdkFieldImage.originalPublisherSha256 !== createHash('sha256').update(publisher).digest('hex')
+      || sdkFieldImage.patchedPublisherSha256 !== createHash('sha256').update(stageSdkInitFieldFault(publisher)).digest('hex')) {
+      throw new Error('owned SDK native init-field fault image binding differs')
+    }
+  }
+  if (fieldFault && !sdkFieldImage) throw new Error('owned SDK native init-field fault image required')
   const mode = selection.mode!
   const logicalProvider = mode === 'kilroy' ? 'kilroy' : 'claude'
   const family = 'claude'
@@ -374,6 +423,17 @@ print(json.dumps({'wrapperSha256':hashlib.sha256(file.read_bytes()).hexdigest(),
     if (actual.wrapperSha256 !== sdkForkImage.wrapperSha256 || actual.originalExecutableSha256 !== sdkForkImage.originalExecutableSha256
       || actual.sdkVersion !== '0.3.237') throw new Error('actual SDK native fault image differs before input')
   }
+  if (sdkFieldImage) {
+    const actual = JSON.parse(await harness.execOwnedContainerExact(supervisor.containerId, ['python3', '-c', String.raw`
+import pathlib,hashlib,json
+base=pathlib.Path('/opt/freshell-claude-sidecar')
+print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').read_bytes()).hexdigest(),'sdkVersion':json.loads((base/'node_modules/@anthropic-ai/claude-agent-sdk/package.json').read_text())['version']}))
+`]))
+    harness.writeArtifact(`${scenario}-sdk-init-field-image-private.json`, actual)
+    if (actual.patchedPublisherSha256 !== sdkFieldImage.patchedPublisherSha256 || actual.sdkVersion !== '0.3.237') {
+      throw new Error('actual SDK native init-field fault image differs before input')
+    }
+  }
   const workspace = path.join(harness.testRoot, scenario + '-workspace')
   fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
   if (caseId === 'crash-before-checkpoint' || caseId === 'effect-before-observation') {
@@ -389,10 +449,14 @@ print(json.dumps({'wrapperSha256':hashlib.sha256(file.read_bytes()).hexdigest(),
     fs.chmodSync(path.join(directory, 'settings.json'), 0o660)
   }
   const startupFault = ['missing-native-id', 'placeholder-id', 'disabled-hooks', 'timeout-50s', 'provider-exit', 'stop-cancellation'].includes(caseId)
-  if (startupFault) {
+  if (startupFault && !fieldFault) {
     const local = path.join(workspace, '.claude'); fs.mkdirSync(local, { mode: 0o770 }); fs.chmodSync(local, 0o770)
     const file = path.join(local, 'settings.json')
     fs.writeFileSync(file, JSON.stringify({ disableAllHooks: true }), { mode: 0o660 }); fs.chmodSync(file, 0o660)
+  }
+  if (fieldFault) {
+    const control = path.join(workspace, 'native-init-field-fault-control.json')
+    fs.writeFileSync(control, JSON.stringify({ mode, caseId }), { mode: 0o660 }); fs.chmodSync(control, 0o660)
   }
   if (wrongId || restorationFailure) {
     const local = path.join(workspace, '.claude'); fs.mkdirSync(local, { mode: 0o770 }); fs.chmodSync(local, 0o770)
@@ -597,7 +661,8 @@ async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervis
   request: any, caseId: string, scenario: string, settings: unknown, sdkForkImage = false): Promise<NativeExperimentOriginal> {
   const soulId = request.params.soulId
   const began = Date.now()
-  let finished = false, reply: any, error: unknown, namespace: any, receipt: any
+  let finished = false, reply: any, error: unknown, namespace: any, receipt: any, fieldReceipt: any, actor: any
+  const fieldFault = ['missing-native-id', 'placeholder-id'].includes(caseId)
   const pending = harness.adminRaw(supervisor, request).then(
     (value) => { reply = value; finished = true },
     (failure) => { error = failure; finished = true },
@@ -612,8 +677,20 @@ async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervis
     receipt = harness.broker.receipts().find((owned) => owned.soulId === soulId)
     if (receipt) {
       try {
+        if (fieldFault) {
+          const file = path.join(request.params.freshAgent.cwd, 'native-init-field-fault-observation.json')
+          if (fs.lstatSync(file).isSymbolicLink() || fs.statSync(file).size > 64 * 1024) throw new Error('owned native field receipt differs')
+          fieldReceipt = JSON.parse(fs.readFileSync(file, 'utf8'))
+        }
         namespace = JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId,'65534:0',
-          ['python3','-c',claudeNativeInspection,request.params.nativeSessionId??'', 'false','fresh', caseId==='wrong-id'?'wrong-id':'disabled-hooks', ...(sdkForkImage ? ['sdk-fork-image'] : [])]))
+          ['python3','-c',claudeNativeInspection,fieldFault ? fieldReceipt.actualNativeSessionId : request.params.nativeSessionId??'', 'false','fresh', fieldFault?'ordinary':caseId==='wrong-id'?'wrong-id':'disabled-hooks', ...(sdkForkImage ? ['sdk-fork-image'] : [])]))
+        if (fieldFault) {
+          actor = JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId, '0:0', ['python3', '-c',
+            "import pathlib,json;file=pathlib.Path('/run/freshell-host-actor/fresh-agent-state.json');raw=file.read_bytes();assert len(raw)<=32*1024*1024;print(json.dumps(json.loads(raw)))"]))
+          if (!nativeSdkInitFieldFaultMatches(request.params.freshAgent.sessionType, caseId, fieldReceipt, namespace, actor)) {
+            throw new Error('actual normalized SDK native field refusal unavailable')
+          }
+        }
         break
       } catch (failure) {attempts.push(String(failure))}
     }
@@ -627,12 +704,13 @@ async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervis
     throw new Error('genuine current unobserved SDK child unavailable before startup fault')
   }
   harness.writeArtifact(`${scenario}-pre-fault-native-private.json`,namespace)
-  const hookSetting=caseId==='wrong-id' ? {} : JSON.parse(fs.readFileSync(path.join(request.params.freshAgent.cwd,'.claude/settings.json'),'utf8'))
+  if (fieldFault) harness.writeArtifact(`${scenario}-native-field-normalized-private.json`, { fieldReceipt, actor })
+  const hookSetting=caseId==='wrong-id'||fieldFault ? {} : JSON.parse(fs.readFileSync(path.join(request.params.freshAgent.cwd,'.claude/settings.json'),'utf8'))
   const actualNamespace=namespace.uid===65534 && namespace.gid===0 && namespace.caps==='0000000000000000'
     && namespace.readOnlyRoot && namespace.httpsStatus===200 && namespace.tlsVerifyMode===2 && namespace.tlsCheckHostname
     && namespace.version.startsWith('2.1.237') && namespace.nativeCwd===request.params.freshAgent.cwd
     && namespace.completedTurns===0 && namespace.toolEvents===0
-  const nativeFault=caseId==='wrong-id' ? !!namespace.hook && namespace.hook.native.session_id!==request.params.nativeSessionId
+  const nativeFault=fieldFault ? nativeSdkInitFieldFaultMatches(request.params.freshAgent.sessionType,caseId,fieldReceipt,namespace,actor) : caseId==='wrong-id' ? !!namespace.hook && namespace.hook.native.session_id!==request.params.nativeSessionId
     && JSON.stringify(namespace.hook.launch)===JSON.stringify(namespace.nativeLaunch)
     : namespace.hook===null && namespace.nativeRoot===null && hookSetting.disableAllHooks===true
   if (!actualNamespace || !nativeFault) {await pending;throw new Error('genuine native SDK pin/profile/identity fault differs')}
@@ -1927,7 +2005,7 @@ last_text=''.join(part.get('text','') for part in (assistants[-1].get('message',
 preferences=json.loads((home/'.claude.json').read_text()) if terminal else None
 native_preferences={key:preferences.get(key) for key in ['theme','hasCompletedOnboarding']} if preferences else None
 if native_preferences is not None:native_preferences['workspaceTrust']=preferences.get('projects',{}).get(str(cwd),{}).get('hasTrustDialogAccepted')
-print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':hook['native']['session_id'] if hook else None,'hook':hook,'loaded':loaded,'hooksDisabled':settings.get('disableAllHooks'),'nativeLaunch':json.loads(env['FRESHELL_NATIVE_IDENTITY_LAUNCH']),'signalDirectory':str(signal_dir),'signalWritable':os.access(signal_dir,os.W_OK),'signalMode':oct(signal_dir.stat().st_mode&0o777) if signal_dir.exists() else None,'nativeArgv':native_argv,'nativeCwd':str((p/'cwd').resolve()),'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'nativePreferences':native_preferences,'completedTurns':len(completed_ids),'toolEvents':tool_events,'lastAssistantText':last_text,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':hook['native']['session_id'] if hook else None,'hook':hook,'hookSha256':hashlib.sha256(hook_file.read_bytes()).hexdigest() if hook else None,'loaded':loaded,'hooksDisabled':settings.get('disableAllHooks'),'nativeLaunch':json.loads(env['FRESHELL_NATIVE_IDENTITY_LAUNCH']),'signalDirectory':str(signal_dir),'signalWritable':os.access(signal_dir,os.W_OK),'signalMode':oct(signal_dir.stat().st_mode&0o777) if signal_dir.exists() else None,'nativeArgv':native_argv,'nativeCwd':str((p/'cwd').resolve()),'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'nativePreferences':native_preferences,'completedTurns':len(completed_ids),'toolEvents':tool_events,'lastAssistantText':last_text,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
 `
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

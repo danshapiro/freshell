@@ -8,7 +8,7 @@ import { createServer } from 'node:net'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -551,7 +551,7 @@ const fs={readdirSync:()=>['71'],readFileSync:(file)=>{if(file.endsWith('native-
       adminOk:async()=>({data:[{soulId,launchState:fault==='running'?'running':'starting',nativeIdentityObservation:fault==='observation'?{}:null}]}),
     } as unknown as RuntimeHarness
     try {
-      const run=executeManagedNativeCase(harness,['env_file','ca_file'].map(suffix=>({name:'claude/grants/'+suffix,path:path.join(directory,suffix),sha256:'e'.repeat(64)})),{mode:'freshclaude',case:'startup'},'missing-native-id')
+      const run=executeManagedNativeCase(harness,['env_file','ca_file'].map(suffix=>({name:'claude/grants/'+suffix,path:path.join(directory,suffix),sha256:'e'.repeat(64)})),{mode:'freshclaude',case:'startup'},'disabled-hooks')
       if(fault==='valid')expect((await run).assertions.every(assertion=>assertion.pass)).toBe(true)
       else await expect(run).rejects.toThrow(fault==='admitted'?'admitted ordinary input':fault==='running'||fault==='observation'?'published Running or identity':'pin/profile/identity fault differs')
     } finally {fs.rmSync(directory,{recursive:true,force:true})}
@@ -621,8 +621,97 @@ const fs={readdirSync:()=>['71'],readFileSync:(file)=>{if(file.endsWith('native-
       expect(launch).toHaveBeenCalledOnce()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it.each(['freshclaude','kilroy'].flatMap(mode => ['missing-native-id','placeholder-id'].flatMap(caseId =>
+    ['valid','wrong-mode','wrong-case','wrong-actual-root','missing-hook','wrong-digest','stale-launch','placeholder-native-uuid','wrong-local-key','filled-profile','started','sdk-only','stale-generation']
+      .map(fault => ({ mode: mode as 'freshclaude'|'kilroy', caseId, fault })))))('binds actual normalized native field refusal $mode/$caseId/$fault', ({mode,caseId,fault}) => {
+    const launch={incarnationId:'inc-current',launchNonce:'nonce-current',evidenceRevision:3,executionGeneration:4,requestedNativeSessionId:null}
+    const frame:any={type:'sdk.session.init',sessionId:'actual-sidecar-local-key',cwd:'/owned/workspace',model:'selected',nativeIdentityEvidence:{launch,digest:'d'.repeat(64),source:'startup',queryGeneration:1}}
+    if(caseId==='placeholder-id')frame.cliSessionId=frame.sessionId
+    const namespace:any={nativeRoot:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',hook:{launch,native:{session_id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',source:'startup',cwd:frame.cwd}},hookSha256:'d'.repeat(64),nativeLaunch:launch}
+    const receipt:any={mode,caseId,actualNativeSessionId:namespace.nativeRoot,frame}
+    const normalized={...frame,type:'freshAgent.session.init'}
+    const actor:any={profile:{provider:mode==='kilroy'?'kilroy':'claude',cwd:frame.cwd,nativeSessionId:null},events:[{sequence:1,event:{kind:'provider',data:{payload:{type:'freshAgent.event',event:normalized}}}}]}
+    if(fault==='wrong-mode')receipt.mode=mode==='kilroy'?'freshclaude':'kilroy'
+    if(fault==='wrong-case')receipt.caseId='disabled-hooks'
+    if(fault==='wrong-actual-root')receipt.actualNativeSessionId='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    if(fault==='missing-hook')namespace.hook=null
+    if(fault==='wrong-digest')namespace.hookSha256='e'.repeat(64)
+    if(fault==='stale-launch')namespace.nativeLaunch={...launch,launchNonce:'nonce-old'}
+    if(fault==='placeholder-native-uuid') {frame.cliSessionId=namespace.nativeRoot;normalized.cliSessionId=namespace.nativeRoot}
+    if(fault==='wrong-local-key') {frame.cliSessionId='other-local';normalized.cliSessionId='other-local'}
+    if(fault==='filled-profile')actor.profile.nativeSessionId=namespace.nativeRoot
+    if(fault==='started')actor.events.push({sequence:2,event:{kind:'started',data:{native_session_id:namespace.nativeRoot}}})
+    if(fault==='sdk-only')normalized.type='sdk.session.init'
+    if(fault==='stale-generation')frame.nativeIdentityEvidence.queryGeneration=0
+    expect(nativeSdkInitFieldFaultMatches(mode,caseId,receipt,namespace,actor)).toBe(fault==='valid')
+  })
+  it.each(['freshclaude','kilroy'].flatMap(mode=>['missing-native-id','placeholder-id'].map(caseId=>({mode:mode as 'freshclaude'|'kilroy',caseId}))))('executes the enabled-hook normalized field refusal route $mode/$caseId', async ({mode,caseId})=>{
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'native-field-route-'))
+    const publisher=fs.readFileSync('crates/freshell-claude-sidecar/index.mjs','utf8')
+    const marker={kind:'owned-sdk-native-init-field-fault-image',imageDigest,sdkVersion:'0.3.237',originalExecutableSha256:'73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916',originalPublisherSha256:createHash('sha256').update(publisher).digest('hex'),patchedPublisherSha256:createHash('sha256').update(stageSdkInitFieldFault(publisher)).digest('hex')}
+    const markerFile=path.join(directory,'field-image.json');fs.writeFileSync(markerFile,JSON.stringify(marker))
+    let soulId='',finish:(reply:any)=>void
+    const launch={incarnationId:'inc-current',launchNonce:'nonce-current',evidenceRevision:3,executionGeneration:4,requestedNativeSessionId:null}
+    const namespace:any={uid:65534,gid:0,caps:'0000000000000000',readOnlyRoot:true,httpsStatus:200,tlsVerifyMode:2,tlsCheckHostname:true,
+      version:'2.1.237',nativeCwd:'',nativeRoot:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',hookSha256:'d'.repeat(64),nativeLaunch:launch,nativePid:37,completedTurns:0,toolEvents:0,executableSha256:'c'.repeat(64),profileFiles:[]}
+    let actor:any
+    const harness={testRoot:directory,runId:ownerId,candidateSha,imageRef:imageDigest,startSupervisor:async()=>({containerId:'owned-supervisor'}),writeArtifact:()=>'',inventoryBody:()=>({method:'inventory'}),
+      execOwnedContainerExact:async()=>JSON.stringify(marker),broker:{receipts:()=>[{soulId,containerId:'owned-container'}]},
+      execOwnedContainerAsExact:async(_container:string,uid:string)=>{if(uid==='0:0'){queueMicrotask(()=>finish({result:{Err:{code:'HOST_UNREACHABLE'}}}));return JSON.stringify(actor)}return JSON.stringify(namespace)},
+      adminRaw:async(_supervisor:unknown,request:any)=>{
+        if(request.method==='launch'){
+          soulId=request.params.soulId;const cwd=request.params.freshAgent.cwd
+          expect(fs.existsSync(path.join(cwd,'.claude/settings.json'))).toBe(false)
+          expect(JSON.parse(fs.readFileSync(path.join(cwd,'native-init-field-fault-control.json'),'utf8'))).toEqual({mode,caseId})
+          namespace.nativeCwd=cwd;namespace.hook={launch,native:{session_id:namespace.nativeRoot,source:'startup',cwd}}
+          const frame:any={type:'sdk.session.init',sessionId:'actual-local-sidecar-key',cwd,model:'selected',nativeIdentityEvidence:{launch,digest:namespace.hookSha256,source:'startup',queryGeneration:1}}
+          if(caseId==='placeholder-id')frame.cliSessionId=frame.sessionId
+          fs.writeFileSync(path.join(cwd,'native-init-field-fault-observation.json'),JSON.stringify({mode,caseId,actualNativeSessionId:namespace.nativeRoot,frame}))
+          actor={profile:{cwd,provider:mode==='kilroy'?'kilroy':'claude',nativeSessionId:null},events:[{sequence:1,event:{kind:'provider',data:{payload:{type:'freshAgent.event',event:{...frame,type:'freshAgent.session.init'}}}}}]}
+          return new Promise(resolve=>{finish=resolve})
+        }
+        if(request.method!=='fresh_agent_send')throw new Error('unexpected native field operation')
+        return {result:{Err:{code:'UNKNOWN_SOUL'}}}
+      },adminOk:async()=>({data:[{soulId,launchState:'starting',nativeIdentityObservation:null}]})
+    } as unknown as RuntimeHarness
+    try {
+      const original=await executeManagedNativeCase(harness,[...['env_file','ca_file'].map(suffix=>({name:'claude/grants/'+suffix,path:path.join(directory,suffix),sha256:'e'.repeat(64)})),{name:'claude/native-fault/sdk-init-fields.json',path:markerFile,sha256:createHash('sha256').update(fs.readFileSync(markerFile)).digest('hex')}],{mode,case:'startup'},caseId)
+      expect(original.assertions.every(item=>item.pass)).toBe(true)
+    } finally {fs.rmSync(directory,{recursive:true,force:true})}
+  })
+  it.each(['image','pin','sdk','original-publisher','patched-publisher','installed-publisher','installed-sdk'])('rejects incomplete native field image admission before launch (%s)',async fault=>{
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'native-field-image-'))
+    const publisher=fs.readFileSync('crates/freshell-claude-sidecar/index.mjs','utf8')
+    const marker:any={kind:'owned-sdk-native-init-field-fault-image',imageDigest,sdkVersion:'0.3.237',originalExecutableSha256:'73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916',originalPublisherSha256:createHash('sha256').update(publisher).digest('hex'),patchedPublisherSha256:createHash('sha256').update(stageSdkInitFieldFault(publisher)).digest('hex')}
+    const installed={...marker}
+    if(fault==='image')marker.imageDigest='sha256:'+'0'.repeat(64)
+    if(fault==='pin')marker.originalExecutableSha256='0'.repeat(64)
+    if(fault==='sdk')marker.sdkVersion='0.0.0'
+    if(fault==='original-publisher')marker.originalPublisherSha256='0'.repeat(64)
+    if(fault==='patched-publisher')marker.patchedPublisherSha256='0'.repeat(64)
+    if(fault==='installed-publisher')installed.patchedPublisherSha256='0'.repeat(64)
+    if(fault==='installed-sdk')installed.sdkVersion='0.0.0'
+    const file=path.join(directory,'image.json');fs.writeFileSync(file,JSON.stringify(marker))
+    const launch=vi.fn(),start=vi.fn(async()=>({containerId:'owned-supervisor'}))
+    const harness={testRoot:directory,imageRef:imageDigest,startSupervisor:start,execOwnedContainerExact:async()=>JSON.stringify(installed),writeArtifact:()=>'',adminRaw:launch} as unknown as RuntimeHarness
+    try {
+      await expect(executeManagedNativeCase(harness,[...['env_file','ca_file'].map(suffix=>({name:'claude/grants/'+suffix,path:path.join(directory,suffix),sha256:'e'.repeat(64)})),{name:'claude/native-fault/sdk-init-fields.json',path:file,sha256:createHash('sha256').update(fs.readFileSync(file)).digest('hex')}],{mode:'freshclaude',case:'startup'},'missing-native-id')).rejects.toThrow(fault.startsWith('installed')?'actual SDK native init-field fault image differs before input':'fault image binding differs')
+      expect(launch).not.toHaveBeenCalled();expect(start).toHaveBeenCalledTimes(fault.startsWith('installed')?1:0)
+    } finally {fs.rmSync(directory,{recursive:true,force:true})}
+  })
+  it.each(['freshclaude','kilroy'] as const)('requires a distinct owned native field-fault image before %s missing or placeholder ID launches', async mode => {
+    for (const caseId of ['missing-native-id','placeholder-id']) {
+      const directory=fs.mkdtempSync(path.join(os.tmpdir(),'native-field-admission-'))
+      const launch=vi.fn(async()=>{throw new Error('unqualified provider launch')})
+      const harness={testRoot:directory,startSupervisor:async()=>({}),writeArtifact:()=>'',broker:{receipts:()=>[]},adminRaw:launch} as unknown as RuntimeHarness
+      try {
+        await expect(executeManagedNativeCase(harness,['env_file','ca_file'].map(suffix=>({name:'claude/grants/'+suffix,path:path.join(directory,suffix),sha256:'e'.repeat(64)})),{mode,case:'startup'},caseId)).rejects.toThrow('owned SDK native init-field fault image required')
+        expect(launch).not.toHaveBeenCalled()
+      } finally {fs.rmSync(directory,{recursive:true,force:true})}
+    }
+  })
   it.each(['freshclaude', 'kilroy'] as const)('routes finite real-native startup faults for %s without any model dispatch', async (mode) => {
-    for (const caseId of ['missing-native-id', 'placeholder-id', 'disabled-hooks', 'timeout-50s', 'provider-exit', 'stop-cancellation']) {
+    for (const caseId of ['disabled-hooks', 'timeout-50s', 'provider-exit', 'stop-cancellation']) {
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-fresh-startup-route-'))
       const launch = vi.fn(async (_supervisor: unknown, body: any) => {
         expect(body.params.provider).toBe(mode === 'kilroy' ? 'kilroy' : 'claude')
