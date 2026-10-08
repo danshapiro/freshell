@@ -217,6 +217,106 @@ pub(crate) fn serve_stdio() -> Result<(), String> {
     exchange(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
 }
 
+fn project_candidate(
+    request: &freshell_runtime_protocol::ClaudeCandidateProjectionRequest,
+    stage: &std::path::Path,
+    home: &std::path::Path,
+    identity: (u32, u32),
+) -> Result<(), String> {
+    let unavailable = |operation: &'static str| {
+        tracing::warn!(
+            event = "provider.inputs.candidate_projection.blocked",
+            provider = "claude",
+            stage = "candidate",
+            operation,
+            "Candidate ordinary projection unavailable"
+        );
+        format!("Claude candidate {operation} unavailable; retain inputs and reprepare")
+    };
+    request.validate().map_err(|_| unavailable("metadata"))?;
+    let published = crate::provider_input_preparation::read_private(
+        stage,
+        ".freshell/claude-candidate-binding.json",
+        freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+    )
+    .map_err(|_| unavailable("publication"))?;
+    let binding = request
+        .source_request
+        .candidate_binding
+        .as_ref()
+        .ok_or_else(|| unavailable("publication"))?;
+    if format!("{:x}", Sha256::digest(&published)) != binding.publication_sha256 {
+        return Err(unavailable("publication"));
+    }
+    crate::verify_initialized_provider_home(home, identity.0, identity.1)
+        .map_err(|_| unavailable("initialized_home"))?;
+    let source = &request.source_request;
+    let Some((accepted, expected)) =
+        crate::provider_input_preparation::final_claude_source_request(
+            Some(&request.provider_launch_context),
+            stage,
+            &source.cwd,
+            home,
+            source.native_source_runtime,
+        )
+        .map_err(|_| unavailable("accepted_manifest"))?
+    else {
+        return Err(unavailable("accepted_manifest"));
+    };
+    if source.home != home
+        || source.selector_manifest_sha256 != accepted.selector_manifest_sha256
+        || source.plan_revision != accepted.plan_revision
+        || source.setting_sources != accepted.setting_sources
+        || (expected.uid, expected.euid, expected.gid, expected.egid)
+            != (identity.0, identity.0, identity.1, identity.1)
+        || std::fs::canonicalize(&request.workspace_path)
+            .ok()
+            .as_deref()
+            != Some(std::path::Path::new(&request.workspace_path))
+        || std::fs::canonicalize(&source.cwd).ok().as_ref() != Some(&source.cwd)
+    {
+        return Err(unavailable("selection_binding"));
+    }
+    // Reuse the workload's selected copier and stale-leaf transaction. This
+    // never resolves secrets, probes a provider, or reads original HOME again.
+    crate::refresh_provider_config_references(
+        &request.provider_launch_context,
+        "claude",
+        std::path::Path::new(&request.workspace_path),
+        stage,
+        home,
+        identity.0,
+        identity.1,
+    )
+    .map_err(|_| unavailable("ordinary_refresh"))
+}
+
+fn read_candidate_request(
+    input: &mut impl Read,
+) -> Result<freshell_runtime_protocol::ClaudeCandidateProjectionRequest, String> {
+    let mut header = [0; 4];
+    input
+        .read_exact(&mut header)
+        .map_err(|_| "Claude candidate private request header unavailable")?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES {
+        return Err("Claude candidate private request exceeds the metadata profile; retain inputs and reprepare".into());
+    }
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(length)
+        .map_err(|_| "Claude candidate private request allocation unavailable")?;
+    raw.resize(length, 0);
+    input
+        .read_exact(&mut raw)
+        .map_err(|_| "Claude candidate private request incomplete")?;
+    let request: freshell_runtime_protocol::ClaudeCandidateProjectionRequest =
+        serde_json::from_slice(&raw).map_err(|_| "Claude candidate private request invalid")?;
+    request
+        .validate()
+        .map_err(|_| "Claude candidate private request metadata unavailable")?;
+    Ok(request)
+}
+
 pub(crate) fn serve_private() -> Result<(), String> {
     let mut input =
         std::os::unix::net::UnixStream::connect("/run/freshell-source-exchange/reply.sock")
@@ -232,6 +332,99 @@ pub(crate) fn serve_private() -> Result<(), String> {
         .try_clone()
         .map_err(|_| "Claude observation private exchange unavailable")?;
     exchange(&mut input, &mut output)
+}
+
+pub(crate) fn serve_candidate_private() -> Result<(), String> {
+    use std::{
+        os::unix::fs::{FileTypeExt, MetadataExt},
+        path::Path,
+    };
+    let home = Path::new("/home/freshell/provider");
+    let socket = Path::new("/run/freshell-source-exchange/reply.sock");
+    let unavailable =
+        || "Claude candidate private helper namespace mapping is unavailable".to_string();
+    if unsafe { libc::getuid() } != 0
+        || unsafe { libc::geteuid() } != 0
+        || unsafe { libc::getgid() } != 0
+        || unsafe { libc::getegid() } != 0
+    {
+        return Err(unavailable());
+    }
+    crate::verify_initialized_provider_home(home, 65534, 0).map_err(|_| unavailable())?;
+    let directory =
+        std::fs::symlink_metadata(socket.parent().unwrap()).map_err(|_| unavailable())?;
+    let endpoint = std::fs::symlink_metadata(socket).map_err(|_| unavailable())?;
+    if !directory.is_dir()
+        || directory.uid() != 0
+        || directory.gid() != 0
+        || directory.mode() & 0o777 != 0o710
+        || !endpoint.file_type().is_socket()
+        || endpoint.uid() != 0
+        || endpoint.gid() != 0
+        || endpoint.mode() & 0o777 != 0o660
+    {
+        return Err(unavailable());
+    }
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|_| "Claude candidate private exchange unavailable")?;
+    let timeout = Some(std::time::Duration::from_secs(15));
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|_| "Claude candidate private timeout unavailable")?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|_| "Claude candidate private timeout unavailable")?;
+    let request = read_candidate_request(&mut stream)?;
+    if request.source_request.home != home
+        || std::env::current_dir().ok().as_ref() != Some(&request.source_request.cwd)
+        || std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .as_deref()
+            != Some(home)
+    {
+        return Err(
+            "Claude candidate actual launch selection unavailable; retain inputs and reprepare"
+                .into(),
+        );
+    }
+    let raw =
+        freshell_runtime_protocol::bounded_json_bytes(&request.source_request, MAX_REQUEST_BYTES)
+            .map_err(|_| "Claude candidate source request exceeds metadata profile")?;
+    project_candidate(
+        &request,
+        Path::new("/run/freshell-candidate-inputs"),
+        home,
+        (65534, 0),
+    )?;
+    // Match the existing provider mountpoint helper's identity transition. The
+    // source evidence below measures this process after the transition.
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0
+        || unsafe { libc::setgid(0) } != 0
+        || unsafe { libc::setuid(65534) } != 0
+    {
+        return Err("Claude candidate provider identity transition unavailable".into());
+    }
+    crate::verify_private_helper_namespace(home, socket).map_err(|_| unavailable())?;
+    if request.source_request.native_source_runtime
+        == freshell_platform::claude_inputs::NativeSourceRuntime::Terminal
+    {
+        crate::providers::run_provider_features_worker(&["claude-mcp".into()])
+            .map_err(|_| "Claude candidate ordinary feature preparation unavailable")?;
+    }
+    let source = &request.source_request;
+    let observation = observe(
+        &source.cwd,
+        home,
+        source.native_source_runtime,
+        &source.setting_sources,
+    )?;
+    write_reply(
+        &ObservationReply {
+            request_sha256: format!("{:x}", Sha256::digest(raw)),
+            observation,
+        },
+        &mut stream,
+    )
 }
 
 fn exchange(input: &mut impl Read, output: &mut impl Write) -> Result<(), String> {
@@ -275,6 +468,10 @@ fn exchange(input: &mut impl Read, output: &mut impl Write) -> Result<(), String
         request_sha256: format!("{:x}", Sha256::digest(&raw)),
         observation,
     };
+    write_reply(&reply, output)
+}
+
+fn write_reply(reply: &ObservationReply, output: &mut impl Write) -> Result<(), String> {
     let bytes =
         freshell_runtime_protocol::bounded_json_bytes(&reply, MAX_REPLY_BYTES).map_err(|_| {
             "Claude observation reply exceeds the metadata profile; retain inputs and reprepare"
@@ -295,6 +492,302 @@ fn exchange(input: &mut impl Read, output: &mut impl Write) -> Result<(), String
 mod tests {
     use super::*;
     use std::io::{Cursor, Error, ErrorKind};
+
+    #[test]
+    fn claude_candidate_projection_runs_selected_dependency_and_frozen_config_consumer() {
+        use freshell_platform::claude_inputs::{
+            AcceptedNativeSourcePlan, ClaudeInputManifest, ClaudeSettingSource, NativeSourceRuntime,
+        };
+        use freshell_runtime_protocol::{
+            bounded_json_bytes, ClaudeCandidateProjectionRequest, ProviderLaunchContext,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        for runtime in [NativeSourceRuntime::Terminal, NativeSourceRuntime::Sdk] {
+            let owned = tempfile::tempdir().unwrap();
+            let workspace = owned.path().join("workspace");
+            let original = owned.path().join("original");
+            let stage = owned.path().join("stage");
+            let home = owned.path().join("candidate-home");
+            for path in [&workspace, &original, &stage, &home] {
+                std::fs::create_dir(path).unwrap();
+            }
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::verify_initialized_provider_home(&home, unsafe { libc::geteuid() }, unsafe { libc::getegid() }).expect("synthetic candidate HOME must match the existing initialized identity before testing projection");
+            std::fs::create_dir_all(stage.join(".freshell")).unwrap();
+            std::fs::create_dir_all(stage.join(".claude")).unwrap();
+            std::fs::write(
+                stage.join(".claude/settings.json"),
+                r#"{"selected":"frozen-original"}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(home.join(".claude")).unwrap();
+            let retained_auth = home.join(".claude/.credentials.json");
+            std::fs::write(&retained_auth, b"PRIVATE_RETAINED_AUTH_SENTINEL").unwrap();
+            std::fs::create_dir_all(home.join(".freshell/provider-roots/unit-0")).unwrap();
+            let unit = stage.join(".freshell/resource-units/unit-0");
+            std::fs::create_dir_all(unit.join("node_modules/selected-dependency")).unwrap();
+            std::fs::write(
+                unit.join("node_modules/selected-dependency/index.js"),
+                "module.exports=value=>'dependency:'+value",
+            )
+            .unwrap();
+            std::fs::write(unit.join("consumer.cjs"), r#"const fs=require('node:fs');const selected=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));console.log(require('selected-dependency')(selected.selected));"#).unwrap();
+            let mut manifest: ClaudeInputManifest = serde_json::from_value(serde_json::json!({
+                "version":1,"nativeSourceRuntime":runtime,"originalHome":original,
+                "cwd":workspace,"workspace":workspace,"settingSources":["user"],"pluginDirs":[]
+            }))
+            .unwrap();
+            let selector_sha256 = format!(
+                "{:x}",
+                Sha256::digest(
+                    bounded_json_bytes(&manifest.original_selectors(), 64 * 1024 * 1024).unwrap()
+                )
+            );
+            let observation =
+                observe(&workspace, &home, runtime, &[ClaudeSettingSource::User]).unwrap();
+            manifest.accepted_native_plan = Some(AcceptedNativeSourcePlan {
+                selector_manifest_sha256: selector_sha256.clone(),
+                plan_revision: 0,
+                observation,
+            });
+            let raw = serde_json::to_vec(&manifest).unwrap();
+            std::fs::write(stage.join(".freshell/input-manifest.json"), &raw).unwrap();
+            let generation = format!("grant-{}", uuid::Uuid::new_v4());
+            let reservation = uuid::Uuid::new_v4().to_string();
+            let context: ProviderLaunchContext = serde_json::from_value(serde_json::json!({
+                "preparation":{"claude":{"mcp_args":[]}},
+                "config":[{"root":"user_provider","relativePath":".claude/settings.json","providerRelativePath":".claude/settings.json","format":"json"}],
+                "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
+                "preparedInputs":{"generationId":generation,"initialAuthReservation":reservation,"manifest":{"relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(&raw)),"sourceCount":0,"aliasCount":0,"recipeCount":0},
+                    "resourceMounts":[{"stageRelativePath":".freshell/resource-units/unit-0","providerRelativePath":".freshell/provider-roots/unit-0","logicalDestination":workspace.join("selected-plugin"),"effectiveDestination":workspace.join("selected-plugin"),"kind":"directory"}]}
+            })).unwrap();
+            let publication = freshell_runtime_protocol::ClaudeCandidatePublication {
+                version: 1,
+                soul_id: freshell_runtime_protocol::SoulId::new(),
+                provider: "claude".into(),
+                authority_sha256: "d".repeat(64),
+                initial_reservation_id: Some(reservation),
+                registry_attempt_id: None,
+                intent_revision: 1,
+                prior_generation_id: None,
+                generation_id: generation.clone(),
+                manifest_sha256: context
+                    .prepared_inputs
+                    .as_ref()
+                    .unwrap()
+                    .manifest
+                    .sha256
+                    .clone(),
+                prepared_context_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(
+                        bounded_json_bytes(
+                            &context,
+                            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+                        )
+                        .unwrap()
+                    )
+                ),
+                prepared_result_sha256: "e".repeat(64),
+                selector_manifest_sha256: selector_sha256.clone(),
+                plan_revision: 0,
+                native_source_runtime: runtime,
+                workspace_path: workspace.to_str().unwrap().into(),
+                cwd: workspace.clone(),
+                git_common_dir: None,
+            };
+            let publication_bytes = bounded_json_bytes(
+                &publication,
+                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+            )
+            .unwrap();
+            std::fs::write(
+                stage.join(".freshell/claude-candidate-binding.json"),
+                &publication_bytes,
+            )
+            .unwrap();
+            let request = ClaudeCandidateProjectionRequest {
+                source_request: ObservationRequest {
+                    version: 1,
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    native_source_runtime: runtime,
+                    cwd: workspace.clone(),
+                    home: home.clone(),
+                    setting_sources: vec![ClaudeSettingSource::User],
+                    selector_manifest_sha256: selector_sha256,
+                    plan_revision: 0,
+                    candidate_binding: Some(
+                        freshell_platform::claude_inputs::observation::CandidateBinding {
+                            soul_id: publication.soul_id.as_str().into(),
+                            generation_id: generation,
+                            authority_sha256: publication.authority_sha256.clone(),
+                            publication_sha256: format!("{:x}", Sha256::digest(&publication_bytes)),
+                            manifest_sha256: publication.manifest_sha256.clone(),
+                            prepared_result_sha256: publication.prepared_result_sha256.clone(),
+                        },
+                    ),
+                },
+                workspace_path: workspace.to_str().unwrap().into(),
+                provider_launch_context: context,
+                publication,
+            };
+            let mut raw_request = freshell_runtime_protocol::bounded_json_bytes(
+                &request,
+                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+            )
+            .unwrap();
+            // Exercise the inclusive transport boundary with a valid request;
+            // padding is insignificant JSON whitespace, not extra selection.
+            raw_request.resize(freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES, b' ');
+            let mut frame = Vec::from((raw_request.len() as u32).to_be_bytes());
+            frame.extend(raw_request);
+            let request = read_candidate_request(&mut Cursor::new(frame)).expect(
+                "valid bounded private candidate frame must reach the actual projection consumer",
+            );
+            std::fs::remove_dir(&original).unwrap();
+            for fault in [
+                "selector",
+                "revision",
+                "runtime",
+                "manifest",
+                "indexed-source",
+                "home",
+                "publication-soul",
+                "publication-generation",
+                "publication-authority",
+                "publication-result",
+                "publication-stage",
+                "publication-context",
+                "publication-missing-binding",
+            ] {
+                let mut altered = request.clone();
+                match fault {
+                    "selector" => altered.source_request.selector_manifest_sha256 = "b".repeat(64),
+                    "revision" => altered.source_request.plan_revision = 2,
+                    "runtime" => {
+                        altered.source_request.native_source_runtime =
+                            if runtime == NativeSourceRuntime::Terminal {
+                                NativeSourceRuntime::Sdk
+                            } else {
+                                NativeSourceRuntime::Terminal
+                            }
+                    }
+                    "manifest" => {
+                        altered
+                            .provider_launch_context
+                            .prepared_inputs
+                            .as_mut()
+                            .unwrap()
+                            .manifest
+                            .sha256 = "c".repeat(64)
+                    }
+                    "indexed-source" => {
+                        altered
+                            .provider_launch_context
+                            .prepared_inputs
+                            .as_mut()
+                            .unwrap()
+                            .manifest
+                            .source_count = 1
+                    }
+                    "home" => altered.source_request.home = owned.path().join("foreign-home"),
+                    "publication-soul" => {
+                        altered.publication.soul_id = freshell_runtime_protocol::SoulId::new()
+                    }
+                    "publication-generation" => {
+                        altered.publication.generation_id =
+                            format!("grant-{}", uuid::Uuid::new_v4())
+                    }
+                    "publication-authority" => {
+                        altered.publication.authority_sha256 = "f".repeat(64)
+                    }
+                    "publication-result" => {
+                        altered.publication.prepared_result_sha256 = "f".repeat(64)
+                    }
+                    "publication-stage" => {
+                        altered.publication.soul_id = freshell_runtime_protocol::SoulId::new();
+                        let binding = altered.source_request.candidate_binding.as_mut().unwrap();
+                        binding.soul_id = altered.publication.soul_id.as_str().into();
+                        binding.publication_sha256 = format!(
+                            "{:x}",
+                            Sha256::digest(
+                                bounded_json_bytes(
+                                    &altered.publication,
+                                    freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+                                )
+                                .unwrap()
+                            )
+                        );
+                        altered.validate().expect(
+                            "a coherent substituted envelope must reach independent stage readback",
+                        );
+                    }
+                    "publication-context" => {
+                        altered.provider_launch_context.config[0].provider_relative_path =
+                            ".claude/another-selected-settings.json".into()
+                    }
+                    "publication-missing-binding" => {
+                        altered.source_request.candidate_binding = None
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    project_candidate(&altered, &stage, &home, unsafe {
+                        (libc::geteuid(), libc::getegid())
+                    })
+                    .is_err(),
+                    "incomplete or mismatched candidate must block for {fault}"
+                );
+                assert!(
+                    !home.join(".claude/settings.json").exists(),
+                    "blocked candidate must not project settings for {fault}"
+                );
+                assert!(
+                    !home
+                        .join(".freshell/provider-roots/unit-0/consumer.cjs")
+                        .exists(),
+                    "blocked candidate must not project executable resources for {fault}"
+                );
+                assert!(
+                    !home.join(crate::PROVIDER_PROJECTION_MANIFEST).exists(),
+                    "blocked candidate must not commit a projection for {fault}"
+                );
+                assert_eq!(
+                    std::fs::read(&retained_auth).unwrap(),
+                    b"PRIVATE_RETAINED_AUTH_SENTINEL"
+                );
+            }
+            project_candidate(&request, &stage, &home, unsafe {
+                (libc::geteuid(), libc::getegid())
+            })
+            .unwrap();
+            let output = std::process::Command::new("node")
+                .arg(home.join(".freshell/provider-roots/unit-0/consumer.cjs"))
+                .arg(home.join(".claude/settings.json"))
+                .current_dir(&workspace)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "selected staged dependency/config consumer must execute"
+            );
+            assert_eq!(output.stdout, b"dependency:frozen-original\n");
+            assert_eq!(
+                std::fs::read(&retained_auth).unwrap(),
+                b"PRIVATE_RETAINED_AUTH_SENTINEL"
+            );
+            assert_eq!(
+                std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+                raw
+            );
+            assert!(
+                !original.exists(),
+                "pure candidate projection must not rescan frozen original HOME"
+            );
+        }
+    }
 
     struct ReaderCase {
         result: Result<(), RuntimeError>,
@@ -319,6 +812,7 @@ mod tests {
             setting_sources: vec![],
             selector_manifest_sha256: "a".repeat(64),
             plan_revision: 0,
+            candidate_binding: None,
         };
         let raw =
             freshell_runtime_protocol::bounded_json_bytes(&request, MAX_REQUEST_BYTES).unwrap();
@@ -500,6 +994,43 @@ process.stdin.on('data',()=>{}).on('end',()=>{
                 return Err(Error::new(ErrorKind::Other, "body must remain unread"));
             }
             self.header.read(bytes)
+        }
+    }
+
+    #[test]
+    fn claude_candidate_rejects_oversized_header_before_reading_or_allocating_body() {
+        for length in [
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES as u32 + 1,
+            u32::MAX,
+        ] {
+            let mut input = HeaderOnly {
+                header: Cursor::new(length.to_be_bytes()),
+                body_reads: 0,
+            };
+            let error = read_candidate_request(&mut input).unwrap_err();
+            assert!(error.contains("exceeds the metadata profile"));
+            assert_eq!(input.body_reads, 0);
+        }
+    }
+
+    #[test]
+    fn claude_candidate_incomplete_or_invalid_frame_never_discloses_private_body() {
+        let private = b"PRIVATE_CANDIDATE_BODY_SENTINEL";
+        let mut incomplete = Vec::from((private.len() as u32 + 1).to_be_bytes());
+        incomplete.extend(private);
+        let mut invalid = Vec::from((private.len() as u32).to_be_bytes());
+        invalid.extend(private);
+        for (frame, expected) in [
+            (vec![0, 0, 0], "header unavailable"),
+            (incomplete, "request incomplete"),
+            (invalid, "request invalid"),
+        ] {
+            let error = read_candidate_request(&mut Cursor::new(frame)).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error
+                .as_bytes()
+                .windows(private.len())
+                .any(|window| window == private));
         }
     }
 

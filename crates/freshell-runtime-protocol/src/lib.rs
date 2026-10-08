@@ -2911,6 +2911,137 @@ pub struct ObserveClaudeSourcesRequest {
     pub observation_request: freshell_platform::claude_inputs::observation::ObservationRequest,
 }
 
+/// Selection-only input to the fixed Claude candidate projection helper.
+/// Ordinary documents stay on its verified private stage mount; credentials,
+/// secret references and native provider stores are not projection inputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeCandidateProjectionRequest {
+    pub source_request: freshell_platform::claude_inputs::observation::ObservationRequest,
+    pub workspace_path: String,
+    pub provider_launch_context: ProviderLaunchContext,
+    pub publication: ClaudeCandidatePublication,
+}
+
+/// Credential-free issuer metadata published beside a complete ordinary
+/// Claude result. It qualifies the published generation, not a provider HOME.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeCandidatePublication {
+    pub version: u8,
+    pub soul_id: SoulId,
+    pub provider: String,
+    pub authority_sha256: String,
+    pub initial_reservation_id: Option<String>,
+    pub registry_attempt_id: Option<RecoveryAttemptId>,
+    pub intent_revision: u64,
+    pub prior_generation_id: Option<String>,
+    pub generation_id: String,
+    pub manifest_sha256: String,
+    pub prepared_context_sha256: String,
+    pub prepared_result_sha256: String,
+    pub selector_manifest_sha256: String,
+    pub plan_revision: u8,
+    pub native_source_runtime: freshell_platform::claude_inputs::NativeSourceRuntime,
+    pub workspace_path: String,
+    pub cwd: std::path::PathBuf,
+    pub git_common_dir: Option<String>,
+}
+
+impl ClaudeCandidateProjectionRequest {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        use sha2::Digest;
+        let invalid = || {
+            RuntimeError::new(RuntimeErrorCode::InvalidRequest,
+            "Claude candidate projection has incomplete ordinary selection metadata; retain inputs and reprepare")
+        };
+        self.source_request.validate().map_err(|_| invalid())?;
+        self.provider_launch_context.validate("claude")?;
+        let inputs = self
+            .provider_launch_context
+            .prepared_inputs
+            .as_ref()
+            .ok_or_else(invalid)?;
+        if self.workspace_path.len() > 64 * 1024
+            || self.workspace_path.chars().any(char::is_control)
+            || !std::path::Path::new(&self.workspace_path).is_absolute()
+            || !self.source_request.cwd.starts_with(&self.workspace_path)
+            || inputs.manifest.source_count != 0
+            || inputs.manifest.alias_count != 0
+            || inputs.manifest.recipe_count != 0
+            || inputs.indexed_files.is_some()
+        {
+            return Err(invalid());
+        }
+        let source = &self.source_request;
+        let binding = source.candidate_binding.as_ref().ok_or_else(invalid)?;
+        let published = &self.publication;
+        let publication_bytes =
+            bounded_json_bytes(published, MAX_CONTROL_FRAME_BYTES).map_err(|_| invalid())?;
+        let context_bytes =
+            bounded_json_bytes(&self.provider_launch_context, MAX_CONTROL_FRAME_BYTES)
+                .map_err(|_| invalid())?;
+        let initial = published.initial_reservation_id.as_ref();
+        if published.version != 1
+            || !matches!(published.provider.as_str(), "claude" | "kilroy")
+            || (published.provider == "kilroy"
+                && source.native_source_runtime
+                    != freshell_platform::claude_inputs::NativeSourceRuntime::Sdk)
+            || published.soul_id.as_str() != binding.soul_id
+            || published.generation_id != binding.generation_id
+            || published.generation_id != inputs.generation_id
+            || published.manifest_sha256 != binding.manifest_sha256
+            || published.manifest_sha256 != inputs.manifest.sha256
+            || published.prepared_result_sha256 != binding.prepared_result_sha256
+            || published.authority_sha256 != binding.authority_sha256
+            || published.workspace_path != self.workspace_path
+            || published.cwd != source.cwd
+            || published.native_source_runtime != source.native_source_runtime
+            || published.selector_manifest_sha256 != source.selector_manifest_sha256
+            || published.plan_revision != source.plan_revision
+            || published.intent_revision == 0
+            || published.soul_id.as_str().len() > 160
+            || published.soul_id.as_str().chars().any(char::is_control)
+            || published.soul_id.as_str().is_empty()
+            || format!("{:x}", Sha256::digest(publication_bytes)) != binding.publication_sha256
+            || format!("{:x}", Sha256::digest(context_bytes)) != published.prepared_context_sha256
+            || if let Some(reservation) = initial {
+                published.intent_revision != 1
+                    || uuid::Uuid::parse_str(reservation).is_err()
+                    || inputs.initial_auth_reservation.as_ref() != initial
+                    || published.registry_attempt_id.is_some()
+                    || published.prior_generation_id.is_some()
+            } else {
+                published
+                    .registry_attempt_id
+                    .as_ref()
+                    .is_none_or(|attempt| RecoveryAttemptId::parse(attempt.as_str()).is_err())
+                    || published
+                        .prior_generation_id
+                        .as_ref()
+                        .is_none_or(|generation| {
+                            !generation.starts_with("grant-")
+                                || uuid::Uuid::parse_str(&generation[6..]).is_err()
+                        })
+            }
+            || published.git_common_dir.as_ref().is_some_and(|path| {
+                path.len() > 64 * 1024
+                    || path.chars().any(char::is_control)
+                    || !std::path::Path::new(path).is_absolute()
+            })
+        {
+            return Err(invalid());
+        }
+        bounded_json_bytes(
+            source,
+            freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES,
+        )
+        .map_err(|_| invalid())?;
+        bounded_json_bytes(self, MAX_CONTROL_FRAME_BYTES).map_err(|_| invalid())?;
+        Ok(())
+    }
+}
+
 impl ObserveClaudeSourcesRequest {
     pub fn validate(&self) -> Result<(), RuntimeError> {
         let invalid = || {

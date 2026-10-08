@@ -126,6 +126,9 @@ async fn run() -> Result<(), String> {
             )?;
             claude_source_observation::serve_private()
         }
+        Some("project-claude-candidate-private") if args.len() == 2 => {
+            claude_source_observation::serve_candidate_private()
+        }
         Some("native-auth-only") if args.len() == 2 => {
             verify_private_helper_namespace(
                 Path::new("/home/freshell/provider"),

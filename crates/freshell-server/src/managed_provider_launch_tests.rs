@@ -1113,6 +1113,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
                     setting_sources: vec![ClaudeSettingSource::Local],
                     selector_manifest_sha256: "a".repeat(64),
                     plan_revision: 0,
+                    candidate_binding: None,
                 },
         };
         let reply = client.observe_claude_sources(request).await.expect(

@@ -127,6 +127,7 @@ pub(crate) async fn prepare_managed(
             format!("{:x}", Sha256::digest(bytes))
         },
         plan_revision: 0,
+        candidate_binding: None,
     };
     let observation_request_sha256 = {
         use sha2::{Digest, Sha256};

@@ -22,6 +22,22 @@ pub struct ObservationRequest {
     pub setting_sources: Vec<ClaudeSettingSource>,
     pub selector_manifest_sha256: String,
     pub plan_revision: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_binding: Option<CandidateBinding>,
+}
+
+/// Ordinary candidate identity covered by the private observation request
+/// digest. Authority material is hashed; no credential payload enters this
+/// reader contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateBinding {
+    pub soul_id: String,
+    pub generation_id: String,
+    pub authority_sha256: String,
+    pub publication_sha256: String,
+    pub manifest_sha256: String,
+    pub prepared_result_sha256: String,
 }
 
 impl ObservationRequest {
@@ -49,6 +65,27 @@ impl ObservationRequest {
         validate_sources(&self.setting_sources)?;
         validate_path(&self.cwd)?;
         validate_path(&self.home)?;
+        if let Some(binding) = &self.candidate_binding {
+            if [binding.soul_id.as_str(), binding.generation_id.as_str()]
+                .iter()
+                .any(|id| id.is_empty() || id.len() > 160 || id.chars().any(char::is_control))
+                || [
+                    &binding.authority_sha256,
+                    &binding.publication_sha256,
+                    &binding.manifest_sha256,
+                    &binding.prepared_result_sha256,
+                ]
+                .iter()
+                .any(|digest| {
+                    digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                return Err(
+                    "Claude candidate observation binding is invalid; retain inputs and reprepare"
+                        .into(),
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -512,6 +549,7 @@ mod tests {
             setting_sources: vec![ClaudeSettingSource::Local],
             selector_manifest_sha256: "a".repeat(64),
             plan_revision: 0,
+            candidate_binding: None,
         };
         let reply = ObservationReply {
             request_sha256: "b".repeat(64),

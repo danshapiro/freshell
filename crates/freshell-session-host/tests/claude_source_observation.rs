@@ -102,6 +102,57 @@ async fn session_host_claude_private_observer_rejects_the_wrong_actual_namespace
 }
 
 #[tokio::test]
+async fn session_host_claude_candidate_private_helper_checks_actual_identity_before_request() {
+    assert_ne!(unsafe { libc::geteuid() }, 0);
+    let owned = tempfile::tempdir().unwrap();
+    let prior = owned.path().join("accepted-prior-inputs");
+    std::fs::write(&prior, b"immutable prior generation").unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_freshell-session-host"))
+        .arg("project-claude-candidate-private")
+        .current_dir(owned.path())
+        .env_clear()
+        .env("HOME", owned.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let mut error = child.stderr.take().unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::try_join!(
+            output.read_to_end(&mut stdout),
+            error.read_to_end(&mut stderr),
+            child.wait()
+        )
+    })
+    .await;
+    if !matches!(completed, Ok(Ok(_))) {
+        child.kill().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        panic!("owned candidate helper did not complete within its finite control deadline");
+    }
+    let (_, _, status) = completed.unwrap().unwrap();
+    assert!(!status.success());
+    assert!(
+        stdout.is_empty(),
+        "wrong actual identity must not emit candidate evidence"
+    );
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert!(
+        stderr.contains("candidate private helper namespace mapping is unavailable"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(prior).unwrap(), b"immutable prior generation");
+}
+
+#[tokio::test]
 async fn session_host_claude_observer_returns_bound_metadata_without_consuming_settings() {
     let owned = tempfile::tempdir().unwrap();
     let root = owned.path().join("root");

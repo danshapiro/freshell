@@ -3,7 +3,7 @@ use crate::provider_secret_resolution::ResolvedProviderSecrets;
 use freshell_runtime_protocol::{ProviderLaunchContext, ProviderPathInputs};
 use std::{collections::BTreeMap, path::Path};
 
-fn read_private(root: &Path, relative: &str, limit: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn read_private(root: &Path, relative: &str, limit: usize) -> Result<Vec<u8>, String> {
     use std::io::Read;
     if std::path::Path::new(relative)
         .components()
@@ -89,6 +89,7 @@ pub(crate) fn final_claude_source_request(
         setting_sources: manifest.setting_sources,
         selector_manifest_sha256: plan.selector_manifest_sha256.clone(),
         plan_revision: plan.plan_revision,
+        candidate_binding: None,
     };
     request.validate()?;
     Ok(Some((request, plan.observation.clone())))
