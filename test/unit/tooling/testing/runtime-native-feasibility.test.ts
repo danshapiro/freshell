@@ -6,11 +6,12 @@ import os from 'node:os'
 import path from 'node:path'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { createServer } from 'node:net'
+import { createServer as createHttpServer } from 'node:http'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
-  amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
+  amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
 const candidateSha = 'b'.repeat(40)
@@ -28,7 +29,48 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
-  it.each(['freshcodex', 'freshopencode'].flatMap(mode => ['valid', 'missing-observation', 'wrong-root', 'wrong-incarnation', 'wrong-source', 'wrong-version', 'wrong-uid', 'wrong-tls'].map(fault => [mode, fault])))('executes managed pre-input native create and refuses incomplete evidence (%s, %s; orchestration only)', async (mode, fault) => {
+  it.each(['valid', 'wrong-root', 'wrong-directory', 'parent-root', 'foreign-history', 'root-http-error', 'missing-tag'])('executes the real native session HTTP reader through an owned process fixture (%s; no provider qualification)', async (fault) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-serve-reader-')), proc = path.join(directory, 'proc'), processRoot = path.join(proc, '26')
+    const workspace = path.join(directory, 'session-workspace'), globalCwd = path.join(directory, 'global-server')
+    for (const child of [processRoot, workspace, globalCwd]) fs.mkdirSync(child, { recursive: true })
+    const executable = path.join(directory, 'opencode.exe'); fs.writeFileSync(executable, "#!/bin/sh\nprintf '1.18.21\\n'\n", { mode: 0o700 })
+    fs.symlinkSync(executable, path.join(processRoot, 'exe')); fs.symlinkSync(globalCwd, path.join(processRoot, 'cwd'))
+    fs.writeFileSync(path.join(proc, 'self-status'), 'CapEff:\t0000000000000000\n')
+    const root = 'ses_actualFixture', requests: string[] = []
+    const server = createHttpServer((request, response) => {
+      const url = new URL(request.url!, 'http://127.0.0.1'); requests.push(url.pathname)
+      if (url.pathname === '/models') { response.end('{}'); return }
+      expect(url.searchParams.get('directory')).toBe(workspace)
+      if (fault === 'root-http-error' && url.pathname === `/session/${root}`) { response.writeHead(503); response.end('{}'); return }
+      response.setHeader('content-type', 'application/json')
+      response.end(JSON.stringify(url.pathname === `/session/${root}`
+        ? { id: fault === 'wrong-root' ? 'ses_other' : root, directory: fault === 'wrong-directory' ? globalCwd : workspace,
+          ...(fault === 'parent-root' ? { parentID: 'ses_parent' } : {}) }
+        : fault === 'foreign-history' ? [{ info: { sessionID: 'ses_other' } }] : []))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as { port: number }).port
+    fs.writeFileSync(path.join(processRoot, 'cmdline'), ['opencode','serve','--hostname','127.0.0.1','--port',String(port),''].join('\0'))
+    fs.writeFileSync(path.join(processRoot, 'environ'), [`HOME=${directory}`, 'NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt',
+      ...(fault === 'missing-tag' ? [] : ['FRESHELL_OPENCODE_SIDECAR_ID=owned-fixture']), ''].join('\0'))
+    // Only this process fixture substitutes owned proc/executable paths and its
+    // real test UID. The production reader keeps the pinned path and UID fence.
+    const script = receiverNativeNamespace.replace("pathlib.Path('/proc')", 'pathlib.Path(' + JSON.stringify(proc) + ')')
+      .replace("pathlib.Path('/proc/self/status')", 'pathlib.Path(' + JSON.stringify(path.join(proc, 'self-status')) + ')')
+      .replace('/usr/local/lib/node_modules/opencode-ai/bin/opencode.exe', executable)
+      .replace('process.stat().st_uid!=65534', 'process.stat().st_uid!=os.getuid()')
+      .replace('https://chatgpt.com/backend-api/codex/models?client_version=0.147.0', `http://127.0.0.1:${port}/models`)
+    try {
+      const run = promisify(execFile)('python3', ['-c', script, 'opencode', root, workspace], { timeout: 5_000 })
+      if (fault === 'valid') {
+        const actual = JSON.parse((await run).stdout)
+        expect(actual.nativeRoot).toBe(root); expect(actual.nativeCwd).toBe(workspace); expect(actual.nativeProcessCwd).toBe(globalCwd)
+        expect(actual.nativeVersion).toBe('1.18.21'); expect(actual.nativeMessageCount).toBe(0)
+        expect(requests).toEqual([`/session/${root}`, `/session/${root}/message`, '/models'])
+      } else await expect(run).rejects.toThrow()
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+  it.each(['freshcodex', 'freshopencode'].flatMap(mode => ['valid', 'missing-observation', 'wrong-root', 'wrong-incarnation', 'wrong-source', 'wrong-version', 'wrong-uid', 'wrong-tls', 'wrong-native-api-root', 'nonempty-before-input'].map(fault => [mode, fault])))('executes managed pre-input native create and refuses incomplete evidence (%s, %s; orchestration only)', async (mode, fault) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-receiver-create-'))
     const provider = mode === 'freshcodex' ? 'codex' : 'opencode', root = provider === 'codex' ? randomUUID() : 'ses_nativeOwned'
     const sources = ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: `${provider}/grants/${suffix}`, path: '/owned/' + suffix, sha256: 'e'.repeat(64) }))
@@ -52,7 +94,8 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       return JSON.stringify({ uid: fault === 'wrong-uid' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
         httpsStatus: fault === 'wrong-tls' ? 0 : 200, tlsVerifyMode: 2, tlsCheckHostname: true,
         nativeCwd: path.join(directory, `${mode}-create-workspace`), nativeVersion: fault === 'wrong-version' ? 'unqualified' : provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21',
-        executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64), nativeRoot: root, activeNativeProcesses: 1 })
+        executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64), nativeRoot: fault === 'wrong-native-api-root' ? 'other' : root,
+        nativeMessageCount: fault === 'nonempty-before-input' ? 1 : 0, activeNativeProcesses: 1 })
     })
     const records = new Map<string, unknown>()
     const start = vi.fn(async (options: any) => {
@@ -64,7 +107,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       adminOk: launch, execOwnedContainerAsExact: capture, writeArtifact: (name: string, value: unknown) => records.set(name, value) } as unknown as RuntimeHarness
     try {
       const run = executeManagedNativeCase(harness, sources, { mode: mode as 'freshcodex' | 'freshopencode', case: 'startup' }, 'create')
-      if (fault === 'valid') {
+      if (fault === 'valid' || provider === 'codex' && ['wrong-native-api-root', 'nonempty-before-input'].includes(fault!)) {
         expect((await run).assertions.every(row => row.pass)).toBe(true)
         expect(launch).toHaveBeenCalledTimes(1); expect(capture).toHaveBeenCalledTimes(1)
         expect(records.has(`${mode}-create-original.json`)).toBe(true)

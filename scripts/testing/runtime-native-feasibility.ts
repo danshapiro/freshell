@@ -720,13 +720,14 @@ async function executeManagedReceiverCreate(harness: RuntimeHarness,
     throw new Error('current managed native receiver observation missing or misbound before input')
   }
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-    ['python3', '-c', receiverNativeNamespace, provider]))
+    ['python3', '-c', receiverNativeNamespace, provider, view.nativeSessionId, workspace]))
   harness.writeArtifact(`${scenario}-namespace-private.json`, namespace)
   const version = provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21'
   if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
     || !namespace.readOnlyRoot || namespace.httpsStatus !== 200 || namespace.tlsVerifyMode !== 2
     || !namespace.tlsCheckHostname || namespace.nativeCwd !== workspace || namespace.nativeVersion !== version
     || namespace.activeNativeProcesses !== 1
+    || (provider === 'opencode' && (namespace.nativeRoot !== view.nativeSessionId || namespace.nativeMessageCount !== 0))
     || !/^[a-f0-9]{64}$/.test(namespace.executableSha256 ?? '') || !/^[a-f0-9]{64}$/.test(namespace.profileSha256 ?? '')) {
     throw new Error('actual native receiver namespace/profile/pin/TLS differs')
   }
@@ -740,22 +741,38 @@ async function executeManagedReceiverCreate(harness: RuntimeHarness,
   return original
 }
 
-const receiverNativeNamespace = String.raw`
-import os,sys,json,pathlib,hashlib,subprocess,ssl,urllib.request
-provider=sys.argv[1];assert provider in ['codex','opencode']
+export const receiverNativeNamespace = String.raw`
+import os,sys,json,pathlib,hashlib,subprocess,ssl,urllib.request,urllib.parse
+provider,root,workspace=sys.argv[1:];assert provider in ['codex','opencode'] and root and pathlib.Path(workspace).is_absolute()
 matches=[]
 for process in pathlib.Path('/proc').iterdir():
  if not process.name.isdigit():continue
  try:
   argv=[item.decode() for item in (process/'cmdline').read_bytes().split(b'\0') if item]
   executable=(process/'exe').resolve()
-  if provider=='codex' and executable.name=='codex' and 'app-server' in argv or provider=='opencode' and executable.name=='opencode' and 'serve' in argv:
+  if (provider=='codex' and executable.name=='codex' and 'app-server' in argv) or (provider=='opencode' and str(executable)=='/usr/local/lib/node_modules/opencode-ai/bin/opencode.exe' and 'serve' in argv):
    environment=dict(item.decode().split('=',1) for item in (process/'environ').read_bytes().split(b'\0') if b'=' in item)
    if process.stat().st_uid!=65534:raise RuntimeError('native child UID differs')
-   matches.append((process,executable,environment))
+   if provider=='opencode' and not environment.get('FRESHELL_OPENCODE_SIDECAR_ID'):raise RuntimeError('native sidecar ownership tag missing')
+   matches.append((process,executable,environment,argv))
  except (OSError,ValueError):continue
 assert len(matches)==1
-process,executable,environment=matches[0]
+process,executable,environment,argv=matches[0]
+native_cwd=str((process/'cwd').resolve());native_info=None;message_count=None
+if provider=='opencode':
+ assert argv.count('--port')==1 and argv.count('--hostname')==1
+ port=int(argv[argv.index('--port')+1]);assert 1<=port<=65535 and argv[argv.index('--hostname')+1]=='127.0.0.1'
+ local=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+ def native_get(suffix):
+  url='http://127.0.0.1:'+str(port)+'/session/'+urllib.parse.quote(root,safe='')+suffix+'?directory='+urllib.parse.quote(workspace,safe='')
+  with local.open(url,timeout=10) as response:
+   assert response.status==200
+   raw=response.read(1024*1024+1);assert len(raw)<=1024*1024
+   return json.loads(raw)
+ native_info=native_get('');messages=native_get('/message')
+ assert native_info['id']==root and native_info.get('parentID') is None and native_info['directory']==workspace and isinstance(messages,list)
+ assert all(isinstance(row,dict) and isinstance(row.get('info'),dict) and row['info']['sessionID']==root for row in messages)
+ native_cwd=native_info['directory'];message_count=len(messages)
 ca=pathlib.Path(environment.get('SSL_CERT_FILE') or environment['NODE_EXTRA_CA_CERTS']);context=ssl.create_default_context(cafile=str(ca))
 proxy=environment.get('HTTPS_PROXY') or environment.get('https_proxy')
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),urllib.request.HTTPSHandler(context=context))
@@ -764,7 +781,7 @@ home=pathlib.Path(environment['HOME']);profiles=[]
 for name in (['.codex/config.toml'] if provider=='codex' else ['.config/opencode/opencode.json','.config/opencode/opencode.jsonc']):
  file=home/name;profiles.append({'path':name,'sha256':hashlib.sha256(file.read_bytes()).hexdigest() if file.exists() else None})
 profile_hash=hashlib.sha256(json.dumps(profiles,sort_keys=True).encode()).hexdigest()
-print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(row.split()[1] for row in pathlib.Path('/proc/self/status').read_text().splitlines() if row.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativeCwd':str((process/'cwd').resolve()),'nativeVersion':subprocess.check_output([str(executable),'--version'],env=environment,text=True,timeout=15).strip(),'executableSha256':hashlib.sha256(executable.read_bytes()).hexdigest(),'profileSha256':profile_hash,'profileFiles':profiles,'activeNativeProcesses':len(matches),'nativePid':int(process.name),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest()}))
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(row.split()[1] for row in pathlib.Path('/proc/self/status').read_text().splitlines() if row.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativeCwd':native_cwd,'nativeProcessCwd':str((process/'cwd').resolve()),'nativeRoot':native_info['id'] if native_info else None,'nativeMessageCount':message_count,'nativeVersion':subprocess.check_output([str(executable),'--version'],env=environment,text=True,timeout=15).strip(),'executableSha256':hashlib.sha256(executable.read_bytes()).hexdigest(),'profileSha256':profile_hash,'profileFiles':profiles,'activeNativeProcesses':len(matches),'nativePid':int(process.name),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest()}))
 `
 
 async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervisor: Awaited<ReturnType<RuntimeHarness['startSupervisor']>>,
