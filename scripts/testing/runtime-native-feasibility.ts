@@ -338,15 +338,18 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     const originals = await dispatchNativeFeasibility({ selection, imageDigest: manifest.imageDigest,
       candidateSha: manifest.candidateSha, ownerId: harness.runId,
       execute: async (caseId) => {
+        const amplifierSeed = selection.provider === 'amplifier' && ['exact-resume', 'old-writer', 'native-followup', 'current-native-turn'].includes(caseId)
         const paidCase = selection.case === 'approval-checkpoint'
           || (selection.provider === 'claude' && ['exact-resume', 'fork-root', 'restoration-failure-after-hook'].includes(caseId))
+          || amplifierSeed
         if (paidPrerequisiteFailed && paidCase) {
           throw new Error('prior native prerequisite failed; no further paid operation started')
         }
         try { return await executeManagedNativeCase(harness, prepared.files, selection, caseId, prepared.serverPath, servers) }
         catch (error) {
           if (selection.case === 'approval-checkpoint'
-            || (selection.provider === 'claude' && caseId === 'create')) paidPrerequisiteFailed = true
+            || (selection.provider === 'claude' && caseId === 'create')
+            || (selection.provider === 'amplifier' && caseId === 'create') || amplifierSeed) paidPrerequisiteFailed = true
           const reason = error instanceof Error ? error.message : 'unknown native case failure'
           harness.writeArtifact(`native-case-${caseId}-failure.json`, { severity: 'error',
             event: 'runtime.native_feasibility.case_failed', caseId, reason })
@@ -1674,7 +1677,7 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
           defaultCwd: workspace, codingCli: { enabledProviders: ['amplifier'], providers: { amplifier: { model: 'glm-5.3', reasoningEffort: 'low' } } },
         } }), { mode: 0o600 })
       } })
-    const owned = { server, scope: 'amplifier-native', pid: undefined as number | undefined }; servers.push(owned)
+    const owned = { server, scope: `${scenario}-native`, pid: undefined as number | undefined }; servers.push(owned)
     const previous = process.env.FRESHELL_E2E_RUST_SERVER_BIN
     process.env.FRESHELL_E2E_RUST_SERVER_BIN = serverPath
     try {

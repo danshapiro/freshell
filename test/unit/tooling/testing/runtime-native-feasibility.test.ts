@@ -124,6 +124,24 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       { provider: 'amplifier', case: 'startup' }, caseId)).rejects.toThrow('actual terminal recovery requires the owned real server artifact')
     expect(start).not.toHaveBeenCalled()
   })
+  it.each(['exact-resume', 'native-followup', 'old-writer'])('keeps distinct owned Amplifier controller cleanup receipts for %s', async (caseId) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-controller-owner-'))
+    const source = path.join(directory, 'profile'); fs.writeFileSync(source, 'fixture-only profile')
+    const descriptor = path.join(directory, 'fault.json')
+    fs.writeFileSync(descriptor, JSON.stringify({ schemaVersion: 1, imageDigest, wrapperSourceSha: candidateSha, wrapperSha256: 'a'.repeat(64),
+      originalCliSha256: 'b'.repeat(64), producerSha256: 'c'.repeat(64), cases: ['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'parent-root', 'old-writer'] }))
+    const sources = ['grants/env_file', 'grants/ca_file', '.amplifier/settings.yaml', '.amplifier/bundles/default.yaml']
+      .map(name => ({ name: 'amplifier/' + name, path: source, sha256: 'e'.repeat(64) }))
+    sources.push({ name: 'amplifier/native-fault/startup.json', path: descriptor, sha256: createHash('sha256').update(fs.readFileSync(descriptor)).digest('hex') })
+    const start = vi.spyOn(RustServer.prototype, 'start').mockRejectedValue(new Error('controlled controller startup boundary'))
+    const servers: any[] = []
+    try {
+      await expect(executeManagedNativeCase({ testRoot: directory, imageRef: imageDigest, startSupervisor: async () => ({}) } as unknown as RuntimeHarness,
+        sources, { provider: 'amplifier', case: 'startup' }, caseId, '/fixture/controller', servers)).rejects.toThrow('controlled controller startup boundary')
+      expect(servers).toHaveLength(1)
+      expect(servers[0].scope).toBe(`amplifier-${caseId}-native`)
+    } finally { start.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['valid', 'no-native-record', 'wrong-current-nonce', 'wrong-current-incarnation', 'wrong-current-revision', 'wrong-previous-signal',
     'current-signal-binding', 'wrong-native-root', 'wrong-source-inode', 'wrong-source-eof', 'wrong-producer', 'wrong-cli', 'wrong-uid', 'wrong-cwd',
     'not-blocked', 'empty-inventory', 'running', 'published', 'admitted-input', 'wrong-previous-incarnation', 'wrong-previous-root',
@@ -1564,13 +1582,14 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
       fs.rmSync(directory, { recursive: true, force: true })
     }
   })
-  it.each(['startup', 'native-turn'] as const)('executes terminal %s profile preparation and paid prerequisite ordering', async (caseId) => {
+  it.each((['claude', 'amplifier'] as const).flatMap(provider => (['startup', 'native-turn'] as const).map(caseId => ({ provider, caseId }))))('executes terminal $provider/$caseId profile preparation and paid prerequisite ordering', async ({ provider, caseId }) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-create-hold-'))
     const manifest = path.join(directory, 'artifacts.json')
     const preferences = path.join(directory, 'preferences.json'); fs.writeFileSync(preferences, '{}')
     const previous = process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
-    const files = (caseId === 'startup' ? ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'] : ['grants/env_file', 'grants/ca_file'])
-      .map((name) => ({ name: 'claude/' + name, path: preferences, sha256: 'e'.repeat(64) }))
+    const files = (provider === 'amplifier' ? ['grants/env_file', 'grants/ca_file', '.amplifier/settings.yaml', '.amplifier/bundles/default.yaml']
+      : caseId === 'startup' ? ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'] : ['grants/env_file', 'grants/ca_file'])
+      .map((name) => ({ name: provider + '/' + name, path: preferences, sha256: 'e'.repeat(64) }))
     fs.writeFileSync(manifest, JSON.stringify({ candidateSha, imageDigest, artifacts: {
       supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
       host: { path: '/fixture/host', sha256: 'd'.repeat(64) },
@@ -1596,9 +1615,11 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
     const stop = vi.spyOn(RustServer.prototype, 'stop').mockResolvedValue()
     const cleanup = vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
     try {
-      await expect(runNativeFeasibility(['--provider', 'claude', '--case', caseId])).rejects.toThrow('native experiment cases failed')
+      await expect(runNativeFeasibility(['--provider', provider, '--case', caseId])).rejects.toThrow('native experiment cases failed')
       if (caseId === 'startup') {
-        expect(admin).toHaveBeenCalledOnce()
+        if (provider === 'claude') expect(admin).toHaveBeenCalledOnce()
+        else expect(admin.mock.calls.map(([, request]: any) => path.basename(request.params.terminal.cwd)))
+          .toEqual(['amplifier-create-workspace', 'amplifier-file-replacement-workspace', 'amplifier-file-truncation-workspace', 'amplifier-malformed-ack-workspace'])
         expect(server).not.toHaveBeenCalled()
       } else {
         expect(server).toHaveBeenCalledOnce()
