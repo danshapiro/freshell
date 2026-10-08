@@ -882,9 +882,161 @@ async fn restart_does_not_resurrect_an_ordinary_claude_callback() {
     )
     .await
     .unwrap();
-    assert!(actor.resolve_permission("dead-process-card",serde_json::json!({"behavior":"allow"})).await.is_err(),
-        "an ordinary callback has no native no-effect checkpoint and cannot become a recoverable pending decision");
+    assert_eq!(
+        actor
+            .resolve_permission("dead-process-card", serde_json::json!({"behavior":"allow"}))
+            .await,
+        Err(ActorError::UnknownDecision),
+        "an ordinary callback has no native no-effect checkpoint and cannot become a recoverable pending decision"
+    );
     assert_eq!(replacement.decisions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn fixture_shaped_callback_without_current_rebind_is_unknown_after_host_replacement() {
+    for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+        let dir = tempfile::tempdir().unwrap();
+        let native = "fixture-native-current-root";
+        let saved_profile = profile(provider, "fixture-decision-store", None);
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            saved_profile.clone(),
+            FakeTransport::new(native),
+        )
+        .await
+        .unwrap();
+        // This is the actual deterministic transport's current request shape.
+        // Its saved provider decision does not supply a native SDK checkpoint.
+        actor
+            .record_permission(
+                "current-fixture-decision".into(),
+                serde_json::json!({
+                    "type":"freshAgent.permission.request",
+                    "requestId":"current-fixture-decision",
+                    "subtype":"fixture",
+                    "tool":{"name":"Read","input":{"file_path":"fixture-only"}}
+                }),
+            )
+            .await
+            .unwrap();
+        drop(actor);
+        let replacement = FakeTransport::new(native);
+        let actor = FreshAgentHostActor::open(dir.path(), saved_profile, replacement.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            actor.observed_native_session_id().await.as_deref(),
+            Some(native)
+        );
+        assert_eq!(
+            actor
+                .resolve_permission(
+                    "current-fixture-decision",
+                    serde_json::json!({"behavior":"allow"})
+                )
+                .await,
+            Err(ActorError::UnknownDecision)
+        );
+        assert_eq!(replacement.decisions.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            actor.state.lock().await.decisions["current-fixture-decision"].state,
+            DecisionState::Interrupted
+        ));
+    }
+}
+
+#[tokio::test]
+async fn admitted_durable_fixture_decision_survives_replacement_without_native_callback_replay() {
+    for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+        let dir = tempfile::tempdir().unwrap();
+        let native = "fixture-native-current-root";
+        let saved_profile = profile(provider.clone(), "durable-fixture-store", None);
+        let actor = FreshAgentHostActor::open_deterministic_fixture(
+            dir.path(),
+            saved_profile.clone(),
+            FakeTransport::new(native),
+        )
+        .await
+        .unwrap();
+        actor
+            .record_permission(
+                "retained-fixture-decision".into(),
+                serde_json::json!({
+                    "type":"freshAgent.permission.request", "requestId":"retained-fixture-decision",
+                    "subtype":"fixture", "tool":{"name":"Read","input":{"file_path":"fixture-only"}}
+                }),
+            )
+            .await
+            .unwrap();
+        drop(actor);
+        let replacement = FakeTransport::new(native);
+        let actor = FreshAgentHostActor::open_deterministic_fixture(
+            dir.path(),
+            saved_profile,
+            replacement.clone(),
+        )
+        .await
+        .unwrap();
+        let allow = serde_json::json!({"behavior":"allow"});
+        assert_eq!(
+            actor
+                .resolve_permission("retained-fixture-decision", allow.clone())
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            actor
+                .resolve_permission("retained-fixture-decision", allow)
+                .await,
+            Ok(())
+        );
+        assert_eq!(replacement.decisions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            actor
+                .resolve_permission(
+                    "unknown-fixture-decision",
+                    serde_json::json!({"behavior":"allow"})
+                )
+                .await,
+            Err(ActorError::UnknownDecision)
+        );
+        assert_eq!(
+            actor
+                .resolve_permission(
+                    "retained-fixture-decision",
+                    serde_json::json!({"behavior":"deny"})
+                )
+                .await,
+            Err(ActorError::DecisionAlreadyResolved)
+        );
+        {
+            let mut state = actor.state.lock().await;
+            let decision = state
+                .decisions
+                .get_mut("retained-fixture-decision")
+                .unwrap();
+            decision.state = DecisionState::Dispatching;
+            write_state(dir.path(), &state).unwrap();
+        }
+        drop(actor);
+        let actor = FreshAgentHostActor::open_deterministic_fixture(
+            dir.path(),
+            profile(provider, "durable-fixture-store", None),
+            replacement.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            actor
+                .resolve_permission(
+                    "retained-fixture-decision",
+                    serde_json::json!({"behavior":"allow"})
+                )
+                .await,
+            Err(ActorError::AmbiguousDispatch)
+        );
+        assert_eq!(replacement.decisions.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]

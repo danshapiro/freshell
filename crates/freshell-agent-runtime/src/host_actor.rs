@@ -402,6 +402,26 @@ pub struct FreshAgentHostActor {
 }
 
 impl FreshAgentHostActor {
+    /// The deterministic qualification transport persists its decision in its
+    /// owned provider store. This opening path is selected only after the
+    /// session host has admitted that typed fixture transport; it provides no
+    /// evidence for native provider recovery.
+    pub async fn open_deterministic_fixture(
+        state_dir: impl Into<PathBuf>,
+        profile: FreshAgentProfile,
+        transport: Arc<dyn FreshAgentTransport>,
+    ) -> Result<Arc<Self>, ActorError> {
+        Self::open_with_callback_lifetime(
+            state_dir,
+            profile,
+            transport,
+            DEFAULT_EVENT_BYTES,
+            DEFAULT_EVENT_COUNT,
+            true,
+        )
+        .await
+    }
+
     pub async fn resume_pending_native_permissions(&self) -> Result<(), ActorError> {
         let _serial = self.dispatch_lock.lock().await;
         if !self.native_recovery_prepared {
@@ -485,6 +505,25 @@ impl FreshAgentHostActor {
         event_byte_cap: usize,
         event_count_cap: usize,
     ) -> Result<Arc<Self>, ActorError> {
+        Self::open_with_callback_lifetime(
+            state_dir,
+            profile,
+            transport,
+            event_byte_cap,
+            event_count_cap,
+            false,
+        )
+        .await
+    }
+
+    async fn open_with_callback_lifetime(
+        state_dir: impl Into<PathBuf>,
+        profile: FreshAgentProfile,
+        transport: Arc<dyn FreshAgentTransport>,
+        event_byte_cap: usize,
+        event_count_cap: usize,
+        deterministic_fixture: bool,
+    ) -> Result<Arc<Self>, ActorError> {
         profile.validate()?;
         if event_byte_cap == 0 || event_count_cap == 0 {
             return Err(ActorError::InvalidProfile);
@@ -509,10 +548,11 @@ impl FreshAgentHostActor {
                     command.state = CommandState::Ambiguous;
                 }
             }
-            let claude_replacement = matches!(
-                loaded.profile.provider,
-                FreshProvider::Claude | FreshProvider::Kilroy
-            );
+            let claude_replacement = !deterministic_fixture
+                && matches!(
+                    loaded.profile.provider,
+                    FreshProvider::Claude | FreshProvider::Kilroy
+                );
             for decision in loaded.decisions.values_mut() {
                 if matches!(decision.state, DecisionState::Dispatching) {
                     decision.state = DecisionState::Ambiguous;

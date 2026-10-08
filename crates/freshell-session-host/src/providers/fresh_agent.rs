@@ -93,9 +93,28 @@ pub(crate) async fn open_hosted_fresh_agent(
     // The supervisor mounts one protected, per-soul directory here across
     // incarnations. The provider-owned HOME cannot hold the host's command
     // and decision journal: the provider can change HOME permissions.
-    FreshAgentHostActor::open(HOST_ACTOR_STATE_DIR, profile, transport)
-        .await
-        .map_err(|error| error.to_string())
+    open_actor_for_transport(
+        HOST_ACTOR_STATE_DIR,
+        profile,
+        transport,
+        launch.fixture_transport,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn open_actor_for_transport(
+    state_dir: impl Into<std::path::PathBuf>,
+    profile: FreshAgentProfile,
+    transport: Arc<dyn FreshAgentTransport>,
+    fixture_transport: Option<FreshAgentFixtureTransport>,
+) -> Result<Arc<FreshAgentHostActor>, freshell_agent_runtime::host_actor::ActorError> {
+    match fixture_transport {
+        Some(FreshAgentFixtureTransport::Deterministic) => {
+            FreshAgentHostActor::open_deterministic_fixture(state_dir, profile, transport).await
+        }
+        None => FreshAgentHostActor::open(state_dir, profile, transport).await,
+    }
 }
 
 fn profile_from_launch(launch: &FreshAgentLaunchSpec) -> FreshAgentProfile {
@@ -1512,6 +1531,67 @@ mod tests {
     use super::*;
 
     static OPENCODE_SNAPSHOT_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[tokio::test]
+    async fn only_typed_deterministic_transport_retains_fixture_decisions_on_replacement() {
+        for fixture_transport in [None, Some(FreshAgentFixtureTransport::Deterministic)] {
+            let directory = tempfile::tempdir().unwrap();
+            let profile = parity_profile(FreshProvider::Claude);
+            let trace = Arc::new(ParityTrace::default());
+            let transport = Arc::new(ParityFixtureTransport {
+                provider: FreshProvider::Claude,
+                trace: trace.clone(),
+            });
+            let actor = open_actor_for_transport(
+                directory.path(),
+                profile.clone(),
+                transport.clone(),
+                fixture_transport,
+            )
+            .await
+            .unwrap();
+            actor.record_permission("retained-fixture".into(), json!({
+                "type":"freshAgent.permission.request", "requestId":"retained-fixture",
+                "subtype":"fixture", "tool":{"name":"Read","input":{"file_path":"fixture-only"}}
+            })).await.unwrap();
+            drop(actor);
+            let actor =
+                open_actor_for_transport(directory.path(), profile, transport, fixture_transport)
+                    .await
+                    .unwrap();
+            let result = actor
+                .resolve_permission("retained-fixture", json!({"behavior":"allow"}))
+                .await;
+            if fixture_transport.is_some() {
+                assert_eq!(result, Ok(()));
+                assert_eq!(
+                    trace
+                        .observations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|row| row.operation == "approval")
+                        .count(),
+                    1
+                );
+            } else {
+                assert_eq!(
+                    result,
+                    Err(freshell_agent_runtime::host_actor::ActorError::UnknownDecision)
+                );
+                assert_eq!(
+                    trace
+                        .observations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|row| row.operation == "approval")
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
 
     struct SnapshotProviderEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
     impl Drop for SnapshotProviderEnv {

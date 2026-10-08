@@ -120,12 +120,12 @@ pub fn read_claude_observation(
         || native["cwd"] != cwd.as_ref()
         || status["workspace"]["current_dir"] != cwd.as_ref()
         || status["version"] != "2.1.263"
-        || !status["model"]["id"]
+        || status["model"]["id"]
             .as_str()
-            .is_some_and(|id| !id.is_empty())
-        || !status["context_window"]["context_window_size"]
+            .is_none_or(|id| id.is_empty())
+        || status["context_window"]["context_window_size"]
             .as_u64()
-            .is_some_and(|size| size > 0)
+            .is_none_or(|size| size == 0)
         || !status["context_window"]
             .as_object()
             .is_some_and(|context| context.contains_key("current_usage"))
