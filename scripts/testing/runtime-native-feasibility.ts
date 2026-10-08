@@ -23,7 +23,7 @@ export type NativeExperimentOriginal = {
 }
 
 // A finite experiment image can retain the pinned ELF behind this wrapper.
-// Only the exact owned wrong-ID resume workspace gets the supported fork flag;
+// Only exact owned resume-fault workspaces get supported native fault flags;
 // ordinary modes and argv remain unchanged. This never fabricates native IDs.
 export const nativeSdkResumeForkWrapper = String.raw`#!/usr/bin/python3
 import hashlib,json,os,pathlib,re,sys,uuid
@@ -31,7 +31,7 @@ native=pathlib.Path('/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/cla
 if not native.is_file() or native.is_symlink() or hashlib.sha256(native.read_bytes()).hexdigest()!='73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916':
  raise RuntimeError('pinned original SDK child differs')
 args=sys.argv[1:]
-owned=re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/(freshclaude|kilroy)-wrong-id-workspace',os.getcwd())
+owned=re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/(freshclaude|kilroy)-(wrong-id|restoration-failure-after-hook)-workspace',os.getcwd())
 roots=[]
 if owned:
  for index,arg in enumerate(args):
@@ -45,7 +45,16 @@ if owned and roots:
   raise RuntimeError('current owned SDK resume binding missing or ambiguous')
  root=roots[0];uuid.UUID(root)
  if launch.get('requestedNativeSessionId')!=root:raise RuntimeError('owned SDK requested resume root differs')
- if '--fork-session' not in args:args.append('--fork-session')
+ if owned.group(2)=='wrong-id':
+  if '--fork-session' not in args:args.append('--fork-session')
+ else:
+  control=json.loads(pathlib.Path('native-restoration-fault-control.json').read_text())
+  anchor=control.get('missingAnchor');uuid.UUID(anchor)
+  if control.get('root')!=root or anchor==root or not isinstance(control.get('seedBytes'),int) or control['seedBytes']<1 or not re.fullmatch(r'[a-f0-9]{64}',control.get('seedSha256','')):
+   raise RuntimeError('owned SDK native restoration control differs')
+  if any(arg=='--resume-session-at' or arg.startswith('--resume-session-at=') for arg in args):
+   raise RuntimeError('selected native resume anchor already exists')
+  args.append('--resume-session-at='+anchor)
 os.execv(str(native),[str(native),*args])
 `
 
@@ -400,7 +409,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
       throw new Error('owned SDK native resume-fork fault image binding differs')
     }
   }
-  if (wrongId && !sdkForkImage) throw new Error('owned SDK native resume-fork fault image required')
+  if ((wrongId || restorationFailure) && !sdkForkImage) throw new Error('owned SDK native resume-fork fault image required')
   const fieldFault = ['missing-native-id', 'placeholder-id'].includes(caseId)
   const fieldSource = sources.find(file => file.name === 'claude/native-fault/sdk-init-fields.json')
   let sdkFieldImage: any
@@ -475,7 +484,7 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
   if (wrongId || restorationFailure) {
     const local = path.join(workspace, '.claude'); fs.mkdirSync(local, { mode: 0o770 }); fs.chmodSync(local, 0o770)
     const file = path.join(workspace, wrongId ? 'native-sdk-fork-observer.mjs' : 'native-sdk-restoration-observer.mjs')
-    const hook = (wrongId ? terminalForkFaultHook : terminalRestorationFaultHook)
+    const hook = (wrongId ? terminalForkFaultHook : sdkRestorationFaultHook)
       .replace('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe',
         '/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude' + (sdkForkImage ? '.native' : ''))
     fs.writeFileSync(file, hook, { mode: 0o660 }); fs.chmodSync(file, 0o660)
@@ -555,25 +564,16 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
     const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
     harness.writeArtifact(`${scenario}-store-probe.json`, probe)
     if (probe.data.kind !== 'reattach_ready') throw new Error('completed native store not readable before death')
-    if (wrongId) {
-      const control = path.join(workspace, 'native-fork-fault-control.json')
+    if (wrongId || restorationFailure) {
       const bytes = Buffer.from(before.transcript.bytesBase64, 'base64')
-      fs.writeFileSync(control, JSON.stringify({ root: view.nativeSessionId, seedBytes: bytes.length,
-        seedSha256: before.transcript.sha256 }), { mode: 0o660 }); fs.chmodSync(control, 0o660)
-    }
-    if (restorationFailure) {
-      const mutation = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-        ['python3', '-c', claudeNativeRestorationFault, view.nativeSessionId, before.transcript.sha256,
-          JSON.stringify(before.transcript.identity)]))
-      harness.writeArtifact(`${scenario}-owned-before-load-mutation-private.json`, mutation)
-      const malformedProbe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
-      harness.writeArtifact(`${scenario}-malformed-before-load-store-probe.json`, malformedProbe)
-      if (malformedProbe.data.kind !== 'reattach_ready' || mutation.uid !== 65534 || mutation.gid !== 0
-        || mutation.beforeSha256 !== before.transcript.sha256 || mutation.changedAssistantRows < 1) {
-        throw new Error('bounded SDK native loader fault did not retain the owned current store route')
+      const missingAnchor = restorationFailure ? randomUUID() : undefined
+      if (missingAnchor && bytes.toString().trim().split('\n').some(line => JSON.parse(line).uuid === missingAnchor)) {
+        throw new Error('owned native resume anchor unexpectedly exists')
       }
-      const control = path.join(workspace, 'native-restoration-fault-control.json')
-      fs.writeFileSync(control, JSON.stringify(mutation), { mode: 0o660 }); fs.chmodSync(control, 0o660)
+      const control = path.join(workspace, wrongId ? 'native-fork-fault-control.json' : 'native-restoration-fault-control.json')
+      fs.writeFileSync(control, JSON.stringify({ root: view.nativeSessionId, missingAnchor, seedBytes: bytes.length,
+        seedSha256: before.transcript.sha256, ...(restorationFailure ? { identity: before.transcript.identity.slice(0, 2) } : {}) }), { mode: 0o660 })
+      fs.chmodSync(control, 0o660)
     }
     await harness.killOwnedRuntimeExact(view.containerId)
     await harness.waitForContainerExit(view.containerId)
@@ -617,10 +617,13 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
       const currentHook = fault.hook.native.source === 'resume' && fault.hook.native.session_id === view.nativeSessionId
         && fault.hook.launch.requestedNativeSessionId === view.nativeSessionId
         && fault.hook.launch.launchNonce !== namespace.hook.launch.launchNonce && fault.hook.launch.incarnationId !== view.incarnationId
-      const ownedFault = fault.beforeSha256 === before.transcript.sha256 && fault.beforeSha256 !== fault.afterSha256
-        && fault.observedFaultPrefixSha256 === fault.afterSha256 && fault.changedAssistantRows > 0
+      const control = JSON.parse(fs.readFileSync(path.join(workspace, 'native-restoration-fault-control.json'), 'utf8'))
+      const ownedFault = fault.originalPrefixSha256 === before.transcript.sha256
+        && JSON.stringify(fault.identity) === JSON.stringify(before.transcript.identity.slice(0, 2))
+        && fault.missingAnchor === control.missingAnchor && fault.nativeArgv.includes('--resume-session-at=' + control.missingAnchor)
+        && nativeResumeRootInArgv(fault.nativeArgv, view.nativeSessionId)
         && fault.uid === 65534 && fault.gid === 0 && fault.nativeExecutableSha256 === namespace.executableSha256
-      if (!contained || !currentHook || !ownedFault || fault.nativeExited !== true || fault.loadedSha256 !== null) {
+      if (!contained || !currentHook || !ownedFault || fault.nativeExited !== true) {
         throw new Error('actual SDK native hook/restoration failure was not contained before input')
       }
       const input = await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: { soulId, text: 'Owned failed restoration probe. Do not use tools.' } })
@@ -1972,6 +1975,61 @@ if(process.argv[2]==='--observe') {
    observationPath:path.join(workspace,'native-restoration-fault-observation.json')}
   const observer=spawn(process.execPath,[fileURLToPath(import.meta.url),'--observe',JSON.stringify(config)],{stdio:'ignore'})
   observer.unref()
+ }
+ process.stdout.write('{}\n')
+}
+`
+
+export const sdkRestorationFaultHook = String.raw`
+import fs from 'node:fs'
+import path from 'node:path'
+import {createHash} from 'node:crypto'
+import {spawn} from 'node:child_process'
+import {fileURLToPath} from 'node:url'
+const digest=bytes=>createHash('sha256').update(bytes).digest('hex')
+const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms))
+if(process.argv[2]==='--observe') {
+ const config=JSON.parse(process.argv[3]),deadline=Date.now()+5000
+ while(Date.now()<deadline) {
+  if(!fs.existsSync('/proc/'+config.nativePid+'/exe')) {
+   fs.writeFileSync(config.observationPath,JSON.stringify({...config,nativeExited:true}),{mode:0o664});break
+  }
+  await pause(10)
+ }
+} else {
+ let input='';for await(const chunk of process.stdin)input+=chunk
+ const native=JSON.parse(input)
+ if(native.source==='resume') {
+  const workspace=process.cwd(),control=JSON.parse(fs.readFileSync(path.join(workspace,'native-restoration-fault-control.json'),'utf8'))
+  const launch=JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH)
+  if(native.session_id!==control.root || launch.requestedNativeSessionId!==control.root || native.cwd!==workspace
+   || !launch.incarnationId || !launch.launchNonce)throw new Error('owned SDK resume binding mismatch')
+  const signal=path.join(process.env.FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR,'session-start.json'),deadline=Date.now()+3000
+  while(!fs.existsSync(signal) && Date.now()<deadline)await pause(10)
+  const hook=JSON.parse(fs.readFileSync(signal,'utf8'))
+  if(JSON.stringify(hook.launch)!==JSON.stringify(launch) || hook.native.session_id!==control.root || hook.native.source!=='resume')throw new Error('current genuine SDK native hook missing')
+  const transcript=path.resolve(native.transcript_path),store=path.resolve(process.env.CLAUDE_CONFIG_DIR ?? path.join(process.env.HOME,'.claude'),'projects')+path.sep
+  if(!transcript.startsWith(store) || path.basename(transcript)!==control.root+'.jsonl'
+   || !fs.lstatSync(transcript).isFile() || fs.lstatSync(transcript).isSymbolicLink())throw new Error('unowned SDK restoration source refused')
+  const before=fs.statSync(transcript),raw=fs.readFileSync(transcript),after=fs.statSync(transcript)
+  const identity=[String(after.dev),String(after.ino)]
+  if(before.dev!==after.dev || before.ino!==after.ino || JSON.stringify(identity)!==JSON.stringify(control.identity.slice(0,2))
+   || raw.at(-1)!==10 || digest(raw.subarray(0,control.seedBytes))!==control.seedSha256)throw new Error('owned SDK native source changed')
+  const rows=raw.toString().trim().split('\n').map(line=>JSON.parse(line))
+  if(rows.some(row=>row.uuid===control.missingAnchor || row.sessionId && row.sessionId!==control.root)
+   || !rows.some(row=>row.type==='assistant' && row.message?.stop_reason==='end_turn'))throw new Error('native missing-anchor restoration fault differs')
+  const selected='/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude.native'
+  const nativeExecutableSha256=digest(fs.readFileSync(selected))
+  const pids=fs.readdirSync('/proc').filter(id=>/^\d+$/.test(id)).filter(id=>{try{return digest(fs.readFileSync('/proc/'+id+'/exe'))===nativeExecutableSha256}catch{return false}})
+  if(pids.length!==1)throw new Error('current SDK native writer ambiguous')
+  const nativeArgv=fs.readFileSync('/proc/'+pids[0]+'/cmdline').toString().split('\0').filter(Boolean)
+  const roots=nativeArgv.flatMap((arg,index)=>arg==='--resume'?[nativeArgv[index+1]]:arg.startsWith('--resume=')?[arg.slice(9)]:[])
+  const anchors=nativeArgv.flatMap((arg,index)=>arg==='--resume-session-at'?[nativeArgv[index+1]]:arg.startsWith('--resume-session-at=')?[arg.slice(20)]:[])
+  if(roots.length!==1 || roots[0]!==control.root || anchors.length!==1 || anchors[0]!==control.missingAnchor)throw new Error('actual SDK native resume anchor differs')
+  const config={hook,nativePid:Number(pids[0]),nativeExecutableSha256,nativeArgv,uid:process.getuid(),gid:process.getgid(),
+   missingAnchor:control.missingAnchor,originalPrefixSha256:digest(raw.subarray(0,control.seedBytes)),identity,
+   observationPath:path.join(workspace,'native-restoration-fault-observation.json')}
+  const observer=spawn(process.execPath,[fileURLToPath(import.meta.url),'--observe',JSON.stringify(config)],{stdio:'ignore'});observer.unref()
  }
  process.stdout.write('{}\n')
 }

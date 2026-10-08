@@ -8,7 +8,7 @@ import { createServer } from 'node:net'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -114,6 +114,34 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       else expect(run).toThrow()
     } finally {fs.rmSync(root,{recursive:true,force:true})}
   })
+  it.each(['freshclaude','kilroy'].flatMap(mode=>['split','sdk-inline'].flatMap(form=>
+    ['valid','wrong-root','missing-launch','invalid-anchor','existing-anchor','ordinary'].map(fault=>({mode,form,fault})))))(
+    'executes only the owned supported post-hook SDK resume-anchor fault $mode/$form/$fault',({mode,form,fault})=>{
+      const directory=path.join('/tmp/frs',randomUUID().slice(0,12))
+      const workspace=path.join(directory,`${mode}-${fault==='ordinary'?'exact-resume':'restoration-failure-after-hook'}-workspace`)
+      fs.mkdirSync(workspace,{recursive:true})
+      const child=path.join(directory,'native-child'),wrapper=path.join(directory,'wrapper.py'),root=randomUUID(),anchor=randomUUID()
+      fs.writeFileSync(child,'#!/usr/bin/python3\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n',{mode:0o700});fs.chmodSync(child,0o700)
+      fs.writeFileSync(wrapper,nativeSdkResumeForkWrapper
+        .replaceAll('/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude.native',child)
+        .replace('73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916',createHash('sha256').update(fs.readFileSync(child)).digest('hex')))
+      fs.writeFileSync(path.join(workspace,'native-restoration-fault-control.json'),JSON.stringify({
+        root:fault==='wrong-root'?randomUUID():root,missingAnchor:fault==='invalid-anchor'?'invalid-anchor':anchor,
+        seedBytes:42,seedSha256:'a'.repeat(64),identity:['9','42'],
+      }))
+      const argv=[...(form==='sdk-inline'?['--resume='+root]:['--resume',root]),'--model','selected-model',
+        ...(fault==='existing-anchor'?['--resume-session-at='+randomUUID()]:[])]
+      const env={...process.env};delete env.FRESHELL_NATIVE_IDENTITY_LAUNCH
+      if(fault!=='missing-launch')env.FRESHELL_NATIVE_IDENTITY_LAUNCH=JSON.stringify({
+        launchNonce:'current-nonce',incarnationId:'current-incarnation',requestedNativeSessionId:root,
+      })
+      try {
+        const run=()=>execFileSync('python3',[wrapper,...argv],{cwd:workspace,env,encoding:'utf8',stdio:['pipe','pipe','pipe']})
+        if(fault==='valid')expect(JSON.parse(run())).toEqual([...argv,'--resume-session-at='+anchor])
+        else if(fault==='ordinary')expect(JSON.parse(run())).toEqual(argv)
+        else expect(run).toThrow()
+      } finally {fs.rmSync(directory,{recursive:true,force:true})}
+    })
   it.each(['default-home','selected-config','foreign-store','changed-file'])('executes native fork observation against the actual selected owned store (%s)', (fault) => {
     const home='/owned-provider',config=fault==='selected-config'?'/selected-native-config':home+'/.claude'
     const original=Buffer.from('owned completed history\n'),originalFile=config+'/projects/fixture/original-root.jsonl'
@@ -169,6 +197,47 @@ const fs={readdirSync:()=>['71'],readFileSync:(file)=>{if(file.endsWith('native-
   it.each(['fork-root','restoration-failure-after-hook'])('requires the owned real managed controller before the native %s fault can seed', async (caseId) => {
     await expect(executeManagedNativeCase({} as RuntimeHarness, [], {provider: 'claude', case: 'startup'}, caseId))
       .rejects.toThrow('actual terminal recovery requires the owned real server artifact')
+  })
+
+  it.each(['valid','changed-prefix','changed-inode','symlink','present-anchor','wrong-native-anchor','stale-hook','foreign-store'])(
+    'observes only genuine current SDK hook and original owned missing-anchor history (%s)',fault=>{
+      const root=randomUUID(),anchor=randomUUID(),messageId=fault==='present-anchor'?anchor:randomUUID()
+      const launch={requestedNativeSessionId:root,incarnationId:'current-incarnation',launchNonce:'current-nonce'}
+      const raw=Buffer.from(JSON.stringify({type:'assistant',sessionId:root,uuid:messageId,message:{id:'native-message',stop_reason:'end_turn',content:[{type:'text',text:'fixture reply'}]}})+'\n')
+      const control={root,missingAnchor:anchor,seedBytes:raw.length,seedSha256:createHash('sha256').update(raw).digest('hex'),identity:['9','42']}
+      const transcript=(fault==='foreign-store'?'/foreign': '/owned-provider/.claude/projects/project')+'/'+root+'.jsonl'
+      const native={source:'resume',session_id:root,cwd:process.cwd(),transcript_path:transcript}
+      const mocked=`let stats=0;const spawns=[],raw=Buffer.from(${JSON.stringify(raw.toString('base64'))},'base64');const fs={
+existsSync:()=>true,readdirSync:()=>['71'],lstatSync:()=>({isFile:()=>true,isSymbolicLink:()=>${fault==='symlink'}}),
+statSync:()=>({dev:9,ino:++stats===2&&${fault==='changed-inode'}?43:42}),
+readFileSync:file=>{if(file.endsWith('native-restoration-fault-control.json'))return ${JSON.stringify(JSON.stringify(control))};
+if(file.endsWith('session-start.json'))return ${JSON.stringify(JSON.stringify({native,launch:fault==='stale-hook'?{...launch,launchNonce:'old-nonce'}:launch}))};
+if(file.endsWith('/cmdline'))return Buffer.from('native-child\\0--resume=${root}\\0--resume-session-at=${fault==='wrong-native-anchor'?randomUUID():anchor}\\0');
+if(file.endsWith('/claude.native')||file.endsWith('/exe'))return Buffer.from('controlled executable');
+if(file===${JSON.stringify(transcript)})return ${fault==='changed-prefix'?'Buffer.from("changed\\n")':'raw'};
+throw new Error('unexpected bounded read '+file)},writeFileSync:()=>{throw new Error('hook must not write native transcript')}};
+const spawn=(_file,args)=>{spawns.push(JSON.parse(args[2]));return{unref(){}}};`
+      const script=sdkRestorationFaultHook.replace("import fs from 'node:fs'",mocked)
+        .replace("import {spawn} from 'node:child_process'",'')+"\nprocess.stdout.write(JSON.stringify(spawns)+'\\n')"
+      const run=()=>execFileSync(process.execPath,['--input-type=module','-e',script],{input:JSON.stringify(native),
+        env:{...process.env,HOME:'/owned-provider',CLAUDE_CONFIG_DIR:'/owned-provider/.claude',FRESHELL_NATIVE_IDENTITY_LAUNCH:JSON.stringify(launch),FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR:'/current-signal'},encoding:'utf8',stdio:['pipe','pipe','pipe']})
+      if(fault==='valid') {
+        const configs=JSON.parse(run().trim().split('\n').at(-1)!)
+        expect(configs).toHaveLength(1);expect(configs[0].missingAnchor).toBe(anchor)
+        expect(configs[0].originalPrefixSha256).toBe(control.seedSha256)
+        expect(configs[0].identity).toEqual(control.identity);expect(configs[0].hook.launch).toEqual(launch)
+      } else expect(run).toThrow()
+    })
+  it.each(['exited','still-alive'])('records SDK restoration refusal only after the actual captured native process exits (%s)',state=>{
+    const config={nativePid:71,observationPath:'/owned-observation',hook:{launch:{launchNonce:'current'}},missingAnchor:randomUUID()}
+    const mocked=`const writes=[];let tick=0;Date.now=()=>tick++*3000;const fs={existsSync:()=>${state==='still-alive'},
+writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
+    const script=sdkRestorationFaultHook.replace("import fs from 'node:fs'",mocked)
+      .replaceAll('process.argv[2]',JSON.stringify('--observe')).replaceAll('process.argv[3]',JSON.stringify(JSON.stringify(config)))
+      +"\nprocess.stdout.write(JSON.stringify(writes)+'\\n')"
+    const writes=JSON.parse(execFileSync(process.execPath,['--input-type=module','-e',script],{encoding:'utf8'}).trim())
+    if(state==='still-alive')expect(writes).toEqual([])
+    else {expect(writes).toHaveLength(1);expect(writes[0]).toEqual({file:config.observationPath,observation:{...config,nativeExited:true}})}
   })
 
   it.each(['valid', 'current-nonce', 'current-incarnation', 'wrong-root', 'wrong-loaded-root', 'missing-loaded', 'wrong-active-launch', 'hooks-enabled', 'missing-prior-nonce'])('requires the actual old/current native signal binding for the stale fault (%s)', (fault) => {
@@ -614,12 +683,16 @@ const fs={readdirSync:()=>['71'],readFileSync:(file)=>{if(file.endsWith('native-
       expect(start).toHaveBeenCalledTimes(['valid','wrong-installed-wrapper','wrong-sdk'].includes(fault)?1:0)
     } finally {fs.rmSync(directory,{recursive:true,force:true})}
   })
-  it.each(['freshclaude','kilroy'] as const)('requires an owned pinned native fault image before %s wrong-ID can seed', async (mode) => {
-    await expect(executeManagedNativeCase({} as RuntimeHarness,[],{mode,case:'startup'},'wrong-id'))
+  it.each((['freshclaude','kilroy'] as const).flatMap(mode=>['wrong-id','restoration-failure-after-hook'].map(caseId=>({mode,caseId}))))('requires an owned pinned native fault image before $mode/$caseId can seed', async ({mode,caseId}) => {
+    await expect(executeManagedNativeCase({} as RuntimeHarness,[],{mode,case:'startup'},caseId))
       .rejects.toThrow('owned SDK native resume-fork fault image required')
   })
   it.each(['freshclaude', 'kilroy'] as const)('routes %s restoration failure through genuine enabled native hooks before seeding', async (mode) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-native-restoration-route-'))
+    const marker={kind:'owned-sdk-resume-fork-fault-image',imageDigest,
+      wrapperSha256:createHash('sha256').update(nativeSdkResumeForkWrapper).digest('hex'),
+      originalExecutableSha256:'73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916'}
+    const markerPath=path.join(directory,'image.json');fs.writeFileSync(markerPath,JSON.stringify(marker))
     const launch = vi.fn(async (_supervisor: unknown, request: any) => {
       expect(request.params.nativeSessionId).toBeUndefined()
       expect(request.params.freshAgent.fixtureTransport).toBeUndefined()
@@ -629,11 +702,12 @@ const fs={readdirSync:()=>['71'],readFileSync:(file)=>{if(file.endsWith('native-
       expect(settings.hooks.SessionStart).toHaveLength(1)
       throw new Error('controlled genuine native restoration seed boundary')
     })
-    const harness = { testRoot: directory, startSupervisor: async () => ({}), writeArtifact: () => '', adminOk: launch } as unknown as RuntimeHarness
+    const harness = { testRoot: directory,imageRef:imageDigest, startSupervisor: async () => ({}),
+      execOwnedContainerExact:async()=>JSON.stringify({...marker,sdkVersion:'0.3.237'}),writeArtifact: () => '', adminOk: launch } as unknown as RuntimeHarness
     try {
       await expect(executeManagedNativeCase(harness, ['env_file', 'ca_file'].map(suffix => ({
         name: 'claude/grants/' + suffix, path: path.join(directory, suffix), sha256: 'e'.repeat(64),
-      })), { mode, case: 'startup' }, 'restoration-failure-after-hook')).rejects.toThrow('genuine native restoration seed boundary')
+      })).concat([{name:'claude/native-fault/sdk-resume-fork.json',path:markerPath,sha256:createHash('sha256').update(fs.readFileSync(markerPath)).digest('hex')}]), { mode, case: 'startup' }, 'restoration-failure-after-hook')).rejects.toThrow('genuine native restoration seed boundary')
       expect(launch).toHaveBeenCalledOnce()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
