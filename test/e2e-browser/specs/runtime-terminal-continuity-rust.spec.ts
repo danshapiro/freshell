@@ -110,20 +110,6 @@ async function waitForOwnedProcess(
   throw new Error(`timed out waiting for owned process ${pattern}; last=${last}`)
 }
 
-function waitForOwnedPidFile(
-  rig: ManagedRuntimeBrowserRig,
-  containerId: string,
-  filePath: string,
-  timeoutMs: number,
-): Promise<number> {
-  return waitForValue(`numeric PID in ${filePath}`, async () => {
-    const raw = (await rig.ownedProviderExec(containerId, ['sh', '-lc', `cat ${JSON.stringify(filePath)} 2>/dev/null || true`])).trim()
-    if (!/^\d+$/.test(raw)) return null
-    const pid = Number(raw)
-    return Number.isSafeInteger(pid) && pid > 0 ? pid : null
-  }, timeoutMs)
-}
-
 function waitForOwnedFileValue(
   rig: ManagedRuntimeBrowserRig,
   containerId: string,
@@ -209,13 +195,11 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         `(i=0; while true; do echo P2_HEARTBEAT:$i; i=$((i+1)); sleep 1; done) & echo P2_HEARTBEAT_PID=$!; sleep 3600 & child=$!; echo "$child" > "$HOME/p2-child-pid"; echo P2_CHILD_READY`,
       )
       await terminal.waitForOutput('P2_CHILD_READY', { timeout: 20_000, terminalId: initialPane.terminalId })
-      const childPid = await waitForOwnedPidFile(
-        rig,
-        initialView.containerId,
-        '/home/freshell/provider/p2-child-pid',
-        20_000,
-      )
-      expect(rig.ownedContainerHasPid(initialView.containerId, childPid)).toBe(true)
+      const childEnclosure = rig.runtimeEnclosureHandle(initialView)
+      const childPid = await waitForValue('numeric original owned child PID', async () => (
+        (await rig.terminalChildFacts(childEnclosure)).pid
+      ), 20_000)
+      expect(await rig.terminalChildFacts(childEnclosure)).toEqual({ pid: childPid, running: true })
       const seeded = await terminal.getVisibleText(initialPane.terminalId)
       const originalIdentity = {
         soulId: initialView.soulId,
@@ -246,7 +230,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         expect(view?.containerId).toBe(originalIdentity.containerId)
         expect(view?.hostBootId).toBe(originalIdentity.hostBootId)
         expect((await rig.ownershipFacts()).receiptCount).toBe(receiptCount)
-        expect(rig.ownedContainerHasPid(originalIdentity.containerId, childPid)).toBe(true)
+        expect(await rig.terminalChildFacts(childEnclosure)).toEqual({ pid: childPid, running: true })
 
         const failWithDiagnostics = async (error: unknown): Promise<never> => {
           const connection = await page.evaluate(() => ({

@@ -23,7 +23,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
   OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, OpencodeLossRecoverySchema,
   OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema,
-  RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -38,7 +38,7 @@ import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerSta
 import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts, RuntimeChaosReceiptArtifact } from './runtime-sandbox.js'
 import type { OpencodeLossCredentialEvidence, OpencodeLossAbsenceEvidence, OpencodeLossRecovery, OpencodeLossIncidentEvidence } from './runtime-sandbox.js'
 import type { RuntimeLossAssertions, RuntimeLossAssertionsArtifact, RuntimeLossReceiptArtifact } from './runtime-sandbox.js'
-import type { RuntimeFreshAgentReceiptArtifacts, RuntimeOwnershipFacts } from './runtime-sandbox.js'
+import type { RuntimeFreshAgentReceiptArtifacts, RuntimeOwnershipFacts, RuntimeTerminalChildFacts } from './runtime-sandbox.js'
 import type { FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
@@ -867,6 +867,9 @@ export class ExternalManagedRuntimeRig {
   async ownershipFacts(): Promise<RuntimeOwnershipFacts> {
     return this.rpc('ownership-facts', RuntimeOwnershipFactsSchema)
   }
+  async terminalChildFacts(enclosure: RuntimeEnclosureHandle): Promise<RuntimeTerminalChildFacts> {
+    return this.rpc('terminal-child-facts', RuntimeTerminalChildFactsSchema, { enclosure })
+  }
   async publishFreshAgentQualification(freshAgentObservations: FreshAgentQualificationRow[]): Promise<RuntimeFreshAgentReceiptArtifacts> {
     return this.rpc('fresh-agent-receipt', RuntimeFreshAgentReceiptArtifactsSchema, { freshAgentObservations })
   }
@@ -1127,6 +1130,10 @@ export function createExternalRuntimeControl(
       case 'inventory-snapshot': result = await owner.inventorySnapshot(); break
       case 'control-epoch': result = await owner.controlEpoch(); break
       case 'ownership-facts': result = await owner.ownershipFacts(); break
+      case 'terminal-child-facts':
+        if (!request.enclosure) throw new Error('exact terminal enclosure required')
+        result = await owner.terminalChildFacts(request.enclosure)
+        break
       case 'candidate-integrity': result = await owner.captureCandidateIntegrity(); break
       case 'web-process-facts': result = await owner.webProcessFacts(); break
       case 'supervisor-process-facts': result = await owner.supervisorProcessFacts(); break

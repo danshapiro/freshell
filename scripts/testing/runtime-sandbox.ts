@@ -721,6 +721,11 @@ export const RuntimeOwnershipFactsSchema = z.object({
   supervisorContainerId: z.string().regex(/^[a-f0-9]{64}$/), supervisorBinaryKind: z.enum(['test', 'release']),
 }).strict()
 export type RuntimeOwnershipFacts = z.infer<typeof RuntimeOwnershipFactsSchema>
+export const RuntimeTerminalChildFactsSchema = z.union([
+  z.object({ pid: z.number().int().positive(), running: z.boolean() }).strict(),
+  z.object({ pid: z.null(), running: z.literal(false) }).strict(),
+])
+export type RuntimeTerminalChildFacts = z.infer<typeof RuntimeTerminalChildFactsSchema>
 const OPENCODE_LOSS_ABSENCE_SCRIPT = String.raw`
 const fs = require('node:fs');
 const target = process.argv[1];
@@ -789,7 +794,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
     'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
@@ -2786,6 +2791,7 @@ export class ManagedRuntimeOwner {
   private lossRecovery?: { handle: ExactRuntimeHandle; incidentId: string }
   private lossIncidentNativeHash?: string
   private lossAssertionsPublished = false
+  private readonly terminalChildren = new Map<string, number>()
 
   constructor(
     private readonly webFactory: RuntimeWebFactory,
@@ -3166,6 +3172,21 @@ export class ManagedRuntimeOwner {
     return RuntimeOwnershipFactsSchema.parse({ receiptCount: this.runtime.broker.receipts().length,
       unsafeBrokerAttempts: this.runtime.broker.unsafeAttempts().length,
       supervisorContainerId: this.supervisor.containerId, supervisorBinaryKind: this.supervisor.binaryKind })
+  }
+  async terminalChildFacts(handle: RuntimeEnclosureHandle): Promise<RuntimeTerminalChildFacts> {
+    if (this.runtime.phase !== 2) throw new Error('Phase 2 terminal continuity fixture required')
+    await this.currentRuntimeEnclosure(handle)
+    const key = JSON.stringify([handle.containerId, handle.hostBootId])
+    let pid = this.terminalChildren.get(key)
+    if (pid === undefined) {
+      const raw = (await this.ownedProviderExec(handle.containerId, ['sh', '-lc',
+        'cat "/home/freshell/provider/p2-child-pid" 2>/dev/null || true'])).trim()
+      if (!/^\d+$/.test(raw)) return { pid: null, running: false }
+      pid = Number(raw)
+      if (!Number.isSafeInteger(pid) || pid <= 0) return { pid: null, running: false }
+      this.terminalChildren.set(key, pid)
+    }
+    return RuntimeTerminalChildFactsSchema.parse({ pid, running: this.ownedContainerHasPid(handle.containerId, pid) })
   }
 
   async incidentMatchesSoul(handle: ExactRuntimeHandle, incidentId: string): Promise<boolean> {

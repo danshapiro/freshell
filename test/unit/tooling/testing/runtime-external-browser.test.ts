@@ -1602,6 +1602,61 @@ describe('closed external owner control', () => {
     owned.supervisor = { ...owned.supervisor, containerId: 'short-container' }
     await expect(owned.ownershipFacts()).rejects.toThrow()
   })
+  it('reads the fixed terminal child marker once and keeps probing its original observed PID', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-terminal-child-'))
+    try {
+      const { owned, context, inventory, request } = fixture()
+      const row = { soulId: 'child-soul', incarnationId: 'child-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'child-boot', provider: 'shell', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+      const marker = path.join(directory, 'child-pid')
+      const read = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (_id, args) => {
+        const command = args[2].replace('/home/freshell/provider/p2-child-pid', '$TEST_TERMINAL_PID_FILE')
+        const child = spawnSync('sh', ['-lc', command], { encoding: 'utf8', env: { ...process.env, TEST_TERMINAL_PID_FILE: marker } })
+        if (child.status !== 0) throw new Error('private child marker read failed')
+        return child.stdout
+      })
+      const probe = vi.spyOn(owned.runtime, 'execOwnedContainerExact').mockImplementation((containerId, args) => {
+        expect(containerId).toBe(row.containerId)
+        const child = spawnSync('sh', args.slice(1), { encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('private process observation failed')
+        return child.stdout
+      })
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+        await control(JSON.parse(String(init.body)))), { status: 200 }))
+      const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+      const enclosure = rig.runtimeEnclosureHandle(row)
+      await expect(rig.terminalChildFacts(enclosure)).resolves.toEqual({ pid: null, running: false })
+      await fsp.writeFile(marker, 'not a pid')
+      await expect(rig.terminalChildFacts(enclosure)).resolves.toEqual({ pid: null, running: false })
+      expect(probe).not.toHaveBeenCalled()
+      await fsp.writeFile(marker, String(process.pid))
+      await expect(rig.terminalChildFacts(enclosure)).resolves.toEqual({ pid: process.pid, running: true })
+      read.mockClear()
+      await fsp.writeFile(marker, '2147483647')
+      await expect(rig.terminalChildFacts(enclosure)).resolves.toEqual({ pid: process.pid, running: true })
+      expect(read).not.toHaveBeenCalled()
+      inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement-boot' }])
+      probe.mockClear()
+      await expect(owned.terminalChildFacts(enclosure)).rejects.toThrow(/current/)
+      await expect(control({ ...request, action: 'terminal-child-facts', enclosure, pid: 1 })).rejects.toThrow(/operation/)
+      expect(probe).not.toHaveBeenCalled()
+      const replacement = rig.runtimeEnclosureHandle({ ...row, hostBootId: 'replacement-boot' })
+      await expect(rig.terminalChildFacts(replacement)).resolves.toEqual({ pid: 2147483647, running: false })
+      Object.assign(owned.runtime, { phase: 3 })
+      read.mockClear()
+      probe.mockClear()
+      await expect(owned.terminalChildFacts(replacement)).rejects.toThrow(/Phase 2/)
+      expect(read).not.toHaveBeenCalled()
+      expect(probe).not.toHaveBeenCalled()
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
   it('runs the closed Phase3 effect operations over the same pre-native enclosure', async () => {
     const { owned, context, request } = fixture()
     const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',
