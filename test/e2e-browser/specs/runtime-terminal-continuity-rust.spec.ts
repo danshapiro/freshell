@@ -14,7 +14,7 @@ import path from 'node:path'
 
 import { ManagedRuntimeBrowserRig, P2_OPENCODE_MODEL, P2_OPENCODE_VERSION, type ManagedRuntimeView } from '../helpers/managed-runtime.js'
 import { requireOpenCodeOnecliBootstrap } from '../helpers/opencode-auth-file.js'
-import { OPENCODE_NATIVE_HISTORY_SCRIPT, type NativeHistory, waitForOpenCodeTerminalCondition } from '../helpers/opencode-native-history.js'
+import { waitForOpenCodeTerminalCondition } from '../helpers/opencode-native-history.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -347,14 +347,9 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
 
       const sessionId = await waitForSessionId(content, 90_000)
       expect(sessionId).toMatch(/^ses_/)
-      const firstTurn = await waitForValue('native OpenCode first reply', async () => {
-        const nativeHistory = JSON.parse((await rig.ownedProviderExec(view.containerId!, [
-          'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
-          '/home/freshell/provider/.local/share/opencode/opencode.db', sessionId,
-        ]))) as NativeHistory
-        if (nativeHistory.nativeSessionId !== sessionId) return null
-        return nativeHistory.turns.find((turn) => turn.text.includes('READY')) ?? null
-      }, 30_000)
+      const firstTurn = await waitForValue('native OpenCode first reply', () => (
+        rig.openCodeContinuityFirstReply(rig.exactRuntimeHandle({ ...view, nativeSessionId: sessionId }))
+      ), 30_000)
       expect(`${firstTurn.resolvedProvider}/${firstTurn.resolvedModel}`).toBe(P2_OPENCODE_MODEL)
 
       await new Promise((resolve) => setTimeout(resolve, 1_000))

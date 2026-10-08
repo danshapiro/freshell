@@ -24,7 +24,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, OpencodeLossRecoverySchema,
   OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema,
   RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema,
-  OpencodeContinuityStartupFactsSchema, requireOpenCodeOnecliBootstrap, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  OpencodeContinuityStartupFactsSchema, OpencodeContinuityFirstReplySchema, requireOpenCodeOnecliBootstrap, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -898,6 +898,9 @@ export class ExternalManagedRuntimeRig {
   async openCodeContinuityFirstTurnCompleted(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
     return this.rpc('opencode-continuity-first-turn', z.boolean(), { enclosure })
   }
+  async openCodeContinuityFirstReply(handle: ExactRuntimeHandle): Promise<z.infer<typeof OpencodeContinuityFirstReplySchema> | null> {
+    return this.rpc('opencode-continuity-first-reply', OpencodeContinuityFirstReplySchema.nullable(), { handle })
+  }
   async openCodeContinuityEffectCount(enclosure: RuntimeEnclosureHandle): Promise<number | null> {
     return this.rpc('opencode-continuity-effect-count', z.number().nullable(), { enclosure })
   }
@@ -1251,6 +1254,9 @@ export function createExternalRuntimeControl(
       case 'opencode-continuity-first-turn':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
         result = await owner.openCodeContinuityFirstTurnCompleted(request.enclosure)
+        break
+      case 'opencode-continuity-first-reply':
+        result = await owner.openCodeContinuityFirstReply(handle())
         break
       case 'opencode-continuity-effect-count':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')

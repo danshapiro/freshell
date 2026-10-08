@@ -871,6 +871,10 @@ export const OpencodeContinuityStartupFactsSchema = z.object({
   loopbackHostname: z.boolean(), explicitPort: z.boolean(),
 }).strict()
 export type OpencodeContinuityStartupFacts = z.infer<typeof OpencodeContinuityStartupFactsSchema>
+export const OpencodeContinuityFirstReplySchema = z.object({
+  resolvedProvider: z.string(), resolvedModel: z.string(),
+}).strict()
+export type OpencodeContinuityFirstReply = z.infer<typeof OpencodeContinuityFirstReplySchema>
 export const RuntimeTerminalChildFactsSchema = z.union([
   z.object({ pid: z.number().int().positive(), running: z.boolean() }).strict(),
   z.object({ pid: z.null(), running: z.literal(false) }).strict(),
@@ -946,6 +950,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   action: z.enum([
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
+    'opencode-continuity-first-reply',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
     'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
@@ -3561,6 +3566,17 @@ export class ManagedRuntimeOwner {
     await this.assertOpenCodeContinuityEnclosure(handle)
     const raw = await this.ownedProviderExec(handle.containerId, ['sh', '-lc', 'cat /home/freshell/provider/p2-opencode-first-turn 2>/dev/null || true'])
     return raw.trim() === 'P2_OPENCODE_FIRST_TURN_DONE'
+  }
+  async openCodeContinuityFirstReply(handle: ExactRuntimeHandle): Promise<OpencodeContinuityFirstReply | null> {
+    await this.assertOpenCodeContinuityEnclosure(handle)
+    await this.assertCurrentHandle(handle)
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
+      '/home/freshell/provider/.local/share/opencode/opencode.db', handle.nativeSessionId])
+    const history = z.object({ nativeSessionId: z.string(), turns: z.array(z.object({ text: z.string(),
+      resolvedProvider: z.string(), resolvedModel: z.string() }).passthrough()) }).passthrough().parse(JSON.parse(raw))
+    if (history.nativeSessionId !== handle.nativeSessionId) return null
+    const turn = history.turns.find(candidate => candidate.text.includes('READY'))
+    return turn ? { resolvedProvider: turn.resolvedProvider, resolvedModel: turn.resolvedModel } : null
   }
   async openCodeContinuityEffectCount(handle: RuntimeEnclosureHandle): Promise<number | null> {
     await this.assertOpenCodeContinuityEnclosure(handle)

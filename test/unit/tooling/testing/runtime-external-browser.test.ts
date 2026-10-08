@@ -7,6 +7,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { spawnSync, type execFileSync } from 'node:child_process'
+import { createRequire } from 'node:module'
+
+const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
 const execute = vi.fn()
 
@@ -1741,6 +1744,59 @@ describe('closed external owner control', () => {
       await expect(owned.terminalWebCycleCompleted(enclosure, 'P2_WEB_CYCLE_1_123')).rejects.toThrow(/current/)
       expect(read).not.toHaveBeenCalled()
     } finally { await fsp.rm(directory, { recursive: true, force: true }) }
+  })
+  it('reads the original native continuity READY reply on the owner and returns only resolved model facts', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-continuity-reply-'))
+    const filename = path.join(directory, 'opencode.db')
+    const db = new DatabaseSync(filename)
+    try {
+      const { owned, context, inventory, request } = fixture()
+      const row = { soulId: 'reply-soul', incarnationId: 'reply-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'reply-boot', nativeSessionId: 'ses_reply', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+      db.exec('CREATE TABLE session(id TEXT); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT)')
+      db.prepare('INSERT INTO session VALUES (?)').run(row.nativeSessionId)
+      db.prepare('INSERT INTO message VALUES (?,?,?,?)').run('msg_reply', row.nativeSessionId, 1,
+        JSON.stringify({ role: 'assistant', time: { completed: 1 }, providerID: 'openai', modelID: 'gpt-5.4' }))
+      db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('part_reply', row.nativeSessionId, 'msg_reply', 1,
+        JSON.stringify({ type: 'text', text: 'private unrelated reply' }))
+      const read = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (_id, args) => {
+        const child = spawnSync(process.execPath, [...args.slice(1, -2), filename, args[args.length - 1]], { encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('private native reply read failed')
+        return child.stdout
+      })
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const wire: unknown[] = []
+      const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      const handle = rig.exactRuntimeHandle(row)
+      await expect(rig.openCodeContinuityFirstReply(handle)).resolves.toBeNull()
+      db.prepare('UPDATE part SET data=?').run(JSON.stringify({ type: 'text', text: 'private READY response body' }))
+      await expect(rig.openCodeContinuityFirstReply(handle)).resolves.toEqual({ resolvedProvider: 'openai', resolvedModel: 'gpt-5.4' })
+      expect(JSON.stringify(wire)).not.toContain('private')
+      expect(JSON.stringify(wire)).not.toContain('msg_reply')
+      read.mockResolvedValueOnce(JSON.stringify({ nativeSessionId: 'ses_other', turns: [
+        { text: 'READY', resolvedProvider: 'openai', resolvedModel: 'gpt-5.4' },
+      ] }))
+      await expect(rig.openCodeContinuityFirstReply(handle)).resolves.toBeNull()
+      read.mockResolvedValueOnce('{"turns":')
+      await expect(rig.openCodeContinuityFirstReply(handle)).rejects.toThrow()
+      read.mockClear()
+      inventory.mockResolvedValue([{ ...row, provider: 'codex' }])
+      await expect(owned.openCodeContinuityFirstReply(handle)).rejects.toThrow(/OpenCode/)
+      inventory.mockResolvedValue([{ ...row, nativeSessionId: 'ses_replacement' }])
+      await expect(owned.openCodeContinuityFirstReply(handle)).rejects.toThrow(/current/)
+      await expect(control({ ...request, action: 'opencode-continuity-first-reply', handle, sql: 'arbitrary' })).rejects.toThrow(/operation/)
+      expect(read).not.toHaveBeenCalled()
+      Object.assign(owned.runtime, { phase: 3 })
+      await expect(owned.openCodeContinuityFirstReply(handle)).rejects.toThrow(/Phase 2/)
+    } finally { db.close(); await fsp.rm(directory, { recursive: true, force: true }) }
   })
   it('observes the fixed OpenCode continuity startup checks without returning auth or process bodies', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-opencode-startup-'))
