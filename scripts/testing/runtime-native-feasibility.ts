@@ -1342,7 +1342,7 @@ if not native.is_file() or native.is_symlink() or hashlib.sha256(native.read_byt
 if not producer.is_file() or hashlib.sha256(producer.read_bytes()).hexdigest()!=producer_pin:
  raise RuntimeError('pinned native Amplifier producer differs')
 workspace=pathlib.Path.cwd().resolve()
-owned=re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/amplifier-(missing-history|load-failure|missing-context-restore|timeout|provider-exit|stop-cancellation|parent-root)-workspace',str(workspace))
+owned=re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/amplifier-(missing-history|load-failure|missing-context-restore|timeout|provider-exit|stop-cancellation|parent-root|old-writer)-workspace',str(workspace))
 if owned:
  fault=owned[1]
  from amplifier_app_cli.freshell_native_resume import managed_launch,load_native
@@ -1421,6 +1421,29 @@ if owned:
     hasRestoreBefore=True,hasRestoreAfter=hasattr(session.coordinator.get('context'),'set_messages'))
    return session
   session_runner._create_bundle_session=fault_create
+ elif fault=='old-writer':
+  from amplifier_app_cli import freshell_native_resume
+  original_publish=freshell_native_resume.publish_initialized
+  async def stale_publish(session,config):
+   prior=workspace/'prior-native-signal.json'
+   if not prior.exists():return await original_publish(session,config)
+   if prior.is_symlink() or not prior.is_file() or prior.stat().st_size>65536:
+    raise RuntimeError('owned previous native signal differs')
+   previous_raw=prior.read_bytes();previous=json.loads(previous_raw);old=previous['launch'];native_previous=previous['native']
+   if set(old)!=set(launch) or old['requestedNativeSessionId']!=root or native_previous['session_id']!=root or native_previous['parent_id'] is not None:
+    raise RuntimeError('previous native root differs')
+   if old['incarnationId']==launch['incarnationId'] or old['launchNonce']==launch['launchNonce'] or old['evidenceRevision']>=launch['evidenceRevision']:
+    raise RuntimeError('previous native launch is not stale')
+   if native_previous['producer_sha256']!=producer_pin or native_previous['load']['sessionId']!=root:
+    raise RuntimeError('previous native producer/load differs')
+   witness=getattr(config.initial_transcript,'native_load_witness',None)
+   if session.session_id!=root or session.parent_id is not None or not config.is_resume or witness is None or witness['sessionId']!=root:
+    raise RuntimeError('current native stale-writer root differs')
+   freshell_native_resume._revalidate(witness)
+   record('before-stale-native-publication',previousLaunch=old,originalLoad=witness,
+    previousSignalSha256=hashlib.sha256(previous_raw).hexdigest())
+   await freshell_native_resume._publish_initialized(session,config,(old,binding[1]))
+  freshell_native_resume.publish_initialized=stale_publish
  else:
   import time
   from amplifier_app_cli import freshell_native_resume

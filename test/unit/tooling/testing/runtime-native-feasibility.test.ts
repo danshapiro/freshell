@@ -344,7 +344,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(fs.readFileSync(path.join(store, 'transcript.jsonl'), 'utf8')).toBe('')
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'parent-root'].flatMap(fault => ['current', 'ordinary', 'wrong-cli-pin', 'wrong-producer-pin', 'missing-launch', 'wrong-root'].map(form => ({ fault, form }))))('executes the fixed owned Amplifier native startup fault $fault/$form', ({ fault, form }) => {
+  it.each(['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'parent-root', 'old-writer'].flatMap(fault => ['current', 'ordinary', 'wrong-cli-pin', 'wrong-producer-pin', 'missing-launch', 'wrong-root'].map(form => ({ fault, form }))))('executes the fixed owned Amplifier native startup fault $fault/$form', ({ fault, form }) => {
     const pending = ['timeout', 'provider-exit', 'stop-cancellation'].includes(fault)
     const directory = path.join('/tmp/frs', randomUUID().slice(0, 8) + '-abc')
     const workspace = path.join(directory, 'amplifier-' + (form === 'ordinary' ? 'create' : fault) + '-workspace')
@@ -361,7 +361,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     fs.writeFileSync(path.join(pkg, 'session_store.py'), `import pathlib,os\nfrom .freshell_native_resume import load_native\nclass SessionStore:\n def __init__(self):self.base_dir=pathlib.Path(os.environ['OWNED_STORE'])\n def load(self,root):return load_native(self,root)\n`)
     fs.writeFileSync(path.join(pkg, 'session_runner.py'), `import types,sys\nclass Context:\n async def set_messages(self,m):pass\n async def get_messages(self):return []\nasync def _create_bundle_session(*args,**kwargs):\n async def cleanup():pass\n context=Context();return types.SimpleNamespace(session_id=sys.argv[-1],parent_id=None,cleanup=cleanup,coordinator=types.SimpleNamespace(get=lambda name:context if name=='context' else None))\n`)
     const cli = path.join(native, '.venv', 'bin', 'amplifier.native')
-    fs.writeFileSync(cli, `import asyncio,json,sys,time,types\nfrom amplifier_app_cli.session_store import SessionStore\nfrom amplifier_app_cli import session_runner,freshell_native_resume\nfailed=False;loaded=None\ntry:loaded,_=SessionStore().load(sys.argv[-1])\nexcept (OSError,ValueError):failed=True\nsession=asyncio.run(session_runner._create_bundle_session())\nif ${pending ? 'True' : 'False'}:\n time.sleep=lambda seconds:None\n try:asyncio.run(freshell_native_resume.publish_initialized(session,types.SimpleNamespace(is_resume=True,initial_transcript=loaded)))\n except RuntimeError:pass\nprint(json.dumps({'loadFailed':failed,'hasRestore':hasattr(session.coordinator.get('context'),'set_messages')}))\n`)
+    fs.writeFileSync(cli, `import asyncio,json,sys,time,types\nfrom amplifier_app_cli.session_store import SessionStore\nfrom amplifier_app_cli import session_runner,freshell_native_resume\nfailed=False;loaded=None\ntry:loaded,_=SessionStore().load(sys.argv[-1])\nexcept (OSError,ValueError):failed=True\nsession=asyncio.run(session_runner._create_bundle_session())\nif ${pending || fault === 'old-writer' ? 'True' : 'False'}:\n time.sleep=lambda seconds:None\n try:asyncio.run(freshell_native_resume.publish_initialized(session,types.SimpleNamespace(is_resume=True,initial_transcript=loaded)))\n except RuntimeError:pass\nprint(json.dumps({'loadFailed':failed,'hasRestore':hasattr(session.coordinator.get('context'),'set_messages')}))\n`)
     const cliSha = createHash('sha256').update(fs.readFileSync(cli)).digest('hex'), producerSha = createHash('sha256').update(fs.readFileSync(producer)).digest('hex')
     const script = nativeAmplifierStartupFaultWrapper.replaceAll('/opt/amplifier-src', native)
       .replace('b46da0c1095accbb6daf4fffc5936a26e172671713cba6688df4dc5c93c210e4', cliSha)
@@ -374,6 +374,14 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       OWNED_STORE: path.dirname(store), FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(form === 'wrong-root' ? { ...launch, requestedNativeSessionId: randomUUID() } : launch),
       FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR: path.join(directory, 'signals') }
     if (form === 'missing-launch') delete env.FRESHELL_NATIVE_IDENTITY_LAUNCH
+    const previousLaunch = { ...launch, incarnationId: 'previous-incarnation', launchNonce: 'previous-nonce', evidenceRevision: 6 }
+    if (fault === 'old-writer') {
+      execFileSync('python3', [cli, 'session', 'resume', '--full-history', root], {
+        cwd: workspace, env: { ...env, FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(previousLaunch),
+          FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR: path.join(directory, 'previous-signals') }, stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      fs.copyFileSync(path.join(directory, 'previous-signals', 'amplifier-loaded-context.json'), path.join(workspace, 'prior-native-signal.json'))
+    }
     try {
       const run = () => execFileSync('python3', [wrapper, 'session', 'resume', '--full-history', root], {
         cwd: workspace, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
@@ -399,6 +407,13 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       const observed = JSON.parse(fs.readFileSync(path.join(workspace, 'native-startup-fault.json'), 'utf8'))
       expect(observed.fault).toBe(fault); expect(observed.launch).toEqual(launch)
       expect(observed.nativePid).toBeGreaterThan(1); expect(observed.originalCliSha256).toBe(cliSha)
+      if (fault === 'old-writer') {
+        expect(observed.phase).toBe('before-stale-native-publication')
+        expect(observed.previousLaunch).toEqual(previousLaunch)
+        const native = JSON.parse(fs.readFileSync(path.join(directory, 'signals', 'amplifier-loaded-context.json'), 'utf8'))
+        expect(native.launch).toEqual(previousLaunch); expect(native.native.session_id).toBe(root)
+        expect(native.native.load.sessionId).toBe(root); expect(native.native.parent_id).toBeNull()
+      }
       if (fault === 'parent-root') {
         expect(observed.phase).toBe('before-native-load')
         expect(observed.originalLoad.sessionId).toBe(root); expect(observed.originalLoad.parentId).toBeNull()
