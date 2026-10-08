@@ -1887,6 +1887,32 @@ mod provider_launch_context_tests {
     }
 
     #[test]
+    fn managed_claude_fork_fault_requires_a_bound_exact_resume() {
+        let root = "112fa138-8ed5-4f98-8977-4444e8433207";
+        let args = vec!["--resume".into(), root.into(), "--fork-session".into()];
+        assert!(validate_managed_terminal_args("claude", &args).is_ok());
+        assert!(durable_managed_terminal_args("claude", args, None).is_ok());
+        for invalid in [
+            vec!["--fork-session".into()],
+            vec!["--session-id".into(), root.into(), "--fork-session".into()],
+            vec![
+                "--resume".into(),
+                root.into(),
+                "--fork-session".into(),
+                "true".into(),
+            ],
+            vec![
+                "--resume".into(),
+                "bad\nroot".into(),
+                "--fork-session".into(),
+            ],
+        ] {
+            assert!(validate_managed_terminal_args("claude", &invalid).is_err());
+        }
+        assert!(validate_managed_terminal_args("codex", &["--fork-session".into()]).is_err());
+    }
+
+    #[test]
     fn managed_codex_accepts_only_the_packaged_mcp_recipe_after_preparation() {
         let args = vec![
             "-c".into(), "mcp_servers.freshell.command=\"node\"".into(),
@@ -2549,6 +2575,17 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
+        if mode == "claude" && flag == "--fork-session" {
+            if !args
+                .windows(2)
+                .any(|pair| pair[0] == "--resume" && safe_selector(&pair[1]))
+                || args.iter().any(|argument| argument == "--session-id")
+            {
+                return Err(invalid());
+            }
+            index += 1;
+            continue;
+        }
         if mode == "codex" && flag == "resume" && index + 1 < args.len() {
             if !safe_selector(&args[index + 1]) {
                 return Err(invalid());
