@@ -983,6 +983,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'opencode-qualification-second-view',
     'opencode-qualification-notice-count',
     'opencode-qualification-message-ids',
+    'opencode-qualification-nonce',
     'terminal-continuity-receipt',
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
@@ -1019,6 +1020,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   freshAgentObservations: z.array(RuntimeFreshAgentObservationSchema).optional(),
   continuityObservation: RuntimeTerminalContinuityObservationSchema.optional(),
   qualificationTerminalId: z.string().min(1).max(200).optional(),
+  qualificationNonce: z.string().regex(/^p-[A-Za-z0-9_-]{22}$/).optional(),
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
@@ -3692,6 +3694,15 @@ export class ManagedRuntimeOwner {
     return OpencodeReplacementReadinessSchema.parse({ incarnationId: output.incarnationId, streamEpoch: output.streamEpoch,
       terminalId: output.terminalId, exited: output.exited, headSeq: output.headSeq,
       sourceReady: openCodeTerminalReady(sourceText, ['GPT-5.6 Luna', P2_OPENCODE_MODEL]) })
+  }
+  async registerOpenCodeQualificationNonce(handle: ExactRuntimeHandle, nonce: string): Promise<{ challengeId: string }> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
+    if (!/^p-[A-Za-z0-9_-]{22}$/.test(nonce)) throw new Error('fixed qualification nonce shape required')
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    await this.assertCurrentHandle(handle)
+    const challengeId = randomUUID()
+    this.nativeChallenges.set(challengeId, { soulId: handle.soulId, nativeSessionId: handle.nativeSessionId, marker: nonce })
+    return { challengeId }
   }
   async openCodeQualificationAssistantMessageIds(handle: ExactRuntimeHandle): Promise<string[]> {
     if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')

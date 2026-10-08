@@ -1942,6 +1942,39 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('registers only the fixed qualification nonce shape against the exact current native root', async () => {
+    const { owned, context, inventory, request } = fixture()
+    Object.assign(owned.runtime, { phase: 5 })
+    const row = { soulId: 'nonce-soul', incarnationId: 'nonce-incarnation', containerId: 'b'.repeat(64),
+      hostBootId: 'nonce-boot', nativeSessionId: 'ses_nonce', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+    inventory.mockResolvedValue([row])
+    const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+      createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: '/private/nonce/runtime' }
+    Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+    const nonce = `p-${'A'.repeat(22)}`
+    const read = vi.spyOn(owned, 'ownedProviderExec').mockResolvedValue(JSON.stringify({ requestIds: [], resultIds: [], replayCount: 0 }))
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const handle = rig.exactRuntimeHandle(row)
+    const registered = await rig.registerOpenCodeQualificationNonce(handle, nonce)
+    expect(registered.challengeId).toMatch(/^[a-f0-9-]{36}$/)
+    const operation = { ...request, action: 'opencode-qualification-nonce', handle, qualificationNonce: nonce }
+    expect(await control(operation)).toEqual(await control(operation))
+    await expect(rig.nativeToolEvidence(handle, registered.challengeId)).resolves.toEqual({ requestIds: [], resultIds: [], replayCount: 0 })
+    expect(read.mock.calls[0][1].at(-1)).toBe(nonce)
+    read.mockClear()
+    await expect(owned.registerOpenCodeQualificationNonce(handle, 'arbitrary response text')).rejects.toThrow(/nonce/)
+    await expect(control({ ...request, action: 'opencode-qualification-nonce', handle, qualificationNonce: nonce, path: '/foreign' })).rejects.toThrow(/operation/)
+    inventory.mockResolvedValue([{ ...row, nativeSessionId: 'ses_replacement' }])
+    await expect(owned.registerOpenCodeQualificationNonce(handle, nonce)).rejects.toThrow(/current/)
+    await expect(owned.nativeToolEvidence(handle, registered.challengeId)).rejects.toThrow(/current/)
+    inventory.mockResolvedValue([{ ...row, provider: 'claude' }])
+    await expect(owned.registerOpenCodeQualificationNonce(handle, nonce)).rejects.toThrow(/OpenCode/)
+    Object.assign(owned.runtime, { phase: 2 })
+    await expect(owned.registerOpenCodeQualificationNonce(handle, nonce)).rejects.toThrow(/Phase 5/)
+    expect(read).not.toHaveBeenCalled()
+  })
   it('reads qualification native assistant message IDs on the exact owner root without returning bodies', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-qualification-message-ids-'))
     const filename = path.join(directory, 'opencode.db')

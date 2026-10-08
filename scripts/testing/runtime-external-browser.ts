@@ -719,7 +719,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'continuityObservation' | 'qualificationTerminalId'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -929,6 +929,9 @@ export class ExternalManagedRuntimeRig {
   }
   async openCodeQualificationAssistantMessageIds(handle: ExactRuntimeHandle): Promise<string[]> {
     return this.rpc('opencode-qualification-message-ids', z.array(z.string().min(1)), { handle })
+  }
+  async registerOpenCodeQualificationNonce(handle: ExactRuntimeHandle, qualificationNonce: string): Promise<{ challengeId: string }> {
+    return this.rpc('opencode-qualification-nonce', z.object({ challengeId: z.string().uuid() }).strict(), { handle, qualificationNonce })
   }
   async openCodeContinuityFirstTurnCompleted(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
     return this.rpc('opencode-continuity-first-turn', z.boolean(), { enclosure })
@@ -1326,6 +1329,10 @@ export function createExternalRuntimeControl(
         break
       case 'opencode-qualification-message-ids':
         result = await owner.openCodeQualificationAssistantMessageIds(handle())
+        break
+      case 'opencode-qualification-nonce':
+        if (!request.qualificationNonce) throw new Error('fixed qualification nonce required')
+        result = await owner.registerOpenCodeQualificationNonce(handle(), request.qualificationNonce)
         break
       case 'opencode-continuity-effect-count':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
