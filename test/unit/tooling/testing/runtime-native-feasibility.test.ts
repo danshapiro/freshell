@@ -165,7 +165,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         expect(request.params.terminal.resumeSessionId).not.toBe(request.params.nativeSessionId)
         expect(records.has('amplifier-wrong-root-original.json')).toBe(true)
       } else {
-        await expect(result).rejects.toThrow(fault === 'published' ? 'Amplifier wrong-root published Running or an observation'
+        await expect(result).rejects.toThrow(fault === 'published' ? 'Amplifier native fault published Running or an observation'
           : fault === 'admitted-input' ? 'Amplifier wrong-root admitted ordinary input'
           : ['signal-present', 'nonempty-root', 'parent-root', 'wrong-namespace'].includes(fault) ? 'owned Amplifier wrong-root source or namespace differs'
           : 'current actual Amplifier wrong native root evidence missing or stale')
@@ -263,6 +263,70 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       const observed = JSON.parse(fs.readFileSync(path.join(workspace, 'native-startup-fault.json'), 'utf8'))
       expect(observed.fault).toBe(fault); expect(observed.launch).toEqual(launch)
       expect(observed.nativePid).toBeGreaterThan(1); expect(observed.originalCliSha256).toBe(cliSha)
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+  it.each(['missing-history', 'load-failure', 'missing-context-restore'].flatMap(fault => ['current', 'missing-fault', 'old-launch', 'wrong-fault', 'wrong-phase', 'missing-native-condition', 'published', 'signal-published', 'wrong-image', 'admitted-input', 'wrong-descriptor'].map(form => ({ fault, form }))))('requires actual current owned Amplifier startup fault evidence $fault/$form', async ({ fault, form }) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-source-fault-route-'))
+    const source = path.join(directory, 'selected-profile'); fs.writeFileSync(source, 'fixture selected profile')
+    const descriptor = { schemaVersion: 1, imageDigest: form === 'wrong-descriptor' ? `sha256:${'0'.repeat(64)}` : imageDigest, wrapperSourceSha: candidateSha, wrapperSha256: 'e'.repeat(64),
+      originalCliSha256: 'f'.repeat(64), producerSha256: 'c'.repeat(64), cases: ['missing-history', 'load-failure', 'missing-context-restore'] }
+    const descriptorFile = path.join(directory, 'fault.json'); fs.writeFileSync(descriptorFile, JSON.stringify(descriptor))
+    const records = new Map<string, unknown>(); let request: any
+    const launch = () => ({ incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 7,
+      executionGeneration: 3, requestedNativeSessionId: request.params.nativeSessionId })
+    const harness = { testRoot: directory, evidenceDir: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
+      startSupervisor: async () => ({ containerId: 'owned-control' }),
+      inventoryBody: () => ({ method: 'inventory' }), terminalReadOutputBody: () => ({ method: 'terminal_read_output' }), terminalInputBody: () => ({ method: 'terminal_input' }),
+      writeArtifact: (name: string, value: unknown) => records.set(name, value),
+      adminRaw: async (_supervisor: unknown, input: any) => {
+        if (input.method === 'launch') {
+          request = input
+          const applied: any = {
+            severity: 'warning', event: 'test.amplifier.native_startup_fault.applied', fault,
+            phase: fault === 'missing-context-restore' ? 'before-native-context-restore' : 'before-native-load', launch: launch(),
+            nativePid: process.pid, uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, nativeCwd: request.params.terminal.cwd,
+            originalCliSha256: descriptor.originalCliSha256, producerSha256: descriptor.producerSha256,
+            originalLoad: { sessionId: request.params.nativeSessionId, parentId: null, messageCount: 0 },
+            transcriptAbsent: fault === 'missing-history', malformedSha256: fault === 'load-failure' ? 'd'.repeat(64) : null,
+            hasRestoreBefore: true, hasRestoreAfter: false, originalContextType: 'controlled.native.Context',
+          }
+          if (form === 'old-launch') applied.launch.launchNonce = 'old-nonce'
+          if (form === 'wrong-fault') applied.fault = 'another-case'
+          if (form === 'wrong-phase') applied.phase = 'after-failed-restore'
+          if (form === 'missing-native-condition') { applied.transcriptAbsent = false; applied.malformedSha256 = null; applied.hasRestoreAfter = true }
+          if (form !== 'missing-fault') fs.writeFileSync(path.join(request.params.terminal.cwd, 'native-startup-fault.json'), JSON.stringify(applied))
+          return { result: { Err: { code: 'RECOVERY_BLOCKED' } } }
+        }
+        return { result: form === 'admitted-input' ? { Ok: {} } : { Err: { code: 'UNKNOWN_SOUL' } } }
+      },
+      adminOk: async (_supervisor: unknown, input: any) => input.method === 'inventory' ? { data: [{
+        soulId: request.params.soulId, incarnationId: 'current-incarnation', containerId: 'owned-amplifier', launchState: form === 'published' ? 'running' : 'starting', executionGeneration: 3,
+      }] } : { data: { frames: [{ data: JSON.stringify({ severity: 'error', event: 'amplifier.native_load.refused', reason: 'no_complete_native_load', ...launch() }) + '\n' }] } },
+      execOwnedContainerAsExact: async (containerId: string, uid: string) => {
+        expect(uid).toBe(containerId === 'owned-control' ? '0:0' : '65534:0')
+        return JSON.stringify(containerId === 'owned-control' ? launch() : { uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+          cliVersion: '0.1.1', coreVersion: '1.6.0', executableSha256: form === 'wrong-image' ? '0'.repeat(64) : descriptor.wrapperSha256, producerSha256: descriptor.producerSha256, signalAbsent: form !== 'signal-published' })
+      },
+    } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', '.amplifier/settings.yaml', '.amplifier/bundles/default.yaml']
+      .map(name => ({ name: 'amplifier/' + name, path: source, sha256: 'e'.repeat(64) }))
+    sources.push({ name: 'amplifier/native-fault/startup.json', path: descriptorFile, sha256: createHash('sha256').update(fs.readFileSync(descriptorFile)).digest('hex') })
+    try {
+      const run = executeManagedNativeCase(harness, sources, { provider: 'amplifier', case: 'startup' }, fault)
+      if (form === 'current') {
+        const original = await run
+        expect(original.assertions.every(row => row.pass)).toBe(true)
+        expect(records.has('amplifier-' + fault + '-original.json')).toBe(true)
+        expect(request.params.terminal.resumeSessionId).toBe(request.params.nativeSessionId)
+      } else {
+        await expect(run).rejects.toThrow(form === 'missing-fault' ? 'ENOENT'
+          : form === 'wrong-descriptor' ? 'actual owned Amplifier fault image binding differs'
+          : form === 'published' ? 'Amplifier native fault published Running or an observation'
+          : ['old-launch', 'wrong-fault'].includes(form) ? 'current actual Amplifier startup fault binding missing or stale'
+          : ['wrong-phase', 'missing-native-condition'].includes(form) ? fault === 'missing-context-restore' ? 'actual native Amplifier context restore method fault missing' : 'actual native Amplifier unloaded history fault missing'
+          : form === 'admitted-input' ? 'Amplifier startup fault admitted ordinary input' : 'actual Amplifier fault image or native signal differs')
+        expect(records.has('amplifier-' + fault + '-original.json')).toBe(false)
+      }
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
   it.each(['matching', 'wrong-root', 'parent-root', 'missing-root'])('executes the pinned Amplifier producer with current native root diagnostics (%s)', (fault) => {

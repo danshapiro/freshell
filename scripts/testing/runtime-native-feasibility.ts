@@ -388,7 +388,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
-  if (selection.provider === 'amplifier' && ['create', 'wrong-root', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'amplifier' && ['create', 'wrong-root', 'missing-history', 'load-failure', 'missing-context-restore', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
     return executeManagedAmplifier(harness, sources, caseId, serverPath, servers)
   }
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
@@ -1429,6 +1429,21 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[]): Promise<NativeExperimentOriginal> {
   const scenario = `amplifier-${caseId}`
   const wrongRoot = caseId === 'wrong-root'
+  const sourceFault = ['missing-history', 'load-failure', 'missing-context-restore'].includes(caseId)
+  let faultImage: any
+  if (sourceFault) {
+    const descriptor = sources.find(source => source.name === 'amplifier/native-fault/startup.json')
+    if (!descriptor) throw new Error('actual owned Amplifier fault image descriptor missing')
+    const raw = fs.readFileSync(descriptor.path)
+    if (createHash('sha256').update(raw).digest('hex') !== descriptor.sha256) throw new Error('Amplifier fault image descriptor changed')
+    faultImage = JSON.parse(raw.toString('utf8'))
+    if (faultImage.schemaVersion !== 1 || faultImage.imageDigest !== harness.imageRef
+      || !/^[a-f0-9]{40}$/.test(faultImage.wrapperSourceSha)
+      || !['wrapperSha256', 'originalCliSha256', 'producerSha256'].every(key => /^[a-f0-9]{64}$/.test(faultImage[key]))
+      || JSON.stringify(faultImage.cases) !== JSON.stringify(['missing-history', 'load-failure', 'missing-context-restore'])) {
+      throw new Error('actual owned Amplifier fault image binding differs')
+    }
+  }
   const resumes = ['exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)
   const followup = caseId === 'native-followup' || caseId === 'current-native-turn'
   if (resumes && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
@@ -1518,16 +1533,16 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
     harness.writeArtifact(`${scenario}-original.json`, original)
     return original
   }
-  if (wrongRoot) {
+  if (wrongRoot || sourceFault) {
     const result = await harness.adminRaw(supervisor, request)
     harness.writeArtifact(`${scenario}-launch.json`, result)
-    if (result.result?.Err?.code !== 'RECOVERY_BLOCKED') throw new Error('Amplifier wrong-root launch was not blocked')
+    if (result.result?.Err?.code !== 'RECOVERY_BLOCKED') throw new Error('Amplifier native fault launch was not blocked')
     const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
     harness.writeArtifact(`${scenario}-inventory.json`, inventory)
     const view = inventory.data.find((row: any) => row.soulId === soulId)
     harness.writeArtifact(`${scenario}-current-view.json`, view)
     if (view?.launchState !== 'starting' || view.nativeIdentityObservation) {
-      throw new Error('Amplifier wrong-root published Running or an observation')
+      throw new Error('Amplifier native fault published Running or an observation')
     }
     // Read only the already-owned registry's persisted launch binding. The
     // native event cannot choose its own nonce, revision or generation.
@@ -1536,10 +1551,62 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
     harness.writeArtifact(`${scenario}-current-launch-binding.json`, launch)
     const output = await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId))
     harness.writeArtifact(`${scenario}-terminal-private.json`, output)
-    const events = stripVTControlCharacters(output.data.frames.map((frame: any) => frame.data).join(''))
+    const nativeEvents = stripVTControlCharacters(output.data.frames.map((frame: any) => frame.data).join(''))
       .split(/\r?\n/).flatMap(line => {
         try { return [JSON.parse(line)] } catch { return [] }
-      }).filter(event => event.event === 'amplifier.native_root.refused')
+      })
+    if (sourceFault) {
+      const fault = JSON.parse(fs.readFileSync(path.join(workspace, 'native-startup-fault.json'), 'utf8'))
+      harness.writeArtifact(`${scenario}-native-fault-private.json`, fault)
+      const bindingMatches = (value: any) => value?.incarnationId === launch.incarnationId
+        && value.launchNonce === launch.launchNonce && value.evidenceRevision === launch.evidenceRevision
+        && value.executionGeneration === launch.executionGeneration
+      if (fault.event !== 'test.amplifier.native_startup_fault.applied' || fault.severity !== 'warning' || fault.fault !== caseId
+        || !bindingMatches(fault.launch) || fault.launch.requestedNativeSessionId !== nativeRoot
+        || launch.incarnationId !== view.incarnationId || launch.executionGeneration !== view.executionGeneration
+        || fault.nativeCwd !== workspace || !Number.isSafeInteger(fault.nativePid) || fault.nativePid <= 1
+        || fault.uid !== 65534 || fault.gid !== 0 || fault.caps !== '0000000000000000' || !fault.readOnlyRoot
+        || fault.originalCliSha256 !== faultImage.originalCliSha256 || fault.producerSha256 !== faultImage.producerSha256) {
+        throw new Error('current actual Amplifier startup fault binding missing or stale')
+      }
+      if (caseId === 'missing-context-restore') {
+        if (fault.phase !== 'before-native-context-restore' || fault.hasRestoreBefore !== true || fault.hasRestoreAfter !== false
+          || typeof fault.originalContextType !== 'string' || !fault.originalContextType) {
+          throw new Error('actual native Amplifier context restore method fault missing')
+        }
+      } else {
+        const loadEvents = nativeEvents.filter(event => event.event === 'amplifier.native_load.refused')
+        if (fault.phase !== 'before-native-load' || fault.originalLoad?.sessionId !== nativeRoot || fault.originalLoad?.parentId !== null
+          || fault.originalLoad?.messageCount !== 0 || !loadEvents.some(event => bindingMatches(event)
+            && event.reason === 'no_complete_native_load' && event.severity === 'error')
+          || (caseId === 'missing-history' ? fault.transcriptAbsent !== true || fault.malformedSha256 !== null
+            : fault.transcriptAbsent !== false || !/^[a-f0-9]{64}$/.test(fault.malformedSha256))) {
+          throw new Error('actual native Amplifier unloaded history fault missing')
+        }
+      }
+      const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+        ['/opt/amplifier-src/.venv/bin/python', '-c', String.raw`
+import os,json,pathlib,hashlib,importlib.metadata as m,sys
+p=pathlib.Path('/opt/amplifier-src/.venv/bin/amplifier');producer=pathlib.Path('/opt/amplifier-src/amplifier_app_cli/freshell_native_resume.py')
+signal=pathlib.Path('/home/freshell/provider/.freshell/native-identity')/sys.argv[1]/'amplifier-loaded-context.json'
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'executableSha256':hashlib.sha256(p.read_bytes()).hexdigest(),'producerSha256':hashlib.sha256(producer.read_bytes()).hexdigest(),'cliVersion':m.version('amplifier-app-cli'),'coreVersion':m.version('amplifier-core'),'signalAbsent':not signal.exists()}))
+`, launch.launchNonce]))
+      harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
+      if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000' || !namespace.readOnlyRoot
+        || namespace.cliVersion !== '0.1.1' || namespace.coreVersion !== '1.6.0'
+        || namespace.executableSha256 !== faultImage.wrapperSha256 || namespace.producerSha256 !== faultImage.producerSha256
+        || namespace.signalAbsent !== true) throw new Error('actual Amplifier fault image or native signal differs')
+      const input = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned refused startup input probe. Do not use tools.\r'))
+      harness.writeArtifact(`${scenario}-input-refusal.json`, input)
+      if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('Amplifier startup fault admitted ordinary input')
+      return finish(namespace,
+        [`${scenario}-launch.json`, `${scenario}-current-view.json`, `${scenario}-current-launch-binding.json`, `${scenario}-terminal-private.json`, `${scenario}-native-fault-private.json`, `${scenario}-namespace-native-private.json`, `${scenario}-input-refusal.json`],
+        [{ name: 'actual-native-startup-fault-bound-to-current-launch', pass: bindingMatches(fault.launch) },
+          { name: caseId === 'missing-context-restore' ? 'native-context-missing-supported-restore-method' : 'native-loader-refuses-unloadable-owned-history',
+            pass: caseId === 'missing-context-restore' ? fault.hasRestoreBefore && !fault.hasRestoreAfter : fault.phase === 'before-native-load' },
+          { name: 'native-startup-fault-refuses-current-ack-running-and-input', pass: namespace.signalAbsent && view.launchState === 'starting' && !view.nativeIdentityObservation && input.result.Err.code === 'UNKNOWN_SOUL' }])
+    }
+    const events = nativeEvents.filter(event => event.event === 'amplifier.native_root.refused')
     const event = events.length === 1 ? events[0] : undefined
     if (!event || event.severity !== 'error' || event.reason !== 'native_root_mismatch'
       || event.nativeSessionId !== actualRoot || actualRoot === nativeRoot
