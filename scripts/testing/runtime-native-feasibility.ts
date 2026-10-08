@@ -800,13 +800,32 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   if (staleSignal) {
     // Obtain genuine current native bytes in this owned rig, then close their
     // sole writer before presenting them to a different launch as a fault.
-    await executeManagedTerminalClaude(harness, sources, 'create', serverPath, servers)
+    const originalPath = path.join(harness.evidenceDir, 'claude-create-original.json')
+    if (!fs.existsSync(originalPath)) await executeManagedTerminalClaude(harness, sources, 'create', serverPath, servers)
     const read = (name: string) => JSON.parse(fs.readFileSync(path.join(harness.evidenceDir, name), 'utf8'))
+    const priorOriginal = read('claude-create-original.json')
     const priorView = read('claude-create-current-view.json')
+    const priorObservation = priorView.nativeIdentityObservation
     priorSignals = read('claude-create-signal-native-private.json').processes.find((row: any) =>
       row.launch?.incarnationId === priorView.incarnationId)
-    if (!priorSignals || priorSignals.signals.length !== 2 || priorSignals.signals.some((row: any) => !row.bytesBase64 || !row.sha256)) {
-      throw new Error('genuine owned prior-launch native signals missing')
+    if (priorOriginal.ownerId !== harness.runId || priorOriginal.candidateSha !== harness.candidateSha
+      || priorOriginal.imageDigest !== harness.imageRef || !priorOriginal.assertions?.length
+      || !priorOriginal.assertions.every((row: any) => row.pass === true)
+      || priorView.launchState !== 'running' || priorView.recoveryState !== 'live'
+      || priorObservation?.source !== 'claude_native_event' || !priorView.nativeSessionId
+      || priorObservation.nativeSessionId !== priorView.nativeSessionId
+      || priorObservation.incarnationId !== priorView.incarnationId || !priorObservation.launchNonce
+      || !priorSignals || priorSignals.launch.launchNonce !== priorObservation.launchNonce
+      || priorSignals.signals.length !== 2 || !['session-start.json', 'statusline-loaded.json'].every((name) =>
+        priorSignals.signals.some((row: any) => {
+          if (row.name !== name || !row.bytesBase64 || !row.sha256) return false
+          const bytes = Buffer.from(row.bytesBase64, 'base64')
+          if (createHash('sha256').update(bytes).digest('hex') !== row.sha256) return false
+          const signal = JSON.parse(bytes.toString('utf8'))
+          return signal.native?.session_id === priorView.nativeSessionId
+            && JSON.stringify(signal.launch) === JSON.stringify(priorSignals.launch)
+        }))) {
+      throw new Error('current owned native create evidence required before stale-signal reuse')
     }
     harness.killOwnedRuntimeExact(priorView.containerId)
     await harness.waitForContainerExit(priorView.containerId)

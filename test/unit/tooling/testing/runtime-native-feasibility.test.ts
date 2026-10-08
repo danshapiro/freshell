@@ -273,7 +273,7 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
       expect(fs.readFileSync(path.join(sibling, 'retained'), 'utf8')).toBe('unchanged')
       throw new Error('controlled unwritable native launch boundary')
     })
-    const harness = { testRoot: directory, startSupervisor: async (options: any) => { home = options.env.HOME; return {} },
+    const harness = { testRoot: directory, evidenceDir: directory, startSupervisor: async (options: any) => { home = options.env.HOME; return {} },
       writeArtifact: () => '', adminRaw: launch, adminOk: launch } as unknown as RuntimeHarness
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({
       name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
@@ -371,7 +371,7 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
       expect(preferences.projects[request.params.terminal.cwd].hasTrustDialogAccepted).toBe(caseId !== 'trust-refusal')
       throw new Error('controlled terminal launch boundary')
     })
-    const harness = { testRoot: directory, startSupervisor: async (options: any) => { home = options.env.HOME; return {} },
+    const harness = { testRoot: directory, evidenceDir: directory, startSupervisor: async (options: any) => { home = options.env.HOME; return {} },
       writeArtifact: () => '', adminOk: launch, adminRaw: launch } as unknown as RuntimeHarness
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({
       name: 'claude/' + name, path: path.join(directory, path.basename(name)), sha256: 'e'.repeat(64) }))
@@ -392,6 +392,45 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
       expect(request.params.fixture).toBeUndefined()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it.each(['valid', 'wrong-owner', 'wrong-candidate', 'wrong-image', 'failed-create', 'wrong-observation', 'wrong-nonce', 'wrong-signal-digest'])(
+    'uses only this campaign’s completed native create for the stale-signal fault (%s)', async (fault) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-stale-campaign-'))
+      const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
+      fs.mkdirSync(path.join(directory, 'claude-create-workspace'))
+      const nativeRoot = randomUUID()
+      const launchBinding = { incarnationId: 'prior-incarnation', launchNonce: 'prior-nonce' }
+      const records: Record<string, unknown> = {
+        'claude-create-original.json': { ownerId: fault === 'wrong-owner' ? 'foreign-owner' : ownerId,
+          candidateSha: fault === 'wrong-candidate' ? 'f'.repeat(40) : candidateSha, imageDigest: fault === 'wrong-image' ? 'sha256:' + 'f'.repeat(64) : imageDigest,
+          assertions: [{ name: 'actual-terminal-current-native-post-load-observation-before-input', pass: fault !== 'failed-create' }] },
+        'claude-create-current-view.json': { containerId: 'prior-owned-container', incarnationId: 'prior-incarnation',
+          launchState: 'running', recoveryState: 'live', nativeSessionId: nativeRoot,
+          nativeIdentityObservation: { source: 'claude_native_event', nativeSessionId: fault === 'wrong-observation' ? randomUUID() : nativeRoot,
+            ...launchBinding, launchNonce: fault === 'wrong-nonce' ? 'foreign-nonce' : launchBinding.launchNonce } },
+        'claude-create-signal-native-private.json': { processes: [{ launch: launchBinding,
+          signals: ['session-start.json', 'statusline-loaded.json'].map((name) => {
+            const bytes = Buffer.from(JSON.stringify({ launch: launchBinding, native: { session_id: nativeRoot } }))
+            return { name, bytesBase64: bytes.toString('base64'), sha256: fault === 'wrong-signal-digest' ? 'f'.repeat(64) : createHash('sha256').update(bytes).digest('hex') }
+          }) }] },
+      }
+      for (const [name, value] of Object.entries(records)) fs.writeFileSync(path.join(directory, name), JSON.stringify(value))
+      const kill = vi.fn(), wait = vi.fn(async () => {}), start = vi.fn(async () => { throw new Error('controlled stale launch boundary') })
+      const harness = { testRoot: directory, evidenceDir: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
+        killOwnedRuntimeExact: kill, waitForContainerExit: wait, startSupervisor: start } as unknown as RuntimeHarness
+      const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json']
+        .map((name) => ({ name: 'claude/' + name, path: source, sha256: 'e'.repeat(64) }))
+      try {
+        await expect(executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, 'stale-shared-signal'))
+          .rejects.toThrow(fault === 'valid' ? 'controlled stale launch boundary' : 'current owned native create evidence')
+        if (fault === 'valid') {
+          expect(kill).toHaveBeenCalledExactlyOnceWith('prior-owned-container')
+          expect(wait).toHaveBeenCalledExactlyOnceWith('prior-owned-container')
+          expect(start).toHaveBeenCalledOnce()
+        } else { expect(kill).not.toHaveBeenCalled(); expect(start).not.toHaveBeenCalled() }
+        expect(JSON.parse(fs.readFileSync(path.join(directory, 'claude-create-original.json'), 'utf8'))).toEqual(records['claude-create-original.json'])
+      } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+    },
+  )
   it('captures current provider-owned terminal signals before a startup refusal tears down the enclosure', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-signal-failure-'))
     const source = path.join(directory, 'preferences.json')
