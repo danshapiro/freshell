@@ -16,18 +16,90 @@ pub(crate) fn read_private(root: &Path, relative: &str, limit: usize) -> Result<
         std::fs::symlink_metadata(&path).map_err(|_| "prepared private source unavailable")?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
+        || metadata.len() > limit as u64
         || std::fs::canonicalize(&path).map_err(|_| "prepared private source unavailable")? != path
     {
-        return Err("prepared private source must be a physical stage file".into());
+        return Err(
+            "prepared private source must be a physical stage file within its byte profile".into(),
+        );
     }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|_| "prepared private source unreadable")?;
+    let opened = file
+        .metadata()
+        .map_err(|_| "prepared private source unavailable")?;
+    let modified = metadata
+        .modified()
+        .map_err(|_| "prepared private source metadata unavailable")?;
+    if opened.len() != metadata.len()
+        || opened
+            .modified()
+            .map_err(|_| "prepared private source metadata unavailable")?
+            != modified
+    {
+        return Err(
+            "prepared private source changed before reading; retain inputs and reprepare".into(),
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino()) {
+            return Err(
+                "prepared private source inode changed before reading; retain inputs and reprepare"
+                    .into(),
+            );
+        }
+    }
+    let length = usize::try_from(metadata.len())
+        .map_err(|_| "prepared private source byte profile exceeded")?;
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .map_err(|_| "prepared private source unreadable")?
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| "prepared private source allocation unavailable")?;
+    bytes.resize(length, 0);
+    file.read_exact(&mut bytes)
         .map_err(|_| "prepared private source read failed")?;
-    if bytes.len() > limit {
-        return Err("prepared source-view or filesystem metadata profile exceeded".into());
+    let mut extra = [0];
+    if file
+        .read(&mut extra)
+        .map_err(|_| "prepared private source completion unavailable")?
+        != 0
+    {
+        return Err(
+            "prepared private source grew during reading; retain inputs and reprepare".into(),
+        );
+    }
+    let after = std::fs::symlink_metadata(&path)
+        .map_err(|_| "prepared private source unavailable after reading")?;
+    if after.file_type().is_symlink()
+        || after.len() != metadata.len()
+        || after
+            .modified()
+            .map_err(|_| "prepared private source metadata unavailable")?
+            != modified
+    {
+        return Err(
+            "prepared private source changed during reading; retain inputs and reprepare".into(),
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (after.dev(), after.ino()) != (metadata.dev(), metadata.ino()) {
+            return Err(
+                "prepared private source inode changed during reading; retain inputs and reprepare"
+                    .into(),
+            );
+        }
     }
     Ok(bytes)
 }
@@ -395,6 +467,59 @@ pub fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_secret_private_reader_rejects_oversize_before_payload_read() {
+        use std::io::Read;
+        let owned = tempfile::tempdir().unwrap();
+        let private = owned.path().join("metadata");
+        let native = owned.path().join("native-history.jsonl");
+        std::fs::write(&native, b"synthetic-native-store-preserved").unwrap();
+        let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        for limit in [
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+            freshell_platform::claude_inputs::MAX_NATIVE_SETTINGS_BYTES,
+            64 * 1024 * 1024,
+        ] {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&private)
+                .unwrap();
+            file.set_len(limit as u64).unwrap();
+            let accepted = read_private(owned.path(), "metadata", limit).unwrap();
+            assert_eq!(
+                accepted.len(),
+                limit,
+                "inclusive physical file limit must remain supported"
+            );
+            drop(accepted);
+            file.set_len(limit as u64 + 1).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
+                .unwrap();
+            file.read_exact(&mut [0u8; 1]).unwrap();
+            assert_ne!(
+                std::fs::metadata(&private).unwrap().accessed().unwrap(),
+                old_access,
+                "fixture must report actual reads"
+            );
+            file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
+                .unwrap();
+            assert!(read_private(owned.path(), "metadata", limit).is_err());
+            assert_eq!(
+                std::fs::metadata(&private).unwrap().accessed().unwrap(),
+                old_access,
+                "host must reject oversized private metadata before reading its payload"
+            );
+            assert_eq!(
+                std::fs::read(&native).unwrap(),
+                b"synthetic-native-store-preserved"
+            );
+        }
+    }
     use freshell_platform::opencode_recipe::*;
     use freshell_runtime_protocol::*;
     use sha2::{Digest, Sha256};
