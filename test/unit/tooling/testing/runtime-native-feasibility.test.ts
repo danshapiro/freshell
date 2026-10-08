@@ -107,6 +107,19 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(result).toEqual(fault === 'fault-sidecar' ? { route: 'fault', args: ['codex', ...args] } : { route: 'native', args })
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it('records a bounded typed native HTTP creation refusal without provider error text', async () => {
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'native-load-http-refusal-')),file=path.join(directory,'wrapper.mjs');fs.writeFileSync(file,nativeReceiverLoadFaultWrapper)
+    const failures:any[]=[],upstream=createHttpServer((_request,response)=>{response.writeHead(409,{'content-type':'application/json'});response.end(JSON.stringify({message:'private-provider-content'}))})
+    await new Promise<void>(resolve=>upstream.listen(0,'127.0.0.1',resolve))
+    let proxy:any
+    try {
+      const native=await import(file)
+      const address=upstream.address();if(!address||typeof address==='string')throw new Error('owned fixture did not bind TCP')
+      proxy=await native.createOpenCodeLoadProxy({port:0,upstreamUrl:'http://127.0.0.1:'+address.port,expectedRoot:'ses_expected',observe:()=>{throw new Error('must not observe refused creation')},onFailure:(value:any)=>failures.push(value)})
+      const result=await fetch(proxy.url+'/session/ses_expected');expect(result.status).toBe(502)
+      expect(failures).toEqual([{schemaVersion:1,severity:'error',event:'runtime.native_receiver_fault.http_failed',stage:'create_native_session',status:409,errorKind:'Error',code:null}])
+    } finally {await proxy?.close();upstream.closeAllConnections();await new Promise<void>(resolve=>upstream.close(()=>resolve()));fs.rmSync(directory,{recursive:true,force:true})}
+  })
   it.each(['owned-mounted-workspace', 'ordinary-workspace', 'wrong-current-root'])('selects the owned OpenCode HTTP workspace mount while preserving daemon cwd (%s; orchestration only)', fault => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-mount-'))
     const workspace = path.join(directory, 'freshopencode-wrong-root-workspace'), daemon = path.join(directory, 'daemon'); fs.mkdirSync(workspace); fs.mkdirSync(daemon)

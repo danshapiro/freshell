@@ -36,7 +36,8 @@ export const nativeReceiverLoadFaultWrapper = String.raw`
 let nativeFaultStage = 'entry'
 export function receiverLoadFaultFailure(error, stage) {
   const stages = ['entry', 'verify_uid', 'read_launch_control', 'verify_native_pin', 'validate_native_route',
-    'spawn_native_child', 'wait_native_listener', 'capture_native_response', 'await_owned_release', 'bind_native_proxy']
+    'spawn_native_child', 'wait_native_listener', 'capture_native_response', 'await_owned_release', 'bind_native_proxy',
+    'create_native_session', 'load_native_session', 'observe_native_load', 'forward_native_request']
   return { stage: stages.includes(stage) ? stage : 'unknown',
     errorKind: ['Error', 'TypeError', 'SyntaxError', 'RangeError'].includes(error?.name) ? error.name : 'OtherError',
     code: ['ENOENT', 'EACCES', 'EROFS', 'EADDRINUSE', 'ECONNREFUSED'].includes(error?.code) ? error.code : null }
@@ -132,25 +133,31 @@ export async function createOpenCodeLoadProxy(options) {
   const { upstreamUrl, port, expectedRoot, observe } = options
   let selectedRoot, nativeInputDispatches = 0
   const server = createServer(async (incoming, outgoing) => {
+    let stage = 'forward_native_request', status = null
     try {
       const selected = new URL(incoming.url, upstreamUrl)
       const headers = { ...incoming.headers }; delete headers.host; delete headers['content-length']
       const exact = selected.pathname === '/session/' + encodeURIComponent(expectedRoot)
       if (incoming.method === 'GET' && exact) {
         if (!selectedRoot) {
+          stage = 'create_native_session'
           const created = await fetch(new URL('/session' + selected.search, upstreamUrl),
             { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(5000) })
+          status = created.status
           if (!created.ok) throw new Error('actual native session creation refused')
           const bytes = Buffer.from(await created.arrayBuffer())
           if (bytes.length > 1048576) throw new Error('actual native creation result exceeds bound')
           selectedRoot = selectedOpenCodeLoadRoot(expectedRoot, JSON.parse(bytes.toString('utf8')).id)
         }
         selected.pathname = '/session/' + encodeURIComponent(selectedRoot)
+        stage = 'load_native_session'; status = null
         const loaded = await fetch(selected, { headers, signal: AbortSignal.timeout(5000) })
+        status = loaded.status
         const bytes = Buffer.from(await loaded.arrayBuffer())
         if (!loaded.ok || bytes.length > 1048576 || JSON.parse(bytes.toString('utf8')).id !== selectedRoot) {
           throw new Error('actual native loaded root differs')
         }
+        stage = 'observe_native_load'
         await observe(selectedRoot, bytes, nativeInputDispatches)
         outgoing.writeHead(loaded.status, { 'content-type': loaded.headers.get('content-type') ?? 'application/json' })
         outgoing.end(bytes)
@@ -166,7 +173,11 @@ export async function createOpenCodeLoadProxy(options) {
       })
       upstream.on('error', () => outgoing.destroy())
       incoming.on('error', () => upstream.destroy()); incoming.pipe(upstream)
-    } catch { outgoing.writeHead(502); outgoing.end('owned native load fault refused') }
+    } catch (error) {
+      options.onFailure?.({ schemaVersion: 1, severity: 'error', event: 'runtime.native_receiver_fault.http_failed',
+        ...receiverLoadFaultFailure(error, stage), status })
+      outgoing.writeHead(502); outgoing.end('owned native load fault refused')
+    }
   })
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve) })
   return { url: 'http://127.0.0.1:' + server.address().port,
@@ -261,7 +272,9 @@ async function runOwnedReceiverLoadFault() {
       proxy = await createCodexLoadProxy({ WebSocket, WebSocketServer, port: outerPort,
         upstreamUrl: 'ws://127.0.0.1:' + backendPort, expectedRoot: binding.expectedRoot, observe })
     } else proxy = await createOpenCodeLoadProxy({ port: outerPort, upstreamUrl: 'http://127.0.0.1:' + backendPort,
-      expectedRoot: binding.expectedRoot, observe })
+      expectedRoot: binding.expectedRoot, observe, onFailure: value => {
+        fs.writeFileSync(path.join(workspace, 'native-receiver-load-fault-failure.json'), JSON.stringify(value), { mode: 0o664, flag: 'wx' })
+      } })
   } catch (error) { child.kill('SIGTERM'); throw error }
 }
 const { fileURLToPath: nativeWrapperFile } = await import('node:url')
