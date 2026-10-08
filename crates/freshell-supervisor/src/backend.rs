@@ -1,3 +1,4 @@
+mod claude_source_observation;
 pub mod docker;
 mod input_publisher;
 mod native_auth;
@@ -121,8 +122,29 @@ pub struct BackendInspection {
     pub configured_limits: RuntimeLimits,
 }
 
+#[derive(Clone)]
+pub enum ClaudeSourceOwner {
+    Initial {
+        reservation: crate::registry::OwnedInputReservation,
+        observation: freshell_runtime_protocol::InitialAuthVolumeObservation,
+    },
+    Retained {
+        handle: OwnedRuntimeHandle,
+    },
+}
+
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
+    async fn observe_claude_sources(
+        &self,
+        _owner: &ClaudeSourceOwner,
+        _request: &freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+        _test_run_id: &str,
+    ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
+        Err(BackendError::Unavailable(
+            "Claude native source reader unavailable; retain inputs and reprepare".into(),
+        ))
+    }
     async fn observe_initial_auth_volume(
         &self,
         _reservation: &crate::registry::OwnedInputReservation,
@@ -572,6 +594,20 @@ fn runtime_host_environment(
 
 #[async_trait]
 impl RuntimeBackend for DockerEngineBackend {
+    async fn observe_claude_sources(
+        &self,
+        owner: &ClaudeSourceOwner,
+        request: &freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+        test_run_id: &str,
+    ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
+        self.read_claude_source_helper(
+            owner,
+            request,
+            test_run_id,
+            std::time::Duration::from_secs(25),
+        )
+        .await
+    }
     async fn observe_initial_auth_volume(
         &self,
         reservation: &crate::registry::OwnedInputReservation,

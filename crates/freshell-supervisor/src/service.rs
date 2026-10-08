@@ -77,6 +77,8 @@ struct AuthLookupScope {
     key: String,
 }
 
+#[path = "claude_source_observation.rs"]
+mod claude_source_observation;
 #[cfg(test)]
 #[path = "native_auth_lookup_tests.rs"]
 mod native_auth_lookup_tests;
@@ -289,6 +291,14 @@ impl Supervisor {
                 self.lookup_native_auth(request)
                     .await
                     .map(AdminResult::NativeAuthLookup)
+            }
+            AdminCommand::ObserveClaudeSources(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.observe_claude_sources(request)
+                    .await
+                    .map(AdminResult::ClaudeSourceObservation)
             }
             AdminCommand::Health => Ok(AdminResult::Health {
                 control_epoch: self.registry.control_epoch(),

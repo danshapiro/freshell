@@ -19,6 +19,7 @@ use std::{
 
 pub const SCHEMA_VERSION: u32 = 9;
 mod input_reservation;
+pub(crate) use input_reservation::binary_digest;
 pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
 const ACTIVE_STATES: &str = "'prepared','created','starting','running','stopping'";
 

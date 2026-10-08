@@ -6,9 +6,18 @@ use std::{os::unix::process::CommandExt, path::Path, process::Stdio, time::Durat
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn read_metadata(cwd: &Path, home: &Path, request: &[u8]) -> Result<Vec<u8>, &'static str> {
+    read_operation(cwd, home, request, "observe-claude-sources").await
+}
+
+async fn read_operation(
+    cwd: &Path,
+    home: &Path,
+    request: &[u8],
+    operation: &str,
+) -> Result<Vec<u8>, &'static str> {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_freshell-session-host"));
     command
-        .arg("observe-claude-sources")
+        .arg(operation)
         .current_dir(cwd)
         .env_clear()
         .env("HOME", home)
@@ -68,6 +77,28 @@ async fn read_metadata(cwd: &Path, home: &Path, request: &[u8]) -> Result<Vec<u8
         return Err("reader failed without complete evidence");
     }
     result.map_err(|_| "reader timed out")?
+}
+
+#[tokio::test]
+async fn session_host_claude_private_observer_rejects_the_wrong_actual_namespace_without_evidence()
+{
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        65534,
+        "this control runs in the documented strict runtime sandbox identity"
+    );
+    let owned = tempfile::tempdir().unwrap();
+    let prior = owned.path().join("accepted-prior-inputs");
+    std::fs::write(&prior, b"immutable prior generation").unwrap();
+    assert!(read_operation(
+        owned.path(),
+        owned.path(),
+        b"",
+        "observe-claude-sources-private"
+    )
+    .await
+    .is_err());
+    assert!(std::fs::read(&prior).unwrap() == b"immutable prior generation");
 }
 
 #[tokio::test]

@@ -46,7 +46,7 @@ pub(super) fn create_table(conn: &Connection) -> Result<(), RegistryError> {
     )?;
     Ok(())
 }
-fn binary_digest(binary: &Path) -> Result<String, RegistryError> {
+pub(crate) fn binary_digest(binary: &Path) -> Result<String, RegistryError> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let metadata = std::fs::symlink_metadata(binary)?;

@@ -119,6 +119,13 @@ async fn run() -> Result<(), String> {
         Some("serve") => serve(&args[2..]).await,
         Some("worker") => worker(&args[2..]).await,
         Some("observe-claude-sources") if args.len() == 2 => claude_source_observation::serve_stdio(),
+        Some("observe-claude-sources-private") if args.len() == 2 => {
+            verify_private_helper_namespace(
+                Path::new("/home/freshell/provider"),
+                Path::new("/run/freshell-source-exchange/reply.sock"),
+            )?;
+            claude_source_observation::serve_private()
+        }
         Some("native-auth-only") if args.len() == 2 => {
             verify_private_helper_namespace(
                 Path::new("/home/freshell/provider"),

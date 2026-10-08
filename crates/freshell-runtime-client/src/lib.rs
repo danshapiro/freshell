@@ -117,6 +117,22 @@ impl RuntimeClient {
             _ => Err(ClientError::UnexpectedResult),
         }
     }
+    pub async fn observe_claude_sources(
+        &self,
+        mut request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+    ) -> Result<freshell_runtime_protocol::ClaudeSourceObservation, ClientError> {
+        request.expected_control_epoch = Some(self.current_epoch().await?);
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::ObserveClaudeSources(request),
+            )
+            .await?
+        {
+            AdminResult::ClaudeSourceObservation(reply) => Ok(reply),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
     pub async fn from_secret_file(
         socket_path: impl Into<PathBuf>,
         secret_file: impl Into<PathBuf>,

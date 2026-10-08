@@ -13,6 +13,74 @@ use std::{
 struct AuthBackend(AtomicUsize);
 
 #[tokio::test]
+async fn provider_claude_creation_source_operation_requires_reader_evidence_after_real_absence() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = temp.path().join("synthetic-host");
+    std::fs::write(&binary, "synthetic helper artifact").unwrap();
+    let registry = Registry::open(temp.path().join("registry"), None).unwrap();
+    let backend = Arc::new(AuthBackend(AtomicUsize::new(0)));
+    let secret = "synthetic-control-secret";
+    let supervisor = Supervisor::new(
+        registry,
+        backend.clone(),
+        SupervisorConfig {
+            runtime_root: temp.path().join("runtime"),
+            control_socket_path: temp.path().join("control.sock"),
+            host_binary_path: binary,
+            image_ref: format!("sha256:{}", "a".repeat(64)),
+            test_run_id: "claude-source-authority".into(),
+            control_secret: secret.into(),
+            lifecycle_log: temp.path().join("lifecycle.jsonl"),
+            admission: crate::admission::AdmissionPolicy::default(),
+        },
+    )
+    .unwrap();
+    let soul = SoulId::new();
+    let mut reserve = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::ReserveProviderInputs(ReserveProviderInputsRequest {
+            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            soul_id: soul.clone(),
+            provider: "claude".into(),
+            creation_seed_ref: "synthetic-creation-seed".into(),
+        }),
+    );
+    reserve.auth = Some(secret.into());
+    let AdminResult::ProviderInputReservation(receipt) =
+        supervisor.dispatch(reserve).await.result.unwrap()
+    else {
+        panic!("unexpected creation receipt");
+    };
+    let command: AdminCommand = serde_json::from_value(serde_json::json!({
+        "method":"observe_claude_sources", "params": {
+            "expectedControlEpoch":supervisor.registry.control_epoch(), "soulId":soul, "provider":"claude",
+            "authority":{"kind":"initial_reservation","reservationId":receipt.reservation_id},
+            "workspacePath":temp.path(), "gitCommonDir":null, "candidate":null,
+            "observationRequest": {
+                "version":1,"requestId":uuid::Uuid::new_v4().to_string(),"nativeSourceRuntime":"terminal",
+                "cwd":temp.path(),"home":"/home/freshell/provider","settingSources":["local"],
+                "selectorManifestSha256":"b".repeat(64),"planRevision":0
+            }
+        }
+    })).expect("Claude source selection requires a real fixed-reader operation, independently of OpenCode auth lookup");
+    let mut lookup = Envelope::new(RequestId::new(), ControlRole::Web, command);
+    lookup.auth = Some(secret.into());
+    let result = supervisor.dispatch(lookup).await.result;
+    assert_eq!(result.unwrap_err().code, RuntimeErrorCode::HostUnreachable,
+        "proved initial volume absence must not substitute for unavailable source-selection evidence");
+    assert_eq!(
+        backend.0.load(Ordering::SeqCst),
+        3,
+        "reserve absence, reobserve absence, then invoke the distinct Claude fixed reader"
+    );
+    assert!(
+        supervisor.registry.inventory().await.unwrap().is_empty(),
+        "source observation must not create a workload, grant or native conversation"
+    );
+}
+
+#[tokio::test]
 async fn provider_ordinary_initial_reservation_cannot_authorize_opencode_auth_lookup() {
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("synthetic-host");
@@ -328,6 +396,18 @@ async fn provider_frozen_path_binding_is_idempotent_private_and_generation_scope
 
 #[async_trait]
 impl RuntimeBackend for AuthBackend {
+    async fn observe_claude_sources(
+        &self,
+        owner: &ClaudeSourceOwner,
+        _: &ObserveClaudeSourcesRequest,
+        _: &str,
+    ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
+        assert!(matches!(owner, ClaudeSourceOwner::Initial { .. }));
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(BackendError::Unavailable(
+            "synthetic fixed reader unavailable".into(),
+        ))
+    }
     async fn observe_initial_auth_volume(
         &self,
         reservation: &OwnedInputReservation,

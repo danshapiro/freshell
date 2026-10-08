@@ -2799,6 +2799,7 @@ pub enum AdminCommand {
     Health,
     ReserveProviderInputs(ReserveProviderInputsRequest),
     NativeAuthLookup(NativeAuthLookupRequest),
+    ObserveClaudeSources(ObserveClaudeSourcesRequest),
     BindProviderPathInputs(BindProviderPathInputsRequest),
     Launch(Box<LaunchRequest>),
     Stop(StopRequest),
@@ -2878,6 +2879,81 @@ pub struct NativeAuthLookupRequest {
     pub soul_id: SoulId,
     pub attempt_authority: String,
     pub keys: Vec<String>,
+}
+
+/// Claude source selection has its own purpose and eligibility. Creation
+/// absence authorizes an empty initial HOME, never source or native-store absence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClaudeSourceAuthority {
+    InitialReservation {
+        #[serde(rename = "reservationId")]
+        reservation_id: String,
+    },
+    RecoveryAttempt {
+        #[serde(rename = "attemptId")]
+        attempt_id: String,
+    },
+}
+
+pub type ClaudeSourceObservation = freshell_platform::claude_inputs::observation::ObservationReply;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObserveClaudeSourcesRequest {
+    pub expected_control_epoch: Option<u64>,
+    pub soul_id: SoulId,
+    pub provider: String,
+    pub authority: ClaudeSourceAuthority,
+    pub workspace_path: String,
+    pub git_common_dir: Option<String>,
+    pub candidate: Option<PreparedProviderContext>,
+    pub observation_request: freshell_platform::claude_inputs::observation::ObservationRequest,
+}
+
+impl ObserveClaudeSourcesRequest {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        let invalid = || {
+            RuntimeError::new(RuntimeErrorCode::InvalidRequest,
+            "Claude source request has invalid selection or authority; retain inputs and reprepare")
+        };
+        if !matches!(self.provider.as_str(), "claude" | "kilroy")
+            || self.observation_request.home != std::path::Path::new("/home/freshell/provider")
+        {
+            return Err(invalid());
+        }
+        let id = match &self.authority {
+            ClaudeSourceAuthority::InitialReservation { reservation_id } => reservation_id,
+            ClaudeSourceAuthority::RecoveryAttempt { attempt_id } => attempt_id,
+        };
+        if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
+            return Err(invalid());
+        }
+        self.observation_request.validate().map_err(|_| invalid())?;
+        for path in std::iter::once(&self.workspace_path).chain(self.git_common_dir.iter()) {
+            if path.len() > 64 * 1024
+                || path.chars().any(char::is_control)
+                || !std::path::Path::new(path).is_absolute()
+            {
+                return Err(invalid());
+            }
+        }
+        if !self
+            .observation_request
+            .cwd
+            .starts_with(&self.workspace_path)
+        {
+            return Err(invalid());
+        }
+        if let Some(candidate) = &self.candidate {
+            candidate.validate("claude")?;
+            if candidate.provider_launch_context.prepared_inputs.is_none() {
+                return Err(invalid());
+            }
+        }
+        bounded_json_bytes(self, MAX_CONTROL_FRAME_BYTES).map_err(|_| invalid())?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -3007,6 +3083,7 @@ pub struct LaunchResult {
 pub enum AdminResult {
     ProviderInputReservation(ProviderInputReservation),
     NativeAuthLookup(NativeAuthValues),
+    ClaudeSourceObservation(ClaudeSourceObservation),
     ProviderPathInputsBound,
     Health {
         control_epoch: u64,

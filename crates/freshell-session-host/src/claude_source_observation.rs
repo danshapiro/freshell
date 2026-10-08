@@ -10,6 +10,23 @@ pub(crate) fn serve_stdio() -> Result<(), String> {
     exchange(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
 }
 
+pub(crate) fn serve_private() -> Result<(), String> {
+    let mut input =
+        std::os::unix::net::UnixStream::connect("/run/freshell-source-exchange/reply.sock")
+            .map_err(|_| "Claude observation private exchange unavailable")?;
+    let timeout = Some(std::time::Duration::from_secs(15));
+    input
+        .set_read_timeout(timeout)
+        .map_err(|_| "Claude observation private timeout unavailable")?;
+    input
+        .set_write_timeout(timeout)
+        .map_err(|_| "Claude observation private timeout unavailable")?;
+    let mut output = input
+        .try_clone()
+        .map_err(|_| "Claude observation private exchange unavailable")?;
+    exchange(&mut input, &mut output)
+}
+
 fn exchange(input: &mut impl Read, output: &mut impl Write) -> Result<(), String> {
     let mut length = [0; 4];
     input
