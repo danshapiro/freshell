@@ -727,8 +727,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       env: { HOME: '/home/freshell/provider', TERM: 'xterm-256color' }, cwd: workspace, workspacePath: workspace,
       runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
       providerModel: settings.model, providerReasoningEffort: 'low', providerPermissionMode: 'on-request', providerSandbox: 'workspace-write',
-      providerSecretReferences: references, providerLaunchContext: { ...freshAgent.providerLaunchContext,
-        preparation: { codex: { tui_args: [], sidecar_args: terminalEffortArgs } } } } } } : request
+      providerSecretReferences: references, providerLaunchContext: freshAgent.providerLaunchContext } } } : request
   harness.writeArtifact(`${scenario}-request.json`, selectedRequest)
   const launch = await harness.adminOk(supervisor, selectedRequest)
   harness.writeArtifact(`${scenario}-launch.json`, launch)
