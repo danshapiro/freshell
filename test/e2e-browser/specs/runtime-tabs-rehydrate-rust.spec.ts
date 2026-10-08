@@ -12,7 +12,7 @@ import { expect, type Page } from '@playwright/test'
 import WebSocket from 'ws'
 
 import { test } from '../helpers/fixtures.js'
-import { ManagedRuntimeBrowserRig, createManagedRuntimeBrowserRig, type FreshCodexHistoryMeasurementError, type FreshCodexHistoryMeasurementFinish, FreshCodexSavedHistoryMeasurementSchema } from '../helpers/managed-runtime.js'
+import { type ManagedFixtureRig, createManagedRuntimeBrowserRig, type FreshCodexHistoryMeasurementError, type FreshCodexHistoryMeasurementFinish, FreshCodexSavedHistoryMeasurementSchema, FreshCodexSavedHistoryPreservationSchema } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { runtimeBrowserPost as apiPost, pruneRuntimeBrowserLayout } from '../helpers/runtime-browser-api.js'
 import { LAYOUT_WINDOW_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
@@ -165,7 +165,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
   test('managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth', async ({ page }) => {
     test.setTimeout(900_000)
     const observerIntervalMs = 60_000
-    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {}, {
+    const rig = createManagedRuntimeBrowserRig(process.cwd(), 3, {}, {
       FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS: '5000', FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS: '10000',
       // Exercise owned history before the supervisor's normal periodic recovery.
       FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: String(observerIntervalMs),
@@ -176,8 +176,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
     const sent: any[] = []
     const received: any[] = []
     let heldHost: {containerId: string, incarnationId: string, pid: number} | undefined
-    let heldHandle: ReturnType<ManagedRuntimeBrowserRig['exactRuntimeHandle']> | undefined
-    let historyEnclosure: ReturnType<ManagedRuntimeBrowserRig['runtimeEnclosureHandle']> | undefined
+    let heldHandle: ReturnType<ManagedFixtureRig['exactRuntimeHandle']> | undefined
+    let historyEnclosure: ReturnType<ManagedFixtureRig['runtimeEnclosureHandle']> | undefined
     let cpuSession: Awaited<ReturnType<ReturnType<Page['context']>['newCDPSession']>> | undefined
     let profilingStarted = false
     const measurementErrors: FreshCodexHistoryMeasurementError[] = []
@@ -485,9 +485,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(bootstrapLifecycle()).toHaveLength(settledLifecycleCount)
       const { targetSoulRecoveries } = await rig.freshCodexSavedHistoryOwnershipFacts(rig.exactRuntimeHandle(view))
       expect(targetSoulRecoveries).toHaveLength(0)
-      rig.runtime.writeBrowserArtifact('owned-host-history-preservation', { ...historyEvidence,
+      await rig.publishFreshCodexSavedHistoryPreservation(rig.exactRuntimeHandle(view), FreshCodexSavedHistoryPreservationSchema.parse({ ...historyEvidence,
         observerWindow: { intervalMs: observerIntervalMs, controllerReattachment, startupFinished, firstObservationNotBefore,
-          holdRequestedAt, heldAt, releasedAt, resumedAt, targetSoulRecoveries } })
+          holdRequestedAt, heldAt, releasedAt, resumedAt, targetSoulRecoveries } }))
     } finally {
       measurement.finallyEnteredAt = Date.now()
       try {

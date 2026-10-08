@@ -539,6 +539,110 @@ describe('fixed saved-history render measurement publication', () => {
   })
 })
 
+describe('fixed owned saved-history preservation artifact', () => {
+  it('preserves captured private fixture profiles and lifecycle evidence without a body or path channel', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-history-preservation-'))
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused preservation web') }, process.cwd(), 3,
+      {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
+    Object.assign(rig.runtime, { browserDir: root })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    const enclosure = rig.runtimeEnclosureHandle(current)
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...current, provider: 'codex', freshAgentSessionType: 'freshcodex', launchState: 'running', intentRevision: 1 }])
+    vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: true, running: true })
+    vi.spyOn(rig, 'freshCodexSavedHistoryUnchanged').mockResolvedValue(true)
+    const coincident = vi.spyOn(rig, 'coincidentFreshCodexHistoryUnchanged').mockResolvedValue(true)
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const state = { nativeSessionId: current.nativeSessionId, pendingDecisionId: null, dispatchCount: 1, completionCount: 1 }
+    const privateState = { ...state, schemaVersion: 1, createProfile: { fixtureTransport: true, privateReference: 'owner-only-profile' } }
+    vi.spyOn(rig.runtime, 'fixtureNativeState').mockImplementation(async (_instance, address, capture) => {
+      capture?.(privateState)
+      return owner.decodeFixtureNativeState(privateState, address.nativeSessionId)
+    })
+    const observedState = await rig.fixtureNativeState(current)
+    const startupFinished = { event: 'supervisor.startup_scan.finished', at: 100, data: { scanned: 1, blockedSubsystems: [] } }
+    const controllerReady = { event: 'supervisor.ready', at: 101, data: { controlEpoch: 17, installationId: 'owned-installation' } }
+    const launch = { event: 'supervisor.launch_running', at: 90, data: { soulId: current.soulId,
+      incarnationId: current.incarnationId, containerId: current.containerId, workerLaunchCount: 1 } }
+    const controllerReattachment = { oldControllerId: 'b'.repeat(64), currentControllerId: 'c'.repeat(64), oldControlEpoch: 16,
+      currentControlEpoch: 17, controllerRestartStartedAt: 99, controllerReady, startupFinished,
+      reattached: { soulId: current.soulId, incarnationId: current.incarnationId, containerId: current.containerId,
+        hostBootId: current.hostBootId, nativeSessionId: current.nativeSessionId, intentRevision: 1, launchState: 'running' }, completedAt: 102 }
+    Object.assign(rig, { supervisor: { runtimeRoot: path.join(root, 'runtime'), containerId: 'c'.repeat(64) } })
+    const lifecycle = path.join(root, 'evidence', 'lifecycle.jsonl')
+    await fsp.mkdir(path.dirname(lifecycle), { recursive: true })
+    const privateLaunch = { ...launch, data: { ...launch.data, privateLaunchReference: 'owner-only-launch' } }
+    const privateStartup = { ...startupFinished, data: { ...startupFinished.data, privateScanReference: 'owner-only-scan' } }
+    const privateController = { ...controllerReattachment, startupFinished: privateStartup }
+    await fsp.writeFile(lifecycle, [privateLaunch, privateStartup, controllerReady,
+      { event: 'browser.owned_controller_reattached', at: 'private-time', data: privateController }].map(value => JSON.stringify(value)).join('\n')+'\n')
+    const input: owner.FreshCodexSavedHistoryPreservation = { source: 'owned provider-volume native history',
+      wrongSource: 'coincident web-local native history', heldHost: { containerId: current.containerId, incarnationId: current.incarnationId, pid: 42 },
+      bootstrap: { type: 'pane.reconcile.request', reconcileId: 'reconcile-owned', panes: [{ paneKey: 'tab:pane', kind: 'fresh-agent',
+        mode: 'codex', createRequestId: 'request-owned', sessionRef: { provider: 'codex', sessionId: current.nativeSessionId } }] },
+      bootstrapCreates: [], nativeSessionId: current.nativeSessionId, beforeHistory: observedState, afterReload: observedState,
+      originalIdentity: { sessionRef: { provider: 'codex', sessionId: current.nativeSessionId }, createRequestId: 'request-owned', soulId: current.soulId },
+      managedLaunch: launch, bothSourcesUnchanged: true, observerWindow: { intervalMs: 60000, controllerReattachment, startupFinished,
+        firstObservationNotBefore: 60100, holdRequestedAt: 103, heldAt: 104, releasedAt: 105, resumedAt: 106, targetSoulRecoveries: [] } }
+    try {
+      const result = await rig.publishFreshCodexSavedHistoryPreservation(current, input)
+      const file = path.join(root, 'owned-host-history-preservation.json')
+      const raw = await fsp.readFile(file, 'utf8')
+      expect(JSON.parse(raw)).toEqual({ ...input, beforeHistory: privateState, afterReload: privateState, managedLaunch: privateLaunch,
+        observerWindow: { ...input.observerWindow, controllerReattachment: privateController, startupFinished: privateStartup } })
+      expect((await fsp.stat(file)).mode & 0o777).toBe(0o600)
+      const { createHash } = await import('node:crypto')
+      expect(result).toEqual({ artifactRef: `owned-host-history-preservation:${createHash('sha256').update(raw).digest('hex')}` })
+      expect(JSON.stringify(result)).not.toContain('owner-only')
+      const descriptor = external.resolveManagedExternalDescriptor({ FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+        FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws', FRESHELL_E2E_TARGET_TOKEN: 'private-token',
+        FRESHELL_RUNTIME_EXTERNAL_RUN_ID: rig.runtime.runId, FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: rig.runtime.candidateSha })!
+      const control = external.createExternalRuntimeControl(rig, descriptor)
+      const replies: unknown[] = []
+      const remote = new external.ExternalManagedRuntimeRig(descriptor, async (_url, init) => {
+        const reply = await control(JSON.parse(String(init?.body)))
+        replies.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      await expect(remote.publishFreshCodexSavedHistoryPreservation(current, input)).resolves.toEqual(result)
+      expect(JSON.stringify(replies)).not.toContain('owner-only')
+      await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha, scenarioId: 'browser-managed-runtime',
+        operationId: 'foreign-history-preservation-path', action: 'freshcodex-history-preservation-artifact', handle: current,
+        historyPreservation: input, outputPath: '/foreign/history' })).rejects.toThrow(/operation/)
+      await expect(rig.publishFreshCodexSavedHistoryPreservation(current, { ...input, beforeHistory: { ...state, completionCount: 99 } })).rejects.toThrow(/captured/)
+
+      coincident.mockResolvedValue(false)
+      await expect(rig.publishFreshCodexSavedHistoryPreservation(current, input)).rejects.toThrow(/unchanged/)
+      await expect(rig.publishFreshCodexSavedHistoryPreservation(current, { ...input, transcript: 'private text' })).rejects.toThrow()
+      expect(await fsp.readFile(file, 'utf8')).toBe(raw)
+      vi.spyOn(rig.runtime, 'fixtureNativeState').mockImplementation(async (_instance, address, capture) => {
+        capture?.({ ...privateState, createProfile: { fixtureTransport: true, privateReference: 'conflicting-profile' } })
+        return owner.decodeFixtureNativeState(privateState, address.nativeSessionId)
+      })
+      await expect(rig.fixtureNativeState(current)).rejects.toThrow(/changed without/)
+    } finally { await fsp.rm(root, { recursive: true, force: true }) }
+  })
+})
+
+describe('private fixture-state capture boundary', () => {
+  it('captures complete private values only after existing identity and counter decoding succeeds', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused fixture capture web') }, process.cwd(), 3)
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    Object.assign(rig.runtime, { broker: { receipts: () => [{ soulId: current.soulId, incarnationId: current.incarnationId, containerId: current.containerId }] } })
+    vi.spyOn(rig.runtime, 'adminOk').mockResolvedValue({ kind: 'inventory', data: [{ ...current, launchState: 'running' }] })
+    const raw = { nativeSessionId: current.nativeSessionId, pendingDecisionId: null, dispatchCount: 1, completionCount: 1,
+      schemaVersion: 1, createProfile: { fixtureTransport: true } }
+    const read = vi.spyOn(rig.runtime, 'execOwnedContainerAsExact').mockReturnValue(JSON.stringify(raw))
+    const captured = vi.fn()
+    await expect(rig.runtime.fixtureNativeState(rig.supervisor, current, captured)).resolves.toEqual({
+      nativeSessionId: current.nativeSessionId, pendingDecisionId: null, dispatchCount: 1, completionCount: 1 })
+    expect(captured).toHaveBeenCalledExactlyOnceWith(raw)
+    read.mockReturnValue(JSON.stringify({ ...raw, nativeSessionId: 'foreign-root' }))
+    await expect(rig.runtime.fixtureNativeState(rig.supervisor, current, captured)).rejects.toThrow(/conflicting/)
+    expect(captured).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('finite Phase 4 browser receipt publication', () => {
   it('writes the existing observation privately on its owner and refuses worker paths or transcript fields', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-phase4-receipt-'))
@@ -1241,9 +1345,12 @@ describe('current handle admission before owner mutation', () => {
     vi.spyOn(rig, 'inventory').mockResolvedValue([prior, row])
     await expect(rig.providerVolumeFacts(current)).resolves.toEqual({ providerVolumeName: 'volume-owned' })
     const state = { nativeSessionId: current.nativeSessionId, pendingDecisionId: 'pending-owned', dispatchCount: 2, completionCount: 1 }
-    const read = vi.spyOn(rig.runtime, 'fixtureNativeState').mockResolvedValue(state)
+    const read = vi.spyOn(rig.runtime, 'fixtureNativeState').mockImplementation(async (_instance, _address, capture) => {
+      capture?.({ ...state, schemaVersion: 1, createProfile: { fixtureTransport: true } })
+      return state
+    })
     await expect(rig.fixtureNativeState(current)).resolves.toEqual(state)
-    expect(read).toHaveBeenCalledExactlyOnceWith(rig.supervisor, current)
+    expect(read).toHaveBeenCalledExactlyOnceWith(rig.supervisor, current, expect.any(Function))
   })
   it('refuses stale incarnation and boot before signalling a host', async () => {
     const { rig, current, row, kill } = rigFixture()

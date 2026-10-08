@@ -250,6 +250,10 @@ export function seedManagedOpenCodeSource(input: {
   }
 }
 
+// Kept after the immutable Task7 seeder prefix; canonical production schemas only.
+import { PaneReconcileRequestSchema, FreshAgentCreateSchema } from '../../shared/ws-protocol.js'
+import { SessionRefSchema } from '../../shared/session-contract.js'
+
 export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
 export const PHASE2_RUNTIME_IMAGE_TAG = 'freshell-managed-runtime:phase2'
 export const CONTROL_PROTOCOL_VERSION = 2
@@ -1025,6 +1029,8 @@ export const FreshCodexControllerStartupFactsSchema = z.object({
     data: z.object({ controlEpoch: z.number().int().nonnegative(), installationId: z.string() }) }),
 }).strict()
 export type FreshCodexControllerStartupFacts = z.infer<typeof FreshCodexControllerStartupFactsSchema>
+const FreshCodexHistoryStateSchema = z.object({ nativeSessionId: z.string().min(1), pendingDecisionId: z.string().min(1).nullable(),
+  dispatchCount: z.number().int().nonnegative(), completionCount: z.number().int().nonnegative() }).strict()
 export type FreshCodexControllerReattachment = {
   oldControllerId: string; currentControllerId: string; oldControlEpoch: number; currentControlEpoch: number
   controllerRestartStartedAt: number; completedAt: number; reattached: ManagedRuntimeView
@@ -1039,6 +1045,21 @@ export const FreshCodexControllerReattachmentSchema: z.ZodType<FreshCodexControl
   startupFinished: FreshCodexControllerStartupFactsSchema.shape.startupFinished,
   reattached: ManagedRuntimeSoulSchema.partial().required({ soulId: true, incarnationId: true, launchState: true, intentRevision: true }).strict(),
 }).strict()
+export const FreshCodexSavedHistoryPreservationSchema = z.object({ source: z.literal('owned provider-volume native history'),
+  wrongSource: z.literal('coincident web-local native history'), heldHost: z.object({ containerId: z.string().regex(/^[a-f0-9]{64}$/),
+    incarnationId: z.string().min(1), pid: z.number().int().positive() }).strict(),
+  bootstrap: PaneReconcileRequestSchema.strict(), bootstrapCreates: z.array(FreshAgentCreateSchema.strict()).max(1),
+  nativeSessionId: z.string().min(1), beforeHistory: FreshCodexHistoryStateSchema, afterReload: FreshCodexHistoryStateSchema,
+  originalIdentity: z.object({ sessionRef: SessionRefSchema, resumeSessionId: z.string().optional(),
+    createRequestId: z.string().min(1), soulId: z.string().min(1) }).strict(),
+  managedLaunch: FreshCodexSavedHistoryOwnershipFactsSchema.shape.launches.element, bothSourcesUnchanged: z.literal(true),
+  observerWindow: z.object({ intervalMs: z.literal(60000), controllerReattachment: FreshCodexControllerReattachmentSchema,
+    startupFinished: FreshCodexControllerStartupFactsSchema.shape.startupFinished,
+    firstObservationNotBefore: z.number(), holdRequestedAt: z.number(), heldAt: z.number(), releasedAt: z.number(), resumedAt: z.number(),
+    targetSoulRecoveries: FreshCodexSavedHistoryOwnershipFactsSchema.shape.targetSoulRecoveries,
+  }).strict(),
+}).strict()
+export type FreshCodexSavedHistoryPreservation = z.infer<typeof FreshCodexSavedHistoryPreservationSchema>
 export const FreshCodexRetainedSnapshotFactsSchema = z.object({
   threadId: z.string(), bytes: z.number().int().nonnegative(), turnCount: z.number().int().nonnegative(),
   firstTurnId: z.string().nullable(), lastTurnId: z.string().nullable(), firstAnswerMatches: z.boolean(),
@@ -1179,7 +1200,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-measurement-artifact', 'freshcodex-controller-reattachment', 'freshcodex-history-measurement-finish', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-preservation-artifact', 'freshcodex-history-measurement-artifact', 'freshcodex-controller-reattachment', 'freshcodex-history-measurement-finish', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
     'provider-volume', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
@@ -1227,6 +1248,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   historyMeasurementFinish: FreshCodexHistoryMeasurementFinishSchema.optional(),
   historyControllerReattachment: FreshCodexControllerReattachmentSchema.optional(),
   historyMeasurement: FreshCodexSavedHistoryMeasurementSchema.optional(),
+  historyPreservation: FreshCodexSavedHistoryPreservationSchema.optional(),
   chaosLogs: RuntimeChaosLogsSchema.optional(),
   chaosEvidence: RuntimeChaosEvidenceSchema.optional(),
   lossAssertions: RuntimeLossAssertionsSchema.optional(),
@@ -2487,12 +2509,14 @@ export class RuntimeHarness {
     }
   }
 
-  async fixtureNativeState(instance: SupervisorInstance, handle: ExactRuntimeHandle): Promise<FixtureNativeState> {
+  async fixtureNativeState(instance: SupervisorInstance, handle: ExactRuntimeHandle, capture?: (value: unknown) => void): Promise<FixtureNativeState> {
     await assertExactRuntimeHandle(this.ownerFactsAdapter(instance), handle)
     const value = JSON.parse(this.execOwnedContainerAsExact(handle.containerId, '65534:0', [
       'cat', '/home/freshell/provider/.freshell-fixture/provider-native-state.json',
     ]))
-    return decodeFixtureNativeState(value, handle.nativeSessionId)
+    const state = decodeFixtureNativeState(value, handle.nativeSessionId)
+    capture?.(value)
+    return state
   }
 
   async nativeFixtureCall(instance: SupervisorInstance, incarnationId: string, body: Record<string, unknown>): Promise<any> {
@@ -3209,6 +3233,7 @@ export class ManagedRuntimeOwner {
   private stopSettlement?: Promise<{ ok: boolean; errors: string[] }>
   private readonly heldHosts = new Map<string, { handle: ExactRuntimeHandle; pid: number }>()
   private readonly recordedHistoryHolds = new Set<string>()
+  private readonly savedHistoryFixtureStates = new Map<string, unknown>()
   private readonly nativeChallenges = new Map<string, { soulId: string; nativeSessionId: string; marker: string }>()
   private readonly providerProbes = new Map<string, { child?: ChildProcess; settlement: Promise<string> }>()
   private syntheticSource?: { source: SyntheticSource; root: string; nonce: string }
@@ -4406,6 +4431,44 @@ export class ManagedRuntimeOwner {
     if (row?.provider !== 'codex' || row.freshAgentSessionType !== 'freshcodex') throw new Error('exact fresh Codex history fixture required')
   }
 
+  async publishFreshCodexSavedHistoryPreservation(handle: ExactRuntimeHandle, input: FreshCodexSavedHistoryPreservation): Promise<{ artifactRef: string }> {
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    const data = FreshCodexSavedHistoryPreservationSchema.parse(input)
+    if (data.nativeSessionId !== handle.nativeSessionId || data.heldHost.containerId !== handle.containerId
+      || data.heldHost.incarnationId !== handle.incarnationId || data.originalIdentity.soulId !== handle.soulId
+      || data.originalIdentity.sessionRef.provider !== 'codex' || data.originalIdentity.sessionRef.sessionId !== handle.nativeSessionId) {
+      throw new Error('exact observed saved-history identity required')
+    }
+    const beforeHistory = this.savedHistoryFixtureStates.get(JSON.stringify(data.beforeHistory))
+    const afterReload = this.savedHistoryFixtureStates.get(JSON.stringify(data.afterReload))
+    if (!beforeHistory || !afterReload) throw new Error('captured private fixture states required before history publication')
+    if (!await this.freshCodexSavedHistoryUnchanged(handle) || !await this.coincidentFreshCodexHistoryUnchanged(handle)) {
+      throw new Error('both observed history sources must remain unchanged')
+    }
+    const lifecycle = await this.readOwnedLifecycle()
+    const managedLaunch = lifecycle.filter(event => event.event === data.managedLaunch.event && event.at === data.managedLaunch.at
+      && z.object({ soulId: z.string(), incarnationId: z.string(), containerId: z.string(), workerLaunchCount: z.number() }).parse(event.data).soulId === handle.soulId).at(-1)
+    const observedLaunch = FreshCodexSavedHistoryOwnershipFactsSchema.shape.launches.element.parse(managedLaunch)
+    if (observedLaunch.data.incarnationId !== handle.incarnationId || observedLaunch.data.containerId !== handle.containerId
+      || observedLaunch.data.workerLaunchCount !== data.managedLaunch.data.workerLaunchCount) throw new Error('observed owned launch required')
+    const controller = lifecycle.filter(event => event.event === 'browser.owned_controller_reattached'
+      && z.object({ completedAt: z.number() }).parse(event.data).completedAt === data.observerWindow.controllerReattachment.completedAt).at(-1)
+    if (!controller) throw new Error('recorded owned controller reattachment required')
+    const observedController = FreshCodexControllerReattachmentSchema.parse(controller.data)
+    if (observedController.currentControllerId !== data.observerWindow.controllerReattachment.currentControllerId
+      || observedController.reattached.soulId !== handle.soulId || observedController.reattached.incarnationId !== handle.incarnationId) {
+      throw new Error('recorded controller differs from the observed history runtime')
+    }
+    if (observedController.startupFinished.at !== data.observerWindow.startupFinished.at) throw new Error('observed startup timestamp differs from its history window')
+    const privateStartup = z.object({ startupFinished: z.unknown() }).parse(controller.data).startupFinished
+    const target = this.runtime.writeBrowserArtifact('owned-host-history-preservation', { ...data, beforeHistory, afterReload, managedLaunch,
+      observerWindow: { ...data.observerWindow, controllerReattachment: controller.data, startupFinished: privateStartup } })
+    fs.chmodSync(target, 0o600)
+    const artifactRef = `owned-host-history-preservation:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
+    this.runtime.recordLifecycle('external.saved_history_preservation_artifact', { severity: 'info', ...handle, artifactRef })
+    return { artifactRef }
+  }
+
   async publishFreshCodexSavedHistoryMeasurement(enclosure: RuntimeEnclosureHandle, input: FreshCodexSavedHistoryMeasurement): Promise<{ artifactRef: string }> {
     if (this.runtime.phase !== 3 || !this.fixtureFreshAgentModes.includes('freshcodex')) throw new Error('registered Phase 3 fresh Codex history fixture required')
     await this.ownedContainerState(enclosure)
@@ -4539,7 +4602,16 @@ export class ManagedRuntimeOwner {
     if (!row?.freshAgentSessionType || !this.fixtureFreshAgentModes.includes(row.freshAgentSessionType)) {
       throw new Error('registered deterministic fresh-agent fixture required')
     }
-    return this.runtime.fixtureNativeState(this.supervisor, handle)
+    if (!this.savedHistoryHostLifecycleEnabled()) return this.runtime.fixtureNativeState(this.supervisor, handle)
+    let captured: unknown
+    const state = await this.runtime.fixtureNativeState(this.supervisor, handle, value => { captured = value })
+    if (captured === undefined) throw new Error('private fixture state capture is unavailable')
+    const key = JSON.stringify(state), previous = this.savedHistoryFixtureStates.get(key)
+    if (previous !== undefined && !(await import('node:util')).isDeepStrictEqual(previous, captured)) {
+      throw new Error('private fixture state changed without its observed counters')
+    }
+    this.savedHistoryFixtureStates.set(key, captured)
+    return state
   }
 
   signalOwnedSessionHostExact(containerId: string, incarnationId: string, signal: 'SIGSTOP' | 'SIGCONT', expectedPid?: number): number {
