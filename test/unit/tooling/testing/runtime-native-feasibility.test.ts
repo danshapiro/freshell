@@ -32,6 +32,15 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it('records only typed finite receiver failure metadata and excludes raw provider strings', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-error-'))
+    const file = path.join(directory, 'native-load-fault.mjs'); fs.writeFileSync(file, nativeReceiverLoadFaultWrapper)
+    try {
+      const native = await import(file)
+      const error = Object.assign(new Error('private provider body and credential must not be recorded'), { code: 'ENOENT', path: '/private/operator' })
+      expect(native.receiverLoadFaultFailure(error, 'verify_native_pin')).toEqual({ stage: 'verify_native_pin', errorKind: 'Error', code: 'ENOENT' })
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it('bounds an unresponsive actual HTTP creation before reporting an owned fault refusal', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-http-timeout-'))
     const file = path.join(directory, 'native-load-fault.mjs'); fs.writeFileSync(file, nativeReceiverLoadFaultWrapper)

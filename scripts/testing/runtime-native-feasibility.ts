@@ -33,6 +33,14 @@ export type NativeExperimentOriginal = {
 // native creation. Responses still come from the pinned provider unchanged;
 // this never creates a provider acknowledgement or an identity value.
 export const nativeReceiverLoadFaultWrapper = String.raw`
+let nativeFaultStage = 'entry'
+export function receiverLoadFaultFailure(error, stage) {
+  const stages = ['entry', 'verify_uid', 'read_launch_control', 'verify_native_pin', 'validate_native_route',
+    'spawn_native_child', 'wait_native_listener', 'capture_native_response', 'await_owned_release', 'bind_native_proxy']
+  return { stage: stages.includes(stage) ? stage : 'unknown',
+    errorKind: ['Error', 'TypeError', 'SyntaxError', 'RangeError'].includes(error?.name) ? error.name : 'OtherError',
+    code: ['ENOENT', 'EACCES', 'EROFS', 'EADDRINUSE', 'ECONNREFUSED'].includes(error?.code) ? error.code : null }
+}
 export function receiverLoadFaultBinding(cwd, provider, launch, control) {
   const owned = /^\/tmp\/f[a-z0-9]+\/[a-f0-9]{8}-[a-f0-9]{3}\/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace$/.exec(cwd)
   if (!owned || provider !== (owned[1] === 'freshcodex' ? 'codex' : 'opencode')
@@ -160,8 +168,10 @@ async function runOwnedReceiverLoadFault() {
   const { createHash } = await import('node:crypto'), { spawn } = await import('node:child_process')
   const { createServer, createConnection } = await import('node:net')
   const [provider, ...argv] = process.argv.slice(2)
+  nativeFaultStage = 'verify_uid'
   if (process.getuid() !== 65534 || process.getgid() !== 0) throw new Error('owned native fault UID/GID differs')
   const cwd = process.cwd()
+  nativeFaultStage = 'read_launch_control'
   const binding = receiverLoadFaultBinding(cwd, provider,
     JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH ?? '{}'),
     JSON.parse(fs.readFileSync(path.join(cwd, 'native-receiver-load-fault-control.json'), 'utf8')))
@@ -170,6 +180,7 @@ async function runOwnedReceiverLoadFault() {
     : '/usr/local/lib/node_modules/opencode-ai/bin/opencode.exe'
   const expectedPin = provider === 'codex' ? 'cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40'
     : 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99'
+  nativeFaultStage = 'verify_native_pin'
   if (!fs.statSync(executable).isFile() || createHash('sha256').update(fs.readFileSync(executable)).digest('hex') !== expectedPin) {
     throw new Error('selected original native executable differs')
   }
@@ -178,6 +189,7 @@ async function runOwnedReceiverLoadFault() {
   const backendPort = free.address().port
   await new Promise(resolve => free.close(resolve))
   const args = [...argv]
+  nativeFaultStage = 'validate_native_route'
   let outerPort
   if (provider === 'codex') {
     const index = args.indexOf('--listen')
@@ -191,12 +203,14 @@ async function runOwnedReceiverLoadFault() {
     outerPort = Number(args[index + 1]); args[index + 1] = String(backendPort)
   }
   if (!Number.isInteger(outerPort) || outerPort < 1 || outerPort > 65535) throw new Error('owned native outer port differs')
+  nativeFaultStage = 'spawn_native_child'
   const child = spawn('/usr/local/bin/' + provider + '.native', args, { stdio: 'inherit' })
   let exited = false, proxy
   child.once('exit', () => { exited = true; proxy?.close().then(() => { process.exitCode = 1 }) })
   child.once('error', () => { exited = true })
   for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => child.kill(signal))
   try {
+    nativeFaultStage = 'wait_native_listener'
     const readyDeadline = Date.now() + 5000
     while (true) {
       if (exited) throw new Error('owned native child exited before listener')
@@ -211,12 +225,14 @@ async function runOwnedReceiverLoadFault() {
     }
     let observed = false
     const observe = async (root, bytes, nativeInputDispatches) => {
+      nativeFaultStage = 'capture_native_response'
       if (observed) throw new Error('owned native load fault repeated')
       observed = true
       const receipt = { schemaVersion: 1, ...binding, nativeSessionId: root,
         nativeEvidenceSha256: createHash('sha256').update(bytes).digest('hex'), executableSha256: expectedPin,
         wrapperChildPid: child.pid, observedAt: Date.now(), nativeInputDispatches }
       fs.writeFileSync(path.join(cwd, 'native-receiver-load-fault-observation.json'), JSON.stringify(receipt), { flag: 'wx', mode: 0o664 })
+      nativeFaultStage = 'await_owned_release'
       const deadline = Date.now() + 4000
       while (!exited && Date.now() < deadline) {
         try {
@@ -229,6 +245,7 @@ async function runOwnedReceiverLoadFault() {
       }
       throw new Error('owned native response release timed out or child exited')
     }
+    nativeFaultStage = 'bind_native_proxy'
     if (provider === 'codex') {
       const { default: WebSocket, WebSocketServer } = await import(new URL('./ws/wrapper.mjs', import.meta.url))
       proxy = await createCodexLoadProxy({ WebSocket, WebSocketServer, port: outerPort,
@@ -239,7 +256,16 @@ async function runOwnedReceiverLoadFault() {
 }
 const { fileURLToPath: nativeWrapperFile } = await import('node:url')
 if (process.argv[1] && nativeWrapperFile(import.meta.url) === process.argv[1]) {
-  await runOwnedReceiverLoadFault()
+  try { await runOwnedReceiverLoadFault() }
+  catch (error) {
+    if (/^\/tmp\/f[a-z0-9]+\/[a-f0-9]{8}-[a-f0-9]{3}\/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace$/.test(process.cwd())) {
+      const fs = await import('node:fs'), path = await import('node:path')
+      fs.writeFileSync(path.join(process.cwd(), 'native-receiver-load-fault-failure.json'),
+        JSON.stringify({ schemaVersion: 1, severity: 'error', event: 'runtime.native_receiver_fault.failed',
+          ...receiverLoadFaultFailure(error, nativeFaultStage) }), { mode: 0o664, flag: 'wx' })
+    }
+    throw error
+  }
 }
 `
 
