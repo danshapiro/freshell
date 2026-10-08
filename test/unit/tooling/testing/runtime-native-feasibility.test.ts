@@ -161,6 +161,42 @@ refusal:fs.existsSync(refusalFile)?JSON.parse(fs.readFileSync(refusalFile,'utf8'
       expect(result.report.producerActive).toBe(true)
     } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
   })
+  it.each(['baseline-only-resume', 'stale-observation'])('arms the supported %s observer only for a new native incarnation (controlled API only)', async caseId => {
+    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12)), home = path.join(ownedRoot, 'provider')
+    const workspace = path.join(ownedRoot, `opencode-${caseId}-workspace`)
+    fs.mkdirSync(workspace, { recursive: true, mode: 0o700 })
+    const directory = path.join(home, '.freshell/session-signals/opencode-adoption-diagnostics')
+    fs.mkdirSync(directory, { recursive: true })
+    const root = 'ses_ownedRoot', terminalId = 'terminal-owned', nonce = 'current-nonce'
+    const module = path.join(workspace, 'observer.mjs'), driver = path.join(workspace, 'driver.mjs')
+    fs.writeFileSync(module, openCodeTuiDisposalObserver)
+    fs.writeFileSync(driver, `import fs from 'node:fs';import plugin from './observer.mjs';
+process.getuid=()=>65534;process.getgid=()=>0;const controller=new AbortController();let active=true,calls=0;
+const api={lifecycle:{signal:controller.signal,onDispose:()=>{}},plugins:{list:()=>[{id:'freshell-rebind',active}],
+deactivate:async()=>{calls++;active=false}},client:{session:{get:async()=>({data:{id:'ses_ownedRoot',directory:process.cwd()}}),
+messages:async()=>({data:[{info:{sessionID:'ses_ownedRoot'}}]})}}};
+plugin.tui(api);await new Promise(resolve=>setTimeout(resolve,200));controller.abort();
+console.log(JSON.stringify({calls,report:fs.existsSync('native-tui-fault-result.json')?JSON.parse(fs.readFileSync('native-tui-fault-result.json','utf8')):null}));`)
+    try {
+      for (const phase of ['unarmed', 'previous-launch', 'replacement']) {
+        const incarnationId = phase === 'replacement' ? 'new-incarnation' : 'old-incarnation'
+        fs.writeFileSync(path.join(workspace, 'native-tui-fault-control.json'), JSON.stringify({ schemaVersion: 1, caseId, rootSessionId: root, terminalId,
+          previousIncarnationId: phase === 'unarmed' ? null : 'old-incarnation' }))
+        fs.writeFileSync(path.join(directory, terminalId + '.native_read_pending.json'), JSON.stringify({stage:'native_read_pending',
+          nativeSessionId:root,incarnationId,launchNonce:'adoption-current',evidenceGeneration:'a'.repeat(64)}))
+        // An original completed publication is provenance, not current evidence.
+        fs.writeFileSync(path.join(directory, terminalId + '.publication_succeeded.json'), JSON.stringify({stage:'publication_succeeded',incarnationId:'old-incarnation'}))
+        const result = JSON.parse(execFileSync(process.execPath, [driver], {cwd:workspace,env:{...process.env,HOME:home,FRESHELL_TERMINAL_ID:terminalId,
+          FRESHELL_OPENCODE_ADOPTION_ROOT_SESSION_ID:root,FRESHELL_OPENCODE_ADOPTION_INCARNATION_ID:incarnationId,
+          FRESHELL_OPENCODE_ADOPTION_LAUNCH_NONCE:'adoption-current',FRESHELL_OPENCODE_ADOPTION_EVIDENCE_GENERATION:'a'.repeat(64),
+          FRESHELL_NATIVE_IDENTITY_LAUNCH:JSON.stringify({incarnationId,launchNonce:nonce,requestedNativeSessionId:root,evidenceRevision:2,executionGeneration:2})},
+          encoding:'utf8',timeout:5000}))
+        expect(result.calls).toBe(phase === 'replacement' ? 1 : 0)
+        if (phase === 'replacement') expect(result.report.outcome).toBe('disposed_before_publication')
+        else expect(result.report).toBe(null)
+      }
+    } finally {fs.rmSync(ownedRoot,{recursive:true,force:true})}
+  })
   it.each(['current', 'stale-incarnation', 'stale-nonce', 'stale-generation', 'already-published', 'inactive', 'wrong-requested-root'])('uses the supported plugin manager to dispose a pending owned native read without publishing identity: %s (controlled API only)', async (fault) => {
     const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
     const workspace = path.join(ownedRoot, 'opencode-disposal-workspace'), home = path.join(ownedRoot, 'provider')

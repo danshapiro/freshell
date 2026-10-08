@@ -2025,15 +2025,18 @@ import { execFileSync } from 'node:child_process'
 const storeFaultScript = ${JSON.stringify(openCodeTuiOwnedStoreFault)}
 export default { id: 'freshell-native-qualification', tui(api) {
   const cwd = fs.realpathSync(process.cwd()), home = process.env.HOME
-  if (!/^\/tmp\/f[a-z0-9]+\/[a-f0-9-]{12}\/opencode-(disposal|baseline-only-resume|root-load-error|history-load-error)-workspace$/.test(cwd)
+  if (!/^\/tmp\/f[a-z0-9]+\/[a-f0-9-]{12}\/opencode-(disposal|baseline-only-resume|stale-observation|root-load-error|history-load-error)-workspace$/.test(cwd)
     || process.getuid() !== 65534 || process.getgid() !== 0 || !home) return
   const control = JSON.parse(fs.readFileSync(path.join(cwd, 'native-tui-fault-control.json'), 'utf8'))
   const launch = JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH || 'null')
   const terminal = process.env.FRESHELL_TERMINAL_ID
-  if (control.schemaVersion !== 1 || !['disposal', 'baseline-only-resume', 'root-load-error', 'history-load-error'].includes(control.caseId)
+  if (control.schemaVersion !== 1 || !['disposal', 'baseline-only-resume', 'stale-observation', 'root-load-error', 'history-load-error'].includes(control.caseId)
     || !cwd.endsWith('/opencode-' + control.caseId + '-workspace') || control.terminalId !== terminal
     || !/^[a-zA-Z0-9_-]+$/.test(terminal || '') || launch?.requestedNativeSessionId !== control.rootSessionId
     || typeof launch.incarnationId !== 'string' || typeof launch.launchNonce !== 'string') return
+  if (['baseline-only-resume', 'stale-observation'].includes(control.caseId)
+    && (typeof control.previousIncarnationId !== 'string' || !control.previousIncarnationId
+      || control.previousIncarnationId === launch.incarnationId)) return
   const directory = path.join(home, '.freshell/session-signals')
   const progress = path.join(directory, 'opencode-adoption-diagnostics', terminal)
   const expected = path.join(directory, 'opencode-adoption', terminal + '.expected.json')
@@ -2041,6 +2044,10 @@ export default { id: 'freshell-native-qualification', tui(api) {
   const read = file => {
     try { const stat = fs.lstatSync(file); return stat.isFile() && !stat.isSymbolicLink() && stat.size <= 65536
       ? JSON.parse(fs.readFileSync(file, 'utf8')) : null } catch { return null }
+  }
+  const publishedForCurrentLaunch = () => {
+    const publication = read(progress + '.publication_succeeded.json')
+    return publication && (!publication.incarnationId || publication.incarnationId === launch.incarnationId)
   }
   let busy = false, settled = false, timer, disposed, storeFault, released = false
   const started = Date.now()
@@ -2056,7 +2063,9 @@ export default { id: 'freshell-native-qualification', tui(api) {
     if (busy || settled || api.lifecycle.signal.aborted) return
     busy = true
     try {
-      if (!released && read(progress + '.publication_succeeded.json')) { finish({ outcome: 'already_published' }); return }
+      if (!released && publishedForCurrentLaunch()) {
+        finish({ outcome: 'already_published' }); return
+      }
       const pending = read(progress + '.native_read_pending.json')
       const binding = read(expected) || { root_session_id: process.env.FRESHELL_OPENCODE_ADOPTION_ROOT_SESSION_ID,
         incarnation_id: process.env.FRESHELL_OPENCODE_ADOPTION_INCARNATION_ID,
@@ -2103,7 +2112,7 @@ export default { id: 'freshell-native-qualification', tui(api) {
       // pending producer publish. Its real scope aborts native observation.
       await api.plugins.deactivate('freshell-rebind')
       const after = api.plugins.list().find(row => row.id === 'freshell-rebind')
-      if (after?.active || read(progress + '.publication_succeeded.json')) {
+      if (after?.active || publishedForCurrentLaunch()) {
         finish({ outcome: 'disposal_did_not_precede_publication' }); return
       }
       const session = await api.client.session.get({ sessionID: control.rootSessionId })
