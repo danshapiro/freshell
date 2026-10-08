@@ -88,6 +88,7 @@ type NativeRefusalReason = 'tui_not_ready' | 'route_not_selected' | 'tui_root_no
   | 'native_api_unavailable' | 'native_root_load_failed' | 'native_history_load_failed'
   | 'tui_context_changed' | 'revert_not_hydrated' | 'history_not_hydrated'
   | 'empty_history_not_hydrated' | 'tail_not_hydrated' | 'parts_not_hydrated'
+  | 'native_tail_mismatch'
   | 'producer_or_publication_failed'
 
 export type NativeObservationRefusal = {
@@ -289,7 +290,7 @@ function sessionIsExactRoot(value: unknown, expectedId: string): boolean {
   return session?.id === expectedId && (session.parentID === undefined || session.parentID === null)
 }
 
-function lastTuiMessageId(value: unknown, expectedSessionId: string): string | null {
+function lastActiveMessageId(value: unknown, expectedSessionId: string): string | null {
   if (!Array.isArray(value) || value.length === 0) return null
   let lastId: string | null = null
   for (const candidate of value) {
@@ -314,7 +315,7 @@ function nativeMessagesFromResult(value: unknown): unknown[] | null {
 }
 
 function activeMessages(value: unknown, sessionId: string, revertValue: unknown): unknown[] | null {
-  if (!Array.isArray(value) || (value.length > 0 && lastTuiMessageId(value, sessionId) === null)) return null
+  if (!Array.isArray(value) || (value.length > 0 && lastActiveMessageId(value, sessionId) === null)) return null
   const revert = asRecord(revertValue)
   if (!revert?.messageID) return value
   if (typeof revert.messageID !== 'string' || !MESSAGE_ID_RE.test(revert.messageID)) return null
@@ -526,8 +527,8 @@ export function createObservationEmitter(
           if (nativeActive.length !== 0 || hydratedMessages.length !== 0) return refuse(current, 'empty_history_not_hydrated')
           messagesRead = 'empty_confirmed'
         } else {
-          if (lastTuiMessageId(nativeActive, current.rootSessionId) !== current.tailMessageId
-            || lastTuiMessageId(hydratedMessages, current.rootSessionId) !== current.tailMessageId) return refuse(current, 'tail_not_hydrated')
+          if (lastActiveMessageId(nativeActive, current.rootSessionId) !== current.tailMessageId) return refuse(current, 'native_tail_mismatch')
+          if (lastActiveMessageId(hydratedMessages, current.rootSessionId) !== current.tailMessageId) return refuse(current, 'tail_not_hydrated')
           const tail = native.messages.find((row) => asRecord(asRecord(row)?.info)?.id === current.tailMessageId)
           const parts = asRecord(tail)?.parts as unknown[]
           if (parts.length) {

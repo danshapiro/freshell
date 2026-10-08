@@ -228,6 +228,19 @@ describe('createObservationEmitter', () => {
     expect(JSON.stringify(refusal.mock.calls)).not.toContain('private')
   })
 
+  it.each(['empty', 'different-tail'])('distinguishes native V1 history %s from missing TUI hydration', async (fault) => {
+    const refusal = vi.fn()
+    const api = makeApi({ nativeMessages: fault === 'empty' ? [] : [
+      { info: { id: 'msg_different1', sessionID: rootSessionId }, parts: [] },
+    ] })
+    await createObservationEmitter({ ...deps(), onRefusal: refusal })(api)
+    expect(refusal).toHaveBeenCalledOnce()
+    expect(refusal.mock.calls[0][0]).toMatchObject({ reason: 'native_tail_mismatch',
+      nativeSessionId: rootSessionId, incarnationId, launchNonce, evidenceGeneration })
+    expect(writes).toHaveLength(0)
+    expect(JSON.stringify(refusal.mock.calls)).not.toContain('private')
+  })
+
   it.each(['not-ready', 'root-load', 'history-load', 'tail', 'parts'])('records a bounded body-free current native refusal (%s)', async (fault) => {
     const refusal = vi.fn()
     const emit = createObservationEmitter({ ...deps(), onRefusal: refusal })
