@@ -367,6 +367,36 @@ describe('scoped Claude source observer broker', () => {
       expect(forwarded.filter((operation) => operation.method === 'DELETE')).toEqual([])
     })
   })
+  it('adopts the full owned identity after a lost source-helper acknowledgement and confirms absence', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance, loseHelperAck }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      loseHelperAck()
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, sourceHelperBody())).status).toBe(503)
+      expect(instance.receiptIds().has(helperId)).toBe(false)
+      const inspected = await request('GET', `/v1.47/containers/${sourceName}/json`)
+      expect(inspected.status).toBe(200)
+      expect(JSON.parse(inspected.body).Id).toBe(helperId)
+      expect(instance.receiptIds().has(helperId)).toBe(true)
+      expect((await request('DELETE', `/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(404)
+      expect(forwarded.filter((operation) => operation.method === 'DELETE')).toEqual([
+        { method: 'DELETE', url: `/v1.47/containers/${helperId}?force=1`, body: undefined },
+      ])
+    })
+  })
+  it('leaves a foreign inspected helper unowned after a lost acknowledgement', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance, loseHelperAck, replaceHelperInspection }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      loseHelperAck()
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, sourceHelperBody())).status).toBe(503)
+      replaceHelperInspection()
+      expect((await request('GET', `/v1.47/containers/${sourceName}/json`)).status).toBe(200)
+      expect(instance.receiptIds().has(helperId)).toBe(false)
+      expect((await request('DELETE', `/v1.47/containers/${helperId}?force=1`)).status).toBe(403)
+      expect((await request('DELETE', `/v1.47/containers/${sourceName}?force=1`)).status).toBe(403)
+      expect(forwarded.filter((operation) => operation.method === 'DELETE')).toEqual([])
+    })
+  })
 })
 
 describe('receipt-owned auth exchange HTTP routes', () => {
@@ -557,6 +587,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
   let helperAckId = helperId
   let indexedVolumeMetadata:unknown
   let foreignHelper=false
+  let sourceHelperDeleted = false
   const upstream = http.createServer(async (req, res) => {
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(Buffer.from(chunk))
@@ -570,13 +601,15 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     if (req.method==='GET' && req.url?.startsWith('/v1.47/volumes/freshell-inputs-') && indexedVolumeMetadata) {
       res.statusCode=200;res.end(JSON.stringify(indexedVolumeMetadata));return;
     }
-    if (req.method==='GET' && (req.url?.includes('-publisher/json') || req.url?.includes('/freshell-claude-source-'))) {
-      const command=req.url?.includes('/freshell-claude-source-')?'observe-claude-sources-private':'publish-provider-inputs';
+    if (req.method==='GET' && (req.url?.includes('-publisher/json') || req.url?.includes('/freshell-claude-source-')
+      || (req.url===`/v1.47/containers/${helperId}/json` && forwarded.some((operation)=>operation.body?.Cmd?.[0]==='observe-claude-sources-private')))) {
+      if (sourceHelperDeleted) { res.statusCode=404;res.end('{}');return }
+      const command=req.url?.includes('/freshell-claude-source-') || req.url===`/v1.47/containers/${helperId}/json`?'observe-claude-sources-private':'publish-provider-inputs';
       const config=forwarded.findLast((request)=>request.url.includes('/containers/create?') && request.body?.Cmd?.[0]===command)!.body;
       const inspected=structuredClone(config);
       inspected.Labels['org.opencontainers.image.version']='24.04';
       for (const mount of inspected.HostConfig.Mounts) if (mount.ReadOnly===false) delete mount.ReadOnly;
-      res.statusCode=200;res.end(JSON.stringify({Config:foreignHelper?{...inspected,User:'0:0'}:inspected,HostConfig:inspected.HostConfig}));return;
+      res.statusCode=200;res.end(JSON.stringify({Id:helperId,Config:foreignHelper?{...inspected,User:'0:0'}:inspected,HostConfig:inspected.HostConfig}));return;
     }
     if (req.url?.startsWith('/v1.47/containers/create?')) {
       if (body.Entrypoint?.[0] === '/runtime/freshell-session-host' && loseAck) {
@@ -588,6 +621,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       return
     }
     if (req.method === 'DELETE' || req.url?.endsWith('/start') || req.url?.endsWith('/update')) {
+      if (req.method==='DELETE' && (req.url===`/v1.47/containers/${helperId}?force=1` || req.url===`/v1.47/containers/${sourceName}?force=1`)) sourceHelperDeleted=true
       res.statusCode = 204
       res.end()
       return

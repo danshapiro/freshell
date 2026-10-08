@@ -384,6 +384,22 @@ export class RestrictedDockerBroker {
       const targetName = helperTarget![1]
       const exactId = targetName === helper.containerId
       const deleting = method === 'DELETE' && url === `${DOCKER_API_PREFIX}/containers/${targetName}?force=1`
+      if (method === 'GET' && url === `${DOCKER_API_PREFIX}/containers/${targetName}/json`) {
+        const inspected = await this.forward(request, body)
+        let actual: Record<string, any> = {}
+        try { actual = JSON.parse(inspected.body.toString()) } catch {}
+        // A successful create may lose its acknowledgement. Adopt only the full
+        // identity returned by the exact reserved name and fixed owned profile.
+        if (!helper.containerId && targetName === name && inspected.statusCode === 200
+          && typeof actual.Id === 'string' && /^[a-f0-9]{64}$/.test(actual.Id)
+          && !this.receiptIds().has(actual.Id) && this.ownedClaudeSourceHelper(actual, helper.expected)) {
+          helper.containerId = actual.Id
+        }
+        this.record({ method, url, decision: 'forward', destructive: false, unsafeAttempt: false,
+          containerId: helper.containerId, helperName: name })
+        replyDocker(response, inspected)
+        return
+      }
       if (deleting) {
         const inspected = await this.forward({ method: 'GET', url: `${DOCKER_API_PREFIX}/containers/${targetName}/json`, headers: {} } as IncomingMessage, Buffer.alloc(0))
         let actual: Record<string, any> = {}
@@ -394,7 +410,6 @@ export class RestrictedDockerBroker {
         }
       }
       if (deleting
-        || (method === 'GET' && url === `${DOCKER_API_PREFIX}/containers/${targetName}/json`)
         || (method === 'POST' && exactId && [
           `${DOCKER_API_PREFIX}/containers/${targetName}/start`,
           `${DOCKER_API_PREFIX}/containers/${targetName}/wait?condition=not-running`,
