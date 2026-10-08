@@ -647,6 +647,25 @@ export const OpencodeLossCredentialEvidenceSchema = z.object({
   sha256: z.string().regex(/^[a-f0-9]{64}$/),
 }).strict()
 export type OpencodeLossCredentialEvidence = z.infer<typeof OpencodeLossCredentialEvidenceSchema>
+const OPENCODE_LOSS_TARGETS = [
+  '/home/freshell/provider/.local/share/opencode/opencode.db',
+  '/home/freshell/provider/.local/share/opencode/opencode.db-wal',
+  '/home/freshell/provider/.local/share/opencode/opencode.db-shm',
+  '/home/freshell/provider/.freshell/checkpoints',
+] as const
+const OpencodeLossAbsenceCheckSchema = z.object({
+  path: z.enum(OPENCODE_LOSS_TARGETS), state: z.enum(['absent', 'present', 'unknown']), probe: z.literal('lstat'),
+}).strict()
+export const OpencodeLossAbsenceEvidenceSchema = z.array(OpencodeLossAbsenceCheckSchema).length(4)
+  .refine(rows => rows.every((row, index) => row.path === OPENCODE_LOSS_TARGETS[index]), 'exact ordered loss targets required')
+export type OpencodeLossAbsenceEvidence = z.infer<typeof OpencodeLossAbsenceEvidenceSchema>
+const OPENCODE_LOSS_ABSENCE_SCRIPT = String.raw`
+const fs = require('node:fs');
+const target = process.argv[1];
+let state = 'absent';
+try { fs.lstatSync(target); state = 'present'; } catch (error) { if (error.code !== 'ENOENT') state = 'unknown'; }
+process.stdout.write(JSON.stringify({ path: target, state, probe: 'lstat' }));
+`
 const OPENCODE_LOSS_CREDENTIAL_SCRIPT = String.raw`
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -698,7 +717,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -3278,6 +3297,14 @@ export class ManagedRuntimeOwner {
     await this.assertCurrentOpenCodeEnclosure(handle)
     const raw = await this.ownedProviderExec(handle.containerId, ['sh', '-lc', 'cat "$HOME/p5-diagnostic-only" 2>/dev/null || true'])
     return raw.trim() === 'phase5-diagnostic-retained-no-credential'
+  }
+  async lossAbsenceEvidence(handle: RuntimeEnclosureHandle): Promise<OpencodeLossAbsenceEvidence> {
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    const rows = await Promise.all(OPENCODE_LOSS_TARGETS.map(async target => {
+      const raw = await this.ownedProviderExec(handle.containerId, ['node', '-e', OPENCODE_LOSS_ABSENCE_SCRIPT, target])
+      return OpencodeLossAbsenceCheckSchema.parse(JSON.parse(raw))
+    }))
+    return OpencodeLossAbsenceEvidenceSchema.parse(rows)
   }
 
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {

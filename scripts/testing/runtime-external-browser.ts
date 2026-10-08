@@ -21,7 +21,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
   RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
   RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
-  OpencodeLossCredentialEvidenceSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -34,7 +34,7 @@ import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionSta
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
 import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
 import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts, RuntimeChaosReceiptArtifact } from './runtime-sandbox.js'
-import type { OpencodeLossCredentialEvidence } from './runtime-sandbox.js'
+import type { OpencodeLossCredentialEvidence, OpencodeLossAbsenceEvidence } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -876,6 +876,9 @@ export class ExternalManagedRuntimeRig {
   async lossDiagnosticRetained(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
     return this.rpc('loss-diagnostic', z.boolean(), { enclosure })
   }
+  async lossAbsenceEvidence(enclosure: RuntimeEnclosureHandle): Promise<OpencodeLossAbsenceEvidence> {
+    return this.rpc('loss-absence', OpencodeLossAbsenceEvidenceSchema, { enclosure })
+  }
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {
     await this.rpc('crash-provider-worker', CompletedOwnerOperationSchema, { handle })
   }
@@ -1117,6 +1120,10 @@ export function createExternalRuntimeControl(
       case 'loss-diagnostic':
         if (!request.enclosure) throw new Error('exact runtime enclosure required')
         result = await owner.lossDiagnosticRetained(request.enclosure)
+        break
+      case 'loss-absence':
+        if (!request.enclosure) throw new Error('exact runtime enclosure required')
+        result = await owner.lossAbsenceEvidence(request.enclosure)
         break
       case 'incident-matches-soul':
         if (!request.incidentId) throw new Error('observed incident identity required')

@@ -137,17 +137,6 @@ function dataOf(result: any, kind: string): any {
   return result.data
 }
 
-async function exactAbsenceCheck(rig: ManagedRuntimeBrowserRig, containerId: string, target: string) {
-  const script = String.raw`
-const fs = require('node:fs');
-const target = process.argv[1];
-let state = 'absent';
-try { fs.lstatSync(target); state = 'present'; } catch (error) { if (error.code !== 'ENOENT') state = 'unknown'; }
-process.stdout.write(JSON.stringify({ path: target, state, probe: 'lstat' }));
-`
-  return JSON.parse((await rig.ownedProviderExec(containerId, ['node', '-e', script, target])))
-}
-
 function writePrivateJson(filePath: string, value: unknown): void {
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 0o600 })
   fs.chmodSync(filePath, 0o600)
@@ -275,12 +264,7 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
       expect(diagnosticOnlyRetained).toBe(true)
       const credentialAfter = await rig.lossCredentialEvidence(rig.runtimeEnclosureHandle(before))
       expect(credentialAfter).toEqual(credentialBefore)
-      const exactAbsenceChecks = await Promise.all([
-        '/home/freshell/provider/.local/share/opencode/opencode.db',
-        '/home/freshell/provider/.local/share/opencode/opencode.db-wal',
-        '/home/freshell/provider/.local/share/opencode/opencode.db-shm',
-        '/home/freshell/provider/.freshell/checkpoints',
-      ].map(async (target) => (await exactAbsenceCheck(rig, before.containerId!, target))))
+      const exactAbsenceChecks = await rig.lossAbsenceEvidence(rig.runtimeEnclosureHandle(before))
       expect(exactAbsenceChecks.every((row) => row.state === 'absent')).toBe(true)
 
       const result = dataOf(await rig.runtime.adminOk(

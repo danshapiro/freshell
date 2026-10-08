@@ -1244,6 +1244,61 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('observes all four fixed loss targets and preserves unknown filesystem errors', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-loss-absence-'))
+    const denied = path.join(directory, 'denied')
+    try {
+      const { owned, context, inventory } = fixture()
+      const row = { soulId: 'absence-soul', incarnationId: 'absence-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'absence-boot', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+      const targets = ['/home/freshell/provider/.local/share/opencode/opencode.db',
+        '/home/freshell/provider/.local/share/opencode/opencode.db-wal',
+        '/home/freshell/provider/.local/share/opencode/opencode.db-shm', '/home/freshell/provider/.freshell/checkpoints']
+      const files = [path.join(directory, 'db'), path.join(directory, 'wal'), path.join(denied, 'shm'), path.join(directory, 'checkpoints')]
+      await fsp.mkdir(denied)
+      await fsp.writeFile(files[0], 'private database fixture')
+      await fsp.writeFile(files[2], 'private shm fixture')
+      await fsp.mkdir(files[3])
+      await fsp.chmod(denied, 0o000)
+      const mapper = path.join(directory, 'map-loss-targets.cjs')
+      await fsp.writeFile(mapper, `const fs=require('node:fs');const names=${JSON.stringify(targets)};const files=${JSON.stringify(files)};const original=fs.lstatSync;fs.lstatSync=function(file,...args){const index=names.indexOf(file);return original.call(fs,index<0?file:files[index],...args)};`)
+      const exec = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (_id, args) => {
+        const child = spawnSync(process.execPath, ['--require', mapper, ...args.slice(1)], { encoding: 'utf8' })
+        if (child.status !== 0) throw new Error(child.stderr)
+        return child.stdout
+      })
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+        await control(JSON.parse(String(init.body)))), { status: 200 }))
+      const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+      const enclosure = rig.runtimeEnclosureHandle(row)
+      const observed = await rig.lossAbsenceEvidence(enclosure)
+      expect(observed.map(value => value.path)).toEqual(targets)
+      expect(observed.map(value => value.state)).toEqual(['present', 'absent', 'unknown', 'present'])
+      expect(observed.every(value => value.state === 'absent')).toBe(false)
+      await fsp.chmod(denied, 0o700)
+      await fsp.unlink(files[0])
+      await fsp.unlink(files[2])
+      await fsp.rmdir(files[3])
+      expect((await rig.lossAbsenceEvidence(enclosure)).every(value => value.state === 'absent')).toBe(true)
+      exec.mockClear()
+      inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement-boot' }])
+      await expect(owned.lossAbsenceEvidence(enclosure)).rejects.toThrow(/current/)
+      inventory.mockResolvedValue([{ ...row, provider: 'claude' }])
+      await expect(owned.lossAbsenceEvidence(enclosure)).rejects.toThrow(/OpenCode/)
+      await expect(control({ runId: context.runId, candidateSha: context.candidateSha,
+        operationId: 'foreign-loss-target', action: 'loss-absence', enclosure,
+        path: '/foreign/target' })).rejects.toThrow(/operation/)
+      expect(exec).not.toHaveBeenCalled()
+    } finally {
+      await fsp.chmod(denied, 0o700).catch(() => undefined)
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
   it('runs the closed Phase3 effect operations over the same pre-native enclosure', async () => {
     const { owned, context, request } = fixture()
     const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',
