@@ -31,6 +31,30 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['valid', 'missing-observation', 'wrong-source', 'wrong-uid'])('executes terminal Codex create through the native app-server gate (%s; orchestration only)', async fault => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-codex-create-')), root = randomUUID()
+    const requests: any[] = []
+    const harness = { testRoot: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
+      startSupervisor: async () => ({}), writeArtifact: () => {},
+      adminOk: async (_supervisor: unknown, request: any) => {
+        requests.push(request); expect(request.params.freshAgent).toBeUndefined()
+        expect(request.params.terminal.mode).toBe('codex'); expect(request.params.terminal.program).toBe('codex')
+        expect(request.params.terminal.providerPermissionMode).toBe('on-request'); expect(request.params.terminal.providerSandbox).toBe('workspace-write')
+        return { data: { view: { launchState: 'running', recoveryState: 'live', containerId: 'owned-terminal', incarnationId: 'current-inc', nativeSessionId: root,
+          nativeIdentityObservation: fault === 'missing-observation' ? null : { nativeSessionId: root, incarnationId: 'current-inc', launchNonce: 'current-nonce',
+            source: fault === 'wrong-source' ? 'fresh_provider_handshake' : 'codex_app_server', evidenceRevision: 0, evidenceDigest: 'a'.repeat(64) } } } }
+      },
+      execOwnedContainerAsExact: async () => JSON.stringify({ uid: fault === 'wrong-uid' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+        httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: path.join(directory, 'codex-create-workspace'), nativeVersion: 'codex-cli 0.147.0',
+        activeNativeProcesses: 1, executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64) }),
+    } as unknown as RuntimeHarness
+    const sources = ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: `codex/grants/${suffix}`, path: '/owned/' + suffix, sha256: 'e'.repeat(64) }))
+    try {
+      const run = executeManagedNativeCase(harness, sources, { provider: 'codex', case: 'startup' }, 'create')
+      if (fault === 'valid') { expect((await run).assertions.every(row => row.pass)).toBe(true); expect(requests).toHaveLength(1) }
+      else await expect(run).rejects.toThrow(fault === 'wrong-uid' ? 'actual native receiver namespace/profile/pin/TLS differs' : 'current managed native receiver observation missing or misbound before input')
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['freshcodex','freshopencode'].flatMap(mode => ['valid','copied-volume','wrong-incarnation','wrong-root','store-changed','profile-changed','wrong-outcome'].map(fault => [mode,fault])))('executes exact receiver recovery only after completed native history and preserves its original volume (%s, %s; controlled orchestration)', async (mode,fault) => {
     const directory=fs.mkdtempSync(path.join(os.tmpdir(),'receiver-exact-recovery-')), provider=mode==='freshcodex'?'codex':'opencode'
     const root=provider==='codex'?randomUUID():'ses_ownedFixture', turn=randomUUID(), container='owned-initial', replacement='owned-replacement'

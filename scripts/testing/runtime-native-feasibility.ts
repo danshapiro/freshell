@@ -394,6 +394,9 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
+  if (selection.provider === 'codex' && caseId === 'create') {
+    return executeManagedReceiverNative(harness, sources, 'codex', caseId)
+  }
   if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, selection.mode as 'freshcodex' | 'freshopencode', caseId)
   }
@@ -688,8 +691,10 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
 }
 
 async function executeManagedReceiverNative(harness: RuntimeHarness,
-  sources: { name: string; path: string; sha256: string }[], mode: 'freshcodex' | 'freshopencode', caseId: string): Promise<NativeExperimentOriginal> {
-  const provider = mode === 'freshcodex' ? 'codex' : 'opencode', scenario = `${mode}-${caseId}`
+  sources: { name: string; path: string; sha256: string }[], mode: 'freshcodex' | 'freshopencode' | 'codex', caseId: string): Promise<NativeExperimentOriginal> {
+  const terminal = mode === 'codex'
+  const provider = mode === 'freshcodex' || terminal ? 'codex' : 'opencode', scenario = `${mode}-${caseId}`
+  const observationSource = terminal ? 'codex_app_server' : 'fresh_provider_handshake'
   const references = ['env_file', 'auth_file', 'ca_file'].map(suffix => {
     const source = sources.find(file => file.name === `${provider}/grants/${suffix}`)
     if (!source) throw new Error(`selected ${provider} ${suffix} reference missing`)
@@ -714,13 +719,21 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       providerSecretReferences: references, providerLaunchContext: { preparation: provider === 'codex'
         ? { codex: { tui_args: [], sidecar_args: [] } }
         : { opencode: { project_config: [], tui_config: null, inline_config: false } }, config: [] } } } }
-  harness.writeArtifact(`${scenario}-request.json`, request)
-  const launch = await harness.adminOk(supervisor, request)
+  const { freshAgent, ...commonParameters } = request.params
+  const selectedRequest = terminal ? { method: 'launch', params: { ...commonParameters,
+    terminal: { terminalId: 'native-terminal-' + randomUUID(), streamId: 'native-stream-' + randomUUID(),
+      mode: 'codex', program: 'codex', args: ['--model', settings.model],
+      env: { HOME: '/home/freshell/provider', TERM: 'xterm-256color' }, cwd: workspace, workspacePath: workspace,
+      runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
+      providerModel: settings.model, providerReasoningEffort: 'low', providerPermissionMode: 'on-request', providerSandbox: 'workspace-write',
+      providerSecretReferences: references, providerLaunchContext: freshAgent.providerLaunchContext } } } : request
+  harness.writeArtifact(`${scenario}-request.json`, selectedRequest)
+  const launch = await harness.adminOk(supervisor, selectedRequest)
   harness.writeArtifact(`${scenario}-launch.json`, launch)
   const view = launch.data.view, observation = view.nativeIdentityObservation
   if (view.launchState !== 'running' || view.recoveryState !== 'live' || !view.nativeSessionId
     || observation?.nativeSessionId !== view.nativeSessionId || observation.incarnationId !== view.incarnationId
-    || observation.source !== 'fresh_provider_handshake' || !observation.launchNonce
+    || observation.source !== observationSource || !observation.launchNonce
     || !Number.isSafeInteger(observation.evidenceRevision) || observation.evidenceRevision < 0
     || !/^[a-f0-9]{64}$/.test(observation.evidenceDigest ?? '')) {
     throw new Error('current managed native receiver observation missing or misbound before input')
@@ -771,7 +784,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     if (recovery.data.outcome !== 'replaced' || current.launchState !== 'running' || current.recoveryState !== 'live'
       || current.incarnationId === view.incarnationId || current.containerId === view.containerId
       || current.nativeSessionId !== view.nativeSessionId || observed?.nativeSessionId !== view.nativeSessionId
-      || observed.incarnationId !== current.incarnationId || observed.source !== 'fresh_provider_handshake'
+      || observed.incarnationId !== current.incarnationId || observed.source !== observationSource
       || !observed.launchNonce || observed.launchNonce === observation.launchNonce
       || !Number.isSafeInteger(observed.evidenceRevision) || observed.evidenceRevision <= observation.evidenceRevision
       || harness.broker.receipts().find(row => row.containerId === current.containerId)?.providerVolumeName !== originalVolume) {
