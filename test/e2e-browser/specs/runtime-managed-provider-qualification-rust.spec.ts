@@ -404,13 +404,8 @@ async function qualifyProvider(
   expect(writerClaim.provider).toBe(definition.provider)
   expect(writerClaim.activeClaimCount).toBe(1)
   expect(writerClaim.globalConflictingClaimCount).toBe(0)
-  const notices = await rig.runtime.adminOk(rig.supervisor, rig.runtime.pendingNoticesBody(
-    `profile:managed-provider-qualification:${definition.provider}`,
-    100,
-    await rig.controlEpoch(),
-  ))
-  expect(notices.kind).toBe('pending_notices')
-  expect(notices.data).toHaveLength(0)
+  const lostNoticeCount = await rig.managedProviderPendingNoticeCount(writerHandle)
+  expect(lostNoticeCount).toBe(0)
   const stopped = await stopManagedRuntimeSoul(rig, created.view.soulId)
   expect(stopped.outcome).toBe('verified_empty')
   if (stopped.outcome !== 'verified_empty') throw new Error('provider qualification Stop did not verify empty')
@@ -491,7 +486,7 @@ async function qualifyProvider(
       globalConflictingClaimCountAfterStop: claimAfterStop.globalConflictingClaimCount,
       oldContainerRunningAfterStop,
     },
-    lostNoticeCount: notices.data.length,
+    lostNoticeCount,
     crashKinds: ['session_host', 'provider_process'],
     nonceRecovery: {
       sameSoul: afterHostLoss.soulId === created.view.soulId,

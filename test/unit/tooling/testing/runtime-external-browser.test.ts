@@ -2912,6 +2912,25 @@ describe('closed external owner control', () => {
 })
 
 describe('external finite fixture client', () => {
+  it('awaits the owner terminal notice count and validates the body-free reply', async () => {
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused notice web') })
+    const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-soul',
+      incarnationId: 'owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'owned-boot', nativeSessionId: 'owned-root' }
+    let release: (value: number) => void = () => { throw new Error('owner count was not requested') }
+    const count = vi.spyOn(owned, 'managedProviderPendingNoticeCount').mockImplementation(() => new Promise(resolve => { release = resolve }))
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    let settled = false
+    const observation = rig.managedProviderPendingNoticeCount(handle).then(value => { settled = true; return value })
+    await vi.waitFor(() => expect(count).toHaveBeenCalledExactlyOnceWith(handle))
+    expect(settled).toBe(false)
+    release(2)
+    await expect(observation).resolves.toBe(2)
+    count.mockResolvedValue(-1)
+    await expect(rig.managedProviderPendingNoticeCount(handle)).rejects.toThrow()
+  })
   it('retries a lost mutation reply with the same operation ID and settles owner cleanup once', async () => {
     const owned = new ManagedRuntimeOwner(() => { throw new Error('web factory unused in RPC unit') })
     const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }

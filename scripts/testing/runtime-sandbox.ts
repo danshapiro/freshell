@@ -1201,7 +1201,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-preservation-artifact', 'freshcodex-history-measurement-artifact', 'freshcodex-controller-reattachment', 'freshcodex-history-measurement-finish', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
-    'provider-volume', 'fixture-decision-allow',
+    'provider-volume', 'managed-provider-notice-count', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
     'opencode-qualification-blockers',
@@ -4394,6 +4394,18 @@ export class ManagedRuntimeOwner {
       && row.incarnationId === handle.incarnationId && row.containerId === handle.containerId)
     if (receipts.length !== 1 || !receipts[0].providerVolumeName) throw new Error('exact current provider volume receipt required')
     return { providerVolumeName: receipts[0].providerVolumeName }
+  }
+
+  async managedProviderPendingNoticeCount(handle: ExactRuntimeHandle): Promise<number> {
+    await this.assertCurrentHandle(handle)
+    const row = await this.currentRuntimeEnclosure(handle)
+    if (!row.provider || !this.enabledProviders.includes(row.provider) || row.freshAgentSessionType) {
+      throw new Error('registered managed terminal provider required')
+    }
+    const result = await this.runtime.adminOk(this.supervisor, this.runtime.pendingNoticesBody(
+      `profile:managed-provider-qualification:${row.provider}`, 100, await this.controlEpoch(),
+    ))
+    return z.array(z.unknown()).parse(this.dataOf(result, 'pending_notices')).length
   }
 
   async fixtureWorkerFacts(handle: ExactRuntimeHandle): Promise<{ provider: string; workerPid: number }> {

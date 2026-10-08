@@ -868,6 +868,9 @@ export class ExternalManagedRuntimeRig {
   async providerVolumeFacts(handle: ExactRuntimeHandle): Promise<{ providerVolumeName: string }> {
     return this.rpc('provider-volume', z.object({ providerVolumeName: z.string().min(1) }).strict(), { handle })
   }
+  async managedProviderPendingNoticeCount(handle: ExactRuntimeHandle): Promise<number> {
+    return this.rpc('managed-provider-notice-count', z.number().int().nonnegative(), { handle })
+  }
   async chaosHostFacts(handle: ExactRuntimeHandle): Promise<RuntimeHostFacts> {
     return this.rpc('host-facts', z.object({ workerPid: z.number().int().positive(), workerLaunchCount: z.number().int().nonnegative(),
       limits: z.object({ cpuMax: z.string().regex(/^(?:max|\d+) \d+$/), memoryMax: z.string().regex(/^(?:max|\d+)$/),
@@ -1501,6 +1504,7 @@ export function createExternalRuntimeControl(
       case 'fixture-state': result = await owner.fixtureNativeState(handle()); break
       case 'fixture-worker': result = await owner.fixtureWorkerFacts(handle()); break
       case 'provider-volume': result = await owner.providerVolumeFacts(handle()); break
+      case 'managed-provider-notice-count': result = await owner.managedProviderPendingNoticeCount(handle()); break
       case 'fixture-decision-allow':
         if (!request.challengeId) throw new Error('actual pending fixture decision required')
         await owner.allowFixtureDecision(handle(), request.challengeId)

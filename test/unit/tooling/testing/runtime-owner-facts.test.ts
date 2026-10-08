@@ -1322,6 +1322,34 @@ describe('run-scoped owner operation settlement', () => {
 })
 
 describe('current handle admission before owner mutation', () => {
+  it('reads the registered terminal provider notice count with the current controller fence', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused terminal web') }, process.cwd(), 5,
+      {}, {}, 'release', { enabledProviders: ['codex'], freshAgentModes: [] })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    const row = { ...current, provider: 'codex', launchState: 'running', intentRevision: 1 }
+    const admission = vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([row])
+    Object.defineProperty(rig.runtime, 'broker', { value: { receipts: () => [current] } })
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(7)
+    const body = vi.spyOn(rig.runtime, 'pendingNoticesBody')
+    const admin = vi.spyOn(rig.runtime, 'adminOk').mockResolvedValue({ kind: 'pending_notices', data: [{ privateText: 'owner only' }] })
+    await expect(rig.managedProviderPendingNoticeCount(current)).resolves.toBe(1)
+    expect(body).toHaveBeenCalledExactlyOnceWith('profile:managed-provider-qualification:codex', 100, 7)
+    admin.mockResolvedValue({ kind: 'pending_notices', data: [] })
+    await expect(rig.managedProviderPendingNoticeCount(current)).resolves.toBe(0)
+    admin.mockResolvedValue({ kind: 'inventory', data: [] })
+    await expect(rig.managedProviderPendingNoticeCount(current)).rejects.toThrow()
+    admin.mockClear()
+    inventory.mockResolvedValue([{ ...row, provider: 'claude' }])
+    await expect(rig.managedProviderPendingNoticeCount(current)).rejects.toThrow(/registered.*terminal/)
+    expect(admin).not.toHaveBeenCalled()
+    inventory.mockResolvedValue([{ ...row, freshAgentSessionType: 'freshcodex' }])
+    await expect(rig.managedProviderPendingNoticeCount(current)).rejects.toThrow(/registered.*terminal/)
+    expect(admin).not.toHaveBeenCalled()
+    admission.mockRejectedValue(new Error('stale current runtime'))
+    await expect(rig.managedProviderPendingNoticeCount(current)).rejects.toThrow(/stale current/)
+    expect(admin).not.toHaveBeenCalled()
+  })
   function rigFixture() {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('web is not used by this unit') }, process.cwd(), 3, {}, {}, 'test', {
       enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'],
