@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { execFile, execFileSync } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
@@ -32,6 +32,88 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['ordinary', 'parity'])('keeps Codex transcript Enter-bound while the %s producer selects its native startup boundary', async route => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'parity-codex-startup-'))
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+    await new Promise<void>(resolve => server.once('listening', resolve))
+    const requests: any[] = []
+    const nativeRoot = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    server.on('connection', socket => socket.on('message', bytes => {
+      const request = JSON.parse(bytes.toString()); requests.push(request)
+      if (request.id) socket.send(JSON.stringify({ id: request.id, result: request.method === 'thread/start'
+        ? { thread: { id: nativeRoot } } : {} }))
+    }))
+    const fixture = path.join(directory, route === 'parity' ? 'parity-codex' : 'fake-codex-terminal.mjs')
+    fs.copyFileSync(path.resolve('test/e2e-browser/fixtures/fake-codex-terminal.mjs'), path.join(directory, 'fake-codex-terminal.mjs'))
+    if (route === 'parity') fs.copyFileSync(path.resolve('test/fixtures/providers/parity-provider.mjs'), fixture)
+    // The copied actual child resolves its ordinary ws dependency from this owned fixture directory.
+    fs.symlinkSync(path.resolve('node_modules'), path.join(directory, 'node_modules'), 'dir')
+    const child = spawn(process.execPath, [fixture, '--remote', `ws://127.0.0.1:${(server.address() as any).port}`], {
+      cwd: directory, env: { ...process.env, HOME: directory, CODEX_HOME: path.join(directory, '.codex') }, stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let output = ''
+    child.stdout.on('data', chunk => { output += String(chunk) })
+    const finished = new Promise<number | null>((resolve, reject) => { child.once('exit', resolve); child.once('error', reject) })
+    try {
+      await vi.waitFor(() => expect(output).toContain('codex>'))
+      if (route === 'parity') await vi.waitFor(() => expect(requests.filter(row => row.method === 'thread/start')).toHaveLength(1))
+      else { await new Promise(resolve => setTimeout(resolve, 100)); expect(requests).toHaveLength(0) }
+      expect(fs.existsSync(path.join(directory, '.codex/sessions'))).toBe(false)
+      expect(requests.some(row => row.method === 'turn/start')).toBe(false)
+      child.stdin.write('fixture user turn\n')
+      await vi.waitFor(() => expect(output).toContain(`codex: session ${nativeRoot} started`))
+      expect(requests.filter(row => row.method === 'thread/start')).toHaveLength(1)
+      const files = fs.readdirSync(path.join(directory, '.codex/sessions'), { recursive: true })
+        .filter(file => String(file).endsWith('.jsonl'))
+      expect(files).toHaveLength(1)
+      const rows = fs.readFileSync(path.join(directory, '.codex/sessions', String(files[0])), 'utf8').trim().split('\n').map(row => JSON.parse(row))
+      expect(rows[0].payload.id).toBe(nativeRoot)
+      expect(rows[1].payload.content[0].text).toBe('fixture user turn')
+    } finally {
+      child.stdin.end(); await finished
+      for (const socket of server.clients) socket.terminate()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 15000)
+  it.each(['missing-native-id', 'wrong-resume-root'])('does not turn a Codex parity %s response into a current exact native acknowledgement', async fault => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'parity-codex-refusal-'))
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+    await new Promise<void>(resolve => server.once('listening', resolve))
+    const requests: any[] = []
+    const requested = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    server.on('connection', socket => socket.on('message', bytes => {
+      const request = JSON.parse(bytes.toString()); requests.push(request)
+      if (request.id) socket.send(JSON.stringify({ id: request.id, result: request.method.startsWith('thread/')
+        ? { thread: fault === 'missing-native-id' ? {} : { id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } } : {} }))
+    }))
+    const fixture = path.join(directory, 'parity-codex')
+    fs.copyFileSync(path.resolve('test/fixtures/providers/parity-provider.mjs'), fixture)
+    fs.copyFileSync(path.resolve('test/e2e-browser/fixtures/fake-codex-terminal.mjs'), path.join(directory, 'fake-codex-terminal.mjs'))
+    fs.symlinkSync(path.resolve('node_modules'), path.join(directory, 'node_modules'), 'dir')
+    const child = spawn(process.execPath, [fixture, '--remote', `ws://127.0.0.1:${(server.address() as any).port}`,
+      ...(fault === 'wrong-resume-root' ? ['resume', requested] : [])], {
+      cwd: directory, env: { ...process.env, HOME: directory, CODEX_HOME: path.join(directory, '.codex') }, stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let output = '', stderr = ''
+    child.stdout.on('data', chunk => { output += String(chunk) }); child.stderr.on('data', chunk => { stderr += String(chunk) })
+    const finished = new Promise<number | null>((resolve, reject) => { child.once('exit', resolve); child.once('error', reject) })
+    try {
+      await vi.waitFor(() => expect(requests.filter(row => row.method.startsWith('thread/'))).toHaveLength(1))
+      expect(requests.find(row => row.method.startsWith('thread/'))).toMatchObject({ method: fault === 'missing-native-id' ? 'thread/start' : 'thread/resume',
+        params: fault === 'missing-native-id' ? { cwd: directory } : { threadId: requested, cwd: directory } })
+      if (fault === 'wrong-resume-root') await vi.waitFor(() => expect(stderr).toContain('resumed wrong session'))
+      expect(output).not.toContain('codex: session ')
+      expect(fs.existsSync(path.join(directory, '.codex/sessions'))).toBe(false)
+      expect(requests.some(row => row.method === 'turn/start')).toBe(false)
+    } finally {
+      child.stdin.end(); const code = await finished
+      for (const socket of server.clients) socket.terminate()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+      fs.rmSync(directory, { recursive: true, force: true })
+      expect(code).toBe(fault === 'wrong-resume-root' ? 1 : 0)
+    }
+  }, 15000)
   it.each(['same-workspace-alias', 'different-directory'])('resolves only the actual directory identity of an owned native workspace alias (%s)', async fault => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-alias-'))
     const workspace = path.join(directory, 'owned-workspace'), alias = path.join(directory, 'native-cwd')

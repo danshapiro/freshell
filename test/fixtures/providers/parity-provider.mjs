@@ -197,11 +197,14 @@ append({
 })
 rpcProbe(mcpRecipe())
 if (provider === 'codex' || provider === 'opencode') {
-  // These CLIs materialize native identity on the first submitted prompt.
-  // Drive the existing behavioral terminal fakes after recording the launch.
+  // Keep ordinary fake transcripts Enter-bound. Only this managed Codex
+  // parity wrapper requests the current proxy handshake before input.
   const fake = path.join(import.meta.dirname,
     provider === 'codex' ? 'fake-codex-terminal.mjs' : 'fake-opencode-terminal.mjs')
-  const terminal = spawn(process.execPath, [fake, ...argv], { stdio: ['inherit', 'pipe', 'inherit'] })
+  const terminal = spawn(process.execPath, [fake, ...argv], {
+    env: provider === 'codex' ? { ...process.env, FAKE_CODEX_TERMINAL_PARITY_STARTUP: '1' } : process.env,
+    stdio: ['inherit', 'pipe', 'inherit'],
+  })
   let output = ''
   terminal.stdout.on('data', chunk => {
     output += String(chunk)
