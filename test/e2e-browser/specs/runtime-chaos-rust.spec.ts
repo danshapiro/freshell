@@ -20,6 +20,7 @@ import {
   ManagedRuntimeBrowserRig,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
+  type ExactRuntimeHandle,
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -134,11 +135,6 @@ async function waitForPaneOutput(
   }, timeoutMs)
 }
 
-function dataOf(result: any, kind: string): any {
-  if (!result || result.kind !== kind) throw new Error(`expected ${kind}, got ${JSON.stringify(result)}`)
-  return result.data
-}
-
 async function runningView(rig: ManagedRuntimeBrowserRig, terminalId: string): Promise<ManagedRuntimeView> {
   return waitForValue(`running managed view ${terminalId}`, async () => {
     const view = await rig.runningViewForTerminal(terminalId)
@@ -154,7 +150,7 @@ async function exactFalseLossNoticeIds(
   page: Page,
   rig: ManagedRuntimeBrowserRig,
   token: string,
-  soulId: string,
+  handle: ExactRuntimeHandle,
 ): Promise<string[]> {
   const notices = await page.evaluate(async ({ authToken }) => {
     const response = await fetch('/api/runtime/notices?profileId=profile%3Aphase5-chaos&limit=100', {
@@ -166,11 +162,7 @@ async function exactFalseLossNoticeIds(
   const matching: string[] = []
   for (const notice of notices) {
     for (const incidentId of notice.incidentIds ?? notice.incident_ids ?? []) {
-      const incident = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.incidentSummaryBody(incidentId, await rig.controlEpoch()),
-      ), 'incident_summary')
-      if (incident.soulId === soulId || incident.soul_id === soulId) matching.push(notice.noticeId ?? notice.notice_id)
+      if (await rig.incidentMatchesSoul(handle, incidentId)) matching.push(notice.noticeId ?? notice.notice_id)
     }
   }
   return [...new Set(matching)]
@@ -436,7 +428,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       expect(finalView.hostBootId).toBe(initial.hostBootId)
       expect(finalView.nativeSessionId).toBe(providerSessionId)
       expect(finalView.evidenceRevision).toBeGreaterThan(0)
-      const matchingNoticeIds = await exactFalseLossNoticeIds(page, rig, info.token, initial.soulId)
+      const matchingNoticeIds = await exactFalseLossNoticeIds(page, rig, info.token, nativeHandle)
       expect(matchingNoticeIds).toEqual([])
       const finalRuntime: ChaosRuntimeObservation = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)
       expect(finalRuntime).toEqual(initialRuntime)

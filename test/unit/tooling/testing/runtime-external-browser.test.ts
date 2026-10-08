@@ -983,6 +983,42 @@ describe('closed external owner control', () => {
     Object.assign(owned, { web: undefined })
     await expect(control({ ...request, operationId: 'unprepared-web-process', action: 'web-process-facts' })).rejects.toThrow(/prepared/)
   })
+  it('compares an observed incident to the exact owned soul without exposing its summary', async () => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'incident-owned-soul',
+      incarnationId: 'incident-owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'incident-owned-boot', nativeSessionId: 'incident-owned-native' }
+    vi.spyOn(owned, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(owned, 'controlEpoch').mockResolvedValue(4)
+    const admin = vi.spyOn(owned.runtime, 'adminOk').mockResolvedValue({ kind: 'incident_summary',
+      data: { soulId: handle.soulId, privateData: 'owner-private-summary' } })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const wire: unknown[] = []
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      try {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      } catch { return new Response(JSON.stringify({ error: 'runtime_owner_refused' }), { status: 409 }) }
+    })
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.incidentMatchesSoul(handle, 'incident-observed')).resolves.toBe(true)
+    expect(admin).toHaveBeenCalledExactlyOnceWith(owned.supervisor, owned.runtime.incidentSummaryBody('incident-observed', 4))
+    expect(JSON.stringify(wire)).not.toContain('owner-private-summary')
+    admin.mockResolvedValue({ kind: 'incident_summary', data: { soul_id: 'foreign-soul' } })
+    await expect(rig.incidentMatchesSoul(handle, 'incident-foreign')).resolves.toBe(false)
+    for (const [index, data] of [{}, { soulId: handle.soulId, soul_id: 'contradictory-soul' }].entries()) {
+      admin.mockResolvedValue({ kind: 'incident_summary', data })
+      await expect(control({ ...request, operationId: `unreadable-incident-${index}`, action: 'incident-matches-soul',
+        handle, incidentId: 'incident-unreadable' })).rejects.toThrow(/absent|ambiguous/)
+      await expect(rig.incidentMatchesSoul(handle, 'incident-unreadable')).rejects.toThrow(/refused: 409/)
+    }
+    admin.mockClear()
+    vi.mocked(owned.assertCurrentHandle).mockRejectedValue(new Error('stale exact runtime handle'))
+    await expect(control({ ...request, operationId: 'stale-incident', action: 'incident-matches-soul',
+      handle, incidentId: 'incident-after-replacement' })).rejects.toThrow(/stale/)
+    await expect(rig.incidentMatchesSoul(handle, 'incident-after-replacement')).rejects.toThrow(/refused: 409/)
+    expect(admin).not.toHaveBeenCalled()
+  })
   it('stops only the exact owned incarnation with its observed intent and controller revisions', async () => {
     const { owned, context, request, inventory } = fixture()
     const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'stop-owned-soul',

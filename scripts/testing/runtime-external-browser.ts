@@ -704,7 +704,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -816,6 +816,9 @@ export class ExternalManagedRuntimeRig {
   }
   async webProcessFacts(): Promise<RuntimeWebProcessFacts> {
     return this.rpc('web-process-facts', RuntimeWebProcessFactsSchema)
+  }
+  async incidentMatchesSoul(handle: ExactRuntimeHandle, incidentId: string): Promise<boolean> {
+    return this.rpc('incident-matches-soul', z.boolean(), { handle, incidentId })
   }
   runtimeEnclosureHandle(view: Pick<ManagedRuntimeView, 'soulId' | 'incarnationId' | 'containerId' | 'hostBootId'>): RuntimeEnclosureHandle {
     return createRuntimeEnclosureHandle(this.descriptor, view)
@@ -1052,6 +1055,10 @@ export function createExternalRuntimeControl(
       case 'inventory-snapshot': result = await owner.inventorySnapshot(); break
       case 'control-epoch': result = await owner.controlEpoch(); break
       case 'web-process-facts': result = await owner.webProcessFacts(); break
+      case 'incident-matches-soul':
+        if (!request.incidentId) throw new Error('observed incident identity required')
+        result = await owner.incidentMatchesSoul(handle(), request.incidentId)
+        break
       case 'managed-opt-in':
         if (request.expectedControlEpoch === undefined) throw new Error('exact managed preset controller epoch required')
         result = await owner.applyManagedOptIn(request.expectedControlEpoch)

@@ -635,7 +635,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts',
     'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
-    'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
+    'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset',
     'synthetic-history-challenge',
     'synthetic-source-facts',
@@ -654,6 +654,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     soulId: z.string().min(1), incarnationId: z.string().min(1), containerId: z.string().regex(/^[a-f0-9]{64}$/),
     hostBootId: z.string().min(1) }).strict().optional(),
   challengeId: z.string().min(1).optional(),
+  incidentId: z.string().min(1).max(200).optional(),
   expectedControlEpoch: z.number().int().nonnegative().optional(),
   expectedIntentRevision: z.number().int().nonnegative().optional(),
   generation: z.number().int().nonnegative().optional(),
@@ -2966,6 +2967,19 @@ export class ManagedRuntimeOwner {
     const health = await this.runtime.adminOk(this.supervisor, { method: 'health' })
     const data = this.dataOf(health, 'health')
     return data.controlEpoch ?? data.control_epoch
+  }
+
+  async incidentMatchesSoul(handle: ExactRuntimeHandle, incidentId: string): Promise<boolean> {
+    await this.assertCurrentHandle(handle)
+    const result = await this.runtime.adminOk(this.supervisor,
+      this.runtime.incidentSummaryBody(incidentId, await this.controlEpoch()))
+    const summary = z.object({ soulId: z.string().min(1).optional(), soul_id: z.string().min(1).optional() })
+      .passthrough().parse(this.dataOf(result, 'incident_summary'))
+    if ((!summary.soulId && !summary.soul_id)
+      || (summary.soulId && summary.soul_id && summary.soulId !== summary.soul_id)) {
+      throw new Error('incident soul observation is absent or ambiguous')
+    }
+    return (summary.soulId ?? summary.soul_id) === handle.soulId
   }
 
   async applyManagedOptIn(expectedControlEpoch: number): Promise<ManagedMigrationFacts> {
