@@ -644,7 +644,37 @@ print(json.dumps({'priorLaunch':prior['launch'],'currentLaunch':current,'signalS
       } while (Date.now() < deadline)
       harness.writeArtifact(`${scenario}-native-exit.json`, faultResult)
     }
-  } else result = startupRefusal ? await harness.adminRaw(supervisor, request) : await harness.adminOk(supervisor, request)
+  } else {
+    try { result = startupRefusal ? await harness.adminRaw(supervisor, request) : await harness.adminOk(supervisor, request) }
+    catch (error) {
+      if (restorationFailure) {
+        const receipt = harness.broker.receipts().find((owned) => owned.soulId === soulId)
+        if (receipt) {
+          try {
+            harness.writeArtifact(`${scenario}-failed-startup-terminal-private.json`, await harness.adminRaw(supervisor,
+              harness.terminalReadOutputBody(soulId)))
+            harness.writeArtifact(`${scenario}-failed-startup-native-private.json`, JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId,
+              '65534:0', ['python3', '-c', String.raw`
+import pathlib,hashlib,json,os
+selected=pathlib.Path('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe');expected=hashlib.sha256(selected.read_bytes()).hexdigest();rows=[]
+for p in pathlib.Path('/proc').iterdir():
+ if not p.name.isdigit():continue
+ try:
+  if hashlib.sha256((p/'exe').read_bytes()).hexdigest()!=expected:continue
+  env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(b'\0') if b'=' in v)
+  directory=pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'])
+  rows.append({'nativePid':int(p.name),'executableSha256':expected,'nativeCwd':str((p/'cwd').resolve()),'launch':json.loads(env['FRESHELL_NATIVE_IDENTITY_LAUNCH']),
+   'hook':json.loads((directory/'session-start.json').read_text()) if (directory/'session-start.json').exists() else None,
+   'loaded':json.loads((directory/'statusline-loaded.json').read_text()) if (directory/'statusline-loaded.json').exists() else None})
+ except (OSError,ValueError):continue
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'processes':rows}))
+`])))
+          } catch (captureError) { harness.writeArtifact(`${scenario}-failed-startup-capture-error.json`, { reason: String(captureError) }) }
+        }
+      }
+      throw error
+    }
+  }
   const launchElapsedMs = Date.now() - launchStartedAt
   harness.writeArtifact(`${scenario}-launch.json`, result)
   harness.writeArtifact(`${scenario}-launch-timing.json`, { elapsedMs: launchElapsedMs })
