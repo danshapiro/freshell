@@ -5,7 +5,7 @@ import http from 'node:http'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
-import { RestrictedDockerBroker, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
+import { RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
 
 const runtimeDir = '/tmp/owned/r/scenario/x/incarnation-one'
 const actorKey = createHash('sha256').update('installation-one\0soul-one').digest('hex')
@@ -311,6 +311,155 @@ function sourceHelperBody(): any {
   }
 }
 
+function candidateAuthorization(): ClaudeCandidateAuthorization {
+  const generationId = 'grant-44444444-4444-4444-8444-444444444444'
+  return { ...sourceAuthorization(), generationId,
+    reservationId: '11111111-1111-4111-8111-111111111111',
+    requestId: '22222222-2222-4222-8222-222222222222',
+    stageRoot: `/tmp/owned/scenarios/claude/control/provider-roots/${generationId}`,
+    workspacePath: '/workspace', cwd: '/workspace/nested', manifestRelativePath: '.freshell/input-manifest.json',
+    configurationBinds: [{ sourceRelativePath: '.freshell/templates/source-0', effectiveDestination: '/workspace/.claude/settings.json' }],
+    resourceMounts: [{ stageRelativePath: '.freshell/resource-units/unit-0', providerRelativePath: '.freshell/provider-roots/unit-0',
+      effectiveDestination: '/workspace/.claude/skills', kind: 'directory' }],
+  }
+}
+function candidateLabels(input: ClaudeCandidateAuthorization) {
+  return { 'com.freshell.installation-id': input.installationId, 'com.freshell.soul-id': input.soulId,
+    'com.freshell.runtime-test-run-id': 'run-one', 'com.freshell.source-request-id': input.requestId,
+    'com.freshell.source-binary-sha256': input.binarySha256, 'com.freshell.input-generation': input.generationId,
+    'com.freshell.source-reservation-id': input.reservationId, 'com.freshell.claude-candidate': 'ordinary' }
+}
+function candidateHelperBody(input: ClaudeCandidateAuthorization, role: 'mountpoints' | 'reader'): any {
+  const volume = `freshell-claude-candidate-${input.requestId}`
+  const exchange = '/tmp/freshell-inputs-33333333-3333-4333-8333-333333333333'
+  const body = sourceHelperBody()
+  body.User = '0:0'; body.Labels = candidateLabels(input)
+  body.Cmd = [role === 'reader' ? 'project-claude-candidate-private' : 'prepare-provider-mountpoints']
+  body.HostConfig.CapAdd = ['CHOWN', 'SETGID', 'SETUID']
+  body.HostConfig.Memory = body.HostConfig.MemorySwap = (role === 'reader' ? 256 : 128) * 1024 * 1024
+  body.HostConfig.Mounts = [
+    { Type: 'bind', Source: input.hostBinaryPath, Target: '/runtime/freshell-session-host', ReadOnly: true },
+    { Type: 'volume', Source: volume, Target: '/home/freshell/provider', ReadOnly: false, VolumeOptions: { NoCopy: true } },
+    { Type: 'bind', Source: exchange, Target: role === 'reader' ? '/run/freshell-source-exchange' : '/run/freshell-input-exchange', ReadOnly: true },
+  ]
+  if (role === 'mountpoints') {
+    delete body.WorkingDir; delete body.HostConfig.Tmpfs; body.Env = ['PATH=']
+    return body
+  }
+  body.WorkingDir = input.cwd; body.HostConfig.Tmpfs = {}
+  body.HostConfig.Mounts.push(
+    { Type: 'bind', Source: input.workspacePath, Target: input.workspacePath, ReadOnly: true },
+    { Type: 'bind', Source: `${exchange}/ordinary-stage`, Target: '/run/freshell-candidate-inputs', ReadOnly: true },
+  )
+  const selected = new Set(['.freshell/claude-candidate-binding.json', '.freshell/prepared-context.json', '.freshell/prepared-result.json', input.manifestRelativePath,
+    ...input.configurationBinds.map((bind) => bind.sourceRelativePath), ...input.resourceMounts.map((mount) => mount.stageRelativePath)])
+  for (const relative of selected) body.HostConfig.Mounts.push({ Type: 'bind', Source: `${input.stageRoot}/${relative}`, Target: `/run/freshell-candidate-inputs/${relative}`, ReadOnly: true })
+  for (const bind of input.configurationBinds) body.HostConfig.Mounts.push({ Type: 'bind', Source: `${input.stageRoot}/${bind.sourceRelativePath}`, Target: bind.effectiveDestination, ReadOnly: true })
+  for (const mount of input.resourceMounts) body.HostConfig.Mounts.push({ Type: 'volume', Source: volume, Target: mount.effectiveDestination, ReadOnly: mount.kind === 'file', VolumeOptions: { NoCopy: true, Subpath: mount.providerRelativePath } })
+  return body
+}
+
+describe('fixed initial Claude candidate broker', () => {
+  it('owns only the exact request disk backing and confirms non-force cleanup', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      const input = candidateAuthorization(), name = `freshell-claude-candidate-${input.requestId}`
+      const url = `/v1.47/volumes/${name}`
+      expect((await request('GET', url)).status).toBe(403)
+      expect(forwarded).toEqual([])
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      instance.authorizeClaudeCandidate(input)
+      expect((await request('GET', url)).status).toBe(404)
+      const body = { Name: name, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) }
+      const before = forwarded.length
+      for (const mutation of ['foreign-name','tmpfs','labels','extra']) {
+        const changed: any = structuredClone(body)
+        if (mutation === 'foreign-name') changed.Name = 'freshell-claude-candidate-33333333-3333-4333-8333-333333333333'
+        if (mutation === 'tmpfs') changed.DriverOpts = { type: 'tmpfs', device: 'tmpfs', o: 'size=64m' }
+        if (mutation === 'labels') changed.Labels['com.freshell.soul-id'] = 'foreign'
+        if (mutation === 'extra') changed.Privileged = true
+        expect((await request('POST', '/v1.47/volumes/create', changed)).status, mutation).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST', '/v1.47/volumes/create', body)).status).toBe(201)
+      expect((await request('GET', url)).status).toBe(200)
+      const beforeForce = forwarded.length
+      expect((await request('DELETE', `${url}?force=1`)).status).toBe(403)
+      expect(forwarded).toHaveLength(beforeForce)
+      expect((await request('DELETE', url)).status).toBe(204)
+      expect((await request('GET', url)).status).toBe(404)
+    })
+  })
+  it('retains attempted disk ownership after a lost acknowledgement and refuses a foreign readback', async () => {
+    for (const foreign of [false, true]) {
+      await withHttpBroker(async ({ request, forwarded, broker: instance, loseCandidateVolumeAck, replaceCandidateVolumeInspection }) => {
+        const input = candidateAuthorization(), name = `freshell-claude-candidate-${input.requestId}`
+        const url = `/v1.47/volumes/${name}`
+        instance.authorizeInitialProviderVolume(sourceAuthorization())
+        instance.authorizeClaudeCandidate(input)
+        loseCandidateVolumeAck()
+        expect((await request('POST', '/v1.47/volumes/create', { Name: name, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) })).status).toBe(503)
+        expect((await request('GET', url)).status).toBe(200)
+        if (foreign) replaceCandidateVolumeInspection()
+        expect((await request('DELETE', url)).status).toBe(foreign ? 403 : 204)
+        expect(forwarded.filter((operation) => operation.method === 'DELETE')).toHaveLength(foreign ? 0 : 1)
+        if (!foreign) expect((await request('GET', url)).status).toBe(404)
+      })
+    }
+  })
+  it('permits only the two fixed candidate helpers with selected ordinary inputs and exact lost-ack cleanup', async () => {
+    for (const role of ['mountpoints', 'reader'] as const) {
+      for (const lost of [false, true]) {
+        await withHttpBroker(async ({ request, forwarded, broker: instance, loseHelperAck }) => {
+          const input = candidateAuthorization(), volume = `freshell-claude-candidate-${input.requestId}`
+          const name = `${role === 'reader' ? 'freshell-claude-candidate-reader' : 'freshell-mountpoints'}-11111111-1111-4111-8111-111111111111`
+          instance.authorizeInitialProviderVolume(sourceAuthorization()); instance.authorizeClaudeCandidate(input)
+          expect((await request('POST', '/v1.47/volumes/create', { Name: volume, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) })).status).toBe(201)
+          const body = candidateHelperBody(input, role), before = forwarded.length
+          for (const mutation of ['uid','command','credential','caps','network','memory','logs','reservation','generation','request','mount','readonly','volume']) {
+            const changed = structuredClone(body)
+            if (mutation === 'uid') changed.User = '65534:0'
+            if (mutation === 'command') changed.Cmd.push('PRIVATE_CANDIDATE_SENTINEL')
+            if (mutation === 'credential') changed.Env.push('SECRET=PRIVATE_CANDIDATE_SENTINEL')
+            if (mutation === 'caps') changed.HostConfig.CapAdd.push('DAC_OVERRIDE')
+            if (mutation === 'network') changed.HostConfig.NetworkMode = 'bridge'
+            if (mutation === 'memory') changed.HostConfig.Memory *= 2
+            if (mutation === 'logs') changed.HostConfig.LogConfig.Type = 'json-file'
+            if (mutation === 'reservation') changed.Labels['com.freshell.source-reservation-id'] = '33333333-3333-4333-8333-333333333333'
+            if (mutation === 'generation') changed.Labels['com.freshell.input-generation'] = 'grant-33333333-3333-4333-8333-333333333333'
+            if (mutation === 'request') changed.Labels['com.freshell.source-request-id'] = '33333333-3333-4333-8333-333333333333'
+            if (mutation === 'mount') changed.HostConfig.Mounts.push({ Type: 'bind', Source: `${input.stageRoot}/.freshell/mcp-capability.json`, Target: '/outside', ReadOnly: true })
+            if (mutation === 'readonly') changed.HostConfig.Mounts[0].ReadOnly = false
+            if (mutation === 'volume') changed.HostConfig.Mounts[1].Source = sourceAuthorization().providerVolumeName
+            expect((await request('POST', `/v1.47/containers/create?name=${name}`, changed)).status, `${role}/${mutation}`).toBe(403)
+            expect(forwarded).toHaveLength(before)
+          }
+          if (lost) loseHelperAck()
+          expect((await request('POST', `/v1.47/containers/create?name=${name}`, body)).status).toBe(lost ? 503 : 201)
+          expect((await request('GET', `/v1.47/containers/${name}/json`)).status).toBe(200)
+          expect(instance.receiptIds().has(helperId)).toBe(true)
+          if (!lost) {
+            expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+            expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+          }
+          const beforeControls = forwarded.length
+          for (const [method, url] of [
+            ['GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=1`], ['POST', `/v1.47/containers/${helperId}/exec`],
+            ['POST', `/v1.47/containers/${helperId}/stop`], ['POST', `/v1.47/containers/${name}/start`],
+          ]) {
+            expect((await request(method, url)).status).toBe(403)
+            expect(forwarded).toHaveLength(beforeControls)
+          }
+          expect((await request('DELETE', `/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
+          expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(404)
+          expect((await request('DELETE', `/v1.47/volumes/${volume}`)).status).toBe(204)
+          expect((await request('GET', `/v1.47/volumes/${volume}`)).status).toBe(404)
+          expect(JSON.stringify(instance.eventsSnapshot())).not.toContain('PRIVATE_CANDIDATE_SENTINEL')
+        })
+      }
+    }
+  })
+})
+
 describe('scoped Claude source observer broker', () => {
   it('allows the reserved fixed reader and exact private lifecycle without creating initial HOME or exposing logs', async () => {
     await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
@@ -442,6 +591,8 @@ type BrokerHttpFixture = {
   loseHelperAck(): void
   returnHelperId(id: string): void
   replaceHelperInspection():void
+  loseCandidateVolumeAck(): void
+  replaceCandidateVolumeInspection(): void
 }
 
 function publisherAuthorization():PreparedInputAuthorization {
@@ -588,6 +739,9 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
   let indexedVolumeMetadata:unknown
   let foreignHelper=false
   let sourceHelperDeleted = false
+  let candidateVolumeMetadata: any
+  let candidateVolumeAckUnavailable = false
+  let candidateHelperDeleted = false
   const upstream = http.createServer(async (req, res) => {
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(Buffer.from(chunk))
@@ -595,11 +749,28 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     const body = raw ? JSON.parse(raw) : undefined
     forwarded.push({ method: req.method!, url: req.url!, body })
     if (req.url==='/v1.47/volumes/create') {
+      if (body.Name.startsWith('freshell-claude-candidate-')) {
+        candidateVolumeMetadata={Name:body.Name,Driver:body.Driver,Options:body.DriverOpts,Labels:body.Labels}
+        res.statusCode=candidateVolumeAckUnavailable?503:201;res.end(JSON.stringify(candidateVolumeMetadata));return
+      }
       indexedVolumeMetadata={Name:body.Name,Driver:body.Driver,Options:body.DriverOpts,Labels:body.Labels};
       res.statusCode=201;res.end(JSON.stringify(indexedVolumeMetadata));return;
     }
+    if (req.url?.startsWith('/v1.47/volumes/freshell-claude-candidate-')) {
+      if (req.method==='DELETE') {candidateVolumeMetadata=undefined;res.statusCode=204;res.end();return}
+      res.statusCode=candidateVolumeMetadata?200:404;res.end(JSON.stringify(candidateVolumeMetadata ?? {}));return
+    }
     if (req.method==='GET' && req.url?.startsWith('/v1.47/volumes/freshell-inputs-') && indexedVolumeMetadata) {
       res.statusCode=200;res.end(JSON.stringify(indexedVolumeMetadata));return;
+    }
+    const candidateCreation = forwarded.findLast((operation) => operation.url.includes('/containers/create?') && operation.body?.Labels?.['com.freshell.claude-candidate']==='ordinary')
+    if (req.method==='GET' && candidateCreation && (req.url===`/v1.47/containers/${helperId}/json`
+      || req.url===`${candidateCreation.url.replace('/containers/create?name=', '/containers/')}/json`)) {
+      if (candidateHelperDeleted) {res.statusCode=404;res.end('{}');return}
+      const inspected=structuredClone(candidateCreation.body)
+      inspected.Labels['org.opencontainers.image.version']='24.04'
+      for (const mount of inspected.HostConfig.Mounts) if (mount.ReadOnly===false) delete mount.ReadOnly
+      res.statusCode=200;res.end(JSON.stringify({Id:helperId,Config:foreignHelper?{...inspected,User:'foreign'}:inspected,HostConfig:inspected.HostConfig}));return
     }
     if (req.method==='GET' && (req.url?.includes('-publisher/json') || req.url?.includes('/freshell-claude-source-')
       || (req.url===`/v1.47/containers/${helperId}/json` && forwarded.some((operation)=>operation.body?.Cmd?.[0]==='observe-claude-sources-private')))) {
@@ -621,6 +792,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       return
     }
     if (req.method === 'DELETE' || req.url?.endsWith('/start') || req.url?.endsWith('/update')) {
+      if (req.method==='DELETE' && candidateCreation && req.url===`/v1.47/containers/${helperId}?force=1`) candidateHelperDeleted=true
       if (req.method==='DELETE' && (req.url===`/v1.47/containers/${helperId}?force=1` || req.url===`/v1.47/containers/${sourceName}?force=1`)) sourceHelperDeleted=true
       res.statusCode = 204
       res.end()
@@ -654,7 +826,8 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
   try {
     await new Promise<void>((resolve) => upstream.listen(socket, resolve))
     await instance.start()
-    await run({ request, forwarded, broker: instance, loseHelperAck: () => { loseAck = true }, returnHelperId: (id) => { helperAckId = id },replaceHelperInspection:()=>{foreignHelper=true} })
+    await run({ request, forwarded, broker: instance, loseHelperAck: () => { loseAck = true }, returnHelperId: (id) => { helperAckId = id },replaceHelperInspection:()=>{foreignHelper=true},
+      loseCandidateVolumeAck:()=>{candidateVolumeAckUnavailable=true},replaceCandidateVolumeInspection:()=>{candidateVolumeMetadata.Labels['com.freshell.soul-id']='foreign'} })
   } finally {
     await instance.close()
     await new Promise<void>((resolve) => upstream.close(() => resolve()))
