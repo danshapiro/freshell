@@ -115,6 +115,64 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       if (fault === 'missing-signal') expect(records.has('amplifier-create-original.json')).toBe(false)
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it.each(['valid', 'requested-echo', 'old-nonce', 'old-incarnation', 'old-revision', 'old-generation', 'published', 'missing-event', 'admitted-input', 'signal-present', 'nonempty-root', 'parent-root', 'wrong-namespace'])('requires a current actual Amplifier wrong-root refusal (%s)', async (fault) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-wrong-root-'))
+    const source = path.join(directory, 'selected-profile'); fs.writeFileSync(source, 'fixture selected profile')
+    const records = new Map<string, unknown>()
+    let request: any
+    const launch = () => ({ incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 7,
+      executionGeneration: 3, requestedNativeSessionId: request.params.nativeSessionId })
+    const view = () => ({ soulId: request.params.soulId, containerId: 'owned-amplifier', incarnationId: 'current-incarnation',
+      launchState: fault === 'published' ? 'running' : 'starting', executionGeneration: 3, nativeSessionId: request.params.nativeSessionId })
+    const harness = { testRoot: directory, evidenceDir: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
+      startSupervisor: async () => ({ containerId: 'owned-control' }),
+      inventoryBody: () => ({ method: 'inventory' }),
+      terminalReadOutputBody: () => ({ method: 'terminal_read_output' }),
+      terminalInputBody: () => ({ method: 'terminal_input' }),
+      writeArtifact: (name: string, value: unknown) => records.set(name, value),
+      adminRaw: async (_supervisor: unknown, input: any) => {
+        if (input.method === 'launch') { request = input; return { result: { Err: { code: 'RECOVERY_BLOCKED' } } } }
+        return { result: fault === 'admitted-input' ? { Ok: {} } : { Err: { code: 'UNKNOWN_SOUL' } } }
+      },
+      adminOk: async (_supervisor: unknown, input: any) => {
+        if (input.method === 'inventory') return { data: [view()] }
+        const event: any = { severity: 'error', event: 'amplifier.native_root.refused', reason: 'native_root_mismatch',
+          ...launch(), nativeSessionId: request.params.terminal.resumeSessionId }
+        delete event.requestedNativeSessionId
+        if (fault === 'requested-echo') event.nativeSessionId = request.params.nativeSessionId
+        if (fault === 'old-nonce') event.launchNonce = 'old-nonce'
+        if (fault === 'old-incarnation') event.incarnationId = 'old-incarnation'
+        if (fault === 'old-revision') event.evidenceRevision--
+        if (fault === 'old-generation') event.executionGeneration--
+        return { data: { frames: [{ data: fault === 'missing-event' ? 'ordinary native output' : JSON.stringify(event) + '\n' }] } }
+      },
+      execOwnedContainerAsExact: async (containerId: string, uid: string) => {
+        if (containerId === 'owned-control') { expect(uid).toBe('0:0'); return JSON.stringify(launch()) }
+        expect(uid).toBe('65534:0')
+        return JSON.stringify({ uid: fault === 'wrong-namespace' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+          cliVersion: '0.1.1', coreVersion: '1.6.0', executableSha256: 'e'.repeat(64), producerSha256: 'f'.repeat(64),
+          signalAbsent: fault !== 'signal-present', nativeRoot: request.params.terminal.resumeSessionId,
+          parentId: fault === 'parent-root' ? 'other-parent' : null, messageCount: fault === 'nonempty-root' ? 1 : 0 })
+      },
+    } as unknown as RuntimeHarness
+    const sources = ['grants/env_file', 'grants/ca_file', '.amplifier/settings.yaml', '.amplifier/bundles/default.yaml']
+      .map(name => ({ name: 'amplifier/' + name, path: source, sha256: 'e'.repeat(64) }))
+    try {
+      const result = executeManagedNativeCase(harness, sources, { provider: 'amplifier', case: 'startup' }, 'wrong-root')
+      if (fault === 'valid') {
+        const original = await result
+        expect(original.assertions.every(row => row.pass)).toBe(true)
+        expect(request.params.terminal.resumeSessionId).not.toBe(request.params.nativeSessionId)
+        expect(records.has('amplifier-wrong-root-original.json')).toBe(true)
+      } else {
+        await expect(result).rejects.toThrow(fault === 'published' ? 'Amplifier wrong-root published Running or an observation'
+          : fault === 'admitted-input' ? 'Amplifier wrong-root admitted ordinary input'
+          : ['signal-present', 'nonempty-root', 'parent-root', 'wrong-namespace'].includes(fault) ? 'owned Amplifier wrong-root source or namespace differs'
+          : 'current actual Amplifier wrong native root evidence missing or stale')
+        expect(records.has('amplifier-wrong-root-original.json')).toBe(false)
+      }
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['matching', 'wrong-root', 'parent-root', 'missing-root'])('executes the pinned Amplifier producer with current native root diagnostics (%s)', (fault) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-native-root-event-'))
     const patch = fs.readFileSync(path.join(process.cwd(), 'extensions/amplifier/freshell-native-resume.patch'), 'utf8')

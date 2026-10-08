@@ -1,4 +1,5 @@
 import { fileURLToPath } from 'node:url'
+import { stripVTControlCharacters } from 'node:util'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
@@ -387,7 +388,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
-  if (selection.provider === 'amplifier' && ['create', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'amplifier' && ['create', 'wrong-root', 'exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)) {
     return executeManagedAmplifier(harness, sources, caseId, serverPath, servers)
   }
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
@@ -1333,6 +1334,7 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath: string | undefined,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[]): Promise<NativeExperimentOriginal> {
   const scenario = `amplifier-${caseId}`
+  const wrongRoot = caseId === 'wrong-root'
   const resumes = ['exact-resume', 'native-followup', 'current-native-turn'].includes(caseId)
   const followup = caseId === 'native-followup' || caseId === 'current-native-turn'
   if (resumes && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
@@ -1353,6 +1355,7 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
     env: { HOME: home, FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'amplifier' } })
   const soulId = 'soul-' + randomUUID()
   const nativeRoot = randomUUID()
+  const actualRoot = wrongRoot ? randomUUID() : nativeRoot
   let managedPreparation: any
   if (resumes && serverPath) {
     const { RustServer } = await import('../../test/e2e-browser/helpers/rust-server.js')
@@ -1403,8 +1406,8 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
     creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: `${scenario}-native-create`,
     limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
     terminal: { terminalId: 'native-terminal-' + randomUUID(), streamId: 'native-stream-' + randomUUID(),
-      mode: 'amplifier', program: 'amplifier', args: ['session', 'resume', '--full-history', nativeRoot],
-      resumeSessionId: nativeRoot, env: { HOME: '/home/freshell/provider', PROMPT_TOOLKIT_NO_CPR: '1' },
+      mode: 'amplifier', program: 'amplifier', args: ['session', 'resume', '--full-history', actualRoot],
+      resumeSessionId: actualRoot, env: { HOME: '/home/freshell/provider', PROMPT_TOOLKIT_NO_CPR: '1' },
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30,
       projectKey: `${scenario}-native-create`, providerModel: 'glm-5.3', providerReasoningEffort: 'low',
       providerSecretReferences: managedPreparation?.secretReferences ?? grants,
@@ -1412,6 +1415,71 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
         config: profile.map((file) => ({ root: 'user_provider', relativePath: file.relative,
           providerRelativePath: '.amplifier/' + file.relative, format: 'yaml' })) } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
+  const finish = (namespace: any, artifactReferences: string[], assertions: { name: string; pass: boolean }[]) => {
+    const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
+      nativeVersion: `amplifier-app-cli ${namespace.cliVersion}; amplifier-core ${namespace.coreVersion}`,
+      executableSha256: namespace.executableSha256,
+      profileSha256: createHash('sha256').update(JSON.stringify(profile.map(file => ({ relative: file.relative, sha256: file.sha256 })))).digest('hex'),
+      artifactReferences, assertions }
+    harness.writeArtifact(`${scenario}-original.json`, original)
+    return original
+  }
+  if (wrongRoot) {
+    const result = await harness.adminRaw(supervisor, request)
+    harness.writeArtifact(`${scenario}-launch.json`, result)
+    if (result.result?.Err?.code !== 'RECOVERY_BLOCKED') throw new Error('Amplifier wrong-root launch was not blocked')
+    const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+    harness.writeArtifact(`${scenario}-inventory.json`, inventory)
+    const view = inventory.data.find((row: any) => row.soulId === soulId)
+    harness.writeArtifact(`${scenario}-current-view.json`, view)
+    if (view?.launchState !== 'starting' || view.nativeIdentityObservation) {
+      throw new Error('Amplifier wrong-root published Running or an observation')
+    }
+    // Read only the already-owned registry's persisted launch binding. The
+    // native event cannot choose its own nonce, revision or generation.
+    const launch = JSON.parse(await harness.execOwnedContainerAsExact(supervisor.containerId, '0:0',
+      ['python3', '-c', "import sqlite3,json,sys; c=sqlite3.connect('file:/var/lib/freshell-supervisor/runtime.sqlite3?mode=ro',uri=True); c.execute('PRAGMA query_only=ON'); row=c.execute('SELECT native_identity_launch FROM incarnations WHERE incarnation_id=?',(sys.argv[1],)).fetchone(); assert row and row[0]; print(row[0])", view.incarnationId]))
+    harness.writeArtifact(`${scenario}-current-launch-binding.json`, launch)
+    const output = await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId))
+    harness.writeArtifact(`${scenario}-terminal-private.json`, output)
+    const events = stripVTControlCharacters(output.data.frames.map((frame: any) => frame.data).join(''))
+      .split(/\r?\n/).flatMap(line => {
+        try { return [JSON.parse(line)] } catch { return [] }
+      }).filter(event => event.event === 'amplifier.native_root.refused')
+    const event = events.length === 1 ? events[0] : undefined
+    if (!event || event.severity !== 'error' || event.reason !== 'native_root_mismatch'
+      || event.nativeSessionId !== actualRoot || actualRoot === nativeRoot
+      || event.incarnationId !== view.incarnationId || event.incarnationId !== launch.incarnationId
+      || !launch.launchNonce || event.launchNonce !== launch.launchNonce
+      || event.evidenceRevision !== launch.evidenceRevision || event.executionGeneration !== launch.executionGeneration
+      || event.executionGeneration !== view.executionGeneration || launch.requestedNativeSessionId !== nativeRoot) {
+      throw new Error('current actual Amplifier wrong native root evidence missing or stale')
+    }
+    const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+      ['/opt/amplifier-src/.venv/bin/python', '-c', String.raw`
+import os,json,pathlib,hashlib,importlib.metadata as m,sys
+os.chdir(sys.argv[1]);actual_root,nonce=sys.argv[2:]
+from amplifier_app_cli.session_store import SessionStore
+from amplifier_app_cli.freshell_native_resume import load_native
+loaded,metadata=load_native(SessionStore(),actual_root)
+p=pathlib.Path('/opt/amplifier-src/.venv/bin/amplifier');producer=pathlib.Path('/opt/amplifier-src/amplifier_app_cli/freshell_native_resume.py')
+signal=pathlib.Path('/home/freshell/provider/.freshell/native-identity')/nonce/'amplifier-loaded-context.json'
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'executableSha256':hashlib.sha256(p.read_bytes()).hexdigest(),'producerSha256':hashlib.sha256(producer.read_bytes()).hexdigest(),'cliVersion':m.version('amplifier-app-cli'),'coreVersion':m.version('amplifier-core'),'signalAbsent':not signal.exists(),'nativeRoot':metadata['session_id'],'parentId':metadata.get('parent_id'),'messageCount':len(loaded),'load':loaded.native_load_witness}))
+`, workspace, actualRoot, launch.launchNonce]))
+    harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
+    if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
+      || !namespace.readOnlyRoot || namespace.cliVersion !== '0.1.1' || namespace.coreVersion !== '1.6.0'
+      || namespace.nativeRoot !== actualRoot || namespace.parentId !== null || namespace.messageCount !== 0
+      || namespace.signalAbsent !== true) throw new Error('owned Amplifier wrong-root source or namespace differs')
+    const input = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned refused root input probe. Do not use tools.\r'))
+    harness.writeArtifact(`${scenario}-input-refusal.json`, input)
+    if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('Amplifier wrong-root admitted ordinary input')
+    return finish(namespace,
+      [`${scenario}-launch.json`, `${scenario}-current-view.json`, `${scenario}-current-launch-binding.json`, `${scenario}-terminal-private.json`, `${scenario}-namespace-native-private.json`, `${scenario}-input-refusal.json`],
+      [{ name: 'actual-current-native-selected-different-root', pass: event.nativeSessionId === actualRoot && actualRoot !== nativeRoot },
+        { name: 'owned-empty-native-root-readable-without-loader-acknowledgement', pass: namespace.signalAbsent && namespace.messageCount === 0 },
+        { name: 'wrong-native-root-blocks-running-and-input', pass: view.launchState === 'starting' && !view.nativeIdentityObservation && input.result.Err.code === 'UNKNOWN_SOUL' }])
+  }
   const result = await harness.adminOk(supervisor, request)
   harness.writeArtifact(`${scenario}-launch.json`, result)
   let view = result.data.view
@@ -1527,14 +1595,7 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
         { name: 'native-turns-requested-no-tools', pass: seed.toolEvents === 0 && recalled.toolEvents === 0 })
     }
   }
-  const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
-    nativeVersion: `amplifier-app-cli ${namespace.cliVersion}; amplifier-core ${namespace.coreVersion}`,
-    executableSha256: namespace.executableSha256,
-    profileSha256: createHash('sha256').update(JSON.stringify(profile.map((file) => ({ relative: file.relative, sha256: file.sha256 })))).digest('hex'),
-    artifactReferences: [`${scenario}-current-view.json`, `${scenario}-native-signal-original.json`, `${scenario}-namespace.json`],
-    assertions }
-  harness.writeArtifact(`amplifier-${caseId}-original.json`, original)
-  return original
+  return finish(namespace, [`${scenario}-current-view.json`, `${scenario}-native-signal-original.json`, `${scenario}-namespace.json`], assertions)
 }
 
 export async function executeManagedNativeApproval(input: {
