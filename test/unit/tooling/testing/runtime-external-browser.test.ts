@@ -1942,6 +1942,44 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('applies only the fixed qualification second-view preset at the current address revision and epoch', async () => {
+    const { owned, context, inventory, request } = fixture()
+    Object.assign(owned.runtime, { phase: 5 })
+    const row = { soulId: 'view-soul', incarnationId: 'view-incarnation', containerId: 'b'.repeat(64),
+      hostBootId: 'view-boot', nativeSessionId: 'ses_view', provider: 'opencode', projectKey: 'owned-project', launchState: 'running', intentRevision: 7 }
+    inventory.mockResolvedValue([row])
+    const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+      createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: '/private/view/runtime' }
+    Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+    vi.spyOn(owned, 'controlEpoch').mockResolvedValue(4)
+    const admin = vi.spyOn(owned.runtime, 'adminOk').mockResolvedValue({ kind: 'view_intent', data: { private: 'ignored observation' } })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const handle = rig.exactRuntimeHandle(row)
+    await rig.addOpenCodeQualificationSecondView(handle, 7, 4)
+    expect(admin).toHaveBeenCalledWith(owned.supervisor, { method: 'upsert_view_intent', params: {
+      soulId: row.soulId, expectedSoulIntentRevision: 7, expectedControlEpoch: 4,
+      intent: { ownerId: 'opencode-qualification-second-view', workspaceId: 'owned-project', kind: 'explicit',
+        preferredTabId: 'opencode-qualification-second-tab', preferredPaneId: 'opencode-qualification-second-pane',
+        title: 'OpenCode qualification second view', placementGroup: 'Recovered agents', visibility: 'visible' },
+    } })
+    inventory.mockResolvedValue([{ ...row, projectKey: undefined }])
+    await rig.addOpenCodeQualificationSecondView(handle, 7, 4)
+    expect(admin.mock.calls.at(-1)?.[1]).toMatchObject({ params: { intent: { workspaceId: 'opencode-qualification' } } })
+    admin.mockClear()
+    await expect(owned.addOpenCodeQualificationSecondView(handle, 6, 4)).rejects.toThrow(/revision/)
+    await expect(owned.addOpenCodeQualificationSecondView(handle, 7, 3)).rejects.toThrow(/epoch/)
+    await expect(control({ ...request, action: 'opencode-qualification-second-view', handle,
+      expectedIntentRevision: 7, expectedControlEpoch: 4, intent: { title: 'arbitrary' } })).rejects.toThrow(/operation/)
+    inventory.mockResolvedValue([{ ...row, nativeSessionId: 'ses_replacement' }])
+    await expect(owned.addOpenCodeQualificationSecondView(handle, 7, 4)).rejects.toThrow(/current/)
+    inventory.mockResolvedValue([{ ...row, provider: 'claude' }])
+    await expect(owned.addOpenCodeQualificationSecondView(handle, 7, 4)).rejects.toThrow(/OpenCode/)
+    Object.assign(owned.runtime, { phase: 2 })
+    await expect(owned.addOpenCodeQualificationSecondView(handle, 7, 4)).rejects.toThrow(/Phase 5/)
+    expect(admin).not.toHaveBeenCalled()
+  })
   it('checks private replacement source readiness on the exact owner stream without exposing terminal text', async () => {
     const { owned, context, inventory, request } = fixture()
     Object.assign(owned.runtime, { phase: 5 })

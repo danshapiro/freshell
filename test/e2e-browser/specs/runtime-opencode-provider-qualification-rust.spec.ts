@@ -611,24 +611,8 @@ test.describe.serial('OpenCode provider qualification', () => {
         .filter((candidate: any) => candidate.soulId === first.view.soulId)
         .at(-1)
       if (!firstSoul) throw new Error('OpenCode qualification inventory has no exact first soul')
-      dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.upsertViewIntentBody({
-          soulId: first.view.soulId,
-          intent: {
-            ownerId: 'opencode-qualification-second-view',
-            workspaceId: firstSoul.projectKey || 'opencode-qualification',
-            kind: 'explicit',
-            preferredTabId: 'opencode-qualification-second-tab',
-            preferredPaneId: 'opencode-qualification-second-pane',
-            title: 'OpenCode qualification second view',
-            placementGroup: 'Recovered agents',
-            visibility: 'visible',
-          },
-          expectedSoulIntentRevision: firstSoul.intentRevision,
-          expectedControlEpoch: await rig.controlEpoch(),
-        }),
-      ), 'view_intent')
+      const writerHandle = rig.exactRuntimeHandle(afterProviderCrash)
+      await rig.addOpenCodeQualificationSecondView(writerHandle, firstSoul.intentRevision, await rig.controlEpoch())
       snapshot = await rig.inventorySnapshot()
       const firstRunning = snapshot.souls.filter((candidate: any) => (
         candidate.soulId === first.view.soulId && candidate.launchState === 'running'
@@ -638,7 +622,6 @@ test.describe.serial('OpenCode provider qualification', () => {
       ))
       expect(firstRunning).toHaveLength(1)
       expect(firstViews).toHaveLength(2)
-      const writerHandle = rig.exactRuntimeHandle(afterProviderCrash)
       const writerClaim = await rig.writerClaimFacts(writerHandle)
       expect(writerClaim.provider).toBe('opencode')
       expect(writerClaim.activeClaimCount).toBe(1)

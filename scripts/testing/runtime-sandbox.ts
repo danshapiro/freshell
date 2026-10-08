@@ -980,6 +980,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'opencode-qualification-limits',
     'opencode-qualification-blockers',
     'opencode-replacement-readiness',
+    'opencode-qualification-second-view',
     'terminal-continuity-receipt',
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
@@ -3689,6 +3690,25 @@ export class ManagedRuntimeOwner {
     return OpencodeReplacementReadinessSchema.parse({ incarnationId: output.incarnationId, streamEpoch: output.streamEpoch,
       terminalId: output.terminalId, exited: output.exited, headSeq: output.headSeq,
       sourceReady: openCodeTerminalReady(sourceText, ['GPT-5.6 Luna', P2_OPENCODE_MODEL]) })
+  }
+  async addOpenCodeQualificationSecondView(handle: ExactRuntimeHandle, expectedIntentRevision: number, expectedControlEpoch: number): Promise<void> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
+    await this.assertCurrentHandle(handle)
+    const row = await this.currentRuntimeEnclosure(handle)
+    if (row.provider !== 'opencode') throw new Error('exact OpenCode runtime required')
+    if (row.intentRevision !== expectedIntentRevision) throw new Error('qualification view revision is stale')
+    if (await this.controlEpoch() !== expectedControlEpoch) throw new Error('qualification controller epoch is stale')
+    const result = await this.runtime.adminOk(this.supervisor, this.runtime.upsertViewIntentBody({
+      soulId: handle.soulId, intent: {
+        ownerId: 'opencode-qualification-second-view', workspaceId: row.projectKey || 'opencode-qualification',
+        kind: 'explicit', preferredTabId: 'opencode-qualification-second-tab',
+        preferredPaneId: 'opencode-qualification-second-pane', title: 'OpenCode qualification second view',
+        placementGroup: 'Recovered agents', visibility: 'visible',
+      }, expectedSoulIntentRevision: expectedIntentRevision, expectedControlEpoch,
+    }))
+    this.dataOf(result, 'view_intent')
+    this.runtime.recordLifecycle('external.opencode_qualification_second_view_applied', { severity: 'info',
+      soulId: handle.soulId, incarnationId: handle.incarnationId, expectedIntentRevision, expectedControlEpoch })
   }
   async runOpenCodeQualificationBlockers(): Promise<string[]> {
     if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')

@@ -921,6 +921,9 @@ export class ExternalManagedRuntimeRig {
   async openCodeReplacementReadiness(enclosure: RuntimeEnclosureHandle, qualificationTerminalId: string): Promise<z.infer<typeof OpencodeReplacementReadinessSchema>> {
     return this.rpc('opencode-replacement-readiness', OpencodeReplacementReadinessSchema, { enclosure, qualificationTerminalId })
   }
+  async addOpenCodeQualificationSecondView(handle: ExactRuntimeHandle, expectedIntentRevision: number, expectedControlEpoch: number): Promise<void> {
+    await this.rpc('opencode-qualification-second-view', CompletedOwnerOperationSchema, { handle, expectedIntentRevision, expectedControlEpoch })
+  }
   async openCodeContinuityFirstTurnCompleted(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
     return this.rpc('opencode-continuity-first-turn', z.boolean(), { enclosure })
   }
@@ -1306,6 +1309,11 @@ export function createExternalRuntimeControl(
       case 'opencode-replacement-readiness':
         if (!request.enclosure || !request.qualificationTerminalId) throw new Error('exact OpenCode enclosure and observed terminal required')
         result = await owner.openCodeReplacementReadiness(request.enclosure, request.qualificationTerminalId)
+        break
+      case 'opencode-qualification-second-view':
+        if (request.expectedIntentRevision === undefined || request.expectedControlEpoch === undefined) throw new Error('exact view revision and controller epoch required')
+        await owner.addOpenCodeQualificationSecondView(handle(), request.expectedIntentRevision, request.expectedControlEpoch)
+        result = { completed: true }
         break
       case 'opencode-continuity-effect-count':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
