@@ -1369,6 +1369,7 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
     error => { failure = error; finished = true })
   const diagnostics: string[] = []
   let namespace: any, report: any, view: any
+  let capturedCandidate: { containerId: string; incarnationId: string; executionGeneration: number } | undefined
   try {
     const deadline = Date.now() + 30000
     while (!finished && Date.now() < deadline) {
@@ -1377,9 +1378,14 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
         try {
           const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
           view = ManagedRuntimeSoulSchema.parse(inventory.data.find((row: any) => row.soulId === request.params.soulId))
-          if (view.launchState !== 'starting' || view.desiredState !== 'running'
-            || view.containerId !== owned.containerId || view.nativeIdentityObservation) {
-            throw new Error('pending native TUI already admitted')
+          const publicUnadmitted = replacement
+            ? view.incarnationId === replacement.priorView.incarnationId && view.containerId === replacement.priorView.containerId
+              && view.launchState === 'stopped' && view.recoveryState === 'recovering'
+              && JSON.stringify(view.nativeIdentityObservation) === JSON.stringify(replacement.priorView.nativeIdentityObservation)
+              && owned.incarnationId !== replacement.priorView.incarnationId
+            : view.launchState === 'starting' && view.containerId === owned.containerId && !view.nativeIdentityObservation
+          if (!publicUnadmitted || view.desiredState !== 'running') {
+            throw new Error('pending native TUI public projection or owned candidate differs')
           }
           if (observer) {
             report = JSON.parse(await harness.execOwnedContainerAsExact(owned.containerId, '65534:0', ['python3', '-c',
@@ -1388,6 +1394,11 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
           }
           namespace = JSON.parse(await harness.execOwnedContainerAsExact(owned.containerId, '65534:0',
             ['python3', '-c', openCodeTuiNativeNamespace, 'opencode', source.rootId, source.workspace]))
+          // Inventory retains the prior incarnation while this candidate waits
+          // for native proof. Its receipt and current native launch bind it;
+          // the prior public observation never certifies the replacement.
+          capturedCandidate = { containerId: owned.containerId, incarnationId: replacement ? owned.incarnationId : view.incarnationId,
+            executionGeneration: replacement ? namespace.nativeLaunch.executionGeneration : view.executionGeneration }
           break
         } catch (error) {
           diagnostics.push(error instanceof Error ? error.message : 'owned current disposal capture unavailable')
@@ -1402,23 +1413,27 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
     harness.writeArtifact(`${scenario}-capture-diagnostics-private.json`, diagnostics)
     if (observer) harness.writeArtifact(`${scenario}-supported-disposal.json`, report ?? null)
     harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace ?? null)
-    if (!namespace || !view || finished || !receiverNativeNamespaceMatches(namespace, 'opencode', source.workspace, source.rootId)
+    const candidate = capturedCandidate
+    if (!namespace || !view || !candidate || finished || !receiverNativeNamespaceMatches(namespace, 'opencode', source.workspace, source.rootId)
       || namespace.nativeVersion !== '1.18.21'
       || namespace.executableSha256 !== 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99'
-      || namespace.nativeMessageCount !== 2 || namespace.nativeLaunch.incarnationId !== view.incarnationId
+      || namespace.nativeMessageCount !== 2 || namespace.nativeLaunch.incarnationId !== candidate.incarnationId
       || namespace.nativeLaunch.requestedNativeSessionId !== source.rootId
-      || namespace.nativeLaunch.executionGeneration !== view.executionGeneration
-      || (observer && (report.incarnationId !== view.incarnationId || report.launchNonce !== namespace.nativeLaunch.launchNonce
-        || report.nativeSessionId !== source.rootId || report.nativeMessageCount !== 2 || report.producerActive !== false))) {
+      || !Number.isSafeInteger(candidate.executionGeneration) || candidate.executionGeneration < 1
+      || namespace.nativeLaunch.executionGeneration !== candidate.executionGeneration
+      || (observer && (report.incarnationId !== candidate.incarnationId || report.launchNonce !== namespace.nativeLaunch.launchNonce
+        || report.nativePid !== namespace.nativePid || report.nativeSessionId !== source.rootId
+        || report.nativeMessageCount !== 2 || report.producerActive !== false))) {
       throw new Error('actual pending TUI native namespace/current binding differs')
     }
     // Capture the unadmitted native store before Stop. Input serializes with
     // the launch, so first cancel that wait through the ordinary Stop intent.
     harness.writeArtifact(`${scenario}-unadmitted-view-before-stop.json`, view)
+    harness.writeArtifact(`${scenario}-owned-candidate-before-stop.json`, candidate)
     let replacementStatus: any
     if (replacement) {
-      const currentReceipt = harness.broker.receipts().find(row => row.containerId === view.containerId && row.soulId === request.params.soulId)
-      if (view.incarnationId === replacement.priorView.incarnationId || view.executionGeneration <= replacement.priorView.executionGeneration
+      const currentReceipt = harness.broker.receipts().find(row => row.containerId === candidate.containerId && row.soulId === request.params.soulId)
+      if (candidate.incarnationId === replacement.priorView.incarnationId
         || currentReceipt?.providerVolumeName !== replacement.priorVolume
         || JSON.stringify(namespace.activeMessageIds) !== JSON.stringify(replacement.priorNamespace.activeMessageIds)) {
         throw new Error('native TUI replacement changed original volume/root/history or reused incarnation')
@@ -1447,7 +1462,7 @@ while file.exists() and time.monotonic()<deadline:time.sleep(0.01)
 replayed={'sha256':hashlib.sha256(raw).hexdigest(),'incarnationId':observation['incarnation_id'],
  'launchNonce':observation['launch_nonce'],'hostConsumed':not file.exists()}
 ` : ''
-      const nativeVolume = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c',
+      const nativeVolume = JSON.parse(await harness.execOwnedContainerAsExact(candidate.containerId, '65534:0', ['python3', '-c',
         staleReplay + openCodeTuiSignalMetadata + String.raw`
 import sys
 terminal,native_root,workspace,current_incarnation=sys.argv[1:];projection={'signals':native_signal_metadata(terminal,native_root)}
@@ -1455,16 +1470,16 @@ projection['replayedNativeReceipt']=replayed if 'replayed' in globals() else Non
 expected_file=home/'.freshell/session-signals/opencode-adoption'/(terminal+'.expected.json')
 assert expected_file.is_file() and not expected_file.is_symlink() and expected_file.stat().st_size<=65536
 projection['expected']=json.loads(expected_file.read_text());print(json.dumps(projection))
-`, replacement.terminalId, source.rootId, source.workspace, view.incarnationId]))
-      const host = JSON.parse(execFileSync('python3', ['-c', statusScript, supervisor.runtimeRoot, view.incarnationId],
+`, replacement.terminalId, source.rootId, source.workspace, candidate.incarnationId]))
+      const host = JSON.parse(execFileSync('python3', ['-c', statusScript, supervisor.runtimeRoot, candidate.incarnationId],
         { encoding: 'utf8', timeout: 6000, stdio: ['ignore', 'pipe', 'pipe'] }))
       replacementStatus = { ...nativeVolume, ...host }
       harness.writeArtifact(`${scenario}-authenticated-current-baseline-gate.json`, replacementStatus)
       const expected = replacementStatus.expected
-      if (replacementStatus.incarnationId !== view.incarnationId || replacementStatus.executionGeneration !== view.executionGeneration
+      if (replacementStatus.incarnationId !== candidate.incarnationId || replacementStatus.executionGeneration !== candidate.executionGeneration
         || replacementStatus.exited !== false || replacementStatus.nativeSessionId || replacementStatus.nativeIdentityObservation
         || replacementStatus.opencodeAdoption?.state !== 'awaiting_observation'
-        || expected?.root_session_id !== source.rootId || expected.incarnation_id !== view.incarnationId
+        || expected?.root_session_id !== source.rootId || expected.incarnation_id !== candidate.incarnationId
         || expected.launch_nonce !== report.adoptionLaunchNonce || expected.evidence_generation !== report.evidenceGeneration
         || (caseId === 'baseline-only-resume' ? replacementStatus.signals?.length !== 0
           : replacementStatus.signals?.length !== 0 || replacementStatus.replayedNativeReceipt?.hostConsumed !== true
@@ -1527,7 +1542,7 @@ projection['expected']=json.loads(expected_file.read_text());print(json.dumps(pr
       || stopped.data?.outcome !== 'verified_empty'
       || current.launchState !== 'stopped' || current.desiredState !== 'stopped' || current.recoveryState !== 'stopped'
       || current.cleanupState !== 'verified_empty' || current.nativeIdentityObservation
-      || current.incarnationId !== view.incarnationId || current.executionGeneration !== view.executionGeneration
+      || current.incarnationId !== candidate.incarnationId || current.executionGeneration !== candidate.executionGeneration
       || current.intentRevision <= view.intentRevision) {
       throw new Error('ordinary Stop did not cancel the current unobserved native launch')
     }
@@ -1539,16 +1554,19 @@ projection['expected']=json.loads(expected_file.read_text());print(json.dumps(pr
       artifactReferences: [...(replacement ? [`${scenario}-original-native-signals.json`, `${scenario}-original-volume-resume-probe.json`,
         `${scenario}-authenticated-current-baseline-gate.json`] : []), ...(observer ? [`${scenario}-supported-disposal.json`] : []),
         ...(loadFault ? [`${scenario}-native-read-refusal.json`, `${scenario}-unadmitted-view-after-fault.json`] : []), `${scenario}-namespace-native-private.json`,
-        `${scenario}-unadmitted-view-before-stop.json`, `${scenario}-input-refusal.json`, `${scenario}-ordinary-stop.json`],
+        `${scenario}-unadmitted-view-before-stop.json`, `${scenario}-owned-candidate-before-stop.json`,
+        `${scenario}-input-refusal.json`, `${scenario}-ordinary-stop.json`],
       assertions: [...(replacement ? [{ name: 'actual-new-incarnation-original-volume-and-verified-baseline',
-          pass: view.incarnationId !== replacement.priorView.incarnationId },
+          pass: candidate.incarnationId !== replacement.priorView.incarnationId },
         { name: caseId === 'stale-observation' ? 'genuine-original-native-receipts-refused-in-current-host' : 'verified-baseline-without-native-receipt-remains-unobserved',
           pass: replacementStatus.opencodeAdoption.state === 'awaiting_observation' && !replacementStatus.nativeIdentityObservation }] : []), ...(disposal ? [{ name: 'supported-real-plugin-scope-disposed-before-publication', pass: report.outcome === 'disposed_before_publication' }] : []),
         ...(loadFault ? [{ name: 'actual-pinned-native-current-root-history-read-refusal', pass: nativeFault.outcome === 'native_load_error_observed'
           && nativeFault.refusal.reason === (caseId === 'root-load-error' ? 'native_root_load_failed' : 'native_history_load_failed') }] : []),
         { name: 'actual-native-pinned-current-root-store-and-normal-uid-tls', pass: namespace.nativeMessageCount === 2 },
-        { name: 'unobserved-native-startup-never-admits-running-or-input', pass: view.launchState === 'starting'
-          && !view.nativeIdentityObservation && !current.nativeIdentityObservation && input.result.Err.code === 'UNKNOWN_SOUL' },
+        { name: 'unobserved-native-startup-never-admits-running-or-input', pass: (replacement
+          ? view.launchState === 'stopped' && view.recoveryState === 'recovering' && view.incarnationId === replacement.priorView.incarnationId
+          : view.launchState === 'starting' && !view.nativeIdentityObservation)
+          && !current.nativeIdentityObservation && input.result.Err.code === 'UNKNOWN_SOUL' },
         { name: loadFault ? 'ordinary-stop-cleans-native-read-refused-startup' : 'ordinary-stop-cancels-current-unobserved-native-startup',
           pass: stopped.data.outcome === 'verified_empty' && (replacement ? replacementStopped : loadFault || reply.result.Err.code === 'STALE_INTENT_REVISION')
             && current.intentRevision > view.intentRevision }] }
