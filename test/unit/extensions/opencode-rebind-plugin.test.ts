@@ -877,6 +877,45 @@ describe('default export (TuiPluginModule)', () => {
     } finally { abort.abort(); rmSync(home, { recursive: true, force: true }) }
   })
 
+  it('records actual mounted native slot wake counts while leaving unhydrated history blocked', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'freshell-native-opencode-mounted-'))
+    const root = 'ses_mounted1', tail = 'msg_mounted1'
+    vi.stubEnv('HOME', home)
+    for (const [key,value] of Object.entries({
+      FRESHELL_OPENCODE_ADOPTION_ROOT_SESSION_ID:root, FRESHELL_OPENCODE_ADOPTION_TAIL_MESSAGE_ID:tail,
+      FRESHELL_OPENCODE_ADOPTION_EXPECTED_EMPTY:'false', FRESHELL_OPENCODE_ADOPTION_EVIDENCE_GENERATION:'a'.repeat(64),
+      FRESHELL_OPENCODE_ADOPTION_INCARNATION_ID:'incarnation-mounted', FRESHELL_OPENCODE_ADOPTION_LAUNCH_NONCE:'launch-mounted',
+    })) vi.stubEnv(key,value)
+    const session = {id:root,parentID:null}, info={id:tail,sessionID:root}
+    const slots: Record<string,(context:unknown,props:unknown)=>unknown>={}
+    const abort = new AbortController()
+    const diagnostic = join(home,'.freshell/session-signals/opencode-adoption-diagnostics/term-tui.json')
+    try {
+      plugin.tui({state:{ready:true,session:{get:()=>session,messages:()=>[]}},
+        client:{session:{get:async()=>({data:session}),messages:async()=>({data:[{info,parts:[]}]})}},
+        route:{current:{name:'session',params:{sessionID:root}}},
+        slots:{register:(contribution:{slots:typeof slots})=>{Object.assign(slots,contribution.slots);return 'host-registration'}},
+        lifecycle:{signal:abort.signal}})
+      await vi.advanceTimersByTimeAsync(0)
+      const initial=JSON.parse(readFileSync(diagnostic,'utf8'))
+      expect(initial.trigger).toBe('initial')
+      expect(initial.registeredSlotCount).toBe(2)
+      expect(initial.sessionPromptRenderCount).toBe(0)
+      expect(initial.sidebarTitleRenderCount).toBe(0)
+      for(const slot of ['session_prompt','sidebar_title']) {
+        expect(slots[slot]({},{})).toBeNull()
+        await vi.advanceTimersByTimeAsync(0)
+        const actual=JSON.parse(readFileSync(diagnostic,'utf8'))
+        expect(actual.trigger).toBe(slot)
+        expect(actual.sessionPromptRenderCount).toBe(1)
+        expect(actual.sidebarTitleRenderCount).toBe(slot==='sidebar_title'?1:0)
+        expect(actual.reason).toBe('tail_not_hydrated')
+        expect(actual.elapsedMs).toBeGreaterThanOrEqual(0)
+      }
+      expect(existsSync(join(home,'.freshell/session-signals/opencode-adoption'))).toBe(false)
+    } finally {abort.abort();rmSync(home,{recursive:true,force:true})}
+  })
+
   it('has the TuiPluginModule shape', () => {
     expect(plugin.id).toBe('freshell-rebind')
     expect(typeof plugin.tui).toBe('function')

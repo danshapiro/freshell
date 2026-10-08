@@ -91,6 +91,16 @@ export interface EmitterDeps {
   readExpectation?: (path: string) => string | null
   now?: () => number
   onRefusal?: (record: NativeObservationRefusal) => void
+  wakeContext?: () => NativeObservationWake
+}
+
+type NativeObservationWake = {
+  trigger: 'initial' | 'poll' | 'session_prompt' | 'sidebar_title'
+  registeredSlotCount: number
+  slotRegistrationFailureCount: number
+  sessionPromptRenderCount: number
+  sidebarTitleRenderCount: number
+  elapsedMs: number
 }
 
 type NativeRefusalReason = 'tui_not_ready' | 'route_not_selected' | 'tui_root_not_loaded'
@@ -101,7 +111,7 @@ type NativeRefusalReason = 'tui_not_ready' | 'route_not_selected' | 'tui_root_no
   | 'native_tail_mismatch'
   | 'producer_or_publication_failed'
 
-export type NativeObservationRefusal = {
+export type NativeObservationRefusal = Partial<NativeObservationWake> & {
   severity: 'warning'
   event: 'runtime.opencode.native_observation_refused'
   terminalId: string
@@ -499,6 +509,7 @@ export function createObservationEmitter(
   let lastEmitted: string | null = null
   let lastRefusal: string | null = null
   let inFlight = false
+  let observingTrigger: NativeObservationWake['trigger'] | undefined
   const refuse = (current: AdoptionExpectation, reason: NativeRefusalReason,
     history?: { nativeActiveMessageCount: number; tuiActiveMessageCount: number; nativeTuiPageMessageCount?: number | null }): void => {
     if (deps.signal?.aborted) return
@@ -507,6 +518,7 @@ export function createObservationEmitter(
       terminalId: current.terminalId, nativeSessionId: current.rootSessionId,
       incarnationId: current.incarnationId, launchNonce: current.launchNonce,
       evidenceGeneration: current.evidenceGeneration, reason, ...history,
+      ...(observingTrigger ? { ...deps.wakeContext?.(), trigger: observingTrigger } : {}),
     }
     const signature = JSON.stringify(record)
     if (signature === lastRefusal) return
@@ -519,6 +531,7 @@ export function createObservationEmitter(
   return async (apiValue: unknown): Promise<void> => {
     if (deps.signal?.aborted || inFlight) return
     inFlight = true
+    observingTrigger = deps.wakeContext?.().trigger
     let active = expected
     try {
       const current = readCurrentAdoptionExpectation(expected, readExpectation)
@@ -765,34 +778,51 @@ export default {
       }
       const managedAdoption = hasAdoptionExpectation(env)
       const managedNative = env.FRESHELL_NATIVE_IDENTITY_LAUNCH !== undefined
+      const startedAt = performance.now()
+      let trigger: NativeObservationWake['trigger'] = 'initial'
+      let registeredSlotCount = 0
+      let slotRegistrationFailureCount = 0
+      const renderCounts = { session_prompt: 0, sidebar_title: 0 }
+      const wakeContext = (): NativeObservationWake => ({
+        trigger, registeredSlotCount, slotRegistrationFailureCount,
+        sessionPromptRenderCount: renderCounts.session_prompt,
+        sidebarTitleRenderCount: renderCounts.sidebar_title,
+        elapsedMs: Math.max(0, Math.floor(performance.now() - startedAt)),
+      })
       const emitLegacy = managedAdoption || managedNative ? undefined : createEmitter({ env })
       const emitObservation = managedAdoption
-        ? createObservationEmitter({ env, signal: cancellation.signal })
-        : managedNative ? createNativeObservationEmitter({ env, signal: cancellation.signal }) : undefined
+        ? createObservationEmitter({ env, signal: cancellation.signal, wakeContext })
+        : managedNative ? createNativeObservationEmitter({ env, signal: cancellation.signal, wakeContext }) : undefined
       // Unmanaged panes keep their route/slot rebind signal. For managed
       // launches, these edges only trigger a fresh TUI-state check; their
       // route and slot arguments never qualify as adoption evidence. The
       // renderer returns null so this plugin contributes no host content.
-      for (const slot of ['session_prompt', 'sidebar_title']) {
+      for (const slot of ['session_prompt', 'sidebar_title'] as const) {
         try {
-          a?.slots?.register?.({
+          if (typeof a?.slots?.register !== 'function') continue
+          a.slots.register({
             slots: {
               [slot]: (_context: unknown, props: unknown) => {
                 if (cancellation.signal.aborted) return null
+                trigger = slot
+                renderCounts[slot] += 1
                 if (emitLegacy) emitLegacy(props)
                 if (emitObservation) void emitObservation(a)
                 return null
               },
             },
           })
+          registeredSlotCount += 1
         } catch {
+          slotRegistrationFailureCount += 1
           /* slot API absent/changed -> polling still covers us */
         }
       }
       // PRIMARY edge: 1s poll covers the slots' visibility gaps. In managed
       // mode, route state only triggers a check and cannot emit adoption.
-      const tick = (): void => {
+      const tick = (edge: NativeObservationWake['trigger']): void => {
         if (cancellation.signal.aborted) return
+        trigger = edge
         try {
           if (emitLegacy) emitLegacy(a?.route?.current)
           if (emitObservation) void emitObservation(a)
@@ -800,8 +830,8 @@ export default {
           /* route API absent/changed */
         }
       }
-      tick()
-      if (!cancellation.signal.aborted) timer = setInterval(tick, POLL_INTERVAL_MS)
+      tick('initial')
+      if (!cancellation.signal.aborted) timer = setInterval(() => tick('poll'), POLL_INTERVAL_MS)
     } catch {
       // Version tolerance: silently no-op.
     }
