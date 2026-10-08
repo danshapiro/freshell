@@ -32,6 +32,18 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['same-workspace-alias', 'different-directory'])('resolves only the actual directory identity of an owned native workspace alias (%s)', async fault => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-alias-'))
+    const workspace = path.join(directory, 'owned-workspace'), alias = path.join(directory, 'native-cwd')
+    fs.mkdirSync(workspace); fs.mkdirSync(path.join(directory, 'other-workspace'))
+    fs.symlinkSync(fault === 'same-workspace-alias' ? workspace : path.join(directory, 'other-workspace'), alias)
+    const file = path.join(directory, 'native-load-fault.mjs'); fs.writeFileSync(file, nativeReceiverLoadFaultWrapper)
+    try {
+      const native = await import(file)
+      if (fault === 'same-workspace-alias') expect(native.receiverLoadFaultWorkspace(alias, { workspace }, fs.statSync)).toBe(workspace)
+      else expect(() => native.receiverLoadFaultWorkspace(alias, { workspace }, fs.statSync)).toThrow('owned native workspace mount alias differs')
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it('publishes owned non-secret native fault controls readable by the provider under a restrictive umask', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-control-mode-'))
     const source = path.resolve('scripts/testing/runtime-native-feasibility.ts')

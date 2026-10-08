@@ -41,6 +41,15 @@ export function receiverLoadFaultFailure(error, stage) {
     errorKind: ['Error', 'TypeError', 'SyntaxError', 'RangeError'].includes(error?.name) ? error.name : 'OtherError',
     code: ['ENOENT', 'EACCES', 'EROFS', 'EADDRINUSE', 'ECONNREFUSED'].includes(error?.code) ? error.code : null }
 }
+export function receiverLoadFaultWorkspace(cwd, control, stat) {
+  if (control.workspace === undefined) return cwd
+  if (typeof control.workspace !== 'string' || !control.workspace) throw new Error('owned native workspace mount alias differs')
+  const actual = stat(cwd), declared = stat(control.workspace)
+  if (!actual.isDirectory() || !declared.isDirectory() || actual.dev !== declared.dev || actual.ino !== declared.ino) {
+    throw new Error('owned native workspace mount alias differs')
+  }
+  return control.workspace
+}
 export function receiverLoadFaultBinding(cwd, provider, launch, control) {
   const owned = /^\/tmp\/f[a-z0-9]+\/[a-f0-9]{8}-[a-f0-9]{3}\/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace$/.exec(cwd)
   if (!owned || provider !== (owned[1] === 'freshcodex' ? 'codex' : 'opencode')
@@ -172,9 +181,10 @@ async function runOwnedReceiverLoadFault() {
   if (process.getuid() !== 65534 || process.getgid() !== 0) throw new Error('owned native fault UID/GID differs')
   const cwd = process.cwd()
   nativeFaultStage = 'read_launch_control'
-  const binding = receiverLoadFaultBinding(cwd, provider,
-    JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH ?? '{}'),
-    JSON.parse(fs.readFileSync(path.join(cwd, 'native-receiver-load-fault-control.json'), 'utf8')))
+  const control = JSON.parse(fs.readFileSync(path.join(cwd, 'native-receiver-load-fault-control.json'), 'utf8'))
+  const workspace = receiverLoadFaultWorkspace(cwd, control, fs.statSync)
+  const binding = receiverLoadFaultBinding(workspace, provider,
+    JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH ?? '{}'), control)
   const executable = provider === 'codex'
     ? '/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex'
     : '/usr/local/lib/node_modules/opencode-ai/bin/opencode.exe'
@@ -231,12 +241,12 @@ async function runOwnedReceiverLoadFault() {
       const receipt = { schemaVersion: 1, ...binding, nativeSessionId: root,
         nativeEvidenceSha256: createHash('sha256').update(bytes).digest('hex'), executableSha256: expectedPin,
         wrapperChildPid: child.pid, observedAt: Date.now(), nativeInputDispatches }
-      fs.writeFileSync(path.join(cwd, 'native-receiver-load-fault-observation.json'), JSON.stringify(receipt), { flag: 'wx', mode: 0o664 })
+      fs.writeFileSync(path.join(workspace, 'native-receiver-load-fault-observation.json'), JSON.stringify(receipt), { flag: 'wx', mode: 0o664 })
       nativeFaultStage = 'await_owned_release'
       const deadline = Date.now() + 4000
       while (!exited && Date.now() < deadline) {
         try {
-          const release = JSON.parse(fs.readFileSync(path.join(cwd, 'native-receiver-load-fault-release.json'), 'utf8'))
+          const release = JSON.parse(fs.readFileSync(path.join(workspace, 'native-receiver-load-fault-release.json'), 'utf8'))
           if (release.incarnationId !== binding.incarnationId || release.launchNonce !== binding.launchNonce
             || release.nativeSessionId !== root || release.expectedRoot !== binding.expectedRoot) throw new Error('owned native release binding differs')
           return
@@ -270,11 +280,21 @@ if (process.argv[1] && nativeWrapperFile(import.meta.url) === process.argv[1]) {
 `
 
 export const nativeReceiverLoadFaultEntry = String.raw`#!/usr/bin/python3
-import os,re,sys
+import os,re,sys,json,pathlib
 provider=os.path.basename(sys.argv[0])
 if provider not in ('codex','opencode'):raise RuntimeError('native receiver entry differs')
 args=sys.argv[1:]
-owned=re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace',os.getcwd())
+workspace=os.getcwd()
+if workspace=='/workspace':
+ try:
+  control=json.loads(pathlib.Path('native-receiver-load-fault-control.json').read_text())
+  declared=control.get('workspace')
+  if not isinstance(declared,str):raise RuntimeError('owned native alias binding absent')
+  actual=os.stat(workspace);selected=os.stat(declared)
+  if (actual.st_dev,actual.st_ino)!=(selected.st_dev,selected.st_ino):raise RuntimeError('owned native workspace alias differs')
+  workspace=declared
+ except FileNotFoundError:pass
+owned=re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/(freshcodex|freshopencode)-(wrong-root|cancellation)-workspace',workspace)
 native='/usr/local/bin/'+provider+'.native'
 if owned and ((provider=='codex' and 'app-server' in args) or (provider=='opencode' and args and args[0]=='serve')):
  os.execv('/usr/local/bin/node',['node','/opt/freshell-native-receiver-load-fault/native-load-fault.mjs',provider,*args])
@@ -1121,7 +1141,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     const faultRequest = { ...request, params: { ...request.params, nativeSessionId: expectedRoot,
       freshAgent: { ...freshAgent, nativeSessionId: expectedRoot } } }
     writeOwnedNativeReceiverControl(workspace, 'native-receiver-load-fault-control.json',
-      { schemaVersion: 1, mode, caseId, expectedRoot })
+      { schemaVersion: 1, mode, caseId, expectedRoot, workspace })
     harness.writeArtifact(`${scenario}-request.json`, faultRequest)
     let finished = false, reply: any, failure: unknown
     const pending = harness.adminRaw(supervisor, faultRequest).then(value => { reply = value; finished = true },
