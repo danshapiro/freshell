@@ -1297,6 +1297,42 @@ describe('closed external owner control', () => {
       .resolves.toMatchObject({ result: { requestIds: ['tool-actual'], resultIds: ['tool-actual'], replayCount: 0 } })
     expect(exec).toHaveBeenCalledExactlyOnceWith(handle.containerId, expect.arrayContaining(['challenge-owned-native', 'p5-chaos-approval-count']))
   })
+  it('observes bounded chaos server-output facts without returning its body or token', async () => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'output-owned-soul',
+      incarnationId: 'output-owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'output-owned-boot', nativeSessionId: 'output-owned-native' }
+    vi.spyOn(owned, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const challenge = await owned.registerNativeChallenge(handle, 'chaos-follow-up')
+    const output = { stdout: 'owner-private-output-λ', stderr: 'owner-private-error' }
+    const token = 'owner-private-token'
+    const capture = vi.fn(() => output)
+    Object.assign(owned, { web: { capturedOutput: capture, info: { token } } })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const bytes = `${output.stdout}${output.stderr}`
+    const wire: unknown[] = []
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      const reply = await control(JSON.parse(String(init.body)))
+      wire.push(reply)
+      return new Response(JSON.stringify(reply), { status: 200 })
+    })
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.chaosWebOutputFacts(handle, challenge.challengeId)).resolves.toEqual({
+      contentSha256: createHash('sha256').update(bytes).digest('hex'), contentBytes: Buffer.byteLength(bytes),
+      containsFollowUpMarker: false, containsAuthToken: false })
+    expect(JSON.stringify(wire)).not.toContain(output.stdout)
+    expect(JSON.stringify(wire)).not.toContain(output.stderr)
+    expect(JSON.stringify(wire)).not.toContain(token)
+    output.stdout = `${token}P5_CHAOS_FOLLOWUP`
+    await expect(rig.chaosWebOutputFacts(handle, challenge.challengeId)).resolves.toMatchObject({
+      containsFollowUpMarker: true, containsAuthToken: true })
+    const approval = await owned.registerNativeChallenge(handle, 'chaos-approval')
+    capture.mockClear()
+    await expect(control({ ...request, operationId: 'wrong-output-kind', action: 'chaos-web-output',
+      handle, challengeId: approval.challengeId })).rejects.toThrow(/follow-up/)
+    await expect(control({ ...request, operationId: 'wrong-output-root', action: 'chaos-web-output',
+      handle: { ...handle, nativeSessionId: 'foreign-root' }, challengeId: challenge.challengeId })).rejects.toThrow(/challenge/)
+    expect(capture).not.toHaveBeenCalled()
+  })
   it('creates synthetic history only for the registered OpenCode fixture and returns observed row identities', async () => {
     const owned = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3, {}, {}, 'test', {
       enabledProviders: [], freshAgentModes: ['freshopencode'], fixtureFreshAgentModes: ['freshopencode'],

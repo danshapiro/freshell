@@ -607,6 +607,9 @@ export type FreshAgentLaunchFacts = z.infer<typeof FreshAgentLaunchFactsSchema>
 export const RuntimeWebProcessFactsSchema = z.object({ pid: z.number().int().positive(),
   bootAttemptCount: z.number().int().positive() }).strict()
 export type RuntimeWebProcessFacts = z.infer<typeof RuntimeWebProcessFactsSchema>
+export const RuntimeChaosWebOutputFactsSchema = z.object({ contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  contentBytes: z.number().int().nonnegative(), containsFollowUpMarker: z.boolean(), containsAuthToken: z.boolean() }).strict()
+export type RuntimeChaosWebOutputFacts = z.infer<typeof RuntimeChaosWebOutputFactsSchema>
 
 export const OwnedContainerStateSchema = z.discriminatedUnion('present', [
   z.object({ present: z.literal(false), running: z.literal(false) }).strict(),
@@ -636,7 +639,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
-    'native-challenge-register', 'native-effect-count', 'native-effect-reset',
+    'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output',
     'synthetic-history-challenge',
     'synthetic-source-facts',
     'synthetic-source-history', 'synthetic-source-exclusions',
@@ -2858,6 +2861,18 @@ export class ManagedRuntimeOwner {
   async webProcessFacts(): Promise<RuntimeWebProcessFacts> {
     if (!this.web) throw new Error('owned web process is not prepared')
     return RuntimeWebProcessFactsSchema.parse(this.web.processEvidence())
+  }
+
+  async chaosWebOutputFacts(handle: ExactRuntimeHandle, challengeId: string): Promise<RuntimeChaosWebOutputFacts> {
+    const marker = await this.nativeChallengeMarker(handle, challengeId)
+    if (marker !== NativeChallengeMarkers['chaos-follow-up']) throw new Error('registered chaos follow-up challenge required')
+    if (!this.web) throw new Error('owned web process is not prepared')
+    const token = this.web.info.token
+    if (!token) throw new Error('owned web token is absent')
+    const output = z.object({ stdout: z.string(), stderr: z.string() }).strict().parse(this.web.capturedOutput())
+    const bytes = `${output.stdout}${output.stderr}`
+    return { contentSha256: createHash('sha256').update(bytes).digest('hex'), contentBytes: Buffer.byteLength(bytes),
+      containsFollowUpMarker: bytes.includes(marker), containsAuthToken: bytes.includes(token) }
   }
 
   async restartWeb(): Promise<RuntimeWebInfo> {

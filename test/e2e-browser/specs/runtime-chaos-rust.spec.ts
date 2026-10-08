@@ -433,13 +433,14 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       const finalRuntime: ChaosRuntimeObservation = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)
       expect(finalRuntime).toEqual(initialRuntime)
 
-      const capturedServer = rig.web.capturedOutput()
-      const capturedServerBytes = `${capturedServer.stdout}${capturedServer.stderr}`
-      expect(capturedServerBytes).not.toContain('P5_CHAOS_FOLLOWUP')
-      expect(capturedServerBytes).not.toContain(info.token)
-      serverLogs.push(structuredChaosLog(
-        'server', serverLogs.length + 1, monotonicMs(), 'info', 'server.output.captured', capturedServerBytes,
-      ))
+      const capturedServer = await rig.chaosWebOutputFacts(nativeHandle, followUpChallenge.challengeId)
+      expect(capturedServer.containsFollowUpMarker).toBe(false)
+      expect(capturedServer.containsAuthToken).toBe(false)
+      serverLogs.push({
+        source: 'server', sequence: serverLogs.length + 1, monotonicMs: monotonicMs(), level: 'info',
+        event: 'server.output.captured', contentSha256: capturedServer.contentSha256,
+        contentBytes: capturedServer.contentBytes, redacted: true,
+      })
       writePrivateJsonl(path.join(rig.runtime.evidenceDir, 'phase5-chaos-server-log.jsonl'), serverLogs)
       writePrivateJsonl(path.join(rig.runtime.evidenceDir, 'phase5-chaos-browser-log.jsonl'), browserLogs)
       writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_CHAOS_PROVIDER_EVENTS_FILE), {

@@ -18,7 +18,8 @@ import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, R
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema,
-  FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
+  RuntimeChaosWebOutputFactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -29,7 +30,7 @@ import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
-import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts } from './runtime-sandbox.js'
+import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -817,6 +818,9 @@ export class ExternalManagedRuntimeRig {
   async webProcessFacts(): Promise<RuntimeWebProcessFacts> {
     return this.rpc('web-process-facts', RuntimeWebProcessFactsSchema)
   }
+  async chaosWebOutputFacts(handle: ExactRuntimeHandle, challengeId: string): Promise<RuntimeChaosWebOutputFacts> {
+    return this.rpc('chaos-web-output', RuntimeChaosWebOutputFactsSchema, { handle, challengeId })
+  }
   async incidentMatchesSoul(handle: ExactRuntimeHandle, incidentId: string): Promise<boolean> {
     return this.rpc('incident-matches-soul', z.boolean(), { handle, incidentId })
   }
@@ -1055,6 +1059,10 @@ export function createExternalRuntimeControl(
       case 'inventory-snapshot': result = await owner.inventorySnapshot(); break
       case 'control-epoch': result = await owner.controlEpoch(); break
       case 'web-process-facts': result = await owner.webProcessFacts(); break
+      case 'chaos-web-output':
+        if (!request.challengeId) throw new Error('registered chaos follow-up challenge required')
+        result = await owner.chaosWebOutputFacts(handle(), request.challengeId)
+        break
       case 'incident-matches-soul':
         if (!request.incidentId) throw new Error('observed incident identity required')
         result = await owner.incidentMatchesSoul(handle(), request.incidentId)
