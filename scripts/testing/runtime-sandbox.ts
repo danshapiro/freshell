@@ -921,6 +921,12 @@ export const OpencodeQualificationTurnSchema = z.object({ messageId: z.string().
   }).strict(),
 }).strict()
 export type OpencodeQualificationTurn = z.infer<typeof OpencodeQualificationTurnSchema>
+export const FreshCodexRetainedSnapshotFactsSchema = z.object({
+  threadId: z.string(), bytes: z.number().int().nonnegative(), turnCount: z.number().int().nonnegative(),
+  firstTurnId: z.string().nullable(), lastTurnId: z.string().nullable(), firstAnswerMatches: z.boolean(),
+  lastAnswerMatches: z.boolean(), retentionAbsent: z.boolean(),
+}).strict()
+export type FreshCodexRetainedSnapshotFacts = z.infer<typeof FreshCodexRetainedSnapshotFactsSchema>
 export const Phase4BrowserObservationSchema = z.object({
   browserInteraction: z.boolean(), coldStartAgents: z.number().int().nonnegative(), restartCycles: z.number().int().nonnegative(),
   deterministicPlacement: z.boolean(), singleViewPerIntent: z.boolean(), existingLayoutPreserved: z.boolean(), focusStable: z.boolean(),
@@ -1053,7 +1059,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
     'provider-volume', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
@@ -4246,6 +4252,23 @@ export class ManagedRuntimeOwner {
     await this.assertCurrentHandle(handle)
     const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
     if (row?.provider !== 'codex' || row.freshAgentSessionType !== 'freshcodex') throw new Error('exact fresh Codex history fixture required')
+  }
+
+  async freshCodexRetainedSnapshotFacts(handle: ExactRuntimeHandle): Promise<FreshCodexRetainedSnapshotFacts> {
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    const reply = await this.runtime.adminOk(this.supervisor, { method: 'fresh_agent_read_snapshot',
+      params: { soulId: handle.soulId, expectedControlEpoch: await this.controlEpoch() } })
+    const snapshot = z.object({ threadId: z.string(), turns: z.array(z.object({ turnId: z.string(),
+      items: z.array(z.object({ text: z.string().optional() }).passthrough()) }).passthrough()),
+      extensions: z.object({ codex: z.object({ nativeHistoryRetention: z.unknown().optional() }).passthrough() }).passthrough(),
+    }).passthrough().parse(reply.data)
+    const first = snapshot.turns[1]?.items.find(item => item.text?.startsWith('Managed retained answer 0'))
+    const last = snapshot.turns[159]?.items.find(item => item.text?.startsWith('Managed fixture saved answer'))
+    return { threadId: snapshot.threadId, bytes: Buffer.byteLength(JSON.stringify(reply.data)), turnCount: snapshot.turns.length,
+      firstTurnId: snapshot.turns[0]?.turnId ?? null, lastTurnId: snapshot.turns[159]?.turnId ?? null,
+      firstAnswerMatches: first?.text === `Managed retained answer 0\n${'x'.repeat(20_000)}`,
+      lastAnswerMatches: last?.text === `Managed fixture saved answer\n${'x'.repeat(20_000)}`,
+      retentionAbsent: snapshot.extensions.codex.nativeHistoryRetention === undefined }
   }
 
   async prepareFreshCodexSavedHistory(handle: ExactRuntimeHandle): Promise<{ bytes: number }> {

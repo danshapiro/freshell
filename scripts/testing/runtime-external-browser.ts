@@ -18,7 +18,7 @@ import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, R
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema, Phase4BrowserObservationSchema,
-  FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
+  FreshCodexRetainedSnapshotFactsSchema, FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
   RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
   RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
   OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, OpencodeLossRecoverySchema,
@@ -41,7 +41,7 @@ import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
-import type { Phase4BrowserObservation, Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
+import type { FreshCodexRetainedSnapshotFacts, Phase4BrowserObservation, Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
 import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts, RuntimeChaosReceiptArtifact } from './runtime-sandbox.js'
 import type { OpencodeLossCredentialEvidence, OpencodeLossAbsenceEvidence, OpencodeLossRecovery, OpencodeLossIncidentEvidence } from './runtime-sandbox.js'
 import type { RuntimeLossAssertions, RuntimeLossAssertionsArtifact, RuntimeLossReceiptArtifact } from './runtime-sandbox.js'
@@ -817,6 +817,9 @@ export class ExternalManagedRuntimeRig {
     return { runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, soulId: view.soulId,
       incarnationId: view.incarnationId, containerId: view.containerId, hostBootId: view.hostBootId, nativeSessionId: view.nativeSessionId }
   }
+  async freshCodexRetainedSnapshotFacts(handle: ExactRuntimeHandle): Promise<FreshCodexRetainedSnapshotFacts> {
+    return this.rpc('freshcodex-history-snapshot', FreshCodexRetainedSnapshotFactsSchema, { handle })
+  }
   async prepareFreshCodexSavedHistory(handle: ExactRuntimeHandle): Promise<{ bytes: number }> {
     return this.rpc('freshcodex-history-prepare', z.object({ bytes: z.number().int().positive() }).strict(), { handle })
   }
@@ -1433,6 +1436,7 @@ export function createExternalRuntimeControl(
         result = await owner.publishPhase3BrowserReceipt(handle(), request.phase3Browser)
         break
       case 'crash-provider-worker': await owner.crashProviderWorker(handle()); result = { completed: true }; break
+      case 'freshcodex-history-snapshot': result = await owner.freshCodexRetainedSnapshotFacts(handle()); break
       case 'freshcodex-history-prepare': result = await owner.prepareFreshCodexSavedHistory(handle()); break
       case 'freshcodex-history-unchanged': result = await owner.freshCodexSavedHistoryUnchanged(handle()); break
       case 'freshcodex-coincident-prepare': await owner.prepareCoincidentFreshCodexHistory(handle()); result = { completed: true }; break

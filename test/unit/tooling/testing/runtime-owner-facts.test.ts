@@ -175,6 +175,49 @@ describe('fixed owned fresh Codex saved history', () => {
   })
 })
 
+describe('fixed fresh Codex controller snapshot facts', () => {
+  it('observes the original retained-row predicates without returning history text', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused snapshot web') }, process.cwd(), 3,
+      {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...current, provider: 'codex', freshAgentSessionType: 'freshcodex', launchState: 'running', intentRevision: 1 }])
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(17)
+    const snapshot = { threadId: current.nativeSessionId, turns: Array.from({ length: 160 }, (_, index) => ({
+      turnId: `retained-${Math.floor(index / 2)}:row-${index % 2}`, items: [{ text: index % 2 === 0 ? `Managed prompt ${index / 2}`
+        : `${index === 159 ? 'Managed fixture saved answer' : `Managed retained answer ${Math.floor(index / 2)}`}\n${'x'.repeat(20_000)}` }],
+    })), extensions: { codex: {} } }
+    const admin = vi.spyOn(rig.runtime, 'adminOk').mockResolvedValue({ kind: 'fresh_agent_snapshot', data: snapshot })
+    const facts = await rig.freshCodexRetainedSnapshotFacts(current)
+    expect(facts).toEqual({ threadId: current.nativeSessionId, bytes: Buffer.byteLength(JSON.stringify(snapshot)),
+      turnCount: 160, firstTurnId: 'retained-0:row-0', lastTurnId: 'retained-79:row-1',
+      firstAnswerMatches: true, lastAnswerMatches: true, retentionAbsent: true })
+    expect(JSON.stringify(facts)).not.toContain('Managed fixture saved answer')
+    expect(facts.bytes).toBeGreaterThan(1024 * 1024)
+    expect(admin).toHaveBeenCalledExactlyOnceWith(rig.supervisor, { method: 'fresh_agent_read_snapshot',
+      params: { soulId: current.soulId, expectedControlEpoch: 17 } })
+    const descriptor = external.resolveManagedExternalDescriptor({ FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+      FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws', FRESHELL_E2E_TARGET_TOKEN: 'private-token',
+      FRESHELL_RUNTIME_EXTERNAL_RUN_ID: rig.runtime.runId, FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: rig.runtime.candidateSha })!
+    const control = external.createExternalRuntimeControl(rig, descriptor)
+    const remote = new external.ExternalManagedRuntimeRig(descriptor, async (_url, init) => (
+      new Response(JSON.stringify(await control(JSON.parse(String(init?.body)))), { status: 200 })
+    ))
+    await expect(remote.freshCodexRetainedSnapshotFacts(current)).resolves.toEqual(facts)
+    const beforeRefusal = admin.mock.calls.length
+    await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha, scenarioId: 'browser-managed-runtime',
+      operationId: 'foreign-snapshot-query', action: 'freshcodex-history-snapshot', handle: current, sql: 'SELECT * FROM history' })).rejects.toThrow(/operation/)
+    expect(admin.mock.calls).toHaveLength(beforeRefusal)
+
+    snapshot.turns[1].items[0].text = 'changed answer'
+    await expect(rig.freshCodexRetainedSnapshotFacts(current)).resolves.toMatchObject({ firstAnswerMatches: false })
+    admin.mockResolvedValue({ kind: 'fresh_agent_snapshot', data: { ...snapshot, extensions: { codex: { nativeHistoryRetention: { limit: 1 } } } } })
+    await expect(rig.freshCodexRetainedSnapshotFacts(current)).resolves.toMatchObject({ retentionAbsent: false })
+    admin.mockResolvedValue({ kind: 'fresh_agent_snapshot', data: { threadId: current.nativeSessionId } })
+    await expect(rig.freshCodexRetainedSnapshotFacts(current)).rejects.toThrow()
+  })
+})
+
 describe('finite Phase 4 browser receipt publication', () => {
   it('writes the existing observation privately on its owner and refuses worker paths or transcript fields', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-phase4-receipt-'))

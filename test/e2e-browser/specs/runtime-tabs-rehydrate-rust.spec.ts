@@ -225,10 +225,15 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(seededHistory.bytes).toBeGreaterThan(1024 * 1024)
       const fixtureState = () => rig.fixtureNativeState(rig.exactRuntimeHandle(view))
       const before = (await fixtureState())
-      const ownedSnapshot = await rig.runtime.adminOk(rig.supervisor, {
-        method: 'fresh_agent_read_snapshot', params: { soulId: view.soulId, expectedControlEpoch: await rig.controlEpoch() },
-      })
-      expect(ownedSnapshot.data.threadId).toBe(view.nativeSessionId)
+      const ownedSnapshot = await rig.freshCodexRetainedSnapshotFacts(rig.exactRuntimeHandle(view))
+      expect(ownedSnapshot.threadId).toBe(view.nativeSessionId)
+      expect(ownedSnapshot.bytes).toBeGreaterThan(1024 * 1024)
+      expect(ownedSnapshot.turnCount).toBe(160)
+      expect(ownedSnapshot.firstTurnId).toBe('retained-0:row-0')
+      expect(ownedSnapshot.lastTurnId).toBe('retained-79:row-1')
+      expect(ownedSnapshot.firstAnswerMatches).toBe(true)
+      expect(ownedSnapshot.lastAnswerMatches).toBe(true)
+      expect(ownedSnapshot.retentionAbsent).toBe(true)
       const expectLargeRetainedHistory = (snapshot: any) => {
         expect(Buffer.byteLength(JSON.stringify(snapshot))).toBeGreaterThan(1024 * 1024)
         // The native projection preserves each user/assistant row independently.
@@ -241,7 +246,6 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         expect(last.text).toBe(`Managed fixture saved answer\n${'x'.repeat(20_000)}`)
         expect(snapshot.extensions.codex.nativeHistoryRetention).toBeUndefined()
       }
-      expectLargeRetainedHistory(ownedSnapshot.data)
       const initialSnapshot = await fetch(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${view.nativeSessionId}`, {
         headers: { 'x-auth-token': info.token },
       })
