@@ -149,9 +149,10 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 })
       const stage = path.join(ownedRoot, 'stage-fixture')
       fs.writeFileSync(stage, 'orchestration fixture only', { mode: 0o500 })
-      let root = '', sourcePath = '', launchRequest: any
+      let root = '', sourcePath = '', sourceHome = '', launchRequest: any
       let resolveLaunch: ((value: any) => void) | undefined
       let stopCalls = 0
+      let selectionReadable = false
       const transferCalls: any[] = []
       const inspect = vi.fn(async () => {
         if (fault === 'disposal-already-published') return JSON.stringify({ outcome: 'already_published' })
@@ -171,14 +172,21 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
         captureTransferFileExact: async (_container: string, name: string, file: string) => {
           fs.writeFileSync(file, name.includes('descriptor') ? JSON.stringify({ rootSessionId: root }) : fs.readFileSync(sourcePath))
         },
-        startSupervisor: async () => ({ runtimeRoot: path.join(ownedRoot, 'runtime') }),
+        startSupervisor: async (options: any) => { sourceHome = options.env.HOME; return { runtimeRoot: path.join(ownedRoot, 'runtime') } },
         launchBody: (params: any) => ({ method: 'launch', params }), inventoryBody: () => ({ method: 'inventory' }),
         broker: { receipts: () => [{ soulId: launchRequest.params.soulId, containerId: 'fixture-host' }] },
         stopBody: (soulId: string) => ({ method: 'stop', params: { soulId } }),
         adminRaw: async (_supervisor: unknown, request: any) => {
           if (request.method === 'stop') { stopCalls++; resolveLaunch?.({ result: { Err: { code: 'STALE_INTENT' } } }); return { result: { Ok: {} } } }
           launchRequest = request
-          if (fault === 'disposal-already-published') return new Promise(resolve => { resolveLaunch = resolve })
+          if (fault === 'disposal-already-published') {
+            const selected = request.params.terminal.providerLaunchContext.config[0]
+            try {
+              const config = JSON.parse(fs.readFileSync(path.join(sourceHome, '.config/opencode', selected.relativePath), 'utf8'))
+              selectionReadable = config.plugin.length === 1 && fs.statSync(new URL(config.plugin[0])).isFile()
+            } catch { selectionReadable = false }
+            return new Promise(resolve => { resolveLaunch = resolve })
+          }
           return { result: { Ok: {} } }
         },
         adminOk: async (_supervisor: unknown, request: any) => {
@@ -206,6 +214,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
         expect(transferCalls.map(row => row.action)).toEqual(['begin', 'chunk', 'finalize'])
         expect(Buffer.from(transferCalls[1].data.data, 'base64')).toEqual(fs.readFileSync(sourcePath))
         expect(inspect).toHaveBeenCalledTimes(['stale-revision', 'ledger-advanced', 'disposal-already-published'].includes(fault) ? 1 : 0)
+        if (fault === 'disposal-already-published') expect(selectionReadable).toBe(true)
         expect(stopCalls).toBe(fault === 'disposal-already-published' ? 1 : 0)
         expect((harness.writeArtifact as any).mock.calls.filter(([name]: string[]) => name.endsWith('-original.json'))).toEqual([])
       } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }

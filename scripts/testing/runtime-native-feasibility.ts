@@ -1139,7 +1139,7 @@ async function executeManagedOpenCodeTui(harness: RuntimeHarness,
       resumeSessionId: source.rootId, opencodeTransfer: descriptor, opencodeTransferAttemptId: attempt,
       providerSecretReferences: references, providerLaunchContext: {
         preparation: { opencode: { project_config: [], tui_config: null, inline_config: false } },
-        config: caseId === 'disposal' ? [{ root: 'user_provider', relativePath: '.config/opencode/tui.json',
+        config: caseId === 'disposal' ? [{ root: 'user_provider', relativePath: 'tui.json',
           providerRelativePath: '.config/opencode/tui.json', format: 'json' }] : [],
       } },
   })
@@ -1289,6 +1289,9 @@ async function executeManagedOpenCodeTuiDisposal(harness: RuntimeHarness,
     // abandons a live startup writer or waits out the adoption budget.
     if (!finished) await harness.adminRaw(supervisor, harness.stopBody(request.params.soulId))
     await pending
+    harness.writeArtifact(`${scenario}-launch.json`, reply ?? null)
+    harness.writeArtifact(`${scenario}-last-view.json`, view ?? null)
+    harness.writeArtifact(`${scenario}-capture-diagnostics-private.json`, diagnostics)
   }
 }
 
