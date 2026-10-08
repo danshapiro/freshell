@@ -1915,6 +1915,27 @@ fn private_bound_destinations(
 }
 
 const PROVIDER_PROJECTION_MANIFEST: &str = ".freshell-config-projection.json";
+// Ordinary disk metadata shares the resource-manifest profile. The control
+// pipe's 1 MiB limit does not reduce these provider-filesystem views.
+const MAX_PROJECTION_METADATA_BYTES: usize = 64 * 1024 * 1024;
+
+fn read_projection_metadata(root: &Path, relative: &str) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::symlink_metadata(root.join(relative)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err("provider projection metadata unavailable; retain inputs and repair".into())
+        }
+        Ok(_) => {}
+    }
+    crate::provider_input_preparation::read_private(root, relative, MAX_PROJECTION_METADATA_BYTES)
+        .map(Some)
+        .map_err(|reason| {
+            tracing::warn!(event="provider.inputs.projection_metadata.blocked",stage="session_host",
+                operation="read",relative_path=relative,permitted_bytes=MAX_PROJECTION_METADATA_BYTES,
+                cause=%reason,"Provider projection metadata unavailable or exceeds its profile");
+            format!("provider projection metadata {relative}: {reason} (64 MiB limit); retain inputs and repair")
+        })
+}
 
 fn write_projection_manifest(
     provider_home: &Path,
@@ -1925,11 +1946,20 @@ fn write_projection_manifest(
         "{PROVIDER_PROJECTION_MANIFEST}.tmp-{}",
         std::process::id()
     ));
-    std::fs::write(
-        &temporary,
-        serde_json::to_vec(entries).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    let bytes =
+        freshell_runtime_protocol::bounded_json_bytes(entries, MAX_PROJECTION_METADATA_BYTES)
+            .map_err(|_| {
+                tracing::warn!(
+                    event = "provider.inputs.projection_metadata.blocked",
+                    stage = "session_host",
+                    operation = "serialize",
+                    relative_path = PROVIDER_PROJECTION_MANIFEST,
+                    permitted_bytes = MAX_PROJECTION_METADATA_BYTES,
+                    "Provider projection metadata exceeds its profile"
+                );
+                "provider projection metadata exceeds 64 MiB; retain inputs and repair".to_owned()
+            })?;
+    std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
     set_mode(&temporary, 0o600)?;
     std::fs::rename(&temporary, &manifest).map_err(|error| error.to_string())?;
     Ok(manifest)
@@ -1938,10 +1968,10 @@ fn write_projection_manifest(
 fn read_projection_manifest(
     provider_home: &Path,
 ) -> Result<std::collections::BTreeSet<String>, String> {
-    match std::fs::read(provider_home.join(PROVIDER_PROJECTION_MANIFEST)) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
-        Err(error) => Err(error.to_string()),
+    match read_projection_metadata(provider_home, PROVIDER_PROJECTION_MANIFEST)? {
+        Some(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|_| "provider projection metadata invalid".into()),
+        None => Ok(Default::default()),
     }
 }
 
@@ -2058,23 +2088,28 @@ fn refresh_provider_config_in_stage(
     );
     std::fs::write(
         stage.path().join("manifest.json"),
-        serde_json::to_vec(&destinations).map_err(|error| error.to_string())?,
+        freshell_runtime_protocol::bounded_json_bytes(&destinations, MAX_PROJECTION_METADATA_BYTES)
+            .map_err(|_| "provider projection destinations exceed 64 MiB")?,
     )
     .map_err(|error| error.to_string())?;
     std::fs::write(
         stage.path().join("provider.json"),
-        serde_json::to_vec(provider).map_err(|error| error.to_string())?,
+        freshell_runtime_protocol::bounded_json_bytes(&provider, MAX_PROJECTION_METADATA_BYTES)
+            .map_err(|_| "provider projection identity exceeds 64 MiB")?,
     )
     .map_err(|error| error.to_string())?;
     std::fs::write(
         stage.path().join("private-mountpoints.json"),
-        serde_json::to_vec(&private_bound_destinations(context))
-            .map_err(|_| "private mountpoint metadata invalid")?,
+        freshell_runtime_protocol::bounded_json_bytes(
+            &private_bound_destinations(context),
+            MAX_PROJECTION_METADATA_BYTES,
+        )
+        .map_err(|_| "private mountpoint metadata exceeds 64 MiB")?,
     )
     .map_err(|_| "private mountpoint metadata write failed")?;
     let mounted = freshell_runtime_protocol::bounded_json_bytes(
         &resource_mount_roots(context),
-        freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+        MAX_PROJECTION_METADATA_BYTES,
     )
     .map_err(|_| "resource mountpoint metadata profile exceeded")?;
     std::fs::write(stage.path().join("resource-mountpoints.json"), mounted)
@@ -2335,19 +2370,19 @@ fn refresh_provider_config_worker(args: &[String]) -> Result<(), String> {
 
 fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<(), String> {
     let destinations: Vec<String> = serde_json::from_slice(
-        &std::fs::read(stage.join("manifest.json")).map_err(|error| error.to_string())?,
+        &read_projection_metadata(stage, "manifest.json")?
+            .ok_or("provider projection destinations unavailable")?,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|_| "provider projection destinations invalid")?;
     let projection = stage.join("projection");
     let previous = read_projection_manifest(provider_home)?;
     let current = read_projection_manifest(&projection)?;
     let protected: std::collections::BTreeSet<String> =
-        match std::fs::read(stage.join("private-mountpoints.json")) {
-            Ok(bytes) => {
+        match read_projection_metadata(stage, "private-mountpoints.json")? {
+            Some(bytes) => {
                 serde_json::from_slice(&bytes).map_err(|_| "private mountpoint metadata invalid")?
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
-            Err(_) => return Err("private mountpoint metadata unavailable".into()),
+            None => Default::default(),
         };
     if protected.iter().any(|relative| {
         Path::new(relative).as_os_str().is_empty()
@@ -2408,10 +2443,10 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
             },
         )
         .collect::<Vec<_>>();
-    let provider = match std::fs::read(stage.join("provider.json")) {
-        Ok(bytes) => serde_json::from_slice::<String>(&bytes).map_err(|error| error.to_string())?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "unknown".into(),
-        Err(error) => return Err(error.to_string()),
+    let provider = match read_projection_metadata(stage, "provider.json")? {
+        Some(bytes) => serde_json::from_slice::<String>(&bytes)
+            .map_err(|_| "provider projection identity invalid")?,
+        None => "unknown".into(),
     };
     if !matches!(
         provider.as_str(),
@@ -2419,24 +2454,12 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     ) {
         return Err("provider config refresh provider is unsupported".into());
     }
-    let mounted: Vec<PathBuf> = {
-        use std::io::Read;
-        match std::fs::File::open(stage.join("resource-mountpoints.json")) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                file.take(freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES as u64 + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|_| "resource mountpoint metadata read failed")?;
-                if bytes.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES {
-                    return Err("resource mountpoint metadata profile exceeded".into());
-                }
-                serde_json::from_slice(&bytes)
-                    .map_err(|_| "resource mountpoint metadata invalid")?
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(_) => return Err("resource mountpoint metadata unavailable".into()),
-        }
-    };
+    let mounted: Vec<PathBuf> =
+        match read_projection_metadata(stage, "resource-mountpoints.json")? {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|_| "resource mountpoint metadata invalid")?,
+            None => Vec::new(),
+        };
     if mounted.iter().any(|path| {
         !path.starts_with(".freshell/provider-roots")
             || path
@@ -4114,6 +4137,111 @@ mod tests {
         assert_eq!(
             std::fs::read(destination.join(".config/opencode/project/allowed.json")).unwrap(),
             b"inside"
+        );
+    }
+
+    #[test]
+    fn provider_config_projection_metadata_writer_preserves_prior_on_oversize() {
+        let home = tempfile::tempdir().unwrap();
+        let accepted = ["skills/prior".to_owned()].into_iter().collect();
+        let path = write_projection_manifest(home.path(), &accepted).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let oversized = ["x".repeat(64 * 1024 * 1024)].into_iter().collect();
+        assert!(write_projection_manifest(home.path(), &oversized).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(home.path()).unwrap().count(),
+            1,
+            "failed metadata publication must not leave a temporary file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_projection_metadata_rejects_oversize_before_read_and_publication() {
+        use std::io::Read;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let stage = owned.path().join("stage");
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        std::fs::create_dir_all(stage.join("projection/skills")).unwrap();
+        let fixtures = [
+            (
+                home.join(PROVIDER_PROJECTION_MANIFEST),
+                br#"["skills","skills/old"]"#.as_slice(),
+            ),
+            (
+                stage.join("projection").join(PROVIDER_PROJECTION_MANIFEST),
+                br#"["skills","skills/new"]"#.as_slice(),
+            ),
+            (stage.join("manifest.json"), br#"["skills"]"#.as_slice()),
+            (stage.join("private-mountpoints.json"), b"[]".as_slice()),
+            (stage.join("resource-mountpoints.json"), b"[]".as_slice()),
+            (stage.join("provider.json"), br#""claude""#.as_slice()),
+        ];
+        for (path, bytes) in &fixtures {
+            std::fs::write(path, bytes).unwrap();
+        }
+        std::fs::write(home.join("skills/old"), b"prior-projection-nonce").unwrap();
+        std::fs::write(home.join("skills/sibling"), b"native-sibling-nonce").unwrap();
+        std::fs::write(
+            stage.join("projection/skills/new"),
+            b"current-projection-nonce",
+        )
+        .unwrap();
+        for (path, original) in &fixtures {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            file.set_len(64 * 1024 * 1024 + 1).unwrap();
+            let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+            file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
+                .unwrap();
+            file.read_exact(&mut [0]).unwrap();
+            assert_ne!(
+                file.metadata().unwrap().accessed().unwrap(),
+                old_access,
+                "fixture filesystem must observe payload reads"
+            );
+            file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
+                .unwrap();
+            drop(file);
+            assert!(apply_staged_provider_config(&stage, &home).is_err());
+            assert_eq!(
+                std::fs::metadata(path).unwrap().accessed().unwrap(),
+                old_access,
+                "oversized ordinary metadata payload was read: {}",
+                path.display()
+            );
+            assert_eq!(
+                std::fs::read(home.join("skills/old")).unwrap(),
+                b"prior-projection-nonce"
+            );
+            assert_eq!(
+                std::fs::read(home.join("skills/sibling")).unwrap(),
+                b"native-sibling-nonce"
+            );
+            assert!(!home.join("skills/new").exists());
+            std::fs::write(path, original).unwrap();
+        }
+        // The disk profile is 64 MiB, independently of the private control
+        // frame. JSON whitespace remains an admitted ordinary metadata view.
+        let resource_metadata = stage.join("resource-mountpoints.json");
+        let mut padded = vec![b' '; 64 * 1024 * 1024];
+        padded[..2].copy_from_slice(b"[]");
+        std::fs::write(resource_metadata, &padded).unwrap();
+        drop(padded);
+        apply_staged_provider_config(&stage, &home).unwrap();
+        assert!(!home.join("skills/old").exists());
+        assert_eq!(
+            std::fs::read(home.join("skills/new")).unwrap(),
+            b"current-projection-nonce"
+        );
+        assert_eq!(
+            std::fs::read(home.join("skills/sibling")).unwrap(),
+            b"native-sibling-nonce"
         );
     }
 
