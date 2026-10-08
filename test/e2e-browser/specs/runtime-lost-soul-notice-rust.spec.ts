@@ -258,7 +258,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       expect(result.incidentId).toMatch(/^incident-/)
       expect(result.view.cleanupState).toBe('verified_empty')
       expect(result.view.nativeSessionId).toBe(providerSessionId)
-      expect(rig.runtime.isContainerRunning(before.containerId)).toBe(false)
+      expect(await rig.lossContainerRunning(result.incidentId)).toBe(false)
 
       const ended = await waitForValue('ended managed pane projection', async () => {
         const state = await page.evaluate(() => (window as any).__FRESHELL_TEST__?.getState?.())

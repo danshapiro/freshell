@@ -736,7 +736,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -2725,6 +2725,7 @@ export class ManagedRuntimeOwner {
   private syntheticSource?: { source: SyntheticSource; root: string; nonce: string }
   private receiptCandidateBefore?: RuntimeCandidateIntegrity
   private chaosEvidencePublished = false
+  private lossRecovery?: { handle: ExactRuntimeHandle; incidentId: string }
 
   constructor(
     private readonly webFactory: RuntimeWebFactory,
@@ -3340,9 +3341,25 @@ export class ManagedRuntimeOwner {
       this.runtime.recoverBody(handle.soulId, 'provider_exit', await this.controlEpoch()))
     const data = OpencodeLossRecoverySchema.extend({ view: OpencodeLossRecoverySchema.shape.view.passthrough() })
       .passthrough().parse(this.dataOf(result, 'recovery'))
-    return OpencodeLossRecoverySchema.parse({ outcome: data.outcome, incidentId: data.incidentId,
+    const observed = OpencodeLossRecoverySchema.parse({ outcome: data.outcome, incidentId: data.incidentId,
       view: { cleanupState: data.view.cleanupState, nativeSessionId: data.view.nativeSessionId,
         intentRevision: data.view.intentRevision } })
+    if (observed.outcome === 'lost') this.lossRecovery = { handle: { ...handle }, incidentId: observed.incidentId }
+    return observed
+  }
+  private observedLossHandle(incidentId: string): ExactRuntimeHandle {
+    const observed = this.lossRecovery
+    if (this.runtime.phase !== 5 || !observed || observed.incidentId !== incidentId
+      || observed.handle.runId !== this.runtime.runId || observed.handle.candidateSha !== this.runtime.candidateSha
+      || !this.runtime.broker.receipts().some(receipt => receipt.soulId === observed.handle.soulId
+        && receipt.incarnationId === observed.handle.incarnationId && receipt.containerId === observed.handle.containerId)) {
+      throw new Error('exact owner-observed loss incident required')
+    }
+    return observed.handle
+  }
+  async lossContainerRunning(incidentId: string): Promise<boolean> {
+    const handle = this.observedLossHandle(incidentId)
+    return this.runtime.isContainerRunning(handle.containerId)
   }
 
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {

@@ -885,6 +885,9 @@ export class ExternalManagedRuntimeRig {
   async recoverLoss(handle: ExactRuntimeHandle): Promise<OpencodeLossRecovery> {
     return this.rpc('loss-recover', OpencodeLossRecoverySchema, { handle })
   }
+  async lossContainerRunning(incidentId: string): Promise<boolean> {
+    return this.rpc('loss-container-running', z.boolean(), { incidentId })
+  }
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {
     await this.rpc('crash-provider-worker', CompletedOwnerOperationSchema, { handle })
   }
@@ -1133,6 +1136,10 @@ export function createExternalRuntimeControl(
         break
       case 'loss-remove-storage': await owner.removeLossStorage(handle()); result = { completed: true }; break
       case 'loss-recover': result = await owner.recoverLoss(handle()); break
+      case 'loss-container-running':
+        if (!request.incidentId) throw new Error('observed loss incident required')
+        result = await owner.lossContainerRunning(request.incidentId)
+        break
       case 'incident-matches-soul':
         if (!request.incidentId) throw new Error('observed incident identity required')
         result = await owner.incidentMatchesSoul(handle(), request.incidentId)
