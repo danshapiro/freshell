@@ -215,7 +215,10 @@ impl DockerEngineBackend {
                 "com.freshell.source-reservation-id":reservation.id,
                 "com.freshell.claude-candidate":"ordinary"});
             scratch = Some(CandidateScratch {
-                name: format!("freshell-claude-candidate-{}", uuid::Uuid::new_v4()),
+                name: format!(
+                    "freshell-claude-candidate-{}",
+                    request.observation_request.request_id
+                ),
                 labels: labels.clone(),
                 daemon: daemon.clone(),
                 attempted: false,

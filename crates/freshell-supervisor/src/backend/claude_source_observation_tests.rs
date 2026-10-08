@@ -717,6 +717,10 @@ async fn qualify_candidate_helper_transport(
         let listener = UnixListener::bind(owned.path().join("docker.sock")).unwrap();
         let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
         let (seen, bodies, backing) = (calls.clone(), containers.clone(), volume.clone());
+        let expected_scratch = format!(
+            "freshell-claude-candidate-{}",
+            request.observation_request.request_id
+        );
         let server = tokio::spawn(async move {
             let mut jobs = JoinSet::new();
             let private_jobs = Arc::new(Mutex::new(Vec::<tokio::task::JoinHandle<()>>::new()));
@@ -725,7 +729,7 @@ async fn qualify_candidate_helper_transport(
                     _=&mut stopped=>break,
                     accepted=listener.accept()=>{
                         let (mut stream,_)=accepted.unwrap();
-                        let (seen,bodies,backing,daemon,private_jobs)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone());
+                        let (seen,bodies,backing,daemon,private_jobs,expected_scratch)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone(),expected_scratch.clone());
                         jobs.spawn(async move {
                             let mut header=Vec::new();let mut byte=[0];
                             while !header.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).await.unwrap();header.push(byte[0]);assert!(header.len()<=32*1024);}
@@ -736,7 +740,7 @@ async fn qualify_candidate_helper_transport(
                             seen.lock().unwrap().push((line.clone(),body.clone()));
                             let (status,value)=if line.contains("/info "){(200,json!({"ID":daemon,"SecurityOptions":["name=rootless"]}))}
                             else if line.contains("/images/"){(200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_IMAGE_CREDENTIAL_SENTINEL"]}}))}
-                            else if line.starts_with("POST") && line.contains("/volumes/create "){let actual=json!({"Name":body["Name"],"Driver":"local","Options":{},"Labels":body["Labels"],"Mountpoint":"/synthetic/ordinary-volume"});*backing.lock().unwrap()=Some(actual.clone());(201,actual)}
+                            else if line.starts_with("POST") && line.contains("/volumes/create "){assert_eq!(body["Name"],expected_scratch,"private candidate request must identify its exact scratch backing before creation");let actual=json!({"Name":body["Name"],"Driver":"local","Options":{},"Labels":body["Labels"],"Mountpoint":"/synthetic/ordinary-volume"});*backing.lock().unwrap()=Some(actual.clone());(201,actual)}
                             else if line.starts_with("GET") && line.contains("/volumes/"){match backing.lock().unwrap().clone(){Some(v) if line.contains(v["Name"].as_str().unwrap())=>(200,v),_=>(404,json!({}))}}
                             else if line.starts_with("DELETE") && line.contains("/volumes/"){assert!(bodies.lock().unwrap().is_empty(),"candidate helpers must be gone before volume deletion");if mode!="volume-still-present" {*backing.lock().unwrap()=None;}(204,json!({}))}
                             else if line.contains("/containers/create?"){
