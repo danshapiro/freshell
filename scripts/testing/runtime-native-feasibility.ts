@@ -695,13 +695,16 @@ async function executeManagedReceiverCreate(harness: RuntimeHarness,
   fs.mkdirSync(path.join(sourceHome, provider === 'codex' ? '.codex' : '.config/opencode'), { recursive: true, mode: 0o700 })
   const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release', env: { HOME: sourceHome } })
   const storeId = 'store-' + randomUUID(), soulId = 'soul-' + randomUUID()
+  const settings = provider === 'codex'
+    ? { model: 'gpt-5.6-luna', effort: 'low', permissionMode: 'on-request', sandbox: 'workspace-write' }
+    : { model: 'openai/gpt-5.6-luna' }
   const request = { method: 'launch', params: { soulId, provider, providerStoreId: storeId,
     creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: scenario,
     limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
     freshAgent: { sessionId: 'native-fresh-' + randomUUID(), provider, sessionType: mode,
       runtimeVariant: provider === 'codex' ? 'codex-app-server' : 'opencode-serve', providerStoreId: storeId,
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0,
-      model: provider === 'codex' ? 'gpt-5.6-luna' : 'openai/gpt-5.6-luna', effort: 'low', permissionMode: 'default',
+      ...settings,
       providerSecretReferences: references, providerLaunchContext: { preparation: provider === 'codex'
         ? { codex: { tui_args: [], sidecar_args: [] } }
         : { opencode: { project_config: [], tui_config: null, inline_config: false } }, config: [] } } } }
@@ -729,7 +732,8 @@ async function executeManagedReceiverCreate(harness: RuntimeHarness,
   }
   const original: NativeExperimentOriginal = { caseId: 'create', ownerId: harness.runId, imageDigest: harness.imageRef,
     candidateSha: harness.candidateSha, nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256,
-    profileSha256: namespace.profileSha256, artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace-private.json`],
+    profileSha256: createHash('sha256').update(JSON.stringify({ settings, nativeProfileSha256: namespace.profileSha256 })).digest('hex'),
+    artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace-private.json`],
     assertions: [{ name: 'actual-native-receiver-current-observation-before-input', pass: true },
       { name: 'actual-selected-native-process-profile-uid-and-tls', pass: true }] }
   harness.writeArtifact(`${scenario}-original.json`, original)

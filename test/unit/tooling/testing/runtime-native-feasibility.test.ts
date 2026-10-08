@@ -38,6 +38,10 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(request.params.freshAgent.providerSecretReferences.map((reference: any) => reference.profile)).toEqual([
         `${provider}_onecli_environment`, `${provider}_onecli_auth_file`, `${provider}_onecli_ca_file`])
       expect(request.params.freshAgent.nativeSessionId).toBeUndefined()
+      if (provider === 'codex') {
+        expect(request.params.freshAgent.permissionMode).toBe('on-request')
+        expect(request.params.freshAgent.sandbox).toBe('workspace-write')
+      } else expect(request.params.freshAgent.permissionMode).toBeUndefined()
       return { data: { view: { launchState: 'running', recoveryState: 'live', containerId: 'owned-native', incarnationId: 'current-inc', nativeSessionId: root,
         nativeIdentityObservation: fault === 'missing-observation' ? null : { nativeSessionId: fault === 'wrong-root' ? 'other' : root,
           incarnationId: fault === 'wrong-incarnation' ? 'old-inc' : 'current-inc', source: fault === 'wrong-source' ? 'claude_native_event' : 'fresh_provider_handshake',
