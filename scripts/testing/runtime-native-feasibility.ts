@@ -505,7 +505,7 @@ async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervis
     harness.writeArtifact(`${scenario}-native-exit.json`,fault)
     if (!fault.nativeExited)throw new Error('owned native SDK writer remains after exit fault')
   }
-  if (caseId==='stop-cancellation' && (fault.data?.proof?.kind!=='verified_empty'||current.some((row:any)=>row.launchState!=='stopped'))) {
+  if (caseId==='stop-cancellation' && (fault.data?.outcome!=='verified_empty'||current.some((row:any)=>row.launchState!=='stopped'||row.desiredState!=='stopped'||row.recoveryState!=='stopped'))) {
     throw new Error('ordinary Stop did not confirm empty stopped native fresh runtime')
   }
   const input=await harness.adminRaw(supervisor,{method:'fresh_agent_send',params:{soulId,text:'Owned blocked startup probe. Do not use tools.'}})
@@ -519,7 +519,7 @@ async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervis
       {name:'actual-native-startup-fault-remains-unobserved',pass:nativeFault},
       {name:'native-fault-refuses-running-current-observation-and-input',pass:!!input.result.Err},
       ...(caseId==='provider-exit'?[{name:'owned-native-writer-exited',pass:fault.nativeExited}]:[]),
-      ...(caseId==='stop-cancellation'?[{name:'ordinary-stop-confirmed-empty-stopped-runtime',pass:fault.data?.proof?.kind==='verified_empty' && current.every((row:any)=>row.launchState==='stopped')}]:[]),
+      ...(caseId==='stop-cancellation'?[{name:'ordinary-stop-confirmed-empty-stopped-runtime',pass:fault.data?.outcome==='verified_empty' && current.every((row:any)=>row.launchState==='stopped'&&row.desiredState==='stopped'&&row.recoveryState==='stopped')}]:[]),
       ...(caseId==='timeout-50s'?[{name:'actual-existing50s-native-startup-bound',pass:elapsedMs>=50_000&&elapsedMs<60_000}]:[])]}
   harness.writeArtifact(`${scenario}-original.json`,original)
   return original

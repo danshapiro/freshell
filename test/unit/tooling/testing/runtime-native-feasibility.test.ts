@@ -467,6 +467,29 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       else await expect(run).rejects.toThrow(fault==='admitted'?'admitted ordinary input':fault==='running'||fault==='observation'?'published Running or identity':'pin/profile/identity fault differs')
     } finally {fs.rmSync(directory,{recursive:true,force:true})}
   })
+  it.each(['verified-empty','unconfirmed','running','wrong-intent'])('requires ordinary native fresh Stop outcome and durable stopped intent (%s)', async (fault) => {
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'native-fresh-stop-'))
+    let soulId='', launchReply:(value:any)=>void
+    const namespace={uid:65534,gid:0,caps:'0000000000000000',readOnlyRoot:true,httpsStatus:200,tlsVerifyMode:2,tlsCheckHostname:true,
+      version:'2.1.237',nativeCwd:'',nativeRoot:null,hook:null,nativePid:37,completedTurns:0,toolEvents:0,executableSha256:'c'.repeat(64),profileFiles:[]}
+    const harness={testRoot:directory,runId:ownerId,candidateSha,imageRef:imageDigest,startSupervisor:async()=>({}),writeArtifact:()=>'',inventoryBody:()=>({method:'inventory'}),stopBody:()=>({method:'stop'}),
+      broker:{receipts:()=>[{soulId,containerId:'owned-container'}]},execOwnedContainerAsExact:async()=>JSON.stringify(namespace),
+      adminRaw:async(_supervisor:unknown,body:any)=>{
+        if(body.method==='launch'){soulId=body.params.soulId;namespace.nativeCwd=body.params.freshAgent.cwd;return new Promise(resolve=>{launchReply=resolve})}
+        if(body.method!=='fresh_agent_send')throw new Error('unexpected native fault operation')
+        return {result:{Err:{code:'UNKNOWN_SOUL'}}}
+      },
+      adminOk:async(_supervisor:unknown,body:any)=>{
+        if(body.method==='stop'){launchReply({result:{Err:{code:'STALE_INTENT_REVISION'}}});return {data:{outcome:fault==='unconfirmed'?'termination_unconfirmed':'verified_empty'}}}
+        return {data:[{soulId,launchState:fault==='running'?'running':'stopped',desiredState:fault==='wrong-intent'?'running':'stopped',recoveryState:'stopped',nativeIdentityObservation:null}]}
+      },
+    } as unknown as RuntimeHarness
+    try {
+      const run=executeManagedNativeCase(harness,['env_file','ca_file'].map(suffix=>({name:'claude/grants/'+suffix,path:path.join(directory,suffix),sha256:'e'.repeat(64)})),{mode:'kilroy',case:'startup'},'stop-cancellation')
+      if(fault==='verified-empty')expect((await run).assertions.every(assertion=>assertion.pass)).toBe(true)
+      else await expect(run).rejects.toThrow(fault==='running'?'published Running or identity':'empty stopped native fresh runtime')
+    } finally {fs.rmSync(directory,{recursive:true,force:true})}
+  })
   it.each(['freshclaude', 'kilroy'] as const)('routes finite real-native startup faults for %s without any model dispatch', async (mode) => {
     for (const caseId of ['wrong-id', 'missing-native-id', 'placeholder-id', 'disabled-hooks', 'timeout-50s', 'provider-exit', 'stop-cancellation']) {
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-fresh-startup-route-'))
