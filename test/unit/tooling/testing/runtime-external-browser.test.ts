@@ -30,6 +30,7 @@ import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type Sup
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 import { stopManagedRuntimeSoul, createManagedOpenCodeRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { structuredChaosLog } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
+import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import type { BrokerReceipt } from '../../../../scripts/testing/runtime-test-broker.js'
 import type { ProviderQualificationRow } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import type { FreshAgentQualificationRow } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
@@ -883,6 +884,47 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       if (h) await fsp.rm(h.testRoot, { recursive: true, force: true })
       vi.unstubAllEnvs()
       vi.restoreAllMocks()
+      await fsp.rm(directory, { recursive: true })
+    }
+  })
+  it.each([
+    { kind: 'external', requestedScrub: false }, { kind: 'colocated', requestedScrub: false },
+    { kind: 'external', requestedScrub: true }, { kind: 'colocated', requestedScrub: true },
+  ])('boots $kind fixture web with only explicitly selected OneCLI references (explicit scrub: $requestedScrub)', async ({ kind, requestedScrub }) => {
+    const { fixture: directory, entry, setup } = await fixture()
+    const referenceKey = 'FRESHELL_MANAGED_CODEX_ONECLI_ENV_FILE'
+    const referenceFile = path.join(directory, 'synthetic-onecli.env')
+    await fsp.writeFile(referenceFile, 'synthetic-reference-only\n', { mode: 0o600 })
+    await fsp.writeFile(entry, `require('node:http').createServer((req,res)=>{res.setHeader('content-type','application/json');const reference=process.env.${referenceKey};res.end(JSON.stringify({ok:true,runtime:'rust',commit:'${'a'.repeat(40)}',buildDirty:false,environmentKeys:Object.keys(process.env),selectedReferenceReadable:!!reference&&require('node:fs').readFileSync(reference,'utf8')==='synthetic-reference-only\\n'}))}).listen(Number(process.env.PORT),'127.0.0.1')`)
+    vi.stubEnv(referenceKey, '/ambient/stale-reference')
+    vi.stubEnv('FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE', '/ambient/unselected-reference')
+    vi.stubEnv('OPENAI_UNIT_CREDENTIAL', 'ambient-fixture-sentinel')
+    vi.stubEnv('FRESHELL_E2E_RUST_SERVER_BIN', process.execPath)
+    const options = { binary: process.execPath, repoRoot: process.cwd(), candidateSha: 'a'.repeat(40),
+      buildDirty: false, setupHome: setup, preserveHomeOnStop: false, providerFreeFixture: true,
+      fixtureOnecliReferences: { [referenceKey]: referenceFile, OPENAI_UNIT_CREDENTIAL: 'ambient-fixture-sentinel' },
+      stripEnvPrefixes: requestedScrub ? ['FRESHELL_MANAGED_CODEX_'] : [],
+      env: { NODE_OPTIONS: `--require=${entry}`, [referenceKey]: referenceFile,
+        FRESHELL_MANAGED_CODEX_UNRELATED_CREDENTIAL: 'explicit-fixture-sentinel',
+        FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/unit/control.sock' } }
+    const server = kind === 'external' ? new runner.ManagedRuntimeWebServer(options) : new RustServer(options)
+    let pid: number | undefined
+    try {
+      const info = await server.start()
+      pid = info.pid
+      const response = await fetch(`${info.baseUrl}/api/server-info`, { headers: { 'x-auth-token': info.token } })
+      const observed = await response.json()
+      expect(observed.selectedReferenceReadable).toBe(!requestedScrub)
+      if (requestedScrub) expect(observed.environmentKeys).not.toContain(referenceKey)
+      else expect(observed.environmentKeys).toContain(referenceKey)
+      expect(observed.environmentKeys).not.toContain('FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE')
+      expect(observed.environmentKeys).not.toContain('OPENAI_UNIT_CREDENTIAL')
+      expect(observed.environmentKeys).not.toContain('FRESHELL_MANAGED_CODEX_UNRELATED_CREDENTIAL')
+      expect(observed.environmentKeys).toContain('FRESHELL_RUNTIME_CONTROL_SOCKET')
+    } finally {
+      await server.stop()
+      if (pid) await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
+      vi.unstubAllEnvs()
       await fsp.rm(directory, { recursive: true })
     }
   })

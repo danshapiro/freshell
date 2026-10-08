@@ -3116,12 +3116,14 @@ export type RuntimeWebInfo = {
   port: number; baseUrl: string; wsUrl: string; token: string
   configDir: string; homeDir: string; logsDir: string; debugLogPath: string; pid: number; runtimeRoot: string
 }
+type FixtureOnecliReferenceKey = `FRESHELL_MANAGED_${'CLAUDE' | 'CODEX' | 'OPENCODE'}_ONECLI_${'ENV' | 'AUTH' | 'CA'}_FILE`
 export type RuntimeWebConstructOptions = {
   binary: string; repoRoot: string; preserveHomeOnStop: boolean; homeDir?: string
   candidateSha: string; buildDirty: boolean
   env: Record<string, string>; setupHome: (homeDir: string) => Promise<void>
   stripEnvPrefixes?: string[]
   providerFreeFixture?: boolean
+  fixtureOnecliReferences?: Partial<Record<FixtureOnecliReferenceKey, string>>
   token?: string
 }
 export interface RuntimeWebHandle {
@@ -3141,6 +3143,34 @@ export function runtimeWebStripPrefixes(options: Pick<RuntimeWebConstructOptions
     'ANTHROPIC_', 'OPENAI_', 'GEMINI_', 'ONECLI_', 'FRESHELL_MANAGED_CLAUDE_',
     'FRESHELL_MANAGED_CODEX_', 'FRESHELL_MANAGED_OPENCODE_', 'FRESHELL_MANAGED_AMPLIFIER_',
   ] : [])]
+}
+
+/** Fixture isolation keeps only explicitly supplied references; requested scrubs still win. */
+export function stripRuntimeWebEnvironment(env: NodeJS.ProcessEnv,
+  options: Pick<RuntimeWebConstructOptions, 'stripEnvPrefixes' | 'providerFreeFixture' | 'fixtureOnecliReferences'>): void {
+  const references = options.providerFreeFixture ? Object.entries(options.fixtureOnecliReferences ?? {}).filter(([key, value]) => (
+    /^FRESHELL_MANAGED_(CLAUDE|CODEX|OPENCODE)_ONECLI_(ENV|AUTH|CA)_FILE$/.test(key)
+    && typeof value === 'string' && value.trim().length > 0 && env[key] === value
+    && !(options.stripEnvPrefixes ?? []).some(prefix => key.startsWith(prefix))
+  )) : []
+  const prefixes = runtimeWebStripPrefixes(options)
+  for (const key of Object.keys(env)) if (prefixes.some(prefix => key.startsWith(prefix))) delete env[key]
+  for (const [key, value] of references) env[key] = value
+}
+
+function fixtureOnecliReferences(serverEnv: Record<string, string>, fixtureModes: readonly string[]) {
+  const references: Partial<Record<FixtureOnecliReferenceKey, string>> = {}
+  const families = new Set<'CLAUDE' | 'CODEX' | 'OPENCODE'>()
+  for (const mode of fixtureModes) {
+    if (mode === 'freshclaude' || mode === 'kilroy') families.add('CLAUDE')
+    else if (mode === 'freshcodex') families.add('CODEX')
+    else if (mode === 'freshopencode') families.add('OPENCODE')
+  }
+  for (const family of families) for (const kind of ['ENV', 'AUTH', 'CA'] as const) {
+    const key: FixtureOnecliReferenceKey = `FRESHELL_MANAGED_${family}_ONECLI_${kind}_FILE`
+    if (serverEnv[key]?.trim()) references[key] = serverEnv[key]
+  }
+  return references
 }
 
 export const P2_OPENCODE_VERSION = '1.18.21'
@@ -3426,6 +3456,7 @@ export class ManagedRuntimeOwner {
       providerFreeFixture: this.fixtureFreshAgentModes.length > 0 && this.enabledProviders.length === 0
         && this.freshAgentModes.every(mode => this.fixtureFreshAgentModes.includes(mode)),
       homeDir: this.webHomeDir,
+      fixtureOnecliReferences: fixtureOnecliReferences(this.serverEnv, this.fixtureFreshAgentModes),
       env: {
         // Managed MCP calls back from Docker workloads, so this owned
         // ephemeral-port server must override RustServer's loopback default.
