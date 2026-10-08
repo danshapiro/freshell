@@ -8,13 +8,12 @@
  * a pane-local recovery decision for the lost conversation, and zero
  * foreign/credential access.
  */
-import fs from 'node:fs'
-import path from 'node:path'
 import { expect, type Page } from '@playwright/test'
 
 import { test } from '../helpers/fixtures.js'
 import {
-  ManagedRuntimeBrowserRig,
+  createManagedRuntimeBrowserRig,
+  type ManagedFixtureRig,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
@@ -22,14 +21,6 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import {
-  sha256,
-} from '../../../scripts/testing/runtime-phase5-evidence-common.js'
-import {
-  buildPhase5LossReceipt,
-  PHASE5_CAPABILITY_INVENTORY_FILE,
-} from '../../../scripts/testing/runtime-phase5-loss-evidence.js'
-
 function leavesByMode(node: any, mode: string): any[] {
   if (!node) return []
   if (node.type === 'leaf') return node.content?.mode === mode ? [node] : []
@@ -120,7 +111,7 @@ async function waitForPaneOutput(
 }
 
 function waitForRunningView(
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   terminalId: string,
   timeoutMs: number,
 ): Promise<ManagedRuntimeView> {
@@ -135,13 +126,13 @@ test.describe.serial('Phase 5 certified provider loss', () => {
     test.skip(process.env.FRESHELL_RUNTIME_PHASE5_LIVE !== '1', 'set FRESHELL_RUNTIME_PHASE5_LIVE=1 for the live loss receipt')
     test.setTimeout(1_200_000)
 
-    const rig = new ManagedRuntimeBrowserRig(
+    const rig = createManagedRuntimeBrowserRig(
       process.cwd(),
       5,
       {},
       { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000' },
     )
-    const candidateBefore = await rig.captureCandidateIntegrity()
+    await rig.captureCandidateIntegrity()
     let receiptReady = false
     try {
       const info = await rig.start()
@@ -352,23 +343,9 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
     expect(receiptReady).toBe(true)
-    fs.copyFileSync(
-      path.join(rig.repoRoot, 'docs/development/runtime-provider-capabilities.json'),
-      path.join(rig.runtime.evidenceDir, PHASE5_CAPABILITY_INVENTORY_FILE),
-    )
-    fs.chmodSync(path.join(rig.runtime.evidenceDir, PHASE5_CAPABILITY_INVENTORY_FILE), 0o600)
-    const receipt = buildPhase5LossReceipt({
-      repoRoot: rig.repoRoot,
-      evidenceDir: rig.runtime.evidenceDir,
-      candidateSha: rig.runtime.candidateSha,
-      runtimeImage: rig.runtime.imageRef,
-      receiptRunId: rig.runtime.runId,
-      candidateBefore,
-      candidateAfter: await rig.captureCandidateIntegrity(),
-    })
-    const receiptPath = rig.writePhase5LossReceipt(receipt)
-    expect(sha256(fs.readFileSync(receiptPath))).toMatch(/^[0-9a-f]{64}$/)
+    const receipt = await rig.finalizeLossReceipt()
+    expect(receipt.artifactRef).toMatch(/^phase5-loss:[0-9a-f]{64}$/)
     // eslint-disable-next-line no-console
-    console.log(`[P5-G02] real OpenCode loss receipt: ${receiptPath}`)
+    console.log(`[P5-G02] real OpenCode loss receipt: ${receipt.artifactRef}`)
   })
 })

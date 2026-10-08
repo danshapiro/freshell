@@ -1481,6 +1481,17 @@ describe('closed external owner control', () => {
       expect(await fsp.readFile(published)).toEqual(retained)
       await fsp.unlink(source)
       await expect(owned.lossIncidentEvidence(incidentId)).rejects.toThrow(/unavailable/)
+      const write = vi.spyOn(owned, 'writePhase5LossReceipt')
+      await expect(owned.finalizeLossReceipt()).rejects.toThrow(/captured/)
+      await rig.captureCandidateIntegrity()
+      await expect(owned.finalizeLossReceipt()).rejects.toThrow(/cleanup/)
+      Object.assign(owned, { stopSettlement: Promise.resolve({ ok: false, errors: ['owned cleanup fixture failure'] }) })
+      await expect(owned.finalizeLossReceipt()).rejects.toThrow(/cleanup failed/)
+      Object.assign(owned, { stopSettlement: Promise.resolve({ ok: true, errors: [] }) })
+      await rig.stop()
+      await expect(rig.finalizeLossReceipt()).rejects.toThrow()
+      await expect(owned.finalizeLossReceipt()).rejects.toThrow(/candidate|ENOENT|missing/)
+      expect(write).not.toHaveBeenCalled()
     } finally {
       await fsp.rm(directory, { recursive: true, force: true })
     }

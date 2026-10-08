@@ -688,6 +688,10 @@ export const RuntimeLossAssertionsArtifactSchema = z.object({
   artifactRef: z.string().regex(/^phase5-loss-assertions:[a-f0-9]{64}$/),
 }).strict()
 export type RuntimeLossAssertionsArtifact = z.infer<typeof RuntimeLossAssertionsArtifactSchema>
+export const RuntimeLossReceiptArtifactSchema = z.object({
+  artifactRef: z.string().regex(/^phase5-loss:[a-f0-9]{64}$/),
+}).strict()
+export type RuntimeLossReceiptArtifact = z.infer<typeof RuntimeLossReceiptArtifactSchema>
 const OPENCODE_LOSS_ABSENCE_SCRIPT = String.raw`
 const fs = require('node:fs');
 const target = process.argv[1];
@@ -759,7 +763,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -2751,6 +2755,7 @@ export class ManagedRuntimeOwner {
   private chaosEvidencePublished = false
   private lossRecovery?: { handle: ExactRuntimeHandle; incidentId: string }
   private lossIncidentNativeHash?: string
+  private lossAssertionsPublished = false
 
   constructor(
     private readonly webFactory: RuntimeWebFactory,
@@ -3372,6 +3377,7 @@ export class ManagedRuntimeOwner {
     if (observed.outcome === 'lost') {
       this.lossRecovery = { handle: { ...handle }, incidentId: observed.incidentId }
       this.lossIncidentNativeHash = undefined
+      this.lossAssertionsPublished = false
     }
     return observed
   }
@@ -3424,8 +3430,29 @@ export class ManagedRuntimeOwner {
       candidateSha: this.runtime.candidateSha, receiptRunId: this.runtime.runId })
     const result = RuntimeLossAssertionsArtifactSchema.parse({
       artifactRef: `phase5-loss-assertions:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}` })
+    this.lossAssertionsPublished = true
     this.runtime.recordLifecycle('external.loss_assertions_published', { severity: 'info', ...result })
     return result
+  }
+  async finalizeLossReceipt(): Promise<RuntimeLossReceiptArtifact> {
+    if (this.runtime.phase !== 5 || !this.receiptCandidateBefore || !this.lossAssertionsPublished || !this.lossIncidentNativeHash) {
+      throw new Error('owned Phase5 loss observations and captured candidate required')
+    }
+    if (!this.stopSettlement) throw new Error('owned cleanup must settle before loss receipt finalization')
+    const cleanup = await this.stopSettlement
+    if (!cleanup.ok || cleanup.errors.length > 0) throw new Error('owned cleanup failed before loss receipt finalization')
+    const { buildPhase5LossReceipt, PHASE5_CAPABILITY_INVENTORY_FILE } = await import('./runtime-phase5-loss-evidence.js')
+    const inventory = path.join(this.runtime.evidenceDir, PHASE5_CAPABILITY_INVENTORY_FILE)
+    fs.copyFileSync(path.join(this.repoRoot, 'docs/development/runtime-provider-capabilities.json'), inventory)
+    fs.chmodSync(inventory, 0o600)
+    const receipt = buildPhase5LossReceipt({ repoRoot: this.repoRoot, evidenceDir: this.runtime.evidenceDir,
+      candidateSha: this.runtime.candidateSha, runtimeImage: this.runtime.imageRef, receiptRunId: this.runtime.runId,
+      candidateBefore: this.receiptCandidateBefore, candidateAfter: await this.captureCandidateIntegrity() })
+    const target = this.writePhase5LossReceipt(receipt)
+    const artifactRef = `phase5-loss:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
+    process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'external.loss_receipt_finalized',
+      runId: this.runtime.runId, candidateSha: this.runtime.candidateSha, artifactRef })}\n`)
+    return { artifactRef }
   }
 
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {
