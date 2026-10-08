@@ -9,6 +9,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from './runtime-sandbox.js'
 import { seedManagedOpenCodeSource } from '../../test/e2e-browser/fixtures/managed-opencode-source.js'
+import { ManagedRuntimeSoulSchema } from '../../shared/managed-runtime.js'
 import { readCodexNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/codex.js'
 import { readOpenCodeNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/opencode.js'
 import type { NativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/types.js'
@@ -542,7 +543,12 @@ export function prepareOwnedOpenCodeTuiSource(repoRoot: string, ownedRoot: strin
       }), source.rootId)
     }
   } finally { database.close() }
-  return { ...source, workspace }
+  const selected = new DatabaseSync(databasePath, { readOnly: true })
+  try {
+    const ids = selected.prepare('SELECT id FROM message WHERE session_id=? ORDER BY id').all(source.rootId).map(row => String(row.id))
+    const expectedActiveMessageIds = caseId === 'full-revert' ? ids.slice(0, -1) : ids
+    return { ...source, workspace, expectedActiveMessageIds }
+  } finally { selected.close() }
 }
 
 type NativeCheckpointSnapshot = { nativeRoot: string; transcript: {
@@ -749,6 +755,9 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
+  if (selection.provider === 'opencode' && selection.case === 'startup') {
+    return executeManagedOpenCodeTui(harness, sources, caseId)
+  }
   if (selection.provider === 'codex' && ['create', 'exact-resume', 'wrong-root', 'cancellation'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, 'codex', caseId, serverPath, servers)
   }
@@ -1041,6 +1050,149 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
     imageDigest: harness.imageRef, nativeVersion: namespace.version, executableSha256: namespace.executableSha256,
     profileSha256, artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace.json`],
     assertions }
+  harness.writeArtifact(`${scenario}-original.json`, original)
+  return original
+}
+
+async function executeManagedOpenCodeTui(harness: RuntimeHarness,
+  sources: { name: string; path: string; sha256: string }[], caseId: string): Promise<NativeExperimentOriginal> {
+  const stageSource = sources.find(file => file.name === 'opencode/native-preparation/transfer-stage.bin')
+  if (!stageSource) throw new Error('selected OpenCode native transfer stage required')
+  if (!['null-slot', 'v1-empty', 'v2-empty-is-not-v1-empty', 'full-revert', 'part-revert'].includes(caseId)) {
+    throw new Error(`actual native OpenCode TUI case has no qualified execution path: ${caseId}`)
+  }
+  const scenario = `opencode-${caseId}`
+  const source = prepareOwnedOpenCodeTuiSource(harness.repoRoot, harness.testRoot, caseId, harness.runId + '-' + caseId)
+  const digest = (bytes: Buffer | string): string => createHash('sha256').update(bytes).digest('hex')
+  const stage = path.join(harness.testRoot, scenario + '-transfer-stage')
+  fs.copyFileSync(stageSource.path, stage)
+  fs.chmodSync(stage, 0o555)
+  const schema = path.join(harness.repoRoot, 'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql')
+  const migrationSource = fs.readFileSync(path.join(harness.repoRoot, 'crates/freshell-sessions/src/opencode_transfer.rs'), 'utf8')
+  const migrationRegistry = migrationSource.match(/const PINNED_MIGRATIONS: &\[&str\] = &\[([\s\S]*?)\];/)
+  if (!migrationRegistry) throw new Error('actual pinned native migration registry unavailable')
+  const migrations = path.join(harness.testRoot, scenario + '-migrations.json')
+  fs.writeFileSync(migrations, JSON.stringify([...migrationRegistry[1]!.matchAll(/"([^"]+)"/g)].map(row => row[1])), { mode: 0o644 })
+  fs.chmodSync(migrations, 0o644)
+  const soulId = 'soul-' + randomUUID()
+  harness.writeArtifact(`${scenario}-source-metadata.json`, { rootSessionId: source.rootId,
+    sourceBytes: fs.statSync(source.databasePath).size, sourceSha256: digest(fs.readFileSync(source.databasePath)),
+    synthetic: true, modelInputs: 0, sourceOnly: true, beforeExport: true })
+  const provider = harness.startTransferProvider(stage, schema, migrations, [source.workspace])
+  await harness.copyTransferFileExact(provider.containerId, source.databasePath, '/scratch/source.bin')
+  harness.writeTransferRequest(provider.containerId, 'native-export-request.json', {
+    candidateSha: harness.candidateSha, imageDigest: harness.imageRef, sourceDatabase: '/scratch/source.bin',
+    rootSessionId: source.rootId, extractionRoot: '/scratch/extractions', workspacePath: source.workspace,
+    descriptorFile: '/scratch/native-descriptor.json', payloadFile: '/scratch/native-payload.json',
+    destinationStoreId: soulId, destinationDatabase: '/scratch/destination.db', providerHome: '/scratch/provider',
+    providerUid: 65534, providerGid: 0, receiptFile: '/scratch/native-export-receipt.json',
+  })
+  const exported = JSON.parse(harness.execTransferProviderExact(provider.containerId,
+    ['/opt/transfer-stage', '--stage', 'export', '--request-file', '/scratch/native-export-request.json']))
+  harness.writeArtifact(`${scenario}-export.json`, exported)
+  const descriptorFile = path.join(harness.evidenceDir, scenario + '-descriptor-original.json')
+  const payloadFile = path.join(harness.evidenceDir, scenario + '-payload-original.json')
+  await harness.captureTransferFileExact(provider.containerId, '/scratch/native-descriptor.json', descriptorFile)
+  await harness.captureTransferFileExact(provider.containerId, '/scratch/native-payload.json', payloadFile)
+  const descriptor = JSON.parse(fs.readFileSync(descriptorFile, 'utf8'))
+  descriptor.transferId = 'opencode-transfer-' + randomUUID()
+  descriptor.incarnationId = 'incarnation-' + randomUUID()
+  const sourceHome = path.join(harness.testRoot, 'native-source', 'opencode', scenario)
+  fs.mkdirSync(path.join(sourceHome, '.config/opencode'), { recursive: true, mode: 0o700 })
+  const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release', env: { HOME: sourceHome } })
+  const transfer = (action: any) => harness.adminOk(supervisor, { method: 'open_code_transfer', params: action })
+  const attempt = randomUUID().replaceAll('-', '')
+  await transfer({ action: 'begin', data: { descriptor, attempt_id: attempt } })
+  const payload = fs.readFileSync(payloadFile)
+  let sequence = 0
+  for (let offset = 0; offset < payload.length; offset += 262144) {
+    const bytes = payload.subarray(offset, Math.min(offset + 262144, payload.length))
+    await transfer({ action: 'chunk', data: { transferId: descriptor.transferId, attemptId: attempt,
+      sequence: sequence++, fileIndex: 0, offset, data: bytes.toString('base64'), sha256: digest(bytes) } })
+  }
+  harness.writeArtifact(`${scenario}-staged.json`, await transfer({ action: 'finalize', data: { transfer_id: descriptor.transferId, attempt_id: attempt } }))
+  const references = ['env_file', 'auth_file', 'ca_file'].map(suffix => {
+    const selected = sources.find(file => file.name === 'opencode/grants/' + suffix)
+    if (!selected) throw new Error('selected OpenCode native grant reference missing')
+    return { sourcePath: selected.path, profile: 'opencode_onecli_' + (suffix === 'env_file' ? 'environment' : suffix) }
+  })
+  const request = harness.launchBody({ soulId, provider: 'opencode', providerStoreId: soulId,
+    nativeSessionId: source.rootId, creationSeedRef: 'owned-native-' + harness.runId,
+    projectKey: scenario, profile: 'custom', limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
+    terminal: { env: { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: '/home/freshell/provider',
+      XDG_DATA_HOME: '/home/freshell/provider/.local/share', XDG_CONFIG_HOME: '/home/freshell/provider/.config',
+      OPENCODE_DB: '/home/freshell/provider/.local/share/opencode/opencode.db', TMPDIR: '/run/opencode-tmp' },
+      terminalId: 'terminal-' + randomUUID(), streamId: 'stream-' + randomUUID(), mode: 'opencode', program: 'opencode',
+      args: ['--session', source.rootId, '--model', 'openai/gpt-5.6-luna'], cwd: source.workspace,
+      workspacePath: source.workspace, projectKey: scenario, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30,
+      resumeSessionId: source.rootId, opencodeTransfer: descriptor, opencodeTransferAttemptId: attempt,
+      providerSecretReferences: references, providerLaunchContext: {
+        preparation: { opencode: { project_config: [], tui_config: null, inline_config: false } }, config: [],
+      } },
+  })
+  harness.writeArtifact(`${scenario}-request.json`, request)
+  const launch = await harness.adminRaw(supervisor, request)
+  harness.writeArtifact(`${scenario}-launch.json`, launch)
+  const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+  harness.writeArtifact(`${scenario}-inventory.json`, inventory)
+  const view = ManagedRuntimeSoulSchema.parse(inventory.data.find((row: any) => row.soulId === soulId))
+  const observation = view.nativeIdentityObservation
+  if (launch.result?.Err || view.launchState !== 'running' || view.recoveryState !== 'live' || view.desiredState !== 'running'
+    || !view.containerId || !observation || observation.source !== 'opencode_tui'
+    || observation.nativeSessionId !== source.rootId || view.nativeSessionId !== source.rootId
+    || observation.incarnationId !== view.incarnationId || observation.evidenceRevision !== view.evidenceRevision) {
+    throw new Error('actual imported native TUI has no current admitted observation')
+  }
+  const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+    ['python3', '-c', openCodeTuiNativeNamespace, 'opencode', source.rootId, source.workspace]))
+  harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
+  if (!receiverNativeNamespaceMatches(namespace, 'opencode', source.workspace, source.rootId)
+    || namespace.nativeVersion !== '1.18.21'
+    || namespace.executableSha256 !== 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99'
+    || namespace.nativeProcessCwd !== source.workspace || namespace.nativeLaunch.incarnationId !== view.incarnationId
+    || namespace.nativeLaunch.launchNonce !== observation.launchNonce || namespace.nativeLaunch.evidenceRevision !== observation.evidenceRevision
+    || namespace.nativeLaunch.executionGeneration !== view.executionGeneration) {
+    throw new Error('actual native TUI current namespace/profile/pin/TLS differs')
+  }
+  const signals = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c', String.raw`
+import pathlib,json
+directory=pathlib.Path('/home/freshell/provider/.freshell/session-signals/opencode-adoption-diagnostics')
+records={}
+for file in directory.glob('*.json'):
+ if file.is_file() and not file.is_symlink() and file.stat().st_size<=65536:records[file.name]=json.loads(file.read_text())
+print(json.dumps(records))
+`]))
+  harness.writeArtifact(`${scenario}-producer-phases.json`, signals)
+  const statusScript = amplifierNativeHostStatus
+    .replace("'nativeSessionId':data.get('native_session_id'),", "'opencodeAdoption':data.get('opencode_adoption'),'nativeSessionId':data.get('native_session_id'),")
+    .replace('amplif-[a-f0-9]{8}', 'openco-[a-f0-9]{8}')
+  const host = JSON.parse(execFileSync('python3', ['-c', statusScript, supervisor.runtimeRoot, view.incarnationId],
+    { encoding: 'utf8', timeout: 6000, stdio: ['ignore', 'pipe', 'pipe'] }))
+  harness.writeArtifact(`${scenario}-authenticated-host.json`, host)
+  const adoption = host.opencodeAdoption?.state === 'observed' ? host.opencodeAdoption.data.observation : null
+  if (!adoption || adoption.rootSessionId !== source.rootId || adoption.incarnationId !== view.incarnationId
+    || !adoption.hydrated || JSON.stringify(namespace.activeMessageIds) !== JSON.stringify(source.expectedActiveMessageIds)
+    || adoption.tailMessageId !== (source.expectedActiveMessageIds.at(-1) ?? null)
+    || adoption.messagesRead !== (source.expectedActiveMessageIds.length ? 'success' : 'empty_confirmed')) {
+    throw new Error('actual pinned TUI active V1/revert hydration differs from current host evidence')
+  }
+  const publication: any = Object.values(signals).find((row: any) => row.stage === 'publication_succeeded')
+  const assertion = (name: string, pass: boolean) => ({ name, pass })
+  const assertions = [assertion('current-native-tui-observation-before-any-input', observation.incarnationId === view.incarnationId),
+    assertion('actual-public-slot-wrapper-registered', publication?.registeredSlotCount === 2),
+    assertion('selected-pinned-native-uid-profile-and-normal-tls', receiverNativeNamespaceMatches(namespace, 'opencode', source.workspace, source.rootId))]
+  if (caseId === 'v1-empty') assertions.push(assertion('actual-qualified-empty-v1-root', namespace.nativeMessageCount === 0))
+  if (caseId === 'null-slot') assertions.push(assertion('actual-native-null-slot-render-wake', Object.values(signals).some((row: any) =>
+    row.incarnationId === view.incarnationId && row.registeredSlotCount === 2
+      && row.sessionPromptRenderCount + row.sidebarTitleRenderCount > 0)))
+  if (caseId === 'v2-empty-is-not-v1-empty') assertions.push(assertion('empty-v2-does-not-replace-loaded-nonempty-v1',
+    namespace.nativeMessageCount === 2 && namespace.v2MessageCount === 0 && publication !== undefined))
+  if (caseId === 'full-revert' || caseId === 'part-revert') assertions.push(assertion('saved-native-revert-active-tail-hydrated',
+    adoption.tailMessageId === source.expectedActiveMessageIds.at(-1)
+      && namespace.activeMessageIds.length === (caseId === 'full-revert' ? 1 : 2)))
+  const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
+    nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256,
+    profileSha256: namespace.profileSha256, artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace-native-private.json`, `${scenario}-producer-phases.json`], assertions }
   harness.writeArtifact(`${scenario}-original.json`, original)
   return original
 }
@@ -1627,6 +1779,39 @@ for name in (['.codex/config.toml'] if provider=='codex' else ['.config/opencode
 profile_hash=hashlib.sha256(json.dumps(profiles,sort_keys=True).encode()).hexdigest()
 print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(row.split()[1] for row in pathlib.Path('/proc/self/status').read_text().splitlines() if row.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativeCwd':native_cwd,'nativeProcessCwd':str((process/'cwd').resolve()),'nativeLaunch':json.loads(environment['FRESHELL_NATIVE_IDENTITY_LAUNCH']) if environment.get('FRESHELL_NATIVE_IDENTITY_LAUNCH') else None,'nativeRoot':native_info['id'] if native_info else None,'nativeMessageCount':message_count,'nativeVersion':subprocess.check_output([str(executable),'--version'],env=environment,text=True,timeout=15).strip(),'executableSha256':hashlib.sha256(executable.read_bytes()).hexdigest(),'profileSha256':profile_hash,'profileFiles':profiles,'activeNativeProcesses':len(matches),'nativePid':int(process.name),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest()}))
 `
+
+// The terminal TUI uses an embedded native server rather than the fresh
+// transport's serve port. Keep the process/profile/TLS inspection identical;
+// inspect only the exact selected owned V1 root through a query-only read.
+export const openCodeTuiNativeNamespace = (() => {
+  const selected = receiverNativeNamespace
+    .replace(" and 'serve' in argv", '')
+    .replace("   if provider=='opencode' and not environment.get('FRESHELL_OPENCODE_SIDECAR_ID'):raise RuntimeError('native sidecar ownership tag missing')",
+      "   assert environment.get('FRESHELL_NATIVE_IDENTITY_LAUNCH') and environment.get('FRESHELL_OPENCODE_ADOPTION_ROOT_SESSION_ID')==root")
+  const begin = selected.indexOf("if provider=='opencode':\n assert argv.count")
+  const end = selected.indexOf('ca=pathlib.Path', begin)
+  if (begin < 0 || end < begin) throw new Error('finite native TUI namespace selection differs')
+  return (selected.slice(0, begin) + String.raw`
+import sqlite3
+assert argv.count('--session')==1 and argv[argv.index('--session')+1]==root
+assert argv.count('--model')==1 and argv[argv.index('--model')+1]=='openai/gpt-5.6-luna'
+assert environment.get('OPENCODE_DISABLE_AUTOUPDATE')=='true'
+database=sqlite3.connect('file:/home/freshell/provider/.local/share/opencode/opencode.db?mode=ro',uri=True)
+database.execute('PRAGMA query_only=ON');database.execute('BEGIN')
+row=database.execute('SELECT id,parent_id,directory,revert FROM session WHERE id=?',(root,)).fetchone()
+assert row and row[0]==root and row[1] is None and row[2]==workspace
+native_info={'id':row[0]}
+message_ids=[row[0] for row in database.execute('SELECT id FROM message WHERE session_id=? ORDER BY id',(root,))]
+message_count=len(message_ids)
+v2_message_count=database.execute('SELECT count(*) FROM session_message WHERE session_id=?',(root,)).fetchone()[0]
+saved_revert=json.loads(row[3]) if row[3] else None
+active_ids=message_ids
+if saved_revert:
+ boundary=message_ids.index(saved_revert['messageID'])
+ active_ids=message_ids[:boundary+(1 if saved_revert.get('partID') else 0)]
+database.rollback();database.close()
+` + selected.slice(end)).replace("'nativeMessageCount':message_count,", "'nativeMessageCount':message_count,'v2MessageCount':v2_message_count,'savedRevert':saved_revert,'activeMessageIds':active_ids,")
+})()
 
 async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervisor: Awaited<ReturnType<RuntimeHarness['startSupervisor']>>,
   request: any, caseId: string, scenario: string, settings: unknown, sdkForkImage = false): Promise<NativeExperimentOriginal> {

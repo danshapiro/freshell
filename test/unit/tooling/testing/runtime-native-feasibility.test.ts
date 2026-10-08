@@ -83,6 +83,59 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         expect(fs.readdirSync(ownedRoot)).toEqual([])
       } finally { if (fs.existsSync(alias)) fs.unlinkSync(alias); fs.rmSync(ownedRoot, { recursive: true, force: true }) }
     })
+  it('routes imported TUI startup through native preparation instead of an unimplemented fresh-agent path', async () => {
+    const harness = { testRoot: '/operator/native-home', writeArtifact: vi.fn() } as unknown as RuntimeHarness
+    await expect(executeManagedNativeCase(harness, [], { provider: 'opencode', case: 'startup' }, 'null-slot'))
+      .rejects.toThrow('selected OpenCode native transfer stage required')
+    expect(harness.writeArtifact).not.toHaveBeenCalled()
+  })
+  it.each(['requested-echo', 'previous-incarnation', 'stale-revision'])(
+    'executes the owned import/launch orchestration and refuses a %s before native qualification inspection', async fault => {
+      const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+      const evidenceDir = path.join(ownedRoot, 'evidence')
+      fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 })
+      const stage = path.join(ownedRoot, 'stage-fixture')
+      fs.writeFileSync(stage, 'orchestration fixture only', { mode: 0o500 })
+      let root = '', sourcePath = '', launchRequest: any
+      const transferCalls: any[] = []
+      const inspect = vi.fn()
+      const harness = {
+        repoRoot: process.cwd(), testRoot: ownedRoot, evidenceDir, runId: randomUUID(), candidateSha, imageRef: imageDigest,
+        writeArtifact: vi.fn(), startTransferProvider: () => ({ containerId: 'fixture-exporter' }),
+        copyTransferFileExact: async (_container: string, file: string) => { sourcePath = file },
+        writeTransferRequest: (_container: string, _file: string, request: any) => { root = request.rootSessionId },
+        execTransferProviderExact: () => JSON.stringify({ fixtureOnly: true }),
+        captureTransferFileExact: async (_container: string, name: string, file: string) => {
+          fs.writeFileSync(file, name.includes('descriptor') ? JSON.stringify({ rootSessionId: root }) : fs.readFileSync(sourcePath))
+        },
+        startSupervisor: async () => ({ runtimeRoot: path.join(ownedRoot, 'runtime') }),
+        launchBody: (params: any) => ({ method: 'launch', params }), inventoryBody: () => ({ method: 'inventory' }),
+        adminRaw: async (_supervisor: unknown, request: any) => { launchRequest = request; return { result: { Ok: {} } } },
+        adminOk: async (_supervisor: unknown, request: any) => {
+          if (request.method === 'open_code_transfer') { transferCalls.push(request.params); return { fixtureOnly: true } }
+          return { data: [{ soulId: launchRequest.params.soulId, incarnationId: 'current-incarnation', launchState: 'running',
+            cleanupState: 'none', intentRevision: 1, executionGeneration: 1, containerId: 'fixture-host',
+            desiredState: 'running', recoveryState: 'live', durabilityState: 'unknown', allocationState: 'allocated',
+            nativeSessionId: root, evidenceRevision: 2, successfulRecoveriesInWindow: 0,
+            ...(fault === 'requested-echo' ? {} : { nativeIdentityObservation: { nativeSessionId: root,
+              incarnationId: fault === 'previous-incarnation' ? 'previous-incarnation' : 'current-incarnation',
+              launchNonce: 'current-nonce', evidenceRevision: fault === 'stale-revision' ? 1 : 2,
+              source: 'opencode_tui', evidenceDigest: 'c'.repeat(64) } }),
+          }] }
+        },
+        execOwnedContainerAsExact: inspect,
+      } as unknown as RuntimeHarness
+      try {
+        await expect(executeManagedNativeCase(harness, [{ name: 'opencode/native-preparation/transfer-stage.bin', path: stage, sha256: 'd'.repeat(64) },
+          ...['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: 'opencode/grants/' + suffix, path: stage, sha256: 'd'.repeat(64) }))],
+        { provider: 'opencode', case: 'startup' }, 'null-slot')).rejects.toThrow('no current admitted observation')
+        expect(launchRequest.params.terminal.resumeSessionId).toBe(root)
+        expect(launchRequest.params.terminal.opencodeTransfer.rootSessionId).toBe(root)
+        expect(transferCalls.map(row => row.action)).toEqual(['begin', 'chunk', 'finalize'])
+        expect(Buffer.from(transferCalls[1].data.data, 'base64')).toEqual(fs.readFileSync(sourcePath))
+        expect(inspect).not.toHaveBeenCalled()
+      } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
+    })
   it.each(['ordinary', 'parity'])('keeps Codex transcript Enter-bound while the %s producer selects its native startup boundary', async route => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'parity-codex-startup-'))
     const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
