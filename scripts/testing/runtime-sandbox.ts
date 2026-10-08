@@ -665,6 +665,14 @@ export const OpencodeLossRecoverySchema = z.object({
     intentRevision: z.number().int().nonnegative() }).strict(),
 }).strict()
 export type OpencodeLossRecovery = z.infer<typeof OpencodeLossRecoverySchema>
+export const OpencodeLossIncidentEvidenceSchema = z.object({
+  persisted: z.boolean(), containsNativeSessionId: z.boolean(), containsControlSecret: z.boolean(),
+  certificateSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  certificate: z.object({ intentRevision: z.number().int().nonnegative(),
+    nativeSessionRefHash: z.string().regex(/^sha256:[a-f0-9]{64}$/) }).strict(),
+  artifactRef: z.string().regex(/^phase5-loss-incident:[a-f0-9]{64}$/),
+}).strict()
+export type OpencodeLossIncidentEvidence = z.infer<typeof OpencodeLossIncidentEvidenceSchema>
 const OPENCODE_LOSS_ABSENCE_SCRIPT = String.raw`
 const fs = require('node:fs');
 const target = process.argv[1];
@@ -736,7 +744,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -3360,6 +3368,26 @@ export class ManagedRuntimeOwner {
   async lossContainerRunning(incidentId: string): Promise<boolean> {
     const handle = this.observedLossHandle(incidentId)
     return this.runtime.isContainerRunning(handle.containerId)
+  }
+  async lossIncidentEvidence(incidentId: string): Promise<OpencodeLossIncidentEvidence> {
+    const handle = this.observedLossHandle(incidentId)
+    if (!/^incident-[a-zA-Z0-9_-]+$/.test(incidentId)) throw new Error('fixed observed incident file identity required')
+    const summary = await this.runtime.adminOk(this.supervisor,
+      this.runtime.incidentSummaryBody(incidentId, await this.controlEpoch()))
+    this.dataOf(summary, 'incident_summary')
+    const incidentPath = path.join('/var/lib/freshell-supervisor/incidents', `${incidentId}.closed.json`)
+    const persisted = this.runtime.runCommand('docker', ['exec', this.supervisor.containerId, 'test', '-s', incidentPath]) === ''
+    const raw = this.runtime.runCommand('docker', ['exec', this.supervisor.containerId, 'cat', incidentPath])
+    const artifact: unknown = JSON.parse(raw)
+    const fields = OpencodeLossIncidentEvidenceSchema.pick({ certificateSha256: true, certificate: true })
+      .extend({ certificate: OpencodeLossIncidentEvidenceSchema.shape.certificate.passthrough() }).passthrough().parse(artifact)
+    const { PHASE5_LOSS_INCIDENT_FILE } = await import('./runtime-phase5-loss-evidence.js')
+    const target = this.runtime.writeArtifact(PHASE5_LOSS_INCIDENT_FILE, artifact)
+    return OpencodeLossIncidentEvidenceSchema.parse({ persisted,
+      containsNativeSessionId: raw.includes(handle.nativeSessionId), containsControlSecret: raw.includes(this.supervisor.controlSecret),
+      certificateSha256: fields.certificateSha256,
+      certificate: { intentRevision: fields.certificate.intentRevision, nativeSessionRefHash: fields.certificate.nativeSessionRefHash },
+      artifactRef: `phase5-loss-incident:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}` })
   }
 
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {

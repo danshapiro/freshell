@@ -1401,6 +1401,73 @@ describe('closed external owner control', () => {
     expect(epoch).not.toHaveBeenCalled()
     expect(admin).not.toHaveBeenCalled()
   })
+  it('keeps the loss incident body private while observing its fixed file and certificate fields', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-loss-incident-'))
+    try {
+      const { owned, context, inventory } = fixture()
+      const row = { soulId: 'incident-loss-soul', incarnationId: 'incident-loss-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'incident-loss-boot', nativeSessionId: 'incident-loss-root', provider: 'opencode', launchState: 'running', intentRevision: 4 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { phase: 5, evidenceDir: directory, broker: { receipts: () => [receipt] } })
+      owned.supervisor = { scenarioId: 'loss-owned', containerId: 'a'.repeat(64), controlSocket: '/owned/socket',
+        controlSecret: 'private-owned-control', controlSecretFile: '/owned/secret', runtimeRoot: '/owned/runtime',
+        volumeName: 'owned-supervisor-volume', binaryKind: 'release' }
+      vi.spyOn(owned, 'controlEpoch').mockResolvedValue(12)
+      const incidentId = 'incident-actual-owned'
+      const admin = vi.spyOn(owned.runtime, 'adminOk').mockResolvedValue({ kind: 'recovery', data: {
+        outcome: 'lost', incidentId, view: { cleanupState: 'verified_empty', nativeSessionId: row.nativeSessionId, intentRevision: 5 } } })
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const wire: unknown[] = []
+      const transport = vi.fn(async (_url: string, init: RequestInit) => {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+      await rig.recoverLoss(rig.exactRuntimeHandle(row))
+      admin.mockResolvedValue({ kind: 'incident_summary', data: { privateDiagnostic: 'private-body-marker' } })
+      const source = path.join(directory, 'source-incident.json')
+      const artifact = { certificateSha256: 'e'.repeat(64), certificate: {
+        intentRevision: 4, nativeSessionRefHash: `sha256:${'f'.repeat(64)}` }, privateDiagnostic: 'private-body-marker' }
+      await fsp.writeFile(source, JSON.stringify(artifact))
+      const command = vi.spyOn(owned.runtime, 'runCommand').mockImplementation((binary, args) => {
+        expect(binary).toBe('docker')
+        expect(args.slice(0, 2)).toEqual(['exec', owned.supervisor.containerId])
+        expect(args.at(-1)).toBe(`/var/lib/freshell-supervisor/incidents/${incidentId}.closed.json`)
+        const child = args[2] === 'test' ? spawnSync('test', ['-s', source], { encoding: 'utf8' })
+          : spawnSync('cat', [source], { encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('fixed incident file unavailable')
+        return child.stdout
+      })
+      const observed = await rig.lossIncidentEvidence(incidentId)
+      expect(observed).toMatchObject({ persisted: true, containsNativeSessionId: false, containsControlSecret: false,
+        certificateSha256: artifact.certificateSha256, certificate: artifact.certificate })
+      const published = path.join(directory, 'phase5-loss-incident.json')
+      expect(JSON.parse(await fsp.readFile(published, 'utf8'))).toEqual(artifact)
+      expect((await fsp.stat(published)).mode & 0o777).toBe(0o600)
+      const digest = createHash('sha256').update(await fsp.readFile(published)).digest('hex')
+      expect(observed.artifactRef).toBe(`phase5-loss-incident:${digest}`)
+      expect(JSON.stringify(wire)).not.toContain('private-body-marker')
+      command.mockClear()
+      await expect(owned.lossIncidentEvidence('incident-foreign')).rejects.toThrow(/observed/)
+      expect(command).not.toHaveBeenCalled()
+      await fsp.writeFile(source, JSON.stringify({ ...artifact, leaked: row.nativeSessionId,
+        leakedControl: owned.supervisor.controlSecret }))
+      const leaked = await rig.lossIncidentEvidence(incidentId)
+      expect(leaked.containsNativeSessionId).toBe(true)
+      expect(leaked.containsControlSecret).toBe(true)
+      const retained = await fsp.readFile(published)
+      await fsp.writeFile(source, '{malformed incident')
+      await expect(owned.lossIncidentEvidence(incidentId)).rejects.toThrow()
+      expect(await fsp.readFile(published)).toEqual(retained)
+      await fsp.unlink(source)
+      await expect(owned.lossIncidentEvidence(incidentId)).rejects.toThrow(/unavailable/)
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
   it('runs the closed Phase3 effect operations over the same pre-native enclosure', async () => {
     const { owned, context, request } = fixture()
     const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',

@@ -29,7 +29,6 @@ import {
   buildPhase5LossReceipt,
   PHASE5_CAPABILITY_INVENTORY_FILE,
   PHASE5_LOSS_ASSERTIONS_FILE,
-  PHASE5_LOSS_INCIDENT_FILE,
 } from '../../../scripts/testing/runtime-phase5-loss-evidence.js'
 
 function leavesByMode(node: any, mode: string): any[] {
@@ -130,11 +129,6 @@ function waitForRunningView(
     const view = await rig.runningViewForTerminal(terminalId)
     return view?.containerId ? view : null
   }, timeoutMs)
-}
-
-function dataOf(result: any, kind: string): any {
-  if (!result || result.kind !== kind) throw new Error(`expected ${kind}, got ${JSON.stringify(result)}`)
-  return result.data
 }
 
 function writePrivateJson(filePath: string, value: unknown): void {
@@ -307,26 +301,13 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       })
       expect(routineNoticeCount).toBe(0)
 
-      const incident = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.incidentSummaryBody(result.incidentId, await rig.controlEpoch()),
-      ), 'incident_summary')
-      const incidentPath = path.join('/var/lib/freshell-supervisor/incidents', `${result.incidentId}.closed.json`)
-      const incidentPersisted = rig.runtime.runCommand('docker', [
-        'exec', rig.supervisor.containerId, 'test', '-s', incidentPath,
-      ]) === ''
-      expect(incidentPersisted).toBe(true)
-      const artifact = rig.runtime.runCommand('docker', [
-        'exec', rig.supervisor.containerId, 'cat', incidentPath,
-      ])
-      expect(artifact).not.toContain(providerSessionId)
-      expect(artifact).not.toContain(rig.supervisor.controlSecret)
-
-      const incidentArtifact = JSON.parse(artifact)
+      const incidentArtifact = await rig.lossIncidentEvidence(result.incidentId)
+      expect(incidentArtifact.persisted).toBe(true)
+      expect(incidentArtifact.containsNativeSessionId).toBe(false)
+      expect(incidentArtifact.containsControlSecret).toBe(false)
       expect(incidentArtifact.certificateSha256).toMatch(/^[0-9a-f]{64}$/)
       expect(incidentArtifact.certificate.intentRevision).toBe(before.intentRevision)
       expect(result.view.intentRevision).toBe(before.intentRevision + 1)
-      writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_LOSS_INCIDENT_FILE), incidentArtifact)
       writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_LOSS_ASSERTIONS_FILE), {
         schemaVersion: 2,
         candidateSha: rig.runtime.candidateSha,
