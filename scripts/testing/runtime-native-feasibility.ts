@@ -342,7 +342,7 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
       candidateSha: manifest.candidateSha, ownerId: harness.runId,
       execute: async (caseId) => {
         const amplifierSeed = selection.provider === 'amplifier' && ['exact-resume', 'old-writer', 'native-followup', 'current-native-turn'].includes(caseId)
-        const receiverMode = ['freshcodex', 'freshopencode'].includes(selection.mode ?? '')
+        const receiverMode = ['freshcodex', 'freshopencode'].includes(selection.mode ?? '') || selection.provider === 'codex'
         const receiverSeed = receiverMode && ['exact-resume', 'wrong-root', 'current-native-turn'].includes(caseId)
         const paidCase = selection.case === 'approval-checkpoint'
           || (selection.provider === 'claude' && ['exact-resume', 'fork-root', 'restoration-failure-after-hook'].includes(caseId))
@@ -395,7 +395,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
   if (selection.provider === 'codex' && ['create', 'exact-resume'].includes(caseId)) {
-    return executeManagedReceiverNative(harness, sources, 'codex', caseId)
+    return executeManagedReceiverNative(harness, sources, 'codex', caseId, serverPath, servers)
   }
   if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, selection.mode as 'freshcodex' | 'freshopencode', caseId)
@@ -691,8 +691,11 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
 }
 
 async function executeManagedReceiverNative(harness: RuntimeHarness,
-  sources: { name: string; path: string; sha256: string }[], mode: 'freshcodex' | 'freshopencode' | 'codex', caseId: string): Promise<NativeExperimentOriginal> {
+  sources: { name: string; path: string; sha256: string }[], mode: 'freshcodex' | 'freshopencode' | 'codex', caseId: string, serverPath?: string,
+  servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
   const terminal = mode === 'codex'
+  const requiresController = terminal && caseId === 'exact-resume'
+  if (requiresController && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   const provider = mode === 'freshcodex' || terminal ? 'codex' : 'opencode', scenario = `${mode}-${caseId}`
   const observationSource = terminal ? 'codex_app_server' : 'fresh_provider_handshake'
   const references = ['env_file', 'auth_file', 'ca_file'].map(suffix => {
@@ -719,6 +722,50 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       providerSecretReferences: references, providerLaunchContext: { preparation: provider === 'codex'
         ? { codex: { tui_args: [], sidecar_args: [] } }
         : { opencode: { project_config: [], tui_config: null, inline_config: false } }, config: [] } } } }
+  let managedPreparation: any
+  if (requiresController && serverPath) {
+    const { RustServer } = await import('../../test/e2e-browser/helpers/rust-server.js')
+    const server = new RustServer({ homeDir: sourceHome, preserveHomeOnStop: true,
+      env: { FRESHELL_BIND_HOST: '0.0.0.0', FRESHELL_MANAGED_RUNTIME_V1: '1',
+        FRESHELL_RUNTIME_CONTROL_SOCKET: supervisor.controlSocket,
+        FRESHELL_RUNTIME_CONTROL_SECRET_FILE: supervisor.controlSecretFile,
+        FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'codex',
+        FRESHELL_MANAGED_CODEX_ONECLI_ENV_FILE: references[0]!.sourcePath,
+        FRESHELL_MANAGED_CODEX_ONECLI_AUTH_FILE: references[1]!.sourcePath,
+        FRESHELL_MANAGED_CODEX_ONECLI_CA_FILE: references[2]!.sourcePath },
+      stripEnvPrefixes: ['GEMINI_', 'GOOGLE_API_KEY', 'ANTHROPIC_', 'CLAUDE_', 'OPENAI_', 'LUNAROUTE_'],
+      setupHome: async selectedHome => {
+        const config = path.join(selectedHome, '.freshell'); fs.mkdirSync(config, { recursive: true, mode: 0o700 })
+        fs.writeFileSync(path.join(config, 'config.json'), JSON.stringify({ version: 1, settings: {
+          defaultCwd: workspace, codingCli: { enabledProviders: ['codex'], providers: { codex: { model: 'gpt-5.6-luna', reasoningEffort: 'low' } } },
+        } }), { mode: 0o600 })
+      } })
+    const owned = { server, scope: scenario, pid: undefined as number | undefined }; servers.push(owned)
+    const previous = process.env.FRESHELL_E2E_RUST_SERVER_BIN
+    process.env.FRESHELL_E2E_RUST_SERVER_BIN = serverPath
+    try {
+      const info = await server.start(); owned.pid = info.pid
+      harness.writeArtifact(`${scenario}-server-private.json`, { ...info, ...server.processEvidence(),
+        executableSha256: createHash('sha256').update(fs.readFileSync(serverPath)).digest('hex') })
+    } finally {
+      if (previous === undefined) delete process.env.FRESHELL_E2E_RUST_SERVER_BIN
+      else process.env.FRESHELL_E2E_RUST_SERVER_BIN = previous
+    }
+    managedPreparation = await new Promise((resolve, reject) => {
+      const socket = createConnection(path.join(path.dirname(supervisor.controlSocket), 'mcp.sock')), chunks: Buffer[] = []
+      socket.setTimeout(5_000, () => socket.destroy(new Error('actual native capability issue timed out')))
+      socket.once('connect', () => socket.end(JSON.stringify({ action: 'issue', controlSecret: supervisor.controlSecret,
+        soulId, incarnationId: null, grantId: null, provider: 'codex', tuiSource: null, workspace, cwd: workspace })))
+      socket.on('data', (chunk: Buffer) => chunks.push(chunk)); socket.once('error', reject)
+      socket.once('end', () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))) } catch { reject(new Error('actual native capability issue failed')) }
+      })
+    })
+    harness.writeArtifact(`${scenario}-managed-preparation-private.json`, managedPreparation)
+    if (!managedPreparation.context?.mcpCapability || !managedPreparation.secretReferences?.length) {
+      throw new Error('actual native managed capability/preparation missing')
+    }
+  }
   const { freshAgent, ...commonParameters } = request.params
   const terminalEffortArgs = ['-c', 'model_reasoning_effort="low"']
   const selectedRequest = terminal ? { method: 'launch', params: { ...commonParameters,
@@ -727,7 +774,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       env: { HOME: '/home/freshell/provider', TERM: 'xterm-256color' }, cwd: workspace, workspacePath: workspace,
       runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
       providerModel: settings.model, providerReasoningEffort: 'low', providerPermissionMode: 'on-request', providerSandbox: 'workspace-write',
-      providerSecretReferences: references, providerLaunchContext: freshAgent.providerLaunchContext } } } : request
+      providerSecretReferences: managedPreparation?.secretReferences ?? references, providerLaunchContext: managedPreparation?.context ?? freshAgent.providerLaunchContext } } } : request
   harness.writeArtifact(`${scenario}-request.json`, selectedRequest)
   const launch = await harness.adminOk(supervisor, selectedRequest)
   harness.writeArtifact(`${scenario}-launch.json`, launch)
