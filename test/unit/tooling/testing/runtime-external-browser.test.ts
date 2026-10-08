@@ -19,6 +19,7 @@ import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type Sup
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 import { stopManagedRuntimeSoul } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { structuredChaosLog } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
+import type { BrokerReceipt } from '../../../../scripts/testing/runtime-test-broker.js'
 
 beforeEach(() => execute.mockReset())
 
@@ -1177,6 +1178,54 @@ describe('closed external owner control', () => {
     await expect(control({ ...request, operationId: 'stale-worker', action: 'crash-provider-worker', handle })).rejects.toThrow(/current/)
     expect(version).toHaveBeenCalledTimes(2)
     expect(kill).toHaveBeenCalledOnce()
+  })
+  it('observes only the fixed loss credential file with the original real Node hash probe', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-loss-credential-'))
+    try {
+      const { owned, context, request, inventory } = fixture()
+      const row = { soulId: 'credential-soul', incarnationId: 'credential-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'credential-boot', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+      const credential = path.join(directory, 'auth.json')
+      const mapper = path.join(directory, 'map-provider-file.cjs')
+      const nativePath = '/home/freshell/provider/.local/share/opencode/auth.json'
+      await fsp.writeFile(mapper, `const fs=require('node:fs');for(const name of ['lstatSync','readFileSync']){const original=fs[name];fs[name]=function(file,...args){return original.call(fs,file===${JSON.stringify(nativePath)}?process.env.TEST_LOSS_CREDENTIAL:file,...args)}}`)
+      await fsp.writeFile(credential, 'private credential fixture\n', { mode: 0o600 })
+      const exec = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (_id, args) => {
+        const child = spawnSync(process.execPath, ['--require', mapper, ...args.slice(1)], {
+          env: { ...process.env, TEST_LOSS_CREDENTIAL: credential }, encoding: 'utf8' })
+        if (child.status !== 0) throw new Error(child.stderr)
+        return child.stdout
+      })
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+        await control(JSON.parse(String(init.body)))), { status: 200 }))
+      const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+      const enclosure = rig.runtimeEnclosureHandle(row)
+      const observed = await rig.lossCredentialEvidence(enclosure)
+      expect(observed).toEqual({ path: nativePath, exists: true,
+        sha256: createHash('sha256').update(await fsp.readFile(credential)).digest('hex') })
+      expect(JSON.stringify(observed)).not.toContain('private credential fixture')
+      await fsp.writeFile(credential, 'changed private credential fixture\n')
+      const changed = await rig.lossCredentialEvidence(enclosure)
+      expect(changed.sha256).toBe(createHash('sha256').update(await fsp.readFile(credential)).digest('hex'))
+      expect(changed.sha256).not.toBe(observed.sha256)
+      await fsp.unlink(credential)
+      await expect(rig.lossCredentialEvidence(enclosure)).resolves.toEqual({ path: nativePath, exists: false,
+        sha256: createHash('sha256').update('absent').digest('hex') })
+      exec.mockClear()
+      await expect(control({ ...request, action: 'loss-credential', enclosure: { ...enclosure, hostBootId: 'foreign-boot' } })).rejects.toThrow(/current/)
+      inventory.mockResolvedValue([{ ...row, provider: 'codex' }])
+      await expect(control({ ...request, operationId: 'foreign-credential-provider', action: 'loss-credential', enclosure })).rejects.toThrow(/OpenCode/)
+      await expect(control({ ...request, operationId: 'foreign-credential-path', action: 'loss-credential', enclosure,
+        filePath: '/foreign/credential' })).rejects.toThrow(/operation/)
+      expect(exec).not.toHaveBeenCalled()
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
   })
   it('runs the closed Phase3 effect operations over the same pre-native enclosure', async () => {
     const { owned, context, request } = fixture()

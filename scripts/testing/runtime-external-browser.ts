@@ -20,7 +20,8 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema,
   FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
   RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
-  RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
+  OpencodeLossCredentialEvidenceSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -33,6 +34,7 @@ import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionSta
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
 import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
 import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts, RuntimeChaosReceiptArtifact } from './runtime-sandbox.js'
+import type { OpencodeLossCredentialEvidence } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -868,6 +870,9 @@ export class ExternalManagedRuntimeRig {
     return this.rpc('opencode-version', z.object({ provider: z.literal('opencode'),
       version: z.string().regex(/^\d+\.\d+\.\d+$/) }).strict(), { enclosure: this.runtimeEnclosureHandle(handle) })
   }
+  async lossCredentialEvidence(enclosure: RuntimeEnclosureHandle): Promise<OpencodeLossCredentialEvidence> {
+    return this.rpc('loss-credential', OpencodeLossCredentialEvidenceSchema, { enclosure })
+  }
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {
     await this.rpc('crash-provider-worker', CompletedOwnerOperationSchema, { handle })
   }
@@ -1102,6 +1107,10 @@ export function createExternalRuntimeControl(
         result = await owner.publishChaosEvidence(handle(), request.chaosEvidence)
         break
       case 'chaos-receipt': result = await owner.finalizeChaosReceipt(); break
+      case 'loss-credential':
+        if (!request.enclosure) throw new Error('exact runtime enclosure required')
+        result = await owner.lossCredentialEvidence(request.enclosure)
+        break
       case 'incident-matches-soul':
         if (!request.incidentId) throw new Error('observed incident identity required')
         result = await owner.incidentMatchesSoul(handle(), request.incidentId)

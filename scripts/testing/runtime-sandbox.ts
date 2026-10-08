@@ -642,6 +642,26 @@ export const RuntimeChaosEvidenceArtifactsSchema = z.object({
 export type RuntimeChaosEvidenceArtifacts = z.infer<typeof RuntimeChaosEvidenceArtifactsSchema>
 export const RuntimeChaosReceiptArtifactSchema = z.object({ artifactRef: z.string().regex(/^phase5-chaos:[a-f0-9]{64}$/) }).strict()
 export type RuntimeChaosReceiptArtifact = z.infer<typeof RuntimeChaosReceiptArtifactSchema>
+export const OpencodeLossCredentialEvidenceSchema = z.object({
+  path: z.literal('/home/freshell/provider/.local/share/opencode/auth.json'), exists: z.boolean(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict()
+export type OpencodeLossCredentialEvidence = z.infer<typeof OpencodeLossCredentialEvidenceSchema>
+const OPENCODE_LOSS_CREDENTIAL_SCRIPT = String.raw`
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const target = process.argv[1];
+let exists = false;
+let digest = crypto.createHash('sha256').update('absent').digest('hex');
+try {
+  const stat = fs.lstatSync(target);
+  exists = stat.isFile();
+  if (exists) digest = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error;
+}
+process.stdout.write(JSON.stringify({ path: target, exists, sha256: digest }));
+`
 
 export function writePrivateRuntimeChaosJsonl(filePath: string, rows: readonly RuntimeChaosLog[]): void {
   if (rows.length === 0) throw new Error('refusing to persist an empty chaos log')
@@ -678,7 +698,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'loss-credential', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -3246,6 +3266,13 @@ export class ManagedRuntimeOwner {
     const version = (await this.ownedProviderExec(handle.containerId, ['opencode', '--version'])).trim()
     if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('OpenCode version reply is invalid')
     return { provider: 'opencode', version }
+  }
+
+  async lossCredentialEvidence(handle: RuntimeEnclosureHandle): Promise<OpencodeLossCredentialEvidence> {
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '-e', OPENCODE_LOSS_CREDENTIAL_SCRIPT,
+      '/home/freshell/provider/.local/share/opencode/auth.json'])
+    return OpencodeLossCredentialEvidenceSchema.parse(JSON.parse(raw))
   }
 
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {

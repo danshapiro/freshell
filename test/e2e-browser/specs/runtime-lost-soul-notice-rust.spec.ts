@@ -137,29 +137,6 @@ function dataOf(result: any, kind: string): any {
   return result.data
 }
 
-async function providerFileEvidence(rig: ManagedRuntimeBrowserRig, containerId: string, filePath: string): Promise<{
-  path: string
-  exists: boolean
-  sha256: string
-}> {
-  const script = String.raw`
-const crypto = require('node:crypto');
-const fs = require('node:fs');
-const target = process.argv[1];
-let exists = false;
-let digest = crypto.createHash('sha256').update('absent').digest('hex');
-try {
-  const stat = fs.lstatSync(target);
-  exists = stat.isFile();
-  if (exists) digest = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
-} catch (error) {
-  if (error.code !== 'ENOENT') throw error;
-}
-process.stdout.write(JSON.stringify({ path: target, exists, sha256: digest }));
-`
-  return JSON.parse((await rig.ownedProviderExec(containerId, ['node', '-e', script, filePath])))
-}
-
 async function exactAbsenceCheck(rig: ManagedRuntimeBrowserRig, containerId: string, target: string) {
   const script = String.raw`
 const fs = require('node:fs');
@@ -255,7 +232,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       expect(workerPid).toBeGreaterThan(1)
 
       const credentialPath = '/home/freshell/provider/.local/share/opencode/auth.json'
-      const credentialBefore = (await providerFileEvidence(rig, before.containerId, credentialPath))
+      const credentialBefore = await rig.lossCredentialEvidence(rig.runtimeEnclosureHandle(before))
 
       // Retain only a diagnostic marker; remove OpenCode session DB/artifacts
       // and all Freshell checkpoint copies without reading or mutating host
@@ -300,7 +277,7 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
         'sh', '-lc', 'cat "$HOME/p5-diagnostic-only"',
       ])).trim() === diagnostic
       expect(diagnosticOnlyRetained).toBe(true)
-      const credentialAfter = (await providerFileEvidence(rig, before.containerId, credentialPath))
+      const credentialAfter = await rig.lossCredentialEvidence(rig.runtimeEnclosureHandle(before))
       expect(credentialAfter).toEqual(credentialBefore)
       const exactAbsenceChecks = await Promise.all([
         '/home/freshell/provider/.local/share/opencode/opencode.db',
