@@ -1887,14 +1887,26 @@ mod provider_launch_context_tests {
     }
 
     #[test]
-    fn managed_claude_fork_fault_requires_a_bound_exact_resume() {
+    fn managed_claude_fork_requires_one_exact_root_selector() {
         let root = "112fa138-8ed5-4f98-8977-4444e8433207";
         let args = vec!["--resume".into(), root.into(), "--fork-session".into()];
         assert!(validate_managed_terminal_args("claude", &args).is_ok());
         assert!(durable_managed_terminal_args("claude", args, None).is_ok());
+        assert!(validate_managed_terminal_args(
+            "claude",
+            &["--session-id".into(), root.into(), "--fork-session".into()]
+        )
+        .is_ok());
         for invalid in [
             vec!["--fork-session".into()],
-            vec!["--session-id".into(), root.into(), "--fork-session".into()],
+            vec![
+                "--session-id".into(),
+                root.into(),
+                "--resume".into(),
+                root.into(),
+                "--fork-session".into(),
+            ],
+            vec!["--model".into(), "--resume".into(), "--fork-session".into()],
             vec![
                 "--resume".into(),
                 root.into(),
@@ -2573,16 +2585,12 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
         )
     };
     let mut index = 0;
+    let mut claude_fork = false;
+    let mut claude_root_selectors = 0;
     while index < args.len() {
         let flag = args[index].as_str();
         if mode == "claude" && flag == "--fork-session" {
-            if !args
-                .windows(2)
-                .any(|pair| pair[0] == "--resume" && safe_selector(&pair[1]))
-                || args.iter().any(|argument| argument == "--session-id")
-            {
-                return Err(invalid());
-            }
+            claude_fork = true;
             index += 1;
             continue;
         }
@@ -2622,7 +2630,10 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
                 value.as_str(),
                 ".claude/freshell-mcp.json" | "/home/freshell/provider/.claude/freshell-mcp.json"
             ),
-            ("claude", "--session-id" | "--resume") => safe_selector(value),
+            ("claude", "--session-id" | "--resume") => {
+                claude_root_selectors += 1;
+                safe_selector(value)
+            }
             ("claude", "--model" | "--effort" | "--permission-mode") => safe_selector(value),
             ("claude", "--plugin-dir") => safe_selector(value),
             ("codex", "-c") => {
@@ -2653,6 +2664,9 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
             return Err(invalid());
         }
         index += 2;
+    }
+    if claude_fork && claude_root_selectors != 1 {
+        return Err(invalid());
     }
     Ok(())
 }
