@@ -15,6 +15,7 @@ import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   prepareOwnedOpenCodeTuiSource,
   openCodeTuiDisposalObserver,
+  openCodeTuiOwnedStoreFault,
   runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeReceiverLoadFaultWrapper, nativeReceiverLoadFaultEntry, writeOwnedNativeReceiverControl, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
   amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, receiverWrongRootEvidence, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
@@ -34,6 +35,57 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['root-load-error', 'history-load-error'])('damages only the owned exact native %s source while preserving the sealed source (controlled UID driver only)', fault => {
+    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+    fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
+    try {
+      const source = prepareOwnedOpenCodeTuiSource(process.cwd(), ownedRoot, fault, randomUUID())
+      const originalSha = createHash('sha256').update(fs.readFileSync(source.databasePath)).digest('hex')
+      const home = path.join(ownedRoot, 'provider')
+      const databasePath = path.join(home, '.local/share/opencode/opencode.db')
+      fs.mkdirSync(path.dirname(databasePath), { recursive: true })
+      fs.copyFileSync(source.databasePath, databasePath)
+      // Only the controlled driver substitutes UID getters. The real helper
+      // runs under the provider UID in its owned container; this is not proof.
+      const actual = JSON.parse(execFileSync('python3', ['-c',
+        `import os;os.getuid=lambda:65534;os.getgid=lambda:0;exec(${JSON.stringify(openCodeTuiOwnedStoreFault)})`,
+        fault, source.rootId, source.workspace], { env: { ...process.env, HOME: home }, encoding: 'utf8' }))
+      const database = new DatabaseSync(databasePath, { readOnly: true })
+      try {
+        if (fault === 'root-load-error') expect(database.prepare('SELECT count(*) AS count FROM session WHERE id=?').get(source.rootId)?.count).toBe(0)
+        else {
+          expect(database.prepare('SELECT count(*) AS count FROM message WHERE session_id=? AND NOT json_valid(data)').get(source.rootId)?.count).toBe(1)
+          expect(database.prepare('SELECT count(*) AS count FROM message WHERE session_id=?').get(source.rootId)?.count).toBe(2)
+          expect(database.prepare('SELECT parent_id FROM session WHERE id=?').get(source.rootId)?.parent_id).toBe(null)
+        }
+      } finally { database.close() }
+      expect(actual.rootSessionId).toBe(source.rootId)
+      expect(actual.changedRows).toBe(1)
+      expect(actual.sameDatabaseIdentity).toBe(true)
+      expect(createHash('sha256').update(fs.readFileSync(source.databasePath)).digest('hex')).toBe(originalSha)
+    } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
+  })
+  it.each(['foreign-home', 'foreign-workspace', 'foreign-root', 'parent-root', 'wrong-count', 'symlink-database'])('refuses owned native store damage on %s before mutation (controlled UID driver only)', defect => {
+    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+    fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
+    try {
+      const source = prepareOwnedOpenCodeTuiSource(process.cwd(), ownedRoot, 'root-load-error', randomUUID())
+      const home = path.join(ownedRoot, 'provider'), databasePath = path.join(home, '.local/share/opencode/opencode.db')
+      fs.mkdirSync(path.dirname(databasePath), { recursive: true }); fs.copyFileSync(source.databasePath, databasePath)
+      const database = new DatabaseSync(databasePath)
+      try {
+        if (defect === 'parent-root') database.prepare('UPDATE session SET parent_id=? WHERE id=?').run(source.childId, source.rootId)
+        if (defect === 'wrong-count') database.prepare('DELETE FROM message WHERE session_id=? AND id=?').run(source.rootId, source.lastMessageId)
+      } finally { database.close() }
+      if (defect === 'symlink-database') { fs.renameSync(databasePath, databasePath + '.original'); fs.symlinkSync(databasePath + '.original', databasePath) }
+      const before = createHash('sha256').update(fs.readFileSync(databasePath)).digest('hex')
+      expect(() => execFileSync('python3', ['-c',
+        `import os;os.getuid=lambda:65534;os.getgid=lambda:0;exec(${JSON.stringify(openCodeTuiOwnedStoreFault)})`, 'root-load-error',
+        defect === 'foreign-root' ? 'ses_absent' : source.rootId, defect === 'foreign-workspace' ? '/operator/cwd' : source.workspace],
+      { env: { ...process.env, HOME: defect === 'foreign-home' ? '/operator/native-home' : home }, stdio: 'pipe' })).toThrow()
+      expect(createHash('sha256').update(fs.readFileSync(databasePath)).digest('hex')).toBe(before)
+    } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
+  })
   it.each(['current', 'stale-incarnation', 'stale-nonce', 'stale-generation', 'already-published', 'inactive', 'wrong-requested-root'])('uses the supported plugin manager to dispose a pending owned native read without publishing identity: %s (controlled API only)', async (fault) => {
     const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
     const workspace = path.join(ownedRoot, 'opencode-disposal-workspace'), home = path.join(ownedRoot, 'provider')

@@ -1932,6 +1932,45 @@ database.rollback();database.close()
 // A qualification-only module, selected through the ordinary owned TUI
 // config. It must use the pinned public plugin lifecycle, never publish a
 // native identity or synthesize a loader acknowledgement.
+export const openCodeTuiOwnedStoreFault = String.raw`
+import os,sys,pathlib,re,sqlite3,json
+case,root,workspace=sys.argv[1:]
+assert os.getuid()==65534 and os.getgid()==0
+assert case in ['root-load-error','history-load-error'] and re.fullmatch(r'ses_[A-Za-z0-9]+',root)
+home=pathlib.Path(os.environ['HOME'])
+assert str(home)=='/home/freshell/provider' or re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9-]{12}/provider',str(home))
+assert re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9-]{12}/opencode-'+case+r'-workspace',workspace)
+file=home/'.local/share/opencode/opencode.db'
+assert file.is_file() and not file.is_symlink() and file.resolve()==file
+before=file.stat()
+database=sqlite3.connect('file:'+str(file)+'?mode=rw',uri=True)
+try:
+ database.execute('PRAGMA foreign_keys=ON');database.execute('BEGIN IMMEDIATE')
+ row=database.execute('SELECT id,parent_id,directory FROM session WHERE id=?',(root,)).fetchone()
+ assert row and row==(root,None,workspace)
+ roots_before=database.execute('SELECT count(*) FROM session WHERE id=?',(root,)).fetchone()[0]
+ count=database.execute('SELECT count(*) FROM message WHERE session_id=?',(root,)).fetchone()[0]
+ assert count==2
+ if case=='root-load-error':
+  changed=database.execute('DELETE FROM session WHERE id=?',(root,)).rowcount
+ else:
+  selected=database.execute('SELECT id FROM message WHERE session_id=? ORDER BY id LIMIT 1',(root,)).fetchone()
+  assert selected
+  changed=database.execute('UPDATE message SET data=? WHERE id=? AND session_id=?',('{"owned_native_fault":',selected[0],root)).rowcount
+ assert changed==1
+ database.commit()
+ roots_after=database.execute('SELECT count(*) FROM session WHERE id=?',(root,)).fetchone()[0]
+ messages_after=database.execute('SELECT count(*) FROM message WHERE session_id=?',(root,)).fetchone()[0]
+ malformed_after=database.execute('SELECT count(*) FROM message WHERE session_id=? AND NOT json_valid(data)',(root,)).fetchone()[0]
+ assert (roots_after==0 if case=='root-load-error' else roots_after==1 and messages_after==2 and malformed_after==1)
+finally:database.close()
+after=file.stat()
+same_identity=(before.st_dev,before.st_ino)==(after.st_dev,after.st_ino)
+assert same_identity
+print(json.dumps({'schemaVersion':1,'caseId':case,'rootSessionId':root,'changedRows':changed,'sameDatabaseIdentity':same_identity,
+ 'rootRowsBefore':roots_before,'rootRowsAfter':roots_after,'messageRowsBefore':count,'messageRowsAfter':messages_after,'malformedMessagesAfter':malformed_after}))
+`
+
 export const openCodeTuiDisposalObserver = String.raw`
 import fs from 'node:fs'
 import path from 'node:path'
