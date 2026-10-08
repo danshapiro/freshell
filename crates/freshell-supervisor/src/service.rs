@@ -56,6 +56,23 @@ pub(crate) struct LaunchWorkload {
     pub(crate) resume_spec: Option<ResumeSpec>,
 }
 
+impl LaunchWorkload {
+    fn opencode_adoption_required(&self, provider: &str) -> bool {
+        provider == "opencode"
+            && (self.resume_spec.as_ref().is_some_and(|spec| {
+                spec.provider_session.provider == "opencode"
+                    && spec
+                        .opencode_adoption_baseline
+                        .as_ref()
+                        .is_some_and(|baseline| baseline.validate().is_ok())
+            }) || self.terminal.as_ref().is_some_and(|terminal| {
+                terminal.mode == "opencode"
+                    && terminal.opencode_transfer.is_some()
+                    && terminal.validate().is_ok()
+            }))
+    }
+}
+
 struct McpCapabilityRequest<'a> {
     action: &'a str,
     soul_id: &'a SoulId,
@@ -1205,16 +1222,11 @@ impl Supervisor {
                 crate::registry::deterministic_fresh_agent_fixture(&native_context.provider, agent)
             });
         if requires_native_observation {
-            let adoption_required = workload
-                .resume_spec
-                .as_ref()
-                .is_some_and(|spec| spec.opencode_adoption_baseline.is_some());
-            let wait = Box::pin(self.wait_for_native_identity(
-                &workload.soul_id,
+            let wait = Box::pin(self.wait_for_native_startup(
+                &workload,
                 handle.incarnation_id(),
+                &native_context,
                 prepared.intent_revision,
-                crate::recovery::native_identity_wait_timeout(adoption_required),
-                false,
             ))
             .await;
             let observed = match wait {
@@ -2668,6 +2680,57 @@ impl Supervisor {
         }
     }
 
+    async fn wait_for_native_startup(
+        &self,
+        workload: &LaunchWorkload,
+        incarnation_id: &IncarnationId,
+        context: &crate::registry::RecoveryContext,
+        intent_revision: u64,
+    ) -> crate::recovery::NativeIdentityWait {
+        use crate::recovery::NativeIdentityWait;
+        let adoption_required = workload.opencode_adoption_required(&context.provider);
+        let result = self
+            .wait_for_native_identity(
+                &workload.soul_id,
+                incarnation_id,
+                intent_revision,
+                crate::recovery::native_identity_wait_timeout(adoption_required),
+                false,
+            )
+            .await;
+        let (outcome, adoption_pending, elapsed_ms) = match &result {
+            NativeIdentityWait::Observed { elapsed_ms, .. } => ("observed", false, elapsed_ms),
+            NativeIdentityWait::ProviderExited { elapsed_ms } => {
+                ("provider_exited", false, elapsed_ms)
+            }
+            NativeIdentityWait::HostUnavailable { elapsed_ms, .. } => {
+                ("host_unavailable", false, elapsed_ms)
+            }
+            NativeIdentityWait::TimedOut {
+                adoption_pending,
+                elapsed_ms,
+            } => ("timed_out", *adoption_pending, elapsed_ms),
+            NativeIdentityWait::StopIntent { elapsed_ms } => ("stop_intent", false, elapsed_ms),
+            NativeIdentityWait::IntentChanged { elapsed_ms } => {
+                ("intent_changed", false, elapsed_ms)
+            }
+        };
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.native_startup_wait_finished",
+            serde_json::json!({
+                "severity": if matches!(outcome, "observed" | "stop_intent" | "intent_changed") { "info" } else { "warning" },
+                "soulId": workload.soul_id, "incarnationId": incarnation_id, "provider": context.provider,
+                "intentRevision": intent_revision, "evidenceRevision": context.evidence_revision,
+                "executionGeneration": context.native_identity_launch.as_ref().map(|launch| launch.execution_generation),
+                "launchNonce": context.native_identity_launch.as_ref().map(|launch| &launch.launch_nonce),
+                "outcome": outcome, "reason": outcome, "adoptionPending": adoption_pending, "elapsedMs": elapsed_ms,
+                "waitClass": if adoption_required { "opencode_adoption" } else { "ordinary" },
+            }),
+        );
+        result
+    }
+
     pub(crate) async fn host_status(
         &self,
         incarnation_id: IncarnationId,
@@ -3958,6 +4021,282 @@ mod opencode_transfer_restart_tests {
             files,
             total_bytes: payload.len() as u64,
         }
+    }
+
+    #[tokio::test]
+    async fn initial_import_waits_for_current_observation_under_existing_adoption_policy() {
+        use crate::recovery::NativeIdentityWait;
+        use freshell_runtime_protocol::{
+            NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource,
+            OpenCodeAdoptionBaseline, OpenCodeAdoptionStatus,
+        };
+        for case in [
+            "initial",
+            "saved",
+            "ordinary",
+            "wrong-mode",
+            "invalid",
+            "stop",
+            "stale-intent",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let prepared =
+                crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            let runtime = dir.path().join("owned-host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+            conn.execute("UPDATE incarnations SET runtime_dir=?1,execution_generation=1,fixture_kind=NULL WHERE incarnation_id=?2",
+                params![runtime.to_string_lossy(), prepared.incarnation_id.as_str()]).unwrap();
+            conn.execute(
+                "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+            registry
+                .record_native_session(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    "ses_exact".into(),
+                )
+                .await
+                .unwrap();
+            let context = registry.recovery_context(soul.clone()).await.unwrap();
+            let binding = registry
+                .bind_native_identity_launch(NativeIdentityLaunch {
+                    incarnation_id: prepared.incarnation_id.clone(),
+                    launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+                    evidence_revision: context.evidence_revision,
+                    execution_generation: 1,
+                    requested_native_session_id: Some("ses_exact".into()),
+                })
+                .await
+                .unwrap();
+            let context = registry.recovery_context(soul.clone()).await.unwrap();
+            let mut terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                "terminalId":"terminal-import", "streamId":"stream-import", "mode":"opencode", "program":"opencode",
+                "cwd":"/workspace", "workspacePath":"/workspace", "projectKey":"owned-import",
+                "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24,
+                "env":{"HOME":"/home/freshell/provider"}, "resumeSessionId":"ses_exact",
+                "opencodeTransfer":descriptor(), "opencodeTransferAttemptId":ATTEMPT_A,
+            })).unwrap();
+            terminal.validate().unwrap();
+            let mut saved = None;
+            if case == "saved" {
+                let mut spec = freshell_agent_runtime::build_resume_spec(
+                    freshell_agent_runtime::ResumeSpecInput {
+                        provider: "opencode",
+                        provider_store_id: &context.provider_store_id,
+                        native_session_id: "ses_exact",
+                        terminal: &terminal,
+                        provider_version: Some("1.18.21".into()),
+                        creation_seed_ref: context.creation_seed_ref.clone(),
+                        checkpoint_revision: 0,
+                        evidence_revision: context.evidence_revision,
+                        never_dispatched: false,
+                    },
+                )
+                .unwrap();
+                spec.opencode_adoption_baseline =
+                    Some(OpenCodeAdoptionBaseline::from_descriptor(descriptor()).unwrap());
+                saved = Some(spec);
+            }
+            if matches!(case, "ordinary" | "saved") {
+                terminal.opencode_transfer = None;
+                terminal.opencode_transfer_attempt_id = None;
+            } else if case == "wrong-mode" {
+                terminal.mode = "claude".into();
+                assert!(terminal.validate().is_err());
+            } else if case == "invalid" {
+                terminal.opencode_transfer.as_mut().unwrap().bundle_sha256 = "invalid".into();
+                assert!(terminal.validate().is_err());
+            }
+            let workload = LaunchWorkload {
+                soul_id: soul.clone(),
+                fixture: None,
+                terminal: Some(terminal),
+                fresh_agent: None,
+                resume_spec: saved,
+            };
+            let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+            let observation = NativeIdentityObservation {
+                native_session_id: "ses_exact".into(),
+                incarnation_id: binding.incarnation_id.clone(),
+                launch_nonce: binding.launch_nonce.clone(),
+                evidence_revision: binding.evidence_revision,
+                source: NativeIdentitySource::OpencodeTui,
+                evidence_digest: "a".repeat(64),
+            };
+            let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let limits = context.requested_limits;
+            let started = Instant::now();
+            let responder = tokio::spawn(async move {
+                let boot = HostBootId::new();
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    let observed =
+                        (started.elapsed() >= Duration::from_secs(9)).then(|| observation.clone());
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => HostResult::Hello {
+                            proof: host_proof(
+                                b"synthetic-secret",
+                                &challenge,
+                                &boot,
+                                &incarnation_id,
+                            ),
+                            host_boot_id: boot.clone(),
+                            capabilities: vec!["native-identity-observation-v1".into()],
+                            effective_limits: limits,
+                        },
+                        HostCommand::Status { .. } => HostResult::Status {
+                            native_identity_observation: observed,
+                            host_boot_id: boot.clone(),
+                            worker_pid: Some(123),
+                            worker_launch_count: 1,
+                            max_control_epoch: 1,
+                            max_execution_generation: 1,
+                            fixture_evidence: serde_json::json!({}),
+                            exited: false,
+                            native_session_id: Some("ses_exact".into()),
+                            opencode_transfer_receipt: None,
+                            opencode_adoption: OpenCodeAdoptionStatus::AwaitingObservation,
+                        },
+                        _ => panic!("unexpected native wait command"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            if case == "stop" {
+                registry.begin_stop(soul.clone()).await.unwrap();
+            }
+            if case == "stale-intent" {
+                conn.execute(
+                    "UPDATE souls SET intent_revision=intent_revision+1 WHERE soul_id=?1",
+                    [soul.as_str()],
+                )
+                .unwrap();
+            }
+            let result = supervisor
+                .wait_for_native_startup(
+                    &workload,
+                    &prepared.incarnation_id,
+                    &context,
+                    prepared.intent_revision,
+                )
+                .await;
+            responder.abort();
+            assert!(responder.await.unwrap_err().is_cancelled());
+            if matches!(case, "initial" | "saved") {
+                assert!(
+                    matches!(result, NativeIdentityWait::Observed { .. }),
+                    "{case}: {result:?}"
+                );
+            } else if case == "stop" {
+                assert!(
+                    matches!(result, NativeIdentityWait::StopIntent { .. }),
+                    "{result:?}"
+                );
+            } else if case == "stale-intent" {
+                assert!(
+                    matches!(result, NativeIdentityWait::IntentChanged { .. }),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, NativeIdentityWait::TimedOut { .. }),
+                    "{case}: {result:?}"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(9),
+                    "ordinary wait must end before the delayed observation"
+                );
+            }
+            let persisted: Option<String> = conn
+                .query_row(
+                    "SELECT native_identity_observation FROM incarnations WHERE incarnation_id=?1",
+                    [prepared.incarnation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                persisted.is_none(),
+                "waiting cannot publish outside the activation transaction"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_startup_failure_records_its_typed_subtype_without_host_error_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fixture_kind=NULL,runtime_dir=?1 WHERE incarnation_id=?2",
+            params![
+                dir.path().join("private-native-detail").to_string_lossy(),
+                prepared.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let workload = LaunchWorkload {
+            soul_id: soul.clone(),
+            fixture: None,
+            terminal: None,
+            fresh_agent: None,
+            resume_spec: None,
+        };
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry);
+        let result = supervisor
+            .wait_for_native_startup(
+                &workload,
+                &prepared.incarnation_id,
+                &context,
+                prepared.intent_revision,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            crate::recovery::NativeIdentityWait::HostUnavailable { .. }
+        ));
+        let text = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
+        let event = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["event"] == "supervisor.native_startup_wait_finished")
+            .unwrap();
+        assert_eq!(event["data"]["outcome"], "host_unavailable");
+        assert_eq!(event["data"]["waitClass"], "ordinary");
+        assert_eq!(event["data"]["soulId"], soul.as_str());
+        assert_eq!(
+            event["data"]["incarnationId"],
+            prepared.incarnation_id.as_str()
+        );
+        assert_eq!(event["data"]["severity"], "warning");
+        assert!(!text.contains("private-native-detail"));
+        assert!(event["data"]["message"].is_null());
     }
 
     fn chunk(descriptor: &OpenCodeTransferDescriptor) -> OpenCodeTransferChunk {
