@@ -1478,9 +1478,9 @@ impl FreshOpencodeState {
             }
         };
         let base = manager
-            .base_url()
+            .ensure_started()
             .await
-            .ok_or("native OpenCode daemon is unavailable")?;
+            .map_err(|error| error.to_string())?;
         let route = msg.cwd.clone();
         let budget = crate::resolve_probe_timeout_ms(
             None,
@@ -12661,8 +12661,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn managed_native_bootstrap_creates_and_loads_before_any_prompt() {
+    async fn cold_native_bootstrap_runtime() -> (FreshOpencodeState, Arc<NativeBootstrapHttp>) {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         let owner = FreshAgentState::new(Arc::new("owned-native".into()), Arc::new(tx));
         let http = Arc::new(NativeBootstrapHttp {
@@ -12680,9 +12679,57 @@ mod tests {
             },
             ServeConfig::default(),
         );
-        manager.ensure_started().await.unwrap();
+        assert!(manager.base_url().await.is_none());
         owner.set_manager_for_test(manager).await;
-        let runtime = FreshOpencodeState::new(owner);
+        (FreshOpencodeState::new(owner), http)
+    }
+
+    #[tokio::test]
+    async fn managed_native_resume_starts_cold_daemon_and_loads_before_any_prompt() {
+        let (runtime, http) = cold_native_bootstrap_runtime().await;
+        let expected_root = "ses_existing_native_root";
+        http.inner
+            .created
+            .lock()
+            .unwrap()
+            .insert(expected_root.into());
+        let mut request = create_msg("managed-cold-native-resume");
+        request.resume_session_id = Some(expected_root.into());
+        let actual = runtime
+            .prepare_managed_native_session(request)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected_root);
+        assert!(runtime.has_live_session(expected_root).await);
+        let requests = http.requests.lock().unwrap().clone();
+        assert!(requests
+            .iter()
+            .any(|(post, url)| !post && url.contains("/global/health")));
+        assert!(
+            requests
+                .iter()
+                .any(|(post, url)| !post
+                    && url.contains(&format!("/session/{expected_root}/message")))
+        );
+        assert!(!requests
+            .iter()
+            .any(|(post, url)| *post && (url.ends_with("/session") || url.contains("/session?"))));
+        assert!(!requests
+            .iter()
+            .any(|(_, url)| url.contains("/prompt_async")));
+        let session = runtime
+            .sessions
+            .lock()
+            .await
+            .get(expected_root)
+            .unwrap()
+            .clone();
+        assert!(session.lock().await.turn_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_native_bootstrap_creates_and_loads_before_any_prompt() {
+        let (runtime, http) = cold_native_bootstrap_runtime().await;
         let root = runtime
             .prepare_managed_native_session(create_msg("managed-empty-input"))
             .await
@@ -12692,7 +12739,7 @@ mod tests {
             "native root must come from actual provider creation, not a local placeholder"
         );
         assert!(runtime.has_live_session(&root).await);
-        let requests = http.requests.lock().unwrap();
+        let requests = http.requests.lock().unwrap().clone();
         assert_eq!(
             requests
                 .iter()
