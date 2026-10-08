@@ -340,7 +340,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const controllerSentBaseline = sent.length
       const controllerRestartStartedAt = Date.now()
       await rig.restartSupervisor()
-      const controllerHealth = (await rig.runtime.adminOk(rig.supervisor, { method: 'health' })).data
+      const { controllerHealth, startupFinished, controllerReady } = await rig.freshCodexControllerStartupFacts(rig.exactRuntimeHandle(view))
       const reattached = (await rig.inventory()).find((row) => row.soulId === view.soulId)
       expect(reattached).toMatchObject({ soulId: view.soulId, containerId: view.containerId,
         incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId,
@@ -352,9 +352,6 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await expectOriginalConversation()
       expect(sent.slice(controllerSentBaseline).filter((frame) => frame.type === 'freshAgent.create'
         || frame.type === 'pane.reconcile.request')).toHaveLength(0)
-      const restartedLifecycle = await readLifecycle()
-      const startupFinished = restartedLifecycle.filter((event) => event.event === 'supervisor.startup_scan.finished').at(-1)
-      const controllerReady = restartedLifecycle.filter((event) => event.event === 'supervisor.ready').at(-1)
       expect(Number.isFinite(startupFinished?.at)).toBe(true)
       expect(Number.isFinite(controllerReady?.at)).toBe(true)
       expect(startupFinished.at).toBeGreaterThanOrEqual(controllerRestartStartedAt)

@@ -921,6 +921,14 @@ export const OpencodeQualificationTurnSchema = z.object({ messageId: z.string().
   }).strict(),
 }).strict()
 export type OpencodeQualificationTurn = z.infer<typeof OpencodeQualificationTurnSchema>
+export const FreshCodexControllerStartupFactsSchema = z.object({
+  controllerHealth: z.object({ control_epoch: z.number().int().nonnegative(), installation_id: z.string() }),
+  startupFinished: z.object({ event: z.literal('supervisor.startup_scan.finished'), at: z.number(),
+    data: z.object({ scanned: z.number().int().nonnegative(), blockedSubsystems: z.array(z.string()) }) }),
+  controllerReady: z.object({ event: z.literal('supervisor.ready'), at: z.number(),
+    data: z.object({ controlEpoch: z.number().int().nonnegative(), installationId: z.string() }) }),
+}).strict()
+export type FreshCodexControllerStartupFacts = z.infer<typeof FreshCodexControllerStartupFactsSchema>
 export const FreshCodexRetainedSnapshotFactsSchema = z.object({
   threadId: z.string(), bytes: z.number().int().nonnegative(), turnCount: z.number().int().nonnegative(),
   firstTurnId: z.string().nullable(), lastTurnId: z.string().nullable(), firstAnswerMatches: z.boolean(),
@@ -1059,7 +1067,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
     'provider-volume', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
@@ -4252,6 +4260,16 @@ export class ManagedRuntimeOwner {
     await this.assertCurrentHandle(handle)
     const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
     if (row?.provider !== 'codex' || row.freshAgentSessionType !== 'freshcodex') throw new Error('exact fresh Codex history fixture required')
+  }
+
+  async freshCodexControllerStartupFacts(handle: ExactRuntimeHandle): Promise<FreshCodexControllerStartupFacts> {
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    const controllerHealth = (await this.runtime.adminOk(this.supervisor, { method: 'health' })).data
+    const lifecycle = (await fsp.readFile(path.join(path.dirname(this.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl'), 'utf8'))
+      .split('\n').filter(Boolean).map((line: string) => z.object({ event: z.string() }).passthrough().parse(JSON.parse(line)))
+    const startupFinished = lifecycle.filter(event => event.event === 'supervisor.startup_scan.finished').at(-1)
+    const controllerReady = lifecycle.filter(event => event.event === 'supervisor.ready').at(-1)
+    return FreshCodexControllerStartupFactsSchema.parse({ controllerHealth, startupFinished, controllerReady })
   }
 
   async freshCodexRetainedSnapshotFacts(handle: ExactRuntimeHandle): Promise<FreshCodexRetainedSnapshotFacts> {
