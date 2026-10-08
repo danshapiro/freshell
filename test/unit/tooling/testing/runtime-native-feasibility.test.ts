@@ -66,6 +66,51 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       else await expect(run).rejects.toThrow(fault === 'wrong-uid' ? 'actual native receiver namespace/profile/pin/TLS differs' : 'current managed native receiver observation missing or misbound before input')
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it.each(['valid', 'published', 'admitted-input', 'requested-echo', 'missing-receipt', 'ephemeral-receipt', 'wrong-uid'])('requires actual different Codex native receipt and rejects initial LIVE/input (%s; controlled orchestration)', async fault => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-codex-wrong-'))
+    const nativeRoot = randomUUID(), requests: any[] = []
+    let expectedRoot = ''
+    const incarnation = 'incarnation-current'
+    fs.mkdirSync(path.join(directory, incarnation))
+    const receipt = path.join(directory, incarnation, 'provider-identity.json')
+    const harness = { testRoot: directory, evidenceDir: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
+      startSupervisor: async () => ({}), writeArtifact: () => {},
+      runtimeDir: (_supervisor: unknown, current: string) => path.join(directory, current),
+      inventoryBody: () => ({ method: 'inventory' }), terminalInputBody: () => ({ method: 'terminal_input' }),
+      adminRaw: async (_supervisor: unknown, request: any) => {
+        requests.push(request)
+        if (request.method === 'launch') {
+          expectedRoot = request.params.nativeSessionId
+          expect(request.params.terminal.resumeSessionId).toBeUndefined()
+          expect(request.params.freshAgent).toBeUndefined()
+          if (fault !== 'missing-receipt') fs.writeFileSync(receipt, JSON.stringify({ schemaVersion: 1, provider: 'codex',
+            nativeSessionId: fault === 'requested-echo' ? expectedRoot : nativeRoot, ephemeral: fault === 'ephemeral-receipt', observedAt: 1 }))
+          return { result: { Err: { code: 'RECOVERY_BLOCKED' } } }
+        }
+        if (request.method === 'terminal_input') return { result: { Err: { code: fault === 'admitted-input' ? 'OTHER_ERROR' : 'UNKNOWN_SOUL' } } }
+        throw new Error('unexpected controlled command')
+      },
+      adminOk: async () => ({ data: [{ soulId: requests[0].params.soulId, launchState: fault === 'published' ? 'running' : 'starting',
+        nativeSessionId: null, nativeIdentityObservation: null, incarnationId: incarnation, containerId: 'owned-current' }] }),
+      execOwnedContainerAsExact: async () => JSON.stringify({ uid: fault === 'wrong-uid' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+        httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: path.join(directory, 'codex-wrong-root-workspace'), nativeVersion: 'codex-cli 0.147.0',
+        activeNativeProcesses: 1, executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64) }),
+    } as unknown as RuntimeHarness
+    const sources = ['env_file','auth_file','ca_file'].map(suffix => ({ name: 'codex/grants/'+suffix, path:'/owned/'+suffix, sha256:'e'.repeat(64) }))
+    try {
+      const run = executeManagedNativeCase(harness, sources, { provider:'codex', case:'startup' }, 'wrong-root')
+      if (fault === 'valid') {
+        const original = await run
+        expect(original.assertions.every(row => row.pass)).toBe(true)
+        expect(expectedRoot).not.toBe(nativeRoot)
+        expect(requests.map(row => row.method)).toEqual(['launch','terminal_input'])
+      } else await expect(run).rejects.toThrow(fault === 'published' ? 'actual initial Codex wrong-root publication was not contained'
+        : fault === 'admitted-input' ? 'actual Codex wrong-root admitted input'
+        : fault === 'wrong-uid' ? 'actual native receiver namespace/profile/pin/TLS differs'
+        : fault === 'missing-receipt' ? 'actual current Codex native receipt unavailable'
+        : 'actual current Codex receipt does not prove a different native root')
+    } finally { fs.rmSync(directory, { recursive:true, force:true }) }
+  })
   it.each(['freshcodex','freshopencode','codex'].flatMap(mode => ['valid','copied-volume','wrong-incarnation','wrong-root','store-changed','profile-changed','wrong-outcome'].map(fault => [mode,fault])))('executes exact receiver recovery only after completed native history and preserves its original volume (%s, %s; controlled orchestration)', async (mode,fault) => {
     const directory=fs.mkdtempSync(path.join(os.tmpdir(),'receiver-exact-recovery-')), provider=mode==='freshcodex'||mode==='codex'?'codex':'opencode'
     const root=provider==='codex'?randomUUID():'ses_ownedFixture', turn=randomUUID(), container='owned-initial', replacement='owned-replacement'

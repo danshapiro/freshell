@@ -394,7 +394,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'codex' && ['create', 'exact-resume'].includes(caseId)) {
+  if (selection.provider === 'codex' && ['create', 'exact-resume', 'wrong-root'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, 'codex', caseId, serverPath, servers)
   }
   if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume'].includes(caseId)) {
@@ -777,6 +777,56 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
       providerModel: settings.model, providerReasoningEffort: 'low', providerPermissionMode: 'on-request', providerSandbox: 'workspace-write',
       providerSecretReferences: managedPreparation?.secretReferences ?? references, providerLaunchContext: managedPreparation?.context ?? freshAgent.providerLaunchContext } } } : request
+  if (terminal && caseId === 'wrong-root') {
+    // A requested root is an expectation only: the native app-server creates
+    // its own different thread with no resume selector and no model input.
+    const expectedRoot = randomUUID()
+    const faultRequest = { ...selectedRequest, params: { ...selectedRequest.params, nativeSessionId: expectedRoot } }
+    harness.writeArtifact(`${scenario}-request.json`, faultRequest)
+    const launch = await harness.adminRaw(supervisor, faultRequest)
+    harness.writeArtifact(`${scenario}-launch-refusal.json`, launch)
+    const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+    const view = inventory.data.find((row: any) => row.soulId === soulId)
+    harness.writeArtifact(`${scenario}-current-view.json`, view)
+    if (launch.result?.Err?.code !== 'RECOVERY_BLOCKED' || !view || view.launchState !== 'starting'
+      || view.nativeSessionId || view.nativeIdentityObservation || !view.incarnationId || !view.containerId) {
+      throw new Error('actual initial Codex wrong-root publication was not contained')
+    }
+    const receiptPath = path.join(harness.runtimeDir(supervisor, view.incarnationId), 'provider-identity.json')
+    let raw: Buffer
+    try {
+      const stat = fs.lstatSync(receiptPath)
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65_536 || fs.realpathSync(receiptPath) !== receiptPath) throw new Error('invalid receipt')
+      raw = fs.readFileSync(receiptPath)
+    } catch { throw new Error('actual current Codex native receipt unavailable') }
+    const receipt = JSON.parse(raw.toString('utf8'))
+    if (receipt.schemaVersion !== 1 || receipt.provider !== 'codex' || receipt.ephemeral !== false
+      || typeof receipt.nativeSessionId !== 'string' || !receipt.nativeSessionId || receipt.nativeSessionId === expectedRoot
+      || !Number.isSafeInteger(receipt.observedAt) || receipt.observedAt < 0) {
+      throw new Error('actual current Codex receipt does not prove a different native root')
+    }
+    harness.writeArtifact(`${scenario}-current-native-receipt.json`, { ...receipt, incarnationId: view.incarnationId,
+      sha256: createHash('sha256').update(raw).digest('hex') })
+    const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+      ['python3', '-c', receiverNativeNamespace, 'codex', receipt.nativeSessionId, workspace]))
+    harness.writeArtifact(`${scenario}-namespace-private.json`, namespace)
+    if (!receiverNativeNamespaceMatches(namespace, 'codex', workspace, receipt.nativeSessionId)) {
+      throw new Error('actual native receiver namespace/profile/pin/TLS differs')
+    }
+    const input = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned wrong-root input refusal probe. Do not use tools.\r'))
+    harness.writeArtifact(`${scenario}-input-refusal.json`, input)
+    if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('actual Codex wrong-root admitted input')
+    if (!fs.readFileSync(receiptPath).equals(raw)) throw new Error('current native receipt changed after refused input')
+    const original: NativeExperimentOriginal = { caseId, ownerId: harness.runId, imageDigest: harness.imageRef,
+      candidateSha: harness.candidateSha, nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256,
+      profileSha256: createHash('sha256').update(JSON.stringify({ settings, nativeProfileSha256: namespace.profileSha256 })).digest('hex'),
+      artifactReferences: [`${scenario}-launch-refusal.json`, `${scenario}-current-native-receipt.json`, `${scenario}-namespace-private.json`, `${scenario}-input-refusal.json`],
+      assertions: [{ name: 'actual-current-native-selected-different-root', pass: true },
+        { name: 'wrong-current-native-root-refused-before-running-and-input', pass: true },
+        { name: 'actual-selected-native-process-profile-uid-and-tls', pass: true }] }
+    harness.writeArtifact(`${scenario}-original.json`, original)
+    return original
+  }
   harness.writeArtifact(`${scenario}-request.json`, selectedRequest)
   const launch = await harness.adminOk(supervisor, selectedRequest)
   harness.writeArtifact(`${scenario}-launch.json`, launch)
@@ -791,13 +841,8 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
     ['python3', '-c', receiverNativeNamespace, provider, view.nativeSessionId, workspace]))
   harness.writeArtifact(`${scenario}-namespace-private.json`, namespace)
-  const version = provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21'
-  if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
-    || !namespace.readOnlyRoot || namespace.httpsStatus !== 200 || namespace.tlsVerifyMode !== 2
-    || !namespace.tlsCheckHostname || namespace.nativeCwd !== workspace || namespace.nativeVersion !== version
-    || namespace.activeNativeProcesses !== 1
-    || (provider === 'opencode' && (namespace.nativeRoot !== view.nativeSessionId || namespace.nativeMessageCount !== 0))
-    || !/^[a-f0-9]{64}$/.test(namespace.executableSha256 ?? '') || !/^[a-f0-9]{64}$/.test(namespace.profileSha256 ?? '')) {
+  if (!receiverNativeNamespaceMatches(namespace, provider, workspace, view.nativeSessionId)
+    || (provider === 'opencode' && namespace.nativeMessageCount !== 0)) {
     throw new Error('actual native receiver namespace/profile/pin/TLS differs')
   }
   const assertions = [{ name: 'actual-native-receiver-current-observation-before-input', pass: true },
@@ -883,6 +928,15 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     assertions }
   harness.writeArtifact(`${scenario}-original.json`, original)
   return original
+}
+
+function receiverNativeNamespaceMatches(namespace: any, provider: 'codex' | 'opencode', workspace: string, root: string): boolean {
+  return namespace.uid === 65534 && namespace.gid === 0 && namespace.caps === '0000000000000000'
+    && namespace.readOnlyRoot === true && namespace.httpsStatus === 200 && namespace.tlsVerifyMode === 2
+    && namespace.tlsCheckHostname === true && namespace.nativeCwd === workspace
+    && namespace.nativeVersion === (provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21')
+    && namespace.activeNativeProcesses === 1 && (provider !== 'opencode' || namespace.nativeRoot === root)
+    && /^[a-f0-9]{64}$/.test(namespace.executableSha256 ?? '') && /^[a-f0-9]{64}$/.test(namespace.profileSha256 ?? '')
 }
 
 async function captureReceiverStore(harness: RuntimeHarness, containerId: string, provider: 'codex' | 'opencode',
