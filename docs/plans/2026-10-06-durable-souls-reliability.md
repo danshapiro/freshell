@@ -467,7 +467,7 @@ Also stage the ROOT-authorized bounded fresh-native version metadata correction 
 
 Also stage the existing exact native store reader and its inline READY-only Amplifier compatibility tests when changed: `git add crates/freshell-agent-runtime/src/lib.rs`. This records the actual native-resume prerequisite filename; existing pristine-stub/absence/loss policy and all acceptance remain unchanged.
 
-Also stage the bounded sidecar behavior tests/controlled fixtures and the managed OpenCode API seam when changed: `git add test/unit/claude-sidecar/native-session-channel.test.ts test/unit/claude-sidecar/native-process.test.ts test/unit/claude-sidecar/native-result.test.ts test/unit/claude-sidecar/fixtures/native-startup-query.mjs test/unit/claude-sidecar/fixtures/native-result-query.mjs crates/freshell-freshagent/src/opencode_ws.rs`. This is a filename correction within the existing native producer/response contract, not a new task or a native qualification claim.
+Also stage the bounded sidecar behavior tests/controlled fixtures and the managed OpenCode API seam when changed: `git add test/unit/claude-sidecar/native-session-channel.test.ts test/unit/claude-sidecar/native-process.test.ts test/unit/claude-sidecar/native-result.test.ts test/unit/claude-sidecar/fixtures/native-startup-query.mjs test/unit/claude-sidecar/fixtures/native-result-query.mjs crates/freshell-freshagent/src/opencode_ws.rs`. This is a filename correction within the existing native producer/response contract, not a new task or a native qualification claim. The root-task004-opencode-abort-fixture-resolution.md dependency additionally permits only finite body-free diagnosis in the existing accepted-daemon-turn kill test/AbortRecordingHttp fixture and deterministic fixture correction after an established cause, preserving every assertion/default budget and all production Stop/ownership behavior.
 
 Also stage the bounded Amplifier native CLI prerequisite scripts when changed: `git add docker/runtime/prepare-amplifier-modes.py docker/runtime/prepare-amplifier-profile.py`. Their actual ordinary CLI setup failures are recorded separately from native behavior RED; full managed startup and fault acceptance remains required.
 
@@ -777,7 +777,7 @@ Run: `git add test/e2e-browser/helpers/opencode-auth-file.ts`
 
 Run: `git add scripts/testing/provider-native-history.ts test/e2e-browser/helpers/provider-native-history/types.ts test/e2e-browser/helpers/provider-native-history/proof.ts`
 
-Preserve unchanged pure native proof/types and unchanged selection relocation with exact old helper compatibility reexports; Task9 semantics and all native reservations remain.
+Preserve unchanged pure native proof/types and unchanged selection relocation with exact old helper compatibility reexports; Task9 semantics and all native reservations remain. The root-task008-native-readiness-relocation-resolution.md prerequisite permits only unchanged hasOpenCodePromptModelText/openCodeTerminalReady plus their node:util dependency in the same pure module and exact old .js reexports; credential/wait behavior, closed44, Task4/Task9 semantics and all gates remain unchanged.
 
 Run: `git commit -m "test(runtime): exercise managed rig from configured Cloud browsers"`
 
