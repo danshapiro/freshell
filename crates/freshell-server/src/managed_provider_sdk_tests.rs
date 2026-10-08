@@ -58,4 +58,5 @@ async fn managed_provider_claude_default_sdk_initializes_fixed_mcp_without_a_pro
         })
     );
     crate::managed_mcp_capability::qualify_claude_linked_sources(fixture.path()).await;
+    crate::managed_mcp_capability::qualify_claude_local_settings(fixture.path()).await;
 }

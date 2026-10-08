@@ -35,7 +35,7 @@ mod ordinary_stage;
 mod source_stage;
 
 #[cfg(all(test, unix, feature = "managed-provider-qualification"))]
-pub(crate) use tests::qualify_claude_linked_sources;
+pub(crate) use tests::{qualify_claude_linked_sources, qualify_claude_local_settings};
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct OpencodeEphemeralInput<'a> {
@@ -4466,6 +4466,212 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         assert!(staged_provider_root_path(&directory, &prior.grant_id)
             .unwrap()
             .is_dir());
+    }
+
+    #[cfg(feature = "managed-provider-qualification")]
+    pub(crate) async fn qualify_claude_local_settings(base: &Path) {
+        use freshell_platform::claude_inputs::{
+            observation::observe, ClaudeSettingSource, NativeSourceRuntime,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        assert_eq!(unsafe { libc::getuid() }, 65534);
+        assert_eq!(unsafe { libc::getgid() }, 0);
+        let probe = base.join("local-settings-probe.mjs");
+        let consumer = base.join("local-settings-consumer.cjs");
+        std::fs::write(
+            &probe,
+            include_str!("managed_provider_claude_local_probe.mjs"),
+        )
+        .unwrap();
+        std::fs::write(
+            &consumer,
+            include_str!("managed_provider_claude_local_consumer.cjs"),
+        )
+        .unwrap();
+        for case in [
+            "qualified-linked",
+            "cwd-root",
+            "home-root",
+            "unreadable-marker",
+            "project-only",
+            "disabled",
+        ] {
+            let fixture = base.join(format!("local-{case}"));
+            let main = fixture.join("canonical");
+            let checkout = fixture.join("checkout");
+            let cwd = if case == "cwd-root" {
+                main.clone()
+            } else if case == "home-root" {
+                main.join("nested")
+            } else {
+                checkout.join("nested")
+            };
+            let home = if case == "home-root" {
+                main.clone()
+            } else {
+                fixture.join("home")
+            };
+            let gitdir = main.join(".git/worktrees/fixture");
+            for directory in [
+                &gitdir,
+                &home,
+                &cwd.join(".claude"),
+                &main.join(".claude"),
+                &checkout.join(".claude"),
+            ] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            std::fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", gitdir.display()),
+            )
+            .unwrap();
+            std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+            std::fs::write(
+                gitdir.join("gitdir"),
+                format!("{}\n", checkout.join(".git").display()),
+            )
+            .unwrap();
+            let documents = [
+                (
+                    main.join(".claude/settings.local.json"),
+                    serde_json::json!({"env":{"FRESHELL_LOCAL_SELECTED_NONCE":format!("{case}-canonical")}}),
+                ),
+                (
+                    checkout.join(".claude/settings.local.json"),
+                    serde_json::json!({"env":{"FRESHELL_LOCAL_SELECTED_NONCE":format!("{case}-checkout")}}),
+                ),
+                (
+                    cwd.join(".claude/settings.local.json"),
+                    serde_json::json!({"env":{"FRESHELL_LOCAL_SELECTED_NONCE":format!("{case}-cwd"),"FRESHELL_LOCAL_CWD_ONLY_NONCE":format!("{case}-retained")}}),
+                ),
+            ];
+            for (path, document) in &documents {
+                std::fs::write(path, serde_json::to_vec(document).unwrap()).unwrap();
+            }
+            let prior = documents
+                .iter()
+                .map(|(path, _)| (path.clone(), std::fs::read(path).unwrap()))
+                .collect::<Vec<_>>();
+            if case == "unreadable-marker" {
+                std::fs::set_permissions(checkout.join(".git"), std::fs::Permissions::from_mode(0))
+                    .unwrap();
+            }
+            let sources = match case {
+                "project-only" => vec![ClaudeSettingSource::Project],
+                "disabled" => vec![],
+                _ => vec![ClaudeSettingSource::Local],
+            };
+            let observation = observe(&cwd, &home, NativeSourceRuntime::Sdk, &sources).unwrap();
+            observation.validate().unwrap();
+            assert_eq!(observation.uid, 65534);
+            assert_eq!(observation.euid, 65534);
+            assert_eq!(observation.gid, 0);
+            assert_eq!(observation.egid, 0);
+            if case == "unreadable-marker" {
+                assert_eq!(observation.roots.as_ref().unwrap().canonical, checkout);
+            }
+            let mut selected = serde_json::Map::new();
+            for candidate in &observation.local_settings {
+                if candidate.is_file() {
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(candidate).unwrap()).unwrap();
+                    selected.extend(value["env"].as_object().unwrap().clone());
+                }
+            }
+            let expected = |name: &str| {
+                format!(
+                    "{:x}",
+                    Sha256::digest(
+                        selected
+                            .get(name)
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .as_bytes()
+                    )
+                )
+            };
+            let consumed = fixture.join("native-consumed.json");
+            let selector = sources
+                .iter()
+                .map(|source| source.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut child = tokio::process::Command::new("node")
+                .arg(&probe)
+                .arg(&cwd)
+                .arg(selector)
+                .arg(&consumer)
+                .arg(&consumed)
+                .current_dir(&cwd)
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("HOME", &home)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut output = BufReader::new(child.stdout.take().unwrap()).take(4097);
+            let mut line = Vec::new();
+            let received = tokio::time::timeout(
+                std::time::Duration::from_secs(25),
+                output.read_until(b'\n', &mut line),
+            )
+            .await;
+            stop_codex_source_child(&mut child).await;
+            received
+                .expect("native local-settings consumption must complete within the finite budget")
+                .unwrap();
+            assert!(
+                line.len() <= 4096 && line.last() == Some(&b'\n'),
+                "native metadata receipt must be complete and bounded"
+            );
+            let receipt: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(
+                receipt["failed"], false,
+                "classified native settings consumption failed: {case}"
+            );
+            for field in ["defaultChild", "zeroPrompts"] {
+                assert_eq!(receipt[field], true, "native local receipt {field}: {case}");
+            }
+            for field in ["uid", "consumerUid"] {
+                assert_eq!(receipt[field], 65534);
+            }
+            for field in ["gid", "consumerGid"] {
+                assert_eq!(receipt[field], 0);
+            }
+            assert_eq!(
+                receipt["selectedSha256"],
+                expected("FRESHELL_LOCAL_SELECTED_NONCE"),
+                "native selected local ordering: {case}"
+            );
+            assert_eq!(
+                receipt["cwdOnlySha256"],
+                expected("FRESHELL_LOCAL_CWD_ONLY_NONCE"),
+                "native cwd-only local retention: {case}"
+            );
+            if case == "unreadable-marker" {
+                std::fs::set_permissions(
+                    checkout.join(".git"),
+                    std::fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            }
+            for (path, bytes) in prior {
+                assert!(
+                    std::fs::read(path).unwrap() == bytes,
+                    "native settings consumer must retain its original inputs"
+                );
+            }
+            println!(
+                "provider_native_local_selection {}",
+                serde_json::json!({"provider":"claude","case":case,"uid":65534,"gid":0,"ownedGroupJoined":true,"zeroPrompts":true,"digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&receipt).unwrap()))})
+            );
+        }
     }
 
     #[cfg(feature = "managed-provider-qualification")]

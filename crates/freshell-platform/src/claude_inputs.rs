@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub mod git;
+pub mod observation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

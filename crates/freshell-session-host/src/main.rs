@@ -1,3 +1,4 @@
+mod claude_source_observation;
 mod command_journal;
 mod control;
 mod output_journal;
@@ -117,6 +118,7 @@ async fn run() -> Result<(), String> {
     match args.get(1).map(String::as_str) {
         Some("serve") => serve(&args[2..]).await,
         Some("worker") => worker(&args[2..]).await,
+        Some("observe-claude-sources") if args.len() == 2 => claude_source_observation::serve_stdio(),
         Some("native-auth-only") if args.len() == 2 => {
             verify_private_helper_namespace(
                 Path::new("/home/freshell/provider"),

@@ -3,7 +3,8 @@
 use super::NativeSourceRuntime;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Roots {
     pub checkout: PathBuf,
     pub canonical: PathBuf,
