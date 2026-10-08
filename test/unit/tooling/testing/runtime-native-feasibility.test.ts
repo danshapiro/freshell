@@ -35,7 +35,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-codex-create-')), root = randomUUID()
     const requests: any[] = []
     const harness = { testRoot: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
-      startSupervisor: async () => ({}), writeArtifact: () => {},
+      startSupervisor: async (options: any) => { expect(options.env.FRESHELL_MANAGED_PROVIDER_QUALIFICATION).toBe('codex'); return {} }, writeArtifact: () => {},
       adminOk: async (_supervisor: unknown, request: any) => {
         requests.push(request); expect(request.params.freshAgent).toBeUndefined()
         expect(request.params.terminal.mode).toBe('codex'); expect(request.params.terminal.program).toBe('codex')

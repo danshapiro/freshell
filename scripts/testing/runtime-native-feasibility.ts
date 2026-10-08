@@ -704,7 +704,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
   fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
   const sourceHome = path.join(harness.testRoot, 'native-source', provider, scenario)
   fs.mkdirSync(path.join(sourceHome, provider === 'codex' ? '.codex' : '.config/opencode'), { recursive: true, mode: 0o700 })
-  const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release', env: { HOME: sourceHome } })
+  const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release', env: { HOME: sourceHome, ...(terminal ? { FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'codex' } : {}) } })
   const storeId = 'store-' + randomUUID(), soulId = 'soul-' + randomUUID()
   const settings = provider === 'codex'
     ? { model: 'gpt-5.6-luna', effort: 'low', permissionMode: 'on-request', sandbox: 'workspace-write' }
