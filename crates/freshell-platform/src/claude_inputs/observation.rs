@@ -210,6 +210,16 @@ fn validate_path(path: &Path) -> Result<(), String> {
 }
 
 impl NativeObservation {
+    /// The final provider namespace must retain the selected native source view.
+    pub fn require_same_selection(&self, current: &Self) -> Result<(), String> {
+        self.validate()?;
+        current.validate()?;
+        if self != current {
+            return Err("Claude native source selection changed before dispatch; retain inputs and reprepare".into());
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         validate_sources(&self.setting_sources)?;
         let local_enabled = self.setting_sources.contains(&ClaudeSettingSource::Local);
@@ -446,6 +456,44 @@ mod tests {
         .expect_err("a file cannot be accepted as the native launch cwd");
         assert!(error.contains("launch cwd is not a directory"));
         assert_eq!(std::fs::read(&prior).unwrap(), b"prior-accepted-inputs");
+    }
+
+    #[test]
+    fn claude_native_final_selection_blocks_changed_git_view_before_consuming_sources() {
+        for runtime in [NativeSourceRuntime::Terminal, NativeSourceRuntime::Sdk] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let root = owned.path().join("root");
+            let cwd = root.join("nested");
+            for path in [
+                &home,
+                &root.join(".git"),
+                &root.join(".claude"),
+                &cwd.join(".claude"),
+            ] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            let prior = root.join(".claude/settings.local.json");
+            let bytes = br#"{"env":{"SELECTED":"canonical-private-synthetic"}}"#;
+            std::fs::write(&prior, bytes).unwrap();
+            std::fs::write(cwd.join(".claude/settings.local.json"), b"{}").unwrap();
+            let accepted = observe(&cwd, &home, runtime, &[ClaudeSettingSource::Local]).unwrap();
+            assert_eq!(accepted.local_decision, LocalDecision::QualifiedCanonical);
+            let same = observe(&cwd, &home, runtime, &[ClaudeSettingSource::Local]).unwrap();
+            accepted
+                .require_same_selection(&same)
+                .expect("unchanged actual namespace remains dispatchable");
+            std::fs::rename(root.join(".git"), root.join("prior-git")).unwrap();
+            let changed = observe(&cwd, &home, runtime, &[ClaudeSettingSource::Local]).unwrap();
+            assert_eq!(changed.local_decision, LocalDecision::NoRoot);
+            assert_eq!(changed.local_settings.len(), 1);
+            let error = accepted.require_same_selection(&changed).expect_err(
+                "a final namespace selecting different native settings must block before dispatch",
+            );
+            assert!(error.contains("retain inputs and reprepare"));
+            assert!(!error.contains("canonical-private-synthetic"));
+            assert_eq!(std::fs::read(prior).unwrap(), bytes);
+        }
     }
 
     #[test]
