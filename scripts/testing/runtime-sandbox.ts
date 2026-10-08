@@ -721,6 +721,12 @@ export const RuntimeOwnershipFactsSchema = z.object({
   supervisorContainerId: z.string().regex(/^[a-f0-9]{64}$/), supervisorBinaryKind: z.enum(['test', 'release']),
 }).strict()
 export type RuntimeOwnershipFacts = z.infer<typeof RuntimeOwnershipFactsSchema>
+const OPENCODE_CONTINUITY_AUTH_SCRIPT = "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||openai.type!=='oauth'||openai.access!=='onecli-managed'||openai.refresh!=='onecli-managed'||openai.expires<Date.now()+3600000)process.exit(2);fs.accessSync('/home/freshell/provider/.config/onecli/gateway-ca.pem',fs.constants.R_OK);process.stdout.write('onecli managed OpenAI stub and CA present')"
+export const OpencodeContinuityStartupFactsSchema = z.object({
+  authPresent: z.boolean(), modelAvailable: z.boolean(), explicitModelArg: z.boolean(),
+  loopbackHostname: z.boolean(), explicitPort: z.boolean(),
+}).strict()
+export type OpencodeContinuityStartupFacts = z.infer<typeof OpencodeContinuityStartupFactsSchema>
 export const RuntimeTerminalChildFactsSchema = z.union([
   z.object({ pid: z.number().int().positive(), running: z.boolean() }).strict(),
   z.object({ pid: z.null(), running: z.literal(false) }).strict(),
@@ -797,7 +803,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -3391,6 +3397,17 @@ export class ManagedRuntimeOwner {
     const version = (await this.ownedProviderExec(handle.containerId, ['opencode', '--version'])).trim()
     if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('OpenCode version reply is invalid')
     return { provider: 'opencode', version }
+  }
+
+  async openCodeContinuityStartupFacts(handle: RuntimeEnclosureHandle): Promise<OpencodeContinuityStartupFacts> {
+    if (this.runtime.phase !== 2) throw new Error('Phase 2 OpenCode continuity fixture required')
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    const auth = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', OPENCODE_CONTINUITY_AUTH_SCRIPT])
+    const models = await this.ownedProviderExec(handle.containerId, ['opencode', 'models', 'openai'])
+    const processes = this.ownedContainerExec(handle.containerId, ['sh', '-lc', "pgrep -af '[o]pencode' || true"])
+    return OpencodeContinuityStartupFactsSchema.parse({ authPresent: auth.trim() === 'onecli managed OpenAI stub and CA present',
+      modelAvailable: models.includes(P2_OPENCODE_MODEL.split('/')[1]), explicitModelArg: processes.includes(`--model ${P2_OPENCODE_MODEL}`),
+      loopbackHostname: processes.includes('--hostname 127.0.0.1'), explicitPort: processes.includes('--port 4096') })
   }
 
   async lossCredentialEvidence(handle: RuntimeEnclosureHandle): Promise<OpencodeLossCredentialEvidence> {

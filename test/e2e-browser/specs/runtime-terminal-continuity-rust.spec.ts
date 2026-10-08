@@ -348,17 +348,12 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       const view = await waitForRunningView(rig, terminalId, 90_000)
       if (!view?.containerId || !view.hostBootId) throw new Error('real OpenCode managed view missing ownership identity')
       expect((await rig.openCodeVersionFacts(rig.runtimeEnclosureHandle(view))).version).toBe(P2_OPENCODE_VERSION)
-      const authProbe = (await rig.ownedProviderExec(view.containerId, [
-        'node', '--no-warnings', '-e',
-        "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||openai.type!=='oauth'||openai.access!=='onecli-managed'||openai.refresh!=='onecli-managed'||openai.expires<Date.now()+3600000)process.exit(2);fs.accessSync('/home/freshell/provider/.config/onecli/gateway-ca.pem',fs.constants.R_OK);process.stdout.write('onecli managed OpenAI stub and CA present')",
-      ]))
-      expect(authProbe.trim()).toBe('onecli managed OpenAI stub and CA present')
-      const availableModels = (await rig.ownedProviderExec(view.containerId, ['opencode', 'models', 'openai']))
-      expect(availableModels).toContain(P2_OPENCODE_MODEL.split('/')[1])
-      const processArgs = rig.ownedContainerExec(view.containerId, ['sh', '-lc', "pgrep -af '[o]pencode' || true"])
-      expect(processArgs).toContain(`--model ${P2_OPENCODE_MODEL}`)
-      expect(processArgs).toContain('--hostname 127.0.0.1')
-      expect(processArgs).toContain('--port 4096')
+      const startupFacts = await rig.openCodeContinuityStartupFacts(rig.runtimeEnclosureHandle(view))
+      expect(startupFacts.authPresent).toBe(true)
+      expect(startupFacts.modelAvailable).toBe(true)
+      expect(startupFacts.explicitModelArg).toBe(true)
+      expect(startupFacts.loopbackHostname).toBe(true)
+      expect(startupFacts.explicitPort).toBe(true)
 
       const opencodeIndex = Math.max(0, (await page.locator('.xterm').count()) - 1)
       await waitForOpenCodeTerminalCondition({

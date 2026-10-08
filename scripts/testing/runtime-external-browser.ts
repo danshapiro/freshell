@@ -23,7 +23,8 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
   OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, OpencodeLossRecoverySchema,
   OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema,
-  RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema,
+  OpencodeContinuityStartupFactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -39,6 +40,7 @@ import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, 
 import type { OpencodeLossCredentialEvidence, OpencodeLossAbsenceEvidence, OpencodeLossRecovery, OpencodeLossIncidentEvidence } from './runtime-sandbox.js'
 import type { RuntimeLossAssertions, RuntimeLossAssertionsArtifact, RuntimeLossReceiptArtifact } from './runtime-sandbox.js'
 import type { RuntimeFreshAgentReceiptArtifacts, RuntimeOwnershipFacts, RuntimeTerminalChildFacts } from './runtime-sandbox.js'
+import type { OpencodeContinuityStartupFacts } from './runtime-sandbox.js'
 import type { FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
@@ -887,6 +889,9 @@ export class ExternalManagedRuntimeRig {
     return this.rpc('opencode-version', z.object({ provider: z.literal('opencode'),
       version: z.string().regex(/^\d+\.\d+\.\d+$/) }).strict(), { enclosure: this.runtimeEnclosureHandle(handle) })
   }
+  async openCodeContinuityStartupFacts(enclosure: RuntimeEnclosureHandle): Promise<OpencodeContinuityStartupFacts> {
+    return this.rpc('opencode-continuity-startup', OpencodeContinuityStartupFactsSchema, { enclosure })
+  }
   async lossCredentialEvidence(enclosure: RuntimeEnclosureHandle): Promise<OpencodeLossCredentialEvidence> {
     return this.rpc('loss-credential', OpencodeLossCredentialEvidenceSchema, { enclosure })
   }
@@ -1219,6 +1224,10 @@ export function createExternalRuntimeControl(
       case 'opencode-version':
         if (!request.enclosure) throw new Error('exact current runtime enclosure address required')
         result = await owner.openCodeVersionFacts(request.enclosure)
+        break
+      case 'opencode-continuity-startup':
+        if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
+        result = await owner.openCodeContinuityStartupFacts(request.enclosure)
         break
       case 'phase3-effect-reset':
         if (!request.enclosure) throw new Error('exact current runtime enclosure address required')

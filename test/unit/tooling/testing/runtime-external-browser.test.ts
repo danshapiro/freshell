@@ -1657,6 +1657,60 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('observes the fixed OpenCode continuity startup checks without returning auth or process bodies', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-opencode-startup-'))
+    try {
+      const { owned, context, inventory, request } = fixture()
+      const row = { soulId: 'startup-soul', incarnationId: 'startup-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'startup-boot', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+      const auth = path.join(directory, 'unit-auth.json'), ca = path.join(directory, 'unit-ca.txt')
+      await fsp.writeFile(auth, JSON.stringify({ openai: { type: 'oauth', access: 'onecli-managed', refresh: 'onecli-managed', expires: Date.now() + 7_200_000 } }))
+      await fsp.writeFile(ca, 'private CA readability fixture; never used for TLS')
+      const mapper = path.join(directory, 'map-startup-files.cjs')
+      await fsp.writeFile(mapper, `const fs=require('node:fs');const read=fs.readFileSync,access=fs.accessSync;fs.readFileSync=function(file,...args){return read.call(fs,file==='/home/freshell/provider/.local/share/opencode/auth.json'?${JSON.stringify(auth)}:file,...args)};fs.accessSync=function(file,...args){return access.call(fs,file==='/home/freshell/provider/.config/onecli/gateway-ca.pem'?${JSON.stringify(ca)}:file,...args)};`)
+      let models = 'openai/gpt-5.6-luna\n', processes = '42 opencode --model openai/gpt-5.6-luna --hostname 127.0.0.1 --port 4096'
+      const provider = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (_id, args) => {
+        if (args[0] === 'opencode') { expect(args).toEqual(['opencode', 'models', 'openai']); return models }
+        const child = spawnSync(process.execPath, ['--require', mapper, ...args.slice(1)], { encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('owned auth probe refused')
+        return child.stdout
+      })
+      const container = vi.spyOn(owned, 'ownedContainerExec').mockImplementation(() => processes)
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const wire: unknown[] = []
+      const transport = vi.fn(async (_url: string, init: RequestInit) => {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+      const enclosure = rig.runtimeEnclosureHandle(row)
+      await expect(rig.openCodeContinuityStartupFacts(enclosure)).resolves.toEqual({ authPresent: true, modelAvailable: true,
+        explicitModelArg: true, loopbackHostname: true, explicitPort: true })
+      models = 'different model'; processes = 'different process'
+      await expect(rig.openCodeContinuityStartupFacts(enclosure)).resolves.toEqual({ authPresent: true, modelAvailable: false,
+        explicitModelArg: false, loopbackHostname: false, explicitPort: false })
+      expect(JSON.stringify(wire)).not.toContain('onecli-managed')
+      expect(JSON.stringify(wire)).not.toContain('opencode --model')
+      await fsp.writeFile(auth, JSON.stringify({ openai: { type: 'oauth', access: 'onecli-managed', refresh: 'onecli-managed', expires: 0 } }))
+      await expect(owned.openCodeContinuityStartupFacts(enclosure)).rejects.toThrow(/auth probe refused/)
+      provider.mockClear(); container.mockClear()
+      inventory.mockResolvedValue([{ ...row, provider: 'claude' }])
+      await expect(owned.openCodeContinuityStartupFacts(enclosure)).rejects.toThrow(/OpenCode/)
+      await expect(control({ ...request, action: 'opencode-continuity-startup', enclosure, command: ['arbitrary'] })).rejects.toThrow(/operation/)
+      expect(provider).not.toHaveBeenCalled(); expect(container).not.toHaveBeenCalled()
+      inventory.mockResolvedValue([row])
+      Object.assign(owned.runtime, { phase: 3 })
+      await expect(owned.openCodeContinuityStartupFacts(enclosure)).rejects.toThrow(/Phase 2/)
+      expect(provider).not.toHaveBeenCalled(); expect(container).not.toHaveBeenCalled()
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
   it('runs the closed Phase3 effect operations over the same pre-native enclosure', async () => {
     const { owned, context, request } = fixture()
     const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',
