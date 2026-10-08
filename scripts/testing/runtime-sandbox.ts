@@ -944,7 +944,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
     'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
@@ -3337,6 +3337,16 @@ export class ManagedRuntimeOwner {
       this.terminalChildren.set(key, pid)
     }
     return RuntimeTerminalChildFactsSchema.parse({ pid, running: this.ownedContainerHasPid(handle.containerId, pid) })
+  }
+
+  async terminalWebCycleCompleted(handle: RuntimeEnclosureHandle, marker: string): Promise<boolean> {
+    if (this.runtime.phase !== 2) throw new Error('Phase 2 terminal continuity fixture required')
+    const cycle = /^P2_WEB_CYCLE_([1-9]|10)_\d+$/.exec(marker)?.[1]
+    if (!cycle) throw new Error('fixed terminal web-cycle marker required')
+    await this.currentRuntimeEnclosure(handle)
+    const actual = (await this.ownedProviderExec(handle.containerId, ['sh', '-lc',
+      `cat ${JSON.stringify(`/home/freshell/provider/p2-web-cycle-${cycle}`)} 2>/dev/null || true`])).trim()
+    return actual === marker
   }
 
   async incidentMatchesSoul(handle: ExactRuntimeHandle, incidentId: string): Promise<boolean> {

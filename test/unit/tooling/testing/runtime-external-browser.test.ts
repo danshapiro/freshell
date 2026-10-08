@@ -1701,6 +1701,47 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('observes only fixed current terminal web-cycle markers through the owner', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-terminal-cycle-'))
+    try {
+      const { owned, context, inventory, request } = fixture()
+      const row = { soulId: 'cycle-soul', incarnationId: 'cycle-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'cycle-boot', provider: 'shell', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+      const read = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (_id, args) => {
+        const command = args[2].replace('/home/freshell/provider/', `${directory}/`)
+        const child = spawnSync('sh', ['-lc', command], { encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('private cycle marker read failed')
+        return child.stdout
+      })
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const wire: unknown[] = []
+      const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      const enclosure = rig.runtimeEnclosureHandle(row)
+      await expect(rig.terminalWebCycleCompleted(enclosure, 'P2_WEB_CYCLE_1_123')).resolves.toBe(false)
+      await fsp.writeFile(path.join(directory, 'p2-web-cycle-1'), 'private unrelated marker')
+      await expect(rig.terminalWebCycleCompleted(enclosure, 'P2_WEB_CYCLE_1_123')).resolves.toBe(false)
+      await fsp.writeFile(path.join(directory, 'p2-web-cycle-1'), 'P2_WEB_CYCLE_1_123\n')
+      await expect(rig.terminalWebCycleCompleted(enclosure, 'P2_WEB_CYCLE_1_123')).resolves.toBe(true)
+      await fsp.writeFile(path.join(directory, 'p2-web-cycle-10'), 'P2_WEB_CYCLE_10_456')
+      await expect(rig.terminalWebCycleCompleted(enclosure, 'P2_WEB_CYCLE_10_456')).resolves.toBe(true)
+      expect(JSON.stringify(wire)).not.toContain('private')
+      read.mockClear()
+      await expect(owned.terminalWebCycleCompleted(enclosure, 'P2_WEB_CYCLE_11_789')).rejects.toThrow(/cycle/)
+      await expect(owned.terminalWebCycleCompleted(enclosure, 'P2_WEB_CYCLE_1_123; arbitrary')).rejects.toThrow(/cycle/)
+      await expect(control({ ...request, action: 'terminal-web-cycle', enclosure, challengeId: 'P2_WEB_CYCLE_1_123', path: '/foreign' })).rejects.toThrow(/operation/)
+      inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement' }])
+      await expect(owned.terminalWebCycleCompleted(enclosure, 'P2_WEB_CYCLE_1_123')).rejects.toThrow(/current/)
+      expect(read).not.toHaveBeenCalled()
+    } finally { await fsp.rm(directory, { recursive: true, force: true }) }
+  })
   it('observes the fixed OpenCode continuity startup checks without returning auth or process bodies', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-opencode-startup-'))
     try {

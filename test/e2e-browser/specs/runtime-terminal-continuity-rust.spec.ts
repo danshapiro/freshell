@@ -94,23 +94,6 @@ function leavesByMode(node: any, mode: string): any[] {
   return []
 }
 
-function waitForOwnedFileValue(
-  rig: ManagedRuntimeBrowserRig,
-  containerId: string,
-  filePath: string,
-  expected: string,
-  timeoutMs: number,
-): Promise<string> {
-  return waitForValue(`${expected} in ${filePath}`, async () => {
-    const actual = (await rig.ownedProviderExec(containerId, [
-      'sh',
-      '-lc',
-      `cat ${JSON.stringify(filePath)} 2>/dev/null || true`,
-    ])).trim()
-    return actual === expected ? actual : null
-  }, timeoutMs)
-}
-
 function waitForModeLeaf(
   harness: TestHarness,
   tabId: string,
@@ -246,12 +229,13 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         lastHeartbeat = heartbeat
 
         const marker = `P2_WEB_CYCLE_${cycle}_${Date.now()}`
-        const markerPath = `/home/freshell/provider/p2-web-cycle-${cycle}`
         await terminal.executeCommandInserted(
           `printf '%s\n' ${JSON.stringify(marker)} > "$HOME/p2-web-cycle-${cycle}"`,
         )
         try {
-          await waitForOwnedFileValue(rig, originalIdentity.containerId, markerPath, marker, 30_000)
+          await waitForValue(`owned terminal cycle marker ${marker}`, async () => (
+            await rig.terminalWebCycleCompleted(childEnclosure, marker)
+          ) ? true : null, 30_000)
         } catch (error) {
           await failWithDiagnostics(error)
         }
