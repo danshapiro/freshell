@@ -300,6 +300,7 @@ async fn apply_prepared_callback(
         .provider
         .as_deref()
         .ok_or("missing managed MCP provider")?;
+    let mut current_claude_plan = None;
     if let Some(binding) = callback.claude_recovery_source.as_ref() {
         binding
             .validate()
@@ -415,6 +416,11 @@ async fn apply_prepared_callback(
         {
             return Err("Claude current native source evidence identity changed; retain inputs and reprepare".into());
         }
+        current_claude_plan = Some(freshell_platform::claude_inputs::AcceptedNativeSourcePlan {
+            selector_manifest_sha256: source.selector_manifest_sha256,
+            plan_revision: 0,
+            observation: reply.observation,
+        });
     }
     if let Some(reply) = store.pending_prepared_context(
         &callback.soul_id,
@@ -461,9 +467,12 @@ async fn apply_prepared_callback(
                 AcceptedOrigins::Codex(manifest)
             }
             "claude" => {
-                let manifest: freshell_platform::claude_inputs::ClaudeInputManifest =
+                let mut manifest: freshell_platform::claude_inputs::ClaudeInputManifest =
                     serde_json::from_slice(&bytes)
                         .map_err(|_| "prior Claude source manifest metadata invalid")?;
+                if let Some(plan) = &current_claude_plan {
+                    manifest.accepted_native_plan = Some(plan.clone());
+                }
                 manifest.validate().map_err(str::to_string)?;
                 AcceptedOrigins::Claude(manifest)
             }
@@ -504,6 +513,7 @@ async fn apply_prepared_callback(
                         "Claude current workspace unavailable; retain inputs and reprepare",
                     )?),
                     claude_manifest: Some(manifest),
+                    claude_observation: current_claude_plan.as_ref().map(|plan| &plan.observation),
                     claude_inline_settings: inline_settings.as_deref(),
                     claude_reservation_provider: callback
                         .claude_recovery_source
@@ -6892,7 +6902,9 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
 
     #[tokio::test]
     async fn managed_provider_claude_pending_replay_requires_current_source_authority() {
-        use freshell_platform::claude_inputs::{ClaudeInputManifest, NativeSourceRuntime};
+        use freshell_platform::claude_inputs::{
+            ClaudeInputManifest, ClaudeSettingSource, NativeSourceRuntime,
+        };
         use freshell_runtime_protocol::{
             bounded_json_bytes, ClaudeRecoverySourceBinding, ClaudeSourceAuthority,
             ProviderLaunchContext, ProviderPreparation, RecoveryAttemptId, MAX_CONTROL_FRAME_BYTES,
@@ -6900,10 +6912,25 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
         let cwd = owned.path().join("workspace");
+        let resumed = cwd.join("resume");
+        let plugin = owned.path().join("selected-plugin");
         let directory = owned.path().join("control/mcp-capabilities");
-        for path in [&home.join(".claude"), &cwd, &directory] {
+        for path in [
+            &home.join(".claude"),
+            &cwd.join(".claude"),
+            &directory,
+            &plugin.join("node_modules/probe-dependency"),
+        ] {
             std::fs::create_dir_all(path).unwrap();
         }
+        std::fs::write(cwd.join(".claude/settings.local.json"), "{}").unwrap();
+        std::fs::write(plugin.join("resource"), "selected-plugin-resource").unwrap();
+        std::fs::write(
+            plugin.join("node_modules/probe-dependency/index.js"),
+            "module.exports='installed-dependency'",
+        )
+        .unwrap();
+        std::fs::write(plugin.join("consume.cjs"), "process.stdout.write(require('node:fs').readFileSync(__dirname+'/resource','utf8')+':'+require('probe-dependency'))").unwrap();
         std::fs::write(
             home.join(".claude/settings.json"),
             r#"{"env":{"ORDINARY_SOURCE":"retained"}}"#,
@@ -6928,8 +6955,8 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             settings_file: None,
             settings_origin: None,
             inline_settings_sha256: None,
-            setting_sources: vec![],
-            plugin_dirs: vec![],
+            setting_sources: vec![ClaudeSettingSource::Local],
+            plugin_dirs: vec![plugin.clone()],
             accepted_native_plan: None,
         };
         let input = OpencodeEphemeralInput {
@@ -7019,7 +7046,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             pending_before
         );
         assert_eq!(store.grants.lock().unwrap().len(), 2);
-        for fault in ["digest", "identity", "none"] {
+        for fault in ["digest", "identity", "none", "replacement"] {
             use freshell_platform::claude_inputs::observation::{
                 LocalDecision, NativeObservation, ObservationReply,
             };
@@ -7027,11 +7054,32 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 read_frame, write_frame, AdminCommand, AdminReply, AdminResult, Envelope,
                 InstallationId,
             };
+            let current_callback = if fault == "replacement" {
+                store
+                    .abort_preparation(&replacement.grant_id, &soul, &directory)
+                    .unwrap();
+                std::fs::create_dir_all(resumed.join(".claude")).unwrap();
+                std::fs::write(
+                    cwd.join(".claude/settings.local.json"),
+                    "invalid unselected workspace-local settings",
+                )
+                .unwrap();
+                std::fs::write(resumed.join(".claude/settings.local.json"), r#"{"env":{"LOCAL_SELECTED":"resumed"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node consume.cjs"}]}]}}"#).unwrap();
+                let mut value: serde_json::Value = serde_json::from_slice(&callback).unwrap();
+                value["cwd"] = serde_json::to_value(&resumed).unwrap();
+                serde_json::to_vec(&value).unwrap()
+            } else {
+                callback.clone()
+            };
             let socket_path = owned.path().join(format!("source-{fault}.sock"));
             let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
             let expected_scope = scope.clone();
             let expected_soul = soul.clone();
-            let expected_cwd = cwd.clone();
+            let expected_cwd = if fault == "replacement" {
+                resumed.clone()
+            } else {
+                cwd.clone()
+            };
             let reader = tokio::spawn(async move {
                 tokio::time::timeout(std::time::Duration::from_secs(5), async move {
                     for operation in 0..2 {
@@ -7057,9 +7105,9 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                                         version: 1, native_source_runtime: selected.native_source_runtime,
                                         setting_sources: selected.setting_sources, uid: if fault == "identity" { 0 } else { 65534 },
                                         euid: if fault == "identity" { 0 } else { 65534 }, gid: 0, egid: 0,
-                                        supplementary_groups: vec![], cwd: selected.cwd, home: Some(selected.home),
-                                        roots: None, local_decision: LocalDecision::Disabled,
-                                        root_uid: None, git_uid: None, claude_uid: None, local_settings: vec![],
+                                        supplementary_groups: vec![], local_settings: vec![selected.cwd.join(".claude/settings.local.json")], cwd: selected.cwd, home: Some(selected.home),
+                                        roots: None, local_decision: LocalDecision::NoRoot,
+                                        root_uid: None, git_uid: None, claude_uid: None,
                                     },
                                 })
                             },
@@ -7072,7 +7120,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             let client =
                 freshell_runtime_client::RuntimeClient::new(socket_path, "fixture-control");
             let result = apply_prepared_callback(
-                &callback,
+                &current_callback,
                 "fixture-control",
                 &store,
                 &directory,
@@ -7087,6 +7135,41 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                     serde_json::from_slice::<serde_json::Value>(&result.unwrap()).unwrap(),
                     serde_json::from_slice::<serde_json::Value>(&pending_before).unwrap()
                 );
+            } else if fault == "replacement" {
+                let ready: freshell_runtime_protocol::PreparedProviderContext = serde_json::from_slice(&result.expect("qualified current local selection must not stage unselected workspace-local poison")).unwrap();
+                let context = &ready.provider_launch_context;
+                let inputs = context.prepared_inputs.as_ref().unwrap();
+                let stage = staged_provider_root_path(&directory, &inputs.generation_id).unwrap();
+                let settings = inputs
+                    .config_binds
+                    .iter()
+                    .find(|bind| {
+                        Path::new(&bind.logical_destination)
+                            == resumed.join(".claude/settings.local.json")
+                    })
+                    .unwrap();
+                let resource = inputs
+                    .resource_mounts
+                    .iter()
+                    .find(|mount| Path::new(&mount.logical_destination) == plugin)
+                    .unwrap();
+                std::fs::remove_dir_all(&plugin).unwrap();
+                let output = std::process::Command::new("node").args(["-e", "const fs=require('node:fs'),s=JSON.parse(fs.readFileSync(process.argv[1]));process.stdout.write(s.env.LOCAL_SELECTED+':'+require('node:child_process').execSync(s.hooks.SessionStart[0].hooks[0].command,{cwd:process.argv[2]}))"])
+                    .arg(stage.join(&settings.source_relative_path)).arg(stage.join(&resource.stage_relative_path)).output().unwrap();
+                assert!(output.status.success());
+                assert_eq!(
+                    output.stdout,
+                    b"resumed:selected-plugin-resource:installed-dependency"
+                );
+                assert!(!inputs
+                    .config_binds
+                    .iter()
+                    .any(|bind| Path::new(&bind.logical_destination)
+                        == cwd.join(".claude/settings.local.json")));
+                assert!(
+                    !pending_stage.exists(),
+                    "deliberately aborted private generation stays removed"
+                );
             } else {
                 assert!(
                     result.is_err(),
@@ -7097,10 +7180,12 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 std::fs::read(prior_stage.join(".freshell/prepared-context.json")).unwrap(),
                 prior_before
             );
-            assert_eq!(
-                std::fs::read(pending_stage.join(".freshell/prepared-result.json")).unwrap(),
-                pending_before
-            );
+            if fault != "replacement" {
+                assert_eq!(
+                    std::fs::read(pending_stage.join(".freshell/prepared-result.json")).unwrap(),
+                    pending_before
+                );
+            }
             assert_eq!(store.grants.lock().unwrap().len(), 2);
         }
     }
