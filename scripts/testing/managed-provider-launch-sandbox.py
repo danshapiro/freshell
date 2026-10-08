@@ -35,7 +35,7 @@ def main():
     parser.add_argument("--provider",choices=["opencode","codex","claude","amplifier"],default="opencode")
     parser.add_argument("--claude-flavor",choices=["freshclaude","kilroy"],default="freshclaude")
     parser.add_argument("--claude-settings-form",choices=["file","inline","owned-last"],default="file")
-    parser.add_argument("--claude-source-guard",choices=["unchanged","changed-git","retained"],default="unchanged")
+    parser.add_argument("--claude-source-guard",choices=["unchanged","changed-git","retained","retained-fresh"],default="unchanged")
     args=parser.parse_args()
     if args.provider!="claude" and args.claude_flavor!="freshclaude":
         parser.error("the finite Claude flavor requires --provider claude")
@@ -211,16 +211,16 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                 receipt["claudeSourceGuard"]=args.claude_source_guard
             receipt["consumedRoutes"]=[json.loads(line.split("provider_launch_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_launch_consumer " in line]
             receipt["candidateObservers"]=[json.loads(line.split("provider_candidate_observer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_candidate_observer " in line]
-            if args.claude_source_guard=="retained":
+            if args.claude_source_guard in {"retained","retained-fresh"}:
                 receipt["recoveryConsumers"]=[json.loads(line.split("provider_recovery_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_recovery_consumer " in line]
                 recovered=receipt["recoveryConsumers"]
                 route_mismatch_recovery=len(recovered)!=1 or any(value.get("outcome")!="replaced" or value.get("sameOwnedHome") is not True or value.get("originalOrdinaryUnavailable") is not True or value.get("generationId")==value.get("priorGeneration") for value in recovered)
             print(outcome.stdout,end="",flush=True);print(outcome.stderr,end="",flush=True)
             expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")} if args.provider=="opencode" else ({(args.provider,"terminal")} if args.provider=="amplifier" else {(args.provider,"terminal"),(args.provider,"fresh")})
-            if args.claude_source_guard=="retained":expected_routes={("claude","terminal")}
+            if args.claude_source_guard in {"retained","retained-fresh"}:expected_routes={("claude","fresh" if args.claude_source_guard=="retained-fresh" else "terminal")}
             observed_routes={(item.get("provider"),item.get("route")) for item in receipt["consumedRoutes"]}
             route_mismatch=len(receipt["consumedRoutes"])!=len(expected_routes) or observed_routes!=expected_routes
-            if args.claude_source_guard=="retained":route_mismatch=route_mismatch or route_mismatch_recovery
+            if args.claude_source_guard in {"retained","retained-fresh"}:route_mismatch=route_mismatch or route_mismatch_recovery
             if args.claude_source_guard=="changed-git":
                 receipt["blockedRoutes"]=[json.loads(line.split("provider_source_guard ",1)[1]) for line in outcome.stdout.splitlines() if "provider_source_guard " in line]
                 blocked={(item.get("provider"),item.get("route")) for item in receipt["blockedRoutes"]}

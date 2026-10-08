@@ -1163,9 +1163,10 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
         .unwrap_or_else(|_| "unchanged".into());
     assert!(matches!(
         source_guard.as_str(),
-        "unchanged" | "changed-git" | "retained"
+        "unchanged" | "changed-git" | "retained" | "retained-fresh"
     ));
     let changed_git = source_guard == "changed-git";
+    let retained_fresh = source_guard == "retained-fresh";
     let flag_argument = match settings_form.as_str() {
         "file" if changed_git => flag_alias.to_str().unwrap().into(),
         "file" => "../source-home/selected-config/selected-settings.json".into(),
@@ -1389,17 +1390,43 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         json!({"uid":observed.uid,"euid":observed.euid,"gid":observed.gid,"egid":observed.egid,"groups":groups})
     }
     let client = controller.runtime_client();
-    let terminal_identity = qualify_private_source_reader(
-        &client,
-        SoulId::parse(format!(
+    let source_provider =
+        if std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_FLAVOR").as_deref() == Ok("kilroy") {
+            "kilroy"
+        } else {
+            "claude"
+        };
+    let initial_seed = if retained_fresh {
+        "closed-native-fresh-create"
+    } else {
+        "closed-native-terminal-create"
+    };
+    let initial_soul = if retained_fresh {
+        format!(
+            "soul-fresh-{source_provider}-{}",
+            &format!("{:x}", Sha256::digest(initial_seed.as_bytes()))[..32]
+        )
+    } else {
+        format!(
             "soul-terminal-{}",
-            &format!("{:x}", Sha256::digest(b"closed-native-terminal-create"))[..32]
-        ))
-        .unwrap(),
-        "claude",
-        "closed-native-terminal-create",
+            &format!("{:x}", Sha256::digest(initial_seed.as_bytes()))[..32]
+        )
+    };
+    let source_identity = qualify_private_source_reader(
+        &client,
+        SoulId::parse(initial_soul).unwrap(),
+        if retained_fresh {
+            source_provider
+        } else {
+            "claude"
+        },
+        initial_seed,
         &workspace,
-        freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+        if retained_fresh {
+            freshell_platform::claude_inputs::NativeSourceRuntime::Sdk
+        } else {
+            freshell_platform::claude_inputs::NativeSourceRuntime::Terminal
+        },
     )
     .await;
     let cwd = if changed_git {
@@ -1418,7 +1445,86 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     )
     .unwrap();
     std::env::set_var("HOME", &ambient_home);
-    let terminal = controller
+    async fn consumed(path: &Path) -> Option<Value> {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(value) = serde_json::from_slice(&bytes) {
+                        break value;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .ok()
+    }
+    let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let expected = json!({"hook":true,"physicalHome":"/home/freshell/provider","nativeIdentity":source_identity,"settings":true,"authenticated":true,"scopedAlias":true,"onecli":true,"refreshStageAbsent":true,"memory":hash(&memory),"skill":hash(std::fs::read(plugin.join("skills/probe/SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-claude-resource"),"diskResource":hash(&disk_resource),"dependency":hash(b"closed-claude-dependency")});
+    let imported_bytes = std::fs::read(home.join("imported-memory.md")).unwrap();
+    let mut expected_imports = serde_json::Map::new();
+    expected_imports.insert("imported-memory.md".into(), json!(hash(&imported_bytes)));
+    expected_imports.insert(
+        "rule-memory.md".into(),
+        json!(hash(b"closed-selected-rule-memory\n")),
+    );
+    for name in [
+        "relative-memory.md",
+        "home-memory.md",
+        "absolute-memory.md",
+        "spaced memory.md",
+        "nested-memory.md",
+    ] {
+        expected_imports.insert(
+            name.into(),
+            json!(hash(std::fs::read(plugin.join(name)).unwrap().as_slice())),
+        );
+    }
+    let expected_imports = Value::Object(expected_imports);
+    let instructions_events = instructions_receipt.with_extension("json.events");
+    fn instruction_events(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("complete native instruction event"))
+            .collect()
+    }
+    async fn imported_graph(path: &Path, expected: &Value) {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let mut loaded = serde_json::Map::new();
+                for event in instruction_events(path) {
+                    assert_ne!(
+                        event["ignored"],
+                        json!(true),
+                        "native code spans/fences/quoted tokens must remain unselected"
+                    );
+                    if let Some(name) = event["selected"]["name"].as_str() {
+                        loaded.insert(name.into(), event["selected"]["digest"].clone());
+                    }
+                }
+                if Value::Object(loaded.clone()) == *expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "native must load the complete original-form Markdown import graph; observed {:?}",
+            instruction_events(path)
+        );
+    }
+    let qualified_digest = hash(
+        serde_json::to_vec(&json!({"startup":expected,"nativeImports":expected_imports,"terminalSettingSources":"user","disabledProjectConsumed":false,"freshSettingSources":"user,project,local"}))
+            .unwrap()
+            .as_slice(),
+    );
+    let terminal = if retained_fresh {
+        None
+    } else {
+        Some(controller
         .launch(ManagedTerminalLaunch {
             spec: freshell_platform::spawn::SpawnSpec {
                 program: "claude".into(),
@@ -1457,9 +1563,12 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
             view_pane_id: None,
             create_request_id: Some("closed-native-terminal-create".into()),
         })
-        .await;
+        .await)
+    };
     if changed_git {
-        let error = terminal.expect_err("actual final source mismatch must block terminal startup");
+        let error = terminal
+            .unwrap()
+            .expect_err("actual final source mismatch must block terminal startup");
         println!(
             "provider_source_guard_diagnostic {}",
             json!({"selectionChanged":error.contains("Claude native source selection changed"),"commonDir":error.contains("git common dir"),"hostUnreachable":error.contains("host") })
@@ -1551,321 +1660,251 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         assert!(control_task.await.unwrap_err().is_cancelled());
         return;
     }
-    let terminal = terminal.expect("complete native Claude terminal startup");
-    async fn consumed(path: &Path) -> Option<Value> {
-        tokio::time::timeout(Duration::from_secs(45), async {
-            loop {
-                if let Ok(bytes) = std::fs::read(path) {
-                    if let Ok(value) = serde_json::from_slice(&bytes) {
-                        break value;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(30)).await;
-            }
-        })
-        .await
-        .ok()
-    }
-    let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-    let expected = json!({"hook":true,"physicalHome":"/home/freshell/provider","nativeIdentity":terminal_identity,"settings":true,"authenticated":true,"scopedAlias":true,"onecli":true,"refreshStageAbsent":true,"memory":hash(&memory),"skill":hash(std::fs::read(plugin.join("skills/probe/SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-claude-resource"),"diskResource":hash(&disk_resource),"dependency":hash(b"closed-claude-dependency")});
-    let imported_bytes = std::fs::read(home.join("imported-memory.md")).unwrap();
-    let mut expected_imports = serde_json::Map::new();
-    expected_imports.insert("imported-memory.md".into(), json!(hash(&imported_bytes)));
-    expected_imports.insert(
-        "rule-memory.md".into(),
-        json!(hash(b"closed-selected-rule-memory\n")),
-    );
-    for name in [
-        "relative-memory.md",
-        "home-memory.md",
-        "absolute-memory.md",
-        "spaced memory.md",
-        "nested-memory.md",
-    ] {
-        expected_imports.insert(
-            name.into(),
-            json!(hash(std::fs::read(plugin.join(name)).unwrap().as_slice())),
-        );
-    }
-    let expected_imports = Value::Object(expected_imports);
-    let instructions_events = instructions_receipt.with_extension("json.events");
-    fn instruction_events(path: &Path) -> Vec<Value> {
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("complete native instruction event"))
-            .collect()
-    }
-    async fn imported_graph(path: &Path, expected: &Value) {
-        let result = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                let mut loaded = serde_json::Map::new();
-                for event in instruction_events(path) {
-                    assert_ne!(
-                        event["ignored"],
-                        json!(true),
-                        "native code spans/fences/quoted tokens must remain unselected"
-                    );
-                    if let Some(name) = event["selected"]["name"].as_str() {
-                        loaded.insert(name.into(), event["selected"]["digest"].clone());
-                    }
-                }
-                if Value::Object(loaded.clone()) == *expected {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(30)).await;
-            }
-        })
-        .await;
-        assert!(
-            result.is_ok(),
-            "native must load the complete original-form Markdown import graph; observed {:?}",
-            instruction_events(path)
-        );
-    }
-    let qualified_digest = hash(
-        serde_json::to_vec(&json!({"startup":expected,"nativeImports":expected_imports,"terminalSettingSources":"user","disabledProjectConsumed":false,"freshSettingSources":"user,project,local"}))
-            .unwrap()
-            .as_slice(),
-    );
-    let observed = consumed(&receipt).await;
-    if observed.is_none() {
-        let output = client
-            .read_output(
-                SoulId::parse(terminal.soul_id.clone()).unwrap(),
-                0,
-                64 * 1024,
-            )
-            .await
-            .unwrap();
-        let text = output
-            .frames
-            .iter()
-            .map(|frame| frame.data.as_str())
-            .collect::<String>();
-        let text = crate::ai_title::strip_ansi(&text);
-        let classes = [
-            "ENOENT",
-            "EACCES",
-            "trust",
-            "Trust",
-            "onboarding",
-            "Sign in",
-            "API key",
-            "plugin",
-            "Plugin",
-            "settings",
-            "MCP",
-            "Permission denied",
-            "text style",
-            "theme",
-            "Theme",
-            "Welcome",
-            "Let's",
-            "Enter",
-            "Continue",
-            "terms",
-            "Token",
-            "Authentication",
-            "Setup",
-            "select",
-            "Select",
-        ]
-        .into_iter()
-        .filter(|class| text.contains(class))
-        .collect::<Vec<_>>();
-        println!(
-            "provider_launch_diagnostic {}",
-            json!({"provider":"claude","route":"terminal","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"classes":classes})
-        );
-    }
-    assert_eq!(
-        observed.expect("native Claude selected plugin must execute its startup hook"),
-        expected
-    );
-    if settings_form == "owned-last" {
-        assert!(
-            !flag_receipt.exists(),
-            "ignored user settings hooks must not execute"
-        );
-    } else {
-        assert_eq!(
-            consumed(&flag_receipt)
+    if let Some(terminal) = terminal {
+        let terminal = terminal.expect("complete native Claude terminal startup");
+        let observed = consumed(&receipt).await;
+        if observed.is_none() {
+            let output = client
+                .read_output(
+                    SoulId::parse(terminal.soul_id.clone()).unwrap(),
+                    0,
+                    64 * 1024,
+                )
                 .await
-                .expect("native must execute the explicitly selected last flag settings hook"),
-            json!({"flag":true,"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")})
-        );
-    }
-    assert_eq!(std::fs::read(&flag_settings).unwrap(), flag_bytes);
-    assert_eq!(
-        std::fs::read_to_string(selected_config.join("rules/nested/policy.md")).unwrap(),
-        rule
-    );
-    assert_eq!(std::fs::read_link(&flag_alias).unwrap(), flag_settings);
-    let native_import = consumed(&instructions_receipt).await;
-    if native_import.is_none() {
-        println!(
-            "provider_memory_diagnostic {}",
-            json!({"route":"terminal","hookEvents":std::fs::read_to_string(instructions_receipt.with_extension("json.events")).unwrap_or_default().lines().filter_map(|line|serde_json::from_str::<Value>(line).ok()).collect::<Vec<_>>() })
-        );
-    }
-    assert_eq!(
-        native_import.expect("native Claude must load selected memory import"),
-        json!({"nativeImport":true,"digest":hash(&imported_bytes)})
-    );
-    imported_graph(&instructions_events, &expected_imports).await;
-    println!(
-        "provider_launch_consumer {}",
-        json!({"provider":"claude","route":"terminal","digest":qualified_digest})
-    );
-    if std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_SOURCE_GUARD").as_deref() == Ok("retained") {
-        let soul = SoulId::parse(terminal.soul_id.clone()).unwrap();
-        let prior = registry.active_handle_for_soul(soul.clone()).await.unwrap();
-        let prior_generation = prior
-            .terminal()
-            .unwrap()
-            .provider_launch_context
-            .as_ref()
-            .unwrap()
-            .prepared_inputs
-            .as_ref()
-            .unwrap()
-            .generation_id
-            .clone();
-        let real = DockerEngineBackend::new(fixture.join("broker.sock"));
-        real.force_stop(&prior)
-            .await
-            .expect("stop only the registry-owned disposable runtime");
-        assert!(real.verify_empty(&prior).await.unwrap());
-        let hidden_home = fixture.join("source-home-unavailable");
-        std::fs::rename(&home, &hidden_home).unwrap();
-        for path in [&receipt, &instructions_receipt, &instructions_events] {
-            std::fs::remove_file(path).unwrap();
-        }
-        if settings_form != "owned-last" {
-            std::fs::remove_file(&flag_receipt).unwrap();
-        }
-        let recovered = tokio::time::timeout(
-            Duration::from_secs(120),
-            client.recover(soul.clone(), RecoveryTrigger::HostUnreachable),
-        )
-        .await
-        .expect("finite actual retained recovery")
-        .expect("authenticated supervisor recovery reply");
-        println!(
-            "provider_recovery_outcome {}",
-            json!({"outcome":recovered.outcome,"priorGeneration":prior_generation,"probe":recovered.probe.as_ref().map(|probe|match probe { RecoveryProbe::ResumeReady {..} => "native_resume", RecoveryProbe::PristineSeedReady {..} => "pristine_seed", _ => "other" })})
-        );
-        if let Some(RecoveryProbe::Blocked {
-            reason, retry_hint, ..
-        }) = &recovered.probe
-        {
-            let repair = retry_hint.repair.as_deref().unwrap_or("");
+                .unwrap();
+            let text = output
+                .frames
+                .iter()
+                .map(|frame| frame.data.as_str())
+                .collect::<String>();
+            let text = crate::ai_title::strip_ansi(&text);
             let classes = [
-                "Claude",
-                "source",
-                "selection",
-                "changed",
-                "observation",
-                "identity",
-                "frozen",
-                "ordinary",
-                "manifest",
-                "metadata",
-                "HOME",
-                "scope",
-                "grant",
-                "missing",
-                "unavailable",
-                "reprepare",
-                "budget",
-                "native",
-                "store",
-                "provider",
-                "callback",
-                "checkpoint",
-                "permission",
-                "configuration",
-                "revision",
+                "ENOENT",
+                "EACCES",
+                "trust",
+                "Trust",
+                "onboarding",
+                "Sign in",
+                "API key",
+                "plugin",
+                "Plugin",
+                "settings",
+                "MCP",
+                "Permission denied",
+                "text style",
+                "theme",
+                "Theme",
+                "Welcome",
+                "Let's",
+                "Enter",
+                "Continue",
+                "terms",
+                "Token",
+                "Authentication",
+                "Setup",
+                "select",
+                "Select",
             ]
             .into_iter()
-            .filter(|class| repair.contains(class))
+            .filter(|class| text.contains(class))
             .collect::<Vec<_>>();
             println!(
-                "provider_recovery_diagnostic {}",
-                json!({"reason":reason,"repairClasses":classes,"repairBytes":repair.len(),"callbackFailureClasses":failure_classes.lock().unwrap().clone()})
+                "provider_launch_diagnostic {}",
+                json!({"provider":"claude","route":"terminal","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"classes":classes})
             );
         }
-        assert_eq!(recovered.outcome, RecoveryOutcome::Replaced, "actual retained callback must replace the stopped owned runtime after original ordinary inputs disappear");
-        let current = registry.active_handle_for_soul(soul).await.unwrap();
-        let generation = &current
-            .terminal()
-            .unwrap()
-            .provider_launch_context
-            .as_ref()
-            .unwrap()
-            .prepared_inputs
-            .as_ref()
-            .unwrap()
-            .generation_id;
-        assert_ne!(generation, &prior_generation);
-        assert_eq!(current.provider_volume_name(), prior.provider_volume_name());
         assert_eq!(
-            consumed(&receipt)
-                .await
-                .expect("recovered real native startup hook"),
+            observed.expect("native Claude selected plugin must execute its startup hook"),
             expected
         );
-        if settings_form != "owned-last" {
+        if settings_form == "owned-last" {
+            assert!(
+                !flag_receipt.exists(),
+                "ignored user settings hooks must not execute"
+            );
+        } else {
             assert_eq!(
                 consumed(&flag_receipt)
                     .await
-                    .expect("recovered explicitly selected settings hook"),
+                    .expect("native must execute the explicitly selected last flag settings hook"),
                 json!({"flag":true,"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")})
             );
         }
-        imported_graph(&instructions_events, &expected_imports).await;
-        assert!(!home.exists());
-        println!(
-            "provider_recovery_consumer {}",
-            json!({"provider":"claude","route":"terminal","digest":qualified_digest,"sameOwnedHome":true,"priorGeneration":prior_generation,"generationId":generation,"originalOrdinaryUnavailable":true,"outcome":recovered.outcome})
+        assert_eq!(std::fs::read(&flag_settings).unwrap(), flag_bytes);
+        assert_eq!(
+            std::fs::read_to_string(selected_config.join("rules/nested/policy.md")).unwrap(),
+            rule
         );
-        std::fs::rename(&hidden_home, &home).unwrap();
-    }
-    client
-        .stop(SoulId::parse(terminal.soul_id).unwrap())
-        .await
-        .unwrap();
-    assert!(instruction_events(&instructions_events)
-        .iter()
-        .all(|event| event["ignored"] != json!(true)));
-    assert!(
-        instruction_events(&instructions_events)
+        assert_eq!(std::fs::read_link(&flag_alias).unwrap(), flag_settings);
+        let native_import = consumed(&instructions_receipt).await;
+        if native_import.is_none() {
+            println!(
+                "provider_memory_diagnostic {}",
+                json!({"route":"terminal","hookEvents":std::fs::read_to_string(instructions_receipt.with_extension("json.events")).unwrap_or_default().lines().filter_map(|line|serde_json::from_str::<Value>(line).ok()).collect::<Vec<_>>() })
+            );
+        }
+        assert_eq!(
+            native_import.expect("native Claude must load selected memory import"),
+            json!({"nativeImport":true,"digest":hash(&imported_bytes)})
+        );
+        imported_graph(&instructions_events, &expected_imports).await;
+        println!(
+            "provider_launch_consumer {}",
+            json!({"provider":"claude","route":"terminal","digest":qualified_digest})
+        );
+        if std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_SOURCE_GUARD").as_deref()
+            == Ok("retained")
+        {
+            let soul = SoulId::parse(terminal.soul_id.clone()).unwrap();
+            let prior = registry.active_handle_for_soul(soul.clone()).await.unwrap();
+            let prior_generation = prior
+                .terminal()
+                .unwrap()
+                .provider_launch_context
+                .as_ref()
+                .unwrap()
+                .prepared_inputs
+                .as_ref()
+                .unwrap()
+                .generation_id
+                .clone();
+            let real = DockerEngineBackend::new(fixture.join("broker.sock"));
+            real.force_stop(&prior)
+                .await
+                .expect("stop only the registry-owned disposable runtime");
+            assert!(real.verify_empty(&prior).await.unwrap());
+            let hidden_home = fixture.join("source-home-unavailable");
+            std::fs::rename(&home, &hidden_home).unwrap();
+            for path in [&receipt, &instructions_receipt, &instructions_events] {
+                std::fs::remove_file(path).unwrap();
+            }
+            if settings_form != "owned-last" {
+                std::fs::remove_file(&flag_receipt).unwrap();
+            }
+            let recovered = tokio::time::timeout(
+                Duration::from_secs(120),
+                client.recover(soul.clone(), RecoveryTrigger::HostUnreachable),
+            )
+            .await
+            .expect("finite actual retained recovery")
+            .expect("authenticated supervisor recovery reply");
+            println!(
+                "provider_recovery_outcome {}",
+                json!({"outcome":recovered.outcome,"priorGeneration":prior_generation,"probe":recovered.probe.as_ref().map(|probe|match probe { RecoveryProbe::ResumeReady {..} => "native_resume", RecoveryProbe::PristineSeedReady {..} => "pristine_seed", _ => "other" })})
+            );
+            if let Some(RecoveryProbe::Blocked {
+                reason, retry_hint, ..
+            }) = &recovered.probe
+            {
+                let repair = retry_hint.repair.as_deref().unwrap_or("");
+                let classes = [
+                    "Claude",
+                    "source",
+                    "selection",
+                    "changed",
+                    "observation",
+                    "identity",
+                    "frozen",
+                    "ordinary",
+                    "manifest",
+                    "metadata",
+                    "HOME",
+                    "scope",
+                    "grant",
+                    "missing",
+                    "unavailable",
+                    "reprepare",
+                    "budget",
+                    "native",
+                    "store",
+                    "provider",
+                    "callback",
+                    "checkpoint",
+                    "permission",
+                    "configuration",
+                    "revision",
+                ]
+                .into_iter()
+                .filter(|class| repair.contains(class))
+                .collect::<Vec<_>>();
+                println!(
+                    "provider_recovery_diagnostic {}",
+                    json!({"reason":reason,"repairClasses":classes,"repairBytes":repair.len(),"callbackFailureClasses":failure_classes.lock().unwrap().clone()})
+                );
+            }
+            assert_eq!(recovered.outcome, RecoveryOutcome::Replaced, "actual retained callback must replace the stopped owned runtime after original ordinary inputs disappear");
+            let current = registry.active_handle_for_soul(soul).await.unwrap();
+            let generation = &current
+                .terminal()
+                .unwrap()
+                .provider_launch_context
+                .as_ref()
+                .unwrap()
+                .prepared_inputs
+                .as_ref()
+                .unwrap()
+                .generation_id;
+            assert_ne!(generation, &prior_generation);
+            assert_eq!(current.provider_volume_name(), prior.provider_volume_name());
+            assert_eq!(
+                consumed(&receipt)
+                    .await
+                    .expect("recovered real native startup hook"),
+                expected
+            );
+            if settings_form != "owned-last" {
+                assert_eq!(
+                    consumed(&flag_receipt)
+                        .await
+                        .expect("recovered explicitly selected settings hook"),
+                    json!({"flag":true,"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")})
+                );
+            }
+            imported_graph(&instructions_events, &expected_imports).await;
+            assert!(!home.exists());
+            println!(
+                "provider_recovery_consumer {}",
+                json!({"provider":"claude","route":"terminal","digest":qualified_digest,"sameOwnedHome":true,"priorGeneration":prior_generation,"generationId":generation,"originalOrdinaryUnavailable":true,"outcome":recovered.outcome})
+            );
+            std::fs::rename(&hidden_home, &home).unwrap();
+        }
+        client
+            .stop(SoulId::parse(terminal.soul_id).unwrap())
+            .await
+            .unwrap();
+        assert!(instruction_events(&instructions_events)
             .iter()
-            .all(|event| event["project"] != json!(true)),
-        "the real native terminal must leave project memory unselected"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&disabled_project_memory).unwrap(),
-        "@missing-disabled-project.md\n"
-    );
-    if source_guard == "retained" {
-        // This closed scenario spends its two runtime attempts on the original
-        // terminal and its replacement. The unchanged scenario below retains
-        // its independent terminal and fresh SDK coverage.
-        web_task.abort();
-        control_task.abort();
-        assert!(web_task.await.unwrap_err().is_cancelled());
-        assert!(control_task.await.unwrap_err().is_cancelled());
-        return;
+            .all(|event| event["ignored"] != json!(true)));
+        assert!(
+            instruction_events(&instructions_events)
+                .iter()
+                .all(|event| event["project"] != json!(true)),
+            "the real native terminal must leave project memory unselected"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&disabled_project_memory).unwrap(),
+            "@missing-disabled-project.md\n"
+        );
+        if source_guard == "retained" {
+            // This closed scenario spends its two runtime attempts on the original
+            // terminal and its replacement. The unchanged scenario below retains
+            // its independent terminal and fresh SDK coverage.
+            web_task.abort();
+            control_task.abort();
+            assert!(web_task.await.unwrap_err().is_cancelled());
+            assert!(control_task.await.unwrap_err().is_cancelled());
+            return;
+        }
     }
     // Fresh SDK exposes the existing all-source default. Remove only these
     // terminal-specific owned decoys before its independent launch.
     std::fs::remove_file(&disabled_project_memory).unwrap();
     std::fs::remove_file(&disabled_project_settings).unwrap();
-    std::fs::remove_file(&receipt).unwrap();
-    std::fs::remove_file(&instructions_receipt).unwrap();
-    std::fs::remove_file(&instructions_events).unwrap();
+    if !retained_fresh {
+        std::fs::remove_file(&receipt).unwrap();
+        std::fs::remove_file(&instructions_receipt).unwrap();
+        std::fs::remove_file(&instructions_events).unwrap();
+    }
     // Native project command discovery stops at this repository root. A
     // dangling ancestor command root is deliberately outside that selection.
     std::fs::create_dir_all(fixture.join(".claude")).unwrap();
@@ -1923,21 +1962,25 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     } else {
         "claude"
     };
-    let fresh_identity = qualify_private_source_reader(
-        &client,
-        SoulId::parse(format!(
-            "soul-fresh-{source_provider}-{}",
-            &format!("{:x}", Sha256::digest(b"closed-native-fresh-create"))[..32]
-        ))
-        .unwrap(),
-        source_provider,
-        "closed-native-fresh-create",
-        &workspace,
-        freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
-    )
-    .await;
+    let fresh_identity = if retained_fresh {
+        source_identity.clone()
+    } else {
+        qualify_private_source_reader(
+            &client,
+            SoulId::parse(format!(
+                "soul-fresh-{source_provider}-{}",
+                &format!("{:x}", Sha256::digest(b"closed-native-fresh-create"))[..32]
+            ))
+            .unwrap(),
+            source_provider,
+            "closed-native-fresh-create",
+            &workspace,
+            freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
+        )
+        .await
+    };
     assert_eq!(
-        fresh_identity, terminal_identity,
+        fresh_identity, source_identity,
         "both actual source readers must match the real native consumer identity"
     );
     Arc::clone(&proxy).dispatch(HostedFreshAgentCommand::Create(serde_json::from_value(json!({"requestId":"closed-native-fresh-create","sessionType":flavor,"provider":"claude","cwd":cwd,"plugins":[plugin.to_str().unwrap()]})).unwrap())).await;
@@ -1946,10 +1989,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
             let frame: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
             if frame["type"] == "freshAgent.create.failed" {
                 println!("provider_launch_failure_classes {}", json!({"provider":"claude","flavor":flavor,"classes":failure_classes.lock().unwrap().clone()}));
-                panic!(
-                    "fresh Claude startup failed classification: {}",
-                    frame["message"]
-                );
+                panic!("fresh Claude startup failed; only the safe failure classes are reported");
             }
             if frame["type"] == "freshAgent.created" {
                 break;
@@ -1988,16 +2028,157 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         std::fs::read_to_string(plugin.join("scripts/consume.cjs")).unwrap(),
         consumer
     );
+    if retained_fresh {
+        let soul = SoulId::parse(format!(
+            "soul-fresh-{source_provider}-{}",
+            &format!("{:x}", Sha256::digest(b"closed-native-fresh-create"))[..32]
+        ))
+        .unwrap();
+        let prior = registry.active_handle_for_soul(soul.clone()).await.unwrap();
+        let prior_generation = prior
+            .fresh_agent()
+            .unwrap()
+            .provider_launch_context
+            .as_ref()
+            .unwrap()
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .generation_id
+            .clone();
+        let real = DockerEngineBackend::new(fixture.join("broker.sock"));
+        real.force_stop(&prior)
+            .await
+            .expect("stop only the registry-owned disposable SDK runtime");
+        assert!(real.verify_empty(&prior).await.unwrap());
+        let hidden_home = fixture.join("source-home-unavailable");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        for path in [
+            &receipt,
+            &instructions_receipt,
+            &instructions_events,
+            &project_receipt,
+        ] {
+            std::fs::remove_file(path).unwrap();
+        }
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(120),
+            client.recover(soul.clone(), RecoveryTrigger::HostUnreachable),
+        )
+        .await
+        .expect("finite actual retained SDK recovery")
+        .expect("authenticated supervisor recovery reply");
+        println!(
+            "provider_recovery_outcome {}",
+            json!({"outcome":recovered.outcome,"priorGeneration":prior_generation,"probe":recovered.probe.as_ref().map(|probe|match probe {RecoveryProbe::ResumeReady {..} => "native_resume", RecoveryProbe::PristineSeedReady {..} => "pristine_seed", _ => "other"}),"callbackFailureClasses":failure_classes.lock().unwrap().clone()})
+        );
+        if let Some(RecoveryProbe::Blocked {
+            reason, retry_hint, ..
+        }) = &recovered.probe
+        {
+            let repair = retry_hint.repair.as_deref().unwrap_or("");
+            let classes = [
+                "Claude",
+                "source",
+                "selection",
+                "changed",
+                "observation",
+                "identity",
+                "frozen",
+                "ordinary",
+                "manifest",
+                "metadata",
+                "HOME",
+                "scope",
+                "grant",
+                "missing",
+                "unavailable",
+                "reprepare",
+                "budget",
+                "native",
+                "store",
+                "provider",
+                "callback",
+                "checkpoint",
+                "permission",
+                "configuration",
+                "revision",
+                "healthy",
+                "host",
+                "worker",
+                "activation",
+                "ready",
+                "timed out",
+            ]
+            .into_iter()
+            .filter(|class| repair.contains(class))
+            .collect::<Vec<_>>();
+            println!(
+                "provider_recovery_diagnostic {}",
+                json!({"reason":reason,"repairClasses":classes,"repairBytes":repair.len()})
+            );
+        }
+        assert_eq!(recovered.outcome, RecoveryOutcome::Replaced, "actual retained SDK callback must replace the stopped owned runtime after original ordinary inputs disappear");
+        assert!(
+            matches!(
+                recovered.probe,
+                Some(RecoveryProbe::PristineSeedReady { .. })
+            ),
+            "empty SDK fixture must use the actual pristine seed recovery path"
+        );
+        let current = registry.active_handle_for_soul(soul).await.unwrap();
+        let generation = &current
+            .fresh_agent()
+            .unwrap()
+            .provider_launch_context
+            .as_ref()
+            .unwrap()
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .generation_id;
+        assert_ne!(generation, &prior_generation);
+        assert_eq!(current.provider_volume_name(), prior.provider_volume_name());
+        assert_eq!(
+            consumed(&receipt)
+                .await
+                .expect("recovered genuine SDK startup hook"),
+            expected
+        );
+        assert_eq!(
+            consumed(&instructions_receipt)
+                .await
+                .expect("recovered SDK native memory import"),
+            json!({"nativeImport":true,"digest":hash(&imported_bytes)})
+        );
+        imported_graph(&instructions_events, &expected_imports).await;
+        assert_eq!(
+            consumed(&project_receipt)
+                .await
+                .expect("recovered SDK current project command hook"),
+            json!({"resource":hash(b"closed-project-command-resource"),"dependency":hash(b"closed-project-command-dependency")})
+        );
+        assert!(!home.exists());
+        println!(
+            "provider_recovery_consumer {}",
+            json!({"provider":"claude","route":"fresh","digest":qualified_digest,"sameOwnedHome":true,"priorGeneration":prior_generation,"generationId":generation,"originalOrdinaryUnavailable":true,"outcome":recovered.outcome})
+        );
+        std::fs::rename(&hidden_home, &home).unwrap();
+    }
     let catalog_project = fixture.join("catalog-project");
     let catalog_home = fixture.join("catalog-home");
     std::fs::create_dir_all(catalog_project.join(".git")).unwrap();
     std::fs::create_dir_all(&catalog_home).unwrap();
+    let mut catalog_owners = 0;
     for view in client.inventory().await.unwrap() {
-        if view.desired_state == DesiredState::Running {
+        if view.desired_state == DesiredState::Running && view.launch_state == LaunchState::Running
+        {
             let handle = registry
                 .active_handle_for_soul(view.soul_id.clone())
                 .await
                 .unwrap();
+            assert_eq!(handle.incarnation_id(), &view.incarnation_id);
+            catalog_owners += 1;
             let inputs = handle
                 .fresh_agent()
                 .unwrap()
@@ -2028,6 +2209,10 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
             client.stop(view.soul_id).await.unwrap();
         }
     }
+    assert_eq!(
+        catalog_owners, 1,
+        "catalog must consume exactly the active SDK preparation"
+    );
     let catalog_script = fixture.join("catalog-probe.mjs");
     std::fs::write(&catalog_script, r#"import {query} from '/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs';
 const abort = new AbortController();

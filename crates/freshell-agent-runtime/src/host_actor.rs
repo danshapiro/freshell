@@ -422,9 +422,18 @@ impl FreshAgentHostActor {
             if expected_profile.native_session_id.is_none() {
                 expected_profile.native_session_id = loaded.profile.native_session_id.clone();
             }
+            // The host validates a fresh preparation for each incarnation.
+            // Its grant and resource generation may change while the durable
+            // conversation and every other launch setting remain the same.
+            let current_preparation = expected_profile.provider_launch_context.take();
+            if current_preparation.is_some() {
+                expected_profile.provider_launch_context =
+                    loaded.profile.provider_launch_context.clone();
+            }
             if loaded.profile != expected_profile {
                 return Err(ActorError::NativeIdentityMismatch);
             }
+            loaded.profile.provider_launch_context = current_preparation;
             for command in loaded.commands.values_mut() {
                 if matches!(command.state, CommandState::Dispatching) {
                     command.state = CommandState::Ambiguous;

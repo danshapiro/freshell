@@ -261,6 +261,7 @@ impl FreshAgentTransport for OperationTransport {
 struct FakeTransport {
     native: String,
     starts: AtomicUsize,
+    start_profiles: std::sync::Mutex<Vec<FreshAgentProfile>>,
     dispatches: AtomicUsize,
     decisions: AtomicUsize,
     stops: AtomicUsize,
@@ -359,6 +360,7 @@ impl FakeTransport {
         Arc::new(Self {
             native: native.into(),
             starts: AtomicUsize::new(0),
+            start_profiles: std::sync::Mutex::new(Vec::new()),
             dispatches: AtomicUsize::new(0),
             decisions: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
@@ -372,6 +374,7 @@ impl FakeTransport {
             ..Self {
                 native: native.into(),
                 starts: AtomicUsize::new(0),
+                start_profiles: std::sync::Mutex::new(Vec::new()),
                 dispatches: AtomicUsize::new(0),
                 decisions: AtomicUsize::new(0),
                 stops: AtomicUsize::new(0),
@@ -384,8 +387,9 @@ impl FakeTransport {
 
 #[async_trait]
 impl FreshAgentTransport for FakeTransport {
-    async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+    async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
         self.starts.fetch_add(1, Ordering::SeqCst);
+        self.start_profiles.lock().unwrap().push(profile.clone());
         Ok(TransportStart {
             native_session_id: Some(self.native.clone()),
         })
@@ -885,6 +889,153 @@ async fn exact_native_identity_and_profile_are_reused_on_host_actor_recovery() {
     )
     .await;
     assert!(matches!(wrong, Err(ActorError::NativeIdentityMismatch)));
+}
+
+#[tokio::test]
+async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
+    use freshell_runtime_protocol::{
+        McpCapabilityReference, ProviderLaunchContext, ProviderPreparation,
+    };
+    for provider in [
+        FreshProvider::Claude,
+        FreshProvider::Kilroy,
+        FreshProvider::Codex,
+        FreshProvider::Opencode,
+    ] {
+        let preparation = match provider {
+            FreshProvider::Claude | FreshProvider::Kilroy => ProviderPreparation::Claude {
+                mcp_args: Vec::new(),
+            },
+            FreshProvider::Codex => ProviderPreparation::Codex {
+                tui_args: Vec::new(),
+                sidecar_args: Vec::new(),
+            },
+            FreshProvider::Opencode => ProviderPreparation::Opencode {
+                project_config: Vec::new(),
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = profile(provider, "same-store", None);
+        initial.provider_launch_context = Some(ProviderLaunchContext {
+            preparation,
+            prepared_inputs: None,
+            config: Vec::new(),
+            mcp_capability: Some(McpCapabilityReference {
+                grant_id: "grant-prior".into(),
+                endpoint: "http://host.docker.internal:9".into(),
+                provider_relative_path: ".freshell/mcp-capability.json".into(),
+                host_gateway_address: None,
+            }),
+        });
+        let actor =
+            FreshAgentHostActor::open(dir.path(), initial, FakeTransport::new("same-native"))
+                .await
+                .unwrap();
+        let mut refreshed = actor.profile().await;
+        drop(actor);
+        refreshed
+            .provider_launch_context
+            .as_mut()
+            .unwrap()
+            .mcp_capability
+            .as_mut()
+            .unwrap()
+            .grant_id = "grant-replacement".into();
+        let transport = FakeTransport::new("same-native");
+        let actor = FreshAgentHostActor::open(dir.path(), refreshed.clone(), transport.clone())
+            .await
+            .expect("current prepared grant must not change the durable conversation identity");
+        assert_eq!(
+            transport.start_profiles.lock().unwrap().as_slice(),
+            &[refreshed.clone()]
+        );
+        assert_eq!(actor.profile().await, refreshed);
+        drop(actor);
+        // The new preparation must also survive a cold actor reopen.
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            refreshed.clone(),
+            FakeTransport::new("same-native"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(actor.profile().await, refreshed);
+        drop(actor);
+        let before = fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
+        let mut next_preparation = refreshed.clone();
+        next_preparation
+            .provider_launch_context
+            .as_mut()
+            .unwrap()
+            .mcp_capability
+            .as_mut()
+            .unwrap()
+            .grant_id = "grant-unconfirmed".into();
+        let wrong_native = FakeTransport::new("wrong-native-from-provider");
+        let result =
+            FreshAgentHostActor::open(dir.path(), next_preparation.clone(), wrong_native.clone())
+                .await;
+        assert!(matches!(result, Err(ActorError::NativeIdentityMismatch)));
+        assert_eq!(
+            wrong_native.start_profiles.lock().unwrap().as_slice(),
+            &[next_preparation]
+        );
+        assert!(
+            fs::read(dir.path().join("fresh-agent-state.json")).unwrap() == before,
+            "failed native identity verification must preserve the accepted preparation"
+        );
+        for changed in [
+            "native",
+            "model",
+            "effort",
+            "cwd",
+            "plugins",
+            "store",
+            "runtime",
+            "permission",
+            "sandbox",
+            "secret-reference",
+            "context-absent",
+        ] {
+            let mut wrong = refreshed.clone();
+            match changed {
+                "native" => wrong.native_session_id = Some("different-native".into()),
+                "model" => wrong.model = Some("different-model".into()),
+                "effort" => wrong.effort = Some("high".into()),
+                "cwd" => wrong.cwd = "/different-workspace".into(),
+                "plugins" => wrong.plugins = Some(vec!["/different-plugin".into()]),
+                "store" => wrong.provider_store_id = "different-store".into(),
+                "runtime" => wrong.runtime_variant = "different-runtime".into(),
+                "permission" => wrong.permission_mode = Some("different-permission".into()),
+                "sandbox" => wrong.sandbox = Some("different-sandbox".into()),
+                "secret-reference" => wrong.provider_secret_references.push(freshell_runtime_protocol::ProviderSecretReference {
+                    source_path: "/synthetic/different-private-reference".into(),
+                    profile: match wrong.provider {
+                        FreshProvider::Claude | FreshProvider::Kilroy => freshell_runtime_protocol::ProviderSecretProfile::ClaudeOnecliEnvironment,
+                        FreshProvider::Codex => freshell_runtime_protocol::ProviderSecretProfile::CodexOnecliEnvironment,
+                        FreshProvider::Opencode => freshell_runtime_protocol::ProviderSecretProfile::OpencodeOnecliEnvironment,
+                    },
+                    provider_relative_path: None,
+                }),
+                "context-absent" => wrong.provider_launch_context = None,
+                _ => unreachable!(),
+            }
+            let transport = FakeTransport::new("same-native");
+            let result = FreshAgentHostActor::open(dir.path(), wrong, transport.clone()).await;
+            assert!(
+                matches!(result, Err(ActorError::NativeIdentityMismatch)),
+                "{changed}"
+            );
+            assert_eq!(transport.starts.load(Ordering::SeqCst), 0, "{changed}");
+            assert!(
+                fs::read(dir.path().join("fresh-agent-state.json")).unwrap() == before,
+                "{changed} must preserve the prior journal"
+            );
+        }
+    }
 }
 
 #[tokio::test]
