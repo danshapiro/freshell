@@ -8,7 +8,7 @@ import { createServer } from 'node:net'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection,
+  runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -207,6 +207,62 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(result.load.transcript.path).toBe(path.join(store, 'transcript.jsonl'))
       expect(fs.existsSync(defaultHome)).toBe(false)
       expect(fs.readFileSync(path.join(store, 'transcript.jsonl'), 'utf8')).toBe('')
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+  it.each(['missing-history', 'load-failure', 'missing-context-restore'].flatMap(fault => ['current', 'ordinary', 'wrong-cli-pin', 'wrong-producer-pin', 'missing-launch', 'wrong-root'].map(form => ({ fault, form }))))('executes the fixed owned Amplifier native startup fault $fault/$form', ({ fault, form }) => {
+    const directory = path.join('/tmp/frs', randomUUID().slice(0, 8) + '-abc')
+    const workspace = path.join(directory, 'amplifier-' + (form === 'ordinary' ? 'create' : fault) + '-workspace')
+    const native = path.join(directory, 'native'), pkg = path.join(native, 'amplifier_app_cli'), root = randomUUID()
+    const store = path.join(directory, 'provider', '.amplifier', 'projects', workspace.replaceAll('/', '-'), 'sessions', root)
+    fs.mkdirSync(pkg, { recursive: true }); fs.mkdirSync(workspace, { recursive: true }); fs.mkdirSync(store, { recursive: true })
+    fs.mkdirSync(path.join(native, '.venv', 'bin'), { recursive: true })
+    const patch = fs.readFileSync(path.join(process.cwd(), 'extensions/amplifier/freshell-native-resume.patch'), 'utf8')
+    const section = patch.split('+++ b/amplifier_app_cli/freshell_native_resume.py\n')[1]!.split('--- a/amplifier_app_cli/runtime/config.py')[0]!
+    const producer = path.join(pkg, 'freshell_native_resume.py')
+    fs.writeFileSync(producer, section.split('\n').filter(line => line.startsWith('+')).map(line => line.slice(1)).join('\n') + '\n')
+    fs.writeFileSync(path.join(store, 'metadata.json'), JSON.stringify({ session_id: root, parent_id: null }))
+    fs.writeFileSync(path.join(store, 'transcript.jsonl'), '')
+    fs.writeFileSync(path.join(pkg, 'session_store.py'), `import pathlib,os\nfrom .freshell_native_resume import load_native\nclass SessionStore:\n def __init__(self):self.base_dir=pathlib.Path(os.environ['OWNED_STORE'])\n def load(self,root):return load_native(self,root)\n`)
+    fs.writeFileSync(path.join(pkg, 'session_runner.py'), `import types\nclass Context:\n async def set_messages(self,m):pass\nasync def _create_bundle_session(*args,**kwargs):\n context=Context();return types.SimpleNamespace(coordinator=types.SimpleNamespace(get=lambda name:context if name=='context' else None))\n`)
+    const cli = path.join(native, '.venv', 'bin', 'amplifier.native')
+    fs.writeFileSync(cli, `import asyncio,json,sys\nfrom amplifier_app_cli.session_store import SessionStore\nfrom amplifier_app_cli import session_runner\nfailed=False\ntry:SessionStore().load(sys.argv[-1])\nexcept (OSError,ValueError):failed=True\nsession=asyncio.run(session_runner._create_bundle_session())\nprint(json.dumps({'loadFailed':failed,'hasRestore':hasattr(session.coordinator.get('context'),'set_messages')}))\n`)
+    const cliSha = createHash('sha256').update(fs.readFileSync(cli)).digest('hex'), producerSha = createHash('sha256').update(fs.readFileSync(producer)).digest('hex')
+    const script = nativeAmplifierStartupFaultWrapper.replaceAll('/opt/amplifier-src', native)
+      .replace('b46da0c1095accbb6daf4fffc5936a26e172671713cba6688df4dc5c93c210e4', cliSha)
+      .replace('1682141140822739c4cd88b7314c3b0daff7ccae1ffb55b7b72f235759123690', producerSha)
+    const wrapper = path.join(directory, 'wrapper.py'); fs.writeFileSync(wrapper, script)
+    const launch = { incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 7, executionGeneration: 3, requestedNativeSessionId: root }
+    if (form === 'wrong-cli-pin') fs.appendFileSync(cli, '\n# changed CLI\n')
+    if (form === 'wrong-producer-pin') fs.appendFileSync(producer, '\n# changed producer\n')
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: path.join(directory, 'provider'), PYTHONPATH: native,
+      OWNED_STORE: path.dirname(store), FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(form === 'wrong-root' ? { ...launch, requestedNativeSessionId: randomUUID() } : launch),
+      FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR: path.join(directory, 'signals') }
+    if (form === 'missing-launch') delete env.FRESHELL_NATIVE_IDENTITY_LAUNCH
+    try {
+      const run = () => execFileSync('python3', [wrapper, 'session', 'resume', '--full-history', root], {
+        cwd: workspace, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+        env,
+      })
+      if (!['current', 'ordinary'].includes(form)) {
+        expect(run).toThrow(form === 'wrong-cli-pin' ? 'pinned ordinary Amplifier CLI differs'
+          : form === 'wrong-producer-pin' ? 'pinned native Amplifier producer differs'
+          : form === 'missing-launch' ? 'managed native launch binding is incomplete' : 'exact owned native resume argv/root differs')
+        expect(fs.existsSync(path.join(workspace, 'native-startup-fault.json'))).toBe(false)
+        expect(fs.readFileSync(path.join(store, 'transcript.jsonl'), 'utf8')).toBe('')
+        return
+      }
+      const result = JSON.parse(run())
+      if (form === 'ordinary') {
+        expect(result).toEqual({ loadFailed: false, hasRestore: true })
+        expect(fs.existsSync(path.join(workspace, 'native-startup-fault.json'))).toBe(false)
+        expect(fs.readFileSync(path.join(store, 'transcript.jsonl'), 'utf8')).toBe('')
+        return
+      }
+      expect(result.loadFailed).toBe(fault !== 'missing-context-restore')
+      expect(result.hasRestore).toBe(fault !== 'missing-context-restore')
+      const observed = JSON.parse(fs.readFileSync(path.join(workspace, 'native-startup-fault.json'), 'utf8'))
+      expect(observed.fault).toBe(fault); expect(observed.launch).toEqual(launch)
+      expect(observed.nativePid).toBeGreaterThan(1); expect(observed.originalCliSha256).toBe(cliSha)
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
   it.each(['matching', 'wrong-root', 'parent-root', 'missing-root'])('executes the pinned Amplifier producer with current native root diagnostics (%s)', (fault) => {

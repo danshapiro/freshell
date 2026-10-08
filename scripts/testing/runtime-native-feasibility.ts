@@ -1330,6 +1330,83 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
   return original
 }
 
+// Finite owned native fault image adapter. It retains the pinned ordinary CLI.
+export const nativeAmplifierStartupFaultWrapper = String.raw`#!/opt/amplifier-src/.venv/bin/python
+import hashlib,json,os,pathlib,re,runpy,sys
+native=pathlib.Path('/opt/amplifier-src/.venv/bin/amplifier.native')
+producer=pathlib.Path('/opt/amplifier-src/amplifier_app_cli/freshell_native_resume.py')
+expected='b46da0c1095accbb6daf4fffc5936a26e172671713cba6688df4dc5c93c210e4'
+producer_pin='1682141140822739c4cd88b7314c3b0daff7ccae1ffb55b7b72f235759123690'
+if not native.is_file() or native.is_symlink() or hashlib.sha256(native.read_bytes()).hexdigest()!=expected:
+ raise RuntimeError('pinned ordinary Amplifier CLI differs')
+if not producer.is_file() or hashlib.sha256(producer.read_bytes()).hexdigest()!=producer_pin:
+ raise RuntimeError('pinned native Amplifier producer differs')
+workspace=pathlib.Path.cwd().resolve()
+owned=re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/amplifier-(missing-history|load-failure|missing-context-restore)-workspace',str(workspace))
+if owned:
+ fault=owned[1]
+ from amplifier_app_cli.freshell_native_resume import managed_launch,load_native
+ binding=managed_launch()
+ if binding is None:raise RuntimeError('current native fault launch missing')
+ launch,_=binding;root=launch['requestedNativeSessionId']
+ if not root or sys.argv[1:]!=['session','resume','--full-history',root]:
+  raise RuntimeError('exact owned native resume argv/root differs')
+ slug=str(workspace).replace('/', '-').replace(chr(92), '-').replace(':', '')
+ if not slug.startswith('-'):slug='-'+slug
+ expected_store=pathlib.Path(os.environ['HOME'])/'.amplifier/projects'/slug/'sessions'
+ def record(phase,**facts):
+  value={'severity':'warning','event':'test.amplifier.native_startup_fault.applied','fault':fault,'phase':phase,
+   'launch':launch,'nativePid':os.getpid(),'uid':os.getuid(),'gid':os.getgid(),
+   'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),
+   'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativeCwd':str(workspace),
+   'originalCliSha256':expected,'producerSha256':producer_pin,**facts}
+  file=workspace/'native-startup-fault.json'
+  with file.open('x',encoding='utf8') as out:json.dump(value,out);out.write('\n')
+  file.chmod(0o660)
+ if fault in ['missing-history','load-failure']:
+  from amplifier_app_cli.session_store import SessionStore
+  original_load=SessionStore.load
+  def fault_load(store,session_id):
+   if store.base_dir.resolve()!=expected_store.resolve() or session_id!=root:
+    raise RuntimeError('native fault store ownership differs')
+   directory=store.base_dir/session_id
+   if not directory.is_dir() or directory.is_symlink():raise RuntimeError('native owned source missing')
+   original,_=load_native(store,session_id)
+   for name in ['transcript.jsonl','transcript.jsonl.backup']:
+    file=directory/name
+    if file.exists():
+     if not file.is_file() or file.is_symlink():raise RuntimeError('unowned native history source refused')
+     if fault=='missing-history':file.unlink()
+     else:
+      with file.open('wb') as out:out.write(b'owned invalid native transcript\n');out.flush();os.fsync(out.fileno())
+   record('before-native-load',originalLoad=original.native_load_witness,
+    transcriptAbsent=not any((directory/name).exists() for name in ['transcript.jsonl','transcript.jsonl.backup']),
+    malformedSha256=hashlib.sha256((directory/'transcript.jsonl').read_bytes()).hexdigest() if (directory/'transcript.jsonl').exists() else None)
+   return original_load(store,session_id)
+  SessionStore.load=fault_load
+ else:
+  from amplifier_app_cli import session_runner
+  original_create=session_runner._create_bundle_session
+  async def fault_create(*args,**kwargs):
+   session=await original_create(*args,**kwargs)
+   original_get=session.coordinator.get;context=original_get('context')
+   if context is None or not callable(getattr(context,'set_messages',None)):
+    raise RuntimeError('native original context restore method missing before fault')
+   class ContextWithoutRestore:
+    def __getattr__(self,name):
+     if name=='set_messages':raise AttributeError(name)
+     return getattr(context,name)
+   missing=ContextWithoutRestore()
+   def fault_get(name,*args,**kwargs):
+    return missing if name=='context' else original_get(name,*args,**kwargs)
+   session.coordinator.get=fault_get
+   record('before-native-context-restore',originalContextType=type(context).__module__+'.'+type(context).__name__,
+    hasRestoreBefore=True,hasRestoreAfter=hasattr(session.coordinator.get('context'),'set_messages'))
+   return session
+  session_runner._create_bundle_session=fault_create
+runpy.run_path(str(native),run_name='__main__')
+`
+
 export const amplifierWrongRootInspection = String.raw`
 import os,json,pathlib,hashlib,importlib.metadata as m,sys
 os.chdir(sys.argv[1]);actual_root,nonce=sys.argv[2:]
