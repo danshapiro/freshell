@@ -22,7 +22,8 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
   RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
   OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, OpencodeLossRecoverySchema,
-  OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema,
+  RuntimeFreshAgentReceiptArtifactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -37,6 +38,8 @@ import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerSta
 import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts, RuntimeChaosReceiptArtifact } from './runtime-sandbox.js'
 import type { OpencodeLossCredentialEvidence, OpencodeLossAbsenceEvidence, OpencodeLossRecovery, OpencodeLossIncidentEvidence } from './runtime-sandbox.js'
 import type { RuntimeLossAssertions, RuntimeLossAssertionsArtifact, RuntimeLossReceiptArtifact } from './runtime-sandbox.js'
+import type { RuntimeFreshAgentReceiptArtifacts } from './runtime-sandbox.js'
+import type { FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -711,7 +714,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -860,6 +863,9 @@ export class ExternalManagedRuntimeRig {
   }
   async validateFreshAgentIngressInventory(): Promise<void> {
     await this.rpc('fresh-agent-ingresses', CompletedOwnerOperationSchema)
+  }
+  async publishFreshAgentQualification(freshAgentObservations: FreshAgentQualificationRow[]): Promise<RuntimeFreshAgentReceiptArtifacts> {
+    return this.rpc('fresh-agent-receipt', RuntimeFreshAgentReceiptArtifactsSchema, { freshAgentObservations })
   }
   async ownedContainerState(enclosure: RuntimeEnclosureHandle): Promise<OwnedContainerState> {
     return this.rpc('container-state', OwnedContainerStateSchema, { enclosure })
@@ -1095,7 +1101,8 @@ export function createExternalRuntimeControl(
   }
   const execute = async (request: RuntimeOwnerOperationRequest) => {
     if (finished && request.action !== 'finish' && request.action !== 'abort'
-      && request.action !== 'candidate-integrity' && request.action !== 'chaos-receipt' && request.action !== 'loss-receipt') {
+      && request.action !== 'candidate-integrity' && request.action !== 'chaos-receipt' && request.action !== 'loss-receipt'
+      && request.action !== 'fresh-agent-receipt') {
       throw new Error('external owned runtime is finished')
     }
     const handle = () => {
@@ -1212,6 +1219,10 @@ export function createExternalRuntimeControl(
         result = await owner.freshAgentLaunchFacts(request.enclosure)
         break
       case 'fresh-agent-ingresses': await owner.validateFreshAgentIngressInventory(); result = { completed: true }; break
+      case 'fresh-agent-receipt':
+        if (!request.freshAgentObservations) throw new Error('observed fresh-agent rows required')
+        result = await owner.publishFreshAgentQualification(request.freshAgentObservations)
+        break
       case 'container-state':
         if (!request.enclosure) throw new Error('exact tracked runtime enclosure address required')
         result = await owner.ownedContainerState(request.enclosure)

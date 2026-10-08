@@ -692,6 +692,30 @@ export const RuntimeLossReceiptArtifactSchema = z.object({
   artifactRef: z.string().regex(/^phase5-loss:[a-f0-9]{64}$/),
 }).strict()
 export type RuntimeLossReceiptArtifact = z.infer<typeof RuntimeLossReceiptArtifactSchema>
+export const RuntimeFreshAgentObservationSchema: z.ZodType<FreshAgentQualificationRow> = z.object({
+  mode: z.enum(['freshclaude', 'kilroy', 'freshcodex', 'freshopencode']), provider: z.string().min(1),
+  providerVersion: z.string().min(1), model: z.string().min(1), effort: z.string().min(1), runtimeVariant: z.string().min(1),
+  actualProviderProcess: z.literal(true), fixtureTransport: z.literal(false),
+  ingresses: z.array(z.enum(['browser-picker', 'browser-split', 'history-resume', 'ws-create', 'ws-attach',
+    'rest-tab', 'rest-split', 'mcp-new-tab', 'mcp-split', 'startup-restore', 'auto-resume'])),
+  soulId: z.string().min(1), nativeSessionId: z.string().min(1), providerStoreId: z.string().min(1),
+  completedNativeTurns: z.array(z.object({ turnId: z.string().min(1), assistantMessageId: z.string().min(1),
+    completionKind: z.literal('provider_native_completed') }).strict()), noToolRecall: z.boolean(),
+  crashes: z.object({ web: z.array(z.string()), host: z.array(z.string()) }).strict(),
+  pendingApproval: z.discriminatedUnion('supported', [z.object({ supported: z.literal(false) }).strict(),
+    z.object({ supported: z.literal(true), survivedWebRestart: z.boolean(), survivedHostRecovery: z.boolean(),
+      resolvedExactlyOnce: z.boolean(), decisionIdHash: z.string() }).strict()]),
+  writerProof: z.object({ activeWriterCount: z.number(), conflictingWriterCount: z.number(),
+    dispatchCountForPrompt: z.number(), completionCountForPrompt: z.number() }).strict(),
+  isolation: z.object({ providerVolumeNameHash: z.string(), enclosureIdHash: z.string(),
+    independentProviderStore: z.boolean(), independentEnclosure: z.boolean() }).strict(),
+  limits: z.object({ cpuMax: z.string(), memoryMax: z.string(), swapMax: z.string(), pidsMax: z.string() }).strict(),
+  oldEnclosure: z.object({ verifiedEmptyBeforeResume: z.boolean(), writerClaimReleasedBeforeResume: z.boolean() }).strict(),
+}).passthrough()
+export const RuntimeFreshAgentReceiptArtifactsSchema = z.object({
+  rowCount: z.number().int().positive(), artifactRefs: z.array(z.string().regex(/^fresh-agent-qualification:[a-f0-9]{64}$/)).nonempty(),
+}).strict()
+export type RuntimeFreshAgentReceiptArtifacts = z.infer<typeof RuntimeFreshAgentReceiptArtifactsSchema>
 const OPENCODE_LOSS_ABSENCE_SCRIPT = String.raw`
 const fs = require('node:fs');
 const target = process.argv[1];
@@ -763,7 +787,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -792,6 +816,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   chaosLogs: RuntimeChaosLogsSchema.optional(),
   chaosEvidence: RuntimeChaosEvidenceSchema.optional(),
   lossAssertions: RuntimeLossAssertionsSchema.optional(),
+  freshAgentObservations: z.array(RuntimeFreshAgentObservationSchema).optional(),
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
@@ -3832,6 +3857,26 @@ export class ManagedRuntimeOwner {
   async validateFreshAgentIngressInventory(): Promise<void> {
     const { validateFreshAgentIngressInventory } = await import('./fresh-agent-ingress-inventory.js')
     validateFreshAgentIngressInventory(this.repoRoot)
+  }
+
+  async publishFreshAgentQualification(input: FreshAgentQualificationRow[]): Promise<RuntimeFreshAgentReceiptArtifacts> {
+    const rows = z.array(RuntimeFreshAgentObservationSchema).parse(input)
+    const modes = new Set(rows.map(row => row.mode))
+    if (this.runtime.phase !== 5 || this.fixtureFreshAgentModes.length !== 0 || modes.size !== rows.length
+      || modes.size === 0 || modes.size !== this.freshAgentModes.length
+      || this.freshAgentModes.some(mode => !rows.some(row => row.mode === mode))) throw new Error('exact registered production fresh-agent modes required')
+    if (!this.stopSettlement) throw new Error('owned cleanup must settle before fresh-agent receipt publication')
+    const cleanup = await this.stopSettlement
+    if (!cleanup.ok || cleanup.errors.length > 0) throw new Error('owned cleanup failed before fresh-agent receipt publication')
+    const finalized = this.finalizeFreshAgentQualificationReceipt(rows)
+    const artifactRefs = finalized.paths.map(target => {
+      fs.chmodSync(target, 0o600)
+      return `fresh-agent-qualification:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
+    })
+    const result = RuntimeFreshAgentReceiptArtifactsSchema.parse({ rowCount: finalized.receipt.rows.length, artifactRefs })
+    process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'external.fresh_agent_receipt_published',
+      runId: this.runtime.runId, candidateSha: this.runtime.candidateSha, ...result })}\n`)
+    return result
   }
 
   finalizeFreshAgentQualificationReceipt(rows: FreshAgentQualificationRow[]): {

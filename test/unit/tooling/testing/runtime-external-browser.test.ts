@@ -20,6 +20,7 @@ import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../..
 import { stopManagedRuntimeSoul } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { structuredChaosLog } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
 import type { BrokerReceipt } from '../../../../scripts/testing/runtime-test-broker.js'
+import type { FreshAgentQualificationRow } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
 
 beforeEach(() => execute.mockReset())
 
@@ -1514,6 +1515,58 @@ describe('closed external owner control', () => {
       }
       const missing = new ManagedRuntimeOwner(() => { throw new Error('unused missing ingress web') }, directory, 5)
       await expect(missing.validateFreshAgentIngressInventory()).rejects.toThrow()
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
+  it('refuses fresh-agent receipt publication for unregistered or custody-only observations after cleanup', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-fresh-receipt-'))
+    try {
+      for (const args of [['init'], ['commit', '--allow-empty', '-m', 'Private fresh receipt refusal fixture']]) {
+        const child = spawnSync('git', args, { cwd: directory, encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('private fresh receipt fixture Git setup failed')
+      }
+      const owned = new ManagedRuntimeOwner(() => { throw new Error('unused fresh receipt web') }, directory, 5,
+        {}, {}, 'release', { enabledProviders: [], providerSettings: {}, freshAgentModes: ['freshcodex'] })
+      vi.spyOn(owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
+      const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+        await control(JSON.parse(String(init.body)))), { status: 200 }))
+      const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+      const row: FreshAgentQualificationRow = { mode: 'freshcodex', provider: 'codex', providerVersion: '0.147.0',
+        model: 'gpt-5.6-luna', effort: 'low', runtimeVariant: 'codex-app-server', actualProviderProcess: true,
+        fixtureTransport: false, ingresses: [], soulId: 'unqualified-fresh-soul', nativeSessionId: 'unqualified-fresh-root',
+        providerStoreId: 'unqualified-fresh-store', completedNativeTurns: [], noToolRecall: false,
+        crashes: { web: [], host: [] }, pendingApproval: { supported: false },
+        writerProof: { activeWriterCount: 0, conflictingWriterCount: 0, dispatchCountForPrompt: 0, completionCountForPrompt: 0 },
+        isolation: { providerVolumeNameHash: 'c'.repeat(64), enclosureIdHash: 'd'.repeat(64),
+          independentProviderStore: false, independentEnclosure: false },
+        limits: { cpuMax: 'fixture', memoryMax: 'fixture', swapMax: 'fixture', pidsMax: 'fixture' },
+        oldEnclosure: { verifiedEmptyBeforeResume: false, writerClaimReleasedBeforeResume: false } }
+      await expect(rig.publishFreshAgentQualification([row])).rejects.toThrow()
+      const finalize = vi.spyOn(owned, 'finalizeFreshAgentQualificationReceipt')
+      await expect(owned.publishFreshAgentQualification([{ ...row, mode: 'freshclaude' }])).rejects.toThrow(/registered/)
+      await expect(owned.publishFreshAgentQualification([row, row])).rejects.toThrow(/registered/)
+      await expect(control({ runId: context.runId, candidateSha: context.candidateSha, operationId: 'foreign-fresh-receipt-path',
+        action: 'fresh-agent-receipt', freshAgentObservations: [row], outputPath: '/foreign/receipt.json' })).rejects.toThrow(/operation/)
+      await expect(owned.publishFreshAgentQualification([row])).rejects.toThrow(/cleanup/)
+      Object.assign(owned, { stopSettlement: Promise.resolve({ ok: false, errors: ['cleanup fixture failure'] }) })
+      await expect(owned.publishFreshAgentQualification([row])).rejects.toThrow(/cleanup failed/)
+      expect(finalize).not.toHaveBeenCalled()
+      Object.assign(owned, { stopSettlement: Promise.resolve({ ok: true, errors: [] }) })
+      await rig.stop()
+      await expect(rig.publishFreshAgentQualification([row])).rejects.toThrow()
+      await expect(owned.publishFreshAgentQualification([row])).rejects.toThrow(/runtime image must be an exact sha256 digest/)
+      // A hash-shaped fixture value still supplies no native/build/broker evidence.
+      Object.assign(owned.runtime, { imageRef: `sha256:${'0'.repeat(64)}` })
+      const boundEvidenceDir = owned.runtime.evidenceDir
+      Object.assign(owned.runtime, { evidenceDir: directory })
+      await expect(owned.publishFreshAgentQualification([row])).rejects.toThrow(/candidate-bound/)
+      Object.assign(owned.runtime, { evidenceDir: boundEvidenceDir })
+      await expect(owned.publishFreshAgentQualification([row])).rejects.toThrow(/ENOENT|missing|selected|turn|ingress/)
+      expect(finalize).toHaveBeenCalled()
+      await expect(fsp.lstat(path.join(owned.runtime.browserDir, 'fresh-agent-qualification.json'))).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       await fsp.rm(directory, { recursive: true, force: true })
     }

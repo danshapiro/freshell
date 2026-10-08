@@ -19,7 +19,7 @@ import {
 import { FRESH_AGENT_QUALIFICATION_LIVE_ENV } from '../../../scripts/testing/runtime-fresh-agent-qualification.js'
 import { executeAction } from '../../../tools/freshell-mcp/freshell-tool.js'
 import { test } from '../helpers/fixtures.js'
-import { ManagedRuntimeBrowserRig, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
+import { createManagedRuntimeBrowserRig, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
 type Definition = {
@@ -234,7 +234,7 @@ test.describe.serial('authentic fresh-agent qualification', () => {
     test.skip(process.env[FRESH_AGENT_QUALIFICATION_LIVE_ENV] !== '1', `set ${FRESH_AGENT_QUALIFICATION_LIVE_ENV}=1 explicitly`)
     test.setTimeout(3_600_000)
     const definitions = selectedDefinitions()
-    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 5, {}, {
+    const rig = createManagedRuntimeBrowserRig(process.cwd(), 5, {}, {
       FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750',
     }, 'release', {
       enabledProviders: [],
@@ -256,8 +256,8 @@ test.describe.serial('authentic fresh-agent qualification', () => {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
-    const finalized = rig.finalizeFreshAgentQualificationReceipt(rows)
-    expect(finalized.receipt.rows).toHaveLength(definitions.length)
-    console.log(`[fresh-agent-qualification] receipts: ${finalized.paths.join(', ')}`)
+    const finalized = await rig.publishFreshAgentQualification(rows)
+    expect(finalized.rowCount).toBe(definitions.length)
+    console.log(`[fresh-agent-qualification] receipts: ${finalized.artifactRefs.join(', ')}`)
   })
 })
