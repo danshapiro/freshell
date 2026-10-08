@@ -214,6 +214,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         }
         expect(uid).toBe('65534:0')
         if (argv[3] === fault) {
+          execFileSync('python3', ['-c', 'import json,sys; value=json.loads(sys.argv[1]); assert value["native"]["load"]["transcript"]["mtimeNs"]==1790000000000000001', argv[4]!], { stdio: ['pipe', 'pipe', 'pipe'] })
           mutated = true
           return JSON.stringify({ fault, launch: { ...launch(), launchNonce: form === 'wrong-launch' ? 'old-nonce' : launch().launchNonce },
             nativeRoot: form === 'wrong-root' ? 'wrong-root' : request.params.nativeSessionId,
@@ -224,7 +225,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         if (argv[3] === '/owned/native/transcript.jsonl') return JSON.stringify({ nativeRoot: request.params.nativeSessionId,
           nativeCwd: request.params.terminal.cwd, httpsStatus: form === 'wrong-tls' ? 401 : 200, tlsVerifyMode: 2, tlsCheckHostname: true,
           completedTurns: 0, toolEvents: 0, transcript: { completeEof: true, sha256: form === 'source-changed' && mutated ? 'changed-source' : 'same-source' } })
-        if (argv[0] === 'python3') return JSON.stringify(signal())
+        if (argv[0] === 'python3') return JSON.stringify(signal()).replace('"transcript":{', '"transcript":{"mtimeNs":1790000000000000001,')
         return JSON.stringify({ uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
           cliVersion: '0.1.1', coreVersion: '1.6.0', executableSha256: 'e'.repeat(64) })
       },

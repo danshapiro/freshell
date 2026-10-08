@@ -1836,10 +1836,11 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
   const result = await harness.adminOk(supervisor, request)
   harness.writeArtifact(`${scenario}-launch.json`, result)
   let view = result.data.view
+  const nativeSignalFile = path.join(harness.evidenceDir, `${scenario}-native-signal-original.json`)
   const captureNativeSignal = async () => {
     const signal = await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c',
       "import pathlib,json; signals=[]\nfor p in pathlib.Path('/proc').iterdir():\n if not p.name.isdigit():continue\n try:\n  env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(bytes([0])) if b'=' in v)\n  if 'FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR' in env:signals.append(pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'])/'amplifier-loaded-context.json')\n except (OSError,ValueError):continue\nassert len(set(signals))==1\nprint(next(iter(set(signals))).read_text())"])
-    fs.writeFileSync(path.join(harness.evidenceDir, `${scenario}-native-signal-original.json`), signal, { mode: 0o600 })
+    fs.writeFileSync(nativeSignalFile, signal, { mode: 0o600 })
   }
   const deadline = Date.now() + 50_000
   while (!view.nativeIdentityObservation && Date.now() < deadline) {
@@ -1879,7 +1880,8 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
     return snapshot
   }
   if (ackFault) {
-    const signal = JSON.parse(fs.readFileSync(path.join(harness.evidenceDir, `${scenario}-native-signal-original.json`), 'utf8'))
+    const signalText = fs.readFileSync(nativeSignalFile, 'utf8')
+    const signal = JSON.parse(signalText)
     if (signal.launch.incarnationId !== view.incarnationId || signal.launch.launchNonce !== observation.launchNonce
       || signal.launch.evidenceRevision !== observation.evidenceRevision || signal.native.session_id !== nativeRoot) {
       throw new Error('actual Amplifier ACK before file fault differs from current observation')
@@ -1902,7 +1904,7 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
       throw new Error('authenticated Amplifier host lacks current observation before file fault')
     }
     const fault = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-      ['python3', '-c', amplifierNativeAckFileFault, caseId, JSON.stringify(signal)]))
+      ['python3', '-c', amplifierNativeAckFileFault, caseId, signalText]))
     harness.writeArtifact(`${scenario}-native-ack-fault.json`, fault)
     const changed = fault.fault === caseId && fault.uid === 65534 && fault.gid === 0 && fault.nativeRoot === nativeRoot
       && JSON.stringify(fault.launch) === JSON.stringify(signal.launch) && fault.validBefore
@@ -1929,8 +1931,7 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
       { name: 'ordinary-input-refused-original-history-preserved', pass: input.result.Err.code === 'RECOVERY_BLOCKED' && conserved.completedTurns === 0 })
   }
   if (resumes) {
-    const signalFile = path.join(harness.evidenceDir, `${scenario}-native-signal-original.json`)
-    const signal = JSON.parse(fs.readFileSync(signalFile, 'utf8'))
+    const signal = JSON.parse(fs.readFileSync(nativeSignalFile, 'utf8'))
     const transcriptPath = signal.native.load.transcript.path
     const inspect = (containerId: string, label: string) => inspectNative(transcriptPath, containerId, label, label === 'startup')
     const startup = await inspect(view.containerId, 'startup')
