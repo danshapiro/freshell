@@ -1057,7 +1057,9 @@ export function createExternalRuntimeControl(
       } } } : stage
   }
   const execute = async (request: RuntimeOwnerOperationRequest) => {
-    if (finished && request.action !== 'finish' && request.action !== 'abort') throw new Error('external owned runtime is finished')
+    if (finished && request.action !== 'finish' && request.action !== 'abort' && request.action !== 'candidate-integrity') {
+      throw new Error('external owned runtime is finished')
+    }
     const handle = () => {
       if (!request.handle) throw new Error('exact current owner handle required')
       return request.handle

@@ -1050,6 +1050,15 @@ describe('closed external owner control', () => {
       expect(untracked.diffHash).toBe(dirty.diffHash)
       expect(untracked.statusHash).not.toBe(dirty.statusHash)
       expect(JSON.stringify(replies)).not.toContain('private-untracked')
+      vi.spyOn(owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
+      await rig.stop()
+      await expect(rig.captureCandidateIntegrity()).resolves.toEqual(untracked)
+      await expect(control({ runId: context.runId, candidateSha: context.candidateSha, scenarioId: 'browser-managed-runtime',
+        operationId: 'finished-inventory', action: 'inventory' })).rejects.toThrow(/finished/)
+      const replace = vi.spyOn(owned, 'crashAndRestartWeb')
+      await expect(control({ runId: context.runId, candidateSha: context.candidateSha, scenarioId: 'browser-managed-runtime',
+        operationId: 'finished-web-replace', action: 'replace-web' })).rejects.toThrow(/finished/)
+      expect(replace).not.toHaveBeenCalled()
       const request = { runId: context.runId, candidateSha: context.candidateSha, scenarioId: 'browser-managed-runtime',
         operationId: 'foreign-integrity-root', action: 'candidate-integrity', repoRoot: '/foreign/root' }
       await expect(control(request)).rejects.toThrow(/operation/)
