@@ -401,7 +401,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
   })
   it.each(['freshcodex', 'freshopencode'].flatMap(mode => ['wrong-root','cancellation'].flatMap(caseId => [
     'valid', 'delayed-current-start', 'published', 'admitted-input', 'requested-echo', 'missing-native-receipt', 'commands-present', 'wrong-uid',
-    ...(caseId==='cancellation'?['stop-unconfirmed','stop-intent-uncommitted']:[])
+    ...(caseId==='cancellation'?['stop-unconfirmed','stop-intent-uncommitted','stop-state-unchanged']:[])
   ].map(fault => [mode,caseId,fault]))))
     ('requires actual fresh native receiver refusal before input (%s, %s, %s; orchestration only)', async (mode, caseId, fault) => {
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-native-wrong-')), root = mode === 'freshopencode' ? 'ses_actual' : randomUUID()
@@ -438,8 +438,9 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
             return new Promise(resolve=>{stopResolve=resolve;if(nativeDone)resolve(stopReply())})
           }
           if(fault==='delayed-current-start'&&!allocated){elapsed=5000;allocated=true}
-          return { data: [{ soulId: soul, launchState: fault === 'published' ? 'running' : intentStopped&&nativeDone?'stopped':'starting',
-            desiredState:intentStopped?'stopped':'running',recoveryState:intentStopped&&nativeDone?'stopped':'live',
+          return { data: [{ soulId: soul, launchState: fault === 'published' ? 'running' : intentStopped&&nativeDone?'stopped':intentStopped&&fault!=='stop-state-unchanged'?'stopping':'starting',
+            cleanupState:intentStopped&&nativeDone?'verified_empty':intentStopped?'requested':'none',
+            desiredState:intentStopped?'stopped':'running',recoveryState:intentStopped?'stopped':'live',
             incarnationId: incarnation, containerId: 'owned-current', nativeSessionId: expected, nativeIdentityObservation: null }] }
         },
         execOwnedContainerAsExact: async (_: string, uid: string, command: string[]) => {
@@ -473,7 +474,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
           : fault === 'admitted-input' ? 'actual fresh wrong-root admitted input'
           : fault === 'wrong-uid' ? 'actual native receiver namespace/profile/pin/TLS differs'
           : fault === 'stop-unconfirmed'?'ordinary fresh receiver Stop did not confirm empty stopped intent'
-          : fault === 'stop-intent-uncommitted'?'ordinary fresh receiver Stop did not commit intent before native response'
+          : ['stop-intent-uncommitted','stop-state-unchanged'].includes(fault!)?'ordinary fresh receiver Stop did not commit intent before native response'
           : 'actual current fresh receiver does not prove a different native root')
       } finally { clock?.mockRestore();fs.rmSync(directory, { recursive: true, force: true }) }
     })

@@ -1223,7 +1223,8 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
         while (!finished && Date.now() < intentDeadline) {
           const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
           const current = inventory.data.find((row: any) => row.soulId === soulId)
-          if (current?.desiredState === 'stopped' && current.launchState === 'starting'
+          if (current?.desiredState === 'stopped' && current.launchState === 'stopping'
+            && current.cleanupState === 'requested' && current.recoveryState === 'stopped'
             && current.incarnationId === receipt.incarnationId && !current.nativeIdentityObservation) { stoppedIntent = current; break }
           await new Promise(resolve => setTimeout(resolve, 25))
         }
@@ -1252,7 +1253,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       if (reply.result?.Err?.code !== 'HOST_UNREACHABLE' || !nativeRefusal || !current || current.launchState === 'running'
         || current.nativeIdentityObservation) throw new Error('actual native wrong-root guard did not refuse provider startup')
       if (caseId === 'cancellation' && (stopReply?.data?.outcome !== 'verified_empty' || current.launchState !== 'stopped'
-        || current.desiredState !== 'stopped' || current.recoveryState !== 'stopped')) {
+        || current.desiredState !== 'stopped' || current.recoveryState !== 'stopped' || current.cleanupState !== 'verified_empty')) {
         throw new Error('ordinary fresh receiver Stop did not confirm empty stopped intent')
       }
       const input = await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: { soulId, text: 'Owned wrong-root input refusal probe. Do not use tools.' } })
@@ -1271,7 +1272,11 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
           { name: 'actual-selected-native-process-profile-uid-and-tls-before-refusal', pass: true }] }
       harness.writeArtifact(`${scenario}-original.json`, original)
       return original
-    } finally { await pending; await stopPending }
+    } finally {
+      await pending; await stopPending
+      if (reply) harness.writeArtifact(`${scenario}-final-launch-reply.json`, reply)
+      if (stopReply) harness.writeArtifact(`${scenario}-final-stop-reply.json`, stopReply)
+    }
   }
   if (terminal && caseId === 'wrong-root') {
     // A requested root is an expectation only: the native app-server creates
