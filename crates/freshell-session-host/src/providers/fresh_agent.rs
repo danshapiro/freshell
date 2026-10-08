@@ -228,6 +228,8 @@ impl HostedTransport {
                 send_outcomes: send_outcomes.clone(),
                 kill_outcomes: kill_outcomes.clone(),
                 suppressed_kills: Arc::clone(&suppressed_kills),
+                #[cfg(test)]
+                refusal_observer: None,
             },
         );
         Arc::new(Self {
@@ -1154,6 +1156,8 @@ struct BroadcastBridgeOutputs {
     send_outcomes: broadcast::Sender<(String, bool)>,
     kill_outcomes: broadcast::Sender<(String, bool)>,
     suppressed_kills: Arc<std::sync::Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    refusal_observer: Option<mpsc::Sender<Value>>,
 }
 
 fn spawn_broadcast_bridge(
@@ -1174,6 +1178,8 @@ fn spawn_broadcast_bridge(
         send_outcomes,
         kill_outcomes,
         suppressed_kills,
+        #[cfg(test)]
+        refusal_observer,
     } = outputs;
     tokio::spawn(async move {
         let mut dropped = 0u64;
@@ -1324,6 +1330,38 @@ fn spawn_broadcast_bridge(
                             .is_err()
                         {
                             break;
+                        }
+                    } else if matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy) {
+                        // Report the actual normalized receiver decision, never
+                        // provider prose, local presentation keys or bodies.
+                        let reason = match event.get("cliSessionId").and_then(Value::as_str) {
+                            None => "missing_cli_session_id",
+                            Some(id) if event["sessionId"].as_str() == Some(id) => {
+                                "local_placeholder_id"
+                            }
+                            Some(id) if uuid::Uuid::parse_str(id).is_err() => {
+                                "invalid_cli_session_id"
+                            }
+                            Some(_) => "wrong_native_root",
+                        };
+                        let launch = expected_launch.clone().or_else(|| {
+                            serde_json::from_value::<
+                            freshell_runtime_protocol::NativeIdentityLaunch,
+                        >(event["nativeIdentityEvidence"]["launch"].clone()).ok()
+                        });
+                        let record = json!({"severity":"warn","event":"host.native_identity.refused",
+                            "provider":provider.as_str(),"reason":reason,"launch":launch,
+                            "normalizedEventType":"freshAgent.session.init",
+                            "nativeEvidenceDigest":event["nativeIdentityEvidence"]["digest"].as_str()
+                                .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
+                            "nativeEvidenceSource":event["nativeIdentityEvidence"]["source"].as_str()
+                                .filter(|source| matches!(*source, "startup" | "resume")),
+                            "queryGeneration":generation,"nativeReceiverPublished":false,
+                            "nativeReceiverContainsIdentity":native.borrow().is_some()});
+                        crate::emit_environment_event(record.clone());
+                        #[cfg(test)]
+                        if let Some(observer) = refusal_observer.as_ref() {
+                            let _ = observer.try_send(record);
                         }
                     }
                 }
@@ -1606,6 +1644,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normalized_native_init_field_refusals_are_typed_and_body_free() {
+        for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+            for (id, reason) in [
+                (None, "missing_cli_session_id"),
+                (Some("local-presentation-key"), "local_placeholder_id"),
+                (Some("invalid-native-id"), "invalid_cli_session_id"),
+            ] {
+                let (sender, receiver) = broadcast::channel(16);
+                let (created, _) = watch::channel(None);
+                let (native, native_rx) = watch::channel(None);
+                let (native_evidence, evidence_rx) = watch::channel(None);
+                let (events, mut event_rx) = mpsc::channel(16);
+                let (send_outcomes, _) = broadcast::channel(16);
+                let (kill_outcomes, _) = broadcast::channel(16);
+                let (observer, mut observations) = mpsc::channel(16);
+                spawn_broadcast_bridge(
+                    provider.clone(),
+                    receiver,
+                    BroadcastBridgeOutputs {
+                        created,
+                        native,
+                        native_evidence,
+                        events,
+                        send_outcomes,
+                        kill_outcomes,
+                        suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                        refusal_observer: Some(observer),
+                    },
+                );
+                let launch = freshell_platform::managed_child_secrets::snapshot()
+                    .and_then(|environment| environment.get(super::super::native_identity::LAUNCH_ENV).cloned())
+                    .map(|value| serde_json::from_str::<Value>(&value).unwrap())
+                    .unwrap_or(json!({"incarnationId":"current","launchNonce":"current-nonce","evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":null}));
+                let mut event = json!({"type":"freshAgent.session.init","sessionId":"local-presentation-key",
+                    "message":"excluded private provider content", "nativeIdentityEvidence":{"launch":launch,"digest":"a".repeat(64),"source":"startup","queryGeneration":1}});
+                if let Some(id) = id {
+                    event["cliSessionId"] = json!(id);
+                }
+                sender
+                    .send(json!({"type":"freshAgent.event","event":event}).to_string())
+                    .unwrap();
+                let record = tokio::time::timeout(Duration::from_secs(1), observations.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(record["event"], "host.native_identity.refused");
+                assert_eq!(record["reason"], reason);
+                assert_eq!(record["severity"], "warn");
+                assert_eq!(record["provider"], provider.as_str());
+                assert_eq!(record["launch"], launch);
+                assert_eq!(record["nativeEvidenceDigest"], "a".repeat(64));
+                assert_eq!(record["queryGeneration"], 1);
+                assert_eq!(record["normalizedEventType"], "freshAgent.session.init");
+                assert_eq!(record["nativeReceiverPublished"], false);
+                assert!(!record
+                    .to_string()
+                    .contains("excluded private provider content"));
+                assert!(!record.to_string().contains("local-presentation-key"));
+                assert!(native_rx.borrow().is_none());
+                assert!(evidence_rx.borrow().is_none());
+                assert!(matches!(
+                    event_rx.recv().await,
+                    Some(AgentEvent::Provider { .. })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn native_query_loading_withdraws_the_previous_current_host_observation() {
         let (sender, receiver) = broadcast::channel(16);
         let (created, _) = watch::channel(None);
@@ -1625,6 +1732,7 @@ mod tests {
                 send_outcomes,
                 kill_outcomes,
                 suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                refusal_observer: None,
             },
         );
         let launch = freshell_platform::managed_child_secrets::snapshot()
@@ -1730,6 +1838,7 @@ mod tests {
                 send_outcomes,
                 kill_outcomes,
                 suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                refusal_observer: None,
             },
         );
         sender

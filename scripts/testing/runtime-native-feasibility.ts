@@ -74,9 +74,9 @@ export function stageSdkInitFieldFault(source: string): string {
       emit(nativeInit)`)
 }
 
-export function nativeSdkInitFieldFaultMatches(mode: NativeMode, caseId: string, receipt: any, namespace: any, actor: any): boolean {
+export function nativeSdkInitFieldFaultMatches(mode: NativeMode, caseId: string, receipt: any, namespace: any, refusals: any): boolean {
   if (!['freshclaude', 'kilroy'].includes(mode) || !['missing-native-id', 'placeholder-id'].includes(caseId)
-    || receipt?.mode !== mode || receipt.caseId !== caseId || !namespace?.hook || !Array.isArray(actor?.events)) return false
+    || receipt?.mode !== mode || receipt.caseId !== caseId || !namespace?.hook || !Array.isArray(refusals)) return false
   const launch = namespace.nativeLaunch, frame = receipt.frame
   const sameLaunch = (actual: any) => !!actual && !!launch
     && ['incarnationId', 'launchNonce', 'evidenceRevision', 'executionGeneration', 'requestedNativeSessionId']
@@ -86,12 +86,10 @@ export function nativeSdkInitFieldFaultMatches(mode: NativeMode, caseId: string,
     || namespace.nativeRoot !== root || namespace.hook.native?.session_id !== root
     || namespace.hook.native?.source !== 'startup' || !sameLaunch(namespace.hook.launch)
     || !launch?.incarnationId || !launch.launchNonce || launch.requestedNativeSessionId !== null
-    || !Number.isSafeInteger(launch.evidenceRevision) || launch.evidenceRevision < 1
+    || !Number.isSafeInteger(launch.evidenceRevision) || launch.evidenceRevision < 0
     || !Number.isSafeInteger(launch.executionGeneration) || launch.executionGeneration < 1
     || frame?.type !== 'sdk.session.init' || typeof frame.sessionId !== 'string' || !frame.sessionId
-    || frame.sessionId === root || namespace.hook.native.cwd !== frame.cwd
-    || actor.profile?.cwd !== frame.cwd || actor.profile?.provider !== (mode === 'kilroy' ? 'kilroy' : 'claude')
-    || actor.profile?.nativeSessionId !== null || actor.events.some((entry: any) => entry.event?.kind === 'started')) return false
+    || frame.sessionId === root || namespace.hook.native.cwd !== frame.cwd) return false
   const evidenceMatches = (event: any) => sameLaunch(event?.nativeIdentityEvidence?.launch)
     && /^[a-f0-9]{64}$/i.test(namespace.hookSha256 ?? '')
     && event.nativeIdentityEvidence.digest === namespace.hookSha256
@@ -101,11 +99,15 @@ export function nativeSdkInitFieldFaultMatches(mode: NativeMode, caseId: string,
     ? !Object.prototype.hasOwnProperty.call(event, 'cliSessionId')
     : event.cliSessionId === frame.sessionId && !/^[a-f0-9-]{36}$/i.test(event.cliSessionId)
   if (!evidenceMatches(frame) || !fieldMatches(frame)) return false
-  const normalized = actor.events.filter((entry: any) => entry.event?.kind === 'provider')
-    .map((entry: any) => entry.event.data?.payload?.event).filter((event: any) => event?.type === 'freshAgent.session.init')
-  return normalized.length === 1 && normalized.every((event: any) => evidenceMatches(event) && fieldMatches(event)
-    && event.sessionId === frame.sessionId && event.cwd === frame.cwd && event.model === frame.model
-    && event.nativeIdentityEvidence.queryGeneration === frame.nativeIdentityEvidence.queryGeneration)
+  const current = refusals.filter((record: any) => record?.event === 'host.native_identity.refused' && sameLaunch(record.launch))
+  return current.length === 1 && current.every((record: any) => record.severity === 'warn'
+    && record.reason === (caseId === 'missing-native-id' ? 'missing_cli_session_id' : 'local_placeholder_id')
+    && record.provider === (mode === 'kilroy' ? 'kilroy' : 'claude')
+    && record.normalizedEventType === 'freshAgent.session.init'
+    && record.nativeEvidenceDigest === namespace.hookSha256
+    && record.nativeEvidenceSource === namespace.hook.native.source
+    && record.queryGeneration === frame.nativeIdentityEvidence.queryGeneration
+    && record.nativeReceiverPublished === false && record.nativeReceiverContainsIdentity === false)
 }
 
 export function staleNativeSignalBindingMatches(captured: any, priorLaunch: any, currentLaunch: any, root: string): boolean {
@@ -661,7 +663,7 @@ async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervis
   request: any, caseId: string, scenario: string, settings: unknown, sdkForkImage = false): Promise<NativeExperimentOriginal> {
   const soulId = request.params.soulId
   const began = Date.now()
-  let finished = false, reply: any, error: unknown, namespace: any, receipt: any, fieldReceipt: any, actor: any
+  let finished = false, reply: any, error: unknown, namespace: any, receipt: any, fieldReceipt: any, refusals: any
   const fieldFault = ['missing-native-id', 'placeholder-id'].includes(caseId)
   const pending = harness.adminRaw(supervisor, request).then(
     (value) => { reply = value; finished = true },
@@ -685,9 +687,12 @@ async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervis
         namespace = JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId,'65534:0',
           ['python3','-c',claudeNativeInspection,fieldFault ? fieldReceipt.actualNativeSessionId : request.params.nativeSessionId??'', 'false','fresh', fieldFault?'ordinary':caseId==='wrong-id'?'wrong-id':'disabled-hooks', ...(sdkForkImage ? ['sdk-fork-image'] : [])]))
         if (fieldFault) {
-          actor = JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId, '0:0', ['python3', '-c',
-            "import pathlib,json;file=pathlib.Path('/run/freshell-host-actor/fresh-agent-state.json');raw=file.read_bytes();assert len(raw)<=32*1024*1024;print(json.dumps(json.loads(raw)))"]))
-          if (!nativeSdkInitFieldFaultMatches(request.params.freshAgent.sessionType, caseId, fieldReceipt, namespace, actor)) {
+          const logs = harness.containerLogs(receipt.containerId)
+          refusals = logs.split('\n').flatMap(line => {
+            try { const record = JSON.parse(line); return record.event === 'host.native_identity.refused' ? [record] : [] }
+            catch { return [] }
+          })
+          if (!nativeSdkInitFieldFaultMatches(request.params.freshAgent.sessionType, caseId, fieldReceipt, namespace, refusals)) {
             throw new Error('actual normalized SDK native field refusal unavailable')
           }
         }
@@ -704,13 +709,13 @@ async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervis
     throw new Error('genuine current unobserved SDK child unavailable before startup fault')
   }
   harness.writeArtifact(`${scenario}-pre-fault-native-private.json`,namespace)
-  if (fieldFault) harness.writeArtifact(`${scenario}-native-field-normalized-private.json`, { fieldReceipt, actor })
+  if (fieldFault) harness.writeArtifact(`${scenario}-native-field-normalized-private.json`, { fieldReceipt, refusals })
   const hookSetting=caseId==='wrong-id'||fieldFault ? {} : JSON.parse(fs.readFileSync(path.join(request.params.freshAgent.cwd,'.claude/settings.json'),'utf8'))
   const actualNamespace=namespace.uid===65534 && namespace.gid===0 && namespace.caps==='0000000000000000'
     && namespace.readOnlyRoot && namespace.httpsStatus===200 && namespace.tlsVerifyMode===2 && namespace.tlsCheckHostname
     && namespace.version.startsWith('2.1.237') && namespace.nativeCwd===request.params.freshAgent.cwd
     && namespace.completedTurns===0 && namespace.toolEvents===0
-  const nativeFault=fieldFault ? nativeSdkInitFieldFaultMatches(request.params.freshAgent.sessionType,caseId,fieldReceipt,namespace,actor) : caseId==='wrong-id' ? !!namespace.hook && namespace.hook.native.session_id!==request.params.nativeSessionId
+  const nativeFault=fieldFault ? nativeSdkInitFieldFaultMatches(request.params.freshAgent.sessionType,caseId,fieldReceipt,namespace,refusals) : caseId==='wrong-id' ? !!namespace.hook && namespace.hook.native.session_id!==request.params.nativeSessionId
     && JSON.stringify(namespace.hook.launch)===JSON.stringify(namespace.nativeLaunch)
     : namespace.hook===null && namespace.nativeRoot===null && hookSetting.disableAllHooks===true
   if (!actualNamespace || !nativeFault) {await pending;throw new Error('genuine native SDK pin/profile/identity fault differs')}

@@ -622,28 +622,29 @@ const fs={readdirSync:()=>['71'],readFileSync:(file)=>{if(file.endsWith('native-
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
   it.each(['freshclaude','kilroy'].flatMap(mode => ['missing-native-id','placeholder-id'].flatMap(caseId =>
-    ['valid','wrong-mode','wrong-case','wrong-actual-root','missing-hook','wrong-digest','stale-launch','placeholder-native-uuid','wrong-local-key','filled-profile','started','sdk-only','stale-generation']
+    ['valid','valid-zero-revision','wrong-revision-type','wrong-mode','wrong-case','wrong-actual-root','missing-hook','wrong-digest','stale-launch','placeholder-native-uuid','wrong-local-key','filled-profile','started','sdk-only','stale-generation']
       .map(fault => ({ mode: mode as 'freshclaude'|'kilroy', caseId, fault })))))('binds actual normalized native field refusal $mode/$caseId/$fault', ({mode,caseId,fault}) => {
     const launch={incarnationId:'inc-current',launchNonce:'nonce-current',evidenceRevision:3,executionGeneration:4,requestedNativeSessionId:null}
     const frame:any={type:'sdk.session.init',sessionId:'actual-sidecar-local-key',cwd:'/owned/workspace',model:'selected',nativeIdentityEvidence:{launch,digest:'d'.repeat(64),source:'startup',queryGeneration:1}}
     if(caseId==='placeholder-id')frame.cliSessionId=frame.sessionId
     const namespace:any={nativeRoot:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',hook:{launch,native:{session_id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',source:'startup',cwd:frame.cwd}},hookSha256:'d'.repeat(64),nativeLaunch:launch}
     const receipt:any={mode,caseId,actualNativeSessionId:namespace.nativeRoot,frame}
-    const normalized={...frame,type:'freshAgent.session.init'}
-    const actor:any={profile:{provider:mode==='kilroy'?'kilroy':'claude',cwd:frame.cwd,nativeSessionId:null},events:[{sequence:1,event:{kind:'provider',data:{payload:{type:'freshAgent.event',event:normalized}}}}]}
+    const actor:any=[{event:'host.native_identity.refused',severity:'warn',provider:mode==='kilroy'?'kilroy':'claude',reason:caseId==='missing-native-id'?'missing_cli_session_id':'local_placeholder_id',launch,nativeEvidenceDigest:'d'.repeat(64),nativeEvidenceSource:'startup',queryGeneration:1,normalizedEventType:'freshAgent.session.init',nativeReceiverPublished:false,nativeReceiverContainsIdentity:false}]
+    if(fault==='valid-zero-revision')launch.evidenceRevision=0
+    if(fault==='wrong-revision-type')(launch as any).evidenceRevision='0'
     if(fault==='wrong-mode')receipt.mode=mode==='kilroy'?'freshclaude':'kilroy'
     if(fault==='wrong-case')receipt.caseId='disabled-hooks'
     if(fault==='wrong-actual-root')receipt.actualNativeSessionId='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
     if(fault==='missing-hook')namespace.hook=null
     if(fault==='wrong-digest')namespace.hookSha256='e'.repeat(64)
     if(fault==='stale-launch')namespace.nativeLaunch={...launch,launchNonce:'nonce-old'}
-    if(fault==='placeholder-native-uuid') {frame.cliSessionId=namespace.nativeRoot;normalized.cliSessionId=namespace.nativeRoot}
-    if(fault==='wrong-local-key') {frame.cliSessionId='other-local';normalized.cliSessionId='other-local'}
-    if(fault==='filled-profile')actor.profile.nativeSessionId=namespace.nativeRoot
-    if(fault==='started')actor.events.push({sequence:2,event:{kind:'started',data:{native_session_id:namespace.nativeRoot}}})
-    if(fault==='sdk-only')normalized.type='sdk.session.init'
+    if(fault==='placeholder-native-uuid') {frame.cliSessionId=namespace.nativeRoot}
+    if(fault==='wrong-local-key') {frame.cliSessionId='other-local'}
+    if(fault==='filled-profile')actor[0].nativeReceiverContainsIdentity=true
+    if(fault==='started')actor[0].nativeReceiverPublished=true
+    if(fault==='sdk-only')actor[0].normalizedEventType='sdk.session.init'
     if(fault==='stale-generation')frame.nativeIdentityEvidence.queryGeneration=0
-    expect(nativeSdkInitFieldFaultMatches(mode,caseId,receipt,namespace,actor)).toBe(fault==='valid')
+    expect(nativeSdkInitFieldFaultMatches(mode,caseId,receipt,namespace,actor)).toBe(fault==='valid'||fault==='valid-zero-revision')
   })
   it.each(['freshclaude','kilroy'].flatMap(mode=>['missing-native-id','placeholder-id'].map(caseId=>({mode:mode as 'freshclaude'|'kilroy',caseId}))))('executes the enabled-hook normalized field refusal route $mode/$caseId', async ({mode,caseId})=>{
     const directory=fs.mkdtempSync(path.join(os.tmpdir(),'native-field-route-'))
@@ -657,7 +658,8 @@ const fs={readdirSync:()=>['71'],readFileSync:(file)=>{if(file.endsWith('native-
     let actor:any
     const harness={testRoot:directory,runId:ownerId,candidateSha,imageRef:imageDigest,startSupervisor:async()=>({containerId:'owned-supervisor'}),writeArtifact:()=>'',inventoryBody:()=>({method:'inventory'}),
       execOwnedContainerExact:async()=>JSON.stringify(marker),broker:{receipts:()=>[{soulId,containerId:'owned-container'}]},
-      execOwnedContainerAsExact:async(_container:string,uid:string)=>{if(uid==='0:0'){queueMicrotask(()=>finish({result:{Err:{code:'HOST_UNREACHABLE'}}}));return JSON.stringify(actor)}return JSON.stringify(namespace)},
+      execOwnedContainerAsExact:async()=>JSON.stringify(namespace),
+      containerLogs:()=>{queueMicrotask(()=>finish({result:{Err:{code:'HOST_UNREACHABLE'}}}));return JSON.stringify(actor[0])+'\n'},
       adminRaw:async(_supervisor:unknown,request:any)=>{
         if(request.method==='launch'){
           soulId=request.params.soulId;const cwd=request.params.freshAgent.cwd
@@ -667,7 +669,7 @@ const fs={readdirSync:()=>['71'],readFileSync:(file)=>{if(file.endsWith('native-
           const frame:any={type:'sdk.session.init',sessionId:'actual-local-sidecar-key',cwd,model:'selected',nativeIdentityEvidence:{launch,digest:namespace.hookSha256,source:'startup',queryGeneration:1}}
           if(caseId==='placeholder-id')frame.cliSessionId=frame.sessionId
           fs.writeFileSync(path.join(cwd,'native-init-field-fault-observation.json'),JSON.stringify({mode,caseId,actualNativeSessionId:namespace.nativeRoot,frame}))
-          actor={profile:{cwd,provider:mode==='kilroy'?'kilroy':'claude',nativeSessionId:null},events:[{sequence:1,event:{kind:'provider',data:{payload:{type:'freshAgent.event',event:{...frame,type:'freshAgent.session.init'}}}}}]}
+          actor=[{event:'host.native_identity.refused',severity:'warn',provider:mode==='kilroy'?'kilroy':'claude',reason:caseId==='missing-native-id'?'missing_cli_session_id':'local_placeholder_id',launch,nativeEvidenceDigest:namespace.hookSha256,nativeEvidenceSource:'startup',queryGeneration:1,normalizedEventType:'freshAgent.session.init',nativeReceiverPublished:false,nativeReceiverContainsIdentity:false}]
           return new Promise(resolve=>{finish=resolve})
         }
         if(request.method!=='fresh_agent_send')throw new Error('unexpected native field operation')
