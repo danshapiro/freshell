@@ -973,6 +973,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'provider-volume', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
+    'opencode-qualification-blockers',
     'terminal-continuity-receipt',
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
@@ -3659,6 +3660,29 @@ export class ManagedRuntimeOwner {
     const raw = this.ownedContainerExec(handle.containerId, ['sh', '-lc',
       `printf '{"cpuMax":"%s","memoryMax":"%s","swapMax":"%s","pidsMax":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/memory.swap.max)" "$(cat /sys/fs/cgroup/pids.max)"`])
     return OpencodeQualificationStartupFactsSchema.shape.limits.parse(JSON.parse(raw))
+  }
+  async runOpenCodeQualificationBlockers(): Promise<string[]> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
+    const tests = [
+      ['freshell-agent-runtime', 'release_qualified_opencode_blocker_matrix_is_explicit'],
+      ['freshell-agent-runtime', 'opencode_probe_reads_exact_row_without_guessing_latest'],
+      ['freshell-supervisor', 'retry_budget_is_persisted_and_manual_retry_rearms_without_identity_change'],
+    ]
+    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
+    for (const [index, [crate, filter]] of tests.entries()) {
+      this.runtime.recordLifecycle('external.opencode_blocker_started', { severity: 'info', crate, filter })
+      try {
+        const stdout = this.runtime.runCommand(mise, ['exec', 'rust@1.96', '--', 'cargo', 'test', '-p', crate, filter, '--', '--nocapture'],
+          { cwd: this.repoRoot })
+        this.runtime.writeArtifact(`opencode-blocker-${index}.json`, { runId: this.runtime.runId,
+          candidateSha: this.runtime.candidateSha, crate, filter, stdout })
+        this.runtime.recordLifecycle('external.opencode_blocker_passed', { severity: 'info', crate, filter })
+      } catch (error) {
+        this.runtime.recordLifecycle('external.opencode_blocker_failed', { severity: 'error', crate, filter })
+        throw error
+      }
+    }
+    return tests.map(([crate, filter]) => `${crate}:${filter}`)
   }
 
   async lossCredentialEvidence(handle: RuntimeEnclosureHandle): Promise<OpencodeLossCredentialEvidence> {

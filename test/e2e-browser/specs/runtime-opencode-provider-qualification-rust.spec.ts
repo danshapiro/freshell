@@ -7,11 +7,7 @@
  * gate. Claude, Codex, and Amplifier are adapter-ready but release-disabled
  * until their corresponding live campaign can produce the same receipt.
  */
-import { execFileSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
 
 import { expect, type Page } from '@playwright/test'
 
@@ -410,21 +406,6 @@ function cgroupLimitEvidence(view: ManagedRuntimeView, actual: NonNullable<Provi
   return actual
 }
 
-function runBlockerMatrixTests(repoRoot: string): string[] {
-  const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-  const tests = [
-    ['freshell-agent-runtime', 'release_qualified_opencode_blocker_matrix_is_explicit'],
-    ['freshell-agent-runtime', 'opencode_probe_reads_exact_row_without_guessing_latest'],
-    ['freshell-supervisor', 'retry_budget_is_persisted_and_manual_retry_rearms_without_identity_change'],
-  ]
-  for (const [crate, filter] of tests) {
-    execFileSync(mise, [
-      'exec', 'rust@1.96', '--', 'cargo', 'test', '-p', crate, filter, '--', '--nocapture',
-    ], { cwd: repoRoot, stdio: 'inherit' })
-  }
-  return tests.map(([crate, filter]) => `${crate}:${filter}`)
-}
-
 test.describe.serial('OpenCode provider qualification', () => {
   test('release-enabled OpenCode proves exact native recovery, isolation, and cleanup', async ({ page }) => {
     test.skip(
@@ -434,7 +415,6 @@ test.describe.serial('OpenCode provider qualification', () => {
     test.setTimeout(1_800_000)
 
     const onecli = requireOpenCodeOnecliBootstrap(process.env, 'OpenCode provider qualification')
-    const blockerEvidence = runBlockerMatrixTests(process.cwd())
     const rig = new ManagedRuntimeBrowserRig(
       process.cwd(),
       5,
@@ -449,6 +429,7 @@ test.describe.serial('OpenCode provider qualification', () => {
     )
     let providerRow: ProviderQualificationRow | undefined
     try {
+      const blockerEvidence = await rig.runOpenCodeQualificationBlockers()
       const info = await rig.start()
       const rollout = await rig.applyManagedOptIn(await rig.controlEpoch())
       expect(rollout.currentMode).toBe('managed-opt-in')

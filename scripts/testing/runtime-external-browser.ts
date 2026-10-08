@@ -914,6 +914,9 @@ export class ExternalManagedRuntimeRig {
   async openCodeQualificationLimits(enclosure: RuntimeEnclosureHandle): Promise<z.infer<typeof OpencodeQualificationStartupFactsSchema>['limits']> {
     return this.rpc('opencode-qualification-limits', OpencodeQualificationStartupFactsSchema.shape.limits, { enclosure })
   }
+  async runOpenCodeQualificationBlockers(): Promise<string[]> {
+    return this.rpc('opencode-qualification-blockers', z.array(z.string().min(1)).length(3))
+  }
   async openCodeContinuityFirstTurnCompleted(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
     return this.rpc('opencode-continuity-first-turn', z.boolean(), { enclosure })
   }
@@ -1292,6 +1295,9 @@ export function createExternalRuntimeControl(
       case 'opencode-qualification-limits':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
         result = await owner.openCodeQualificationLimits(request.enclosure)
+        break
+      case 'opencode-qualification-blockers':
+        result = await owner.runOpenCodeQualificationBlockers()
         break
       case 'opencode-continuity-effect-count':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')

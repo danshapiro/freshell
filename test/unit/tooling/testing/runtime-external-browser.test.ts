@@ -1942,6 +1942,44 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('executes only the existing fixed OpenCode blocker matrix on the owner and refuses failed prerequisites', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-qualification-blockers-'))
+    try {
+      const { owned, context, request } = fixture()
+      Object.assign(owned.runtime, { phase: 5, evidenceDir: directory })
+      const child = vi.spyOn(owned.runtime, 'runCommand').mockReturnValue('private bounded Cargo output')
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const wire: unknown[] = []
+      const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      const evidence = await rig.runOpenCodeQualificationBlockers()
+      expect(evidence).toEqual([
+        'freshell-agent-runtime:release_qualified_opencode_blocker_matrix_is_explicit',
+        'freshell-agent-runtime:opencode_probe_reads_exact_row_without_guessing_latest',
+        'freshell-supervisor:retry_budget_is_persisted_and_manual_retry_rearms_without_identity_change',
+      ])
+      expect(child).toHaveBeenCalledTimes(3)
+      for (const [index, call] of child.mock.calls.entries()) {
+        const [crate, filter] = evidence[index].split(':')
+        expect(call[0]).toBe(path.join(os.homedir(), '.local', 'bin', 'mise'))
+        expect(call[1]).toEqual(['exec', 'rust@1.96', '--', 'cargo', 'test', '-p', crate, filter, '--', '--nocapture'])
+        expect(call[2]).toEqual({ cwd: owned.repoRoot })
+      }
+      expect(JSON.stringify(wire)).not.toContain('private')
+      child.mockClear()
+      child.mockImplementationOnce(() => { throw new Error('owned Cargo prerequisite failed') })
+      await expect(owned.runOpenCodeQualificationBlockers()).rejects.toThrow(/prerequisite failed/)
+      expect(child).toHaveBeenCalledOnce()
+      child.mockClear()
+      await expect(control({ ...request, action: 'opencode-qualification-blockers', command: 'arbitrary' })).rejects.toThrow(/operation/)
+      Object.assign(owned.runtime, { phase: 2 })
+      await expect(owned.runOpenCodeQualificationBlockers()).rejects.toThrow(/Phase 5/)
+      expect(child).not.toHaveBeenCalled()
+    } finally { await fsp.rm(directory, { recursive: true, force: true }) }
+  })
   it('observes qualification auth model process and exact cgroup limits privately on the owner', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-qualification-startup-'))
     try {
