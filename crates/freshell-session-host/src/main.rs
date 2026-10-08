@@ -1941,11 +1941,8 @@ fn write_projection_manifest(
     provider_home: &Path,
     entries: &std::collections::BTreeSet<String>,
 ) -> Result<PathBuf, String> {
+    use std::io::Write;
     let manifest = provider_home.join(PROVIDER_PROJECTION_MANIFEST);
-    let temporary = provider_home.join(format!(
-        "{PROVIDER_PROJECTION_MANIFEST}.tmp-{}",
-        std::process::id()
-    ));
     let bytes =
         freshell_runtime_protocol::bounded_json_bytes(entries, MAX_PROJECTION_METADATA_BYTES)
             .map_err(|_| {
@@ -1959,9 +1956,27 @@ fn write_projection_manifest(
                 );
                 "provider projection metadata exceeds 64 MiB; retain inputs and repair".to_owned()
             })?;
-    std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-    set_mode(&temporary, 0o600)?;
-    std::fs::rename(&temporary, &manifest).map_err(|error| error.to_string())?;
+    let published: Result<(), std::io::Error> = (|| {
+        // Keep incomplete metadata private and remove it on every write or
+        // rename failure. Only the complete file replaces the prior manifest.
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".freshell-config-projection-")
+            .tempfile_in(provider_home)?;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(&manifest).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        std::fs::File::open(provider_home)?.sync_all()?;
+        Ok(())
+    })();
+    published.map_err(|cause| {
+        tracing::warn!(event="provider.inputs.projection_metadata.blocked",stage="session_host",
+            operation="publish",relative_path=PROVIDER_PROJECTION_MANIFEST,cause=%cause,
+            "Provider projection metadata publication failed; retain inputs and repair");
+        format!(
+            "provider projection metadata publication failed: {cause}; retain inputs and repair"
+        )
+    })?;
     Ok(manifest)
 }
 
@@ -4154,6 +4169,109 @@ mod tests {
             1,
             "failed metadata publication must not leave a temporary file"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_config_projection_metadata_writer_cleans_failed_publication() {
+        const CHILD: &str = "FRESHELL_TEST_PROJECTION_WRITE_FAILURE_CHILD";
+        const TEST: &str =
+            "tests::provider_config_projection_metadata_writer_cleans_failed_publication";
+        if std::env::var_os(CHILD).is_none() {
+            let mut failed = Vec::new();
+            for case in ["write", "rename"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, case)
+                    .output()
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&output.stdout)
+                    .contains("projection_write_failure_fixture_ready"));
+                eprintln!(
+                    "projection_write_failure_child_result {}",
+                    serde_json::json!({
+                        "case":case,
+                        "success":output.status.success(),
+                        "temporaryMetadataRemaining":String::from_utf8_lossy(&output.stderr)
+                            .contains("left temporary metadata")
+                    })
+                );
+                if !output.status.success() {
+                    failed.push(case);
+                }
+            }
+            assert!(failed.is_empty(), "projection metadata failure must preserve prior metadata and remove owned temporary files: {failed:?}");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let accepted = ["skills/prior".to_owned()].into_iter().collect();
+        let manifest = write_projection_manifest(home.path(), &accepted).unwrap();
+        let before = std::fs::read(&manifest).unwrap();
+        let incoming = [
+            "skills/new-resource".to_owned(),
+            "skills/next-resource".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        println!("projection_write_failure_fixture_ready");
+        if std::env::var(CHILD).unwrap() == "write" {
+            let mut previous = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut previous) },
+                0
+            );
+            let restricted = libc::rlimit {
+                rlim_cur: 16,
+                rlim_max: previous.rlim_max,
+            };
+            let old_signal = unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &restricted) },
+                0
+            );
+            let result = write_projection_manifest(home.path(), &incoming);
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &previous) }, 0);
+            unsafe {
+                libc::signal(libc::SIGXFSZ, old_signal);
+            }
+            assert!(result.is_err());
+            assert!(std::fs::read(&manifest).unwrap() == before);
+            assert_eq!(
+                std::fs::read_dir(home.path()).unwrap().count(),
+                1,
+                "failed publication left temporary metadata"
+            );
+        }
+
+        // A rename failure must clean the fully written temporary too, without
+        // replacing the occupied destination or its provider-owned contents.
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+        let sibling = manifest.join("provider-owned");
+        std::fs::write(&sibling, b"owned-metadata-sibling-nonce").unwrap();
+        assert!(write_projection_manifest(home.path(), &incoming).is_err());
+        assert_eq!(
+            std::fs::read_dir(home.path()).unwrap().count(),
+            1,
+            "failed rename left temporary metadata"
+        );
+        assert_eq!(
+            std::fs::read(&sibling).unwrap(),
+            b"owned-metadata-sibling-nonce"
+        );
+        std::fs::remove_file(sibling).unwrap();
+        std::fs::remove_dir(&manifest).unwrap();
+        write_projection_manifest(home.path(), &incoming).unwrap();
+        assert_eq!(read_projection_manifest(home.path()).unwrap(), incoming);
+        assert_eq!(
+            std::fs::metadata(&manifest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
