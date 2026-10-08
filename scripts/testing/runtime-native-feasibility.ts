@@ -284,7 +284,8 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (!['freshclaude', 'kilroy'].includes(selection.mode ?? '')
     || !['create', 'exact-resume', 'current-native-turn', 'allow', 'deny', 'changed-tool', 'missing-tool',
       'changed-input', 'changed-profile', 'changed-root', 'stale-callback', 'crash-before-checkpoint',
-      'multiple-tools', 'effect-before-observation'].includes(caseId)) {
+      'multiple-tools', 'effect-before-observation', 'wrong-id', 'missing-native-id', 'placeholder-id', 'disabled-hooks',
+      'timeout-50s', 'provider-exit', 'stop-cancellation'].includes(caseId)) {
     throw new Error(`actual native case has no qualified execution path: ${selection.mode ?? selection.provider}/${caseId}`)
   }
   const mode = selection.mode!
@@ -311,17 +312,25 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
     fs.writeFileSync(path.join(directory, 'settings.json'), JSON.stringify(settings), { mode: 0o660 })
     fs.chmodSync(path.join(directory, 'settings.json'), 0o660)
   }
+  const startupFault = ['wrong-id', 'missing-native-id', 'placeholder-id', 'disabled-hooks', 'timeout-50s', 'provider-exit', 'stop-cancellation'].includes(caseId)
+  if (startupFault && caseId !== 'wrong-id') {
+    const local = path.join(workspace, '.claude'); fs.mkdirSync(local, { mode: 0o770 }); fs.chmodSync(local, 0o770)
+    const file = path.join(local, 'settings.json')
+    fs.writeFileSync(file, JSON.stringify({ disableAllHooks: true }), { mode: 0o660 }); fs.chmodSync(file, 0o660)
+  }
   const soulId = 'soul-' + randomUUID()
   const storeId = 'store-' + randomUUID()
   const settings = { model: 'claude-haiku-4-5-20251001', effort: 'low', permissionMode: 'default' }
   const request = { method: 'launch', params: { soulId, provider: logicalProvider, providerStoreId: storeId,
     creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: scenario,
+    ...(caseId === 'wrong-id' ? {nativeSessionId:randomUUID()} : {}),
     limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
     freshAgent: { sessionId: 'native-fresh-' + randomUUID(), provider: logicalProvider,
       sessionType: mode, runtimeVariant: 'claude-sdk-sidecar', providerStoreId: storeId,
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, ...settings,
       providerSecretReferences: references, providerLaunchContext: { preparation: { claude: { mcp_args: [] } }, config: [] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
+  if (startupFault) return executeManagedFreshStartupFault(harness, supervisor, request, caseId, scenario, settings)
   const launch = await harness.adminOk(supervisor, request)
   harness.writeArtifact(`${scenario}-launch.json`, launch)
   const view = launch.data.view
@@ -423,6 +432,96 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
     profileSha256, artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace.json`],
     assertions }
   harness.writeArtifact(`${scenario}-original.json`, original)
+  return original
+}
+
+async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervisor: Awaited<ReturnType<RuntimeHarness['startSupervisor']>>,
+  request: any, caseId: string, scenario: string, settings: unknown): Promise<NativeExperimentOriginal> {
+  const soulId = request.params.soulId
+  const began = Date.now()
+  let finished = false, reply: any, error: unknown, namespace: any, receipt: any
+  const pending = harness.adminRaw(supervisor, request).then(
+    (value) => { reply = value; finished = true },
+    (failure) => { error = failure; finished = true },
+  )
+  await Promise.resolve()
+  if (finished && error) throw error
+  const attempts: string[] = []
+  // Observe the actual selected child before its existing identity deadline.
+  // A requested root and the sidecar create key never fill observed identity.
+  const deadline = Date.now() + 6_000
+  while (!finished && Date.now() < deadline) {
+    receipt = harness.broker.receipts().find((owned) => owned.soulId === soulId)
+    if (receipt) {
+      try {
+        namespace = JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId,'65534:0',
+          ['python3','-c',claudeNativeInspection,request.params.nativeSessionId??'', 'false','fresh', caseId==='wrong-id'?'wrong-id':'disabled-hooks']))
+        break
+      } catch (failure) {attempts.push(String(failure))}
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  harness.writeArtifact(`${scenario}-pre-fault-capture-errors-private.json`,attempts)
+  if (!namespace || !receipt) {
+    await pending
+    if (error) throw error
+    harness.writeArtifact(`${scenario}-failed-launch.json`,reply)
+    throw new Error('genuine current unobserved SDK child unavailable before startup fault')
+  }
+  harness.writeArtifact(`${scenario}-pre-fault-native-private.json`,namespace)
+  const hookSetting=caseId==='wrong-id' ? {} : JSON.parse(fs.readFileSync(path.join(request.params.freshAgent.cwd,'.claude/settings.json'),'utf8'))
+  const actualNamespace=namespace.uid===65534 && namespace.gid===0 && namespace.caps==='0000000000000000'
+    && namespace.readOnlyRoot && namespace.httpsStatus===200 && namespace.tlsVerifyMode===2 && namespace.tlsCheckHostname
+    && namespace.version.startsWith('2.1.237') && namespace.nativeCwd===request.params.freshAgent.cwd
+    && namespace.completedTurns===0 && namespace.toolEvents===0
+  const nativeFault=caseId==='wrong-id' ? !!namespace.hook && namespace.hook.native.session_id!==request.params.nativeSessionId
+    && JSON.stringify(namespace.hook.launch)===JSON.stringify(namespace.nativeLaunch)
+    : namespace.hook===null && namespace.nativeRoot===null && hookSetting.disableAllHooks===true
+  if (!actualNamespace || !nativeFault) {await pending;throw new Error('genuine native SDK pin/profile/identity fault differs')}
+  let fault: any
+  if (caseId==='provider-exit') {
+    if (finished)throw new Error('native startup settled before owned provider exit')
+    await harness.killOwnedRuntimePidExact(receipt.containerId,namespace.nativePid,'TERM')
+  } else if (caseId==='stop-cancellation') {
+    if (finished)throw new Error('native startup settled before ordinary Stop')
+    fault=await harness.adminOk(supervisor,harness.stopBody(soulId))
+    harness.writeArtifact(`${scenario}-ordinary-stop.json`,fault)
+  }
+  await pending
+  if (error)throw error
+  const elapsedMs=Date.now() - began
+  harness.writeArtifact(`${scenario}-launch.json`,reply)
+  harness.writeArtifact(`${scenario}-timing.json`,{elapsedMs})
+  const inventory=await harness.adminOk(supervisor,harness.inventoryBody())
+  harness.writeArtifact(`${scenario}-current-inventory.json`,inventory)
+  const current=inventory.data.filter((row:any)=>row.soulId===soulId)
+  if (!reply.result?.Err || !current.length || current.some((row:any)=>row.launchState==='running'||row.nativeIdentityObservation)) {
+    throw new Error('unobserved native fresh startup published Running or identity')
+  }
+  if (caseId==='timeout-50s' && (elapsedMs<50_000||elapsedMs>=60_000))throw new Error('actual SDK native timeout did not respect its existing50s bound')
+  if (caseId==='provider-exit') {
+    fault=JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId,'65534:0',
+      ['python3','-c',"import pathlib,json,sys;print(json.dumps({'nativeExited':not (pathlib.Path('/proc')/sys.argv[1]/'exe').exists()}))",String(namespace.nativePid)]))
+    harness.writeArtifact(`${scenario}-native-exit.json`,fault)
+    if (!fault.nativeExited)throw new Error('owned native SDK writer remains after exit fault')
+  }
+  if (caseId==='stop-cancellation' && (fault.data?.proof?.kind!=='verified_empty'||current.some((row:any)=>row.launchState!=='stopped'))) {
+    throw new Error('ordinary Stop did not confirm empty stopped native fresh runtime')
+  }
+  const input=await harness.adminRaw(supervisor,{method:'fresh_agent_send',params:{soulId,text:'Owned blocked startup probe. Do not use tools.'}})
+  harness.writeArtifact(`${scenario}-input-refusal.json`,input)
+  if (!input.result?.Err)throw new Error('unobserved native fresh startup admitted ordinary input')
+  const original={caseId,ownerId:harness.runId,candidateSha:harness.candidateSha,imageDigest:harness.imageRef,
+    nativeVersion:namespace.version,executableSha256:namespace.executableSha256,
+    profileSha256:createHash('sha256').update(JSON.stringify({settings,nativeProfile:namespace.profileFiles})).digest('hex'),
+    artifactReferences:[`${scenario}-pre-fault-native-private.json`,`${scenario}-launch.json`,`${scenario}-current-inventory.json`,`${scenario}-input-refusal.json`],
+    assertions:[{name:'actual-default-sdk-child-normal-uid-tls-current-launch',pass:actualNamespace},
+      {name:'actual-native-startup-fault-remains-unobserved',pass:nativeFault},
+      {name:'native-fault-refuses-running-current-observation-and-input',pass:!!input.result.Err},
+      ...(caseId==='provider-exit'?[{name:'owned-native-writer-exited',pass:fault.nativeExited}]:[]),
+      ...(caseId==='stop-cancellation'?[{name:'ordinary-stop-confirmed-empty-stopped-runtime',pass:fault.data?.proof?.kind==='verified_empty' && current.every((row:any)=>row.launchState==='stopped')}]:[]),
+      ...(caseId==='timeout-50s'?[{name:'actual-existing50s-native-startup-bound',pass:elapsedMs>=50_000&&elapsedMs<60_000}]:[])]}
+  harness.writeArtifact(`${scenario}-original.json`,original)
   return original
 }
 
@@ -1617,7 +1716,8 @@ if(process.argv[2]==='--observe') {
 const claudeNativeInspection = String.raw`
 import pathlib,os,json,hashlib,ssl,urllib.parse,urllib.request,subprocess,sys,base64
 root=sys.argv[1];required=sys.argv[2]=='true';terminal=len(sys.argv)>3 and sys.argv[3]=='terminal'
-missing_callbacks=terminal and len(sys.argv)>4 and sys.argv[4] in ['disabled-hooks','trust-refusal','unwritable-signal']
+missing_callbacks=len(sys.argv)>4 and sys.argv[4] in (['disabled-hooks','trust-refusal','unwritable-signal'] if terminal else ['disabled-hooks'])
+wrong_root=not terminal and len(sys.argv)>4 and sys.argv[4]=='wrong-id'
 selected=pathlib.Path('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe' if terminal else '/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude')
 expected=hashlib.sha256(selected.read_bytes()).hexdigest();matches=[]
 for p in pathlib.Path('/proc').iterdir():
@@ -1629,7 +1729,7 @@ for p in pathlib.Path('/proc').iterdir():
 assert len(matches)==1
 p,env=matches[0];signal_dir=pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR']);hook_file=signal_dir/'session-start.json';loaded_file=signal_dir/'statusline-loaded.json'
 hook=None if missing_callbacks and not hook_file.exists() else json.loads(hook_file.read_text())
-assert hook is None and missing_callbacks or hook['native']['session_id']==root
+assert hook is None and missing_callbacks or hook is not None and (wrong_root or hook['native']['session_id']==root)
 loaded=None if not terminal or missing_callbacks and not loaded_file.exists() else json.loads(loaded_file.read_text())
 ca=pathlib.Path(env.get('SSL_CERT_FILE') or env['NODE_EXTRA_CA_CERTS']);context=ssl.create_default_context(cafile=str(ca));proxy=env.get('HTTPS_PROXY') or env.get('https_proxy')
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),urllib.request.HTTPSHandler(context=context))

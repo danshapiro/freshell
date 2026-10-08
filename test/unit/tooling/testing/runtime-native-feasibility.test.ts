@@ -445,6 +445,53 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       } else expect(methods).toEqual(['fresh_agent_send', 'fresh_agent_read_events', 'fresh_agent_resolve', ...(publishedOutcome ? [] : ['probe_recovery'])])
     } finally { fs.rmSync(workspace, { recursive: true, force: true }) }
   })
+  it.each(['valid','wrong-pin','running','observation','admitted','native-turn'])('executes current native fresh startup refusal checks (%s)', async (fault) => {
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'native-fresh-fault-oracle-'))
+    let soulId='', launchReply:(value:any)=>void
+    const namespace={uid:65534,gid:0,caps:'0000000000000000',readOnlyRoot:true,httpsStatus:200,tlsVerifyMode:2,tlsCheckHostname:true,
+      version:fault==='wrong-pin'?'2.1.263':'2.1.237',nativeCwd:'',nativeRoot:null,hook:null,nativePid:37,
+      completedTurns:fault==='native-turn'?1:0,toolEvents:0,executableSha256:'c'.repeat(64),profileFiles:[]}
+    const harness={testRoot:directory,runId:ownerId,candidateSha,imageRef:imageDigest,startSupervisor:async()=>({}),writeArtifact:()=>'',inventoryBody:()=>({method:'inventory'}),
+      broker:{receipts:()=>[{soulId,containerId:'owned-container'}]},
+      execOwnedContainerAsExact:async()=>{queueMicrotask(()=>launchReply({result:{Err:{code:'HOST_UNREACHABLE'}}}));return JSON.stringify(namespace)},
+      adminRaw:async(_supervisor:unknown,body:any)=>{
+        if(body.method==='launch') {soulId=body.params.soulId;namespace.nativeCwd=body.params.freshAgent.cwd;return new Promise(resolve=>{launchReply=resolve})}
+        if(body.method!=='fresh_agent_send')throw new Error('unexpected native fault operation')
+        return fault==='admitted'?{result:{Ok:{}}}:{result:{Err:{code:'UNKNOWN_SOUL'}}}
+      },
+      adminOk:async()=>({data:[{soulId,launchState:fault==='running'?'running':'starting',nativeIdentityObservation:fault==='observation'?{}:null}]}),
+    } as unknown as RuntimeHarness
+    try {
+      const run=executeManagedNativeCase(harness,['env_file','ca_file'].map(suffix=>({name:'claude/grants/'+suffix,path:path.join(directory,suffix),sha256:'e'.repeat(64)})),{mode:'freshclaude',case:'startup'},'missing-native-id')
+      if(fault==='valid')expect((await run).assertions.every(assertion=>assertion.pass)).toBe(true)
+      else await expect(run).rejects.toThrow(fault==='admitted'?'admitted ordinary input':fault==='running'||fault==='observation'?'published Running or identity':'pin/profile/identity fault differs')
+    } finally {fs.rmSync(directory,{recursive:true,force:true})}
+  })
+  it.each(['freshclaude', 'kilroy'] as const)('routes finite real-native startup faults for %s without any model dispatch', async (mode) => {
+    for (const caseId of ['wrong-id', 'missing-native-id', 'placeholder-id', 'disabled-hooks', 'timeout-50s', 'provider-exit', 'stop-cancellation']) {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-fresh-startup-route-'))
+      const launch = vi.fn(async (_supervisor: unknown, body: any) => {
+        expect(body.params.provider).toBe(mode === 'kilroy' ? 'kilroy' : 'claude')
+        expect(body.params.freshAgent.fixtureTransport).toBeUndefined()
+        expect(body.params.freshAgent.sessionType).toBe(mode)
+        expect(body.params.freshAgent.runtimeVariant).toBe('claude-sdk-sidecar')
+        expect(body.params.freshAgent.nativeSessionId).toBeUndefined()
+        if (caseId === 'wrong-id') expect(body.params.nativeSessionId).toMatch(/^[a-f0-9-]{36}$/)
+        else {
+          const settings = JSON.parse(fs.readFileSync(path.join(body.params.freshAgent.cwd, '.claude/settings.json'), 'utf8'))
+          expect(settings.disableAllHooks).toBe(true)
+          if (caseId === 'placeholder-id') expect(body.params.freshAgent.sessionId).toMatch(/^native-fresh-/)
+        }
+        throw new Error('controlled genuine native startup boundary')
+      })
+      const harness = {testRoot:directory,startSupervisor:async()=>({}),writeArtifact:()=>'',broker:{receipts:()=>[]},adminRaw:launch,adminOk:launch} as unknown as RuntimeHarness
+      try {
+        await expect(executeManagedNativeCase(harness,['env_file','ca_file'].map(suffix=>({name:'claude/grants/'+suffix,path:path.join(directory,suffix),sha256:'e'.repeat(64)})),{mode,case:'startup'},caseId))
+          .rejects.toThrow('controlled genuine native startup boundary')
+        expect(launch).toHaveBeenCalledOnce()
+      } finally {fs.rmSync(directory,{recursive:true,force:true})}
+    }
+  })
   it.each(['changed-tool', 'missing-tool', 'changed-input', 'changed-profile', 'changed-root', 'stale-callback',
     'crash-before-checkpoint', 'multiple-tools', 'effect-before-observation', 'exact-resume'])(
     'dispatches %s through the managed native launch boundary', async (caseId) => {
