@@ -607,6 +607,9 @@ export type FreshAgentLaunchFacts = z.infer<typeof FreshAgentLaunchFactsSchema>
 export const RuntimeWebProcessFactsSchema = z.object({ pid: z.number().int().positive(),
   bootAttemptCount: z.number().int().positive() }).strict()
 export type RuntimeWebProcessFacts = z.infer<typeof RuntimeWebProcessFactsSchema>
+export const RuntimeSupervisorProcessFactsSchema = z.object({ containerId: z.string().regex(/^[a-f0-9]{64}$/),
+  pid: z.number().int().min(2) }).strict()
+export type RuntimeSupervisorProcessFacts = z.infer<typeof RuntimeSupervisorProcessFactsSchema>
 export const RuntimeChaosWebOutputFactsSchema = z.object({ contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
   contentBytes: z.number().int().nonnegative(), containsFollowUpMarker: z.boolean(), containsAuthToken: z.boolean() }).strict()
 export type RuntimeChaosWebOutputFacts = z.infer<typeof RuntimeChaosWebOutputFactsSchema>
@@ -635,7 +638,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   action: z.enum([
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
-    'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts',
+    'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
     'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
@@ -2861,6 +2864,12 @@ export class ManagedRuntimeOwner {
   async webProcessFacts(): Promise<RuntimeWebProcessFacts> {
     if (!this.web) throw new Error('owned web process is not prepared')
     return RuntimeWebProcessFactsSchema.parse(this.web.processEvidence())
+  }
+
+  async supervisorProcessFacts(): Promise<RuntimeSupervisorProcessFacts> {
+    if (!this.supervisor) throw new Error('owned supervisor process is not prepared')
+    const containerId = RuntimeSupervisorProcessFactsSchema.shape.containerId.parse(this.supervisor.containerId)
+    return RuntimeSupervisorProcessFactsSchema.parse({ containerId, pid: this.runtime.ownedContainerHostPidExact(containerId) })
   }
 
   async chaosWebOutputFacts(handle: ExactRuntimeHandle, challengeId: string): Promise<RuntimeChaosWebOutputFacts> {

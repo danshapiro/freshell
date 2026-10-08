@@ -366,8 +366,9 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       }
 
       for (let cycle = 1; cycle <= 20; cycle += 1) {
-        const beforeContainerId = rig.supervisor.containerId
-        const beforePid = rig.runtime.ownedContainerHostPidExact(beforeContainerId)
+        const beforeSupervisor = await rig.supervisorProcessFacts()
+        const beforeContainerId = beforeSupervisor.containerId
+        const beforePid = beforeSupervisor.pid
         const beforeControlEpoch = await rig.controlEpoch()
         const mode = cycle % 2 === 1 ? 'abrupt' : 'graceful'
         const startedMonotonicMs = monotonicMs()
@@ -378,8 +379,9 @@ test.describe.serial('Phase 5 runtime chaos', () => {
           const row = snapshot.souls.filter((candidate: any) => candidate.soulId === initial.soulId).at(-1)
           return row?.launchState === 'running' ? row : null
         }, 60_000)
-        const afterContainerId = rig.supervisor.containerId
-        const afterPid = rig.runtime.ownedContainerHostPidExact(afterContainerId)
+        const afterSupervisor = await rig.supervisorProcessFacts()
+        const afterContainerId = afterSupervisor.containerId
+        const afterPid = afterSupervisor.pid
         const afterControlEpoch = await rig.controlEpoch()
         const endedMonotonicMs = monotonicMs()
         const runtime = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)
