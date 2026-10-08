@@ -1054,6 +1054,12 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
   return original
 }
 
+function openCodeTuiHostStatusScript(): string {
+  return amplifierNativeHostStatus
+    .replace('amplif-[a-f0-9]{8}', 'openco-[a-f0-9]{8}')
+    .replace("'nativeSessionId':data.get('native_session_id'),", "'opencodeAdoption':data.get('opencode_adoption'),'nativeSessionId':data.get('native_session_id'),")
+}
+
 async function executeManagedOpenCodeTui(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
@@ -1229,9 +1235,7 @@ for file in directory.glob('*.json'):
 print(json.dumps(records))
 `]))
   harness.writeArtifact(`${scenario}-producer-phases.json`, signals)
-  const statusScript = amplifierNativeHostStatus
-    .replace("'nativeSessionId':data.get('native_session_id'),", "'opencodeAdoption':data.get('opencode_adoption'),'nativeSessionId':data.get('native_session_id'),")
-    .replace('amplif-[a-f0-9]{8}', 'openco-[a-f0-9]{8}')
+  const statusScript = openCodeTuiHostStatusScript()
   const host = JSON.parse(execFileSync('python3', ['-c', statusScript, supervisor.runtimeRoot, view.incarnationId],
     { encoding: 'utf8', timeout: 6000, stdio: ['ignore', 'pipe', 'pipe'] }))
   harness.writeArtifact(`${scenario}-authenticated-host.json`, host)
@@ -1306,15 +1310,27 @@ export async function executeManagedOpenCodeTuiReplacementFault(harness: Runtime
   const captured = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c',
     openCodeTuiSignalMetadata + String.raw`
 import sys
-terminal,root,incarnation,case=sys.argv[1:];assert case in ['baseline-only-resume','stale-observation']
-records=native_signal_metadata(terminal,root)
-assert records and all(row['incarnationId']==incarnation and row['hydrated'] is True and row['messagesRead']=='success' for row in records)
+terminal,root,incarnation,case,workspace=sys.argv[1:];assert case in ['baseline-only-resume','stale-observation']
+workspace=pathlib.Path(workspace).resolve();assert re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9-]{12}/opencode-'+case+r'-workspace',str(workspace))
+raw_file=workspace/'native-tui-captured-signal.json';metadata_file=workspace/'native-tui-captured-signal-metadata.json'
+for file in [raw_file,metadata_file]:assert file.is_file() and not file.is_symlink() and file.stat().st_size<=65536
+raw=raw_file.read_bytes();meta=json.loads(metadata_file.read_text());frame=json.loads(raw);observation=frame['adoption_observation']
+assert meta['schemaVersion']==1 and meta['terminalId']==terminal and meta['rootSessionId']==root and meta['incarnationId']==incarnation
+assert meta['sourceSha256']==hashlib.sha256(raw).hexdigest() and meta['sourceFile'].startswith(terminal+'__')
+assert frame['source']=='opencode-tui-plugin' and frame['session_id']==root and observation['root_session_id']==root
+assert observation['terminal_id']==terminal and observation['incarnation_id']==incarnation and observation['hydrated'] is True and observation['messages_read']=='success'
+records=[{'name':meta['sourceFile'],'sha256':meta['sourceSha256'],'nativeSessionId':root,'incarnationId':incarnation,
+ 'launchNonce':observation['launch_nonce'],'evidenceGeneration':observation['evidence_generation'],'hydrated':True,'messagesRead':observation['messages_read']}]
+removed=0
 if case=='baseline-only-resume':
- for row in records:(home/'.freshell/session-signals/opencode-adoption'/row['name']).unlink()
-print(json.dumps({'signals':records,'cleared':case=='baseline-only-resume'}))
-`, request.params.terminal.terminalId, source.rootId, view.incarnationId, caseId]))
+ for row in native_signal_metadata(terminal,root):
+  assert row['incarnationId']==incarnation
+  (home/'.freshell/session-signals/opencode-adoption'/row['name']).unlink();removed+=1
+print(json.dumps({'signals':records,'cleared':case=='baseline-only-resume','removedSignalFiles':removed,'launchNonce':meta['launchNonce'],'nativePid':meta['nativePid']}))
+`, request.params.terminal.terminalId, source.rootId, view.incarnationId, caseId, source.workspace]))
   harness.writeArtifact(`${scenario}-original-native-signals.json`, captured)
-  if (!Array.isArray(captured.signals) || !captured.signals.length || captured.cleared !== (caseId === 'baseline-only-resume')
+  if (captured.launchNonce !== namespace.nativeLaunch.launchNonce || captured.nativePid !== namespace.nativePid
+    || !Array.isArray(captured.signals) || !captured.signals.length || captured.cleared !== (caseId === 'baseline-only-resume')
     || captured.signals.some((row: any) => row.incarnationId !== view.incarnationId || row.nativeSessionId !== source.rootId
       || row.hydrated !== true || row.messagesRead !== 'success' || !/^[a-f0-9]{64}$/.test(row.sha256 ?? ''))) {
     throw new Error('genuine original native TUI signal capture differs')
@@ -1407,21 +1423,42 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
         || JSON.stringify(namespace.activeMessageIds) !== JSON.stringify(replacement.priorNamespace.activeMessageIds)) {
         throw new Error('native TUI replacement changed original volume/root/history or reused incarnation')
       }
-      // Use the actual framed/authenticated Status contract inside this exact
-      // owned host namespace, after its provider receipt has been inspected.
-      const statusScript = amplifierNativeHostStatus
-        .replace("assert re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/r/amplif-[a-f0-9]{8}/x',str(root))", "assert root==pathlib.Path('/run/freshell')")
-        .replace('directory=root/incarnation;', 'directory=root;')
-        .replace("'nativeSessionId':data.get('native_session_id'),", "'opencodeAdoption':data.get('opencode_adoption'),'nativeSessionId':data.get('native_session_id'),")
-        .replace('print(json.dumps({', 'projection={')
-        .replace("'nativeIdentityObservation':data.get('native_identity_observation')}))", "'nativeIdentityObservation':data.get('native_identity_observation')}")
-      replacementStatus = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c',
-        statusScript + openCodeTuiSignalMetadata + String.raw`
-terminal,native_root=sys.argv[3:];projection['signals']=native_signal_metadata(terminal,native_root)
+      // Keep native volume inspection under the provider UID. Authenticate
+      // the host from its existing owner-side private runtime directory.
+      const statusScript = openCodeTuiHostStatusScript()
+      const staleReplay = caseId === 'stale-observation' ? openCodeTuiSignalMetadata + String.raw`
+import sys,time
+terminal,native_root,workspace,current_incarnation=sys.argv[1:];workspace=pathlib.Path(workspace).resolve()
+assert re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9-]{12}/opencode-stale-observation-workspace',str(workspace))
+control=json.loads((workspace/'native-tui-fault-control.json').read_text());assert control['caseId']=='stale-observation'
+assert control['terminalId']==terminal and control['rootSessionId']==native_root and control['previousIncarnationId']!=current_incarnation
+raw_file=workspace/'native-tui-captured-signal.json';meta_file=workspace/'native-tui-captured-signal-metadata.json'
+for file in [raw_file,meta_file]:assert file.is_file() and not file.is_symlink() and file.stat().st_size<=65536
+raw=raw_file.read_bytes();meta=json.loads(meta_file.read_text());frame=json.loads(raw);observation=frame['adoption_observation']
+assert hashlib.sha256(raw).hexdigest()==meta['sourceSha256'] and meta['incarnationId']==control['previousIncarnationId']
+assert frame['source']=='opencode-tui-plugin' and frame['session_id']==native_root and observation['root_session_id']==native_root
+assert observation['incarnation_id']==control['previousIncarnationId'] and observation['hydrated'] is True and observation['messages_read']=='success'
+assert re.fullmatch(re.escape(terminal)+r'__[A-Za-z0-9_-]+\.json',meta['sourceFile'])
+directory=home/'.freshell/session-signals/opencode-adoption';assert directory.is_dir() and not directory.is_symlink()
+file=directory/meta['sourceFile'];temporary=directory/(meta['sourceFile']+'.task004-stale.tmp')
+assert not file.exists() and not temporary.exists();temporary.write_bytes(raw);temporary.chmod(0o600);temporary.replace(file)
+deadline=time.monotonic()+2
+while file.exists() and time.monotonic()<deadline:time.sleep(0.01)
+replayed={'sha256':hashlib.sha256(raw).hexdigest(),'incarnationId':observation['incarnation_id'],
+ 'launchNonce':observation['launch_nonce'],'hostConsumed':not file.exists()}
+` : ''
+      const nativeVolume = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c',
+        staleReplay + openCodeTuiSignalMetadata + String.raw`
+import sys
+terminal,native_root,workspace,current_incarnation=sys.argv[1:];projection={'signals':native_signal_metadata(terminal,native_root)}
+projection['replayedNativeReceipt']=replayed if 'replayed' in globals() else None
 expected_file=home/'.freshell/session-signals/opencode-adoption'/(terminal+'.expected.json')
 assert expected_file.is_file() and not expected_file.is_symlink() and expected_file.stat().st_size<=65536
 projection['expected']=json.loads(expected_file.read_text());print(json.dumps(projection))
-`, '/run/freshell', view.incarnationId, replacement.terminalId, source.rootId]))
+`, replacement.terminalId, source.rootId, source.workspace, view.incarnationId]))
+      const host = JSON.parse(execFileSync('python3', ['-c', statusScript, supervisor.runtimeRoot, view.incarnationId],
+        { encoding: 'utf8', timeout: 6000, stdio: ['ignore', 'pipe', 'pipe'] }))
+      replacementStatus = { ...nativeVolume, ...host }
       harness.writeArtifact(`${scenario}-authenticated-current-baseline-gate.json`, replacementStatus)
       const expected = replacementStatus.expected
       if (replacementStatus.incarnationId !== view.incarnationId || replacementStatus.executionGeneration !== view.executionGeneration
@@ -1430,8 +1467,11 @@ projection['expected']=json.loads(expected_file.read_text());print(json.dumps(pr
         || expected?.root_session_id !== source.rootId || expected.incarnation_id !== view.incarnationId
         || expected.launch_nonce !== report.adoptionLaunchNonce || expected.evidence_generation !== report.evidenceGeneration
         || (caseId === 'baseline-only-resume' ? replacementStatus.signals?.length !== 0
-          : JSON.stringify(replacementStatus.signals) !== JSON.stringify(replacement.priorSignals)
-            || replacementStatus.signals.some((row: any) => row.incarnationId === view.incarnationId || row.launchNonce === expected.launch_nonce))) {
+          : replacementStatus.signals?.length !== 0 || replacementStatus.replayedNativeReceipt?.hostConsumed !== true
+            || replacementStatus.replayedNativeReceipt.sha256 !== replacement.priorSignals[0]?.sha256
+            || replacementStatus.replayedNativeReceipt.incarnationId !== replacement.priorView.incarnationId
+            || replacementStatus.replayedNativeReceipt.launchNonce !== replacement.priorSignals[0]?.launchNonce
+            || replacementStatus.replayedNativeReceipt.launchNonce === expected.launch_nonce)) {
         throw new Error('actual current baseline/native gate accepted missing or stale producer evidence')
       }
     }
@@ -2187,6 +2227,7 @@ export const openCodeTuiDisposalObserver = String.raw`
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 const storeFaultScript = ${JSON.stringify(openCodeTuiOwnedStoreFault)}
 export default { id: 'freshell-native-qualification', tui(api) {
   const cwd = fs.realpathSync(process.cwd()), home = process.env.HOME
@@ -2199,9 +2240,8 @@ export default { id: 'freshell-native-qualification', tui(api) {
     || !cwd.endsWith('/opencode-' + control.caseId + '-workspace') || control.terminalId !== terminal
     || !/^[a-zA-Z0-9_-]+$/.test(terminal || '') || launch?.requestedNativeSessionId !== control.rootSessionId
     || typeof launch.incarnationId !== 'string' || typeof launch.launchNonce !== 'string') return
-  if (['baseline-only-resume', 'stale-observation'].includes(control.caseId)
-    && (typeof control.previousIncarnationId !== 'string' || !control.previousIncarnationId
-      || control.previousIncarnationId === launch.incarnationId)) return
+  const replacementOnly = ['baseline-only-resume', 'stale-observation'].includes(control.caseId)
+  if (replacementOnly && control.previousIncarnationId === launch.incarnationId) return
   const directory = path.join(home, '.freshell/session-signals')
   const progress = path.join(directory, 'opencode-adoption-diagnostics', terminal)
   const expected = path.join(directory, 'opencode-adoption', terminal + '.expected.json')
@@ -2209,6 +2249,43 @@ export default { id: 'freshell-native-qualification', tui(api) {
   const read = file => {
     try { const stat = fs.lstatSync(file); return stat.isFile() && !stat.isSymbolicLink() && stat.size <= 65536
       ? JSON.parse(fs.readFileSync(file, 'utf8')) : null } catch { return null }
+  }
+  if (replacementOnly && (typeof control.previousIncarnationId !== 'string' || !control.previousIncarnationId)) {
+    // Keep the genuine initial producer enabled. Copy its exact output before
+    // the authenticated host consumes it; these owner artifacts never enter
+    // a native identity channel or release input themselves.
+    let captured = false, timer, watcher
+    const start = Date.now(), directory = path.dirname(expected)
+    const close = () => { clearInterval(timer); watcher?.close() }
+    const capture = () => {
+      if (captured || api.lifecycle.signal.aborted) { close(); return }
+      try {
+        const binding = read(expected)
+        if (binding?.root_session_id !== control.rootSessionId || binding.incarnation_id !== launch.incarnationId) return
+        for (const name of fs.readdirSync(directory)) {
+          if (!name.startsWith(terminal + '__') || !name.endsWith('.json')) continue
+          const file = path.join(directory, name), stat = fs.lstatSync(file)
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) continue
+          const raw = fs.readFileSync(file), frame = JSON.parse(raw.toString('utf8')), observation = frame.adoption_observation
+          if (frame.source !== 'opencode-tui-plugin' || frame.session_id !== control.rootSessionId
+            || observation?.terminal_id !== terminal || observation.root_session_id !== control.rootSessionId
+            || observation.incarnation_id !== launch.incarnationId || observation.launch_nonce !== binding.launch_nonce
+            || observation.evidence_generation !== binding.evidence_generation || observation.hydrated !== true
+            || observation.messages_read !== 'success') continue
+          fs.writeFileSync(path.join(cwd, 'native-tui-captured-signal.json'), raw, { mode: 0o600 })
+          fs.writeFileSync(path.join(cwd, 'native-tui-captured-signal-metadata.json'), JSON.stringify({schemaVersion:1,
+            terminalId:terminal, rootSessionId:control.rootSessionId, incarnationId:launch.incarnationId,
+            launchNonce:launch.launchNonce, nativePid:process.pid, sourceFile:name,
+            sourceSha256:createHash('sha256').update(raw).digest('hex')}), { mode: 0o600 })
+          captured = true; close(); return
+        }
+      } catch { /* A consumed/incomplete file is not evidence; wait boundedly. */ }
+      finally { if (Date.now() - start >= 10000) close() }
+    }
+    try { watcher = fs.watch(directory, () => capture()) } catch { /* Finite polling still reads only this owned namespace. */ }
+    timer = setInterval(capture, 5)
+    api.lifecycle.signal.addEventListener('abort', close, { once: true }); api.lifecycle.onDispose(close)
+    capture(); return
   }
   const publishedForCurrentLaunch = () => {
     const publication = read(progress + '.publication_succeeded.json')

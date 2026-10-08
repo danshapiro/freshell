@@ -1,5 +1,6 @@
 // @vitest-environment node
-import { execFile, execFileSync, spawn } from 'node:child_process'
+import childProcess, { execFile, execFileSync, spawn } from 'node:child_process'
+import { syncBuiltinESMExports } from 'node:module'
 import { promisify } from 'node:util'
 import { describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
@@ -189,6 +190,35 @@ print(json.dumps(native_signal_metadata(${JSON.stringify(fault==='foreign-termin
       expect(actual).toHaveLength(1);expect(actual[0].sha256).toBe(createHash('sha256').update(raw).digest('hex'))
       expect(actual[0].incarnationId).toBe('old-incarnation');expect(actual[0].hydrated).toBe(true)
     }finally{fs.rmSync(directory,{recursive:true,force:true})}
+  })
+  it.each(['current','wrong-root','stale-incarnation','stale-nonce','stale-generation','missing-hydration'])('captures original producer receipt with %s before host consumption without creating an acknowledgement (controlled lifecycle/file IO only)', fault => {
+    const ownedRoot=path.join('/tmp/frs',randomUUID().slice(0,12)),workspace=path.join(ownedRoot,'opencode-stale-observation-workspace'),home=path.join(ownedRoot,'provider')
+    fs.mkdirSync(workspace,{recursive:true,mode:0o700});const directory=path.join(home,'.freshell/session-signals/opencode-adoption')
+    fs.mkdirSync(directory,{recursive:true});const root='ses_ownedRoot',terminalId='terminal-owned',incarnationId='old-incarnation'
+    const raw=JSON.stringify({session_id:fault==='wrong-root'?'ses_other':root,source:'opencode-tui-plugin',adoption_observation:{terminal_id:terminalId,root_session_id:root,
+      incarnation_id:fault==='stale-incarnation'?'previous-incarnation':incarnationId,launch_nonce:fault==='stale-nonce'?'old-adoption':'adoption-current',
+      evidence_generation:(fault==='stale-generation'?'b':'a').repeat(64),hydrated:fault!=='missing-hydration',messages_read:'success'}})
+    fs.writeFileSync(path.join(directory,terminalId+'.expected.json'),JSON.stringify({root_session_id:root,incarnation_id:incarnationId,
+      launch_nonce:'adoption-current',evidence_generation:'a'.repeat(64)}))
+    fs.writeFileSync(path.join(workspace,'native-tui-fault-control.json'),JSON.stringify({schemaVersion:1,caseId:'stale-observation',rootSessionId:root,terminalId}))
+    fs.writeFileSync(path.join(workspace,'observer.mjs'),openCodeTuiDisposalObserver)
+    const driver=path.join(workspace,'driver.mjs')
+    fs.writeFileSync(driver,`import fs from 'node:fs';import path from 'node:path';import plugin from './observer.mjs';process.getuid=()=>65534;process.getgid=()=>0;
+const controller=new AbortController();plugin.tui({lifecycle:{signal:controller.signal,onDispose:()=>{}},plugins:{deactivate:()=>{throw Error('initial producer must stay enabled')}}});
+await new Promise(resolve=>setTimeout(resolve,20));const file=${JSON.stringify(path.join(directory,terminalId+'__native.json'))};
+fs.writeFileSync(file,${JSON.stringify(raw)});await new Promise(resolve=>setTimeout(resolve,100));fs.unlinkSync(file);controller.abort();
+const captured=path.join(process.cwd(),'native-tui-captured-signal.json'),metadata=path.join(process.cwd(),'native-tui-captured-signal-metadata.json');
+console.log(JSON.stringify({raw:fs.existsSync(captured)?fs.readFileSync(captured,'utf8'):null,metadata:fs.existsSync(metadata)?JSON.parse(fs.readFileSync(metadata,'utf8')):null,
+originalRemoved:!fs.existsSync(file),liveNativeFiles:fs.readdirSync(${JSON.stringify(directory)}).filter(name=>name.startsWith('terminal-owned__'))}));`)
+    try{
+      const result=JSON.parse(execFileSync(process.execPath,[driver],{cwd:workspace,env:{...process.env,HOME:home,FRESHELL_TERMINAL_ID:terminalId,
+        FRESHELL_NATIVE_IDENTITY_LAUNCH:JSON.stringify({incarnationId,launchNonce:'generic-current',requestedNativeSessionId:root,evidenceRevision:1,executionGeneration:1})},encoding:'utf8',timeout:5000}))
+      expect(result.originalRemoved).toBe(true);expect(result.liveNativeFiles).toEqual([])
+      if(fault!=='current'){expect(result.raw).toBe(null);expect(result.metadata).toBe(null);return}
+      expect(result.raw).toBe(raw)
+      expect(result.metadata.sourceSha256).toBe(createHash('sha256').update(raw).digest('hex'))
+      expect(result.metadata.incarnationId).toBe(incarnationId);expect(result.metadata.launchNonce).toBe('generic-current')
+    }finally{fs.rmSync(ownedRoot,{recursive:true,force:true})}
   })
   it.each(['baseline-only-resume', 'stale-observation'])('arms the supported %s observer only for a new native incarnation (controlled API only)', async caseId => {
     const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12)), home = path.join(ownedRoot, 'provider')
@@ -515,7 +545,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
         if (fault !== 'disposal-current' && fault !== 'cancellation-current' && !(loadFault && fault.endsWith('-current'))) expect((harness.writeArtifact as any).mock.calls.filter(([name]: string[]) => name.endsWith('-original.json'))).toEqual([])
       } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
     })
-  it.each(['baseline-only-resume', 'stale-observation'].flatMap(caseId => ['current', 'canonical-stopped-omission', 'wrong-native-binary', 'missing-baseline', 'copied-volume', 'changed-history', 'current-observation', 'changed-stale-receipt', 'false-stopped-result'].map(fault => [caseId, fault])))('executes original-volume %s/%s through actual recovery and Stop ordering (controlled orchestration)', async (caseId, fault) => {
+  it.each(['baseline-only-resume', 'stale-observation'].flatMap(caseId => ['current', 'canonical-stopped-omission', 'owner-authenticator', 'wrong-native-binary', 'missing-baseline', 'copied-volume', 'changed-history', 'current-observation', 'changed-stale-receipt', 'unconsumed-stale-receipt', 'false-stopped-result'].map(fault => [caseId, fault])))('executes original-volume %s/%s through actual recovery and Stop ordering (controlled orchestration)', async (caseId, fault) => {
     const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12)), evidenceDir=path.join(ownedRoot,'evidence')
     fs.mkdirSync(evidenceDir,{recursive:true,mode:0o700})
     const source=prepareOwnedOpenCodeTuiSource(process.cwd(),ownedRoot,caseId,randomUUID())
@@ -553,23 +583,38 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
         return {data:[view(recovered)]}
       },
       execOwnedContainerAsExact:async(container:string,_uid:string,args:string[])=>{
-        if(container==='old-native')return JSON.stringify({signals:[oldSignal],cleared:caseId==='baseline-only-resume'})
+        if(container==='old-native')return JSON.stringify({signals:[oldSignal],cleared:caseId==='baseline-only-resume',nativePid:7,launchNonce:'old-launch'})
         if(args.includes('opencode'))return JSON.stringify({...namespace(true),...(fault==='changed-history'?{activeMessageIds:[]}: {})})
-        if(args.includes('/run/freshell'))return JSON.stringify({incarnationId:newInc,executionGeneration:2,exited:false,nativeSessionId:null,nativeIdentityObservation:fault==='current-observation'?{source:'opencode_tui'}:null,
-          opencodeAdoption:{state:'awaiting_observation'},signals:caseId==='stale-observation'?[{...oldSignal,...(fault==='changed-stale-receipt'?{sha256:'b'.repeat(64)}:{})}]:fault==='changed-stale-receipt'?[oldSignal]:[],
+        if(args.includes('/run/freshell')&&fault==='owner-authenticator')throw new Error('provider UID cannot read host control secret')
+        if(args.includes('/run/freshell')||args[3]===terminalId)return JSON.stringify({incarnationId:newInc,executionGeneration:2,exited:false,nativeSessionId:null,nativeIdentityObservation:fault==='current-observation'?{source:'opencode_tui'}:null,
+          opencodeAdoption:{state:'awaiting_observation'},signals:caseId==='baseline-only-resume'&&['changed-stale-receipt','unconsumed-stale-receipt'].includes(fault)?[oldSignal]:[],
+          replayedNativeReceipt:caseId==='stale-observation'?{sha256:fault==='changed-stale-receipt'?'b'.repeat(64):oldSignal.sha256,incarnationId:oldInc,launchNonce:oldSignal.launchNonce,hostConsumed:fault!=='unconsumed-stale-receipt'}:null,
           expected:{root_session_id:root,incarnation_id:newInc,launch_nonce:'new-adoption',evidence_generation:'a'.repeat(64)}})
         return JSON.stringify({outcome:'disposed_before_publication',incarnationId:newInc,launchNonce:'new-launch',nativeSessionId:root,
           nativePid:8,nativeMessageCount:2,producerActive:false,adoptionLaunchNonce:'new-adoption',evidenceGeneration:'a'.repeat(64)})
       }
     } as unknown as RuntimeHarness
+    const runtimeRoot=path.join(ownedRoot,'r/openco-12345678/x'),originalExec=childProcess.execFileSync
+    let ownerStatusReads=0
+    // Controlled owner-side Status transport only; real native execution uses
+    // the existing private-runtime Hello/proof/Status authenticator unchanged.
+    childProcess.execFileSync=((program:any,args:any,options:any)=>{
+      if(program==='python3'&&args?.[2]===runtimeRoot){
+        ownerStatusReads++;expect(args[3]).toBe(newInc)
+        return JSON.stringify({incarnationId:newInc,executionGeneration:2,exited:false,nativeSessionId:null,
+          nativeIdentityObservation:fault==='current-observation'?{source:'opencode_tui'}:null,opencodeAdoption:{state:'awaiting_observation'}})
+      }
+      return originalExec(program,args,options)
+    }) as typeof childProcess.execFileSync;syncBuiltinESMExports()
     try{
       const initialNamespace=namespace();if(fault==='wrong-native-binary')initialNamespace.executableSha256='b'.repeat(64)
-      const execution=executeManagedOpenCodeTuiReplacementFault(harness,{runtimeRoot:path.join(ownedRoot,'r/openco-12345678/x')} as any,
+      const execution=executeManagedOpenCodeTuiReplacementFault(harness,{runtimeRoot} as any,
         {method:'launch',params:{soulId:'soul-owned',terminal:{terminalId}}},source,view(),initialNamespace,caseId as 'baseline-only-resume'|'stale-observation')
-      if(['current','canonical-stopped-omission'].includes(fault)){
+      if(['current','canonical-stopped-omission','owner-authenticator'].includes(fault)){
         const result=await execution
         expect(commands).toEqual(['owned-death','old-absence','probe','recover','stop','input'])
         expect(result.assertions.every(assertion=>assertion.pass)).toBe(true)
+        if(fault==='owner-authenticator')expect(ownerStatusReads).toBe(1)
       }else{
         await expect(execution).rejects.toThrow(fault==='wrong-native-binary'?'genuine initial native TUI observation/owned volume required before replacement fault'
           :fault==='missing-baseline'?'actual original native store has no verified exact adoption baseline for replacement'
@@ -583,7 +628,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
         const control=JSON.parse(fs.readFileSync(path.join(source.workspace,'native-tui-fault-control.json'),'utf8'))
         expect(control.previousIncarnationId).toBe(oldInc)
       }
-    }finally{fs.rmSync(ownedRoot,{recursive:true,force:true})}
+    }finally{childProcess.execFileSync=originalExec;syncBuiltinESMExports();fs.rmSync(ownedRoot,{recursive:true,force:true})}
   })
   it.each(['ordinary', 'parity'])('keeps Codex transcript Enter-bound while the %s producer selects its native startup boundary', async route => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'parity-codex-startup-'))
