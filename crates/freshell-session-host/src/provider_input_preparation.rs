@@ -434,7 +434,11 @@ mod tests {
         )
         .await
         .expect_err("the actual final host gate cannot bypass unrecorded native source evidence");
-        assert!(error.contains("retain inputs and reprepare"), "{error}");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert!(
+            error.message.contains("retain inputs and reprepare"),
+            "{error:?}"
+        );
         assert_eq!(
             std::fs::read(owned.path().join(".freshell/input-manifest.json")).unwrap(),
             bytes

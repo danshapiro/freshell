@@ -1074,8 +1074,7 @@ async fn grant_execution(
                 prepared.terminal.run_as_gid,
                 freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
             )
-            .await
-            .map_err(|error| RuntimeError::new(RuntimeErrorCode::ProviderInputsChanged, error))?;
+            .await?;
             consume_grant(&mut persisted)?;
             let prepared = providers::start_terminal_sidecar(prepared)
                 .await
@@ -1215,8 +1214,7 @@ async fn grant_execution(
                 launch.run_as_gid,
                 freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
             )
-            .await
-            .map_err(|error| RuntimeError::new(RuntimeErrorCode::ProviderInputsChanged, error))?;
+            .await?;
             consume_grant(&mut persisted)?;
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;

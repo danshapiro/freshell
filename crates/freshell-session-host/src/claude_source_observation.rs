@@ -3,6 +3,7 @@
 use freshell_platform::claude_inputs::observation::{
     observe, ObservationReply, ObservationRequest, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
 };
+use freshell_runtime_protocol::{RuntimeError, RuntimeErrorCode};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
@@ -14,22 +15,33 @@ pub(crate) async fn verify_final(
     uid: u32,
     gid: u32,
     runtime: freshell_platform::claude_inputs::NativeSourceRuntime,
-) -> Result<(), String> {
+) -> Result<(), RuntimeError> {
     use freshell_runtime_protocol::bounded_json_bytes;
     let Some((request, expected)) = crate::provider_input_preparation::final_claude_source_request(
         context, stage, cwd, home, runtime,
-    )?
+    )
+    .map_err(|reason| final_source_error(RuntimeErrorCode::HostUnreachable, reason))?
     else {
         return Ok(());
     };
     if (expected.uid, expected.euid, expected.gid, expected.egid) != (uid, uid, gid, gid) {
-        return Err("Claude actual provider identity differs from accepted inputs; retain inputs and reprepare".into());
+        return Err(final_source_error(
+            RuntimeErrorCode::ProviderInputsChanged,
+            "Claude actual provider identity differs from accepted inputs",
+        ));
     }
-    let raw = bounded_json_bytes(&request, MAX_REQUEST_BYTES)
-        .map_err(|_| "Claude final source request exceeds its finite metadata profile")?;
+    let raw = bounded_json_bytes(&request, MAX_REQUEST_BYTES).map_err(|_| {
+        final_source_error(
+            RuntimeErrorCode::HostUnreachable,
+            "Claude final source request exceeds its finite metadata profile",
+        )
+    })?;
     let request_sha256 = format!("{:x}", Sha256::digest(raw));
     let executable = std::env::current_exe().map_err(|_| {
-        "Claude final source reader artifact unavailable; retain inputs and reprepare"
+        final_source_error(
+            RuntimeErrorCode::HostUnreachable,
+            "Claude final source reader artifact unavailable",
+        )
     })?;
     let mut command = tokio::process::Command::new("/usr/bin/setpriv");
     command
@@ -45,9 +57,12 @@ pub(crate) async fn verify_final(
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
     let started = std::time::Instant::now();
-    let mut child = command
-        .spawn()
-        .map_err(|_| "Claude final source reader could not start; retain inputs and reprepare")?;
+    let mut child = command.spawn().map_err(|_| {
+        final_source_error(
+            RuntimeErrorCode::HostUnreachable,
+            "Claude final source reader could not start",
+        )
+    })?;
     let reader_pid = child.id();
     tracing::info!(
         event = "provider.inputs.native_final.started",
@@ -58,15 +73,15 @@ pub(crate) async fn verify_final(
         gid,
         "Observing final native provider source selection"
     );
-    let result = read_final_child(
+    let result = verify_final_child(
         &mut child,
         &request,
         &request_sha256,
+        &expected,
         std::time::Duration::from_secs(20),
         std::time::Duration::from_secs(5),
     )
-    .await
-    .and_then(|reply| expected.require_same_selection(&reply.observation));
+    .await;
     match &result {
         Ok(()) => tracing::info!(
             event = "provider.inputs.native_final.completed",
@@ -78,16 +93,22 @@ pub(crate) async fn verify_final(
         ),
         Err(reason) => {
             tracing::warn!(event="provider.inputs.native_final.blocked",provider="claude",stage="session_host",
-            reader_pid,elapsed_ms=started.elapsed().as_millis() as u64,cause=%reason,"Final native provider source selection unavailable or changed")
+            reader_pid,elapsed_ms=started.elapsed().as_millis() as u64,code=?reason.code,cause=%reason.message,"Final native provider source selection unavailable or changed")
         }
     }
-    result.map_err(|reason| {
+    result
+}
+
+fn final_source_error(code: RuntimeErrorCode, reason: impl Into<String>) -> RuntimeError {
+    let reason = reason.into();
+    RuntimeError::new(
+        code,
         if reason.contains("retain inputs and reprepare") {
             reason
         } else {
             format!("{reason}; retain inputs and reprepare")
-        }
-    })
+        },
+    )
 }
 
 async fn read_final_child(
@@ -163,6 +184,33 @@ async fn read_final_child(
     }
     reply.validate_for_request(request, request_sha256)?;
     Ok(reply)
+}
+
+async fn verify_final_child(
+    child: &mut tokio::process::Child,
+    request: &ObservationRequest,
+    request_sha256: &str,
+    expected: &freshell_platform::claude_inputs::observation::NativeObservation,
+    exchange_timeout: std::time::Duration,
+    cleanup_timeout: std::time::Duration,
+) -> Result<(), RuntimeError> {
+    // Transport, binding and cleanup failures provide no selection evidence.
+    // Only two complete validated observations can establish a source change.
+    let reply = read_final_child(
+        child,
+        request,
+        request_sha256,
+        exchange_timeout,
+        cleanup_timeout,
+    )
+    .await
+    .map_err(|reason| final_source_error(RuntimeErrorCode::HostUnreachable, reason))?;
+    expected
+        .validate()
+        .map_err(|reason| final_source_error(RuntimeErrorCode::HostUnreachable, reason))?;
+    expected
+        .require_same_selection(&reply.observation)
+        .map_err(|reason| final_source_error(RuntimeErrorCode::ProviderInputsChanged, reason))
 }
 
 pub(crate) fn serve_stdio() -> Result<(), String> {
@@ -249,7 +297,7 @@ mod tests {
     use std::io::{Cursor, Error, ErrorKind};
 
     struct ReaderCase {
-        result: Result<ObservationReply, String>,
+        result: Result<(), RuntimeError>,
         joined_before_test_cleanup: bool,
         elapsed: std::time::Duration,
     }
@@ -279,10 +327,19 @@ mod tests {
             request_sha256: request_sha256.clone(),
             observation: observe(&cwd, &home, NativeSourceRuntime::Terminal, &[]).unwrap(),
         };
+        let expected = reply.observation.clone();
         if mode == "wrong-binding" {
             reply.request_sha256 = "b".repeat(64);
         } else if mode == "wrong-runtime" {
             reply.observation.native_source_runtime = NativeSourceRuntime::Sdk;
+        } else if mode == "changed-selection" {
+            let added = (0..u32::MAX)
+                .find(|group| {
+                    *group != expected.egid && !expected.supplementary_groups.contains(group)
+                })
+                .unwrap();
+            reply.observation.supplementary_groups.push(added);
+            reply.observation.supplementary_groups.sort_unstable();
         }
         let mut bytes = serde_json::to_vec(&reply).unwrap();
         if matches!(mode, "near-cap" | "oversized") {
@@ -322,10 +379,11 @@ process.stdin.on('data',()=>{}).on('end',()=>{
             .spawn()
             .unwrap();
         let started = std::time::Instant::now();
-        let result = read_final_child(
+        let result = verify_final_child(
             &mut child,
             &request,
             &request_sha256,
+            &expected,
             std::time::Duration::from_secs(2),
             std::time::Duration::from_millis(200),
         )
@@ -379,7 +437,40 @@ process.stdin.on('data',()=>{}).on('end',()=>{
                 "finite reader exchange for {mode}"
             );
             if let Err(error) = case.result {
-                assert!(!error.contains("PRIVATE_READER_BODY_SENTINEL"));
+                assert!(!error.message.contains("PRIVATE_READER_BODY_SENTINEL"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_final_reader_classifies_only_complete_proven_selection_changes() {
+        for mode in [
+            "valid",
+            "changed-selection",
+            "invalid",
+            "wrong-binding",
+            "wrong-runtime",
+            "eof-stall",
+        ] {
+            let case = reader_case(mode).await;
+            assert!(
+                case.joined_before_test_cleanup,
+                "actual private fault reader must be joined for {mode}"
+            );
+            if mode == "valid" {
+                case.result.unwrap();
+            } else {
+                let error = case.result.unwrap_err();
+                let expected = if mode == "changed-selection" {
+                    RuntimeErrorCode::ProviderInputsChanged
+                } else {
+                    RuntimeErrorCode::HostUnreachable
+                };
+                assert_eq!(
+                    error.code, expected,
+                    "unavailable evidence cannot authorize source replan for {mode}"
+                );
+                assert!(!error.message.contains("PRIVATE_READER_BODY_SENTINEL"));
             }
         }
     }
