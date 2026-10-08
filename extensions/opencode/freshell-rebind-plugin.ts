@@ -55,7 +55,7 @@ type TuiSlotContribution = {
 }
 
 interface AdoptionTuiApi {
-  route?: { current?: unknown; navigate?: (route: { type: 'session'; sessionID: string }) => void }
+  route?: { current?: unknown; navigate?: (name: 'session', params: { sessionID: string }) => void }
   state?: {
     ready?: unknown
     part?: (messageId: string) => unknown
@@ -702,7 +702,7 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
         if (response?.error || typeof created?.id !== 'string' || !SESSION_ID_RE.test(created.id)
           || !sessionIsExactRoot(created, created.id)) return refuse('native_create_unconfirmed')
         root = created.id
-        navigate.call(api.route, { type: 'session', sessionID: root })
+        navigate.call(api.route, 'session', { sessionID: root })
       }
       if (currentRouteSessionId(api.route?.current) !== root) return refuse('route_not_selected')
       const get = api.state?.session?.get

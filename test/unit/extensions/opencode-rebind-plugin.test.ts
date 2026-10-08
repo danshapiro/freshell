@@ -770,7 +770,15 @@ describe('default export (TuiPluginModule)', () => {
     const session = { id: root, parentID: null }
     const create = vi.fn(async () => ({ data: session }))
     const route = { current: mode === 'resume' ? { name: 'session', params: { sessionID: root } } : { name: 'home' },
-      navigate: vi.fn((next: { type: string; sessionID: string }) => { route.current = { name: next.type, params: { sessionID: next.sessionID } } }) }
+      navigate: vi.fn((name: unknown, params?: { sessionID?: string }) => {
+        // Pinned public TUI navigation takes a route name plus parameters.
+        // The internal {type,...} route is treated as a plugin route instead.
+        if (name !== 'session' || typeof params?.sessionID !== 'string') {
+          route.current = { name: 'unselected-plugin-route' }
+          return
+        }
+        route.current = { name, params: { sessionID: params.sessionID } }
+      }) }
     const abort = new AbortController()
     try {
       plugin.tui({
@@ -780,7 +788,7 @@ describe('default export (TuiPluginModule)', () => {
       })
       await vi.advanceTimersByTimeAsync(1000)
       expect(create).toHaveBeenCalledTimes(mode === 'create' ? 1 : 0)
-      if (mode === 'create') expect(route.navigate).toHaveBeenCalledWith({ type: 'session', sessionID: root })
+      expect(route.current).toEqual({ name: 'session', params: { sessionID: root } })
       const file = join(home, '.freshell/native-identity', launch.launchNonce, 'opencode-loaded.json')
       expect(existsSync(file)).toBe(true)
       expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ launch,
