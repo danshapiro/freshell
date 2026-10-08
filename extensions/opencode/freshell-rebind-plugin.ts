@@ -80,6 +80,24 @@ export interface EmitterDeps {
   writeFile?: (dir: string, name: string, body: string) => void
   readExpectation?: (path: string) => string | null
   now?: () => number
+  onRefusal?: (record: NativeObservationRefusal) => void
+}
+
+type NativeRefusalReason = 'tui_not_ready' | 'route_not_selected' | 'tui_root_not_loaded'
+  | 'native_api_unavailable' | 'native_root_load_failed' | 'native_history_load_failed'
+  | 'tui_context_changed' | 'revert_not_hydrated' | 'history_not_hydrated'
+  | 'empty_history_not_hydrated' | 'tail_not_hydrated' | 'parts_not_hydrated'
+  | 'producer_or_publication_failed'
+
+export type NativeObservationRefusal = {
+  severity: 'warning'
+  event: 'runtime.opencode.native_observation_refused'
+  terminalId: string
+  nativeSessionId: string
+  incarnationId: string
+  launchNonce: string
+  evidenceGeneration: string
+  reason: NativeRefusalReason
 }
 
 export function extractSessionId(value: unknown): string | null {
@@ -394,27 +412,36 @@ function readCurrentAdoptionExpectation(
   }
 }
 
-async function readNativeHistory(api: AdoptionTuiApi, sessionId: string): Promise<{ session: Record<string, unknown>; messages: unknown[] } | null> {
+class NativeHistoryReadError extends Error {
+  constructor(readonly reason: NativeRefusalReason) { super(reason) }
+}
+
+async function readNativeHistory(api: AdoptionTuiApi, sessionId: string): Promise<
+  { session: Record<string, unknown>; messages: unknown[] }
+  | { failure: NativeRefusalReason }
+> {
   try {
     const sessionClient = api.client?.session
     const read = sessionClient?.messages
     const get = sessionClient?.get
-    if (typeof read !== 'function' || typeof get !== 'function') return null
+    if (typeof read !== 'function' || typeof get !== 'function') return { failure: 'native_api_unavailable' }
     // The exact-session SDK request explicitly throws for non-2xx results.
     // Changed shapes, errors, missing data, and malformed responses are all
     // treated as an unqualified read, never as empty history.
     const [metadata, result] = await Promise.all([
-      get.call(sessionClient, { sessionID: sessionId }, { throwOnError: true }),
-      read.call(sessionClient, { sessionID: sessionId }, { throwOnError: true }),
+      Promise.resolve().then(() => get.call(sessionClient, { sessionID: sessionId }, { throwOnError: true }))
+        .catch(() => { throw new NativeHistoryReadError('native_root_load_failed') }),
+      Promise.resolve().then(() => read.call(sessionClient, { sessionID: sessionId }, { throwOnError: true }))
+        .catch(() => { throw new NativeHistoryReadError('native_history_load_failed') }),
     ])
     const response = asRecord(metadata)
     const session = asRecord(response?.data)
-    if (!session || response?.error || !sessionIsExactRoot(session, sessionId)) return null
+    if (!session || response?.error || !sessionIsExactRoot(session, sessionId)) return { failure: 'native_root_load_failed' }
     const messages = nativeMessagesFromResult(result)
-    if (!messages || messages.some((row) => !asRecord(asRecord(row)?.info) || !Array.isArray(asRecord(row)?.parts))) return null
+    if (!messages || messages.some((row) => !asRecord(asRecord(row)?.info) || !Array.isArray(asRecord(row)?.parts))) return { failure: 'native_history_load_failed' }
     return { session, messages }
-  } catch {
-    return null
+  } catch (error) {
+    return { failure: error instanceof NativeHistoryReadError ? error.reason : 'native_history_load_failed' }
   }
 }
 
@@ -436,58 +463,77 @@ export function createObservationEmitter(
   const now = deps.now ?? Date.now
   let seq = 0
   let lastEmitted: string | null = null
+  let lastRefusal: string | null = null
   let inFlight = false
+  const refuse = (current: AdoptionExpectation, reason: NativeRefusalReason): void => {
+    const record: NativeObservationRefusal = {
+      severity: 'warning', event: 'runtime.opencode.native_observation_refused',
+      terminalId: current.terminalId, nativeSessionId: current.rootSessionId,
+      incarnationId: current.incarnationId, launchNonce: current.launchNonce,
+      evidenceGeneration: current.evidenceGeneration, reason,
+    }
+    const signature = JSON.stringify(record)
+    if (signature === lastRefusal) return
+    try {
+      if (deps.onRefusal) deps.onRefusal(record)
+      else defaultWriteFile(join(current.dir, '..', 'opencode-adoption-diagnostics'), current.terminalId, signature)
+      lastRefusal = signature
+    } catch { /* A diagnostic failure cannot change the native gate or break the renderer. */ }
+  }
   return async (apiValue: unknown): Promise<void> => {
     if (inFlight) return
     inFlight = true
+    let active = expected
     try {
       const current = readCurrentAdoptionExpectation(expected, readExpectation)
       if (!current) return
+      active = current
       const api = asRecord(apiValue) as unknown as AdoptionTuiApi | null
       const state = asRecord(api?.state)
       const sessionState = asRecord(state?.session)
+      if (!api || state?.ready !== true) return refuse(current, 'tui_not_ready')
+      if (currentRouteSessionId(api.route?.current) !== current.rootSessionId) return refuse(current, 'route_not_selected')
       if (
-        !api ||
-        state?.ready !== true ||
-        currentRouteSessionId(api.route?.current) !== current.rootSessionId ||
         typeof sessionState?.get !== 'function' ||
         typeof sessionState.messages !== 'function' ||
         !sessionIsExactRoot(sessionState.get(current.rootSessionId), current.rootSessionId)
       ) {
-        return
+        return refuse(current, 'tui_root_not_loaded')
       }
 
-      const native = await readNativeHistory(api, current.rootSessionId)
-      if (currentRouteSessionId(api.route?.current) !== current.rootSessionId || state.ready !== true) return
+      const read = await readNativeHistory(api, current.rootSessionId)
+      const native = 'failure' in read ? null : read
+      if (currentRouteSessionId(api.route?.current) !== current.rootSessionId || state.ready !== true) return refuse(current, 'tui_context_changed')
       const selected = asRecord(sessionState.get(current.rootSessionId))
-      if (!sessionIsExactRoot(selected, current.rootSessionId)) return
+      if (!sessionIsExactRoot(selected, current.rootSessionId)) return refuse(current, 'tui_root_not_loaded')
       const hydratedMessages = activeMessages(sessionState.messages(current.rootSessionId), current.rootSessionId, selected?.revert)
       let messagesRead: 'success' | 'empty_confirmed' | 'failed'
       if (!native) {
+        if ('failure' in read) refuse(current, read.failure)
         messagesRead = 'failed'
       } else {
         const revert = (value: unknown) => {
           const record = asRecord(value)
           return JSON.stringify({ messageID: record?.messageID ?? null, partID: record?.partID ?? null })
         }
-        if (revert(native.session.revert) !== revert(selected?.revert)) return
+        if (revert(native.session.revert) !== revert(selected?.revert)) return refuse(current, 'revert_not_hydrated')
         const nativeActive = activeMessages(native.messages.map((row) => asRecord(row)?.info), current.rootSessionId, native.session.revert)
-        if (!nativeActive || !hydratedMessages) return
+        if (!nativeActive || !hydratedMessages) return refuse(current, 'history_not_hydrated')
         if (current.expectedEmpty) {
-          if (nativeActive.length !== 0 || hydratedMessages.length !== 0) return
+          if (nativeActive.length !== 0 || hydratedMessages.length !== 0) return refuse(current, 'empty_history_not_hydrated')
           messagesRead = 'empty_confirmed'
         } else {
           if (lastTuiMessageId(nativeActive, current.rootSessionId) !== current.tailMessageId
-            || lastTuiMessageId(hydratedMessages, current.rootSessionId) !== current.tailMessageId) return
+            || lastTuiMessageId(hydratedMessages, current.rootSessionId) !== current.tailMessageId) return refuse(current, 'tail_not_hydrated')
           const tail = native.messages.find((row) => asRecord(asRecord(row)?.info)?.id === current.tailMessageId)
           const parts = asRecord(tail)?.parts as unknown[]
           if (parts.length) {
             const hydrated = typeof state.part === 'function' ? state.part(current.tailMessageId!) : null
-            if (!Array.isArray(hydrated)) return
+            if (!Array.isArray(hydrated)) return refuse(current, 'parts_not_hydrated')
             const ids = new Set(hydrated.map((part) => asRecord(part)?.id))
             const boundary = asRecord(native.session.revert)?.partID
             const partIndex = typeof boundary === 'string' ? parts.findIndex((part) => asRecord(part)?.id === boundary) : parts.length
-            if (partIndex < 0 || parts.slice(0, partIndex).some((part) => typeof asRecord(part)?.id !== 'string' || !ids.has(asRecord(part)?.id))) return
+            if (partIndex < 0 || parts.slice(0, partIndex).some((part) => typeof asRecord(part)?.id !== 'string' || !ids.has(asRecord(part)?.id))) return refuse(current, 'parts_not_hydrated')
           }
           messagesRead = 'success'
         }
@@ -518,8 +564,9 @@ export function createObservationEmitter(
       )
       // A failed publication must remain eligible for the next observation.
       lastEmitted = signature
+      if (messagesRead !== 'failed') lastRefusal = null
     } catch {
-      // Version drift and local I/O errors leave adoption blocked and quiet.
+      refuse(active, 'producer_or_publication_failed')
     } finally {
       inFlight = false
     }

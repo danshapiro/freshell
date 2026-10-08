@@ -168,6 +168,7 @@ describe('createObservationEmitter', () => {
     },
     writeFile: (dir, name, body) => writes.push({ dir, name, body }),
     now: () => 1_700_000_000_000,
+    onRefusal: () => {},
   })
 
   const makeApi = (options: {
@@ -212,6 +213,52 @@ describe('createObservationEmitter', () => {
   }
 
   beforeEach(() => writes.splice(0))
+
+  it.each(['not-ready', 'root-load', 'history-load', 'tail', 'parts'])('records a bounded body-free current native refusal (%s)', async (fault) => {
+    const refusal = vi.fn()
+    const emit = createObservationEmitter({ ...deps(), onRefusal: refusal })
+    const api = makeApi() as any
+    if (fault === 'not-ready') api.state.ready = false
+    if (fault === 'root-load') api.client.session.get = async () => { throw new Error('private provider root detail') }
+    if (fault === 'history-load') api.client.session.messages = async () => { throw new Error('private transcript load detail') }
+    if (fault === 'tail') api.state.session.messages = () => []
+    if (fault === 'parts') api.state.part = () => []
+    await emit(api); await emit(api)
+    expect(refusal).toHaveBeenCalledOnce()
+    expect(refusal.mock.calls[0][0]).toMatchObject({ severity: 'warning', event: 'runtime.opencode.native_observation_refused',
+      terminalId: 'term-managed', nativeSessionId: rootSessionId, incarnationId, launchNonce,
+      evidenceGeneration, reason: { 'not-ready': 'tui_not_ready', 'root-load': 'native_root_load_failed',
+        'history-load': 'native_history_load_failed', tail: 'tail_not_hydrated', parts: 'parts_not_hydrated' }[fault] })
+    expect(JSON.stringify(refusal.mock.calls)).not.toContain('private')
+    expect(writes.every(row => JSON.parse(row.body).adoption_observation.messages_read === 'failed')).toBe(true)
+  })
+  it('persists the default native refusal separately from identity receipts', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'opencode-native-refusal-'))
+    const selected = deps()
+    try {
+      const emit = createObservationEmitter({ ...selected, env: { ...selected.env, HOME: directory }, onRefusal: undefined })
+      await emit(makeApi({ stateReady: false }))
+      const diagnostic = JSON.parse(readFileSync(join(directory, '.freshell/session-signals/opencode-adoption-diagnostics/term-managed.json'), 'utf8'))
+      expect(diagnostic.reason).toBe('tui_not_ready'); expect(diagnostic.launchNonce).toBe(launchNonce)
+      expect(diagnostic.adoption_observation).toBeUndefined(); expect(writes).toHaveLength(0)
+    } finally { rmSync(directory, { recursive: true, force: true }) }
+  })
+  it('retries failed diagnostic storage and keeps native input unqualified', async () => {
+    const refusal = vi.fn(() => { throw new Error('private filesystem error') })
+    const emit = createObservationEmitter({ ...deps(), onRefusal: refusal })
+    await expect(emit(makeApi({ stateReady: false }))).resolves.toBeUndefined()
+    await expect(emit(makeApi({ stateReady: false }))).resolves.toBeUndefined()
+    expect(refusal).toHaveBeenCalledTimes(2); expect(writes).toHaveLength(0)
+  })
+  it('reports a native read failure without awaiting a different stalled read', async () => {
+    const refusal = vi.fn(), api = makeApi() as any
+    api.client.session.get = async () => { throw new Error('private root error') }
+    api.client.session.messages = () => new Promise(() => {})
+    await createObservationEmitter({ ...deps(), onRefusal: refusal })(api)
+    expect(refusal.mock.calls[0][0].reason).toBe('native_root_load_failed')
+    expect(writes).toHaveLength(1)
+    expect(JSON.parse(writes[0].body).adoption_observation.messages_read).toBe('failed')
+  })
 
   it('emits only an exact hydrated root and current tail, with body-free launch bindings', async () => {
     const emit = createObservationEmitter(deps())
