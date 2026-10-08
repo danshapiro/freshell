@@ -241,6 +241,23 @@ describe('createObservationEmitter', () => {
     expect(JSON.stringify(refusal.mock.calls)).not.toContain('private')
   })
 
+  it.each(['native-empty', 'tui-empty', 'tui-different-tail'])('records body-free active history counts for the %s refusal', async fault => {
+    const refusal = vi.fn()
+    const api = makeApi({
+      ...(fault === 'native-empty' ? { nativeMessages: [] } : {}),
+      ...(fault === 'tui-empty' ? { tuiMessages: [] } : {}),
+      ...(fault === 'tui-different-tail' ? { tuiMessages: [{ id: 'msg_other1', sessionID: rootSessionId, text: 'private transcript' }] } : {}),
+    })
+    await createObservationEmitter({ ...deps(), onRefusal: refusal })(api)
+    expect(refusal).toHaveBeenCalledOnce()
+    expect(refusal.mock.calls[0][0]).toMatchObject({
+      reason: fault === 'native-empty' ? 'native_tail_mismatch' : 'tail_not_hydrated',
+      nativeActiveMessageCount: fault === 'native-empty' ? 0 : 1,
+      tuiActiveMessageCount: fault === 'tui-empty' ? 0 : 1,
+    })
+    expect(JSON.stringify(refusal.mock.calls)).not.toContain('private')
+    expect(writes).toHaveLength(0)
+  })
   it.each(['not-ready', 'root-load', 'history-load', 'tail', 'parts'])('records a bounded body-free current native refusal (%s)', async (fault) => {
     const refusal = vi.fn()
     const emit = createObservationEmitter({ ...deps(), onRefusal: refusal })
