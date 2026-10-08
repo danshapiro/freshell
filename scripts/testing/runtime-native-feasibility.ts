@@ -1816,6 +1816,84 @@ database.rollback();database.close()
 ` + selected.slice(end)).replace("'nativeMessageCount':message_count,", "'nativeMessageCount':message_count,'v2MessageCount':v2_message_count,'savedRevert':saved_revert,'activeMessageIds':active_ids,")
 })()
 
+// A qualification-only module, selected through the ordinary owned TUI
+// config. It must use the pinned public plugin lifecycle, never publish a
+// native identity or synthesize a loader acknowledgement.
+export const openCodeTuiDisposalObserver = String.raw`
+import fs from 'node:fs'
+import path from 'node:path'
+export default { id: 'freshell-native-qualification', tui(api) {
+  const cwd = fs.realpathSync(process.cwd()), home = process.env.HOME
+  if (!/^\/tmp\/f[a-z0-9]+\/[a-f0-9-]{12}\/opencode-(disposal|baseline-only-resume)-workspace$/.test(cwd)
+    || process.getuid() !== 65534 || process.getgid() !== 0 || !home) return
+  const control = JSON.parse(fs.readFileSync(path.join(cwd, 'native-tui-fault-control.json'), 'utf8'))
+  const launch = JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH || 'null')
+  const terminal = process.env.FRESHELL_TERMINAL_ID
+  if (control.schemaVersion !== 1 || !['disposal', 'baseline-only-resume'].includes(control.caseId)
+    || !cwd.endsWith('/opencode-' + control.caseId + '-workspace') || control.terminalId !== terminal
+    || !/^[a-zA-Z0-9_-]+$/.test(terminal || '') || launch?.requestedNativeSessionId !== control.rootSessionId
+    || typeof launch.incarnationId !== 'string' || typeof launch.launchNonce !== 'string') return
+  const directory = path.join(home, '.freshell/session-signals')
+  const progress = path.join(directory, 'opencode-adoption-diagnostics', terminal)
+  const expected = path.join(directory, 'opencode-adoption', terminal + '.expected.json')
+  const read = file => {
+    try { const stat = fs.lstatSync(file); return stat.isFile() && !stat.isSymbolicLink() && stat.size <= 65536
+      ? JSON.parse(fs.readFileSync(file, 'utf8')) : null } catch { return null }
+  }
+  let busy = false, settled = false, timer
+  const started = Date.now()
+  const finish = report => {
+    settled = true; clearInterval(timer)
+    fs.writeFileSync(path.join(cwd, 'native-tui-fault-result.json'), JSON.stringify({
+      schemaVersion: 1, caseId: control.caseId, terminalId: terminal, incarnationId: launch.incarnationId,
+      launchNonce: launch.launchNonce, elapsedMs: Date.now() - started, ...report }), { mode: 0o600 })
+  }
+  const tick = async () => {
+    if (busy || settled || api.lifecycle.signal.aborted) return
+    busy = true
+    try {
+      if (read(progress + '.publication_succeeded.json')) { finish({ outcome: 'already_published' }); return }
+      const pending = read(progress + '.native_read_pending.json')
+      const binding = read(expected) || { root_session_id: process.env.FRESHELL_OPENCODE_ADOPTION_ROOT_SESSION_ID,
+        incarnation_id: process.env.FRESHELL_OPENCODE_ADOPTION_INCARNATION_ID,
+        launch_nonce: process.env.FRESHELL_OPENCODE_ADOPTION_LAUNCH_NONCE,
+        evidence_generation: process.env.FRESHELL_OPENCODE_ADOPTION_EVIDENCE_GENERATION }
+      if (pending?.stage !== 'native_read_pending' || pending.nativeSessionId !== control.rootSessionId
+        || pending.incarnationId !== launch.incarnationId || binding.root_session_id !== control.rootSessionId
+        || binding.incarnation_id !== launch.incarnationId || pending.launchNonce !== binding.launch_nonce
+        || pending.evidenceGeneration !== binding.evidence_generation) {
+        if (Date.now() - started >= 10000) finish({ outcome: 'pending_current_read_not_observed' })
+        return
+      }
+      const before = api.plugins.list().find(row => row.id === 'freshell-rebind')
+      if (!before?.active) { finish({ outcome: 'producer_not_active' }); return }
+      // Invoke the supported manager before any await that could let the
+      // pending producer publish. Its real scope aborts native observation.
+      await api.plugins.deactivate('freshell-rebind')
+      const after = api.plugins.list().find(row => row.id === 'freshell-rebind')
+      if (after?.active || read(progress + '.publication_succeeded.json')) {
+        finish({ outcome: 'disposal_did_not_precede_publication' }); return
+      }
+      const session = await api.client.session.get({ sessionID: control.rootSessionId })
+      const messages = await api.client.session.messages({ sessionID: control.rootSessionId })
+      if (session?.error || messages?.error || session?.data?.id !== control.rootSessionId
+        || session.data.directory !== cwd || !Array.isArray(messages.data)
+        || messages.data.some(row => row?.info?.sessionID !== control.rootSessionId)) {
+        finish({ outcome: 'native_root_read_failed' }); return
+      }
+      finish({ outcome: 'disposed_before_publication', nativeSessionId: session.data.id,
+        nativeMessageCount: messages.data.length, producerActive: after?.active === true,
+        adoptionLaunchNonce: pending.launchNonce, evidenceGeneration: pending.evidenceGeneration })
+    } catch { finish({ outcome: 'supported_disposal_failed' }) }
+    finally { busy = false }
+  }
+  timer = setInterval(() => { void tick() }, 5)
+  api.lifecycle.signal.addEventListener('abort', () => clearInterval(timer), { once: true })
+  api.lifecycle.onDispose(() => clearInterval(timer))
+  void tick()
+} }
+`
+
 async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervisor: Awaited<ReturnType<RuntimeHarness['startSupervisor']>>,
   request: any, caseId: string, scenario: string, settings: unknown, sdkForkImage = false): Promise<NativeExperimentOriginal> {
   const soulId = request.params.soulId

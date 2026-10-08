@@ -14,6 +14,7 @@ import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   prepareOwnedOpenCodeTuiSource,
+  openCodeTuiDisposalObserver,
   runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeReceiverLoadFaultWrapper, nativeReceiverLoadFaultEntry, writeOwnedNativeReceiverControl, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
   amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, receiverWrongRootEvidence, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
@@ -33,6 +34,47 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['current', 'stale-incarnation', 'stale-nonce', 'stale-generation', 'already-published', 'inactive', 'wrong-requested-root'])('uses the supported plugin manager to dispose a pending owned native read without publishing identity: %s (controlled API only)', async (fault) => {
+    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+    const workspace = path.join(ownedRoot, 'opencode-disposal-workspace'), home = path.join(ownedRoot, 'provider')
+    fs.mkdirSync(workspace, { recursive: true, mode: 0o700 })
+    const directory = path.join(home, '.freshell/session-signals/opencode-adoption-diagnostics')
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const root = 'ses_ownedRoot', terminalId = 'terminal-owned', incarnationId = 'incarnation-owned'
+    fs.writeFileSync(path.join(workspace, 'native-tui-fault-control.json'), JSON.stringify({ schemaVersion: 1, caseId: 'disposal', rootSessionId: root, terminalId }))
+    fs.writeFileSync(path.join(directory, terminalId + '.native_read_pending.json'), JSON.stringify({
+      stage: 'native_read_pending', nativeSessionId: root, incarnationId: fault === 'stale-incarnation' ? 'previous-incarnation' : incarnationId,
+      launchNonce: fault === 'stale-nonce' ? 'previous-nonce' : 'native-adoption-current', evidenceGeneration: (fault === 'stale-generation' ? 'b' : 'a').repeat(64),
+    }))
+    if (fault === 'already-published') fs.writeFileSync(path.join(directory, terminalId + '.publication_succeeded.json'), JSON.stringify({ stage: 'publication_succeeded' }))
+    const module = path.join(workspace, 'observer.mjs'), driver = path.join(workspace, 'driver.mjs')
+    fs.writeFileSync(module, openCodeTuiDisposalObserver)
+    fs.writeFileSync(driver, `import fs from 'node:fs'; import plugin from './observer.mjs';
+process.getuid=()=>65534;process.getgid=()=>0;const controller=new AbortController();let active=${fault !== 'inactive'},calls=0;
+const api={lifecycle:{signal:controller.signal,onDispose:()=>{}},plugins:{list:()=>[{id:'freshell-rebind',active,enabled:active}],
+deactivate:async(id)=>{if(id!=='freshell-rebind')throw new Error('unexpected plugin');calls++;active=false;return true}},
+client:{session:{get:async()=>({data:{id:${JSON.stringify(root)},directory:process.cwd()}}),messages:async()=>({data:[{info:{sessionID:${JSON.stringify(root)}}}]})}}};
+plugin.tui(api);await new Promise(resolve=>setTimeout(resolve,250));controller.abort();
+const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,active,report:fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):null}));`)
+    try {
+      const actual = JSON.parse(execFileSync(process.execPath, [driver], { cwd: workspace,
+        env: { ...process.env, HOME: home, FRESHELL_TERMINAL_ID: terminalId,
+          FRESHELL_OPENCODE_ADOPTION_ROOT_SESSION_ID: root, FRESHELL_OPENCODE_ADOPTION_INCARNATION_ID: incarnationId,
+          FRESHELL_OPENCODE_ADOPTION_LAUNCH_NONCE: 'native-adoption-current', FRESHELL_OPENCODE_ADOPTION_EVIDENCE_GENERATION: 'a'.repeat(64),
+          FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify({ incarnationId, launchNonce: 'launch-current', requestedNativeSessionId: fault === 'wrong-requested-root' ? 'ses_wrongRoot' : root, evidenceRevision: 1, executionGeneration: 1 }) },
+        encoding: 'utf8', timeout: 5000 }))
+      expect(actual.calls).toBe(fault === 'current' ? 1 : 0)
+      expect(actual.active).toBe(!['current', 'inactive'].includes(fault))
+      if (fault === 'current') {
+        expect(actual.report.outcome).toBe('disposed_before_publication')
+        expect(actual.report.nativeSessionId).toBe(root)
+        expect(actual.report.nativeMessageCount).toBe(1)
+      } else if (fault === 'already-published') expect(actual.report.outcome).toBe('already_published')
+      else if (fault === 'inactive') expect(actual.report.outcome).toBe('producer_not_active')
+      else expect(actual.report).toBe(null)
+      expect(fs.existsSync(path.join(home, '.freshell/native-identity'))).toBe(false)
+    } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
+  })
   it('prepares a genuinely empty owned V1 root before native export while preserving related roots', () => {
     const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
     fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
