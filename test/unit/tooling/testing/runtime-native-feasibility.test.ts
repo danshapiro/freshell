@@ -15,6 +15,7 @@ import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   prepareOwnedOpenCodeTuiSource,
   openCodeTuiDisposalObserver,
+  openCodeTuiSignalMetadata,
   executeManagedOpenCodeTuiReplacementFault,
   openCodeTuiOwnedStoreFault,
   runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeReceiverLoadFaultWrapper, nativeReceiverLoadFaultEntry, writeOwnedNativeReceiverControl, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
@@ -161,6 +162,33 @@ refusal:fs.existsSync(refusalFile)?JSON.parse(fs.readFileSync(refusalFile,'utf8'
       expect(result.report.refusal.incarnationId).toBe(incarnationId)
       expect(result.report.producerActive).toBe(true)
     } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
+  })
+  it.each(['ambient-home','wrong-uid','wrong-gid','symlink-signal','foreign-root','foreign-terminal'])('reads the actual canonical managed signal volume with %s (controlled UID/path driver only)', fault => {
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'opencode-signal-home-')),home=path.join(directory,'provider')
+    const signals=path.join(home,'.freshell/session-signals/opencode-adoption'),terminal='terminal-owned',root='ses_ownedRoot'
+    fs.mkdirSync(signals,{recursive:true})
+    const raw=JSON.stringify({session_id:fault==='foreign-root'?'ses_foreignRoot':root,source:'opencode-tui-plugin',adoption_observation:{root_session_id:root,incarnation_id:'old-incarnation',
+      launch_nonce:'old-adoption',evidence_generation:'a'.repeat(64),hydrated:true,messages_read:'success'}})
+    const signalFile=path.join(signals,terminal+'__native.json');fs.writeFileSync(signalFile,raw)
+    if(fault==='symlink-signal'){fs.renameSync(signalFile,signalFile+'.original');fs.symlinkSync(signalFile+'.original',signalFile)}
+    try{
+      // This maps only the fixed managed path into the owned fixture. Neither
+      // the controlled path/UID driver nor these envelopes are native proof.
+      const driver=`import os,pathlib;os.getuid=lambda:${fault==='wrong-uid'?1000:65534};os.getgid=lambda:${fault==='wrong-gid'?1000:0}
+ConcretePath=pathlib.PosixPath
+def owned_path(*args,**kwargs):
+ if args==('/home/freshell/provider',):args=(${JSON.stringify(home)},)
+ return ConcretePath(*args,**kwargs)
+pathlib.Path=owned_path
+exec(${JSON.stringify(openCodeTuiSignalMetadata)})
+print(json.dumps(native_signal_metadata(${JSON.stringify(fault==='foreign-terminal'?'../operator':'terminal-owned')},'ses_ownedRoot')))
+`
+      const execute=()=>execFileSync('python3',['-c',driver],{env:{...process.env,HOME:'/unrelated/docker-exec-home'},encoding:'utf8',stdio:'pipe'})
+      if(fault!=='ambient-home'){expect(execute).toThrow();expect(fs.readFileSync(signalFile,'utf8')).toBe(raw);return}
+      const actual=JSON.parse(execute())
+      expect(actual).toHaveLength(1);expect(actual[0].sha256).toBe(createHash('sha256').update(raw).digest('hex'))
+      expect(actual[0].incarnationId).toBe('old-incarnation');expect(actual[0].hydrated).toBe(true)
+    }finally{fs.rmSync(directory,{recursive:true,force:true})}
   })
   it.each(['baseline-only-resume', 'stale-observation'])('arms the supported %s observer only for a new native incarnation (controlled API only)', async caseId => {
     const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12)), home = path.join(ownedRoot, 'provider')

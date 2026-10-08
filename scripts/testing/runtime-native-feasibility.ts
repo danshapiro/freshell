@@ -1269,10 +1269,10 @@ print(json.dumps(records))
 // Read only the actual managed TUI signal envelopes. The baseline-only
 // fault removes these already captured owned receipts; stale keeps their
 // original bytes. Neither path writes a provider acknowledgement.
-const openCodeTuiSignalMetadata = String.raw`
+export const openCodeTuiSignalMetadata = String.raw`
 import os,pathlib,json,hashlib,re
 assert os.getuid()==65534 and os.getgid()==0
-home=pathlib.Path(os.environ['HOME']);assert home==pathlib.Path('/home/freshell/provider')
+home=pathlib.Path('/home/freshell/provider')
 def native_signal_metadata(terminal,native_root):
  assert re.fullmatch(r'[A-Za-z0-9_-]+',terminal) and re.fullmatch(r'ses_[A-Za-z0-9]+',native_root)
  directory=home/'.freshell/session-signals/opencode-adoption';records=[]
