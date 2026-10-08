@@ -676,6 +676,7 @@ impl OpenCodeAdoptionGate {
                 current
             }
             Err(error) => {
+                self.emit_validation_result("warning", "current_store_unavailable");
                 self.observation = None;
                 self.released = false;
                 if !self.verification_failed {
@@ -698,6 +699,7 @@ impl OpenCodeAdoptionGate {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
+            self.emit_validation_result("warning", "current_store_identity_mismatch");
             self.observation = None;
             self.released = false;
             if !self.verification_failed {
@@ -723,10 +725,25 @@ impl OpenCodeAdoptionGate {
             self.rotate_nonce();
             self.observation = None;
             self.released = false;
+            self.emit_validation_result("info", "current_evidence_changed");
             self.publish_expectation()?;
             return Ok(false);
         }
+        self.emit_validation_result("info", "current_store_verified");
         Ok(true)
+    }
+
+    fn emit_validation_result(&self, severity: &str, reason: &str) {
+        crate::emit_environment_event(serde_json::json!({
+            "severity": severity,
+            "event": "managed_opencode.current_store_revalidation",
+            "terminal_id": self.terminal_id,
+            "provider_store_id": self.expectation.baseline.descriptor.destination_store_id,
+            "incarnation_id": self.incarnation_id,
+            "launch_nonce": self.expectation.launch_nonce,
+            "evidence_generation": self.expectation.evidence_generation,
+            "reason": reason,
+        }));
     }
 
     fn rotate_nonce(&mut self) {
@@ -1829,6 +1846,70 @@ mod managed_opencode_adoption_tests {
         assert!(gate.observe(fresh_observation));
         assert!(gate.release_input());
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn current_store_revalidation_emits_bound_body_free_results() {
+        const CHILD_ENV: &str = "FRESHELL_OPENCODE_GATE_EVENT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "pty::managed_opencode_adoption_tests::current_store_revalidation_emits_bound_body_free_results", "--nocapture"])
+                .env(CHILD_ENV, "1").output().unwrap();
+            assert!(output.status.success(), "owned behavioral child must pass");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(!stderr.contains("private-reader-payload"));
+            let events = stderr
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| event["event"] == "managed_opencode.current_store_revalidation")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events.len(),
+                4,
+                "actual verifier transitions must be diagnosable"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event["reason"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "current_store_verified",
+                    "current_evidence_changed",
+                    "current_store_verified",
+                    "current_store_unavailable"
+                ]
+            );
+            for event in &events {
+                assert_eq!(event["terminal_id"], "terminal-opencode-adoption");
+                assert_eq!(event["incarnation_id"], "incarnation-opencode-adoption");
+                assert!(event["launch_nonce"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()));
+                assert_eq!(event["evidence_generation"].as_str().unwrap().len(), 64);
+            }
+            assert_eq!(events[3]["severity"], "warning");
+            return;
+        }
+        let expected = expectation(OpenCodeVerifiedRootTail::Message {
+            message_id: "msg_current_tail".into(),
+        });
+        let initial = evidence(
+            &expected,
+            &expected.evidence_generation,
+            expected.root_tail.clone(),
+        );
+        let (mut gate, current, _, _owned_signal_root) =
+            gate_with_evidence(expected.clone(), initial);
+        assert!(gate.observe(observation(&expected)));
+        *current.lock().unwrap() = evidence(&expected, &"c".repeat(64), expected.root_tail.clone());
+        assert!(!gate.release_input());
+        assert!(gate.observation.is_none());
+        assert!(gate.observe(observation(&gate.expectation)));
+        gate.verifier = Arc::new(|_| Err("private-reader-payload".into()));
+        assert!(!gate.observe(observation(&gate.expectation)));
+        assert!(gate.observation.is_none());
+        assert!(!gate.input_allowed());
     }
 
     #[test]
