@@ -642,7 +642,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
-    'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output',
+    'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running',
     'synthetic-history-challenge',
     'synthetic-source-facts',
     'synthetic-source-history', 'synthetic-source-exclusions',
@@ -3272,6 +3272,12 @@ export class ManagedRuntimeOwner {
   async resetNativeChallengeEffect(handle: ExactRuntimeHandle, challengeId: string): Promise<void> {
     const marker = await this.nativeEffectMarker(handle, challengeId)
     await this.ownedProviderExec(handle.containerId, ['rm', '-f', `/home/freshell/provider/${marker}`])
+  }
+
+  async chaosLongToolRunning(handle: ExactRuntimeHandle, challengeId: string): Promise<boolean> {
+    const marker = await this.nativeChallengeMarker(handle, challengeId)
+    if (marker !== NativeChallengeMarkers['chaos-long-tool']) throw new Error('registered chaos long-tool challenge required')
+    return this.ownedContainerProcessTable(handle.containerId).includes('sleep 180')
   }
 
   async nativeFollowUpMessageIds(handle: ExactRuntimeHandle, challengeId: string): Promise<string[]> {

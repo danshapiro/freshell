@@ -1363,6 +1363,37 @@ describe('closed external owner control', () => {
       handle: { ...handle, nativeSessionId: 'foreign-root' }, challengeId: challenge.challengeId })).rejects.toThrow(/challenge/)
     expect(capture).not.toHaveBeenCalled()
   })
+  it('observes only the registered long-tool process without exposing its process table', async () => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'long-tool-soul',
+      incarnationId: 'long-tool-incarnation', containerId: 'b'.repeat(64), hostBootId: 'long-tool-boot', nativeSessionId: 'long-tool-native' }
+    const current = vi.spyOn(owned, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const challenge = await owned.registerNativeChallenge(handle, 'chaos-long-tool')
+    const table = vi.spyOn(owned, 'ownedContainerProcessTable').mockReturnValue('42 sleep 180\n43 owner-private-process-arguments')
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const replies: unknown[] = []
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      const reply = await control(JSON.parse(String(init.body)))
+      replies.push(reply)
+      return new Response(JSON.stringify(reply), { status: 200 })
+    })
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.chaosLongToolRunning(handle, challenge.challengeId)).resolves.toBe(true)
+    table.mockReturnValue('42 sleep 18\n43 owner-private-process-arguments')
+    await expect(rig.chaosLongToolRunning(handle, challenge.challengeId)).resolves.toBe(false)
+    expect(JSON.stringify(replies)).not.toContain('owner-private-process-arguments')
+    table.mockClear()
+    const approval = await owned.registerNativeChallenge(handle, 'chaos-approval')
+    await expect(control({ ...request, action: 'chaos-long-tool-running', handle, challengeId: approval.challengeId })).rejects.toThrow(/long-tool/)
+    await expect(control({ ...request, operationId: 'foreign-long-tool-root', action: 'chaos-long-tool-running',
+      handle: { ...handle, nativeSessionId: 'foreign-root' }, challengeId: challenge.challengeId })).rejects.toThrow(/challenge/)
+    await expect(control({ ...request, operationId: 'unknown-long-tool', action: 'chaos-long-tool-running',
+      handle, challengeId: 'unregistered' })).rejects.toThrow(/challenge/)
+    current.mockRejectedValue(new Error('exact runtime handle changed'))
+    await expect(control({ ...request, operationId: 'stale-long-tool', action: 'chaos-long-tool-running',
+      handle, challengeId: challenge.challengeId })).rejects.toThrow(/changed/)
+    expect(table).not.toHaveBeenCalled()
+  })
   it('creates synthetic history only for the registered OpenCode fixture and returns observed row identities', async () => {
     const owned = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3, {}, {}, 'test', {
       enabledProviders: [], freshAgentModes: ['freshopencode'], fixtureFreshAgentModes: ['freshopencode'],

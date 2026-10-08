@@ -317,10 +317,9 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         paneId,
         'Use the bash tool exactly once to run: sleep 180; printf "P5_LONG_TOOL_DONE\\n" >> "$HOME/p5-chaos-long-tool-count". Do not finish until the command completes.',
       )
-      await waitForValue('long tool process', async () => {
-        const table = rig.ownedContainerProcessTable(initial.containerId!)
-        return table.includes('sleep 180') ? true : null
-      }, 60_000)
+      await waitForValue('long tool process', async () => (
+        await rig.chaosLongToolRunning(nativeHandle, longToolChallenge.challengeId) ? true : null
+      ), 60_000)
 
       for (let cycle = 2; cycle <= 100; cycle += 1) {
         const beforeProcess = await rig.webProcessFacts()

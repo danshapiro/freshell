@@ -824,6 +824,9 @@ export class ExternalManagedRuntimeRig {
   async chaosWebOutputFacts(handle: ExactRuntimeHandle, challengeId: string): Promise<RuntimeChaosWebOutputFacts> {
     return this.rpc('chaos-web-output', RuntimeChaosWebOutputFactsSchema, { handle, challengeId })
   }
+  async chaosLongToolRunning(handle: ExactRuntimeHandle, challengeId: string): Promise<boolean> {
+    return this.rpc('chaos-long-tool-running', z.boolean(), { handle, challengeId })
+  }
   async incidentMatchesSoul(handle: ExactRuntimeHandle, incidentId: string): Promise<boolean> {
     return this.rpc('incident-matches-soul', z.boolean(), { handle, incidentId })
   }
@@ -1066,6 +1069,10 @@ export function createExternalRuntimeControl(
       case 'chaos-web-output':
         if (!request.challengeId) throw new Error('registered chaos follow-up challenge required')
         result = await owner.chaosWebOutputFacts(handle(), request.challengeId)
+        break
+      case 'chaos-long-tool-running':
+        if (!request.challengeId) throw new Error('registered chaos long-tool challenge required')
+        result = await owner.chaosLongToolRunning(handle(), request.challengeId)
         break
       case 'incident-matches-soul':
         if (!request.incidentId) throw new Error('observed incident identity required')
