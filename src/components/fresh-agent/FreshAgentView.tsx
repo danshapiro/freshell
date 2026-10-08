@@ -2929,8 +2929,11 @@ export function FreshAgentView({
       // This read has no live actor authority, even if Retry cleared the intervention while it ran.
       const liveProviderState = resolved.extensions?.[provider]
       if (requestReadOnly || historyOnly) return
+      // An older coalesced reader may already display this exact response.
+      // The current reader can still authorize recovery; rejected revisions cannot.
+      const snapshotAcceptedForRecovery = snapshotAccepted || displaySnapshot === resolved
       if (
-        snapshotAccepted && paneContentRef.current.soulId && requestSessionWasLost && agentSessionLostRef.current
+        snapshotAcceptedForRecovery && paneContentRef.current.soulId && requestSessionWasLost && agentSessionLostRef.current
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
         && resolved.provider === provider && resolved.sessionType === requestSessionType
         && resolved.threadId === sessionId
