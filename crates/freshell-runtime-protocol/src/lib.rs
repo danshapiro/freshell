@@ -1925,6 +1925,38 @@ mod provider_launch_context_tests {
     }
 
     #[test]
+    fn managed_codex_pinned_update_setting_survives_durable_resume_without_expanding_overrides() {
+        let args = vec![
+            "--model".into(),
+            "gpt-5.6-luna".into(),
+            "-c".into(),
+            "model_reasoning_effort=\"low\"".into(),
+            "-c".into(),
+            "check_for_update_on_startup=false".into(),
+            "resume".into(),
+            "thread-current".into(),
+        ];
+        validate_managed_terminal_args("codex", &args).unwrap();
+        let durable = durable_managed_terminal_args("codex", args, None).unwrap();
+        validate_managed_terminal_args("codex", &durable).unwrap();
+        for value in [
+            "check_for_update_on_startup=true",
+            "check_for_update_on_startup=false\napi_key=secret",
+            "check_for_update_on_startup=\"false\"",
+            "check_for_update_on_startup=false;token=secret",
+        ] {
+            assert!(validate_managed_terminal_args("codex", &["-c".into(), value.into()]).is_err());
+        }
+        for provider in ["claude", "opencode", "amplifier"] {
+            assert!(validate_managed_terminal_args(
+                provider,
+                &["-c".into(), "check_for_update_on_startup=false".into()]
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn managed_codex_accepts_only_the_packaged_mcp_recipe_after_preparation() {
         let args = vec![
             "-c".into(), "mcp_servers.freshell.command=\"node\"".into(),
@@ -2640,6 +2672,7 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
                 matches!(
                     value.as_str(),
                     "tui.notification_method=bel"
+                        | "check_for_update_on_startup=false"
                         | "tui.notifications=['agent-turn-complete']"
                         | "features.apps=false"
                         | "mcp_servers.freshell.command=\"node\""
