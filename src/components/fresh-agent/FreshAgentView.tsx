@@ -1199,6 +1199,11 @@ export function FreshAgentView({
   const preferredResumeSessionId = getPreferredResumeSessionId(claudeSession) ?? paneContent.resumeSessionId
   const bootstrapHistoryThreadId = getManagedBootstrapHistoryThreadId(paneContent)
   const snapshotReadOnly = managedRecoveryPending || Boolean(bootstrapHistoryThreadId)
+  // A newer status invalidates a held read's authority to clear lost. Queue a
+  // current read through the single-flight scheduler only for managed live recovery.
+  const managedLostStatusVersion = supervisorRecoveryOwned && !snapshotReadOnly && agentSession?.lost
+    ? agentSession.statusVersion ?? 0
+    : undefined
   const snapshotThreadId = bootstrapHistoryThreadId ?? getFreshAgentSnapshotThreadId(paneContent, claudeSession)
   const snapshotThreadIdRef = useRef(snapshotThreadId)
   snapshotThreadIdRef.current = snapshotThreadId
@@ -3276,14 +3281,16 @@ export function FreshAgentView({
       if (outcome.status === 'coalesced') return
       handleSnapshotError(outcome.error)
     })
-    // Depend only on what identifies *which* snapshot to load. This effect
-    // dispatches updatePaneContent to persist its own resolved resumeSessionId/
+    // Identity changes and newer status activity during managed lost recovery
+    // load a current snapshot. Ordinary status updates stay outside this effect.
+    // This effect dispatches updatePaneContent to persist its resolved resumeSessionId/
     // status; listing the whole paneContent object (or those output fields) made
     // that self-update retrigger the effect, firing a redundant second fetch for
     // the same session. Current values for non-identity fields are read live via
     // paneContentRef.current inside the effect.
   }, [
     agentSession?.lost,
+    managedLostStatusVersion,
     appStore,
     captureFreshAgentAttachmentAttempt,
     claudeSession,
