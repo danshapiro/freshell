@@ -1711,6 +1711,55 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('observes only the fixed continuity markers, effect count and long-tool process', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-continuity-effects-'))
+    try {
+      const { owned, context, inventory, request } = fixture()
+      const row = { soulId: 'effect-soul', incarnationId: 'effect-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'effect-boot', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+      const names = ['p2-opencode-first-turn', 'p2-opencode-tool-count', 'p2-opencode-followup']
+      const provider = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (_id, args) => {
+        let command = args[2]
+        names.forEach((name, index) => { command = command.replaceAll(`/home/freshell/provider/${name}`, `$TEST_EFFECT_FILE_${index}`) })
+        const child = spawnSync('sh', ['-lc', command], { encoding: 'utf8', env: { ...process.env,
+          TEST_EFFECT_FILE_0: path.join(directory, names[0]), TEST_EFFECT_FILE_1: path.join(directory, names[1]),
+          TEST_EFFECT_FILE_2: path.join(directory, names[2]) } })
+        if (child.status !== 0) throw new Error('fixed private effect read failed')
+        return child.stdout
+      })
+      const table = vi.spyOn(owned, 'ownedContainerProcessTable').mockReturnValue('40 sleep 12\n41 unrelated')
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+        await control(JSON.parse(String(init.body)))), { status: 200 }))
+      const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+      const enclosure = rig.runtimeEnclosureHandle(row)
+      await expect(rig.openCodeContinuityFirstTurnCompleted(enclosure)).resolves.toBe(false)
+      await expect(rig.openCodeContinuityEffectCount(enclosure)).resolves.toBe(0)
+      await expect(rig.openCodeContinuityFollowUpCompleted(enclosure)).resolves.toBe(false)
+      await fsp.writeFile(path.join(directory, names[0]), 'P2_OPENCODE_FIRST_TURN_DONE\n')
+      await fsp.writeFile(path.join(directory, names[1]), 'one\n')
+      await fsp.writeFile(path.join(directory, names[2]), 'P2_OPENCODE_FOLLOWUP_DONE\n')
+      await expect(rig.openCodeContinuityFirstTurnCompleted(enclosure)).resolves.toBe(true)
+      await expect(rig.openCodeContinuityEffectCount(enclosure)).resolves.toBe(1)
+      await expect(rig.openCodeContinuityFollowUpCompleted(enclosure)).resolves.toBe(true)
+      await expect(rig.openCodeContinuityLongToolRunning(enclosure)).resolves.toBe(true)
+      table.mockReturnValue('41 unrelated')
+      await expect(rig.openCodeContinuityLongToolRunning(enclosure)).resolves.toBe(false)
+      await fsp.writeFile(path.join(directory, names[1]), 'one\ntwo\n')
+      await expect(rig.openCodeContinuityEffectCount(enclosure)).resolves.toBe(2)
+      provider.mockClear(); table.mockClear()
+      inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement-boot' }])
+      await expect(owned.openCodeContinuityFirstTurnCompleted(enclosure)).rejects.toThrow(/current/)
+      await expect(control({ ...request, action: 'opencode-continuity-long-tool', enclosure, pattern: 'arbitrary' })).rejects.toThrow(/operation/)
+      expect(provider).not.toHaveBeenCalled(); expect(table).not.toHaveBeenCalled()
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
   it('runs the closed Phase3 effect operations over the same pre-native enclosure', async () => {
     const { owned, context, request } = fixture()
     const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'p3-soul',

@@ -94,22 +94,6 @@ function leavesByMode(node: any, mode: string): any[] {
   return []
 }
 
-async function waitForOwnedProcess(
-  rig: ManagedRuntimeBrowserRig,
-  containerId: string,
-  pattern: string,
-  timeoutMs = 30_000,
-): Promise<string> {
-  const deadline = Date.now() + timeoutMs
-  let last = ''
-  while (Date.now() < deadline) {
-    last = rig.ownedContainerProcessTable(containerId)
-    if (last.split(/\r?\n/).some((line) => line.includes(pattern))) return last
-    await new Promise((resolve) => setTimeout(resolve, 200))
-  }
-  throw new Error(`timed out waiting for owned process ${pattern}; last=${last}`)
-}
-
 function waitForOwnedFileValue(
   rig: ManagedRuntimeBrowserRig,
   containerId: string,
@@ -348,7 +332,8 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       const view = await waitForRunningView(rig, terminalId, 90_000)
       if (!view?.containerId || !view.hostBootId) throw new Error('real OpenCode managed view missing ownership identity')
       expect((await rig.openCodeVersionFacts(rig.runtimeEnclosureHandle(view))).version).toBe(P2_OPENCODE_VERSION)
-      const startupFacts = await rig.openCodeContinuityStartupFacts(rig.runtimeEnclosureHandle(view))
+      const continuityEnclosure = rig.runtimeEnclosureHandle(view)
+      const startupFacts = await rig.openCodeContinuityStartupFacts(continuityEnclosure)
       expect(startupFacts.authPresent).toBe(true)
       expect(startupFacts.modelAvailable).toBe(true)
       expect(startupFacts.explicitModelArg).toBe(true)
@@ -372,9 +357,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         readTerminalText: () => terminal.getVisibleText(terminalId),
         wait: (milliseconds) => page.waitForTimeout(milliseconds),
         description: `OpenCode tool marker ${firstTurnMarker}`,
-        succeeds: async () => (await rig.ownedProviderExec(view.containerId!, [
-            'sh', '-lc', 'cat /home/freshell/provider/p2-opencode-first-turn 2>/dev/null || true',
-          ])).trim() === firstTurnMarker,
+        succeeds: () => rig.openCodeContinuityFirstTurnCompleted(continuityEnclosure),
         timeoutMs: 90_000,
       })
 
@@ -395,7 +378,9 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         'Use the bash tool to run exactly: sleep 12; echo P2_OPENCODE_TOOL_DONE >> "$HOME/p2-opencode-tool-count". Do not finish your response until that command completes.',
         opencodeIndex,
       )
-      await waitForOwnedProcess(rig, view.containerId, 'sleep 12', 60_000)
+      await waitForValue('owned OpenCode long-tool process', async () => (
+        await rig.openCodeContinuityLongToolRunning(continuityEnclosure)
+      ) ? true : null, 60_000)
 
       const previousLastReadyAt = await harness.getLastReadyAt()
       await rig.crashAndRestartWeb()
@@ -415,10 +400,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       expect(afterView?.containerId).toBe(view.containerId)
       expect(afterView?.hostBootId).toBe(view.hostBootId)
 
-      await expect.poll(async () => {
-        const count = (await rig.ownedProviderExec(view.containerId!, ['sh', '-lc', 'test -f /home/freshell/provider/p2-opencode-tool-count && wc -l < /home/freshell/provider/p2-opencode-tool-count || echo 0']))
-        return Number(count.trim())
-      }, { timeout: 60_000 }).toBe(1)
+      await expect.poll(() => rig.openCodeContinuityEffectCount(continuityEnclosure), { timeout: 60_000 }).toBe(1)
 
       const afterIndex = Math.max(0, (await page.locator('.xterm').count()) - 1)
       await new Promise((resolve) => setTimeout(resolve, 1_000))
@@ -426,9 +408,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         'Use the bash tool to run exactly: echo P2_OPENCODE_FOLLOWUP_DONE > "$HOME/p2-opencode-followup". Reply with exactly FOLLOWUP when the command completes.',
         afterIndex,
       )
-      await expect.poll(async () => {
-        return (await rig.ownedProviderExec(view.containerId!, ['sh', '-lc', 'cat /home/freshell/provider/p2-opencode-followup 2>/dev/null || true'])).trim()
-      }, { timeout: 90_000 }).toBe('P2_OPENCODE_FOLLOWUP_DONE')
+      await expect.poll(() => rig.openCodeContinuityFollowUpCompleted(continuityEnclosure), { timeout: 90_000 }).toBe(true)
       const hostFacts = await rig.chaosHostFacts(rig.exactRuntimeHandle({ ...view, nativeSessionId: sessionId }))
       expect(hostFacts.workerLaunchCount).toBe(1)
       expect((await content())?.sessionRef?.sessionId).toBe(sessionId)

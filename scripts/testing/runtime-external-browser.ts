@@ -892,6 +892,18 @@ export class ExternalManagedRuntimeRig {
   async openCodeContinuityStartupFacts(enclosure: RuntimeEnclosureHandle): Promise<OpencodeContinuityStartupFacts> {
     return this.rpc('opencode-continuity-startup', OpencodeContinuityStartupFactsSchema, { enclosure })
   }
+  async openCodeContinuityFirstTurnCompleted(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
+    return this.rpc('opencode-continuity-first-turn', z.boolean(), { enclosure })
+  }
+  async openCodeContinuityEffectCount(enclosure: RuntimeEnclosureHandle): Promise<number | null> {
+    return this.rpc('opencode-continuity-effect-count', z.number().nullable(), { enclosure })
+  }
+  async openCodeContinuityFollowUpCompleted(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
+    return this.rpc('opencode-continuity-follow-up', z.boolean(), { enclosure })
+  }
+  async openCodeContinuityLongToolRunning(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
+    return this.rpc('opencode-continuity-long-tool', z.boolean(), { enclosure })
+  }
   async lossCredentialEvidence(enclosure: RuntimeEnclosureHandle): Promise<OpencodeLossCredentialEvidence> {
     return this.rpc('loss-credential', OpencodeLossCredentialEvidenceSchema, { enclosure })
   }
@@ -1228,6 +1240,22 @@ export function createExternalRuntimeControl(
       case 'opencode-continuity-startup':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
         result = await owner.openCodeContinuityStartupFacts(request.enclosure)
+        break
+      case 'opencode-continuity-first-turn':
+        if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
+        result = await owner.openCodeContinuityFirstTurnCompleted(request.enclosure)
+        break
+      case 'opencode-continuity-effect-count':
+        if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
+        result = await owner.openCodeContinuityEffectCount(request.enclosure)
+        break
+      case 'opencode-continuity-follow-up':
+        if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
+        result = await owner.openCodeContinuityFollowUpCompleted(request.enclosure)
+        break
+      case 'opencode-continuity-long-tool':
+        if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
+        result = await owner.openCodeContinuityLongToolRunning(request.enclosure)
         break
       case 'phase3-effect-reset':
         if (!request.enclosure) throw new Error('exact current runtime enclosure address required')

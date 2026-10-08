@@ -803,7 +803,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -3399,9 +3399,32 @@ export class ManagedRuntimeOwner {
     return { provider: 'opencode', version }
   }
 
-  async openCodeContinuityStartupFacts(handle: RuntimeEnclosureHandle): Promise<OpencodeContinuityStartupFacts> {
+  private async assertOpenCodeContinuityEnclosure(handle: RuntimeEnclosureHandle): Promise<void> {
     if (this.runtime.phase !== 2) throw new Error('Phase 2 OpenCode continuity fixture required')
     await this.assertCurrentOpenCodeEnclosure(handle)
+  }
+  async openCodeContinuityFirstTurnCompleted(handle: RuntimeEnclosureHandle): Promise<boolean> {
+    await this.assertOpenCodeContinuityEnclosure(handle)
+    const raw = await this.ownedProviderExec(handle.containerId, ['sh', '-lc', 'cat /home/freshell/provider/p2-opencode-first-turn 2>/dev/null || true'])
+    return raw.trim() === 'P2_OPENCODE_FIRST_TURN_DONE'
+  }
+  async openCodeContinuityEffectCount(handle: RuntimeEnclosureHandle): Promise<number | null> {
+    await this.assertOpenCodeContinuityEnclosure(handle)
+    const raw = await this.ownedProviderExec(handle.containerId, ['sh', '-lc', 'test -f /home/freshell/provider/p2-opencode-tool-count && wc -l < /home/freshell/provider/p2-opencode-tool-count || echo 0'])
+    const count = Number(raw.trim())
+    return Number.isFinite(count) ? count : null
+  }
+  async openCodeContinuityFollowUpCompleted(handle: RuntimeEnclosureHandle): Promise<boolean> {
+    await this.assertOpenCodeContinuityEnclosure(handle)
+    const raw = await this.ownedProviderExec(handle.containerId, ['sh', '-lc', 'cat /home/freshell/provider/p2-opencode-followup 2>/dev/null || true'])
+    return raw.trim() === 'P2_OPENCODE_FOLLOWUP_DONE'
+  }
+  async openCodeContinuityLongToolRunning(handle: RuntimeEnclosureHandle): Promise<boolean> {
+    await this.assertOpenCodeContinuityEnclosure(handle)
+    return this.ownedContainerProcessTable(handle.containerId).split(/\r?\n/).some(line => line.includes('sleep 12'))
+  }
+  async openCodeContinuityStartupFacts(handle: RuntimeEnclosureHandle): Promise<OpencodeContinuityStartupFacts> {
+    await this.assertOpenCodeContinuityEnclosure(handle)
     const auth = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', OPENCODE_CONTINUITY_AUTH_SCRIPT])
     const models = await this.ownedProviderExec(handle.containerId, ['opencode', 'models', 'openai'])
     const processes = this.ownedContainerExec(handle.containerId, ['sh', '-lc', "pgrep -af '[o]pencode' || true"])
