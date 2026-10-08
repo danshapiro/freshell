@@ -350,6 +350,9 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
         if (paidPrerequisiteFailed && paidCase) {
           throw new Error('prior native prerequisite failed; no further paid operation started')
         }
+        if (paidPrerequisiteFailed && receiverMode && caseId === 'cancellation') {
+          throw new Error('prior native create failed; dependent receiver cancellation not started')
+        }
         try { return await executeManagedNativeCase(harness, prepared.files, selection, caseId, prepared.serverPath, servers) }
         catch (error) {
           if (selection.case === 'approval-checkpoint'
@@ -394,7 +397,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'codex' && ['create', 'exact-resume', 'wrong-root'].includes(caseId)) {
+  if (selection.provider === 'codex' && ['create', 'exact-resume', 'wrong-root', 'cancellation'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, 'codex', caseId, serverPath, servers)
   }
   if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume', 'wrong-root'].includes(caseId)) {
@@ -777,6 +780,69 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30, projectKey: scenario,
       providerModel: settings.model, providerReasoningEffort: 'low', providerPermissionMode: 'on-request', providerSandbox: 'workspace-write',
       providerSecretReferences: managedPreparation?.secretReferences ?? references, providerLaunchContext: managedPreparation?.context ?? freshAgent.providerLaunchContext } } } : request
+  if (terminal && caseId === 'cancellation') {
+    const expectedRoot = randomUUID()
+    const faultRequest = { ...selectedRequest, params: { ...selectedRequest.params, nativeSessionId: expectedRoot } }
+    harness.writeArtifact(`${scenario}-request.json`, faultRequest)
+    let finished = false, reply: any, failure: unknown
+    const pending = harness.adminRaw(supervisor, faultRequest).then(value => { reply = value; finished = true },
+      error => { failure = error; finished = true })
+    const deadline = Date.now() + 6_000, diagnostics: string[] = []
+    let view: any, namespace: any, receipt: any
+    while (!finished && Date.now() < deadline) {
+      try {
+        const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+        view = inventory.data.find((row: any) => row.soulId === soulId)
+        const owned = harness.broker.receipts().find(row => row.soulId === soulId && row.containerId === view?.containerId)
+        if (!view?.incarnationId || !owned) throw new Error('current owned native enclosure not yet allocated')
+        const file = path.join(harness.runtimeDir(supervisor, view.incarnationId), 'provider-identity.json')
+        receipt = JSON.parse(readCurrentCodexReceipt(file).toString('utf8'))
+        if (receipt.schemaVersion !== 1 || receipt.provider !== 'codex' || receipt.ephemeral !== false
+          || typeof receipt.nativeSessionId !== 'string' || !receipt.nativeSessionId || receipt.nativeSessionId === expectedRoot) {
+          throw new Error('current native root mismatch not observed')
+        }
+        namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+          ['python3', '-c', receiverNativeNamespace, 'codex', receipt.nativeSessionId, workspace]))
+        break
+      } catch (error) { diagnostics.push(error instanceof Error ? error.message : 'owned native capture unavailable') }
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    harness.writeArtifact(`${scenario}-pre-fault-capture-diagnostics.json`, diagnostics)
+    if (!namespace || !view || view.launchState !== 'starting' || view.nativeIdentityObservation
+      || !receiverNativeNamespaceMatches(namespace, 'codex', workspace, receipt?.nativeSessionId)) {
+      await pending
+      if (failure) throw failure
+      throw new Error('actual pending native receiver cancellation namespace differs')
+    }
+    harness.writeArtifact(`${scenario}-pre-stop-native.json`, { namespace, receipt, incarnationId: view.incarnationId })
+    // Join already-arrived launch replies before dispatching the fault.
+    await new Promise<void>(resolve => setImmediate(resolve))
+    if (finished) throw new Error('native receiver startup settled before ordinary Stop')
+    const stop = await harness.adminOk(supervisor, harness.stopBody(soulId))
+    harness.writeArtifact(`${scenario}-ordinary-stop.json`, stop)
+    await pending
+    if (failure) throw failure
+    harness.writeArtifact(`${scenario}-launch-refusal.json`, reply)
+    const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+    const current = inventory.data.find((row: any) => row.soulId === soulId)
+    harness.writeArtifact(`${scenario}-current-view.json`, current ?? null)
+    if (reply.result?.Err?.code !== 'STALE_INTENT_REVISION' || stop.data?.outcome !== 'verified_empty'
+      || current?.launchState !== 'stopped' || current.desiredState !== 'stopped' || current.recoveryState !== 'stopped'
+      || current.nativeIdentityObservation) throw new Error('ordinary Stop did not confirm empty stopped native receiver')
+    const input = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned stopped input refusal probe. Do not use tools.\r'))
+    harness.writeArtifact(`${scenario}-input-refusal.json`, input)
+    if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('stopped native receiver admitted ordinary input')
+    const original: NativeExperimentOriginal = { caseId, ownerId: harness.runId, imageDigest: harness.imageRef,
+      candidateSha: harness.candidateSha, nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256,
+      profileSha256: createHash('sha256').update(JSON.stringify({ settings, nativeProfileSha256: namespace.profileSha256 })).digest('hex'),
+      artifactReferences: [`${scenario}-pre-stop-native.json`, `${scenario}-ordinary-stop.json`, `${scenario}-launch-refusal.json`, `${scenario}-input-refusal.json`],
+      assertions: [{ name: 'actual-native-current-root-pending-before-stop', pass: true },
+        { name: 'actual-selected-native-process-profile-uid-and-tls', pass: true },
+        { name: 'ordinary-stop-cancels-pending-launch-and-confirms-empty-stopped', pass: true },
+        { name: 'stopped-native-receiver-refuses-input', pass: true }] }
+    harness.writeArtifact(`${scenario}-original.json`, original)
+    return original
+  }
   if (!terminal && caseId === 'wrong-root') {
     const expectedRoot = provider === 'opencode' ? 'ses_' + randomUUID().replaceAll('-', '') : randomUUID()
     const faultRequest = { ...selectedRequest, params: { ...selectedRequest.params, nativeSessionId: expectedRoot } }
@@ -839,9 +905,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     const receiptPath = path.join(harness.runtimeDir(supervisor, view.incarnationId), 'provider-identity.json')
     let raw: Buffer
     try {
-      const stat = fs.lstatSync(receiptPath)
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65_536 || fs.realpathSync(receiptPath) !== receiptPath) throw new Error('invalid receipt')
-      raw = fs.readFileSync(receiptPath)
+      raw = readCurrentCodexReceipt(receiptPath)
     } catch { throw new Error('actual current Codex native receipt unavailable') }
     const receipt = JSON.parse(raw.toString('utf8'))
     if (receipt.schemaVersion !== 1 || receipt.provider !== 'codex' || receipt.ephemeral !== false
@@ -972,6 +1036,14 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     assertions }
   harness.writeArtifact(`${scenario}-original.json`, original)
   return original
+}
+
+function readCurrentCodexReceipt(file: string): Buffer {
+  const stat = fs.lstatSync(file)
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65_536 || fs.realpathSync(file) !== file) {
+    throw new Error('current Codex receipt is not a bounded canonical regular file')
+  }
+  return fs.readFileSync(file)
 }
 
 function receiverNativeNamespaceMatches(namespace: any, provider: 'codex' | 'opencode', workspace: string, root: string): boolean {

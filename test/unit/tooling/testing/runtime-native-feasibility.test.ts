@@ -42,6 +42,54 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       expect(start).not.toHaveBeenCalled()
     } finally { fs.rmSync(directory,{recursive:true,force:true}) }
   })
+  it.each(['valid', 'late-launch', 'published', 'unconfirmed-stop', 'admitted-input', 'wrong-uid'])('cancels a pending genuine terminal receiver launch through ordinary Stop (%s; orchestration only)', async fault => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-native-cancel-')), root = randomUUID()
+    fs.mkdirSync(path.join(directory, 'current-inc'))
+    let soul = '', cwd = '', stopped = false, settle: (value: any) => void = () => {}
+    const requests: string[] = []
+    const harness = { testRoot: directory, runId: ownerId, candidateSha, imageRef: imageDigest,
+      startSupervisor: async () => ({}), writeArtifact: () => {}, inventoryBody: () => ({ method: 'inventory' }),
+      stopBody: () => ({ method: 'stop' }), terminalInputBody: () => ({ method: 'terminal_input' }),
+      runtimeDir: () => path.join(directory, 'current-inc'), broker: { receipts: () => [{ soulId: soul, containerId: 'owned-current' }] },
+      adminRaw: async (_: unknown, request: any) => {
+        requests.push(request.method)
+        if (request.method === 'launch') {
+          soul = request.params.soulId; cwd = request.params.terminal.cwd
+          fs.writeFileSync(path.join(directory, 'current-inc/provider-identity.json'), JSON.stringify({ schemaVersion: 1, provider: 'codex',
+            nativeSessionId: root, ephemeral: false, observedAt: 1 }))
+          return new Promise(resolve => { settle = resolve })
+        }
+        return { result: { Err: { code: fault === 'admitted-input' ? 'OTHER_ERROR' : 'UNKNOWN_SOUL' } } }
+      },
+      adminOk: async (_: unknown, request: any) => {
+        if (request.method === 'stop') {
+          stopped = true; settle({ result: { Err: { code: 'STALE_INTENT_REVISION' } } })
+          return { data: { outcome: fault === 'unconfirmed-stop' ? 'unknown' : 'verified_empty' } }
+        }
+        return { data: [{ soulId: soul, containerId: 'owned-current', incarnationId: 'current-inc',
+          launchState: stopped ? 'stopped' : fault === 'published' ? 'running' : 'starting',
+          desiredState: stopped ? 'stopped' : 'running', recoveryState: stopped ? 'stopped' : 'live', nativeIdentityObservation: null }] }
+      },
+      execOwnedContainerAsExact: async () => {
+        if (fault === 'late-launch') settle({ result: { Err: { code: 'RECOVERY_BLOCKED' } } })
+        if (fault === 'wrong-uid' || fault === 'published') settle({ result: { Err: { code: 'RECOVERY_BLOCKED' } } })
+        return JSON.stringify({ uid: fault === 'wrong-uid' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+          httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: cwd, nativeVersion: 'codex-cli 0.147.0',
+          activeNativeProcesses: 1, executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64) })
+      },
+    } as unknown as RuntimeHarness
+    const sources = ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: 'codex/grants/' + suffix, path: '/owned/' + suffix, sha256: 'e'.repeat(64) }))
+    try {
+      const run = executeManagedNativeCase(harness, sources, { provider: 'codex', case: 'startup' }, 'cancellation')
+      if (fault === 'valid') {
+        expect((await run).assertions.every(row => row.pass)).toBe(true)
+        expect(requests).toEqual(['launch', 'terminal_input']); expect(stopped).toBe(true)
+      } else await expect(run).rejects.toThrow(fault === 'late-launch' ? 'native receiver startup settled before ordinary Stop'
+        : fault === 'unconfirmed-stop' ? 'ordinary Stop did not confirm empty stopped native receiver'
+        : fault === 'admitted-input' ? 'stopped native receiver admitted ordinary input'
+        : 'actual pending native receiver cancellation namespace differs')
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['valid', 'missing-observation', 'wrong-source', 'wrong-uid'])('executes terminal Codex create through the native app-server gate (%s; orchestration only)', async fault => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-codex-create-')), root = randomUUID()
     const requests: any[] = []
