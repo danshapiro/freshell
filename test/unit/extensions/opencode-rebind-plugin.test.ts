@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -11,7 +11,7 @@ import plugin, {
   extractSessionId,
   hasAdoptionExpectation,
   type EmitterDeps,
-} from '../../../extensions/opencode/freshell-rebind-plugin'
+} from '../../../extensions/opencode/freshell-rebind-plugin.js'
 import { seedManagedOpenCodeSource } from '../../e2e-browser/fixtures/managed-opencode-source.js'
 
 describe('extractSessionId', () => {
@@ -213,6 +213,59 @@ describe('createObservationEmitter', () => {
   }
 
   beforeEach(() => writes.splice(0))
+
+  it('retains bounded body-free read and publication phases across a current expectation rotation', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'opencode-current-poll-'))
+    const selected = deps()
+    const diagnosticRoot = join(directory, '.freshell/session-signals/opencode-adoption-diagnostics')
+    const diagnostic = (stage: string) => JSON.parse(readFileSync(join(diagnosticRoot, `term-managed.${stage}.json`), 'utf8'))
+    let descriptor: string | null = null
+    let settle: (value: unknown) => void = () => {}
+    const api = makeApi({ nativeRead: () => new Promise(resolve => { settle = resolve }) })
+    const emit = createObservationEmitter({ ...selected, env: { ...selected.env, HOME: directory },
+      readExpectation: () => descriptor })
+    try {
+      const first = emit(api)
+      await vi.waitFor(() => expect(diagnostic('native_read_pending').inFlight).toBe(true))
+      await emit(api)
+      expect(diagnostic('in_flight').launchNonce).toBe(launchNonce)
+      settle({ data: [{ info: { id: tailMessageId, sessionID: rootSessionId }, parts: [] }] })
+      await first
+      expect(diagnostic('publication_succeeded').launchNonce).toBe(launchNonce)
+      descriptor = JSON.stringify({ terminal_id: 'term-managed', root_session_id: rootSessionId,
+        incarnation_id: incarnationId, launch_nonce: 'rotated-current-nonce', evidence_generation: 'b'.repeat(64),
+        root_tail: { state: 'message', data: { message_id: tailMessageId } } })
+      api.client.session.messages = async () => ({ data: [{ info: { id: tailMessageId, sessionID: rootSessionId }, parts: [] }] })
+      await emit(api)
+      expect(writes.map(row => JSON.parse(row.body).adoption_observation.launch_nonce)).toEqual([
+        launchNonce, 'rotated-current-nonce',
+      ])
+      expect(diagnostic('expectation_read').launchNonce).toBe('rotated-current-nonce')
+      expect(diagnostic('publication_succeeded')).toMatchObject({ evidenceGeneration: 'b'.repeat(64),
+        event: 'runtime.opencode.native_observation_progress', severity: 'info', inFlight: true })
+      await emit(api)
+      expect(writes).toHaveLength(2)
+      expect(diagnostic('duplicate').launchNonce).toBe('rotated-current-nonce')
+      for (const stage of ['expectation_read', 'native_read_pending', 'native_read_settled', 'publication_succeeded', 'in_flight', 'duplicate']) {
+        expect(JSON.stringify(diagnostic(stage))).not.toContain('private')
+        expect(diagnostic(stage).adoption_observation).toBeUndefined()
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }) }
+  })
+
+  it('keeps diagnostic filesystem failure inert for actual native receipt publication', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'opencode-poll-storage-'))
+    const selected = deps()
+    try {
+      const parent = join(directory, '.freshell/session-signals')
+      mkdirSync(parent, { recursive: true })
+      writeFileSync(join(parent, 'opencode-adoption-diagnostics'), 'owned obstruction')
+      const emit = createObservationEmitter({ ...selected, env: { ...selected.env, HOME: directory } })
+      await expect(emit(makeApi())).resolves.toBeUndefined()
+      expect(writes).toHaveLength(1)
+      expect(JSON.parse(writes[0].body).adoption_observation.launch_nonce).toBe(launchNonce)
+    } finally { rmSync(directory, { recursive: true, force: true }) }
+  })
 
   it.each(['get', 'messages'])('distinguishes an unavailable TUI session %s API from an unloaded root', async (method) => {
     const refusal = vi.fn()

@@ -510,6 +510,24 @@ export function createObservationEmitter(
   let lastRefusal: string | null = null
   let inFlight = false
   let observingTrigger: NativeObservationWake['trigger'] | undefined
+  let lastCurrent = expected
+  type ProgressStage = 'in_flight' | 'expectation_unavailable' | 'expectation_read'
+    | 'native_read_pending' | 'native_read_settled' | 'duplicate' | 'publication_succeeded'
+  // Fixed stage filenames retain the last actual transition even if a later
+  // poll is blocked by an in-flight native read. No history or error bodies
+  // enter these bounded diagnostics, and a reporting failure is inert.
+  const progress = (stage: ProgressStage): void => {
+    try {
+      defaultWriteFile(join(lastCurrent.dir, '..', 'opencode-adoption-diagnostics'),
+        `${lastCurrent.terminalId}.${stage}`, JSON.stringify({
+          event: 'runtime.opencode.native_observation_progress', severity: 'info', stage,
+          terminalId: lastCurrent.terminalId, nativeSessionId: lastCurrent.rootSessionId,
+          incarnationId: lastCurrent.incarnationId, launchNonce: lastCurrent.launchNonce,
+          evidenceGeneration: lastCurrent.evidenceGeneration, inFlight,
+          ...deps.wakeContext?.(),
+        }))
+    } catch { /* Diagnostic storage never changes native admission or renderer behavior. */ }
+  }
   const refuse = (current: AdoptionExpectation, reason: NativeRefusalReason,
     history?: { nativeActiveMessageCount: number; tuiActiveMessageCount: number; nativeTuiPageMessageCount?: number | null }): void => {
     if (deps.signal?.aborted) return
@@ -529,14 +547,23 @@ export function createObservationEmitter(
     } catch { /* A diagnostic failure cannot change the native gate or break the renderer. */ }
   }
   return async (apiValue: unknown): Promise<void> => {
-    if (deps.signal?.aborted || inFlight) return
+    if (deps.signal?.aborted) return
+    if (inFlight) {
+      progress('in_flight')
+      return
+    }
     inFlight = true
     observingTrigger = deps.wakeContext?.().trigger
     let active = expected
     try {
       const current = readCurrentAdoptionExpectation(expected, readExpectation)
-      if (!current) return
+      if (!current) {
+        progress('expectation_unavailable')
+        return
+      }
       active = current
+      lastCurrent = current
+      progress('expectation_read')
       const api = asRecord(apiValue) as unknown as AdoptionTuiApi | null
       const state = asRecord(api?.state)
       const sessionState = asRecord(state?.session)
@@ -553,8 +580,10 @@ export function createObservationEmitter(
       }
 
       if (deps.signal?.aborted) return
+      progress('native_read_pending')
       const read = await readNativeHistory(api, current.rootSessionId)
       if (deps.signal?.aborted) return
+      progress('native_read_settled')
       const native = 'failure' in read ? null : read
       if (currentRouteSessionId(api.route?.current) !== current.rootSessionId || state.ready !== true) return refuse(current, 'tui_context_changed')
       const selected = asRecord(sessionState.get(current.rootSessionId))
@@ -606,7 +635,10 @@ export function createObservationEmitter(
         messages_read: messagesRead,
       }
       const signature = JSON.stringify(observation)
-      if (signature === lastEmitted) return
+      if (signature === lastEmitted) {
+        progress('duplicate')
+        return
+      }
       seq += 1
       const nonce = `${String(now()).padStart(14, '0')}-${String(seq).padStart(6, '0')}-${process.pid}`
       if (deps.signal?.aborted) return
@@ -621,6 +653,7 @@ export function createObservationEmitter(
       )
       // A failed publication must remain eligible for the next observation.
       lastEmitted = signature
+      progress('publication_succeeded')
       if (messagesRead !== 'failed') lastRefusal = null
     } catch {
       refuse(active, 'producer_or_publication_failed')
