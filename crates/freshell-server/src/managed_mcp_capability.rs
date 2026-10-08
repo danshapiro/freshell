@@ -333,6 +333,88 @@ async fn apply_prepared_callback(
                 "Claude callback source provenance changed; retain inputs and reprepare".into(),
             );
         }
+        // A replayed pending result is data, not authority for a new callback.
+        // The supervisor validates the current registry attempt before and
+        // after the private reader; no capability-store lock crosses this IPC.
+        let context = callback.prior_context.as_ref().unwrap();
+        let manifest: freshell_platform::claude_inputs::ClaudeInputManifest =
+            serde_json::from_slice(&read_prior_manifest_bytes(
+                "claude",
+                store,
+                directory,
+                &callback.soul_id,
+                context,
+            )?)
+            .map_err(|_| "prior Claude source manifest metadata invalid")?;
+        manifest.validate().map_err(str::to_string)?;
+        let source = freshell_platform::claude_inputs::observation::ObservationRequest {
+            version: 1,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            native_source_runtime: manifest
+                .native_source_runtime
+                .ok_or("Claude native source runtime unavailable")?,
+            cwd: std::fs::canonicalize(
+                callback
+                    .cwd
+                    .as_ref()
+                    .ok_or("Claude current launch directory unavailable")?,
+            )
+            .map_err(|_| "Claude current launch directory unavailable")?,
+            home: "/home/freshell/provider".into(),
+            setting_sources: manifest.setting_sources.clone(),
+            selector_manifest_sha256: format!(
+                "{:x}",
+                Sha256::digest(
+                    freshell_runtime_protocol::bounded_json_bytes(
+                        &manifest.original_selectors(),
+                        64 * 1024 * 1024
+                    )
+                    .map_err(|_| "Claude selector metadata exceeds its finite profile")?
+                )
+            ),
+            plan_revision: 0,
+            candidate_binding: None,
+        };
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(
+                freshell_runtime_protocol::bounded_json_bytes(
+                    &source,
+                    freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES,
+                )
+                .map_err(|_| "Claude source request exceeds its finite profile")?
+            )
+        );
+        let reply = client
+            .observe_claude_sources(freshell_runtime_protocol::ObserveClaudeSourcesRequest {
+                expected_control_epoch: None,
+                soul_id: callback.soul_id.clone(),
+                provider: binding.provider.clone(),
+                authority,
+                workspace_path: callback
+                    .workspace
+                    .as_ref()
+                    .and_then(|path| path.to_str())
+                    .ok_or("Claude current workspace unavailable")?
+                    .into(),
+                git_common_dir: binding.git_common_dir.clone(),
+                candidate: None,
+                observation_request: source.clone(),
+            })
+            .await
+            .map_err(|_| {
+                "Claude current native source evidence unavailable; retain inputs and reprepare"
+            })?;
+        reply.validate_for_request(&source, &digest)?;
+        if (
+            reply.observation.uid,
+            reply.observation.euid,
+            reply.observation.gid,
+            reply.observation.egid,
+        ) != (65534, 65534, 0, 0)
+        {
+            return Err("Claude current native source evidence identity changed; retain inputs and reprepare".into());
+        }
     }
     if let Some(reply) = store.pending_prepared_context(
         &callback.soul_id,
@@ -6802,6 +6884,221 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn managed_provider_claude_pending_replay_requires_current_source_authority() {
+        use freshell_platform::claude_inputs::{ClaudeInputManifest, NativeSourceRuntime};
+        use freshell_runtime_protocol::{
+            bounded_json_bytes, ClaudeRecoverySourceBinding, ClaudeSourceAuthority,
+            ProviderLaunchContext, ProviderPreparation, RecoveryAttemptId, MAX_CONTROL_FRAME_BYTES,
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let directory = owned.path().join("control/mcp-capabilities");
+        for path in [&home.join(".claude"), &cwd, &directory] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"env":{"ORDINARY_SOURCE":"retained"}}"#,
+        )
+        .unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let endpoint = "http://host.docker.internal:4000";
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+            config: vec![],
+            mcp_capability: None,
+            prepared_inputs: None,
+        };
+        let manifest = ClaudeInputManifest {
+            version: 1,
+            native_source_runtime: Some(NativeSourceRuntime::Terminal),
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            workspace: cwd.clone(),
+            config_root: None,
+            settings_file: None,
+            settings_origin: None,
+            inline_settings_sha256: None,
+            setting_sources: vec![],
+            plugin_dirs: vec![],
+            accepted_native_plan: None,
+        };
+        let input = OpencodeEphemeralInput {
+            claude_manifest: Some(&manifest),
+            cwd: Some(&cwd),
+            workspace: Some(&cwd),
+            launch_context: Some(&context),
+            secret_references: Some(&[]),
+            ..Default::default()
+        };
+        let prior = store
+            .issue(
+                soul.clone(),
+                &directory,
+                endpoint.into(),
+                Some(("claude", &home, &[])),
+                input,
+                None,
+            )
+            .unwrap();
+        let prior_context = read_prepared_context(&directory, &prior).unwrap();
+        let replacement = store
+            .issue_replacement_with_inputs(
+                soul.clone(),
+                &directory,
+                endpoint.into(),
+                Some(("claude", &home, &[])),
+                OpencodeEphemeralInput {
+                    launch_context: Some(&prior_context),
+                    ..input
+                },
+            )
+            .unwrap();
+        let prior_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+        let pending_stage = staged_provider_root_path(&directory, &replacement.grant_id).unwrap();
+        let prior_before =
+            std::fs::read(prior_stage.join(".freshell/prepared-context.json")).unwrap();
+        let pending_before =
+            std::fs::read(pending_stage.join(".freshell/prepared-result.json")).unwrap();
+        let scope = uuid::Uuid::new_v4().to_string();
+        let authority = ClaudeSourceAuthority::RecoveryAttempt {
+            attempt_id: scope.clone(),
+        };
+        let binding = ClaudeRecoverySourceBinding {
+            provider: "claude".into(),
+            git_common_dir: None,
+            authority_sha256: format!(
+                "{:x}",
+                Sha256::digest(bounded_json_bytes(&authority, MAX_CONTROL_FRAME_BYTES).unwrap())
+            ),
+            registry_attempt_id: RecoveryAttemptId::new(),
+            intent_revision: 2,
+            prior_generation_id: prior.grant_id.clone(),
+        };
+        let callback = serde_json::to_vec(&serde_json::json!({
+            "action":"issue", "controlSecret":"fixture-control", "soulId":soul,
+            "provider":"claude", "cwd":cwd, "workspace":cwd, "priorContext":prior_context,
+            "providerSecretReferences":[], "authLookupAuthority":scope, "claudeRecoverySource":binding,
+        })).unwrap();
+        // The ordinary pending generation is intact, but there is no current
+        // supervisor scope available to qualify it. No replay may grant authority.
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unavailable.sock"),
+            "fixture-control",
+        );
+        let result = apply_prepared_callback(
+            &callback,
+            "fixture-control",
+            &store,
+            &directory,
+            endpoint,
+            &home,
+            &client,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "pending replay must first obtain current native source authority"
+        );
+        assert!(result.unwrap_err().contains("native source evidence"));
+        assert_eq!(
+            std::fs::read(prior_stage.join(".freshell/prepared-context.json")).unwrap(),
+            prior_before
+        );
+        assert_eq!(
+            std::fs::read(pending_stage.join(".freshell/prepared-result.json")).unwrap(),
+            pending_before
+        );
+        assert_eq!(store.grants.lock().unwrap().len(), 2);
+        for fault in ["digest", "identity", "none"] {
+            use freshell_platform::claude_inputs::observation::{
+                LocalDecision, NativeObservation, ObservationReply,
+            };
+            use freshell_runtime_protocol::{
+                read_frame, write_frame, AdminCommand, AdminReply, AdminResult, Envelope,
+                InstallationId,
+            };
+            let socket_path = owned.path().join(format!("source-{fault}.sock"));
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            let expected_scope = scope.clone();
+            let expected_soul = soul.clone();
+            let expected_cwd = cwd.clone();
+            let reader = tokio::spawn(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+                    for operation in 0..2 {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let request: Envelope<AdminCommand> = read_frame(&mut socket).await.unwrap();
+                        assert_eq!(request.auth.as_deref(), Some("fixture-control"));
+                        let result = match (operation, request.body) {
+                            (0, AdminCommand::Health) => AdminResult::Health {
+                                control_epoch: 1, installation_id: InstallationId::parse("installation-fixture").unwrap(),
+                            },
+                            (1, AdminCommand::ObserveClaudeSources(request)) => {
+                                assert_eq!(request.expected_control_epoch, Some(1));
+                                assert_eq!(request.soul_id, expected_soul);
+                                assert!(matches!(request.authority, ClaudeSourceAuthority::RecoveryAttempt { attempt_id } if attempt_id == expected_scope));
+                                assert_eq!(request.observation_request.cwd, expected_cwd);
+                                assert!(request.candidate.is_none());
+                                let selected = request.observation_request;
+                                let raw = bounded_json_bytes(&selected, freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES).unwrap();
+                                // This synthetic reply qualifies IPC validation, not an actual native reader.
+                                AdminResult::ClaudeSourceObservation(ObservationReply {
+                                    request_sha256: if fault == "digest" { "0".repeat(64) } else { format!("{:x}", Sha256::digest(raw)) },
+                                    observation: NativeObservation {
+                                        version: 1, native_source_runtime: selected.native_source_runtime,
+                                        setting_sources: selected.setting_sources, uid: if fault == "identity" { 0 } else { 65534 },
+                                        euid: if fault == "identity" { 0 } else { 65534 }, gid: 0, egid: 0,
+                                        supplementary_groups: vec![], cwd: selected.cwd, home: Some(selected.home),
+                                        roots: None, local_decision: LocalDecision::Disabled,
+                                        root_uid: None, git_uid: None, claude_uid: None, local_settings: vec![],
+                                    },
+                                })
+                            },
+                            _ => panic!("unexpected scoped source callback request"),
+                        };
+                        write_frame(&mut socket, &AdminReply { request_id: request.request_id, result: Ok(result) }).await.unwrap();
+                    }
+                }).await.unwrap();
+            });
+            let client =
+                freshell_runtime_client::RuntimeClient::new(socket_path, "fixture-control");
+            let result = apply_prepared_callback(
+                &callback,
+                "fixture-control",
+                &store,
+                &directory,
+                endpoint,
+                &home,
+                &client,
+            )
+            .await;
+            reader.await.unwrap();
+            if fault == "none" {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&result.unwrap()).unwrap(),
+                    serde_json::from_slice::<serde_json::Value>(&pending_before).unwrap()
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "invalid {fault} must not grant pending replay authority"
+                );
+            }
+            assert_eq!(
+                std::fs::read(prior_stage.join(".freshell/prepared-context.json")).unwrap(),
+                prior_before
+            );
+            assert_eq!(
+                std::fs::read(pending_stage.join(".freshell/prepared-result.json")).unwrap(),
+                pending_before
+            );
+            assert_eq!(store.grants.lock().unwrap().len(), 2);
+        }
     }
 
     #[tokio::test]
