@@ -28,6 +28,40 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['freshcodex', 'freshopencode'].flatMap(mode => ['valid', 'missing-observation', 'wrong-root', 'wrong-incarnation', 'wrong-source', 'wrong-version', 'wrong-uid', 'wrong-tls'].map(fault => [mode, fault])))('executes managed pre-input native create and refuses incomplete evidence (%s, %s; orchestration only)', async (mode, fault) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-receiver-create-'))
+    const provider = mode === 'freshcodex' ? 'codex' : 'opencode', root = provider === 'codex' ? randomUUID() : 'ses_nativeOwned'
+    const sources = ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: `${provider}/grants/${suffix}`, path: '/owned/' + suffix, sha256: 'e'.repeat(64) }))
+    const launch = vi.fn(async (_supervisor: unknown, request: any) => {
+      expect(request.method).toBe('launch'); expect(request.params.provider).toBe(provider)
+      expect(request.params.freshAgent.sessionType).toBe(mode)
+      expect(request.params.freshAgent.providerSecretReferences.map((reference: any) => reference.profile)).toEqual([
+        `${provider}_onecli_environment`, `${provider}_onecli_auth_file`, `${provider}_onecli_ca_file`])
+      expect(request.params.freshAgent.nativeSessionId).toBeUndefined()
+      return { data: { view: { launchState: 'running', recoveryState: 'live', containerId: 'owned-native', incarnationId: 'current-inc', nativeSessionId: root,
+        nativeIdentityObservation: fault === 'missing-observation' ? null : { nativeSessionId: fault === 'wrong-root' ? 'other' : root,
+          incarnationId: fault === 'wrong-incarnation' ? 'old-inc' : 'current-inc', source: fault === 'wrong-source' ? 'claude_native_event' : 'fresh_provider_handshake',
+          launchNonce: 'current-nonce', evidenceRevision: 0, evidenceDigest: 'a'.repeat(64) } } } }
+    })
+    const capture = vi.fn(async (_container: string, uid: string) => {
+      expect(uid).toBe('65534:0')
+      return JSON.stringify({ uid: fault === 'wrong-uid' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+        httpsStatus: fault === 'wrong-tls' ? 0 : 200, tlsVerifyMode: 2, tlsCheckHostname: true,
+        nativeCwd: path.join(directory, `${mode}-create-workspace`), nativeVersion: fault === 'wrong-version' ? 'unqualified' : provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21',
+        executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64), nativeRoot: root, activeNativeProcesses: 1 })
+    })
+    const records = new Map<string, unknown>()
+    const harness = { testRoot: directory, runId: ownerId, candidateSha, imageRef: imageDigest, startSupervisor: async () => ({}),
+      adminOk: launch, execOwnedContainerAsExact: capture, writeArtifact: (name: string, value: unknown) => records.set(name, value) } as unknown as RuntimeHarness
+    try {
+      const run = executeManagedNativeCase(harness, sources, { mode: mode as 'freshcodex' | 'freshopencode', case: 'startup' }, 'create')
+      if (fault === 'valid') {
+        expect((await run).assertions.every(row => row.pass)).toBe(true)
+        expect(launch).toHaveBeenCalledTimes(1); expect(capture).toHaveBeenCalledTimes(1)
+        expect(records.has(`${mode}-create-original.json`)).toBe(true)
+      } else { await expect(run).rejects.toThrow(); expect(records.has(`${mode}-create-original.json`)).toBe(false) }
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['file-replacement', 'file-truncation', 'malformed-ack'].flatMap(fault =>
     ['valid', 'wrong-original', 'symlink', 'wrong-uid'].map(form => [fault, form])))('executes the restricted ACK filesystem mutation (%s, %s; controlled identity only)', (fault, form) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-ack-file-'))

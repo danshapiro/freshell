@@ -388,6 +388,9 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
+  if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && caseId === 'create') {
+    return executeManagedReceiverCreate(harness, sources, selection.mode as 'freshcodex' | 'freshopencode')
+  }
   if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
@@ -677,6 +680,86 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
   harness.writeArtifact(`${scenario}-original.json`, original)
   return original
 }
+
+async function executeManagedReceiverCreate(harness: RuntimeHarness,
+  sources: { name: string; path: string; sha256: string }[], mode: 'freshcodex' | 'freshopencode'): Promise<NativeExperimentOriginal> {
+  const provider = mode === 'freshcodex' ? 'codex' : 'opencode', scenario = `${mode}-create`
+  const references = ['env_file', 'auth_file', 'ca_file'].map(suffix => {
+    const source = sources.find(file => file.name === `${provider}/grants/${suffix}`)
+    if (!source) throw new Error(`selected ${provider} ${suffix} reference missing`)
+    return { sourcePath: source.path, profile: `${provider}_onecli_${suffix === 'env_file' ? 'environment' : suffix}` }
+  })
+  const workspace = path.join(harness.testRoot, `${scenario}-workspace`)
+  fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
+  const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release' })
+  const storeId = 'store-' + randomUUID(), soulId = 'soul-' + randomUUID()
+  const request = { method: 'launch', params: { soulId, provider, providerStoreId: storeId,
+    creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: scenario,
+    limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
+    freshAgent: { sessionId: 'native-fresh-' + randomUUID(), provider, sessionType: mode,
+      runtimeVariant: provider === 'codex' ? 'codex-app-server' : 'opencode-serve', providerStoreId: storeId,
+      cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0,
+      model: provider === 'codex' ? 'gpt-5.6-luna' : 'openai/gpt-5.6-luna', effort: 'low', permissionMode: 'default',
+      providerSecretReferences: references, providerLaunchContext: { preparation: provider === 'codex'
+        ? { codex: { tui_args: [], sidecar_args: [] } }
+        : { opencode: { project_config: [], tui_config: null, inline_config: false } }, config: [] } } } }
+  harness.writeArtifact(`${scenario}-request.json`, request)
+  const launch = await harness.adminOk(supervisor, request)
+  harness.writeArtifact(`${scenario}-launch.json`, launch)
+  const view = launch.data.view, observation = view.nativeIdentityObservation
+  if (view.launchState !== 'running' || view.recoveryState !== 'live' || !view.nativeSessionId
+    || observation?.nativeSessionId !== view.nativeSessionId || observation.incarnationId !== view.incarnationId
+    || observation.source !== 'fresh_provider_handshake' || !observation.launchNonce
+    || !Number.isSafeInteger(observation.evidenceRevision) || observation.evidenceRevision < 0
+    || !/^[a-f0-9]{64}$/.test(observation.evidenceDigest ?? '')) {
+    throw new Error('current managed native receiver observation missing or misbound before input')
+  }
+  const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+    ['python3', '-c', receiverNativeNamespace, provider]))
+  harness.writeArtifact(`${scenario}-namespace-private.json`, namespace)
+  const version = provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21'
+  if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
+    || !namespace.readOnlyRoot || namespace.httpsStatus !== 200 || namespace.tlsVerifyMode !== 2
+    || !namespace.tlsCheckHostname || namespace.nativeCwd !== workspace || namespace.nativeVersion !== version
+    || namespace.activeNativeProcesses !== 1
+    || !/^[a-f0-9]{64}$/.test(namespace.executableSha256 ?? '') || !/^[a-f0-9]{64}$/.test(namespace.profileSha256 ?? '')) {
+    throw new Error('actual native receiver namespace/profile/pin/TLS differs')
+  }
+  const original: NativeExperimentOriginal = { caseId: 'create', ownerId: harness.runId, imageDigest: harness.imageRef,
+    candidateSha: harness.candidateSha, nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256,
+    profileSha256: namespace.profileSha256, artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace-private.json`],
+    assertions: [{ name: 'actual-native-receiver-current-observation-before-input', pass: true },
+      { name: 'actual-selected-native-process-profile-uid-and-tls', pass: true }] }
+  harness.writeArtifact(`${scenario}-original.json`, original)
+  return original
+}
+
+const receiverNativeNamespace = String.raw`
+import os,sys,json,pathlib,hashlib,subprocess,ssl,urllib.request
+provider=sys.argv[1];assert provider in ['codex','opencode']
+matches=[]
+for process in pathlib.Path('/proc').iterdir():
+ if not process.name.isdigit():continue
+ try:
+  argv=[item.decode() for item in (process/'cmdline').read_bytes().split(b'\0') if item]
+  executable=(process/'exe').resolve()
+  if provider=='codex' and executable.name=='codex' and 'app-server' in argv or provider=='opencode' and executable.name=='opencode' and 'serve' in argv:
+   environment=dict(item.decode().split('=',1) for item in (process/'environ').read_bytes().split(b'\0') if b'=' in item)
+   if process.stat().st_uid!=65534:raise RuntimeError('native child UID differs')
+   matches.append((process,executable,environment))
+ except (OSError,ValueError):continue
+assert len(matches)==1
+process,executable,environment=matches[0]
+ca=pathlib.Path(environment.get('SSL_CERT_FILE') or environment['NODE_EXTRA_CA_CERTS']);context=ssl.create_default_context(cafile=str(ca))
+proxy=environment.get('HTTPS_PROXY') or environment.get('https_proxy')
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),urllib.request.HTTPSHandler(context=context))
+with opener.open(urllib.request.Request('https://chatgpt.com/backend-api/codex/models?client_version=0.147.0',headers={'Authorization':'Bearer onecli-managed'}),timeout=20) as response:status=response.status;response.read()
+home=pathlib.Path(environment['HOME']);profiles=[]
+for name in (['.codex/config.toml'] if provider=='codex' else ['.config/opencode/opencode.json','.config/opencode/opencode.jsonc']):
+ file=home/name;profiles.append({'path':name,'sha256':hashlib.sha256(file.read_bytes()).hexdigest() if file.exists() else None})
+profile_hash=hashlib.sha256(json.dumps(profiles,sort_keys=True).encode()).hexdigest()
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(row.split()[1] for row in pathlib.Path('/proc/self/status').read_text().splitlines() if row.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativeCwd':str((process/'cwd').resolve()),'nativeVersion':subprocess.check_output([str(executable),'--version'],env=environment,text=True,timeout=15).strip(),'executableSha256':hashlib.sha256(executable.read_bytes()).hexdigest(),'profileSha256':profile_hash,'profileFiles':profiles,'activeNativeProcesses':len(matches),'nativePid':int(process.name),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest()}))
+`
 
 async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervisor: Awaited<ReturnType<RuntimeHarness['startSupervisor']>>,
   request: any, caseId: string, scenario: string, settings: unknown, sdkForkImage = false): Promise<NativeExperimentOriginal> {
