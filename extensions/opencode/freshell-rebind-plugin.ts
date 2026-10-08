@@ -84,6 +84,7 @@ export interface EmitterDeps {
 }
 
 type NativeRefusalReason = 'tui_not_ready' | 'route_not_selected' | 'tui_root_not_loaded'
+  | 'tui_session_api_unavailable'
   | 'native_api_unavailable' | 'native_root_load_failed' | 'native_history_load_failed'
   | 'tui_context_changed' | 'revert_not_hydrated' | 'history_not_hydrated'
   | 'empty_history_not_hydrated' | 'tail_not_hydrated' | 'parts_not_hydrated'
@@ -495,9 +496,11 @@ export function createObservationEmitter(
       if (currentRouteSessionId(api.route?.current) !== current.rootSessionId) return refuse(current, 'route_not_selected')
       if (
         typeof sessionState?.get !== 'function' ||
-        typeof sessionState.messages !== 'function' ||
-        !sessionIsExactRoot(sessionState.get(current.rootSessionId), current.rootSessionId)
+        typeof sessionState.messages !== 'function'
       ) {
+        return refuse(current, 'tui_session_api_unavailable')
+      }
+      if (!sessionIsExactRoot(sessionState.get(current.rootSessionId), current.rootSessionId)) {
         return refuse(current, 'tui_root_not_loaded')
       }
 

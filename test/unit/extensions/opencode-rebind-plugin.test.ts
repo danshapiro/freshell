@@ -214,6 +214,20 @@ describe('createObservationEmitter', () => {
 
   beforeEach(() => writes.splice(0))
 
+  it.each(['get', 'messages'])('distinguishes an unavailable TUI session %s API from an unloaded root', async (method) => {
+    const refusal = vi.fn()
+    const api = makeApi() as any
+    delete api.state.session[method]
+    await createObservationEmitter({ ...deps(), onRefusal: refusal })(api)
+    expect(refusal).toHaveBeenCalledOnce()
+    expect(refusal.mock.calls[0][0]).toMatchObject({
+      reason: 'tui_session_api_unavailable', nativeSessionId: rootSessionId,
+      incarnationId, launchNonce, evidenceGeneration,
+    })
+    expect(writes).toHaveLength(0)
+    expect(JSON.stringify(refusal.mock.calls)).not.toContain('private')
+  })
+
   it.each(['not-ready', 'root-load', 'history-load', 'tail', 'parts'])('records a bounded body-free current native refusal (%s)', async (fault) => {
     const refusal = vi.fn()
     const emit = createObservationEmitter({ ...deps(), onRefusal: refusal })
