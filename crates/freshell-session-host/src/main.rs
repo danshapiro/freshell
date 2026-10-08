@@ -2001,15 +2001,39 @@ fn refresh_provider_config_references(
     run_as_gid: u32,
 ) -> Result<(), String> {
     context.validate(provider).map_err(|error| error.message)?;
-    let stage =
-        if run_as_uid == unsafe { libc::geteuid() } && run_as_gid == unsafe { libc::getegid() } {
-            tempfile::Builder::new()
-                .prefix(".freshell-provider-refresh-")
-                .tempdir_in(provider_home)
-        } else {
-            tempfile::tempdir()
-        }
+    if run_as_uid != unsafe { libc::geteuid() } || run_as_gid != unsafe { libc::getegid() } {
+        return refresh_provider_config_as_provider(
+            context,
+            provider,
+            workspace,
+            user_provider_root,
+            provider_home,
+            run_as_uid,
+            run_as_gid,
+        );
+    }
+    let stage = tempfile::Builder::new()
+        .prefix(".freshell-provider-refresh-")
+        .tempdir_in(provider_home)
         .map_err(|error| error.to_string())?;
+    refresh_provider_config_in_stage(
+        context,
+        provider,
+        workspace,
+        user_provider_root,
+        provider_home,
+        stage,
+    )
+}
+
+fn refresh_provider_config_in_stage(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    provider: &str,
+    workspace: &Path,
+    user_provider_root: &Path,
+    provider_home: &Path,
+    stage: tempfile::TempDir,
+) -> Result<(), String> {
     let projection = stage.path().join("projection");
     std::fs::create_dir(&projection).map_err(|error| error.to_string())?;
     copy_provider_config_references_with_ownership(
@@ -2055,25 +2079,152 @@ fn refresh_provider_config_references(
     .map_err(|_| "resource mountpoint metadata profile exceeded")?;
     std::fs::write(stage.path().join("resource-mountpoints.json"), mounted)
         .map_err(|_| "resource mountpoint metadata write failed")?;
-    allow_provider_read_stage(stage.path(), run_as_gid)?;
-    if run_as_uid == unsafe { libc::geteuid() } && run_as_gid == unsafe { libc::getegid() } {
-        return apply_staged_provider_config(stage.path(), provider_home);
-    }
+    allow_provider_read_stage(stage.path(), unsafe { libc::getegid() })?;
+    apply_staged_provider_config(stage.path(), provider_home)
+}
+
+fn refresh_provider_config_as_provider(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    provider: &str,
+    workspace: &Path,
+    user_provider_root: &Path,
+    provider_home: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<(), String> {
+    use std::io::{Seek, Write};
+    // Only bounded control metadata uses temporary memory. The child performs
+    // the complete ordinary transaction on disk as the actual provider UID.
+    let bytes = freshell_runtime_protocol::bounded_json_bytes(
+        context,
+        freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+    )
+    .map_err(|_| "provider-owned refresh control metadata exceeds its profile")?;
+    let mut input = tempfile::tempfile().map_err(|_| "provider-owned refresh input unavailable")?;
+    input
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .and_then(|()| input.write_all(&bytes))
+        .and_then(|()| input.rewind())
+        .map_err(|_| "provider-owned refresh input incomplete")?;
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let status = std::process::Command::new("/usr/bin/setpriv")
-        .args(provider_identity_args(run_as_uid, run_as_gid))
+    let transaction = uuid::Uuid::new_v4().to_string();
+    let stage = provider_home.join(format!(".freshell-provider-refresh-{transaction}"));
+    let mut child = std::process::Command::new("/usr/bin/setpriv")
+        .args(provider_identity_args(uid, gid))
         .arg(exe)
         .arg("refresh-provider-config")
-        .arg(stage.path())
+        .arg("--prepare")
+        .arg(provider)
+        .arg(workspace)
+        .arg(user_provider_root)
         .arg(provider_home)
-        .status()
+        .arg(&transaction)
+        .env_clear()
+        .stdin(std::process::Stdio::from(input))
+        .stdout(std::process::Stdio::null())
+        .spawn()
         .map_err(|error| format!("provider-owned config refresh failed to start: {error}"))?;
+    let status = wait_for_provider_config_refresh(
+        &mut child,
+        provider,
+        uid,
+        gid,
+        std::time::Duration::from_secs(25),
+        &stage,
+    )?;
     if status.success() {
         Ok(())
     } else {
         Err(format!(
             "provider-owned config refresh failed with status {status}"
         ))
+    }
+}
+
+fn wait_for_provider_config_refresh(
+    child: &mut std::process::Child,
+    provider: &str,
+    uid: u32,
+    gid: u32,
+    timeout: std::time::Duration,
+    stage: &Path,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                cleanup_provider_refresh_stage(stage, uid, gid)?;
+                return Ok(status);
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => {
+                tracing::warn!(event="provider.inputs.refresh.completion_unavailable", provider, stage="session_host", "Provider-owned ordinary refresh wait ownership was not confirmed; retain inputs and repair");
+                return Err("provider-owned config refresh completion unavailable; retain inputs and repair".into());
+            }
+            Ok(None) => {
+                // The restricted root host has no CAP_KILL. Signal only this
+                // unreaped child through its existing provider identity.
+                let pid = child.id().to_string();
+                let termination =
+                    run_provider_refresh_cleanup(uid, gid, "/usr/bin/kill", &["-KILL", "--", &pid]);
+                let cleanup_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            cleanup_provider_refresh_stage(stage, uid, gid)?;
+                            break;
+                        }
+                        Ok(None) if std::time::Instant::now() < cleanup_deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        _ => {
+                            tracing::warn!(event="provider.inputs.refresh.cleanup_failed", provider, stage="session_host", worker_pid=%pid, termination_succeeded=termination.is_ok(), "Provider-owned ordinary refresh join was not confirmed");
+                            return Err("provider-owned config refresh cleanup unavailable; retain inputs and repair".into());
+                        }
+                    }
+                }
+                return Err(
+                    "provider-owned config refresh timed out; retain inputs and retry".into(),
+                );
+            }
+        }
+    }
+}
+
+fn cleanup_provider_refresh_stage(stage: &Path, uid: u32, gid: u32) -> Result<(), String> {
+    let stage = stage
+        .to_str()
+        .ok_or("provider refresh transaction path is not UTF-8")?;
+    // This path is one newly generated transaction, never an accepted provider
+    // projection. The UID worker is joined before its directory can be removed.
+    run_provider_refresh_cleanup(uid, gid, "/usr/bin/rm", &["-rf", "--", stage]).map_err(|_| {
+        "provider-owned refresh transaction cleanup unavailable; retain inputs and repair".into()
+    })
+}
+
+fn run_provider_refresh_cleanup(
+    uid: u32,
+    gid: u32,
+    program: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    let status = std::process::Command::new("/usr/bin/setpriv")
+        .args(provider_identity_args(uid, gid))
+        .args(["/usr/bin/timeout", "--kill-after=1s", "4s", program])
+        .args(args)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|_| "provider refresh cleanup failed to start")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("provider refresh cleanup failed or timed out".into())
     }
 }
 
@@ -2123,6 +2274,59 @@ fn allow_provider_read_stage(path: &Path, gid: u32) -> Result<(), String> {
 }
 
 fn refresh_provider_config_worker(args: &[String]) -> Result<(), String> {
+    if args.len() == 6 && args[0] == "--prepare" {
+        use std::io::Read;
+        let mut input = std::io::stdin().lock();
+        let mut header = [0; 4];
+        input
+            .read_exact(&mut header)
+            .map_err(|_| "provider refresh control header unavailable")?;
+        let length = u32::from_be_bytes(header) as usize;
+        if length > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES {
+            return Err("provider refresh control metadata exceeds its profile".into());
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| "provider refresh control allocation unavailable")?;
+        bytes.resize(length, 0);
+        input
+            .read_exact(&mut bytes)
+            .map_err(|_| "provider refresh control input incomplete")?;
+        let mut trailing = [0];
+        if input
+            .read(&mut trailing)
+            .map_err(|_| "provider refresh control completion unavailable")?
+            != 0
+        {
+            return Err("provider refresh control input has trailing metadata".into());
+        }
+        let context: freshell_runtime_protocol::ProviderLaunchContext =
+            serde_json::from_slice(&bytes)
+                .map_err(|_| "provider refresh control metadata invalid")?;
+        context.validate(&args[1]).map_err(|error| error.message)?;
+        let transaction =
+            uuid::Uuid::parse_str(&args[5]).map_err(|_| "provider refresh transaction invalid")?;
+        if transaction.get_version_num() != 4 || transaction.to_string() != args[5] {
+            return Err("provider refresh transaction invalid".into());
+        }
+        let name = format!(".freshell-provider-refresh-{transaction}");
+        let stage = tempfile::Builder::new()
+            .prefix(&name)
+            .rand_bytes(0)
+            .tempdir_in(&args[4])
+            .map_err(|error| {
+                format!("provider refresh transaction creation unavailable: {error}")
+            })?;
+        return refresh_provider_config_in_stage(
+            &context,
+            &args[1],
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+            Path::new(&args[4]),
+            stage,
+        );
+    }
     if args.len() != 2 {
         return Err("refresh-provider-config requires stage and provider home".into());
     }
@@ -4279,6 +4483,166 @@ mod tests {
             .unwrap()
             .contains("repair"));
         assert!(event["elapsed_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn provider_config_worker_timeout_removes_owned_stage_after_join() {
+        use super::*;
+        use std::time::{Duration, Instant};
+        const STAGE_ENV: &str = "FRESHELL_TEST_PROVIDER_REFRESH_STAGE";
+        if let Some(stage) = std::env::var_os(STAGE_ENV) {
+            let stage = PathBuf::from(stage);
+            std::fs::create_dir(&stage).unwrap();
+            std::fs::write(stage.join("partial"), b"selected ordinary resource").unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join(format!(
+            ".freshell-provider-refresh-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let retained = root.path().join("retained-state");
+        std::fs::write(&retained, b"previous accepted projection").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::provider_config_worker_timeout_removes_owned_stage_after_join",
+            ])
+            .env(STAGE_ENV, &stage)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !stage.join("partial").is_file() {
+            if Instant::now() >= ready_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("owned worker did not create its transaction stage");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        let error = wait_for_provider_config_refresh(
+            &mut child,
+            "claude",
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            Duration::from_millis(30),
+            &stage,
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "owned worker must be joined"
+        );
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert_eq!(
+            std::fs::read(retained).unwrap(),
+            b"previous accepted projection"
+        );
+        assert!(
+            !stage.exists(),
+            "joined timed-out worker left an ordinary transaction stage"
+        );
+    }
+
+    #[test]
+    fn provider_config_worker_unconfirmed_termination_preserves_stage() {
+        use super::*;
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join(format!(
+            ".freshell-provider-refresh-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let retained = root.path().join("retained-state");
+        std::fs::write(&retained, b"previous accepted projection").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::provider_config_worker_timeout_removes_owned_stage_after_join",
+            ])
+            .env("FRESHELL_TEST_PROVIDER_REFRESH_STAGE", &stage)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !stage.join("partial").is_file() {
+            if Instant::now() >= ready_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("owned worker did not create its transaction stage");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        // The strict sandbox user cannot adopt this different UID. Exercise a
+        // real failed signal operation, rather than mocking a joined worker.
+        let outcome = wait_for_provider_config_refresh(
+            &mut child,
+            "claude",
+            unsafe { libc::geteuid() } + 1,
+            unsafe { libc::getegid() },
+            Duration::from_millis(30),
+            &stage,
+        );
+        let elapsed = started.elapsed();
+        let worker_alive = child.try_wait().unwrap().is_none();
+        let stage_retained = stage.join("partial").is_file();
+        let accepted = std::fs::read(&retained).unwrap();
+        // The test itself owns the exact child and can signal it as its actual
+        // UID. Join before assertions even when the production outcome is wrong.
+        if worker_alive {
+            child.kill().unwrap();
+        }
+        child.wait().unwrap();
+        let error = outcome.unwrap_err();
+        assert!(error.contains("cleanup unavailable"), "{error}");
+        assert!(worker_alive, "unconfirmed worker must remain observable");
+        assert!(stage_retained, "unconfirmed worker inputs must be retained");
+        assert_eq!(accepted, b"previous accepted projection");
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "uncertain cleanup must settle finitely"
+        );
+    }
+
+    #[test]
+    fn provider_config_worker_lost_wait_ownership_returns_incomplete_evidence() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join(format!(
+            ".freshell-provider-refresh-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("retained"), b"uncertain ordinary transaction").unwrap();
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let mut exit = 0;
+        // Reap only the child this test created, through another real waiter.
+        // The Child handle can no longer prove that its old PID is owned.
+        assert_eq!(
+            unsafe { libc::waitpid(child.id() as libc::pid_t, &mut exit, 0) },
+            child.id() as libc::pid_t
+        );
+        let error = wait_for_provider_config_refresh(
+            &mut child,
+            "claude",
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            std::time::Duration::from_millis(30),
+            &stage,
+        )
+        .unwrap_err();
+        assert!(error.contains("completion unavailable"), "{error}");
+        assert_eq!(
+            std::fs::read(stage.join("retained")).unwrap(),
+            b"uncertain ordinary transaction"
+        );
     }
 
     #[test]

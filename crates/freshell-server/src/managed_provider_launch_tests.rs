@@ -999,6 +999,10 @@ async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prep
     .unwrap();
     std::fs::write(plugin.join("skills/probe/SKILL.md"),"---\nname: closed-plugin-probe\ndescription: selected complete native plugin\n---\nUse the adjacent resources.\n").unwrap();
     std::fs::write(plugin.join("scripts/resource"), b"closed-claude-resource").unwrap();
+    // Ordinary selected resources must use their disk budget, not the
+    // workload's deliberately small temporary-memory filesystem.
+    let disk_resource = vec![0x5a; 128 * 1024 * 1024];
+    std::fs::write(plugin.join("scripts/disk-resource"), &disk_resource).unwrap();
     std::fs::write(
         plugin.join("scripts/node_modules/probe-dependency/index.js"),
         "module.exports='closed-claude-dependency'\n",
@@ -1021,7 +1025,8 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
  const endpoint=process.env.FRESHELL_URL,token=process.env.FRESHELL_TOKEN;
  const authenticated=await new Promise(resolve=>{if(!endpoint||!token)return resolve(false);const req=http.request(new URL('/api/mcp',endpoint),{method:'POST',headers:{'x-auth-token':token}},res=>{res.resume();resolve(res.statusCode===200)});req.on('error',()=>resolve(false));req.end('{}')});
  const record={hook:input.hook_event_name==='SessionStart',physicalHome:process.env.HOME,nativeIdentity:{uid:process.getuid(),euid:process.geteuid(),gid:process.getgid(),egid:process.getegid(),groups:[...new Set([...process.getgroups(),process.getegid()])].sort((a,b)=>a-b)},settings:['closed-selected-settings','closed-explicit-settings'].includes(process.env.CLAUDE_SELECTED_NONCE),authenticated,scopedAlias:process.env.FRESHELL==='1',onecli:hash(process.env.ANTHROPIC_API_KEY||'')===process.argv[3],
- memory:hash(fs.readFileSync(path.join(process.env.HOME,'.claude/CLAUDE.md'))),skill:hash(fs.readFileSync(path.join(root,'skills/probe/SKILL.md'))),resource:hash(require('node:child_process').execFileSync(path.join(__dirname,'run'))),dependency:hash(require('probe-dependency'))};
+ refreshStageAbsent:fs.readdirSync(process.env.HOME).every(name=>!name.startsWith('.freshell-provider-refresh-')),
+ memory:hash(fs.readFileSync(path.join(process.env.HOME,'.claude/CLAUDE.md'))),skill:hash(fs.readFileSync(path.join(root,'skills/probe/SKILL.md'))),resource:hash(require('node:child_process').execFileSync(path.join(__dirname,'run'))),diskResource:hash(fs.readFileSync(path.join(__dirname,'disk-resource'))),dependency:hash(require('probe-dependency'))};
  fs.writeFileSync(process.argv[2],JSON.stringify(record));
 });
 "#;
@@ -1457,7 +1462,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         .ok()
     }
     let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-    let expected = json!({"hook":true,"physicalHome":"/home/freshell/provider","nativeIdentity":terminal_identity,"settings":true,"authenticated":true,"scopedAlias":true,"onecli":true,"memory":hash(&memory),"skill":hash(std::fs::read(plugin.join("skills/probe/SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")});
+    let expected = json!({"hook":true,"physicalHome":"/home/freshell/provider","nativeIdentity":terminal_identity,"settings":true,"authenticated":true,"scopedAlias":true,"onecli":true,"refreshStageAbsent":true,"memory":hash(&memory),"skill":hash(std::fs::read(plugin.join("skills/probe/SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-claude-resource"),"diskResource":hash(&disk_resource),"dependency":hash(b"closed-claude-dependency")});
     let imported_bytes = std::fs::read(home.join("imported-memory.md")).unwrap();
     let mut expected_imports = serde_json::Map::new();
     expected_imports.insert("imported-memory.md".into(), json!(hash(&imported_bytes)));
