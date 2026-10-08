@@ -341,6 +341,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await rig.restartSupervisor()
       const { controllerHealth, startupFinished, controllerReady } = await rig.freshCodexControllerStartupFacts(rig.exactRuntimeHandle(view))
       const reattached = (await rig.inventory()).find((row) => row.soulId === view.soulId)
+      if (!reattached) throw new Error('original managed soul was not reattached by its controller')
       expect(reattached).toMatchObject({ soulId: view.soulId, containerId: view.containerId,
         incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId,
         desiredState: 'running', launchState: 'running', recoveryState: 'live' })
@@ -363,7 +364,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const controllerReattachment = { oldControllerId, currentControllerId: (await rig.ownershipFacts()).supervisorContainerId,
         oldControlEpoch, currentControlEpoch: controllerReady.data.controlEpoch, controllerRestartStartedAt,
         controllerReady, startupFinished, reattached, completedAt: Date.now() }
-      rig.runtime.recordLifecycle('browser.owned_controller_reattached', controllerReattachment)
+      await rig.recordFreshCodexControllerReattachment(rig.exactRuntimeHandle(view), controllerReattachment)
       // The observer sleeps first, after startup reconciliation finishes.
       const firstObservationNotBefore = startupFinished.at + observerIntervalMs
       const holdRequestedAt = Date.now()

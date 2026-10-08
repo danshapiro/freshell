@@ -18,7 +18,7 @@ import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, R
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema, Phase4BrowserObservationSchema,
-  FreshCodexHistoryMeasurementFinishSchema, FreshCodexHistoryMeasurementStartSchema, FreshCodexSavedHistoryOwnershipFactsSchema, FreshCodexControllerStartupFactsSchema, FreshCodexRetainedSnapshotFactsSchema, FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHostProcessStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
+  FreshCodexControllerReattachmentSchema, FreshCodexHistoryMeasurementFinishSchema, FreshCodexHistoryMeasurementStartSchema, FreshCodexSavedHistoryOwnershipFactsSchema, FreshCodexControllerStartupFactsSchema, FreshCodexRetainedSnapshotFactsSchema, FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHostProcessStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
   RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
   RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
   OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, OpencodeLossRecoverySchema,
@@ -41,7 +41,7 @@ import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
-import type { FreshCodexHistoryMeasurementFinish, FreshCodexHistoryMeasurementStart, FreshCodexSavedHistoryOwnershipFacts, RuntimeHostProcessState, FreshCodexControllerStartupFacts, FreshCodexRetainedSnapshotFacts, Phase4BrowserObservation, Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
+import type { FreshCodexControllerReattachment, FreshCodexHistoryMeasurementFinish, FreshCodexHistoryMeasurementStart, FreshCodexSavedHistoryOwnershipFacts, RuntimeHostProcessState, FreshCodexControllerStartupFacts, FreshCodexRetainedSnapshotFacts, Phase4BrowserObservation, Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
 import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts, RuntimeChaosReceiptArtifact } from './runtime-sandbox.js'
 import type { OpencodeLossCredentialEvidence, OpencodeLossAbsenceEvidence, OpencodeLossRecovery, OpencodeLossIncidentEvidence } from './runtime-sandbox.js'
 import type { RuntimeLossAssertions, RuntimeLossAssertionsArtifact, RuntimeLossReceiptArtifact } from './runtime-sandbox.js'
@@ -724,7 +724,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'historyControllerReattachment' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -816,6 +816,9 @@ export class ExternalManagedRuntimeRig {
     if (!view.containerId || !/^[a-f0-9]{64}$/.test(view.containerId) || !view.hostBootId || !view.nativeSessionId) throw new Error('exact current runtime address required')
     return { runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, soulId: view.soulId,
       incarnationId: view.incarnationId, containerId: view.containerId, hostBootId: view.hostBootId, nativeSessionId: view.nativeSessionId }
+  }
+  async recordFreshCodexControllerReattachment(handle: ExactRuntimeHandle, historyControllerReattachment: FreshCodexControllerReattachment): Promise<void> {
+    await this.rpc('freshcodex-controller-reattachment', z.object({ completed: z.literal(true) }).strict(), { handle, historyControllerReattachment })
   }
   async finishFreshCodexSavedHistoryMeasurement(enclosure: RuntimeEnclosureHandle, historyMeasurementFinish: FreshCodexHistoryMeasurementFinish): Promise<void> {
     await this.rpc('freshcodex-history-measurement-finish', z.object({ completed: z.literal(true) }).strict(), { enclosure, historyMeasurementFinish })
@@ -1455,6 +1458,11 @@ export function createExternalRuntimeControl(
         result = await owner.publishPhase3BrowserReceipt(handle(), request.phase3Browser)
         break
       case 'crash-provider-worker': await owner.crashProviderWorker(handle()); result = { completed: true }; break
+      case 'freshcodex-controller-reattachment':
+        if (!request.historyControllerReattachment) throw new Error('closed controller reattachment observation required')
+        await owner.recordFreshCodexControllerReattachment(handle(), request.historyControllerReattachment)
+        result = { completed: true }
+        break
       case 'freshcodex-history-measurement-finish':
         if (!request.enclosure || !request.historyMeasurementFinish) throw new Error('recorded enclosure and closed saved-history completion timing required')
         await owner.finishFreshCodexSavedHistoryMeasurement(request.enclosure, request.historyMeasurementFinish)

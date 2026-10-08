@@ -950,6 +950,20 @@ export const FreshCodexControllerStartupFactsSchema = z.object({
     data: z.object({ controlEpoch: z.number().int().nonnegative(), installationId: z.string() }) }),
 }).strict()
 export type FreshCodexControllerStartupFacts = z.infer<typeof FreshCodexControllerStartupFactsSchema>
+export type FreshCodexControllerReattachment = {
+  oldControllerId: string; currentControllerId: string; oldControlEpoch: number; currentControlEpoch: number
+  controllerRestartStartedAt: number; completedAt: number; reattached: ManagedRuntimeView
+  controllerReady: FreshCodexControllerStartupFacts['controllerReady']
+  startupFinished: FreshCodexControllerStartupFacts['startupFinished']
+}
+export const FreshCodexControllerReattachmentSchema: z.ZodType<FreshCodexControllerReattachment> = z.object({
+  oldControllerId: z.string().regex(/^[a-f0-9]{64}$/), currentControllerId: z.string().regex(/^[a-f0-9]{64}$/),
+  oldControlEpoch: z.number().int().nonnegative(), currentControlEpoch: z.number().int().nonnegative(),
+  controllerRestartStartedAt: z.number(), completedAt: z.number(),
+  controllerReady: FreshCodexControllerStartupFactsSchema.shape.controllerReady,
+  startupFinished: FreshCodexControllerStartupFactsSchema.shape.startupFinished,
+  reattached: ManagedRuntimeSoulSchema.partial().required({ soulId: true, incarnationId: true, launchState: true, intentRevision: true }).strict(),
+}).strict()
 export const FreshCodexRetainedSnapshotFactsSchema = z.object({
   threadId: z.string(), bytes: z.number().int().nonnegative(), turnCount: z.number().int().nonnegative(),
   firstTurnId: z.string().nullable(), lastTurnId: z.string().nullable(), firstAnswerMatches: z.boolean(),
@@ -1090,7 +1104,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-measurement-finish', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-controller-reattachment', 'freshcodex-history-measurement-finish', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
     'provider-volume', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
@@ -1136,6 +1150,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   phase4Browser: Phase4BrowserObservationSchema.optional(),
   historyMeasurementStart: FreshCodexHistoryMeasurementStartSchema.optional(),
   historyMeasurementFinish: FreshCodexHistoryMeasurementFinishSchema.optional(),
+  historyControllerReattachment: FreshCodexControllerReattachmentSchema.optional(),
   chaosLogs: RuntimeChaosLogsSchema.optional(),
   chaosEvidence: RuntimeChaosEvidenceSchema.optional(),
   lossAssertions: RuntimeLossAssertionsSchema.optional(),
@@ -4313,6 +4328,28 @@ export class ManagedRuntimeOwner {
     await this.assertCurrentHandle(handle)
     const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
     if (row?.provider !== 'codex' || row.freshAgentSessionType !== 'freshcodex') throw new Error('exact fresh Codex history fixture required')
+  }
+
+  async recordFreshCodexControllerReattachment(handle: ExactRuntimeHandle, input: FreshCodexControllerReattachment): Promise<void> {
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    const data = FreshCodexControllerReattachmentSchema.parse(input)
+    if (data.currentControllerId !== this.supervisor.containerId || data.currentControllerId === data.oldControllerId
+      || data.currentControlEpoch !== data.controllerReady.data.controlEpoch || data.currentControlEpoch <= data.oldControlEpoch
+      || data.reattached.soulId !== handle.soulId || data.reattached.incarnationId !== handle.incarnationId
+      || data.reattached.containerId !== handle.containerId || data.reattached.hostBootId !== handle.hostBootId
+      || data.reattached.nativeSessionId !== handle.nativeSessionId) throw new Error('exact observed controller and reattached runtime required')
+    const lifecycle = await this.readOwnedLifecycle()
+    const controllerReady = lifecycle.filter(event => event.event === data.controllerReady.event && event.at === data.controllerReady.at).at(-1)
+    const startupFinished = lifecycle.filter(event => event.event === data.startupFinished.event && event.at === data.startupFinished.at).at(-1)
+    const observed = FreshCodexControllerStartupFactsSchema.pick({ controllerReady: true, startupFinished: true }).parse({ controllerReady, startupFinished })
+    const ready = observed.controllerReady.data, startup = observed.startupFinished.data
+    if (ready.controlEpoch !== data.controllerReady.data.controlEpoch || ready.installationId !== data.controllerReady.data.installationId
+      || startup.scanned !== data.startupFinished.data.scanned
+      || startup.blockedSubsystems.length !== data.startupFinished.data.blockedSubsystems.length
+      || startup.blockedSubsystems.some((value, index) => value !== data.startupFinished.data.blockedSubsystems[index])) {
+      throw new Error('controller startup observation differs from its owned lifecycle')
+    }
+    this.runtime.recordLifecycle('browser.owned_controller_reattached', { ...data, controllerReady, startupFinished })
   }
 
   async finishFreshCodexSavedHistoryMeasurement(enclosure: RuntimeEnclosureHandle, input: FreshCodexHistoryMeasurementFinish): Promise<void> {

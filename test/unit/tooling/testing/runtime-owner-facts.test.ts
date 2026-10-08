@@ -439,6 +439,56 @@ describe('fixed saved-history measurement completion', () => {
   })
 })
 
+describe('fixed saved-history controller reattachment lifecycle', () => {
+  it('records original reattachment metadata with its complete private startup events', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-controller-reattach-'))
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused reattachment web') }, process.cwd(), 3,
+      {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    const reattached = { ...current, provider: 'codex', freshAgentSessionType: 'freshcodex', launchState: 'running', intentRevision: 1 }
+    vi.spyOn(rig, 'inventory').mockResolvedValue([reattached])
+    Object.assign(rig, { supervisor: { runtimeRoot: path.join(root, 'runtime'), containerId: 'c'.repeat(64) } })
+    const record = vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const startupFinished = { event: 'supervisor.startup_scan.finished', at: 100, data: { scanned: 1, blockedSubsystems: [] } }
+    const controllerReady = { event: 'supervisor.ready', at: 101, data: { controlEpoch: 17, installationId: 'owned-installation' } }
+    const privateReady = { ...controllerReady, data: { ...controllerReady.data, privateStartupDiagnostic: 'owner-only metadata' } }
+    const file = path.join(root, 'evidence', 'lifecycle.jsonl')
+    await fsp.mkdir(path.dirname(file), { recursive: true })
+    await fsp.writeFile(file, `${JSON.stringify(startupFinished)}\n${JSON.stringify(privateReady)}\n`)
+    const input: owner.FreshCodexControllerReattachment = { oldControllerId: 'b'.repeat(64), currentControllerId: 'c'.repeat(64),
+      oldControlEpoch: 16, currentControlEpoch: 17, controllerRestartStartedAt: 99, controllerReady, startupFinished,
+      reattached: { soulId: current.soulId, incarnationId: current.incarnationId, containerId: current.containerId,
+        hostBootId: current.hostBootId, nativeSessionId: current.nativeSessionId, intentRevision: 1, launchState: 'running',
+        provider: 'codex', freshAgentSessionType: 'freshcodex' }, completedAt: 102 }
+    try {
+      await rig.recordFreshCodexControllerReattachment(current, input)
+      expect(record).toHaveBeenCalledExactlyOnceWith('browser.owned_controller_reattached', { ...input, controllerReady: privateReady })
+      const descriptor = external.resolveManagedExternalDescriptor({ FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+        FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws', FRESHELL_E2E_TARGET_TOKEN: 'private-token',
+        FRESHELL_RUNTIME_EXTERNAL_RUN_ID: rig.runtime.runId, FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: rig.runtime.candidateSha })!
+      const control = external.createExternalRuntimeControl(rig, descriptor)
+      const replies: unknown[] = []
+      const remote = new external.ExternalManagedRuntimeRig(descriptor, async (_url, init) => {
+        const reply = await control(JSON.parse(String(init?.body)))
+        replies.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      await remote.recordFreshCodexControllerReattachment(current, input)
+      expect(JSON.stringify(replies)).not.toContain('owner-only metadata')
+      expect(record).toHaveBeenNthCalledWith(2, 'browser.owned_controller_reattached', { ...input, controllerReady: privateReady })
+      await expect(rig.recordFreshCodexControllerReattachment(current, { ...input,
+        controllerReady: { ...controllerReady, data: { ...controllerReady.data, installationId: 'foreign-installation' } } })).rejects.toThrow(/owned lifecycle/)
+      await expect(rig.recordFreshCodexControllerReattachment(current, { ...input,
+        reattached: { ...input.reattached, nativeSessionId: 'foreign-root' } })).rejects.toThrow(/reattached/)
+
+      await expect(rig.recordFreshCodexControllerReattachment(current, { ...input, currentControllerId: 'd'.repeat(64) })).rejects.toThrow(/controller/)
+      await expect(rig.recordFreshCodexControllerReattachment(current, { ...input, reattached: { ...input.reattached, transcript: 'private text' } })).rejects.toThrow()
+      expect(record).toHaveBeenCalledTimes(2)
+    } finally { await fsp.rm(root, { recursive: true, force: true }) }
+  })
+})
+
 describe('finite Phase 4 browser receipt publication', () => {
   it('writes the existing observation privately on its owner and refuses worker paths or transcript fields', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-phase4-receipt-'))
