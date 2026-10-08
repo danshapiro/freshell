@@ -1,6 +1,8 @@
 //! Finite Claude source roots enter the same ordinary resource graph as Codex.
 use super::ordinary_stage::{prepare_selected, Preparation};
-use freshell_platform::claude_inputs::{ClaudeInputManifest, ClaudeSettingSource};
+use freshell_platform::claude_inputs::{
+    observation::NativeObservation, ClaudeInputManifest, ClaudeSettingSource,
+};
 use std::path::{Path, PathBuf};
 
 const RESOURCE_DIRECTORIES: &[&str] = &[
@@ -14,11 +16,47 @@ const RESOURCE_DIRECTORIES: &[&str] = &[
     "routines",
 ];
 
+pub(super) fn prepare_with_native_observation(
+    home: &Path,
+    cwd: &Path,
+    workspace: &Path,
+    accepted: &ClaudeInputManifest,
+    observation: &NativeObservation,
+    excluded: &[PathBuf],
+) -> Result<Preparation, String> {
+    observation.validate()?;
+    if Some(observation.native_source_runtime) != accepted.native_source_runtime
+        || observation.setting_sources != accepted.setting_sources
+        || std::fs::canonicalize(cwd).ok().as_ref() != Some(&observation.cwd)
+    {
+        return Err("Claude native source observation does not match the selected launch; retain inputs and reprepare".into());
+    }
+    prepare_selected_sources(
+        home,
+        cwd,
+        workspace,
+        Some(accepted),
+        Some(observation),
+        excluded,
+    )
+}
+
 pub(super) fn prepare(
     home: &Path,
     cwd: &Path,
     workspace: &Path,
     accepted: Option<&ClaudeInputManifest>,
+    excluded: &[PathBuf],
+) -> Result<Preparation, String> {
+    prepare_selected_sources(home, cwd, workspace, accepted, None, excluded)
+}
+
+fn prepare_selected_sources(
+    home: &Path,
+    cwd: &Path,
+    workspace: &Path,
+    accepted: Option<&ClaudeInputManifest>,
+    observation: Option<&NativeObservation>,
     excluded: &[PathBuf],
 ) -> Result<Preparation, String> {
     let mut manifest = accepted.cloned().unwrap_or_else(|| ClaudeInputManifest {
@@ -52,7 +90,11 @@ pub(super) fn prepare(
         manifest.settings_origin = Some(origin.clone());
         configurations.push((origin.clone(), origin));
     }
-    let native_cwd = std::fs::canonicalize(&manifest.cwd).unwrap_or_else(|_| manifest.cwd.clone());
+    let native_cwd = observation
+        .map(|observed| observed.cwd.clone())
+        .unwrap_or_else(|| {
+            std::fs::canonicalize(&manifest.cwd).unwrap_or_else(|_| manifest.cwd.clone())
+        });
     let mut bases: Vec<PathBuf> = native_cwd
         .ancestors()
         .filter(|path| path.parent().is_some())
@@ -70,7 +112,9 @@ pub(super) fn prepare(
     let local_enabled = manifest
         .setting_sources
         .contains(&ClaudeSettingSource::Local);
-    let roots = if project_enabled {
+    let roots = if let Some(observed) = observation {
+        observed.roots.clone()
+    } else if project_enabled {
         freshell_platform::claude_inputs::git::roots(
             &native_cwd,
             manifest
@@ -112,14 +156,20 @@ pub(super) fn prepare(
     }
     let mut settings = Vec::new();
     if project_enabled {
-        settings.push(manifest.cwd.join(".claude/settings.json"));
+        settings.push(native_cwd.join(".claude/settings.json"));
     }
     if local_enabled {
-        settings.push(manifest.cwd.join(".claude/settings.local.json"));
-        settings.push(manifest.workspace.join(".claude/settings.local.json"));
+        if let Some(observed) = observation {
+            settings.extend(observed.local_settings.iter().cloned());
+        } else {
+            settings.push(manifest.cwd.join(".claude/settings.local.json"));
+            settings.push(manifest.workspace.join(".claude/settings.local.json"));
+        }
     }
-    settings.sort();
-    settings.dedup();
+    if observation.is_none() {
+        settings.sort();
+        settings.dedup();
+    }
     for logical in settings {
         if optional(&logical)? {
             configurations.push((logical.clone(), canonical(&logical)?));
@@ -391,6 +441,88 @@ mod tests {
         claude_inputs::ClaudeSettingSource,
         provider_environment::{copy_environment, CopyLimits},
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_observed_local_order_consumes_cwd_then_canonical_and_leaves_workspace_poison(
+    ) {
+        use freshell_platform::claude_inputs::{observation::observe, NativeSourceRuntime};
+        for runtime in [NativeSourceRuntime::Terminal, NativeSourceRuntime::Sdk] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let canonical_root = owned.path().join("canonical");
+            let workspace = owned.path().join("checkout");
+            let cwd = workspace.join("nested");
+            let gitdir = canonical_root.join(".git/worktrees/fixture");
+            for path in [
+                &home,
+                &gitdir,
+                &cwd.join(".claude"),
+                &workspace.join(".claude"),
+                &canonical_root.join(".claude"),
+            ] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            std::fs::write(
+                workspace.join(".git"),
+                format!("gitdir: {}\n", gitdir.display()),
+            )
+            .unwrap();
+            std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+            std::fs::write(
+                gitdir.join("gitdir"),
+                format!("{}\n", workspace.join(".git").display()),
+            )
+            .unwrap();
+            let current = cwd.join(".claude/settings.local.json");
+            let canonical = canonical_root.join(".claude/settings.local.json");
+            let unselected = workspace.join(".claude/settings.local.json");
+            std::fs::write(
+                &current,
+                br#"{"env":{"SELECTED":"cwd","CWD_ONLY":"retained"}}"#,
+            )
+            .unwrap();
+            std::fs::write(&canonical, br#"{"env":{"SELECTED":"canonical"}}"#).unwrap();
+            let poison = b"NATIVE_UNSELECTED_WORKSPACE_POISON: invalid JSON";
+            std::fs::write(&unselected, poison).unwrap();
+            let manifest = ClaudeInputManifest {
+                version: 1,
+                native_source_runtime: Some(runtime),
+                original_home: home.clone(),
+                cwd: cwd.clone(),
+                workspace: workspace.clone(),
+                config_root: None,
+                settings_file: None,
+                settings_origin: None,
+                inline_settings_sha256: None,
+                setting_sources: vec![ClaudeSettingSource::Local],
+                plugin_dirs: vec![],
+            };
+            let observed = observe(&cwd, &home, runtime, &manifest.setting_sources).unwrap();
+            assert_eq!(observed.uid, unsafe { libc::getuid() });
+            assert_eq!(observed.local_settings, [current, canonical]);
+            let selected=prepare_with_native_observation(&home,&cwd,&workspace,&manifest,&observed,&[])
+                .expect("native-selected local settings must prepare without the unrelated workspace document");
+            let stage = owned.path().join("stage");
+            copy_environment(&selected.selections, &stage, &[], CopyLimits::default()).unwrap();
+            stage_settings(&stage, &selected, None)
+                .expect("unselected malformed workspace settings must not be read or staged");
+            let files = selected
+                .binds
+                .iter()
+                .map(|bind| stage.join(&bind.source_relative_path))
+                .collect::<Vec<_>>();
+            let output=std::process::Command::new("node").args(["-e", "const fs=require('node:fs');let env={};for(const file of process.argv.slice(1)){Object.assign(env,JSON.parse(fs.readFileSync(file,'utf8')).env||{})};process.stdout.write(env.SELECTED+':'+env.CWD_ONLY)"])
+                .args(files).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"canonical:retained");
+            assert!(std::fs::read(&unselected).unwrap() == poison);
+            assert!(!selected
+                .selections
+                .iter()
+                .any(|copy| copy.source == unselected));
+        }
+    }
 
     #[cfg(unix)]
     #[test]
