@@ -12,7 +12,7 @@ import { expect, type Page } from '@playwright/test'
 import WebSocket from 'ws'
 
 import { test } from '../helpers/fixtures.js'
-import { ManagedRuntimeBrowserRig, createManagedRuntimeBrowserRig, type FreshCodexHistoryMeasurementError, type FreshCodexHistoryMeasurementFinish } from '../helpers/managed-runtime.js'
+import { ManagedRuntimeBrowserRig, createManagedRuntimeBrowserRig, type FreshCodexHistoryMeasurementError, type FreshCodexHistoryMeasurementFinish, FreshCodexSavedHistoryMeasurementSchema } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { runtimeBrowserPost as apiPost, pruneRuntimeBrowserLayout } from '../helpers/runtime-browser-api.js'
 import { LAYOUT_WINDOW_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
@@ -600,8 +600,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
                   }) }
               }, Number(measurement.finallyEnteredAt))
             } catch { measurementErrors.push('owned perf audit extraction failed') }
-            rig.runtime.writeBrowserArtifact('saved-history-render-measurement', measurement)
             if (!historyEnclosure) throw new Error('recorded saved-history enclosure is unavailable')
+            await rig.publishFreshCodexSavedHistoryMeasurement(historyEnclosure, FreshCodexSavedHistoryMeasurementSchema.parse(measurement))
             await rig.finishFreshCodexSavedHistoryMeasurement(historyEnclosure, measurementFinish)
           }
         } finally {

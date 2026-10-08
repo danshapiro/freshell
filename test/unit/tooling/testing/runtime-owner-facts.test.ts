@@ -489,6 +489,56 @@ describe('fixed saved-history controller reattachment lifecycle', () => {
   })
 })
 
+describe('fixed saved-history render measurement publication', () => {
+  it('publishes existing sanitized profiler and audit metadata privately before cleanup', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-history-measurement-'))
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused measurement artifact web') }, process.cwd(), 3,
+      {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
+    Object.assign(rig.runtime, { browserDir: root })
+    const enclosure = rig.runtimeEnclosureHandle(handle)
+    vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: false, running: false })
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const measurement: owner.FreshCodexSavedHistoryMeasurement = { kind: 'owned-page saved-history diagnostic', errors: [],
+      browserBeforeReload: { timeOrigin: 1, now: 2 }, cpuStartRequestedAt: 3, cpuStartedAt: 4,
+      cpuStopRequestedAt: 5, cpuStoppedAt: 6, finallyEnteredAt: 7,
+      cpu: { startTimeUs: 1000, endTimeUs: 2000, sampledDurationMs: 1, sampleCount: 1,
+        topLeaves: [{ functionName: 'render', script: 'index-fixture.js', line: 1, column: 2,
+          samples: 1, durationMs: 1, stack: [{ functionName: '(root)', script: 'native-or-anonymous' }] }],
+        seconds: [{ second: 0, durationMs: 1, samples: 1, idleMs: 0 }] },
+      audit: { timeOrigin: 1, extractedAtMs: 2, available: true, cutoffWallMs: 7, requestRecordCount: 1,
+        requestRecordsReturned: 1, requestRecordsDropped: 0, requestRecords: [{ sequence: 0, stage: 'display_committed', rows: 160, live: false }],
+        events: [{ sequence: 0, event: 'perf.api_slow', route: 'native-thread-snapshot', durationMs: 1, status: 200 }] } }
+    try {
+      const result = await rig.publishFreshCodexSavedHistoryMeasurement(enclosure, measurement)
+      const file = path.join(root, 'saved-history-render-measurement.json')
+      const raw = await fsp.readFile(file, 'utf8')
+      expect(JSON.parse(raw)).toEqual(measurement)
+      expect((await fsp.stat(file)).mode & 0o777).toBe(0o600)
+      const { createHash } = await import('node:crypto')
+      expect(result).toEqual({ artifactRef: `saved-history-render-measurement:${createHash('sha256').update(raw).digest('hex')}` })
+      expect(JSON.stringify(result)).not.toContain(root)
+      const descriptor = external.resolveManagedExternalDescriptor({ FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+        FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws', FRESHELL_E2E_TARGET_TOKEN: 'private-token',
+        FRESHELL_RUNTIME_EXTERNAL_RUN_ID: rig.runtime.runId, FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: rig.runtime.candidateSha })!
+      const control = external.createExternalRuntimeControl(rig, descriptor)
+      const remote = new external.ExternalManagedRuntimeRig(descriptor, async (_url, init) => (
+        new Response(JSON.stringify(await control(JSON.parse(String(init?.body)))), { status: 200 })
+      ))
+      await expect(remote.publishFreshCodexSavedHistoryMeasurement(enclosure, measurement)).resolves.toEqual(result)
+      await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha, scenarioId: 'browser-managed-runtime',
+        operationId: 'foreign-profiler-path', action: 'freshcodex-history-measurement-artifact', enclosure,
+        historyMeasurement: measurement, outputPath: '/foreign/measurement' })).rejects.toThrow(/operation/)
+      const audit = measurement.audit
+      if (!audit) throw new Error('measurement test requires its audit fixture')
+      await expect(rig.publishFreshCodexSavedHistoryMeasurement(enclosure, { ...measurement,
+        audit: { ...audit, requestRecords: [{ sequence: 0, transcript: 'private text' }] } })).rejects.toThrow()
+
+      await expect(rig.publishFreshCodexSavedHistoryMeasurement(enclosure, { ...measurement, transcript: 'private text' })).rejects.toThrow()
+      expect(await fsp.readFile(file, 'utf8')).toBe(raw)
+    } finally { await fsp.rm(root, { recursive: true, force: true }) }
+  })
+})
+
 describe('finite Phase 4 browser receipt publication', () => {
   it('writes the existing observation privately on its owner and refuses worker paths or transcript fields', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-phase4-receipt-'))

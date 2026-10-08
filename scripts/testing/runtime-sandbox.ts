@@ -934,6 +934,81 @@ export const FreshCodexHistoryMeasurementFinishSchema = z.object({ cpuStartReque
   errors: z.array(FreshCodexHistoryMeasurementErrorSchema),
 }).strict()
 export type FreshCodexHistoryMeasurementFinish = z.infer<typeof FreshCodexHistoryMeasurementFinishSchema>
+const FreshCodexProfileFrameSchema = z.object({ functionName: z.string().regex(/^[\w .()<>:$-]{0,120}$/),
+  script: z.string().regex(/^[^/?#\\\r\n]*$/).optional(), line: z.number().optional(), column: z.number().optional(),
+}).strict()
+export const FreshCodexSavedHistoryMeasurementSchema = z.object({ kind: z.literal('owned-page saved-history diagnostic'),
+  errors: z.array(FreshCodexHistoryMeasurementErrorSchema), browserBeforeReload: z.object({ timeOrigin: z.number(), now: z.number() }).strict().optional(),
+  cpuStartRequestedAt: z.number().optional(), cpuStartedAt: z.number().optional(), cpuStopRequestedAt: z.number().optional(),
+  cpuStoppedAt: z.number().optional(), finallyEnteredAt: z.number().optional(),
+  cpu: z.object({ startTimeUs: z.number(), endTimeUs: z.number(), sampledDurationMs: z.number(), sampleCount: z.number(),
+    topLeaves: z.array(FreshCodexProfileFrameSchema.extend({ samples: z.number(), durationMs: z.number(),
+      stack: z.array(FreshCodexProfileFrameSchema).max(20) })).max(80),
+    seconds: z.array(z.object({ second: z.number(), durationMs: z.number(), samples: z.number(), idleMs: z.number() }).strict()),
+  }).strict().optional(),
+  audit: z.object({ timeOrigin: z.number(), extractedAtMs: z.number(), available: z.boolean(), cutoffWallMs: z.number(),
+    requestRecordCount: z.number(), requestRecordsReturned: z.number(), requestRecordsDropped: z.number(),
+    requestRecords: z.array(z.object({ sequence: z.number(),
+    stage: z.enum(['refresh_requested', 'effect_skipped', 'request_captured', 'request_queued', 'run_started', 'native_started', 'native_completed', 'native_failed', 'soul_started', 'outcome_received', 'currentness_checked', 'identity_rejected', 'display_committed']).optional(),
+    trigger: z.enum(['identity', 'event', 'send-accepted', 'materialized', 'manual', 'poll', 'reconnect', 'reveal', 'idle-incomplete']).optional(),
+    reason: z.enum(['no_thread', 'divergence', 'unmanaged_lost']).optional(),
+    check: z.enum(['native-error', 'before-soul', 'outcome', 'error-fold']).optional(),
+    source: z.enum(['direct', 'fallback']).optional(),
+    fence: z.enum(['create', 'soul', 'revision', 'boot', 'owner', 'applied_serial', 'read_generation', 'recovery', 'provider', 'session_type', 'thread', 'divergence']).optional(),
+    errorKind: z.enum(['abort', 'error']).optional(),
+    outcome: z.enum(['ok', 'error', 'coalesced', 'rate-limited', 'backoff']).optional(),
+    timestamp: z.number().optional(),
+    view: z.number().optional(),
+    requestSerial: z.number().optional(),
+    readGeneration: z.number().optional(),
+    refreshSerial: z.number().optional(),
+    appliedSerial: z.number().optional(),
+    currentGeneration: z.number().optional(),
+    previousRows: z.number().optional(),
+    rows: z.number().optional(),
+    revision: z.number().optional(),
+    requestReadOnly: z.boolean().optional(),
+    hasSoul: z.boolean().optional(),
+    ran: z.boolean().optional(),
+    stale: z.boolean().optional(),
+    historyOnly: z.boolean().optional(),
+    live: z.boolean().optional(),
+    vacant: z.boolean().optional(),
+    accepted: z.boolean().optional(),
+    providerMatches: z.boolean().optional(),
+    typeMatches: z.boolean().optional(),
+    threadMatches: z.boolean().optional(),
+    initialCapture: z.boolean().optional(),
+    createChanged: z.boolean().optional(),
+    soulChanged: z.boolean().optional(),
+    revisionChanged: z.boolean().optional(),
+    bootChanged: z.boolean().optional(),
+    ownerChanged: z.boolean().optional(),
+    providerChanged: z.boolean().optional(),
+    typeChanged: z.boolean().optional(),
+    threadChanged: z.boolean().optional(),
+    paneSessionChanged: z.boolean().optional(),
+    recoveryChanged: z.boolean().optional(),
+    lostChanged: z.boolean().optional(),
+    supervisorChanged: z.boolean().optional(),
+    refreshChanged: z.boolean().optional(),
+    }).strict()).max(2000),
+    events: z.array(z.object({ sequence: z.number(), event: z.enum(['perf.api_slow', 'perf.api_parse_slow', 'perf.longtask', 'perf.resource_slow']),
+      route: z.string().regex(/^(native-thread-snapshot|owned-soul-history|unknown-route|other-api|document-or-resource|asset:[^/?#\\\r\n]*)$/).optional(),
+      status: z.number().optional(),
+      durationMs: z.number().optional(),
+      ttfbMs: z.number().optional(),
+      bodyMs: z.number().optional(),
+      parseMs: z.number().optional(),
+      payloadChars: z.number().optional(),
+      startTime: z.number().optional(),
+      transferSize: z.number().optional(),
+      encodedBodySize: z.number().optional(),
+      decodedBodySize: z.number().optional(),
+    }).strict()),
+  }).strict().optional(),
+}).strict()
+export type FreshCodexSavedHistoryMeasurement = z.infer<typeof FreshCodexSavedHistoryMeasurementSchema>
 export const FreshCodexSavedHistoryOwnershipFactsSchema = z.object({
   receiptContainerIds: z.array(z.string()), startCount: z.number().int().nonnegative(),
   launches: z.array(z.object({ event: z.literal('supervisor.launch_running'), at: z.union([z.number(), z.string()]),
@@ -1104,7 +1179,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
-    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-controller-reattachment', 'freshcodex-history-measurement-finish', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
+    'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-measurement-artifact', 'freshcodex-controller-reattachment', 'freshcodex-history-measurement-finish', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
     'provider-volume', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
@@ -1151,6 +1226,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   historyMeasurementStart: FreshCodexHistoryMeasurementStartSchema.optional(),
   historyMeasurementFinish: FreshCodexHistoryMeasurementFinishSchema.optional(),
   historyControllerReattachment: FreshCodexControllerReattachmentSchema.optional(),
+  historyMeasurement: FreshCodexSavedHistoryMeasurementSchema.optional(),
   chaosLogs: RuntimeChaosLogsSchema.optional(),
   chaosEvidence: RuntimeChaosEvidenceSchema.optional(),
   lossAssertions: RuntimeLossAssertionsSchema.optional(),
@@ -4328,6 +4404,17 @@ export class ManagedRuntimeOwner {
     await this.assertCurrentHandle(handle)
     const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
     if (row?.provider !== 'codex' || row.freshAgentSessionType !== 'freshcodex') throw new Error('exact fresh Codex history fixture required')
+  }
+
+  async publishFreshCodexSavedHistoryMeasurement(enclosure: RuntimeEnclosureHandle, input: FreshCodexSavedHistoryMeasurement): Promise<{ artifactRef: string }> {
+    if (this.runtime.phase !== 3 || !this.fixtureFreshAgentModes.includes('freshcodex')) throw new Error('registered Phase 3 fresh Codex history fixture required')
+    await this.ownedContainerState(enclosure)
+    const measurement = FreshCodexSavedHistoryMeasurementSchema.parse(input)
+    const target = this.runtime.writeBrowserArtifact('saved-history-render-measurement', measurement)
+    fs.chmodSync(target, 0o600)
+    const artifactRef = `saved-history-render-measurement:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
+    this.runtime.recordLifecycle('external.saved_history_measurement_artifact', { severity: 'info', ...enclosure, artifactRef })
+    return { artifactRef }
   }
 
   async recordFreshCodexControllerReattachment(handle: ExactRuntimeHandle, input: FreshCodexControllerReattachment): Promise<void> {
