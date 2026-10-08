@@ -7085,6 +7085,51 @@ describe('FreshAgentView', () => {
     }
   })
 
+  it.each(['none', 'same-idle', 'busy-then-idle'] as const)(
+    'recovers a managed Codex lost lookup after a held live read and %s status events', async (events) => {
+      const store = createStore()
+      const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+      const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: native.threadId }
+      const makeLive = () => ({ ...native, status: 'idle' as const,
+        capabilities: { ...native.capabilities, send: true },
+        extensions: { codex: { statusFromLiveState: true, ownerKind: 'fresh-agent' } } })
+      const content = { kind: 'fresh-agent' as const, ...locator,
+        sessionRef: { provider: 'codex' as const, sessionId: native.threadId }, resumeSessionId: native.threadId,
+        createRequestId: 'held-live-diagnosis', status: 'idle' as const, soulId: 'held-live-soul', soulIntentRevision: 7,
+        recoverySummary: { desiredState: 'running' as const, recoveryState: 'live' as const,
+          durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+      store.dispatch(sessionInit(locator))
+      store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => makeLive())
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).not.toBeDisabled())
+      fireEvent.change(composer, { target: { value: 'Held recovery draft' } })
+      const pending = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockClear()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => pending.promise)
+      wsMock.send.mockClear()
+      act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+        event: { type: 'freshAgent.error', code: 'INVALID_SESSION_ID', message: 'Stale managed lookup' } }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      expect(composer).toBeDisabled()
+      act(() => {
+        if (events === 'busy-then-idle') handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+          event: { type: 'freshAgent.status', status: 'running' } })
+        if (events !== 'none') handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+          event: { type: 'freshAgent.status', status: 'idle' } })
+      })
+      await act(async () => pending.resolve(makeLive()))
+      await waitFor(() => expect(composer).not.toBeDisabled())
+      expect(composer).toHaveValue('Held recovery draft')
+      expect(getFreshAgentPaneContent(store)).toMatchObject(content)
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      expect(Object.values(store.getState().freshAgent.sessions).find((session) => session.sessionId === locator.sessionId)?.lost).toBe(false)
+    },
+  )
+
   it.each([
     ['freshcodex', 'codex', savedCodexNativeHistory, 'no rollout found for thread id'],
     ['freshopencode', 'opencode', savedOpenCodeNativeHistory, 'Saved provider temporarily unavailable'],
