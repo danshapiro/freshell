@@ -858,6 +858,8 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       const config=forwarded.findLast((request)=>request.url.includes('/containers/create?') && request.body?.Cmd?.[0]===command)!.body;
       const inspected=structuredClone(config);
       inspected.Labels['org.opencontainers.image.version']='24.04';
+      // Docker reports an empty Tmpfs object as null on the retained reader.
+      if (inspected.HostConfig.Tmpfs && Object.keys(inspected.HostConfig.Tmpfs).length === 0) inspected.HostConfig.Tmpfs = null;
       for (const mount of inspected.HostConfig.Mounts) if (mount.ReadOnly===false) delete mount.ReadOnly;
       res.statusCode=200;res.end(JSON.stringify({Id:helperId,Config:foreignHelper?{...inspected,User:'0:0'}:inspected,HostConfig:inspected.HostConfig}));return;
     }

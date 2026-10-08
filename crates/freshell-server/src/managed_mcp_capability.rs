@@ -1561,7 +1561,22 @@ fn stage_provider_root(
                     opencode_input.amplifier_manifest,
                 )?
             } else if provider == "claude" {
-                if let Some(observation) = opencode_input.claude_observation {
+                if let Some(prior_stage) = prior_stage {
+                    claude_stage::prepare_retained(
+                        home,
+                        opencode_input.cwd.unwrap_or(home),
+                        opencode_input
+                            .workspace
+                            .or(opencode_input.cwd)
+                            .unwrap_or(home),
+                        opencode_input
+                            .claude_manifest
+                            .ok_or("Claude retained inputs lack original selectors")?,
+                        opencode_input.claude_observation,
+                        &excluded,
+                        prior_stage,
+                    )?
+                } else if let Some(observation) = opencode_input.claude_observation {
                     claude_stage::prepare_with_native_observation(
                         home,
                         opencode_input.cwd.unwrap_or(home),
@@ -7677,6 +7692,266 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             .unwrap(),
             b"retained-original-resource"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_provider_claude_fresh_replacement_uses_frozen_origins_and_current_project() {
+        use freshell_platform::claude_inputs::{
+            ClaudeInputManifest, NativeSourceRuntime, INLINE_SETTINGS_SOURCE,
+        };
+        use freshell_runtime_protocol::{
+            PreparedProviderContext, ProviderLaunchContext, ProviderPreparation,
+        };
+        for form in ["file", "inline"] {
+            let owned = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+                Some(root) => tempfile::tempdir_in(root).unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            let home = owned.path().join("original-home");
+            let config = home.join("selected-config");
+            let plugin = home.join("selected-plugin");
+            let workspace = owned.path().join("workspace");
+            let original_cwd = workspace.join("original");
+            let resume_cwd = workspace.join("resume");
+            let hooks = resume_cwd.join(".claude/hooks");
+            for path in [
+                &config.join("skills/probe/node_modules/probe-dependency"),
+                &plugin,
+                &original_cwd.join(".claude/skills/old-project"),
+                &hooks,
+            ] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            std::fs::write(
+                config.join("settings.json"),
+                r#"{"env":{"SELECTED_USER":"frozen"}}"#,
+            )
+            .unwrap();
+            let explicit = config.join("explicit.json");
+            let settings = r#"{"env":{"SELECTED_EXPLICIT":"frozen"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node consume.cjs"}]}]}}"#;
+            std::fs::write(&explicit, settings).unwrap();
+            std::fs::write(config.join("CLAUDE.md"), "@../imported-memory.md\n").unwrap();
+            std::fs::write(home.join("imported-memory.md"), "frozen-memory-import").unwrap();
+            std::fs::write(config.join("skills/probe/resource"), "frozen-resource").unwrap();
+            std::fs::write(
+                config.join("skills/probe/node_modules/probe-dependency/index.js"),
+                "module.exports='frozen-dependency'",
+            )
+            .unwrap();
+            std::fs::write(config.join("skills/probe/consume.cjs"), "#!/usr/bin/env node\nprocess.stdout.write(require('node:fs').readFileSync(__dirname+'/resource','utf8')+':'+require('probe-dependency'))").unwrap();
+            std::fs::write(plugin.join("resource"), "frozen-plugin").unwrap();
+            std::fs::write(plugin.join("consume.cjs"), "process.stdout.write(require('node:fs').readFileSync(__dirname+'/resource','utf8'))").unwrap();
+            std::fs::write(
+                original_cwd.join(".claude/skills/old-project/poison"),
+                "unselected-old-project",
+            )
+            .unwrap();
+            std::fs::write(hooks.join("resource"), "current-resume-hook").unwrap();
+            std::fs::write(hooks.join("consume.cjs"), "#!/usr/bin/env node\nprocess.stdout.write(require('node:fs').readFileSync(__dirname+'/resource','utf8'))").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for path in [
+                    config.join("skills/probe/consume.cjs"),
+                    hooks.join("consume.cjs"),
+                ] {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750)).unwrap();
+                }
+            }
+            let directory = owned.path().join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let store = CapabilityStore::default();
+            let soul = SoulId::new();
+            let context = ProviderLaunchContext {
+                preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+                mcp_capability: None,
+                config: vec![],
+                prepared_inputs: None,
+            };
+            let manifest = ClaudeInputManifest {
+                version: 1,
+                accepted_native_plan: None,
+                native_source_runtime: Some(NativeSourceRuntime::Terminal),
+                original_home: home.clone(),
+                cwd: original_cwd.clone(),
+                workspace: workspace.clone(),
+                config_root: Some(config.clone()),
+                settings_file: (form == "file").then(|| explicit.clone()),
+                settings_origin: None,
+                inline_settings_sha256: (form == "inline")
+                    .then(|| format!("{:x}", sha2::Sha256::digest(settings.as_bytes()))),
+                setting_sources: freshell_platform::claude_inputs::default_setting_sources(),
+                plugin_dirs: vec![plugin.clone()],
+            };
+            let prior = store
+                .issue(
+                    soul.clone(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("claude", &home, &context.config)),
+                    OpencodeEphemeralInput {
+                        claude_manifest: Some(&manifest),
+                        claude_inline_settings: (form == "inline").then_some(settings),
+                        cwd: Some(&original_cwd),
+                        workspace: Some(&workspace),
+                        launch_context: Some(&context),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let prior_context = read_prepared_context(&directory, &prior).unwrap();
+            let prior_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+            let prior_before =
+                std::fs::read(prior_stage.join(".freshell/prepared-context.json")).unwrap();
+            std::fs::rename(&home, owned.path().join("unavailable-original-home")).unwrap();
+            let callback = serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,"provider":"claude","workspace":workspace,"cwd":resume_cwd,"priorContext":prior_context,"providerSecretReferences":[]})).unwrap();
+            let client = freshell_runtime_client::RuntimeClient::new(
+                owned.path().join("unused.sock"),
+                "fixture-control",
+            );
+            let bytes = apply_prepared_callback(&callback, "fixture-control", &store, &directory, "http://host.docker.internal:4000", &owned.path().join("wrong-home"), &client).await
+                .expect("fresh replacement must use frozen selected origins when original HOME is unavailable");
+            let ready: PreparedProviderContext = serde_json::from_slice(&bytes).unwrap();
+            let inputs = ready
+                .provider_launch_context
+                .prepared_inputs
+                .as_ref()
+                .unwrap();
+            let stage = staged_provider_root_path(&directory, &inputs.generation_id).unwrap();
+            assert_ne!(inputs.generation_id, prior.grant_id);
+            assert_eq!(
+                std::fs::read(prior_stage.join(".freshell/prepared-context.json")).unwrap(),
+                prior_before
+            );
+            assert!(!inputs
+                .resource_mounts
+                .iter()
+                .any(|mount| Path::new(&mount.logical_destination).starts_with(&original_cwd)));
+            let skill = inputs
+                .resource_mounts
+                .iter()
+                .find(|mount| mount.logical_destination == "/home/freshell/provider/.claude/skills")
+                .unwrap();
+            let consume = stage
+                .join(&skill.stage_relative_path)
+                .join("probe/consume.cjs");
+            let output = std::process::Command::new(&consume).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"frozen-resource:frozen-dependency");
+            let plugin_mount = inputs
+                .resource_mounts
+                .iter()
+                .find(|mount| Path::new(&mount.logical_destination) == plugin)
+                .unwrap();
+            let output = std::process::Command::new("node")
+                .arg(
+                    stage
+                        .join(&plugin_mount.stage_relative_path)
+                        .join("consume.cjs"),
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"frozen-plugin");
+            let memory = inputs
+                .resource_mounts
+                .iter()
+                .find(|mount| {
+                    Path::new(&mount.logical_destination) == home.join("imported-memory.md")
+                })
+                .unwrap();
+            assert_eq!(
+                std::fs::read(stage.join(&memory.stage_relative_path)).unwrap(),
+                b"frozen-memory-import"
+            );
+            let hook = inputs
+                .resource_mounts
+                .iter()
+                .find(|mount| Path::new(&mount.logical_destination) == hooks)
+                .unwrap();
+            let output = std::process::Command::new(
+                stage.join(&hook.stage_relative_path).join("consume.cjs"),
+            )
+            .output()
+            .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"current-resume-hook");
+            let settings_path = if form == "inline" {
+                stage.join(INLINE_SETTINGS_SOURCE)
+            } else {
+                let bind = inputs
+                    .config_binds
+                    .iter()
+                    .find(|bind| {
+                        Path::new(&bind.logical_destination) == manifest.runtime_path(&explicit)
+                    })
+                    .unwrap();
+                stage.join(&bind.source_relative_path)
+            };
+            let output = std::process::Command::new("node").args(["-e", "const fs=require('node:fs'),s=JSON.parse(fs.readFileSync(process.argv[1]));process.stdout.write(s.env.SELECTED_EXPLICIT+':'+require('node:child_process').execSync(s.hooks.SessionStart[0].hooks[0].command,{cwd:process.argv[2]}))"])
+                .arg(settings_path).arg(consume.parent().unwrap()).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"frozen:frozen-resource:frozen-dependency");
+            let accepted = ready
+                .provider_launch_context
+                .mcp_capability
+                .as_ref()
+                .unwrap();
+            let incarnation = IncarnationId::new();
+            store
+                .activate(
+                    &accepted.grant_id,
+                    soul.clone(),
+                    incarnation.clone(),
+                    &directory,
+                    &accepted.endpoint,
+                )
+                .unwrap();
+            store
+                .commit_preparation(&accepted.grant_id, &soul, &incarnation, &directory)
+                .unwrap();
+            let context_before =
+                std::fs::read(stage.join(".freshell/prepared-context.json")).unwrap();
+            let stages_before = std::fs::read_dir(stage.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+            std::fs::remove_file(stage.join(&memory.stage_relative_path)).unwrap();
+            let callback = serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,"provider":"claude","workspace":workspace,"cwd":resume_cwd,"priorContext":ready.provider_launch_context,"providerSecretReferences":[]})).unwrap();
+            let error = apply_prepared_callback(
+                &callback,
+                "fixture-control",
+                &store,
+                &directory,
+                "http://host.docker.internal:4000",
+                &owned.path().join("wrong-home"),
+                &client,
+            )
+            .await
+            .err()
+            .expect("lost selected frozen ordinary source must block another fresh generation");
+            assert!(
+                error.contains("frozen selected source unavailable"),
+                "{error}"
+            );
+            assert!(!error.contains("frozen-memory-import"));
+            assert_eq!(
+                std::fs::read(stage.join(".freshell/prepared-context.json")).unwrap(),
+                context_before
+            );
+            assert_eq!(
+                std::fs::read_dir(stage.parent().unwrap())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                stages_before,
+                "failed generation must leave no temporary or published replacement"
+            );
+            let output = std::process::Command::new(&consume).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"frozen-resource:frozen-dependency");
+        }
     }
 
     #[tokio::test]

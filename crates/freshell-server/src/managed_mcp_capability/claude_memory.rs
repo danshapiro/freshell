@@ -16,6 +16,19 @@ pub(super) fn imports(
     user_rules: &[PathBuf],
     excluded: &[PathBuf],
 ) -> Result<Vec<PathBuf>, String> {
+    imports_with_frozen(home, roots, user_rules, &[], &[], excluded, None)
+        .map(|(fresh, frozen)| fresh.into_iter().chain(frozen).collect())
+}
+
+pub(super) fn imports_with_frozen(
+    home: &Path,
+    roots: &[PathBuf],
+    user_rules: &[PathBuf],
+    frozen_roots: &[PathBuf],
+    frozen_rules: &[PathBuf],
+    excluded: &[PathBuf],
+    frozen_source: Option<&dyn Fn(&Path) -> Result<PathBuf, String>>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
     let excluded = excluded
         .iter()
         .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
@@ -33,16 +46,28 @@ pub(super) fn imports(
         rule_directories: BTreeSet::new(),
         rule_entries: 0,
         rule_path_bytes: 0,
+        frozen_source,
     };
+    for root in frozen_roots {
+        graph.visit(root, 0, true)?;
+    }
+    for root in frozen_rules {
+        graph.visit_rules(root, 0, true)?;
+    }
     for root in roots {
-        graph.visit(root, 0)?;
+        graph.visit(root, 0, false)?;
     }
     // Native user rules use the same Markdown import parser, including
     // external imports, before conditional rules are activated by the provider.
     for root in user_rules {
-        graph.visit_rules(root, 0)?;
+        graph.visit_rules(root, 0, false)?;
     }
-    Ok(graph.selected)
+    let (frozen, fresh): (Vec<_>, Vec<_>) =
+        graph.selected.into_iter().partition(|(_, frozen)| *frozen);
+    Ok((
+        fresh.into_iter().map(|(path, _)| path).collect(),
+        frozen.into_iter().map(|(path, _)| path).collect(),
+    ))
 }
 
 struct ImportGraph<'a> {
@@ -54,25 +79,36 @@ struct ImportGraph<'a> {
     bytes: u64,
     events: usize,
     path_bytes: usize,
-    selected: Vec<PathBuf>,
+    selected: Vec<(PathBuf, bool)>,
     rule_directories: BTreeSet<PathBuf>,
     rule_entries: usize,
     rule_path_bytes: usize,
+    frozen_source: Option<&'a dyn Fn(&Path) -> Result<PathBuf, String>>,
 }
 impl ImportGraph<'_> {
-    fn visit_rules(&mut self, logical: &Path, depth: usize) -> Result<(), String> {
+    fn source(&self, logical: &Path, frozen: bool) -> Result<PathBuf, String> {
+        if frozen {
+            self.frozen_source
+                .ok_or("Claude frozen source view unavailable")?(logical)
+        } else {
+            std::fs::canonicalize(logical)
+                .map_err(|cause| format!("selected source unavailable: {cause}"))
+        }
+    }
+    fn visit_rules(&mut self, logical: &Path, depth: usize, frozen: bool) -> Result<(), String> {
         let limits = freshell_platform::provider_environment::CopyLimits::default();
         let error =
             |cause: &str| format!("Claude selected user rules {}: {cause}", logical.display());
         if depth > limits.max_depth {
             return Err(error("resource depth profile exceeded"));
         }
-        let source = std::fs::canonicalize(logical)
-            .map_err(|cause| error(&format!("selected directory unavailable: {cause}")))?;
+        let source = self
+            .source(logical, frozen)
+            .map_err(|cause| error(&cause))?;
         if self
             .excluded
             .iter()
-            .any(|excluded| source.starts_with(excluded))
+            .any(|excluded| source.starts_with(excluded) || logical.starts_with(excluded))
         {
             return Err(error(
                 "selected private or native-state source cannot become ordinary rules",
@@ -85,13 +121,14 @@ impl ImportGraph<'_> {
             return Ok(());
         }
         self.active.insert(source.clone());
-        let entries = std::fs::read_dir(logical)
+        let entries = std::fs::read_dir(&source)
             .map_err(|cause| error(&format!("selected directory unreadable: {cause}")))?;
         let mut paths = Vec::new();
         for entry in entries {
-            let path = entry
+            let entry = entry
                 .map_err(|cause| error(&format!("selected directory entry unavailable: {cause}")))?
-                .path();
+                .file_name();
+            let path = logical.join(entry);
             self.rule_entries = self
                 .rule_entries
                 .checked_add(1)
@@ -107,34 +144,36 @@ impl ImportGraph<'_> {
         }
         paths.sort();
         for path in paths {
-            let metadata = std::fs::metadata(&path).map_err(|cause| {
+            let physical = self.source(&path, frozen).map_err(|cause| error(&cause))?;
+            let metadata = std::fs::metadata(&physical).map_err(|cause| {
                 error(&format!(
                     "selected rule {} metadata failed: {cause}",
                     path.display()
                 ))
             })?;
             if metadata.is_dir() {
-                self.visit_rules(&path, depth + 1)?;
+                self.visit_rules(&path, depth + 1, frozen)?;
             } else if path.extension().is_some_and(|extension| extension == "md") {
-                self.visit(&path, depth + 1)?;
+                self.visit(&path, depth + 1, frozen)?;
             }
         }
         self.active.remove(&source);
         Ok(())
     }
 
-    fn visit(&mut self, logical: &Path, depth: usize) -> Result<(), String> {
+    fn visit(&mut self, logical: &Path, depth: usize, frozen: bool) -> Result<(), String> {
         let logical = normalize(logical);
         let error = |cause: &str| format!("Claude memory import {}: {cause}", logical.display());
         if depth > freshell_platform::provider_environment::CopyLimits::default().max_depth {
             return Err(error("resource depth profile exceeded"));
         }
-        let source = std::fs::canonicalize(&logical)
-            .map_err(|cause| error(&format!("selected file unavailable: {cause}")))?;
+        let source = self
+            .source(&logical, frozen)
+            .map_err(|cause| error(&cause))?;
         if self
             .excluded
             .iter()
-            .any(|excluded| source.starts_with(excluded))
+            .any(|excluded| source.starts_with(excluded) || logical.starts_with(excluded))
         {
             return Err(error(
                 "selected private or native-state source cannot become ordinary memory",
@@ -220,9 +259,9 @@ impl ImportGraph<'_> {
             {
                 return Err(error("selected import path profile exceeded"));
             }
-            self.visit(&selected, depth + 1)?;
-            if !self.selected.contains(&selected) {
-                self.selected.push(selected);
+            self.visit(&selected, depth + 1, frozen)?;
+            if !self.selected.iter().any(|(path, _)| path == &selected) {
+                self.selected.push((selected, frozen));
             }
         }
         self.active.remove(&source);

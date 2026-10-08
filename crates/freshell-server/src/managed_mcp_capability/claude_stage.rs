@@ -5,6 +5,239 @@ use freshell_platform::claude_inputs::{
 };
 use std::path::{Path, PathBuf};
 
+struct FrozenSources {
+    root: PathBuf,
+    inputs: freshell_runtime_protocol::PreparedProviderInputs,
+}
+impl FrozenSources {
+    fn load(root: &Path, accepted: &ClaudeInputManifest) -> Result<Self, String> {
+        use freshell_runtime_protocol::{ProviderLaunchContext, MAX_CONTROL_FRAME_BYTES};
+        use sha2::{Digest, Sha256};
+        let bytes = super::read_prepared_metadata(
+            root,
+            ".freshell/prepared-context.json",
+            MAX_CONTROL_FRAME_BYTES,
+        )?;
+        let context: ProviderLaunchContext =
+            serde_json::from_slice(&bytes).map_err(|_| "Claude frozen context invalid")?;
+        let capability = context
+            .mcp_capability
+            .as_ref()
+            .ok_or("Claude frozen generation unavailable")?;
+        let inputs = context
+            .prepared_inputs
+            .ok_or("Claude frozen inputs unavailable")?;
+        inputs
+            .validate(Some(capability))
+            .map_err(|error| error.message)?;
+        if root.file_name().and_then(|name| name.to_str()) != Some(inputs.generation_id.as_str()) {
+            return Err("Claude frozen source generation changed".into());
+        }
+        let bytes =
+            super::read_prepared_metadata(root, &inputs.manifest.relative_path, 64 * 1024 * 1024)?;
+        if format!("{:x}", Sha256::digest(&bytes)) != inputs.manifest.sha256 {
+            return Err("Claude frozen source manifest identity changed".into());
+        }
+        let prior: ClaudeInputManifest =
+            serde_json::from_slice(&bytes).map_err(|_| "Claude frozen source manifest invalid")?;
+        prior.validate().map_err(str::to_string)?;
+        if prior.original_home != accepted.original_home
+            || prior.config_root != accepted.config_root
+            || prior.settings_file != accepted.settings_file
+            || prior.settings_origin != accepted.settings_origin
+            || prior.inline_settings_sha256 != accepted.inline_settings_sha256
+            || prior.plugin_dirs != accepted.plugin_dirs
+            || prior.setting_sources != accepted.setting_sources
+            || prior.native_source_runtime != accepted.native_source_runtime
+        {
+            return Err("Claude frozen original selectors changed".into());
+        }
+        Ok(Self {
+            root: root.into(),
+            inputs,
+        })
+    }
+    fn selected(&self, logical: &Path) -> Result<Option<PathBuf>, String> {
+        let mut selected: Option<(usize, PathBuf)> = None;
+        for bind in &self.inputs.config_binds {
+            if logical == Path::new(&bind.logical_destination)
+                || logical == Path::new(&bind.effective_destination)
+            {
+                selected = Some((usize::MAX, self.root.join(&bind.source_relative_path)));
+            }
+        }
+        for mount in &self.inputs.resource_mounts {
+            for destination in [&mount.logical_destination, &mount.effective_destination] {
+                let destination = Path::new(destination);
+                if let Ok(suffix) = logical.strip_prefix(destination) {
+                    let length = destination.as_os_str().len();
+                    let physical = self.root.join(&mount.stage_relative_path);
+                    let physical = if suffix.as_os_str().is_empty() {
+                        physical
+                    } else {
+                        physical.join(suffix)
+                    };
+                    if let Some((prior_length, prior_path)) = &selected {
+                        if *prior_length == length && *prior_path != physical {
+                            return Err("Claude frozen selected source is ambiguous".into());
+                        }
+                        if *prior_length > length {
+                            continue;
+                        }
+                    }
+                    selected = Some((length, physical));
+                }
+            }
+        }
+        selected
+            .map(|(_, path)| {
+                std::fs::canonicalize(path)
+                    .map_err(|_| {
+                        "Claude frozen selected source unavailable; retain inputs and reprepare"
+                            .to_string()
+                    })
+                    .and_then(|path| {
+                        if path.starts_with(&self.root) {
+                            Ok(path)
+                        } else {
+                            Err("Claude frozen selected source escaped its ordinary stage".into())
+                        }
+                    })
+            })
+            .transpose()
+    }
+    fn source(&self, logical: &Path) -> Result<PathBuf, String> {
+        self.selected(logical)?.ok_or(
+            "Claude source has no selected frozen ordinary alias; retain inputs and reprepare"
+                .into(),
+        )
+    }
+    fn append(
+        &self,
+        prepared: &mut Preparation,
+        manifest: &ClaudeInputManifest,
+        configs: &[PathBuf],
+        resources: &[PathBuf],
+    ) -> Result<(), String> {
+        // Keep the existing typed unit layout. Current project units get names
+        // beyond the prior generation's range, preserving frozen aliases.
+        fn next_id<'a>(
+            paths: impl Iterator<Item = &'a str>,
+            prefix: &str,
+        ) -> Result<usize, String> {
+            paths
+                .filter_map(|path| path.strip_prefix(prefix))
+                .filter_map(|suffix| suffix.split('/').next()?.parse::<usize>().ok())
+                .max()
+                .map_or(Ok(0), |id| {
+                    id.checked_add(1)
+                        .ok_or("Claude current unit name overflow".into())
+                })
+        }
+        let next_config = next_id(
+            self.inputs
+                .config_binds
+                .iter()
+                .map(|bind| bind.source_relative_path.as_str()),
+            ".freshell/templates/claude-",
+        )?;
+        let next_resource = next_id(
+            self.inputs
+                .resource_mounts
+                .iter()
+                .map(|mount| mount.stage_relative_path.as_str()),
+            ".freshell/resource-units/root-",
+        )?;
+        let renamed = |relative: &str| -> Result<String, String> {
+            for (prefix, offset) in [
+                (".freshell/templates/claude-", next_config),
+                (".freshell/resource-units/root-", next_resource),
+                (".freshell/provider-roots/root-", next_resource),
+            ] {
+                if let Some(suffix) = relative.strip_prefix(prefix) {
+                    let (number, file) = suffix
+                        .split_once('/')
+                        .map_or((suffix, ""), |(number, file)| (number, file));
+                    let number: usize = number
+                        .parse()
+                        .map_err(|_| "Claude current unit name invalid")?;
+                    let number = number
+                        .checked_add(offset)
+                        .ok_or("Claude current unit name overflow")?;
+                    return Ok(if file.is_empty() {
+                        format!("{prefix}{number}")
+                    } else {
+                        format!("{prefix}{number}/{file}")
+                    });
+                }
+            }
+            Err("Claude current unit source layout invalid".into())
+        };
+        for selection in &mut prepared.selections {
+            selection.destination_relative = renamed(
+                selection
+                    .destination_relative
+                    .to_str()
+                    .ok_or("Claude current unit path invalid")?,
+            )?
+            .into();
+        }
+        for bind in &mut prepared.binds {
+            bind.source_relative_path = renamed(&bind.source_relative_path)?;
+        }
+        for mount in &mut prepared.mounts {
+            mount.stage_relative_path = renamed(&mount.stage_relative_path)?;
+            mount.provider_relative_path = renamed(&mount.provider_relative_path)?;
+        }
+        let selected = |logical: &str, paths: &[PathBuf]| {
+            paths.iter().any(|path| {
+                Path::new(logical) == path || Path::new(logical) == manifest.runtime_path(path)
+            })
+        };
+        for bind in &self.inputs.config_binds {
+            if selected(&bind.logical_destination, configs) && !prepared.binds.contains(bind) {
+                prepared.binds.push(bind.clone());
+            }
+        }
+        for mount in &self.inputs.resource_mounts {
+            if selected(&mount.logical_destination, resources) && !prepared.mounts.contains(mount) {
+                prepared.mounts.push(mount.clone());
+            }
+        }
+        for relative in prepared
+            .binds
+            .iter()
+            .map(|bind| &bind.source_relative_path)
+            .chain(
+                prepared
+                    .mounts
+                    .iter()
+                    .map(|mount| &mount.stage_relative_path),
+            )
+        {
+            if !prepared
+                .selections
+                .iter()
+                .any(|selection| selection.destination_relative == Path::new(relative))
+            {
+                let source = self.root.join(relative);
+                let canonical = std::fs::canonicalize(&source)
+                    .map_err(|_| "Claude frozen ordinary unit unavailable")?;
+                if !canonical.starts_with(&self.root) {
+                    return Err("Claude frozen ordinary unit escaped its stage".into());
+                }
+                prepared
+                    .selections
+                    .push(freshell_platform::provider_environment::CopySelection {
+                        source,
+                        destination_relative: relative.into(),
+                    });
+            }
+        }
+        Ok(())
+    }
+}
+
 const RESOURCE_DIRECTORIES: &[&str] = &[
     "skills",
     "commands",
@@ -38,6 +271,7 @@ pub(super) fn prepare_with_native_observation(
         Some(accepted),
         Some(observation),
         excluded,
+        None,
     )
 }
 
@@ -48,7 +282,37 @@ pub(super) fn prepare(
     accepted: Option<&ClaudeInputManifest>,
     excluded: &[PathBuf],
 ) -> Result<Preparation, String> {
-    prepare_selected_sources(home, cwd, workspace, accepted, None, excluded)
+    prepare_selected_sources(home, cwd, workspace, accepted, None, excluded, None)
+}
+
+pub(super) fn prepare_retained(
+    home: &Path,
+    cwd: &Path,
+    workspace: &Path,
+    accepted: &ClaudeInputManifest,
+    observation: Option<&NativeObservation>,
+    excluded: &[PathBuf],
+    prior_stage: &Path,
+) -> Result<Preparation, String> {
+    if let Some(observation) = observation {
+        observation.validate()?;
+        if Some(observation.native_source_runtime) != accepted.native_source_runtime
+            || observation.setting_sources != accepted.setting_sources
+            || std::fs::canonicalize(cwd).ok().as_ref() != Some(&observation.cwd)
+        {
+            return Err("Claude native source observation does not match retained launch".into());
+        }
+    }
+    let frozen = FrozenSources::load(prior_stage, accepted)?;
+    prepare_selected_sources(
+        home,
+        cwd,
+        workspace,
+        Some(accepted),
+        observation,
+        excluded,
+        Some(&frozen),
+    )
 }
 
 fn prepare_selected_sources(
@@ -58,6 +322,7 @@ fn prepare_selected_sources(
     accepted: Option<&ClaudeInputManifest>,
     observation: Option<&NativeObservation>,
     excluded: &[PathBuf],
+    frozen: Option<&FrozenSources>,
 ) -> Result<Preparation, String> {
     let mut manifest = accepted.cloned().unwrap_or_else(|| ClaudeInputManifest {
         version: 1,
@@ -80,16 +345,36 @@ fn prepare_selected_sources(
     let mut resources = Vec::new();
     let mut memory = Vec::new();
     let mut user_rules = Vec::new();
+    let mut frozen_configurations = Vec::new();
+    let mut frozen_resources = Vec::new();
+    let mut frozen_memory = Vec::new();
+    let mut frozen_rules = Vec::new();
     if let Some(selected) = &manifest.settings_file {
-        let origin = canonical(selected)?;
-        if !std::fs::metadata(&origin).is_ok_and(|metadata| metadata.is_file()) {
+        let origin = if frozen.is_some() {
+            manifest
+                .settings_origin
+                .clone()
+                .ok_or("Claude frozen settings origin unrecorded")?
+        } else {
+            canonical(selected)?
+        };
+        let physical = if let Some(frozen) = frozen {
+            frozen.source(&origin)?
+        } else {
+            origin.clone()
+        };
+        if !std::fs::metadata(&physical).is_ok_and(|metadata| metadata.is_file()) {
             return Err(format!(
                 "Claude --settings {} must select a regular file",
                 selected.display()
             ));
         }
         manifest.settings_origin = Some(origin.clone());
-        configurations.push((origin.clone(), origin));
+        if frozen.is_some() {
+            frozen_configurations.push(origin);
+        } else {
+            configurations.push((origin.clone(), origin));
+        }
     }
     // The manifest retains original explicit selector origins. Project discovery
     // and projection follow the current launch directory on every preparation.
@@ -135,8 +420,19 @@ fn prepare_selected_sources(
     } else {
         None
     };
-    if user_enabled && optional(&user_settings)? {
-        configurations.push((user_settings.clone(), canonical(&user_settings)?));
+    let original_optional = |path: &Path| {
+        if let Some(frozen) = frozen {
+            frozen.selected(path).map(|source| source.is_some())
+        } else {
+            optional(path)
+        }
+    };
+    if user_enabled && original_optional(&user_settings)? {
+        if frozen.is_some() {
+            frozen_configurations.push(user_settings.clone());
+        } else {
+            configurations.push((user_settings.clone(), canonical(&user_settings)?));
+        }
     }
     for relative in ["CLAUDE.md", "rules"]
         .into_iter()
@@ -146,7 +442,16 @@ fn prepare_selected_sources(
             continue;
         }
         let logical = config_root.join(relative);
-        if optional(&logical)? {
+        if original_optional(&logical)? {
+            if frozen.is_some() {
+                if relative == "CLAUDE.md" {
+                    frozen_memory.push(logical.clone());
+                } else if relative == "rules" {
+                    frozen_rules.push(logical.clone());
+                }
+                frozen_resources.push(logical);
+                continue;
+            }
             if relative == "CLAUDE.md" {
                 memory.push(logical.clone());
             } else if relative == "rules" {
@@ -236,24 +541,52 @@ fn prepare_selected_sources(
         }
     }
     for plugin in &manifest.plugin_dirs {
-        canonical(plugin)?; // Explicit selections may never be silently omitted.
-        resources.push(plugin.clone());
+        if let Some(frozen) = frozen {
+            frozen.source(plugin)?;
+            frozen_resources.push(plugin.clone());
+        } else {
+            canonical(plugin)?;
+            resources.push(plugin.clone());
+        }
     }
-    for imported in super::claude_memory::imports(&manifest.original_home, &memory, &user_rules, excluded).inspect_err(|error| {
+    let frozen_resolver = |path: &Path| {
+        frozen
+            .ok_or("Claude frozen source view unavailable".to_string())?
+            .source(path)
+    };
+    let (imports, frozen_imports) = super::claude_memory::imports_with_frozen(&manifest.original_home, &memory, &user_rules, &frozen_memory, &frozen_rules, excluded, frozen.map(|_| &frozen_resolver as &dyn Fn(&Path) -> Result<PathBuf, String>)).inspect_err(|error| {
         tracing::warn!(event="provider.inputs.preparation.blocked",provider="claude",stage="controller",operation="select_memory_imports",reason=%error,"Selected Claude memory imports could not be prepared");
-    })? {
+    })?;
+    for imported in imports {
         if !resources.iter().any(|root| imported.starts_with(root)) {
             resources.push(imported);
         }
     }
-    prepare_selected(
+    for imported in frozen_imports {
+        if !frozen_resources
+            .iter()
+            .any(|root| imported.starts_with(root))
+        {
+            frozen_resources.push(imported);
+        }
+    }
+    let mut prepared = prepare_selected(
         "claude",
         cwd,
         &manifest,
         configurations,
         resources,
         |path| manifest.runtime_path(path),
-    )
+    )?;
+    if let Some(frozen) = frozen {
+        frozen.append(
+            &mut prepared,
+            &manifest,
+            &frozen_configurations,
+            &frozen_resources,
+        )?;
+    }
+    Ok(prepared)
 }
 
 // The ordinary native initializer sets projectRoot to realpath(launch cwd).

@@ -1015,7 +1015,8 @@ export class RestrictedDockerBroker {
       && ['Entrypoint','Cmd'].every((key) => same(config[key], expected[key]))
       && ownedHelperLabels(config.Labels, expected.Labels)
       && Array.isArray(config.Env) && same([...config.Env].sort(), [...expected.Env].sort())
-      && ['NetworkMode','ReadonlyRootfs','CapDrop','SecurityOpt','Memory','MemorySwap','NanoCpus','PidsLimit','Tmpfs'].every((key) => same(host[key], expected.HostConfig[key]))
+      && ['NetworkMode','ReadonlyRootfs','CapDrop','SecurityOpt','Memory','MemorySwap','NanoCpus','PidsLimit'].every((key) => same(host[key], expected.HostConfig[key]))
+      && same(host.Tmpfs ?? {}, expected.HostConfig.Tmpfs ?? {})
       && (host.CapAdd?.length ?? 0) === 0 && host.LogConfig?.Type === 'none'
       && Array.isArray(host.Mounts) && host.Mounts.length === expected.HostConfig.Mounts.length
       && expected.HostConfig.Mounts.every((wanted: Record<string, any>) => host.Mounts.some((mount: Record<string, any>) =>

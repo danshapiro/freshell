@@ -35,7 +35,7 @@ def main():
     parser.add_argument("--provider",choices=["opencode","codex","claude","amplifier"],default="opencode")
     parser.add_argument("--claude-flavor",choices=["freshclaude","kilroy"],default="freshclaude")
     parser.add_argument("--claude-settings-form",choices=["file","inline","owned-last"],default="file")
-    parser.add_argument("--claude-source-guard",choices=["unchanged","changed-git"],default="unchanged")
+    parser.add_argument("--claude-source-guard",choices=["unchanged","changed-git","retained"],default="unchanged")
     args=parser.parse_args()
     if args.provider!="claude" and args.claude_flavor!="freshclaude":
         parser.error("the finite Claude flavor requires --provider claude")
@@ -75,9 +75,10 @@ def main():
                     known_helpers.append(metadata)
         fixed_helper=value["Config"].get("Image")==IMAGE and value["Config"].get("Cmd") in [["publish-provider-inputs"],["prepare-provider-mountpoints"]] and bool(known_helpers)
         candidate_helper=value["Config"].get("Image")==IMAGE and value["Config"].get("Cmd") in [["project-claude-candidate-private"],["prepare-provider-mountpoints"]] and labels.get("com.freshell.runtime-test-run-id")==run and labels.get("com.freshell.installation-id")==installation and labels.get("com.freshell.claude-candidate")=="ordinary"
-        if candidate_helper:
+        source_helper=value["Config"].get("Image")==IMAGE and value["Config"].get("Cmd")==["observe-claude-sources-private"] and labels.get("com.freshell.runtime-test-run-id")==run and labels.get("com.freshell.installation-id")==installation
+        if candidate_helper or source_helper:
             host_config=value["HostConfig"]
-            receipt.setdefault("candidateHelperInspections",[]).append({
+            receipt.setdefault("sourceHelperInspections" if source_helper else "candidateHelperInspections",[]).append({
                 "id":value["Id"],"image":value["Config"]["Image"],"user":value["Config"]["User"],
                 "command":value["Config"]["Cmd"],"labels":labels,"workingDirectory":value["Config"].get("WorkingDir"),
                 "running":value["State"].get("Running"),"exitCode":value["State"].get("ExitCode"),
@@ -210,10 +211,16 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                 receipt["claudeSourceGuard"]=args.claude_source_guard
             receipt["consumedRoutes"]=[json.loads(line.split("provider_launch_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_launch_consumer " in line]
             receipt["candidateObservers"]=[json.loads(line.split("provider_candidate_observer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_candidate_observer " in line]
+            if args.claude_source_guard=="retained":
+                receipt["recoveryConsumers"]=[json.loads(line.split("provider_recovery_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_recovery_consumer " in line]
+                recovered=receipt["recoveryConsumers"]
+                route_mismatch_recovery=len(recovered)!=1 or any(value.get("outcome")!="replaced" or value.get("sameOwnedHome") is not True or value.get("originalOrdinaryUnavailable") is not True or value.get("generationId")==value.get("priorGeneration") for value in recovered)
             print(outcome.stdout,end="",flush=True);print(outcome.stderr,end="",flush=True)
             expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")} if args.provider=="opencode" else ({(args.provider,"terminal")} if args.provider=="amplifier" else {(args.provider,"terminal"),(args.provider,"fresh")})
+            if args.claude_source_guard=="retained":expected_routes={("claude","terminal")}
             observed_routes={(item.get("provider"),item.get("route")) for item in receipt["consumedRoutes"]}
             route_mismatch=len(receipt["consumedRoutes"])!=len(expected_routes) or observed_routes!=expected_routes
+            if args.claude_source_guard=="retained":route_mismatch=route_mismatch or route_mismatch_recovery
             if args.claude_source_guard=="changed-git":
                 receipt["blockedRoutes"]=[json.loads(line.split("provider_source_guard ",1)[1]) for line in outcome.stdout.splitlines() if "provider_source_guard " in line]
                 blocked={(item.get("provider"),item.get("route")) for item in receipt["blockedRoutes"]}
@@ -228,7 +235,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                 evidence=json.loads((root/"broker-receipt.json").read_text())
                 receipt["broker"]=evidence
                 for value in evidence["receipts"]:owned.append(value["containerId"])
-                if exit_code==0 and args.provider=="claude" and args.claude_source_guard=="unchanged":
+                if exit_code==0 and args.provider=="claude" and args.claude_source_guard!="changed-git":
                     candidates=evidence["authorizedCandidates"]
                     observers=receipt["candidateObservers"]
                     authorized={(value["requestId"],value["generationId"],value["soulId"]) for value in candidates}
@@ -266,6 +273,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                 labels=None
                 for prepared in preparations:
                     if volume==prepared["providerVolumeName"]:
+                        if not prepared.get("initialAuthReservation"):continue
                         source=next(item for item in initial if item["providerVolumeName"]==volume)
                         labels={"com.freshell.installation-id":installation,"com.freshell.soul-id":prepared["soulId"],
                                 "freshell.input.reservation":prepared["initialAuthReservation"],"freshell.input.incarnation":prepared["incarnationId"],
@@ -281,7 +289,9 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                         labels={"com.freshell.installation-id":installation,"com.freshell.soul-id":candidate["soulId"],
                                 "com.freshell.runtime-test-run-id":run,"com.freshell.source-request-id":candidate["requestId"],
                                 "com.freshell.source-binary-sha256":source["binarySha256"],"com.freshell.input-generation":candidate["generationId"],
-                                "com.freshell.source-reservation-id":candidate["reservationId"],"com.freshell.claude-candidate":"ordinary"}
+                                "com.freshell.claude-candidate":"ordinary"}
+                        if candidate.get("retained"):labels["com.freshell.source-recovery-attempt-id"]=candidate["retained"]["attemptId"]
+                        else:labels["com.freshell.source-reservation-id"]=candidate["reservationId"]
                 if labels is None or value.get("Driver")!="local" or value.get("Options") not in (None,{}) or value.get("Labels")!=labels:
                     raise RuntimeError("closed startup volume cleanup ownership changed")
                 docker("volume","rm",volume)

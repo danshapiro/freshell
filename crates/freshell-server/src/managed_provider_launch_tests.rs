@@ -69,20 +69,8 @@ impl BrokerAuthorizedBackend {
         let Some(candidate) = request.candidate.as_ref() else {
             return Ok(());
         };
-        let invalid = || {
-            BackendError::InvalidConfig("closed initial Claude candidate handoff invalid".into())
-        };
-        let freshell_supervisor::backend::ClaudeSourceOwner::Initial { observation, .. } = owner
-        else {
-            // The retained reader stays fail-closed until its actual prior
-            // ordinary topology is qualified. Do not invent initial authority.
-            return Ok(());
-        };
-        let InitialAuthVolumeObservation::Absent { daemon_id } = observation;
-        let ClaudeSourceAuthority::InitialReservation { reservation_id } = &request.authority
-        else {
-            return Err(invalid());
-        };
+        let invalid =
+            || BackendError::InvalidConfig("closed Claude candidate handoff invalid".into());
         request.validate().map_err(|_| invalid())?;
         let inputs = candidate
             .provider_launch_context
@@ -96,7 +84,6 @@ impl BrokerAuthorizedBackend {
             .ok_or_else(invalid)?;
         if binding.soul_id != request.soul_id.as_str()
             || binding.generation_id != inputs.generation_id
-            || inputs.initial_auth_reservation.as_deref() != Some(reservation_id.as_str())
             || inputs.indexed_files.is_some()
             || inputs.manifest.source_count != 0
             || inputs.manifest.alias_count != 0
@@ -104,6 +91,59 @@ impl BrokerAuthorizedBackend {
         {
             return Err(invalid());
         }
+        let (daemon_id, reservation_id, retained) = match owner {
+            freshell_supervisor::backend::ClaudeSourceOwner::Initial { observation, .. } => {
+                let InitialAuthVolumeObservation::Absent { daemon_id } = observation;
+                let ClaudeSourceAuthority::InitialReservation { reservation_id } =
+                    &request.authority
+                else {
+                    return Err(invalid());
+                };
+                if inputs.initial_auth_reservation.as_deref() != Some(reservation_id.as_str()) {
+                    return Err(invalid());
+                }
+                (daemon_id, reservation_id.clone(), None)
+            }
+            freshell_supervisor::backend::ClaudeSourceOwner::Retained {
+                handle,
+                recovery_source,
+            } => {
+                let source = recovery_source.as_ref().ok_or_else(invalid)?;
+                source.validate().map_err(|_| invalid())?;
+                if !matches!(
+                    request.authority,
+                    ClaudeSourceAuthority::RecoveryAttempt { .. }
+                ) || handle.soul_id() != &request.soul_id
+                    || inputs.initial_auth_reservation.is_some()
+                {
+                    return Err(invalid());
+                }
+                let prior = handle
+                    .terminal()
+                    .and_then(|spec| spec.provider_launch_context.as_ref())
+                    .or_else(|| {
+                        handle
+                            .fresh_agent()
+                            .and_then(|spec| spec.provider_launch_context.as_ref())
+                    })
+                    .and_then(|context| context.prepared_inputs.as_ref())
+                    .ok_or_else(invalid)?;
+                if prior.generation_id != source.prior_generation_id
+                    || prior.generation_id == inputs.generation_id
+                {
+                    return Err(invalid());
+                }
+                // Original creation metadata is carried only by this closed
+                // fixture. The real authority remains its registry recovery
+                // attempt and private callback scope, never a new reservation.
+                let reservation = prior.initial_auth_reservation.clone().ok_or_else(invalid)?;
+                let retained = json!({"attemptId":source.registry_attempt_id,"generationId":prior.generation_id,
+                    "stageRoot":self.control.join("provider-roots").join(&prior.generation_id),
+                    "configurationBinds":prior.config_binds.iter().map(|bind|json!({"sourceRelativePath":bind.source_relative_path,"effectiveDestination":bind.effective_destination})).collect::<Vec<_>>(),
+                    "resourceMounts":prior.resource_mounts.iter().map(|mount|json!({"stageRelativePath":mount.stage_relative_path,"providerRelativePath":mount.provider_relative_path,"effectiveDestination":mount.effective_destination,"kind":mount.kind})).collect::<Vec<_>>()});
+                (handle.daemon_id(), reservation, Some(retained))
+            }
+        };
         let root = self.handoff.parent().ok_or_else(invalid)?;
         // The wrapper's closed source configuration contains only artifact and
         // owner metadata. Bound the physical file before allocating its frame.
@@ -142,6 +182,9 @@ impl BrokerAuthorizedBackend {
             "resourceMounts":inputs.resource_mounts.iter().map(|mount|json!({"stageRelativePath":mount.stage_relative_path,"providerRelativePath":mount.provider_relative_path,"effectiveDestination":mount.effective_destination,"kind":mount.kind})).collect::<Vec<_>>(),
         });
         let mut value = value;
+        if let Some(retained) = retained {
+            value["retained"] = retained;
+        }
         if let Some(common) = &request.git_common_dir {
             value["gitCommonDir"] = json!(common);
         }
@@ -256,10 +299,46 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
         test_run_id: &str,
     ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
         self.authorize_claude_candidate(owner, request).await?;
-        let reply = self
+        let reply = match self
             .real
             .observe_claude_sources(owner, request, test_run_id)
-            .await?;
+            .await
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                let message = error.to_string();
+                let classes = [
+                    "private",
+                    "peer",
+                    "identity",
+                    "reply",
+                    "digest",
+                    "retained",
+                    "frozen",
+                    "manifest",
+                    "metadata",
+                    "topology",
+                    "mount",
+                    "report",
+                    "actual",
+                    "changed",
+                    "timeout",
+                    "unavailable",
+                    "cleanup",
+                    "ownership",
+                    "baseline",
+                    "candidate",
+                ]
+                .into_iter()
+                .filter(|class| message.contains(class))
+                .collect::<Vec<_>>();
+                println!(
+                    "provider_source_reader_failure {}",
+                    json!({"candidate":request.candidate.is_some(),"classes":classes,"messageBytes":message.len()})
+                );
+                return Err(error);
+            }
+        };
         if let Some(binding) = &request.observation_request.candidate_binding {
             println!(
                 "provider_candidate_observer {}",
@@ -270,6 +349,14 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
                     "gid":reply.observation.gid,"supplementaryGroups":reply.observation.supplementary_groups,
                     "backendCompleteAfterCleanup":true,
                 })
+            );
+        } else if matches!(
+            owner,
+            freshell_supervisor::backend::ClaudeSourceOwner::Retained { .. }
+        ) {
+            println!(
+                "provider_retained_source_observer {}",
+                json!({"uid":reply.observation.uid,"gid":reply.observation.gid,"supplementaryGroups":reply.observation.supplementary_groups,"rootUid":reply.observation.root_uid,"decision":reply.observation.local_decision,"localCount":reply.observation.local_settings.len(),"backendCompleteAfterCleanup":true})
             );
         }
         Ok(reply)
@@ -381,7 +468,9 @@ fn capture_fresh_launch_failure_classes() -> std::sync::Arc<std::sync::Mutex<Vec
             event: &tracing::Event<'_>,
             _: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            if !event.metadata().target().contains("fresh_agent_proxy") {
+            if !event.metadata().target().contains("fresh_agent_proxy")
+                && !event.metadata().target().contains("managed_mcp_capability")
+            {
                 return;
             }
             struct Classes(Vec<&'static str>);
@@ -443,6 +532,19 @@ fn capture_fresh_launch_failure_classes() -> std::sync::Arc<std::sync::Mutex<Vec
                         "temporary",
                         "failed to start",
                         "failed with status",
+                        "original",
+                        "origins",
+                        "No such file",
+                        "resolve",
+                        "root",
+                        "budget",
+                        "bound",
+                        "pending",
+                        "committed",
+                        "publication",
+                        "source evidence",
+                        "source selection",
+                        "source provenance",
                     ] {
                         if text.contains(label) {
                             self.0.push(label);
@@ -1059,7 +1161,10 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
         .unwrap_or_else(|_| "file".into());
     let source_guard = std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_SOURCE_GUARD")
         .unwrap_or_else(|_| "unchanged".into());
-    assert!(matches!(source_guard.as_str(), "unchanged" | "changed-git"));
+    assert!(matches!(
+        source_guard.as_str(),
+        "unchanged" | "changed-git" | "retained"
+    ));
     let changed_git = source_guard == "changed-git";
     let flag_argument = match settings_form.as_str() {
         "file" if changed_git => flag_alias.to_str().unwrap().into(),
@@ -1613,6 +1718,120 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         "provider_launch_consumer {}",
         json!({"provider":"claude","route":"terminal","digest":qualified_digest})
     );
+    if std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_SOURCE_GUARD").as_deref() == Ok("retained") {
+        let soul = SoulId::parse(terminal.soul_id.clone()).unwrap();
+        let prior = registry.active_handle_for_soul(soul.clone()).await.unwrap();
+        let prior_generation = prior
+            .terminal()
+            .unwrap()
+            .provider_launch_context
+            .as_ref()
+            .unwrap()
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .generation_id
+            .clone();
+        let real = DockerEngineBackend::new(fixture.join("broker.sock"));
+        real.force_stop(&prior)
+            .await
+            .expect("stop only the registry-owned disposable runtime");
+        assert!(real.verify_empty(&prior).await.unwrap());
+        let hidden_home = fixture.join("source-home-unavailable");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        for path in [&receipt, &instructions_receipt, &instructions_events] {
+            std::fs::remove_file(path).unwrap();
+        }
+        if settings_form != "owned-last" {
+            std::fs::remove_file(&flag_receipt).unwrap();
+        }
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(120),
+            client.recover(soul.clone(), RecoveryTrigger::HostUnreachable),
+        )
+        .await
+        .expect("finite actual retained recovery")
+        .expect("authenticated supervisor recovery reply");
+        println!(
+            "provider_recovery_outcome {}",
+            json!({"outcome":recovered.outcome,"priorGeneration":prior_generation,"probe":recovered.probe.as_ref().map(|probe|match probe { RecoveryProbe::ResumeReady {..} => "native_resume", RecoveryProbe::PristineSeedReady {..} => "pristine_seed", _ => "other" })})
+        );
+        if let Some(RecoveryProbe::Blocked {
+            reason, retry_hint, ..
+        }) = &recovered.probe
+        {
+            let repair = retry_hint.repair.as_deref().unwrap_or("");
+            let classes = [
+                "Claude",
+                "source",
+                "selection",
+                "changed",
+                "observation",
+                "identity",
+                "frozen",
+                "ordinary",
+                "manifest",
+                "metadata",
+                "HOME",
+                "scope",
+                "grant",
+                "missing",
+                "unavailable",
+                "reprepare",
+                "budget",
+                "native",
+                "store",
+                "provider",
+                "callback",
+                "checkpoint",
+                "permission",
+                "configuration",
+                "revision",
+            ]
+            .into_iter()
+            .filter(|class| repair.contains(class))
+            .collect::<Vec<_>>();
+            println!(
+                "provider_recovery_diagnostic {}",
+                json!({"reason":reason,"repairClasses":classes,"repairBytes":repair.len(),"callbackFailureClasses":failure_classes.lock().unwrap().clone()})
+            );
+        }
+        assert_eq!(recovered.outcome, RecoveryOutcome::Replaced, "actual retained callback must replace the stopped owned runtime after original ordinary inputs disappear");
+        let current = registry.active_handle_for_soul(soul).await.unwrap();
+        let generation = &current
+            .terminal()
+            .unwrap()
+            .provider_launch_context
+            .as_ref()
+            .unwrap()
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .generation_id;
+        assert_ne!(generation, &prior_generation);
+        assert_eq!(current.provider_volume_name(), prior.provider_volume_name());
+        assert_eq!(
+            consumed(&receipt)
+                .await
+                .expect("recovered real native startup hook"),
+            expected
+        );
+        if settings_form != "owned-last" {
+            assert_eq!(
+                consumed(&flag_receipt)
+                    .await
+                    .expect("recovered explicitly selected settings hook"),
+                json!({"flag":true,"resource":hash(b"closed-claude-resource"),"dependency":hash(b"closed-claude-dependency")})
+            );
+        }
+        imported_graph(&instructions_events, &expected_imports).await;
+        assert!(!home.exists());
+        println!(
+            "provider_recovery_consumer {}",
+            json!({"provider":"claude","route":"terminal","digest":qualified_digest,"sameOwnedHome":true,"priorGeneration":prior_generation,"generationId":generation,"originalOrdinaryUnavailable":true,"outcome":recovered.outcome})
+        );
+        std::fs::rename(&hidden_home, &home).unwrap();
+    }
     client
         .stop(SoulId::parse(terminal.soul_id).unwrap())
         .await
@@ -1630,6 +1849,16 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         std::fs::read_to_string(&disabled_project_memory).unwrap(),
         "@missing-disabled-project.md\n"
     );
+    if source_guard == "retained" {
+        // This closed scenario spends its two runtime attempts on the original
+        // terminal and its replacement. The unchanged scenario below retains
+        // its independent terminal and fresh SDK coverage.
+        web_task.abort();
+        control_task.abort();
+        assert!(web_task.await.unwrap_err().is_cancelled());
+        assert!(control_task.await.unwrap_err().is_cancelled());
+        return;
+    }
     // Fresh SDK exposes the existing all-source default. Remove only these
     // terminal-specific owned decoys before its independent launch.
     std::fs::remove_file(&disabled_project_memory).unwrap();
@@ -1857,6 +2086,8 @@ try {
         .all(|event| event["ignored"] != json!(true)));
     web_task.abort();
     control_task.abort();
+    assert!(web_task.await.unwrap_err().is_cancelled());
+    assert!(control_task.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
