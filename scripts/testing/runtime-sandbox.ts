@@ -698,7 +698,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'loss-credential', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'loss-credential', 'loss-diagnostic', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -3273,6 +3273,11 @@ export class ManagedRuntimeOwner {
     const raw = await this.ownedProviderExec(handle.containerId, ['node', '-e', OPENCODE_LOSS_CREDENTIAL_SCRIPT,
       '/home/freshell/provider/.local/share/opencode/auth.json'])
     return OpencodeLossCredentialEvidenceSchema.parse(JSON.parse(raw))
+  }
+  async lossDiagnosticRetained(handle: RuntimeEnclosureHandle): Promise<boolean> {
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    const raw = await this.ownedProviderExec(handle.containerId, ['sh', '-lc', 'cat "$HOME/p5-diagnostic-only" 2>/dev/null || true'])
+    return raw.trim() === 'phase5-diagnostic-retained-no-credential'
   }
 
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {

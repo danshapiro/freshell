@@ -217,9 +217,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
         paneId,
         `Use the bash tool exactly once to run: printf '${diagnostic}\\n' > "$HOME/p5-diagnostic-only". Reply with exactly P5_STATE_READY when complete.`,
       )
-      await expect.poll(async () => (await rig.ownedProviderExec(before.containerId!, [
-        'sh', '-lc', 'cat "$HOME/p5-diagnostic-only" 2>/dev/null || true',
-      ])).trim(), { timeout: 180_000 }).toBe(diagnostic)
+      await expect.poll(() => rig.lossDiagnosticRetained(rig.runtimeEnclosureHandle(before)), { timeout: 180_000 }).toBe(true)
       const providerSessionId = await waitForValue('native OpenCode session id', async () => {
         const content = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
           .find((candidate) => candidate.id === paneId)?.content
@@ -273,9 +271,7 @@ try { fs.rmSync(checkpoints, { recursive: true }); } catch (error) { if (error.c
 if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process.exit(2);
 `,
       ])
-      const diagnosticOnlyRetained = (await rig.ownedProviderExec(before.containerId, [
-        'sh', '-lc', 'cat "$HOME/p5-diagnostic-only"',
-      ])).trim() === diagnostic
+      const diagnosticOnlyRetained = await rig.lossDiagnosticRetained(rig.runtimeEnclosureHandle(before))
       expect(diagnosticOnlyRetained).toBe(true)
       const credentialAfter = await rig.lossCredentialEvidence(rig.runtimeEnclosureHandle(before))
       expect(credentialAfter).toEqual(credentialBefore)

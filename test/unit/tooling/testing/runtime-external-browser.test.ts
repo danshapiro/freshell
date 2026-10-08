@@ -1179,7 +1179,7 @@ describe('closed external owner control', () => {
     expect(version).toHaveBeenCalledTimes(2)
     expect(kill).toHaveBeenCalledOnce()
   })
-  it('observes only the fixed loss credential file with the original real Node hash probe', async () => {
+  it('observes fixed loss files with the original hash and diagnostic probes', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-loss-credential-'))
     try {
       const { owned, context, request, inventory } = fixture()
@@ -1195,6 +1195,12 @@ describe('closed external owner control', () => {
       await fsp.writeFile(mapper, `const fs=require('node:fs');for(const name of ['lstatSync','readFileSync']){const original=fs[name];fs[name]=function(file,...args){return original.call(fs,file===${JSON.stringify(nativePath)}?process.env.TEST_LOSS_CREDENTIAL:file,...args)}}`)
       await fsp.writeFile(credential, 'private credential fixture\n', { mode: 0o600 })
       const exec = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (_id, args) => {
+        if (args[0] === 'sh') {
+          const child = spawnSync('sh', ['-lc', args[2].replaceAll('$HOME', '$TEST_PROVIDER_HOME')], {
+            env: { ...process.env, TEST_PROVIDER_HOME: directory }, encoding: 'utf8' })
+          if (child.status !== 0) throw new Error(child.stderr)
+          return child.stdout
+        }
         const child = spawnSync(process.execPath, ['--require', mapper, ...args.slice(1)], {
           env: { ...process.env, TEST_LOSS_CREDENTIAL: credential }, encoding: 'utf8' })
         if (child.status !== 0) throw new Error(child.stderr)
@@ -1205,6 +1211,13 @@ describe('closed external owner control', () => {
         await control(JSON.parse(String(init.body)))), { status: 200 }))
       const rig = new runner.ExternalManagedRuntimeRig(context, transport)
       const enclosure = rig.runtimeEnclosureHandle(row)
+      const diagnostic = path.join(directory, 'p5-diagnostic-only')
+      await fsp.writeFile(diagnostic, 'phase5-diagnostic-retained-no-credential\n')
+      await expect(rig.lossDiagnosticRetained(enclosure)).resolves.toBe(true)
+      await fsp.writeFile(diagnostic, 'mismatched private marker\n')
+      await expect(rig.lossDiagnosticRetained(enclosure)).resolves.toBe(false)
+      await fsp.unlink(diagnostic)
+      await expect(rig.lossDiagnosticRetained(enclosure)).resolves.toBe(false)
       const observed = await rig.lossCredentialEvidence(enclosure)
       expect(observed).toEqual({ path: nativePath, exists: true,
         sha256: createHash('sha256').update(await fsp.readFile(credential)).digest('hex') })
@@ -1218,6 +1231,10 @@ describe('closed external owner control', () => {
         sha256: createHash('sha256').update('absent').digest('hex') })
       exec.mockClear()
       await expect(control({ ...request, action: 'loss-credential', enclosure: { ...enclosure, hostBootId: 'foreign-boot' } })).rejects.toThrow(/current/)
+      await expect(control({ ...request, operationId: 'stale-diagnostic-boot', action: 'loss-diagnostic',
+        enclosure: { ...enclosure, hostBootId: 'foreign-boot' } })).rejects.toThrow(/current/)
+      await expect(control({ ...request, operationId: 'foreign-diagnostic-command', action: 'loss-diagnostic', enclosure,
+        command: 'cat /foreign/marker' })).rejects.toThrow(/operation/)
       inventory.mockResolvedValue([{ ...row, provider: 'codex' }])
       await expect(control({ ...request, operationId: 'foreign-credential-provider', action: 'loss-credential', enclosure })).rejects.toThrow(/OpenCode/)
       await expect(control({ ...request, operationId: 'foreign-credential-path', action: 'loss-credential', enclosure,

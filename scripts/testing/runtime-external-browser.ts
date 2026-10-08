@@ -873,6 +873,9 @@ export class ExternalManagedRuntimeRig {
   async lossCredentialEvidence(enclosure: RuntimeEnclosureHandle): Promise<OpencodeLossCredentialEvidence> {
     return this.rpc('loss-credential', OpencodeLossCredentialEvidenceSchema, { enclosure })
   }
+  async lossDiagnosticRetained(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
+    return this.rpc('loss-diagnostic', z.boolean(), { enclosure })
+  }
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {
     await this.rpc('crash-provider-worker', CompletedOwnerOperationSchema, { handle })
   }
@@ -1110,6 +1113,10 @@ export function createExternalRuntimeControl(
       case 'loss-credential':
         if (!request.enclosure) throw new Error('exact runtime enclosure required')
         result = await owner.lossCredentialEvidence(request.enclosure)
+        break
+      case 'loss-diagnostic':
+        if (!request.enclosure) throw new Error('exact runtime enclosure required')
+        result = await owner.lossDiagnosticRetained(request.enclosure)
         break
       case 'incident-matches-soul':
         if (!request.incidentId) throw new Error('observed incident identity required')
