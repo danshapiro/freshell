@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import type { ManagedRuntimeView, ManagedFixtureRig } from './managed-runtime.js'
+import type { RuntimeChaosLog } from '../../../scripts/testing/runtime-sandbox.js'
+export { writePrivateRuntimeChaosJsonl as writePrivateJsonl } from '../../../scripts/testing/runtime-sandbox.js'
 
 
 
@@ -22,16 +24,7 @@ export type ChaosRuntimeObservation = {
 
 export type { NativeToolEvidence } from '../../../scripts/testing/runtime-sandbox.js'
 
-export type StructuredChaosLog = {
-  source: 'server' | 'browser'
-  sequence: number
-  monotonicMs: number
-  level: string
-  event: string
-  contentSha256: string
-  contentBytes: number
-  redacted: true
-}
+export type StructuredChaosLog = RuntimeChaosLog
 
 export async function captureChaosRuntimeObservation(
   rig: ManagedFixtureRig,
@@ -77,14 +70,14 @@ export async function nativeFollowUpMessageIds(
   return rig.nativeFollowUpMessageIds(handle, challengeId)
 }
 
-export function structuredChaosLog(
-  source: 'server' | 'browser',
+export function structuredChaosLog<T extends StructuredChaosLog['source']>(
+  source: T,
   sequence: number,
   monotonicMs: number,
   level: string,
   event: string,
   transientContent: string,
-): StructuredChaosLog {
+): StructuredChaosLog & { source: T } {
   return {
     source,
     sequence,
@@ -100,12 +93,5 @@ export function structuredChaosLog(
 export function writePrivateJson(filePath: string, value: unknown): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 })
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 0o600 })
-  fs.chmodSync(filePath, 0o600)
-}
-
-export function writePrivateJsonl(filePath: string, rows: readonly StructuredChaosLog[]): void {
-  if (rows.length === 0) throw new Error('refusing to persist an empty chaos log')
-  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 })
-  fs.writeFileSync(filePath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, { mode: 0o600 })
   fs.chmodSync(filePath, 0o600)
 }

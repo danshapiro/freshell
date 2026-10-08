@@ -613,6 +613,27 @@ export type RuntimeSupervisorProcessFacts = z.infer<typeof RuntimeSupervisorProc
 export const RuntimeCandidateIntegritySchema = z.object({ sha: z.string().regex(/^[a-f0-9]{40}$/), dirty: z.boolean(),
   diffHash: z.string().regex(/^[a-f0-9]{64}$/), statusHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict()
 export type RuntimeCandidateIntegrity = z.infer<typeof RuntimeCandidateIntegritySchema>
+const RuntimeChaosLogSchema = z.object({ source: z.enum(['server', 'browser']), sequence: z.number().int().positive(),
+  monotonicMs: z.number().nonnegative(), level: z.string(), event: z.string(),
+  contentSha256: z.string().regex(/^[a-f0-9]{64}$/), contentBytes: z.number().int().nonnegative(), redacted: z.literal(true) }).strict()
+export type RuntimeChaosLog = z.infer<typeof RuntimeChaosLogSchema>
+export const RuntimeChaosLogsSchema = z.object({
+  server: z.array(RuntimeChaosLogSchema.extend({ source: z.literal('server') })).min(1),
+  browser: z.array(RuntimeChaosLogSchema.extend({ source: z.literal('browser') })).min(1),
+}).strict()
+export type RuntimeChaosLogs = z.infer<typeof RuntimeChaosLogsSchema>
+export const RuntimeChaosLogArtifactsSchema = z.object({
+  serverArtifactRef: z.string().regex(/^phase5-chaos-server-log:[a-f0-9]{64}$/),
+  browserArtifactRef: z.string().regex(/^phase5-chaos-browser-log:[a-f0-9]{64}$/),
+}).strict()
+export type RuntimeChaosLogArtifacts = z.infer<typeof RuntimeChaosLogArtifactsSchema>
+
+export function writePrivateRuntimeChaosJsonl(filePath: string, rows: readonly RuntimeChaosLog[]): void {
+  if (rows.length === 0) throw new Error('refusing to persist an empty chaos log')
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 })
+  fs.writeFileSync(filePath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, { mode: 0o600 })
+  fs.chmodSync(filePath, 0o600)
+}
 export const RuntimeChaosWebOutputFactsSchema = z.object({ contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
   contentBytes: z.number().int().nonnegative(), containsFollowUpMarker: z.boolean(), containsAuthToken: z.boolean() }).strict()
 export type RuntimeChaosWebOutputFacts = z.infer<typeof RuntimeChaosWebOutputFactsSchema>
@@ -645,7 +666,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
-    'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running',
+    'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs',
     'synthetic-history-challenge',
     'synthetic-source-facts',
     'synthetic-source-history', 'synthetic-source-exclusions',
@@ -668,6 +689,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   expectedIntentRevision: z.number().int().nonnegative().optional(),
   generation: z.number().int().nonnegative().optional(),
   phase3Browser: Phase3BrowserObservationSchema.optional(),
+  chaosLogs: RuntimeChaosLogsSchema.optional(),
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
@@ -3287,6 +3309,19 @@ export class ManagedRuntimeOwner {
     const marker = await this.nativeChallengeMarker(handle, challengeId)
     if (marker !== NativeChallengeMarkers['chaos-long-tool']) throw new Error('registered chaos long-tool challenge required')
     return this.ownedContainerProcessTable(handle.containerId).includes('sleep 180')
+  }
+
+  async publishChaosLogs(handle: ExactRuntimeHandle, input: RuntimeChaosLogs): Promise<RuntimeChaosLogArtifacts> {
+    await this.assertCurrentHandle(handle)
+    const logs = RuntimeChaosLogsSchema.parse(input)
+    const server = path.join(this.runtime.evidenceDir, 'phase5-chaos-server-log.jsonl')
+    const browser = path.join(this.runtime.evidenceDir, 'phase5-chaos-browser-log.jsonl')
+    writePrivateRuntimeChaosJsonl(server, logs.server)
+    writePrivateRuntimeChaosJsonl(browser, logs.browser)
+    const artifacts = { serverArtifactRef: `phase5-chaos-server-log:${createHash('sha256').update(fs.readFileSync(server)).digest('hex')}`,
+      browserArtifactRef: `phase5-chaos-browser-log:${createHash('sha256').update(fs.readFileSync(browser)).digest('hex')}` }
+    this.runtime.recordLifecycle('external.chaos_logs_published', { severity: 'info', ...artifacts })
+    return artifacts
   }
 
   async nativeFollowUpMessageIds(handle: ExactRuntimeHandle, challengeId: string): Promise<string[]> {

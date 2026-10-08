@@ -19,7 +19,8 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema,
   FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
-  RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
+  RuntimeChaosLogArtifactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -31,6 +32,7 @@ import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
 import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
+import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -705,7 +707,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -830,6 +832,9 @@ export class ExternalManagedRuntimeRig {
   }
   async chaosLongToolRunning(handle: ExactRuntimeHandle, challengeId: string): Promise<boolean> {
     return this.rpc('chaos-long-tool-running', z.boolean(), { handle, challengeId })
+  }
+  async publishChaosLogs(handle: ExactRuntimeHandle, chaosLogs: RuntimeChaosLogs): Promise<RuntimeChaosLogArtifacts> {
+    return this.rpc('chaos-logs', RuntimeChaosLogArtifactsSchema, { handle, chaosLogs })
   }
   async incidentMatchesSoul(handle: ExactRuntimeHandle, incidentId: string): Promise<boolean> {
     return this.rpc('incident-matches-soul', z.boolean(), { handle, incidentId })
@@ -1078,6 +1083,10 @@ export function createExternalRuntimeControl(
       case 'chaos-long-tool-running':
         if (!request.challengeId) throw new Error('registered chaos long-tool challenge required')
         result = await owner.chaosLongToolRunning(handle(), request.challengeId)
+        break
+      case 'chaos-logs':
+        if (!request.chaosLogs) throw new Error('chaos log observations required')
+        result = await owner.publishChaosLogs(handle(), request.chaosLogs)
         break
       case 'incident-matches-soul':
         if (!request.incidentId) throw new Error('observed incident identity required')

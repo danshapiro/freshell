@@ -18,6 +18,7 @@ import * as runner from '../../../../scripts/testing/runtime-external-browser.js
 import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type SupervisorInstance, type Phase3BrowserObservation } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 import { stopManagedRuntimeSoul } from '../../../e2e-browser/helpers/managed-runtime.js'
+import { structuredChaosLog } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
 
 beforeEach(() => execute.mockReset())
 
@@ -1439,6 +1440,44 @@ describe('closed external owner control', () => {
     await expect(control({ ...request, operationId: 'stale-long-tool', action: 'chaos-long-tool-running',
       handle, challengeId: challenge.challengeId })).rejects.toThrow(/changed/)
     expect(table).not.toHaveBeenCalled()
+  })
+  it('persists both fixed chaos logs privately before returning their observed artifact references', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-chaos-logs-'))
+    try {
+      const { owned, context, request } = fixture()
+      Object.assign(owned.runtime, { evidenceDir: directory, lifecyclePath: path.join(directory, 'lifecycle.jsonl') })
+      const current = vi.spyOn(owned, 'assertCurrentHandle').mockResolvedValue(undefined)
+      const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'log-owned-soul',
+        incarnationId: 'log-owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'log-owned-boot', nativeSessionId: 'log-owned-native' }
+      const logs = { server: [structuredChaosLog('server', 1, 100, 'info', 'supervisor.replaced', 'private server body')],
+        browser: [structuredChaosLog('browser', 1, 120, 'info', 'web.replaced', 'private browser body')] }
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+        await control(JSON.parse(String(init.body)))), { status: 200 }))
+      const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+      const references = await rig.publishChaosLogs(handle, logs)
+      const sources: Array<'server' | 'browser'> = ['server', 'browser']
+      for (const source of sources) {
+        const file = path.join(directory, `phase5-chaos-${source}-log.jsonl`)
+        const bytes = await fsp.readFile(file)
+        expect(bytes.toString()).toBe(`${logs[source].map(row => JSON.stringify(row)).join('\n')}\n`)
+        expect((await fsp.stat(file)).mode & 0o777).toBe(0o600)
+        expect(references[`${source}ArtifactRef`]).toBe(`phase5-chaos-${source}-log:${createHash('sha256').update(bytes).digest('hex')}`)
+        expect(bytes.toString()).not.toContain(`private ${source} body`)
+      }
+      expect(JSON.stringify(references)).not.toContain(directory)
+      const before = await fsp.readFile(path.join(directory, 'phase5-chaos-server-log.jsonl'))
+      await expect(control({ ...request, action: 'chaos-logs', handle, chaosLogs: { ...logs, browser: [] } })).rejects.toThrow()
+      await expect(control({ ...request, operationId: 'wrong-log-role', action: 'chaos-logs', handle,
+        chaosLogs: { server: logs.browser, browser: logs.server } })).rejects.toThrow()
+      await expect(control({ ...request, operationId: 'foreign-log-path', action: 'chaos-logs', handle,
+        chaosLogs: logs, filePath: '/foreign/log.jsonl' })).rejects.toThrow(/operation/)
+      current.mockRejectedValue(new Error('exact runtime handle changed'))
+      await expect(control({ ...request, operationId: 'stale-chaos-logs', action: 'chaos-logs', handle, chaosLogs: logs })).rejects.toThrow(/changed/)
+      expect(await fsp.readFile(path.join(directory, 'phase5-chaos-server-log.jsonl'))).toEqual(before)
+    } finally {
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
   })
   it('creates synthetic history only for the registered OpenCode fixture and returns observed row identities', async () => {
     const owned = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3, {}, {}, 'test', {

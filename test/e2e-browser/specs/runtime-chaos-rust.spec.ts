@@ -30,7 +30,6 @@ import {
   nativeToolEvidence,
   structuredChaosLog,
   writePrivateJson,
-  writePrivateJsonl,
   type ChaosRuntimeObservation,
   type StructuredChaosLog,
 } from '../helpers/runtime-chaos-evidence.js'
@@ -186,8 +185,8 @@ test.describe.serial('Phase 5 runtime chaos', () => {
     const candidateBefore = await rig.captureCandidateIntegrity()
     const webCycles: Record<string, unknown>[] = []
     const supervisorCycles: Record<string, unknown>[] = []
-    const browserLogs: StructuredChaosLog[] = []
-    const serverLogs: StructuredChaosLog[] = []
+    const browserLogs: Array<StructuredChaosLog & { source: 'browser' }> = []
+    const serverLogs: Array<StructuredChaosLog & { source: 'server' }> = []
     let receiptReady = false
     try {
       const info = await rig.start()
@@ -442,8 +441,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         event: 'server.output.captured', contentSha256: capturedServer.contentSha256,
         contentBytes: capturedServer.contentBytes, redacted: true,
       })
-      writePrivateJsonl(path.join(rig.runtime.evidenceDir, 'phase5-chaos-server-log.jsonl'), serverLogs)
-      writePrivateJsonl(path.join(rig.runtime.evidenceDir, 'phase5-chaos-browser-log.jsonl'), browserLogs)
+      await rig.publishChaosLogs(nativeHandle, { server: serverLogs, browser: browserLogs })
       writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_CHAOS_PROVIDER_EVENTS_FILE), {
         schemaVersion: 1,
         provider: 'opencode',
