@@ -788,8 +788,10 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
     const view = inventory.data.find((row: any) => row.soulId === soulId)
     harness.writeArtifact(`${scenario}-current-view.json`, view)
+    // The legacy root reference is not an observation. Starting and absence
+    // of current provider evidence must fence publication and ordinary input.
     if (launch.result?.Err?.code !== 'RECOVERY_BLOCKED' || !view || view.launchState !== 'starting'
-      || view.nativeSessionId || view.nativeIdentityObservation || !view.incarnationId || !view.containerId) {
+      || (view.nativeSessionId && view.nativeSessionId !== expectedRoot) || view.nativeIdentityObservation || !view.incarnationId || !view.containerId) {
       throw new Error('actual initial Codex wrong-root publication was not contained')
     }
     const receiptPath = path.join(harness.runtimeDir(supervisor, view.incarnationId), 'provider-identity.json')

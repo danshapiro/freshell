@@ -91,7 +91,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
         throw new Error('unexpected controlled command')
       },
       adminOk: async () => ({ data: [{ soulId: requests[0].params.soulId, launchState: fault === 'published' ? 'running' : 'starting',
-        nativeSessionId: null, nativeIdentityObservation: null, incarnationId: incarnation, containerId: 'owned-current' }] }),
+        nativeSessionId: expectedRoot, nativeIdentityObservation: null, incarnationId: incarnation, containerId: 'owned-current' }] }),
       execOwnedContainerAsExact: async () => JSON.stringify({ uid: fault === 'wrong-uid' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
         httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: path.join(directory, 'codex-wrong-root-workspace'), nativeVersion: 'codex-cli 0.147.0',
         activeNativeProcesses: 1, executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64) }),
