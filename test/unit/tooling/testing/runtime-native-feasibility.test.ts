@@ -13,6 +13,7 @@ import WebSocket, { WebSocketServer } from 'ws'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
+  prepareOwnedOpenCodeTuiSource,
   runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeReceiverLoadFaultWrapper, nativeReceiverLoadFaultEntry, writeOwnedNativeReceiverControl, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
   amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, receiverWrongRootEvidence, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
@@ -32,6 +33,56 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it('prepares a genuinely empty owned V1 root before native export while preserving related roots', () => {
+    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+    fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
+    try {
+      const source = prepareOwnedOpenCodeTuiSource(process.cwd(), ownedRoot, 'v1-empty', randomUUID())
+      const database = new DatabaseSync(source.databasePath, { readOnly: true })
+      try {
+        expect(database.prepare('SELECT count(*) AS count FROM message WHERE session_id=?').get(source.rootId)?.count).toBe(0)
+        expect(database.prepare('SELECT count(*) AS count FROM part WHERE session_id=?').get(source.rootId)?.count).toBe(0)
+        expect(database.prepare('SELECT count(*) AS count FROM message WHERE session_id=?').get(source.childId)?.count).toBe(1)
+        expect(database.prepare('SELECT parent_id,directory FROM session WHERE id=?').get(source.rootId)).toEqual({ parent_id: null, directory: source.workspace })
+        expect(database.prepare('SELECT vcs FROM project WHERE worktree=?').get(source.workspace)?.vcs).toBe('git')
+      } finally { database.close() }
+      expect(execFileSync('git', ['-C', source.workspace, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim()).toBe(source.workspace)
+      expect(() => prepareOwnedOpenCodeTuiSource(process.cwd(), ownedRoot, 'v1-empty', randomUUID())).toThrow('already exists')
+    } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
+  })
+  it.each(['null-slot', 'v2-empty-is-not-v1-empty', 'full-revert', 'part-revert', 'baseline-only-resume'])(
+    'prepares the actual owned V1 and saved revert shape for %s without inventing V2 history', caseId => {
+      const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+      fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
+      try {
+        const source = prepareOwnedOpenCodeTuiSource(process.cwd(), ownedRoot, caseId, randomUUID())
+        const database = new DatabaseSync(source.databasePath, { readOnly: true })
+        try {
+          const messages = database.prepare('SELECT id FROM message WHERE session_id=? ORDER BY id').all(source.rootId)
+          expect(messages).toHaveLength(2)
+          expect(database.prepare('SELECT count(*) AS count FROM session_message WHERE session_id=?').get(source.rootId)?.count).toBe(0)
+          const row = database.prepare('SELECT revert FROM session WHERE id=?').get(source.rootId)
+          if (caseId === 'full-revert') expect(JSON.parse(String(row?.revert))).toEqual({ messageID: source.lastMessageId })
+          else if (caseId === 'part-revert') {
+            const revert = JSON.parse(String(row?.revert))
+            expect(revert.messageID).toBe(source.lastMessageId)
+            expect(database.prepare('SELECT message_id FROM part WHERE id=?').get(revert.partID)?.message_id).toBe(source.lastMessageId)
+          } else expect(row?.revert).toBeNull()
+        } finally { database.close() }
+      } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
+    })
+  it.each(['foreign-root', 'symlink-root', 'unknown-case'])(
+    'refuses unowned or invalid source preparation before creating a workspace (%s)', fault => {
+      const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+      fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
+      const alias = ownedRoot + '-alias'
+      if (fault === 'symlink-root') fs.symlinkSync(ownedRoot, alias, 'dir')
+      try {
+        expect(() => prepareOwnedOpenCodeTuiSource(process.cwd(), fault === 'foreign-root' ? '/operator/native-home'
+          : fault === 'symlink-root' ? alias : ownedRoot, fault === 'unknown-case' ? 'arbitrary-shell' : 'v1-empty', randomUUID())).toThrow('finite owned')
+        expect(fs.readdirSync(ownedRoot)).toEqual([])
+      } finally { if (fs.existsSync(alias)) fs.unlinkSync(alias); fs.rmSync(ownedRoot, { recursive: true, force: true }) }
+    })
   it.each(['ordinary', 'parity'])('keeps Codex transcript Enter-bound while the %s producer selects its native startup boundary', async route => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'parity-codex-startup-'))
     const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })

@@ -4,8 +4,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { createConnection } from 'node:net'
+import { execFileSync } from 'node:child_process'
+import { DatabaseSync } from 'node:sqlite'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from './runtime-sandbox.js'
+import { seedManagedOpenCodeSource } from '../../test/e2e-browser/fixtures/managed-opencode-source.js'
 import { readCodexNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/codex.js'
 import { readOpenCodeNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/opencode.js'
 import type { NativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/types.js'
@@ -494,6 +497,52 @@ export function nativeFeasibilityCases(selection: NativeSelection): readonly str
     'full-revert', 'part-revert', 'baseline-only-resume', 'stale-observation', 'cancellation',
   ]
   return ['create', 'exact-resume', 'wrong-root', 'cancellation']
+}
+
+/** Prepare only a new qualification source, before the unchanged exporter.
+ * The canonical seeder, imported destination and adoption baseline are never
+ * altered by this finite native experiment.
+ */
+export function prepareOwnedOpenCodeTuiSource(repoRoot: string, ownedRoot: string, caseId: string, nonce: string) {
+  if (!/^\/tmp\/f[a-z0-9]+\/[a-f0-9]{8}-[a-f0-9]{3}$/.test(ownedRoot)
+    || fs.realpathSync(ownedRoot) !== ownedRoot || !nonce
+    || !nativeFeasibilityCases({ provider: 'opencode', case: 'startup' }).includes(caseId)) {
+    throw new Error('finite owned OpenCode source preparation required')
+  }
+  const workspace = path.join(ownedRoot, `opencode-${caseId}-workspace`)
+  const databasePath = path.join(ownedRoot, `opencode-${caseId}-source.db`)
+  if (fs.existsSync(workspace) || fs.existsSync(databasePath)) throw new Error('OpenCode source already exists')
+  fs.mkdirSync(workspace, { mode: 0o770 })
+  fs.chmodSync(workspace, 0o770)
+  const options = { env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }, stdio: 'ignore' as const }
+  const nativeGit = (args: string[]): void => {
+    // A child-local umask makes the new fixture readable by the native UID
+    // without changing the caller's process-wide mask (or operator files).
+    execFileSync('python3', ['-c', "import os,sys; os.umask(0o022); os.execvp('git',['git',*sys.argv[1:]])", '-C', workspace, ...args], options)
+  }
+  nativeGit(['init', '--quiet'])
+  nativeGit(['remote', 'add', 'origin', 'https://fixture.invalid/freshell/managed-opencode.git'])
+  nativeGit(['-c', 'user.name=Owned Fixture', '-c', 'user.email=fixture@example.invalid',
+    'commit', '--allow-empty', '--no-verify', '--quiet', '-m', 'owned native qualification workspace'])
+  const source = seedManagedOpenCodeSource({ repoRoot, databasePath, workspace, nonce, messageCount: 2 })
+  const database = new DatabaseSync(databasePath)
+  try {
+    const changed = database.prepare("UPDATE project SET vcs='git' WHERE worktree=?").run(workspace)
+    if (changed.changes !== 1) throw new Error('owned source native Git project count differs')
+    if (caseId === 'v1-empty') {
+      database.prepare('DELETE FROM part WHERE session_id=?').run(source.rootId)
+      database.prepare('DELETE FROM message WHERE session_id=?').run(source.rootId)
+    } else if (caseId === 'full-revert' || caseId === 'part-revert') {
+      const part = caseId === 'part-revert'
+        ? database.prepare("SELECT id FROM part WHERE message_id=? AND json_extract(data,'$.type')='text'").get(source.lastMessageId)
+        : undefined
+      if (caseId === 'part-revert' && typeof part?.id !== 'string') throw new Error('owned source native revert part missing')
+      database.prepare('UPDATE session SET revert=? WHERE id=?').run(JSON.stringify({
+        messageID: source.lastMessageId, ...(part ? { partID: part.id } : {}),
+      }), source.rootId)
+    }
+  } finally { database.close() }
+  return { ...source, workspace }
 }
 
 type NativeCheckpointSnapshot = { nativeRoot: string; transcript: {
