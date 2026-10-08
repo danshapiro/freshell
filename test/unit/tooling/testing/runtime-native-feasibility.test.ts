@@ -45,6 +45,24 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       else expect(JSON.parse(run())).toEqual(fault==='owned-fork'?[...argv,'--fork-session']:argv)
     } finally {fs.rmSync(root,{recursive:true,force:true})}
   })
+  it.each(['default-home','selected-config','foreign-store','changed-file'])('executes native fork observation against the actual selected owned store (%s)', (fault) => {
+    const home='/owned-provider',config=fault==='selected-config'?'/selected-native-config':home+'/.claude'
+    const original=Buffer.from('owned completed history\n'),originalFile=config+'/projects/fixture/original-root.jsonl'
+    const mocked = `const writes=[];let stats=0;const selectedBytes=Buffer.from('controlled native executable');const originalBytes=Buffer.from(${JSON.stringify(original.toString('base64'))},'base64');
+const fs={readdirSync:()=>['71'],readFileSync:(file)=>{if(file.endsWith('native-fork-fault-control.json'))return JSON.stringify({root:'original-root',seedBytes:originalBytes.length});if(file.endsWith('/claude.exe')||file==='/proc/71/exe')return selectedBytes;if(file==='/proc/71/cmdline')return Buffer.from('native-child\\0--resume\\0original-root\\0--fork-session\\0');if(file===${JSON.stringify(originalFile)})return originalBytes;throw new Error('unowned read '+file)},lstatSync:()=>({isFile:()=>true,isSymbolicLink:()=>false}),statSync:()=>({dev:9,ino:++stats===2&&${JSON.stringify(fault)}==='changed-file'?43:42}),writeFileSync:(file,body)=>writes.push({file,body:JSON.parse(body)})};`
+    const script=terminalForkFaultHook.replace("import fs from 'node:fs'",mocked)+"\nprocess.stdout.write(JSON.stringify(writes)+'\\n')"
+    const env={...process.env,HOME:home,FRESHELL_NATIVE_IDENTITY_LAUNCH:JSON.stringify({requestedNativeSessionId:'original-root',incarnationId:'current',launchNonce:'nonce'})}
+    delete (env as NodeJS.ProcessEnv).CLAUDE_CONFIG_DIR
+    if(fault==='selected-config')(env as NodeJS.ProcessEnv).CLAUDE_CONFIG_DIR=config
+    const input=JSON.stringify({source:'fork',session_id:'fork-root',cwd:process.cwd(),transcript_path:(fault==='foreign-store'?'/foreign-native-store':config+'/projects/fixture')+'/fork-root.jsonl'})
+    const run=()=>execFileSync(process.execPath,['--input-type=module','-e',script],{input,env,encoding:'utf8',stdio:['pipe','pipe','pipe']})
+    if(fault==='foreign-store'||fault==='changed-file')expect(run).toThrow(fault==='foreign-store'?'unowned original fork store refused':'native original fork store changed during capture')
+    else {
+      const writes=JSON.parse(run().trim().split('\n').at(-1)!)
+      expect(writes).toHaveLength(1);expect(writes[0].body.originalPrefixSha256).toBe(createHash('sha256').update(original).digest('hex'))
+      expect(writes[0].body.identity).toEqual(['9','42'])
+    }
+  })
   it.each(['startup', 'wrong-requested-root', 'foreign-workspace', 'same-native-root'])('requires an actual owned different native root before recording a fork (%s)', (fault) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-fork-hook-'))
     const hookPath = path.join(directory, 'fork.mjs')
@@ -508,8 +526,31 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       else await expect(run).rejects.toThrow(fault==='running'?'published Running or identity':'empty stopped native fresh runtime')
     } finally {fs.rmSync(directory,{recursive:true,force:true})}
   })
+  it.each(['valid','wrong-image','wrong-wrapper','wrong-original','wrong-installed-wrapper','wrong-sdk'])('executes the pinned SDK fault-image admission before native seed (%s)', async (fault) => {
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'native-sdk-image-admission-')),file=path.join(directory,'image.json')
+    const marker={kind:'owned-sdk-resume-fork-fault-image',imageDigest:fault==='wrong-image'?'sha256:'+'0'.repeat(64):imageDigest,
+      wrapperSha256:fault==='wrong-wrapper'?'0'.repeat(64):createHash('sha256').update(nativeSdkResumeForkWrapper).digest('hex'),
+      originalExecutableSha256:fault==='wrong-original'?'0'.repeat(64):'73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916'}
+    fs.writeFileSync(file,JSON.stringify(marker))
+    const start=vi.fn(async()=>({containerId:'owned-supervisor'})),launch=vi.fn(async(_supervisor:unknown,request:any)=>{
+      expect(request.params.nativeSessionId).toBeUndefined();expect(request.params.freshAgent.nativeSessionId).toBeUndefined()
+      throw new Error('controlled legitimate native initial create boundary')
+    })
+    const inspect=vi.fn(async()=>JSON.stringify({...marker,wrapperSha256:fault==='wrong-installed-wrapper'?'0'.repeat(64):marker.wrapperSha256,sdkVersion:fault==='wrong-sdk'?'0.0.0':'0.3.237'}))
+    const harness={testRoot:directory,imageRef:imageDigest,startSupervisor:start,execOwnedContainerExact:inspect,writeArtifact:()=>'',adminOk:launch} as unknown as RuntimeHarness
+    try {
+      const run=executeManagedNativeCase(harness,[...['env_file','ca_file'].map(suffix=>({name:'claude/grants/'+suffix,path:path.join(directory,suffix),sha256:'e'.repeat(64)})),{name:'claude/native-fault/sdk-resume-fork.json',path:file,sha256:createHash('sha256').update(fs.readFileSync(file)).digest('hex')}],{mode:'freshclaude',case:'startup'},'wrong-id')
+      await expect(run).rejects.toThrow(fault==='valid'?'legitimate native initial create boundary':fault.startsWith('wrong-installed')||fault==='wrong-sdk'?'actual SDK native fault image differs before input':'fault image binding differs')
+      expect(launch).toHaveBeenCalledTimes(fault==='valid'?1:0)
+      expect(start).toHaveBeenCalledTimes(['valid','wrong-installed-wrapper','wrong-sdk'].includes(fault)?1:0)
+    } finally {fs.rmSync(directory,{recursive:true,force:true})}
+  })
+  it.each(['freshclaude','kilroy'] as const)('requires an owned pinned native fault image before %s wrong-ID can seed', async (mode) => {
+    await expect(executeManagedNativeCase({} as RuntimeHarness,[],{mode,case:'startup'},'wrong-id'))
+      .rejects.toThrow('owned SDK native resume-fork fault image required')
+  })
   it.each(['freshclaude', 'kilroy'] as const)('routes finite real-native startup faults for %s without any model dispatch', async (mode) => {
-    for (const caseId of ['wrong-id', 'missing-native-id', 'placeholder-id', 'disabled-hooks', 'timeout-50s', 'provider-exit', 'stop-cancellation']) {
+    for (const caseId of ['missing-native-id', 'placeholder-id', 'disabled-hooks', 'timeout-50s', 'provider-exit', 'stop-cancellation']) {
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-fresh-startup-route-'))
       const launch = vi.fn(async (_supervisor: unknown, body: any) => {
         expect(body.params.provider).toBe(mode === 'kilroy' ? 'kilroy' : 'claude')

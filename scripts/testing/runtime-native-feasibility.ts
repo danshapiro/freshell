@@ -309,6 +309,18 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
       'timeout-50s', 'provider-exit', 'stop-cancellation'].includes(caseId)) {
     throw new Error(`actual native case has no qualified execution path: ${selection.mode ?? selection.provider}/${caseId}`)
   }
+  const wrongId = caseId === 'wrong-id'
+  const forkSource = sources.find(file => file.name === 'claude/native-fault/sdk-resume-fork.json')
+  let sdkForkImage: any
+  if (forkSource) {
+    sdkForkImage = JSON.parse(fs.readFileSync(forkSource.path, 'utf8'))
+    if (sdkForkImage.kind !== 'owned-sdk-resume-fork-fault-image' || sdkForkImage.imageDigest !== harness.imageRef
+      || sdkForkImage.originalExecutableSha256 !== '73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916'
+      || sdkForkImage.wrapperSha256 !== createHash('sha256').update(nativeSdkResumeForkWrapper).digest('hex')) {
+      throw new Error('owned SDK native resume-fork fault image binding differs')
+    }
+  }
+  if (wrongId && !sdkForkImage) throw new Error('owned SDK native resume-fork fault image required')
   const mode = selection.mode!
   const logicalProvider = mode === 'kilroy' ? 'kilroy' : 'claude'
   const family = 'claude'
@@ -319,6 +331,17 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   })
   const scenario = `${mode}-${caseId}`
   const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release' })
+  if (sdkForkImage) {
+    const actual = JSON.parse(await harness.execOwnedContainerExact(supervisor.containerId, ['python3', '-c', String.raw`
+import pathlib,hashlib,json
+base=pathlib.Path('/opt/freshell-claude-sidecar/node_modules/@anthropic-ai')
+file=base/'claude-agent-sdk-linux-x64/claude'
+print(json.dumps({'wrapperSha256':hashlib.sha256(file.read_bytes()).hexdigest(),'originalExecutableSha256':hashlib.sha256(pathlib.Path(str(file)+'.native').read_bytes()).hexdigest(),'sdkVersion':json.loads((base/'claude-agent-sdk/package.json').read_text())['version']}))
+`]))
+    harness.writeArtifact(`${scenario}-sdk-fault-image-private.json`, actual)
+    if (actual.wrapperSha256 !== sdkForkImage.wrapperSha256 || actual.originalExecutableSha256 !== sdkForkImage.originalExecutableSha256
+      || actual.sdkVersion !== '0.3.237') throw new Error('actual SDK native fault image differs before input')
+  }
   const workspace = path.join(harness.testRoot, scenario + '-workspace')
   fs.mkdirSync(workspace, { mode: 0o770 }); fs.chmodSync(workspace, 0o770)
   if (caseId === 'crash-before-checkpoint' || caseId === 'effect-before-observation') {
@@ -333,25 +356,34 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
     fs.writeFileSync(path.join(directory, 'settings.json'), JSON.stringify(settings), { mode: 0o660 })
     fs.chmodSync(path.join(directory, 'settings.json'), 0o660)
   }
-  const startupFault = ['wrong-id', 'missing-native-id', 'placeholder-id', 'disabled-hooks', 'timeout-50s', 'provider-exit', 'stop-cancellation'].includes(caseId)
-  if (startupFault && caseId !== 'wrong-id') {
+  const startupFault = ['missing-native-id', 'placeholder-id', 'disabled-hooks', 'timeout-50s', 'provider-exit', 'stop-cancellation'].includes(caseId)
+  if (startupFault) {
     const local = path.join(workspace, '.claude'); fs.mkdirSync(local, { mode: 0o770 }); fs.chmodSync(local, 0o770)
     const file = path.join(local, 'settings.json')
     fs.writeFileSync(file, JSON.stringify({ disableAllHooks: true }), { mode: 0o660 }); fs.chmodSync(file, 0o660)
+  }
+  if (wrongId) {
+    const local = path.join(workspace, '.claude'); fs.mkdirSync(local, { mode: 0o770 }); fs.chmodSync(local, 0o770)
+    const file = path.join(workspace, 'native-sdk-fork-observer.mjs')
+    const hook = terminalForkFaultHook.replace('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe',
+      '/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude.native')
+    fs.writeFileSync(file, hook, { mode: 0o660 }); fs.chmodSync(file, 0o660)
+    const selected = path.join(local, 'settings.json')
+    fs.writeFileSync(selected, JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command',
+      command: "node '" + file.replaceAll("'", "'\\''") + "'" }] }] } }), { mode: 0o660 }); fs.chmodSync(selected, 0o660)
   }
   const soulId = 'soul-' + randomUUID()
   const storeId = 'store-' + randomUUID()
   const settings = { model: 'claude-haiku-4-5-20251001', effort: 'low', permissionMode: 'default' }
   const request = { method: 'launch', params: { soulId, provider: logicalProvider, providerStoreId: storeId,
     creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: scenario,
-    ...(caseId === 'wrong-id' ? {nativeSessionId:randomUUID()} : {}),
     limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
     freshAgent: { sessionId: 'native-fresh-' + randomUUID(), provider: logicalProvider,
       sessionType: mode, runtimeVariant: 'claude-sdk-sidecar', providerStoreId: storeId,
       cwd: workspace, workspacePath: workspace, runAsUid: 65534, runAsGid: 0, ...settings,
       providerSecretReferences: references, providerLaunchContext: { preparation: { claude: { mcp_args: [] } }, config: [] } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
-  if (startupFault) return executeManagedFreshStartupFault(harness, supervisor, request, caseId, scenario, settings)
+  if (startupFault) return executeManagedFreshStartupFault(harness, supervisor, request, caseId, scenario, settings, !!sdkForkImage)
   const launch = await harness.adminOk(supervisor, request)
   harness.writeArtifact(`${scenario}-launch.json`, launch)
   const view = launch.data.view
@@ -365,7 +397,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   }
   const inspect = async (containerId: string, label: string, requireTranscript: boolean) => {
     const metadata = JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
-      ['python3', '-c', claudeNativeInspection, view.nativeSessionId, String(requireTranscript)]))
+      ['python3', '-c', claudeNativeInspection, view.nativeSessionId, String(requireTranscript), 'fresh', 'ordinary', ...(sdkForkImage ? ['sdk-fork-image'] : [])]))
     harness.writeArtifact(`${scenario}-${label}-native-private.json`, metadata)
     if (metadata.uid !== 65534 || metadata.gid !== 0 || metadata.caps !== '0000000000000000'
       || !metadata.readOnlyRoot || metadata.httpsStatus !== 200 || metadata.tlsVerifyMode !== 2
@@ -379,7 +411,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   if (namespace.uid !== 65534 || namespace.gid !== 0 || !namespace.version.includes('2.1.237')) {
     throw new Error('actual selected native child/UID differs')
   }
-  if (caseId === 'current-native-turn' || caseId === 'exact-resume') {
+  if (caseId === 'current-native-turn' || caseId === 'exact-resume' || wrongId) {
     const marker = 'owned-memory-' + randomUUID()
     let cursor = 0
     const nativeTurn = async (text: string, label: string): Promise<any[]> => {
@@ -412,35 +444,67 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
     const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
     harness.writeArtifact(`${scenario}-store-probe.json`, probe)
     if (probe.data.kind !== 'reattach_ready') throw new Error('completed native store not readable before death')
+    if (wrongId) {
+      const control = path.join(workspace, 'native-fork-fault-control.json')
+      const bytes = Buffer.from(before.transcript.bytesBase64, 'base64')
+      fs.writeFileSync(control, JSON.stringify({ root: view.nativeSessionId, seedBytes: bytes.length,
+        seedSha256: before.transcript.sha256 }), { mode: 0o660 }); fs.chmodSync(control, 0o660)
+    }
     await harness.killOwnedRuntimeExact(view.containerId)
     await harness.waitForContainerExit(view.containerId)
-    const recovery = await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+    const recovery = wrongId ? await harness.adminRaw(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+      : await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
     harness.writeArtifact(`${scenario}-recovery.json`, recovery)
-    if (recovery.data.outcome !== 'replaced' || recovery.data.view.nativeSessionId !== view.nativeSessionId
-      || recovery.data.view.incarnationId === view.incarnationId || !recovery.data.view.nativeIdentityObservation
-      || recovery.data.view.recoveryState !== 'live') throw new Error('native exact-root replacement failed')
-    const after = await inspect(recovery.data.view.containerId, 'after-death', true)
-    if (before.transcript.sha256 !== after.transcript.sha256 || before.transcript.identity[0] !== after.transcript.identity[0]
-      || before.transcript.identity[1] !== after.transcript.identity[1]) throw new Error('native transcript lost original owned volume/file continuity')
-    assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
-      { name: 'replacement-new-incarnation-same-native-root', pass: recovery.data.outcome === 'replaced'
-        && recovery.data.view.incarnationId !== view.incarnationId && recovery.data.view.nativeSessionId === view.nativeSessionId
-        && recovery.data.view.nativeIdentityObservation.nativeSessionId === view.nativeSessionId },
-      { name: 'original-owned-volume-transcript-continuity', pass: before.transcript.sha256 === after.transcript.sha256
-        && before.transcript.identity[0] === after.transcript.identity[0] && before.transcript.identity[1] === after.transcript.identity[1] },
-      { name: 'same-workspace-selected-native-profile', pass: JSON.stringify(before.profileFiles) === JSON.stringify(after.profileFiles) })
-    if (caseId === 'current-native-turn') {
-      const recalled = await nativeTurn('Reply with only the private marker from before. Do not use tools.', 'recall')
-      const text = recalled.flatMap((event) => event.content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('').trim()
-      if (text !== marker) throw new Error('native restored context did not recall the private marker')
-      if (recalled.some((event) => (event.content ?? []).some((part: any) => part.type === 'tool_use'))) throw new Error('native recall unexpectedly requested a tool')
-      assertions.push({ name: 'actual-restored-context-private-marker-recall', pass: text === marker },
-        { name: 'native-turns-requested-no-tools', pass: ![...seedEvents, ...recalled].some((event) =>
-          (event.content ?? []).some((part: any) => part.type === 'tool_use')) })
+    if (wrongId) {
+      const observedPath = path.join(workspace, 'native-fork-fault-observation.json')
+      const fault = JSON.parse(fs.readFileSync(observedPath, 'utf8'))
+      harness.writeArtifact(`${scenario}-fork-current-native-event-private.json`, fault)
+      const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+      harness.writeArtifact(`${scenario}-fork-current-inventory.json`, inventory)
+      const current = inventory.data.filter((row: any) => row.soulId === soulId)
+      const nativeFork = fault.native.source === 'fork' && fault.native.session_id !== view.nativeSessionId
+        && fault.launch.requestedNativeSessionId === view.nativeSessionId
+        && fault.launch.incarnationId !== view.incarnationId && fault.launch.launchNonce !== namespace.hook.launch.launchNonce
+        && fault.uid === 65534 && fault.gid === 0 && fault.nativeExecutableSha256 === namespace.executableSha256
+        && fault.nativeArgv.includes('--fork-session') && fault.nativeArgv.includes('--resume')
+      const retained = fault.originalPrefixSha256 === before.transcript.sha256
+        && JSON.stringify(fault.identity) === JSON.stringify(before.transcript.identity.slice(0, 2))
+      const blocked = recovery.result?.Ok?.data?.outcome === 'blocked' && current.length > 0
+        && current.every((row: any) => row.launchState !== 'running' && row.nativeIdentityObservation?.incarnationId !== fault.launch.incarnationId)
+      if (!nativeFork || !retained || !blocked) throw new Error('genuine SDK native wrong root was not contained before input')
+      const input = await harness.adminRaw(supervisor, { method: 'fresh_agent_send', params: { soulId, text: 'Owned refused native fork probe. Do not use tools.' } })
+      harness.writeArtifact(`${scenario}-fork-input-refusal.json`, input)
+      if (!input.result?.Err) throw new Error('genuine SDK native wrong root admitted input')
+      assertions.push({ name: 'actual-sdk-exact-resume-selected-different-native-root', pass: nativeFork },
+        { name: 'original-native-root-volume-file-and-eof-retained', pass: retained },
+        { name: 'different-native-root-blocked-running-observation-and-input', pass: blocked && !!input.result.Err })
     } else {
-      assertions.push({ name: 'current-native-resume-observation-before-replacement-input', pass:
-        after.hook.native.source === 'resume' && after.hook.native.session_id === view.nativeSessionId
-        && recovery.data.view.nativeIdentityObservation.incarnationId === recovery.data.view.incarnationId })
+      if (recovery.data.outcome !== 'replaced' || recovery.data.view.nativeSessionId !== view.nativeSessionId
+        || recovery.data.view.incarnationId === view.incarnationId || !recovery.data.view.nativeIdentityObservation
+        || recovery.data.view.recoveryState !== 'live') throw new Error('native exact-root replacement failed')
+      const after = await inspect(recovery.data.view.containerId, 'after-death', true)
+      if (before.transcript.sha256 !== after.transcript.sha256 || before.transcript.identity[0] !== after.transcript.identity[0]
+        || before.transcript.identity[1] !== after.transcript.identity[1]) throw new Error('native transcript lost original owned volume/file continuity')
+      assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
+        { name: 'replacement-new-incarnation-same-native-root', pass: recovery.data.outcome === 'replaced'
+          && recovery.data.view.incarnationId !== view.incarnationId && recovery.data.view.nativeSessionId === view.nativeSessionId
+          && recovery.data.view.nativeIdentityObservation.nativeSessionId === view.nativeSessionId },
+        { name: 'original-owned-volume-transcript-continuity', pass: before.transcript.sha256 === after.transcript.sha256
+          && before.transcript.identity[0] === after.transcript.identity[0] && before.transcript.identity[1] === after.transcript.identity[1] },
+        { name: 'same-workspace-selected-native-profile', pass: JSON.stringify(before.profileFiles) === JSON.stringify(after.profileFiles) })
+      if (caseId === 'current-native-turn') {
+        const recalled = await nativeTurn('Reply with only the private marker from before. Do not use tools.', 'recall')
+        const text = recalled.flatMap((event) => event.content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('').trim()
+        if (text !== marker) throw new Error('native restored context did not recall the private marker')
+        if (recalled.some((event) => (event.content ?? []).some((part: any) => part.type === 'tool_use'))) throw new Error('native recall unexpectedly requested a tool')
+        assertions.push({ name: 'actual-restored-context-private-marker-recall', pass: text === marker },
+          { name: 'native-turns-requested-no-tools', pass: ![...seedEvents, ...recalled].some((event) =>
+            (event.content ?? []).some((part: any) => part.type === 'tool_use')) })
+      } else {
+        assertions.push({ name: 'current-native-resume-observation-before-replacement-input', pass:
+          after.hook.native.source === 'resume' && after.hook.native.session_id === view.nativeSessionId
+          && recovery.data.view.nativeIdentityObservation.incarnationId === recovery.data.view.incarnationId })
+      }
     }
   }
   if (selection.case === 'approval-checkpoint') {
@@ -457,7 +521,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
 }
 
 async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervisor: Awaited<ReturnType<RuntimeHarness['startSupervisor']>>,
-  request: any, caseId: string, scenario: string, settings: unknown): Promise<NativeExperimentOriginal> {
+  request: any, caseId: string, scenario: string, settings: unknown, sdkForkImage = false): Promise<NativeExperimentOriginal> {
   const soulId = request.params.soulId
   const began = Date.now()
   let finished = false, reply: any, error: unknown, namespace: any, receipt: any
@@ -476,7 +540,7 @@ async function executeManagedFreshStartupFault(harness: RuntimeHarness, supervis
     if (receipt) {
       try {
         namespace = JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId,'65534:0',
-          ['python3','-c',claudeNativeInspection,request.params.nativeSessionId??'', 'false','fresh', caseId==='wrong-id'?'wrong-id':'disabled-hooks']))
+          ['python3','-c',claudeNativeInspection,request.params.nativeSessionId??'', 'false','fresh', caseId==='wrong-id'?'wrong-id':'disabled-hooks', ...(sdkForkImage ? ['sdk-fork-image'] : [])]))
         break
       } catch (failure) {attempts.push(String(failure))}
     }
@@ -1675,7 +1739,7 @@ if(native.source==='fork') {
  const pids=fs.readdirSync('/proc').filter(id=>/^\d+$/.test(id)).filter(id=>{try{return digest(fs.readFileSync('/proc/'+id+'/exe'))===nativeExecutableSha256}catch{return false}})
  if(pids.length!==1)throw new Error('current native fork writer ambiguous')
  const pid=pids[0],nativeArgv=fs.readFileSync('/proc/'+pid+'/cmdline').toString().split('\0').filter(Boolean)
- const file=path.resolve(path.dirname(native.transcript_path),control.root+'.jsonl'),store=path.resolve(process.env.CLAUDE_CONFIG_DIR,'projects')+path.sep
+ const file=path.resolve(path.dirname(native.transcript_path),control.root+'.jsonl'),store=path.resolve(process.env.CLAUDE_CONFIG_DIR ?? path.join(process.env.HOME,'.claude'),'projects')+path.sep
  if(!file.startsWith(store) || !fs.lstatSync(file).isFile() || fs.lstatSync(file).isSymbolicLink())throw new Error('unowned original fork store refused')
  const before=fs.statSync(file),original=fs.readFileSync(file),after=fs.statSync(file)
  if(before.dev!==after.dev || before.ino!==after.ino || original.at(-1)!==10)throw new Error('native original fork store changed during capture')
@@ -1739,7 +1803,8 @@ import pathlib,os,json,hashlib,ssl,urllib.parse,urllib.request,subprocess,sys,ba
 root=sys.argv[1];required=sys.argv[2]=='true';terminal=len(sys.argv)>3 and sys.argv[3]=='terminal'
 missing_callbacks=len(sys.argv)>4 and sys.argv[4] in (['disabled-hooks','trust-refusal','unwritable-signal'] if terminal else ['disabled-hooks'])
 wrong_root=not terminal and len(sys.argv)>4 and sys.argv[4]=='wrong-id'
-selected=pathlib.Path('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe' if terminal else '/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude')
+sdk_fork_image=not terminal and len(sys.argv)>5 and sys.argv[5]=='sdk-fork-image'
+selected=pathlib.Path('/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe' if terminal else '/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude'+('.native' if sdk_fork_image else ''))
 expected=hashlib.sha256(selected.read_bytes()).hexdigest();matches=[]
 for p in pathlib.Path('/proc').iterdir():
  if not p.name.isdigit():continue
