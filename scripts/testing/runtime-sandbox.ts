@@ -3096,7 +3096,8 @@ export class ManagedRuntimeOwner {
     }
     const provider = mode === 'freshclaude' || mode === 'kilroy' ? 'claude'
       : mode === 'freshcodex' ? 'codex' : mode === 'freshopencode' ? 'opencode' : null
-    if (!provider || row.provider !== provider) throw new Error('fresh-agent provider registration differs')
+    const registeredProvider = mode === 'kilroy' ? 'kilroy' : provider
+    if (!provider || row.provider !== registeredProvider) throw new Error('fresh-agent provider registration differs')
     const raw = await this.ownedProviderExec(handle.containerId, [provider, '--version'])
     const version = raw.match(/\b\d+\.\d+\.\d+\b/)?.[0]
     if (!version) throw new Error('provider version reply is invalid')

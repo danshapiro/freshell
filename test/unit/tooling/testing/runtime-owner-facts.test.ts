@@ -77,15 +77,16 @@ describe('fixed fresh-agent launch observations', () => {
   })
   it.each([
     { mode: 'freshclaude', provider: 'claude', version: '2.1.263', command: 'claude --session owned' },
+    { mode: 'kilroy', provider: 'claude', registeredProvider: 'kilroy', version: '2.1.263', command: 'claude --session owned' },
     { mode: 'freshcodex', provider: 'codex', version: '0.147.0', command: 'codex app-server' },
     { mode: 'freshopencode', provider: 'opencode', version: '1.18.21', command: 'opencode serve' },
-  ])('observes $provider version/PID without requiring a pre-turn native ID', async ({ mode, provider, version, command }) => {
+  ])('observes $mode native-family version/PID without requiring a pre-turn native ID', async ({ mode, provider, registeredProvider = provider, version, command }) => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-fresh-launch-'))
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 5, {}, {}, 'release', {
       enabledProviders: [], freshAgentModes: [mode],
     })
     const enclosure = rig.runtimeEnclosureHandle(handle)
-    const row = { ...enclosure, provider, freshAgentSessionType: mode, launchState: 'running', intentRevision: 1 }
+    const row = { ...enclosure, provider: registeredProvider, freshAgentSessionType: mode, launchState: 'running', intentRevision: 1 }
     const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([row])
     rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(root, 'unused.sock'), proxySocketPath: path.join(root, 'proxy.sock'),
       runtimeRootPrefix: root, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId, logPath: path.join(root, 'broker.jsonl') })
@@ -101,6 +102,9 @@ describe('fixed fresh-agent launch observations', () => {
       probe.mockImplementation(async (_container, args) => args[0] === provider ? version : '1 session-host\n')
       await expect(rig.freshAgentLaunchFacts(enclosure)).rejects.toThrow(/provider.*PID/)
       probe.mockClear()
+      inventory.mockResolvedValue([{ ...row, provider: registeredProvider === provider ? 'kilroy' : provider }])
+      await expect(rig.freshAgentLaunchFacts(enclosure)).rejects.toThrow(/registration/)
+      expect(probe).not.toHaveBeenCalled()
       inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement' }])
       await expect(rig.freshAgentLaunchFacts(enclosure)).rejects.toThrow(/current|enclosure/)
       expect(probe).not.toHaveBeenCalled()
