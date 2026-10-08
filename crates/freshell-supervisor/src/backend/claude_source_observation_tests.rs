@@ -493,9 +493,7 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
             let qualified = qualify_candidate_stage(&stage, &owner, &request);
             assert_eq!(qualified.is_ok(),mode=="valid" || retained,"{flavor}/{runtime:?}/{mode}: physical issuer and current owner must qualify before consumer selection: {:?}",qualified.as_ref().err());
             if let Ok(projection) = qualified {
-                if !retained {
-                    qualify_candidate_helper_transport(&owner, &request, &stage).await;
-                }
+                qualify_candidate_helper_transport(&owner, &request, &stage).await;
                 let selected = &projection
                     .provider_launch_context
                     .prepared_inputs
@@ -997,7 +995,7 @@ async fn qualify_candidate_helper_transport(
     request: &ObserveClaudeSourcesRequest,
     stage: &Path,
 ) {
-    for mode in [
+    let mut modes = vec![
         "success",
         "docker-empty-tmpfs",
         "unexpected-tmpfs",
@@ -1007,15 +1005,55 @@ async fn qualify_candidate_helper_transport(
         "volume-still-present",
         "wrong-mount-report",
         "wrong-resource-subpath",
-    ] {
+    ];
+    if matches!(owner, ClaudeSourceOwner::Retained { .. }) {
+        modes.extend([
+            "writable-retained-home",
+            "wrong-retained-volume",
+            "changed-prior-context",
+        ]);
+    }
+    for mode in modes {
         let owned = tempfile::tempdir().unwrap();
         let daemon = match owner {
             ClaudeSourceOwner::Initial {
                 observation: InitialAuthVolumeObservation::Absent { daemon_id },
                 ..
             } => daemon_id.clone(),
-            _ => panic!("this fixture qualifies an initial candidate"),
+            ClaudeSourceOwner::Retained { handle, .. } => handle.daemon_id().clone(),
         };
+        let retained_name = match owner {
+            ClaudeSourceOwner::Retained { handle, .. } => {
+                Some(handle.provider_volume_name().to_string())
+            }
+            _ => None,
+        };
+        let prior_stage = owned.path().join("prior-stage");
+        if let ClaudeSourceOwner::Retained { handle, .. } = owner {
+            use freshell_platform::provider_environment::{copy_environment, CopySelection};
+            let context = retained_claude_context(handle).unwrap();
+            let inputs = context.prepared_inputs.as_ref().unwrap();
+            let selections = std::iter::once(CopySelection {
+                source: stage.join(&inputs.manifest.relative_path),
+                destination_relative: inputs.manifest.relative_path.clone().into(),
+            })
+            .chain(inputs.resource_mounts.iter().map(|unit| CopySelection {
+                source: stage.join(&unit.stage_relative_path),
+                destination_relative: unit.stage_relative_path.clone().into(),
+            }))
+            .collect::<Vec<_>>();
+            std::fs::create_dir(&prior_stage).unwrap();
+            copy_environment(&selections, &prior_stage, &[], Default::default()).unwrap();
+            std::fs::write(
+                prior_stage.join(".freshell/prepared-context.json"),
+                freshell_runtime_protocol::bounded_json_bytes(
+                    context,
+                    freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
         let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let containers = Arc::new(Mutex::new(BTreeMap::<String, Value>::new()));
         let volume = Arc::new(Mutex::new(None::<Value>));
@@ -1026,7 +1064,9 @@ async fn qualify_candidate_helper_transport(
             "freshell-claude-candidate-{}",
             request.observation_request.request_id
         );
+        let retained_name_for_server = retained_name.clone();
         let server = tokio::spawn(async move {
+            let retained_name = retained_name_for_server;
             let mut jobs = JoinSet::new();
             let private_jobs = Arc::new(Mutex::new(Vec::<tokio::task::JoinHandle<()>>::new()));
             loop {
@@ -1034,7 +1074,7 @@ async fn qualify_candidate_helper_transport(
                     _=&mut stopped=>break,
                     accepted=listener.accept()=>{
                         let (mut stream,_)=accepted.unwrap();
-                        let (seen,bodies,backing,daemon,private_jobs,expected_scratch)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone(),expected_scratch.clone());
+                        let (seen,bodies,backing,daemon,private_jobs,expected_scratch,retained_name)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone(),expected_scratch.clone(),retained_name.clone());
                         jobs.spawn(async move {
                             let mut header=Vec::new();let mut byte=[0];
                             while !header.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).await.unwrap();header.push(byte[0]);assert!(header.len()<=32*1024);}
@@ -1046,13 +1086,13 @@ async fn qualify_candidate_helper_transport(
                             let (status,value)=if line.contains("/info "){(200,json!({"ID":daemon,"SecurityOptions":["name=rootless"]}))}
                             else if line.contains("/images/"){(200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_IMAGE_CREDENTIAL_SENTINEL"]}}))}
                             else if line.starts_with("POST") && line.contains("/volumes/create "){assert_eq!(body["Name"],expected_scratch,"private candidate request must identify its exact scratch backing before creation");let actual=json!({"Name":body["Name"],"Driver":"local","Options":{},"Labels":body["Labels"],"Mountpoint":"/synthetic/ordinary-volume"});*backing.lock().unwrap()=Some(actual.clone());(201,actual)}
-                            else if line.starts_with("GET") && line.contains("/volumes/"){match backing.lock().unwrap().clone(){Some(v) if line.contains(v["Name"].as_str().unwrap())=>(200,v),_=>(404,json!({}))}}
+                            else if line.starts_with("GET") && line.contains("/volumes/"){if retained_name.as_ref().is_some_and(|name|line.contains(name)) {(200,json!({"Name":retained_name,"Driver":"local","Options":{},"Mountpoint":"/synthetic/retained-home"}))} else {match backing.lock().unwrap().clone(){Some(v) if line.contains(v["Name"].as_str().unwrap())=>(200,v),_=>(404,json!({}))}}}
                             else if line.starts_with("DELETE") && line.contains("/volumes/"){assert!(bodies.lock().unwrap().is_empty(),"candidate helpers must be gone before volume deletion");if mode!="volume-still-present" {*backing.lock().unwrap()=None;}(204,json!({}))}
                             else if line.contains("/containers/create?"){
                                 if body["Cmd"]==json!(["project-claude-candidate-private"]) {let root=body["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|m|m["Target"]=="/run/freshell-candidate-inputs").unwrap()["Source"].as_str().unwrap();assert!(!Path::new(root).join(".freshell/mcp-capability.json").exists(),"ordinary candidate input root must not expose capability credentials");}
                                 let name=line.split("name=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();let id=if body["Cmd"]==json!(["prepare-provider-mountpoints"]) {"a".repeat(64)} else {"b".repeat(64)};bodies.lock().unwrap().insert(name,json!({"Id":id,"Config":body,"HostConfig":body["HostConfig"],"State":{"Running":false}}));(if mode=="lost-projection-ack" && body["Cmd"]==json!(["project-claude-candidate-private"]) {503}else{201},json!({"Id":id}))}
                             else if line.starts_with("GET") && line.contains("/containers/"){let key=line.split("/containers/").nth(1).unwrap().split('/').next().unwrap();let found=bodies.lock().unwrap().iter().find(|(name,v)|*name==key || v["Id"]==key).map(|(_,v)|v.clone());match found {Some(mut v)=>{
-                                let reports=v["HostConfig"]["Mounts"].as_array().unwrap().iter().map(|m|json!({"Type":m["Type"],"Destination":m["Target"],"RW":!m["ReadOnly"].as_bool().unwrap(),"Source":if m["Type"]=="volume" {json!("/synthetic/ordinary-volume")} else {m["Source"].clone()},"Name":if m["Type"]=="volume" {m["Source"].clone()} else {Value::Null}})).collect::<Vec<_>>();
+                                let reports=v["HostConfig"]["Mounts"].as_array().unwrap().iter().map(|m|json!({"Type":m["Type"],"Destination":m["Target"],"RW":!m["ReadOnly"].as_bool().unwrap(),"Source":if m["Type"]=="volume" {json!(if m["Target"]=="/run/freshell-retained-home" {"/synthetic/retained-home"} else {"/synthetic/ordinary-volume"})} else {m["Source"].clone()},"Name":if m["Type"]=="volume" {m["Source"].clone()} else {Value::Null}})).collect::<Vec<_>>();
                                 v["Mounts"]=json!(reports);
                                 if mode=="docker-empty-tmpfs" && v["Config"]["Cmd"]==json!(["project-claude-candidate-private"]) {v["HostConfig"]["Tmpfs"]=Value::Null;}
                                 if key.len()==64 && v["Config"]["Cmd"]==json!(["project-claude-candidate-private"]) {
@@ -1060,6 +1100,8 @@ async fn qualify_candidate_helper_transport(
                                     if mode=="wrong-caps" {v["HostConfig"]["CapAdd"]=json!(["SYS_ADMIN"]);}
                                     if mode=="wrong-mount-report" {v["Mounts"][0]["RW"]=json!(true);}
                                     if mode=="wrong-resource-subpath" {let mount=v["HostConfig"]["Mounts"].as_array_mut().unwrap().iter_mut().find(|m|m["VolumeOptions"]["Subpath"].is_string()).unwrap();mount["VolumeOptions"]["Subpath"]=json!("foreign/ordinary");}
+                                    if mode=="writable-retained-home" {v["Mounts"].as_array_mut().unwrap().iter_mut().find(|m|m["Destination"]=="/run/freshell-retained-home").unwrap()["RW"]=json!(true);}
+                                    if mode=="wrong-retained-volume" {v["Mounts"].as_array_mut().unwrap().iter_mut().find(|m|m["Destination"]=="/run/freshell-retained-home").unwrap()["Name"]=json!("foreign-provider-home");}
                                 } (200,v)},None=>(404,json!({}))}}
                             else if line.starts_with("DELETE") && line.contains("/containers/"){let key=line.split("/containers/").nth(1).unwrap().split('?').next().unwrap();let name=bodies.lock().unwrap().iter().find(|(name,v)|*name==key || v["Id"]==key).map(|(name,_)|name.clone());if let Some(name)=name{bodies.lock().unwrap().remove(&name);}(204,json!({}))}
                             else if line.contains("/start "){let id=line.split("/containers/").nth(1).unwrap().split('/').next().unwrap();let v=bodies.lock().unwrap().values().find(|v|v["Id"]==id).unwrap().clone();private_jobs.lock().unwrap().push(tokio::spawn(async move {
@@ -1070,7 +1112,30 @@ async fn qualify_candidate_helper_transport(
                                 if !is_mountpoint && mode=="projection-timeout" {tokio::time::sleep(Duration::from_secs(10)).await;return;}
                                 let length=channel.read_u32().await.unwrap() as usize;assert!(length<=1024*1024);let mut raw=vec![0;length];channel.read_exact(&mut raw).await.unwrap();
                                 if is_mountpoint {let _:Vec<freshell_platform::provider_mountpoints::Mountpoint>=serde_json::from_slice(&raw).unwrap();channel.write_all(b"ok").await.unwrap();}
-                                else {let p:freshell_runtime_protocol::ClaudeCandidateProjectionRequest=serde_json::from_slice(&raw).unwrap();p.validate().unwrap();let source=p.source_request;let canonical=freshell_runtime_protocol::bounded_json_bytes(&source,MAX_REQUEST_BYTES).unwrap();let reply=ObservationReply {request_sha256:format!("{:x}",Sha256::digest(canonical)),observation:NativeObservation {version:1,native_source_runtime:source.native_source_runtime,setting_sources:source.setting_sources,uid:65534,euid:65534,gid:0,egid:0,supplementary_groups:vec![],cwd:source.cwd,home:Some(source.home),roots:None,local_settings:vec![],local_decision:LocalDecision::Disabled,root_uid:None,git_uid:None,claude_uid:None}};let raw=serde_json::to_vec(&reply).unwrap();channel.write_u32(raw.len() as u32).await.unwrap();channel.write_all(&raw).await.unwrap();channel.shutdown().await.unwrap();}
+                                else {
+                                    let p:freshell_runtime_protocol::ClaudeCandidateProjectionRequest=serde_json::from_slice(&raw).unwrap();
+                                    p.validate().unwrap();
+                                    if let Some(generation) = p.publication.prior_generation_id.as_deref() {
+                                        let mounts = v["HostConfig"]["Mounts"].as_array().unwrap();
+                                        let context = mounts.iter().find(|m|m["Target"]=="/run/freshell-retained-inputs/.freshell/prepared-context.json").unwrap()["Source"].as_str().unwrap();
+                                        let prior:freshell_runtime_protocol::ProviderLaunchContext = serde_json::from_slice(&std::fs::read(context).unwrap()).unwrap();
+                                        assert_eq!(prior.prepared_inputs.as_ref().unwrap().generation_id,generation);
+                                        let unit = mounts.iter().find(|m|m["Target"]=="/run/freshell-retained-inputs/.freshell/resource-units/unit-0").unwrap()["Source"].as_str().unwrap();
+                                        let mut consumer = std::process::Command::new("node").arg(Path::new(unit).join("probe/consumer.cjs")).current_dir(&p.workspace_path).env_clear().env("PATH","/usr/local/bin:/usr/bin:/bin").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+                                        let started = std::time::Instant::now();
+                                        let completed = loop {
+                                            if let Some(status) = consumer.try_wait().unwrap() { break status; }
+                                            if started.elapsed() >= Duration::from_secs(3) { consumer.kill().unwrap();consumer.wait().unwrap();panic!("owned frozen consumer timed out after finite joined cleanup"); }
+                                            std::thread::sleep(Duration::from_millis(5));
+                                        };
+                                        assert!(completed.success());
+                                        let mut output = Vec::new();
+                                        std::io::Read::read_to_end(&mut consumer.stdout.take().unwrap(),&mut output).unwrap();
+                                        assert_eq!(output,format!("qualified-frozen-dependency:{}",p.workspace_path).as_bytes());
+                                        if mode=="changed-prior-context" { std::fs::write(context,b"{}").unwrap(); }
+                                    }
+                                    let source=p.source_request;let canonical=freshell_runtime_protocol::bounded_json_bytes(&source,MAX_REQUEST_BYTES).unwrap();let reply=ObservationReply {request_sha256:format!("{:x}",Sha256::digest(canonical)),observation:NativeObservation {version:1,native_source_runtime:source.native_source_runtime,setting_sources:source.setting_sources,uid:65534,euid:65534,gid:0,egid:0,supplementary_groups:vec![],cwd:source.cwd,home:Some(source.home),roots:None,local_settings:vec![],local_decision:LocalDecision::Disabled,root_uid:None,git_uid:None,claude_uid:None}};let raw=serde_json::to_vec(&reply).unwrap();channel.write_u32(raw.len() as u32).await.unwrap();channel.write_all(&raw).await.unwrap();channel.shutdown().await.unwrap();
+                                }
                             }));(204,json!({}))}
                             else if line.contains("/wait?"){(200,json!({"StatusCode":0}))}else{(500,json!({}))};
                             let response=value.to_string();let _=stream.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await;
@@ -1082,10 +1147,13 @@ async fn qualify_candidate_helper_transport(
             jobs.shutdown().await;
             let workers = std::mem::take(&mut *private_jobs.lock().unwrap());
             for worker in workers {
-                if !worker.is_finished() {
+                if mode == "projection-timeout" && !worker.is_finished() {
                     worker.abort();
                 }
-                match worker.await {
+                match tokio::time::timeout(Duration::from_secs(5), worker)
+                    .await
+                    .expect("owned private worker must finish and join")
+                {
                     Ok(()) => {}
                     Err(e) if e.is_cancelled() => {}
                     Err(e) => panic!("private fixture worker failed: {e}"),
@@ -1100,6 +1168,7 @@ async fn qualify_candidate_helper_transport(
                 stage,
                 "synthetic-source-run",
                 Duration::from_millis(250),
+                retained_name.as_ref().map(|_| prior_stage.as_path()),
             )
             .await;
         let _ = stop.send(());
@@ -1123,7 +1192,12 @@ async fn qualify_candidate_helper_transport(
         let seen = calls.lock().unwrap();
         if matches!(
             mode,
-            "unexpected-tmpfs" | "wrong-caps" | "wrong-mount-report" | "wrong-resource-subpath"
+            "unexpected-tmpfs"
+                | "wrong-caps"
+                | "wrong-mount-report"
+                | "wrong-resource-subpath"
+                | "writable-retained-home"
+                | "wrong-retained-volume"
         ) {
             assert!(
                 !seen
@@ -1135,22 +1209,37 @@ async fn qualify_candidate_helper_transport(
         }
         for (line, body) in seen.iter() {
             assert!(!line.contains("/logs"));
+            if let Some(retained) = retained_name.as_ref() {
+                assert!(
+                    !line.starts_with("DELETE") || !line.contains(retained),
+                    "candidate cleanup must preserve the exact retained native HOME"
+                );
+            }
             assert!(!body
                 .to_string()
                 .contains("PRIVATE_IMAGE_CREDENTIAL_SENTINEL"));
             if body["Cmd"] == json!(["project-claude-candidate-private"]) {
-                let root = body["HostConfig"]["Mounts"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|mount| mount["Target"] == "/run/freshell-candidate-inputs")
-                    .unwrap()["Source"]
-                    .as_str()
-                    .unwrap();
-                assert!(
+                for target in [
+                    "/run/freshell-candidate-inputs",
+                    "/run/freshell-retained-inputs",
+                ] {
+                    let root = body["HostConfig"]["Mounts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|mount| mount["Target"] == target);
+                    let Some(root) = root else {
+                        assert!(
+                            target == "/run/freshell-retained-inputs" && retained_name.is_none()
+                        );
+                        continue;
+                    };
+                    let root = root["Source"].as_str().unwrap();
+                    assert!(
                     !Path::new(root).exists(),
                     "{mode}: owned ordinary mount skeleton must be gone after reader settlement"
                 );
+                }
             }
         }
         if let Some((_, body)) = seen

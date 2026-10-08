@@ -76,18 +76,32 @@ impl CandidateInputView {
         stage: &Path,
         exchange: &native_auth::ExchangeDirectory,
         mounts: &docker::TerminalMounts,
+        retained: bool,
     ) -> Result<(Self, Vec<Value>), BackendError> {
         use std::os::unix::fs::PermissionsExt;
         let blocked = || fail("Claude candidate ordinary input view unavailable");
-        let root = exchange.0.join("ordinary-stage");
+        let root = exchange.0.join(if retained {
+            "retained-stage"
+        } else {
+            "ordinary-stage"
+        });
+        let namespace = if retained {
+            "/run/freshell-retained-inputs"
+        } else {
+            "/run/freshell-candidate-inputs"
+        };
         std::fs::create_dir(&root).map_err(|_| blocked())?;
         let view = Self(root, false);
         let mut selected = BTreeMap::<PathBuf, (PathBuf, bool)>::new();
-        for relative in [
-            ".freshell/claude-candidate-binding.json",
-            ".freshell/prepared-context.json",
-            ".freshell/prepared-result.json",
-        ] {
+        for relative in std::iter::once(".freshell/prepared-context.json").chain(
+            (!retained)
+                .then_some([
+                    ".freshell/claude-candidate-binding.json",
+                    ".freshell/prepared-result.json",
+                ])
+                .into_iter()
+                .flatten(),
+        ) {
             selected.insert(relative.into(), (stage.join(relative), false));
         }
         for file in mounts
@@ -109,9 +123,8 @@ impl CandidateInputView {
                 ),
             );
         }
-        let mut bindings = vec![
-            json!({"Type":"bind","Source":view.0,"Target":"/run/freshell-candidate-inputs","ReadOnly":true}),
-        ];
+        let mut bindings =
+            vec![json!({"Type":"bind","Source":view.0,"Target":namespace,"ReadOnly":true})];
         for (relative, (source, directory)) in selected {
             if !relative
                 .components()
@@ -145,7 +158,7 @@ impl CandidateInputView {
                 }
                 ancestor = ancestor.parent().ok_or_else(blocked)?;
             }
-            bindings.push(json!({"Type":"bind","Source":source,"Target":Path::new("/run/freshell-candidate-inputs").join(relative),"ReadOnly":true}));
+            bindings.push(json!({"Type":"bind","Source":source,"Target":Path::new(namespace).join(relative),"ReadOnly":true}));
         }
         Ok((view, bindings))
     }
@@ -176,6 +189,53 @@ impl Drop for CandidateInputView {
 }
 
 impl DockerEngineBackend {
+    async fn retained_claude_volume(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        request: &ObserveClaudeSourcesRequest,
+        daemon: &DockerDaemonId,
+    ) -> Result<Value, BackendError> {
+        let provider = handle
+            .terminal()
+            .map(|spec| spec.mode.as_str())
+            .or_else(|| handle.fresh_agent().map(|spec| spec.provider.as_str()));
+        if handle.soul_id() != &request.soul_id
+            || provider != Some(request.provider.as_str())
+            || handle.daemon_id() != daemon
+            || !matches!(
+                self.inspect(handle).await?.state,
+                BackendRuntimeState::Created
+                    | BackendRuntimeState::Exited
+                    | BackendRuntimeState::Dead
+                    | BackendRuntimeState::Missing
+            )
+        {
+            return Err(fail(
+                "Claude candidate requires its exact quiescent retained owner",
+            ));
+        }
+        let response = self
+            .request_bounded(
+                "GET",
+                &format!("{DOCKER_API}/volumes/{}", handle.provider_volume_name()),
+                None,
+                64 * 1024,
+            )
+            .await?;
+        let volume: Value = serde_json::from_slice(&response.body)
+            .map_err(|_| fail("Claude retained HOME metadata invalid"))?;
+        if response.status != 200
+            || volume["Name"] != handle.provider_volume_name()
+            || volume["Driver"] != "local"
+            || !volume["Mountpoint"].is_string()
+        {
+            return Err(fail(
+                "Claude retained HOME is unavailable; preserve native stores and repair the source",
+            ));
+        }
+        Ok(volume)
+    }
+
     async fn read_claude_candidate_helper(
         &self,
         owner: &ClaudeSourceOwner,
@@ -183,6 +243,7 @@ impl DockerEngineBackend {
         root: &Path,
         test_run_id: &str,
         budget: Duration,
+        prior_stage: Option<&Path>,
     ) -> Result<ObservationReply, BackendError> {
         use freshell_runtime_protocol::{bounded_json_bytes, MAX_CONTROL_FRAME_BYTES};
         let deadline = tokio::time::Instant::now() + budget;
@@ -193,6 +254,7 @@ impl DockerEngineBackend {
         let mut attempted = false;
         let mut directory = None::<native_auth::ExchangeDirectory>;
         let mut input_view = None::<CandidateInputView>;
+        let mut retained_view = None::<CandidateInputView>;
         let operation = async {
             let projection = qualify_candidate_stage(root, owner, request)?;
             let raw = bounded_json_bytes(&projection, MAX_CONTROL_FRAME_BYTES)
@@ -203,25 +265,47 @@ impl DockerEngineBackend {
                     "Claude candidate reader requires the qualified rootless daemon",
                 ));
             }
-            let (reservation, observation) = match owner {
-                ClaudeSourceOwner::Initial { reservation, observation } => (reservation, observation),
-                // Retained candidates need ordinary metadata from their exact
-                // prior HOME. An empty scratch HOME is not equivalent to it.
-                ClaudeSourceOwner::Retained { .. } => return Err(fail("Claude retained candidate ordinary topology unavailable; retain inputs and reprepare")),
+            let mut retained_volume = None;
+            let (installation, image, binary_path, reservation_id) = match owner {
+                ClaudeSourceOwner::Initial {
+                    reservation,
+                    observation,
+                } => {
+                    if reservation.soul_id != request.soul_id
+                        || reservation.provider != request.provider
+                        || self.observe_initial_volume(reservation).await? != *observation
+                        || !matches!(observation, freshell_runtime_protocol::InitialAuthVolumeObservation::Absent { daemon_id } if daemon_id == &daemon)
+                    {
+                        return Err(fail("Claude candidate creation absence changed"));
+                    }
+                    (
+                        reservation.installation_id.as_str(),
+                        reservation.image_ref.as_str(),
+                        reservation.binary.as_path(),
+                        Some(reservation.id.as_str()),
+                    )
+                }
+                ClaudeSourceOwner::Retained { handle, .. } => {
+                    retained_volume = Some(
+                        self.retained_claude_volume(handle, request, &daemon)
+                            .await?,
+                    );
+                    (
+                        handle.installation_id().as_str(),
+                        handle.image_ref(),
+                        handle.host_binary_path(),
+                        None,
+                    )
+                }
             };
-            if reservation.soul_id != request.soul_id
-                || reservation.provider != request.provider
-                || self.observe_initial_volume(reservation).await? != *observation
-                || !matches!(observation, freshell_runtime_protocol::InitialAuthVolumeObservation::Absent { daemon_id } if daemon_id == &daemon)
-            {
-                return Err(fail("Claude candidate creation absence changed"));
-            }
-            let binary = canonical_regular_file(&reservation.binary)
+            let binary = canonical_regular_file(binary_path)
                 .map_err(|_| fail("Claude candidate reader artifact unavailable"))?;
             let digest = crate::registry::binary_digest(&binary)
                 .map_err(|_| fail("Claude candidate reader artifact unavailable"))?;
-            if digest != reservation.binary_sha256 {
-                return Err(fail("Claude candidate reserved reader artifact changed"));
+            if let ClaudeSourceOwner::Initial { reservation, .. } = owner {
+                if digest != reservation.binary_sha256 {
+                    return Err(fail("Claude candidate reserved reader artifact changed"));
+                }
             }
             let workspace = canonical_dir(Path::new(&request.workspace_path))
                 .map_err(|_| fail("Claude candidate workspace unavailable"))?;
@@ -240,12 +324,12 @@ impl DockerEngineBackend {
                 &projection.provider_launch_context,
             )
             .map_err(|_| fail("Claude candidate ordinary mounts unavailable"))?;
-            let labels = json!({"com.freshell.installation-id":reservation.installation_id,
+            let labels = json!({"com.freshell.installation-id":installation,
                 "com.freshell.soul-id":request.soul_id,"com.freshell.runtime-test-run-id":test_run_id,
                 "com.freshell.source-request-id":request.observation_request.request_id,
                 "com.freshell.source-binary-sha256":digest,
                 "com.freshell.input-generation":projection.publication.generation_id,
-                "com.freshell.source-reservation-id":reservation.id,
+                "com.freshell.source-reservation-id":reservation_id,
                 "com.freshell.claude-candidate":"ordinary"});
             scratch = Some(CandidateScratch {
                 name: format!(
@@ -260,7 +344,7 @@ impl DockerEngineBackend {
             self.create_claude_candidate_scratch(backing).await?;
             self.run_provider_mountpoint_helper(
                 provider_mountpoints::MountpointHelperTarget {
-                    image: &reservation.image_ref,
+                    image,
                     volume: &backing.name,
                     binary: &binary,
                     daemon: &daemon,
@@ -281,7 +365,7 @@ impl DockerEngineBackend {
                 .map_err(|_| fail("Claude candidate exchange unavailable"))?;
             exchange_directory.mode(&socket, 0o660)?;
             let (view, view_bindings) =
-                CandidateInputView::create(root, exchange_directory, &mounts)?;
+                CandidateInputView::create(root, exchange_directory, &mounts, false)?;
             input_view = Some(view);
             let mut descriptors = vec![
                 json!({"Type":"bind","Source":binary,"Target":"/runtime/freshell-session-host","ReadOnly":true}),
@@ -290,6 +374,20 @@ impl DockerEngineBackend {
                 json!({"Type":"volume","Source":backing.name,"Target":"/home/freshell/provider","ReadOnly":false,"VolumeOptions":{"NoCopy":true}}),
             ];
             descriptors.extend(view_bindings);
+            if let ClaudeSourceOwner::Retained { handle, .. } = owner {
+                let stage = prior_stage.ok_or_else(||fail("Claude retained frozen ordinary stage unavailable; retain inputs and reprepare"))?;
+                let ordinary = qualify_retained_claude_stage(
+                    stage,
+                    handle,
+                    &workspace,
+                    mounts.git_common_dir.as_deref(),
+                )?;
+                let (view, bindings) =
+                    CandidateInputView::create(stage, exchange_directory, &ordinary, true)?;
+                retained_view = Some(view);
+                descriptors.extend(bindings);
+                descriptors.push(json!({"Type":"volume","Source":handle.provider_volume_name(),"Target":"/run/freshell-retained-home","ReadOnly":true,"VolumeOptions":{"NoCopy":true}}));
+            }
             if let Some(common) = mounts
                 .git_common_dir
                 .as_ref()
@@ -299,9 +397,9 @@ impl DockerEngineBackend {
                     .push(json!({"Type":"bind","Source":common,"Target":common,"ReadOnly":true}));
             }
             descriptors.extend(prepared_inputs::mount_descriptors(&mounts, &backing.name)?);
-            let body = json!({"Image":reservation.image_ref,"User":"0:0","Tty":false,"WorkingDir":cwd,
+            let body = json!({"Image":image,"User":"0:0","Tty":false,"WorkingDir":cwd,
                 "Entrypoint":["/runtime/freshell-session-host"],"Cmd":["project-claude-candidate-private"],"Labels":labels,
-                "Env":self.private_helper_environment(&reservation.image_ref,&["HOME=/home/freshell/provider"]).await?,
+                "Env":self.private_helper_environment(image,&["HOME=/home/freshell/provider"]).await?,
                 "HostConfig":{"NetworkMode":"none","ReadonlyRootfs":true,"CapDrop":["ALL"],"CapAdd":["CHOWN","SETGID","SETUID"],
                     "SecurityOpt":["no-new-privileges"],"Memory":256*1024*1024,"MemorySwap":256*1024*1024,"NanoCpus":500_000_000,"PidsLimit":32,
                     "LogConfig":{"Type":"none","Config":{}},"Tmpfs":{},"Mounts":descriptors}});
@@ -361,7 +459,14 @@ impl DockerEngineBackend {
             if volume_reply.status != 200 {
                 return Err(fail("Claude candidate ordinary backing disappeared"));
             }
-            verify_candidate_mount_reports(&actual, &body, backing, &volume, &mounts)?;
+            verify_candidate_mount_reports(
+                &actual,
+                &body,
+                backing,
+                &volume,
+                &mounts,
+                retained_volume.as_ref(),
+            )?;
             let supervision = async {
                 let started = self
                     .request_bounded(
@@ -410,9 +515,36 @@ impl DockerEngineBackend {
                 || crate::registry::binary_digest(&binary)
                     .map_err(|_| fail("Claude candidate reader artifact unavailable"))?
                     != digest
-                || self.observe_initial_volume(reservation).await? != *observation
             {
                 return Err(fail("Claude candidate actual namespace changed"));
+            }
+            match owner {
+                ClaudeSourceOwner::Initial {
+                    reservation,
+                    observation,
+                } => {
+                    if self.observe_initial_volume(reservation).await? != *observation {
+                        return Err(fail("Claude candidate creation absence changed"));
+                    }
+                }
+                ClaudeSourceOwner::Retained { handle, .. } => {
+                    if Some(
+                        self.retained_claude_volume(handle, request, &daemon)
+                            .await?,
+                    ) != retained_volume
+                    {
+                        return Err(fail(
+                            "Claude retained HOME metadata changed during candidate projection",
+                        ));
+                    }
+                    qualify_retained_claude_stage(
+                        prior_stage
+                            .ok_or_else(|| fail("Claude retained frozen stage unavailable"))?,
+                        handle,
+                        &workspace,
+                        mounts.git_common_dir.as_deref(),
+                    )?;
+                }
             }
             qualify_candidate_stage(root, owner, request)?;
             Ok(reply)
@@ -441,6 +573,9 @@ impl DockerEngineBackend {
                 self.cleanup_claude_candidate_scratch(backing).await?;
             }
             if let Some(view) = input_view.as_mut() {
+                view.cleanup()?;
+            }
+            if let Some(view) = retained_view.as_mut() {
                 view.cleanup()?;
             }
             Ok::<_, BackendError>(())
@@ -585,6 +720,36 @@ impl DockerEngineBackend {
         scratch.attempted = false;
         Ok(())
     }
+}
+
+fn qualify_retained_claude_stage(
+    stage: &Path,
+    handle: &OwnedRuntimeHandle,
+    workspace: &Path,
+    common: Option<&Path>,
+) -> Result<docker::TerminalMounts, BackendError> {
+    use freshell_runtime_protocol::{bounded_json_bytes, MAX_CONTROL_FRAME_BYTES};
+    let blocked = || {
+        fail("Claude retained frozen ordinary stage changed or unavailable; retain inputs and reprepare")
+    };
+    let context = retained_claude_context(handle)?;
+    let expected = bounded_json_bytes(context, MAX_CONTROL_FRAME_BYTES).map_err(|_| blocked())?;
+    if read_candidate_metadata(
+        stage,
+        ".freshell/prepared-context.json",
+        MAX_CONTROL_FRAME_BYTES,
+    )? != expected
+    {
+        return Err(blocked());
+    }
+    let inputs = context.prepared_inputs.as_ref().ok_or_else(blocked)?;
+    let manifest =
+        read_candidate_metadata(stage, &inputs.manifest.relative_path, 64 * 1024 * 1024)?;
+    if format!("{:x}", Sha256::digest(&manifest)) != inputs.manifest.sha256 {
+        return Err(blocked());
+    }
+    docker::ordinary_claude_candidate_mounts(workspace, common, stage, context)
+        .map_err(|_| blocked())
 }
 
 fn qualify_candidate_stage(
@@ -893,6 +1058,7 @@ fn verify_candidate_mount_reports(
     backing: &CandidateScratch,
     volume: &Value,
     mounts: &docker::TerminalMounts,
+    retained: Option<&Value>,
 ) -> Result<(), BackendError> {
     let blocked = || fail("Claude candidate reported mount topology changed");
     if !backing.owns(volume) || !volume["Mountpoint"].is_string() {
@@ -914,11 +1080,22 @@ fn verify_candidate_mount_reports(
             return Err(blocked());
         }
         let report = reports[0];
+        let expected_volume = if mount["Type"] == "volume" {
+            if mount["Source"] == backing.name {
+                Some(volume)
+            } else {
+                retained.filter(|volume| volume["Name"] == mount["Source"])
+            }
+        } else {
+            None
+        };
         if report["Type"] != mount["Type"]
             || report["RW"].as_bool() != mount["ReadOnly"].as_bool().map(|readonly| !readonly)
             || (mount["Type"] == "bind" && report["Source"] != mount["Source"])
             || (mount["Type"] == "volume"
-                && (report["Name"] != backing.name || report["Source"] != volume["Mountpoint"]))
+                && !expected_volume.is_some_and(|volume| {
+                    report["Name"] == volume["Name"] && report["Source"] == volume["Mountpoint"]
+                }))
         {
             return Err(blocked());
         }
@@ -1001,6 +1178,16 @@ impl DockerEngineBackend {
         request
             .validate()
             .map_err(|_| fail("Claude source request invalid"))?;
+        let prior_stage = match owner {
+            ClaudeSourceOwner::Initial { .. } => None,
+            ClaudeSourceOwner::Retained { handle, .. } => {
+                let context = retained_claude_context(handle)?;
+                let grant = context.mcp_capability.as_ref().unwrap();
+                Some(docker::staged_provider_root_for_grant(&grant.grant_id).map_err(|_| {
+                    fail("Claude retained frozen ordinary stage unavailable; retain inputs and reprepare")
+                })?)
+            }
+        };
         if request.candidate.is_some() {
             let grant = request
                 .candidate
@@ -1013,19 +1200,16 @@ impl DockerEngineBackend {
                 fail("Claude candidate stage unavailable; retain inputs and reprepare")
             })?;
             return self
-                .read_claude_candidate_helper(owner, request, &root, test_run_id, budget)
+                .read_claude_candidate_helper(
+                    owner,
+                    request,
+                    &root,
+                    test_run_id,
+                    budget,
+                    prior_stage.as_deref(),
+                )
                 .await;
         }
-        let prior_stage = match owner {
-            ClaudeSourceOwner::Initial { .. } => None,
-            ClaudeSourceOwner::Retained { handle, .. } => {
-                let context = retained_claude_context(handle)?;
-                let grant = context.mcp_capability.as_ref().unwrap();
-                Some(docker::staged_provider_root_for_grant(&grant.grant_id).map_err(|_| {
-                    fail("Claude retained frozen ordinary stage unavailable; retain inputs and reprepare")
-                })?)
-            }
-        };
         self.read_claude_baseline_helper(
             owner,
             request,
