@@ -1058,10 +1058,11 @@ async function executeManagedOpenCodeTui(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], caseId: string): Promise<NativeExperimentOriginal> {
   const stageSource = sources.find(file => file.name === 'opencode/native-preparation/transfer-stage.bin')
   if (!stageSource) throw new Error('selected OpenCode native transfer stage required')
-  if (!['null-slot', 'v1-empty', 'v2-empty-is-not-v1-empty', 'full-revert', 'part-revert', 'disposal', 'cancellation'].includes(caseId)) {
+  if (!['null-slot', 'v1-empty', 'v2-empty-is-not-v1-empty', 'full-revert', 'part-revert', 'disposal', 'cancellation', 'root-load-error', 'history-load-error'].includes(caseId)) {
     throw new Error(`actual native OpenCode TUI case has no qualified execution path: ${caseId}`)
   }
   const scenario = `opencode-${caseId}`
+  const tuiObserver = ['disposal', 'root-load-error', 'history-load-error'].includes(caseId)
   const source = prepareOwnedOpenCodeTuiSource(harness.repoRoot, harness.testRoot, caseId, harness.runId + '-' + caseId)
   const digest = (bytes: Buffer | string): string => createHash('sha256').update(bytes).digest('hex')
   const stage = path.join(harness.testRoot, scenario + '-transfer-stage')
@@ -1100,7 +1101,7 @@ async function executeManagedOpenCodeTui(harness: RuntimeHarness,
   const sourceHome = path.join(harness.testRoot, 'native-source', 'opencode', scenario)
   fs.mkdirSync(path.join(sourceHome, '.config/opencode'), { recursive: true, mode: 0o700 })
   const terminalId = 'terminal-' + randomUUID()
-  if (caseId === 'disposal') {
+  if (tuiObserver) {
     const observer = path.join(source.workspace, 'native-tui-disposal-observer.mjs')
     fs.writeFileSync(observer, openCodeTuiDisposalObserver, { mode: 0o644 }); fs.chmodSync(observer, 0o644)
     const control = path.join(source.workspace, 'native-tui-fault-control.json')
@@ -1132,19 +1133,19 @@ async function executeManagedOpenCodeTui(harness: RuntimeHarness,
     terminal: { env: { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: '/home/freshell/provider',
       XDG_DATA_HOME: '/home/freshell/provider/.local/share', XDG_CONFIG_HOME: '/home/freshell/provider/.config',
       OPENCODE_DB: '/home/freshell/provider/.local/share/opencode/opencode.db', TMPDIR: '/run/opencode-tmp',
-      ...(caseId === 'disposal' ? { OPENCODE_TUI_CONFIG: '/home/freshell/provider/.config/opencode/tui.json' } : {}) },
+      ...(tuiObserver ? { OPENCODE_TUI_CONFIG: '/home/freshell/provider/.config/opencode/tui.json' } : {}) },
       terminalId, streamId: 'stream-' + randomUUID(), mode: 'opencode', program: 'opencode',
       args: ['--session', source.rootId, '--model', 'openai/gpt-5.6-luna'], cwd: source.workspace,
       workspacePath: source.workspace, projectKey: scenario, runAsUid: 65534, runAsGid: 0, cols: 100, rows: 30,
       resumeSessionId: source.rootId, opencodeTransfer: descriptor, opencodeTransferAttemptId: attempt,
       providerSecretReferences: references, providerLaunchContext: {
         preparation: { opencode: { project_config: [], tui_config: null, inline_config: false } },
-        config: caseId === 'disposal' ? [{ root: 'user_provider', relativePath: 'tui.json',
+        config: tuiObserver ? [{ root: 'user_provider', relativePath: 'tui.json',
           providerRelativePath: '.config/opencode/tui.json', format: 'json' }] : [],
       } },
   })
   harness.writeArtifact(`${scenario}-request.json`, request)
-  if (caseId === 'disposal' || caseId === 'cancellation') {
+  if (caseId === 'disposal' || caseId === 'cancellation' || caseId === 'root-load-error' || caseId === 'history-load-error') {
     return executeManagedOpenCodeTuiPending(harness, supervisor, request, source, scenario, caseId)
   }
   const launch = await harness.adminRaw(supervisor, request)
@@ -1219,8 +1220,12 @@ print(json.dumps(records))
 async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
   supervisor: Awaited<ReturnType<RuntimeHarness['startSupervisor']>>, request: any,
   source: ReturnType<typeof prepareOwnedOpenCodeTuiSource>, scenario: string,
-  caseId: 'disposal' | 'cancellation'): Promise<NativeExperimentOriginal> {
+  caseId: 'disposal' | 'cancellation' | 'root-load-error' | 'history-load-error'): Promise<NativeExperimentOriginal> {
   const disposal = caseId === 'disposal'
+  const loadFault = caseId === 'root-load-error' || caseId === 'history-load-error'
+  const observer = disposal || loadFault
+  const pendingOutcome = loadFault ? 'disposed_before_store_fault' : 'disposed_before_publication'
+  const readObserver = "import pathlib,json,sys;p=pathlib.Path(sys.argv[1])/'native-tui-fault-result.json';assert p.is_file() and not p.is_symlink() and p.stat().st_size<=65536;print(p.read_text())"
   let finished = false, reply: any, failure: unknown, stopped: any
   const pending = harness.adminRaw(supervisor, request).then(value => { reply = value; finished = true },
     error => { failure = error; finished = true })
@@ -1238,17 +1243,17 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
             || view.containerId !== owned.containerId || view.nativeIdentityObservation) {
             throw new Error('pending native TUI already admitted')
           }
-          if (disposal) {
+          if (observer) {
             report = JSON.parse(await harness.execOwnedContainerAsExact(owned.containerId, '65534:0', ['python3', '-c',
-              "import pathlib,json,sys;p=pathlib.Path(sys.argv[1])/'native-tui-fault-result.json';assert p.is_file() and not p.is_symlink() and p.stat().st_size<=65536;print(p.read_text())", source.workspace]))
-            if (report.outcome !== 'disposed_before_publication') throw new Error('supported native TUI disposal was not observed before publication')
+              readObserver, source.workspace]))
+            if (report.outcome !== pendingOutcome) throw new Error('supported native TUI disposal was not observed before publication')
           }
           namespace = JSON.parse(await harness.execOwnedContainerAsExact(owned.containerId, '65534:0',
             ['python3', '-c', openCodeTuiNativeNamespace, 'opencode', source.rootId, source.workspace]))
           break
         } catch (error) {
           diagnostics.push(error instanceof Error ? error.message : 'owned current disposal capture unavailable')
-          if (report && report.outcome !== 'disposed_before_publication') {
+          if (report && report.outcome !== pendingOutcome) {
             harness.writeArtifact(`${scenario}-supported-disposal.json`, report)
             throw error
           }
@@ -1257,7 +1262,7 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
       await new Promise(resolve => setTimeout(resolve, 50))
     }
     harness.writeArtifact(`${scenario}-capture-diagnostics-private.json`, diagnostics)
-    if (disposal) harness.writeArtifact(`${scenario}-supported-disposal.json`, report ?? null)
+    if (observer) harness.writeArtifact(`${scenario}-supported-disposal.json`, report ?? null)
     harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace ?? null)
     if (!namespace || !view || finished || !receiverNativeNamespaceMatches(namespace, 'opencode', source.workspace, source.rootId)
       || namespace.nativeVersion !== '1.18.21'
@@ -1265,13 +1270,50 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
       || namespace.nativeMessageCount !== 2 || namespace.nativeLaunch.incarnationId !== view.incarnationId
       || namespace.nativeLaunch.requestedNativeSessionId !== source.rootId
       || namespace.nativeLaunch.executionGeneration !== view.executionGeneration
-      || (disposal && (report.incarnationId !== view.incarnationId || report.launchNonce !== namespace.nativeLaunch.launchNonce
+      || (observer && (report.incarnationId !== view.incarnationId || report.launchNonce !== namespace.nativeLaunch.launchNonce
         || report.nativeSessionId !== source.rootId || report.nativeMessageCount !== 2 || report.producerActive !== false))) {
       throw new Error('actual pending TUI native namespace/current binding differs')
     }
     // Capture the unadmitted native store before Stop. Input serializes with
     // the launch, so first cancel that wait through the ordinary Stop intent.
     harness.writeArtifact(`${scenario}-unadmitted-view-before-stop.json`, view)
+    let nativeFault: any
+    if (loadFault) {
+      fs.writeFileSync(path.join(source.workspace, 'native-tui-fault-release.json'), JSON.stringify({ schemaVersion: 1,
+        caseId, rootSessionId: source.rootId, incarnationId: namespace.nativeLaunch.incarnationId,
+        launchNonce: namespace.nativeLaunch.launchNonce, evidenceRevision: namespace.nativeLaunch.evidenceRevision,
+        executionGeneration: namespace.nativeLaunch.executionGeneration }), { mode: 0o644 })
+      fs.chmodSync(path.join(source.workspace, 'native-tui-fault-release.json'), 0o644)
+      const deadline = Date.now() + 20000
+      while (Date.now() < deadline) {
+        nativeFault = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
+          ['python3', '-c', readObserver, source.workspace]))
+        if (nativeFault.outcome !== pendingOutcome) break
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      harness.writeArtifact(`${scenario}-native-read-refusal.json`, nativeFault ?? null)
+      const store = nativeFault?.storeFault, refusal = nativeFault?.refusal
+      if (nativeFault?.outcome !== 'native_load_error_observed' || nativeFault.caseId !== caseId
+        || nativeFault.nativePid !== namespace.nativePid || nativeFault.incarnationId !== view.incarnationId
+        || nativeFault.launchNonce !== namespace.nativeLaunch.launchNonce || nativeFault.nativeSessionId !== source.rootId
+        || nativeFault.producerActive !== true || store?.caseId !== caseId || store.rootSessionId !== source.rootId
+        || store.rootRowsBefore !== 1 || store.messageRowsBefore !== 2 || store.changedRows !== 1 || store.sameDatabaseIdentity !== true
+        || (caseId === 'root-load-error' ? store.rootRowsAfter !== 0
+          : store.rootRowsAfter !== 1 || store.messageRowsAfter !== 2 || store.malformedMessagesAfter !== 1)
+        || refusal?.reason !== (caseId === 'root-load-error' ? 'native_root_load_failed' : 'native_history_load_failed')
+        || refusal.nativeSessionId !== source.rootId || refusal.incarnationId !== view.incarnationId
+        || typeof report.adoptionLaunchNonce !== 'string' || !report.adoptionLaunchNonce
+        || refusal.launchNonce !== report.adoptionLaunchNonce || refusal.evidenceGeneration !== report.evidenceGeneration
+        || !/^[a-f0-9]{64}$/.test(refusal.evidenceGeneration ?? '')) {
+        throw new Error('actual current pinned native root/history refusal was not established')
+      }
+      const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
+      const refused = ManagedRuntimeSoulSchema.parse(inventory.data.find((row: any) => row.soulId === request.params.soulId))
+      harness.writeArtifact(`${scenario}-unadmitted-view-after-fault.json`, refused)
+      if (refused.launchState === 'running' || refused.nativeIdentityObservation || refused.incarnationId !== view.incarnationId) {
+        throw new Error('actual native load error admitted Running or observed identity')
+      }
+    }
     stopped = await harness.adminOk(supervisor, harness.stopBody(request.params.soulId))
     await pending
     if (failure) throw failure
@@ -1280,7 +1322,8 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
     const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
     const current = ManagedRuntimeSoulSchema.parse(inventory.data.find((row: any) => row.soulId === request.params.soulId))
     harness.writeArtifact(`${scenario}-current-view.json`, current)
-    if (reply.result?.Err?.code !== 'STALE_INTENT_REVISION' || stopped.data?.outcome !== 'verified_empty'
+    if (!(loadFault ? ['STALE_INTENT_REVISION', 'RECOVERY_BLOCKED'].includes(reply.result?.Err?.code) : reply.result?.Err?.code === 'STALE_INTENT_REVISION')
+      || stopped.data?.outcome !== 'verified_empty'
       || current.launchState !== 'stopped' || current.desiredState !== 'stopped' || current.recoveryState !== 'stopped'
       || current.cleanupState !== 'verified_empty' || current.nativeIdentityObservation
       || current.incarnationId !== view.incarnationId || current.executionGeneration !== view.executionGeneration
@@ -1292,14 +1335,18 @@ async function executeManagedOpenCodeTuiPending(harness: RuntimeHarness,
     if (input.result?.Err?.code !== 'UNKNOWN_SOUL') throw new Error('disposed native TUI admitted ordinary input')
     const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
       nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256, profileSha256: namespace.profileSha256,
-      artifactReferences: [...(disposal ? [`${scenario}-supported-disposal.json`] : []), `${scenario}-namespace-native-private.json`,
+      artifactReferences: [...(observer ? [`${scenario}-supported-disposal.json`] : []),
+        ...(loadFault ? [`${scenario}-native-read-refusal.json`, `${scenario}-unadmitted-view-after-fault.json`] : []), `${scenario}-namespace-native-private.json`,
         `${scenario}-unadmitted-view-before-stop.json`, `${scenario}-input-refusal.json`, `${scenario}-ordinary-stop.json`],
       assertions: [...(disposal ? [{ name: 'supported-real-plugin-scope-disposed-before-publication', pass: report.outcome === 'disposed_before_publication' }] : []),
+        ...(loadFault ? [{ name: 'actual-pinned-native-current-root-history-read-refusal', pass: nativeFault.outcome === 'native_load_error_observed'
+          && nativeFault.refusal.reason === (caseId === 'root-load-error' ? 'native_root_load_failed' : 'native_history_load_failed') }] : []),
         { name: 'actual-native-pinned-current-root-store-and-normal-uid-tls', pass: namespace.nativeMessageCount === 2 },
         { name: 'unobserved-native-startup-never-admits-running-or-input', pass: view.launchState === 'starting'
           && !view.nativeIdentityObservation && !current.nativeIdentityObservation && input.result.Err.code === 'UNKNOWN_SOUL' },
-        { name: 'ordinary-stop-cancels-current-unobserved-native-startup', pass: stopped.data.outcome === 'verified_empty'
-          && reply.result.Err.code === 'STALE_INTENT_REVISION' && current.intentRevision > view.intentRevision }] }
+        { name: loadFault ? 'ordinary-stop-cleans-native-read-refused-startup' : 'ordinary-stop-cancels-current-unobserved-native-startup',
+          pass: stopped.data.outcome === 'verified_empty' && (loadFault || reply.result.Err.code === 'STALE_INTENT_REVISION')
+            && current.intentRevision > view.intentRevision }] }
     harness.writeArtifact(`${scenario}-original.json`, original)
     return original
   } finally {
@@ -2000,7 +2047,7 @@ export default { id: 'freshell-native-qualification', tui(api) {
   const report = value => {
     fs.writeFileSync(path.join(cwd, 'native-tui-fault-result.json'), JSON.stringify({
       schemaVersion: 1, caseId: control.caseId, terminalId: terminal, incarnationId: launch.incarnationId,
-      launchNonce: launch.launchNonce, elapsedMs: Date.now() - started, ...value }), { mode: 0o600 })
+      launchNonce: launch.launchNonce, nativePid: process.pid, elapsedMs: Date.now() - started, ...value }), { mode: 0o600 })
   }
   const finish = value => {
     settled = true; clearInterval(timer); report(value)

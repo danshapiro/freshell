@@ -269,7 +269,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       expect(harness.writeArtifact).not.toHaveBeenCalled()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['requested-echo', 'previous-incarnation', 'stale-revision', 'ledger-advanced', 'disposal-already-published', 'disposal-current', 'cancellation-current', 'cancellation-wrong-result', 'cancellation-old-intent'])(
+  it.each(['requested-echo', 'previous-incarnation', 'stale-revision', 'ledger-advanced', 'disposal-already-published', 'disposal-current', 'cancellation-current', 'cancellation-wrong-result', 'cancellation-old-intent', 'root-load-error-current', 'history-load-error-current', 'root-load-error-wrong-pid', 'root-load-error-stale-refusal', 'root-load-error-wrong-reason', 'history-load-error-store-unchanged', 'history-load-error-producer-disabled'])(
     'executes owned import/launch orchestration with %s without inventing qualification', async fault => {
       const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
       const evidenceDir = path.join(ownedRoot, 'evidence')
@@ -282,9 +282,25 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       let selectionReadable = false
       let stopped = false
       const commandOrder: string[] = []
+      const loadFault = fault.startsWith('root-load-error') || fault.startsWith('history-load-error')
+      const nativeCase = fault.startsWith('root-load-error') ? 'root-load-error' : 'history-load-error'
       const transferCalls: any[] = []
       const inspect = vi.fn(async () => {
         if (fault === 'disposal-already-published') return JSON.stringify({ outcome: 'already_published' })
+        if (loadFault && [1, 3].includes(inspect.mock.calls.length)) {
+          const after = inspect.mock.calls.length === 3
+          return JSON.stringify({ schemaVersion: 1, caseId: nativeCase,
+            outcome: after ? 'native_load_error_observed' : 'disposed_before_store_fault',
+            incarnationId: 'current-incarnation', launchNonce: 'current-nonce', nativePid: after && fault === 'root-load-error-wrong-pid' ? 8 : 7,
+            adoptionLaunchNonce: 'adoption-current', evidenceGeneration: 'a'.repeat(64),
+            nativeSessionId: root, nativeMessageCount: 2, producerActive: after && fault !== 'history-load-error-producer-disabled',
+            ...(after ? { storeFault: { schemaVersion: 1, caseId: nativeCase, rootSessionId: root,
+              changedRows: fault === 'history-load-error-store-unchanged' ? 0 : 1, sameDatabaseIdentity: true, rootRowsBefore: 1, rootRowsAfter: nativeCase === 'root-load-error' ? 0 : 1,
+              messageRowsBefore: 2, messageRowsAfter: nativeCase === 'root-load-error' ? 0 : 2,
+              malformedMessagesAfter: nativeCase === 'root-load-error' ? 0 : 1 },
+            refusal: { reason: fault === 'root-load-error-wrong-reason' ? 'tui_root_not_loaded' : nativeCase === 'root-load-error' ? 'native_root_load_failed' : 'native_history_load_failed',
+              nativeSessionId: root, incarnationId: 'current-incarnation', launchNonce: fault === 'root-load-error-stale-refusal' ? 'old-adoption' : 'adoption-current', evidenceGeneration: 'a'.repeat(64) } } : {}) })
+        }
         if (fault === 'disposal-current' && inspect.mock.calls.length === 1) return JSON.stringify({
           outcome: 'disposed_before_publication', incarnationId: 'current-incarnation', launchNonce: 'current-nonce',
           nativeSessionId: root, nativeMessageCount: 2, producerActive: false })
@@ -293,6 +309,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
           httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: launchRequest.params.terminal.cwd,
           nativeProcessCwd: launchRequest.params.terminal.cwd, nativeVersion: '1.18.21', nativeRoot: root,
           nativeMessageCount: 2,
+          nativePid: 7,
           activeNativeProcesses: 1, executableSha256: 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99', profileSha256: 'd'.repeat(64),
           nativeLaunch: { incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 2, executionGeneration: 1, requestedNativeSessionId: root } })
       })
@@ -314,8 +331,8 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
           if (request.method === 'terminal_input') { commandOrder.push('input'); return { result: { Err: { code: 'UNKNOWN_SOUL' } } } }
           if (request.method === 'stop') { stopCalls++; resolveLaunch?.({ result: { Err: { code: 'STALE_INTENT_REVISION' } } }); return { result: { Ok: {} } } }
           launchRequest = request
-          if (fault.startsWith('disposal-') || fault.startsWith('cancellation-')) {
-            if (fault.startsWith('disposal-')) {
+          if (fault.startsWith('disposal-') || fault.startsWith('cancellation-') || loadFault) {
+            if (fault.startsWith('disposal-') || loadFault) {
               const selected = request.params.terminal.providerLaunchContext.config[0]
               try {
                 const config = JSON.parse(fs.readFileSync(path.join(sourceHome, '.config/opencode', selected.relativePath), 'utf8'))
@@ -332,11 +349,11 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
             return { data: { outcome: 'verified_empty' } }
           }
           if (request.method === 'open_code_transfer') { transferCalls.push(request.params); return { fixtureOnly: true } }
-          return { data: [{ soulId: launchRequest.params.soulId, incarnationId: 'current-incarnation', launchState: stopped ? 'stopped' : fault.startsWith('disposal-') || fault.startsWith('cancellation-') ? 'starting' : 'running',
+          return { data: [{ soulId: launchRequest.params.soulId, incarnationId: 'current-incarnation', launchState: stopped ? 'stopped' : fault.startsWith('disposal-') || fault.startsWith('cancellation-') || loadFault ? 'starting' : 'running',
             cleanupState: stopped ? 'verified_empty' : 'none', intentRevision: stopped && fault !== 'cancellation-old-intent' ? 2 : 1, executionGeneration: 1, containerId: 'fixture-host',
             desiredState: stopped ? 'stopped' : 'running', recoveryState: stopped ? 'stopped' : 'live', durabilityState: 'unknown', allocationState: 'allocated',
             nativeSessionId: root, evidenceRevision: 2, successfulRecoveriesInWindow: 0,
-            ...(fault === 'requested-echo' || fault.startsWith('disposal-') || fault.startsWith('cancellation-') ? {} : { nativeIdentityObservation: { nativeSessionId: root,
+            ...(fault === 'requested-echo' || fault.startsWith('disposal-') || fault.startsWith('cancellation-') || loadFault ? {} : { nativeIdentityObservation: { nativeSessionId: root,
               incarnationId: fault === 'previous-incarnation' ? 'previous-incarnation' : 'current-incarnation',
               launchNonce: 'current-nonce', evidenceRevision: ['stale-revision', 'ledger-advanced'].includes(fault) ? 1 : 2,
               source: 'opencode_tui', evidenceDigest: 'c'.repeat(64) } }),
@@ -347,11 +364,17 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       try {
         const execution = executeManagedNativeCase(harness, [{ name: 'opencode/native-preparation/transfer-stage.bin', path: stage, sha256: 'd'.repeat(64) },
           ...['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: 'opencode/grants/' + suffix, path: stage, sha256: 'd'.repeat(64) }))],
-        { provider: 'opencode', case: 'startup' }, fault.startsWith('cancellation-') ? 'cancellation' : fault.startsWith('disposal-') ? 'disposal' : 'null-slot')
-        if (fault === 'disposal-current' || fault === 'cancellation-current') {
+        { provider: 'opencode', case: 'startup' }, loadFault ? nativeCase : fault.startsWith('cancellation-') ? 'cancellation' : fault.startsWith('disposal-') ? 'disposal' : 'null-slot')
+        if (fault === 'disposal-current' || fault === 'cancellation-current' || (loadFault && fault.endsWith('-current'))) {
           await execution
           expect(commandOrder).toEqual(['stop', 'input'])
-        } else await expect(execution).rejects.toThrow(fault.startsWith('cancellation-') ? 'ordinary Stop did not cancel the current unobserved native launch'
+          if (loadFault) {
+            const release = JSON.parse(fs.readFileSync(path.join(launchRequest.params.terminal.cwd, 'native-tui-fault-release.json'), 'utf8'))
+            expect(release.incarnationId).toBe('current-incarnation')
+            expect(release.launchNonce).toBe('current-nonce')
+            expect(release.evidenceRevision).toBe(2)
+          }
+        } else await expect(execution).rejects.toThrow(loadFault ? 'actual current pinned native root/history refusal was not established' : fault.startsWith('cancellation-') ? 'ordinary Stop did not cancel the current unobserved native launch'
           : fault === 'disposal-already-published' ? 'supported native TUI disposal was not observed before publication'
           : fault === 'ledger-advanced' ? 'controlled native inspection reached'
           : fault === 'stale-revision' ? 'actual native TUI current namespace/profile/pin/TLS differs' : 'no current admitted observation')
@@ -359,10 +382,10 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
         expect(launchRequest.params.terminal.opencodeTransfer.rootSessionId).toBe(root)
         expect(transferCalls.map(row => row.action)).toEqual(['begin', 'chunk', 'finalize'])
         expect(Buffer.from(transferCalls[1].data.data, 'base64')).toEqual(fs.readFileSync(sourcePath))
-        expect(inspect).toHaveBeenCalledTimes(fault === 'disposal-current' ? 2 : fault.startsWith('cancellation-') || ['stale-revision', 'ledger-advanced', 'disposal-already-published'].includes(fault) ? 1 : 0)
-        if (fault.startsWith('disposal-')) expect(selectionReadable).toBe(true)
-        expect(stopCalls).toBe(fault.startsWith('disposal-') || fault.startsWith('cancellation-') ? 1 : 0)
-        if (fault !== 'disposal-current' && fault !== 'cancellation-current') expect((harness.writeArtifact as any).mock.calls.filter(([name]: string[]) => name.endsWith('-original.json'))).toEqual([])
+        expect(inspect).toHaveBeenCalledTimes(loadFault ? 3 : fault === 'disposal-current' ? 2 : fault.startsWith('cancellation-') || ['stale-revision', 'ledger-advanced', 'disposal-already-published'].includes(fault) ? 1 : 0)
+        if (fault.startsWith('disposal-') || loadFault) expect(selectionReadable).toBe(true)
+        expect(stopCalls).toBe(fault.startsWith('disposal-') || fault.startsWith('cancellation-') || loadFault ? 1 : 0)
+        if (fault !== 'disposal-current' && fault !== 'cancellation-current' && !(loadFault && fault.endsWith('-current'))) expect((harness.writeArtifact as any).mock.calls.filter(([name]: string[]) => name.endsWith('-original.json'))).toEqual([])
       } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
     })
   it.each(['ordinary', 'parity'])('keeps Codex transcript Enter-bound while the %s producer selects its native startup boundary', async route => {
