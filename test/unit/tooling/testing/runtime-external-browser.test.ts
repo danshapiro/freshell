@@ -1528,6 +1528,35 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('refuses to finalize a chaos receipt from custody-only records after cleanup', async () => {
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused receipt web') }, process.cwd(), 5)
+    const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    const write = vi.spyOn(owned, 'writePhase5ChaosReceipt')
+    try {
+      await expect(owned.finalizeChaosReceipt()).rejects.toThrow(/observation|captured/)
+      await rig.captureCandidateIntegrity()
+      const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'unqualified-custody-soul',
+        incarnationId: 'unqualified-custody-incarnation', containerId: 'b'.repeat(64), hostBootId: 'unqualified-custody-boot', nativeSessionId: 'unqualified-custody-native' }
+      vi.spyOn(owned, 'assertCurrentHandle').mockResolvedValue(undefined)
+      await rig.publishChaosEvidence(handle, { providerEvents: { schemaVersion: 1, provider: 'opencode', nativeSessionId: handle.nativeSessionId },
+        assertions: { schemaVersion: 1, caseId: 'P5-G09', identity: { soulId: handle.soulId, incarnationId: handle.incarnationId,
+          containerId: handle.containerId, hostBootId: handle.hostBootId, nativeSessionId: handle.nativeSessionId } } })
+      await expect(owned.finalizeChaosReceipt()).rejects.toThrow(/cleanup/)
+      Object.assign(owned, { stopSettlement: Promise.resolve({ ok: false, errors: ['owned cleanup fixture failure'] }) })
+      await expect(owned.finalizeChaosReceipt()).rejects.toThrow(/cleanup failed/)
+      Object.assign(owned, { stopSettlement: Promise.resolve({ ok: true, errors: [] }) })
+      await rig.stop()
+      await expect(rig.finalizeChaosReceipt()).rejects.toThrow()
+      await expect(owned.finalizeChaosReceipt()).rejects.toThrow(/cycles|array/)
+      expect(write).not.toHaveBeenCalled()
+    } finally {
+      await fsp.rm(owned.runtime.evidenceDir, { recursive: true, force: true })
+    }
+  })
   it('creates synthetic history only for the registered OpenCode fixture and returns observed row identities', async () => {
     const owned = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3, {}, {}, 'test', {
       enabledProviders: [], freshAgentModes: ['freshopencode'], fixtureFreshAgentModes: ['freshopencode'],

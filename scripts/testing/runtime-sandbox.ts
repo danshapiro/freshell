@@ -640,6 +640,8 @@ export const RuntimeChaosEvidenceArtifactsSchema = z.object({
   assertionsArtifactRef: z.string().regex(/^phase5-chaos-assertions:[a-f0-9]{64}$/),
 }).strict()
 export type RuntimeChaosEvidenceArtifacts = z.infer<typeof RuntimeChaosEvidenceArtifactsSchema>
+export const RuntimeChaosReceiptArtifactSchema = z.object({ artifactRef: z.string().regex(/^phase5-chaos:[a-f0-9]{64}$/) }).strict()
+export type RuntimeChaosReceiptArtifact = z.infer<typeof RuntimeChaosReceiptArtifactSchema>
 
 export function writePrivateRuntimeChaosJsonl(filePath: string, rows: readonly RuntimeChaosLog[]): void {
   if (rows.length === 0) throw new Error('refusing to persist an empty chaos log')
@@ -679,7 +681,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
-    'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence',
+    'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
     'synthetic-history-challenge',
     'synthetic-source-facts',
     'synthetic-source-history', 'synthetic-source-exclusions',
@@ -2663,6 +2665,8 @@ export class ManagedRuntimeOwner {
   private readonly nativeChallenges = new Map<string, { soulId: string; nativeSessionId: string; marker: string }>()
   private readonly providerProbes = new Map<string, { child?: ChildProcess; settlement: Promise<string> }>()
   private syntheticSource?: { source: SyntheticSource; root: string; nonce: string }
+  private receiptCandidateBefore?: RuntimeCandidateIntegrity
+  private chaosEvidencePublished = false
 
   constructor(
     private readonly webFactory: RuntimeWebFactory,
@@ -2913,8 +2917,10 @@ export class ManagedRuntimeOwner {
 
   async captureCandidateIntegrity(): Promise<RuntimeCandidateIntegrity> {
     const { captureRuntimeReceiptCandidate } = await import('./runtime-phase5-evidence-common.js')
-    return RuntimeCandidateIntegritySchema.refine(value => value.sha === this.runtime.candidateSha, 'owned candidate changed')
+    const observed = RuntimeCandidateIntegritySchema.refine(value => value.sha === this.runtime.candidateSha, 'owned candidate changed')
       .parse(captureRuntimeReceiptCandidate(this.repoRoot))
+    if (!this.stopSettlement) this.receiptCandidateBefore ??= observed
+    return observed
   }
 
   async chaosWebOutputFacts(handle: ExactRuntimeHandle, challengeId: string): Promise<RuntimeChaosWebOutputFacts> {
@@ -3357,7 +3363,29 @@ export class ManagedRuntimeOwner {
     const artifacts = { providerEventsArtifactRef: `phase5-chaos-provider-events:${createHash('sha256').update(fs.readFileSync(provider)).digest('hex')}`,
       assertionsArtifactRef: `phase5-chaos-assertions:${createHash('sha256').update(fs.readFileSync(browser)).digest('hex')}` }
     this.runtime.recordLifecycle('external.chaos_evidence_published', { severity: 'info', ...artifacts })
+    this.chaosEvidencePublished = true
     return artifacts
+  }
+
+  async finalizeChaosReceipt(): Promise<RuntimeChaosReceiptArtifact> {
+    if (this.runtime.phase !== 5 || !this.receiptCandidateBefore || !this.chaosEvidencePublished) {
+      throw new Error('owned Phase5 chaos observations and captured candidate required')
+    }
+    if (!this.stopSettlement) throw new Error('owned cleanup must settle before chaos receipt finalization')
+    const cleanup = await this.stopSettlement
+    if (!cleanup.ok || cleanup.errors.length > 0) throw new Error('owned cleanup failed before chaos receipt finalization')
+    const { buildPhase5ChaosReceipt } = await import('./runtime-phase5-chaos-evidence.js')
+    const inventory = path.join(this.runtime.evidenceDir, 'phase5-capability-inventory.json')
+    fs.copyFileSync(path.join(this.repoRoot, 'docs/development/runtime-provider-capabilities.json'), inventory)
+    fs.chmodSync(inventory, 0o600)
+    const receipt = buildPhase5ChaosReceipt({ repoRoot: this.repoRoot, evidenceDir: this.runtime.evidenceDir,
+      candidateSha: this.runtime.candidateSha, runtimeImage: this.runtime.imageRef, receiptRunId: this.runtime.runId,
+      candidateBefore: this.receiptCandidateBefore, candidateAfter: await this.captureCandidateIntegrity() })
+    const target = this.writePhase5ChaosReceipt(receipt)
+    const artifactRef = `phase5-chaos:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
+    process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'external.chaos_receipt_finalized',
+      runId: this.runtime.runId, candidateSha: this.runtime.candidateSha, artifactRef })}\n`)
+    return { artifactRef }
   }
 
   async nativeFollowUpMessageIds(handle: ExactRuntimeHandle, challengeId: string): Promise<string[]> {

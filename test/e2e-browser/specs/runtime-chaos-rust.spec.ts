@@ -5,21 +5,15 @@
  * long-running tool, 100 web replacements, and 20 supervisor replacements
  * exercise reconnect, output cursors, notices, and one-writer invariants.
  */
-import fs from 'node:fs'
-import path from 'node:path'
 import { expect, type Page } from '@playwright/test'
-
-import { sha256 } from '../../../scripts/testing/runtime-phase5-evidence-common.js'
-import {
-  buildPhase5ChaosReceipt,
-} from '../../../scripts/testing/runtime-phase5-chaos-evidence.js'
 import { test } from '../helpers/fixtures.js'
 import {
-  ManagedRuntimeBrowserRig,
+  createManagedRuntimeBrowserRig,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ExactRuntimeHandle,
   type ManagedRuntimeView,
+  type ManagedFixtureRig,
 } from '../helpers/managed-runtime.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import {
@@ -131,7 +125,7 @@ async function waitForPaneOutput(
   }, timeoutMs)
 }
 
-async function runningView(rig: ManagedRuntimeBrowserRig, terminalId: string): Promise<ManagedRuntimeView> {
+async function runningView(rig: ManagedFixtureRig, terminalId: string): Promise<ManagedRuntimeView> {
   return waitForValue(`running managed view ${terminalId}`, async () => {
     const view = await rig.runningViewForTerminal(terminalId)
     return view?.containerId ? view : null
@@ -144,7 +138,7 @@ function monotonicMs(): number {
 
 async function exactFalseLossNoticeIds(
   page: Page,
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   token: string,
   handle: ExactRuntimeHandle,
 ): Promise<string[]> {
@@ -169,7 +163,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
     test.skip(process.env.FRESHELL_RUNTIME_PHASE5_CHAOS_LIVE !== '1', 'set FRESHELL_RUNTIME_PHASE5_CHAOS_LIVE=1 for the chaos receipt')
     test.setTimeout(2_400_000)
 
-    const rig = new ManagedRuntimeBrowserRig(
+    const rig = createManagedRuntimeBrowserRig(
       process.cwd(),
       5,
       {
@@ -179,7 +173,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '1000',
       },
     )
-    const candidateBefore = await rig.captureCandidateIntegrity()
+    await rig.captureCandidateIntegrity()
     const webCycles: Record<string, unknown>[] = []
     const supervisorCycles: Record<string, unknown>[] = []
     const browserLogs: Array<StructuredChaosLog & { source: 'browser' }> = []
@@ -490,23 +484,9 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
     expect(receiptReady).toBe(true)
-    fs.copyFileSync(
-      path.join(rig.repoRoot, 'docs/development/runtime-provider-capabilities.json'),
-      path.join(rig.runtime.evidenceDir, 'phase5-capability-inventory.json'),
-    )
-    fs.chmodSync(path.join(rig.runtime.evidenceDir, 'phase5-capability-inventory.json'), 0o600)
-    const receipt = buildPhase5ChaosReceipt({
-      repoRoot: rig.repoRoot,
-      evidenceDir: rig.runtime.evidenceDir,
-      candidateSha: rig.runtime.candidateSha,
-      runtimeImage: rig.runtime.imageRef,
-      receiptRunId: rig.runtime.runId,
-      candidateBefore,
-      candidateAfter: await rig.captureCandidateIntegrity(),
-    })
-    const receiptPath = rig.writePhase5ChaosReceipt(receipt)
-    expect(sha256(fs.readFileSync(receiptPath))).toMatch(/^[0-9a-f]{64}$/)
+    const receipt = await rig.finalizeChaosReceipt()
+    expect(receipt.artifactRef).toMatch(/^phase5-chaos:[a-f0-9]{64}$/)
     // eslint-disable-next-line no-console
-    console.log(`[P5-G09] evidence-derived chaos receipt: ${receiptPath}`)
+    console.log(`[P5-G09] evidence-derived chaos receipt: ${receipt.artifactRef}`)
   })
 })

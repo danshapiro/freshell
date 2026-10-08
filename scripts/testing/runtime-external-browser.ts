@@ -20,7 +20,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema,
   FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
   RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
-  RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -32,7 +32,7 @@ import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
 import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
-import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts } from './runtime-sandbox.js'
+import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts, RuntimeChaosReceiptArtifact } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -839,6 +839,9 @@ export class ExternalManagedRuntimeRig {
   async publishChaosEvidence(handle: ExactRuntimeHandle, chaosEvidence: RuntimeChaosEvidence): Promise<RuntimeChaosEvidenceArtifacts> {
     return this.rpc('chaos-evidence', RuntimeChaosEvidenceArtifactsSchema, { handle, chaosEvidence })
   }
+  async finalizeChaosReceipt(): Promise<RuntimeChaosReceiptArtifact> {
+    return this.rpc('chaos-receipt', RuntimeChaosReceiptArtifactSchema)
+  }
   async incidentMatchesSoul(handle: ExactRuntimeHandle, incidentId: string): Promise<boolean> {
     return this.rpc('incident-matches-soul', z.boolean(), { handle, incidentId })
   }
@@ -1057,7 +1060,8 @@ export function createExternalRuntimeControl(
       } } } : stage
   }
   const execute = async (request: RuntimeOwnerOperationRequest) => {
-    if (finished && request.action !== 'finish' && request.action !== 'abort' && request.action !== 'candidate-integrity') {
+    if (finished && request.action !== 'finish' && request.action !== 'abort'
+      && request.action !== 'candidate-integrity' && request.action !== 'chaos-receipt') {
       throw new Error('external owned runtime is finished')
     }
     const handle = () => {
@@ -1097,6 +1101,7 @@ export function createExternalRuntimeControl(
         if (!request.chaosEvidence) throw new Error('chaos evidence observations required')
         result = await owner.publishChaosEvidence(handle(), request.chaosEvidence)
         break
+      case 'chaos-receipt': result = await owner.finalizeChaosReceipt(); break
       case 'incident-matches-soul':
         if (!request.incidentId) throw new Error('observed incident identity required')
         result = await owner.incidentMatchesSoul(handle(), request.incidentId)
