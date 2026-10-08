@@ -714,6 +714,51 @@ describe('default export (TuiPluginModule)', () => {
     expect(typeof plugin.tui).toBe('function')
   })
 
+  it.each(['abort', 'dispose'])('does not publish a pending native read or reuse retained slots after lifecycle %s', async (edge) => {
+    const home = mkdtempSync(join(tmpdir(), 'freshell-native-disposal-'))
+    vi.stubEnv('HOME', home)
+    const root = 'ses_disposal1', tail = 'msg_disposal1'
+    for (const [key, value] of Object.entries({
+      FRESHELL_OPENCODE_ADOPTION_ROOT_SESSION_ID: root,
+      FRESHELL_OPENCODE_ADOPTION_TAIL_MESSAGE_ID: tail,
+      FRESHELL_OPENCODE_ADOPTION_EXPECTED_EMPTY: 'false',
+      FRESHELL_OPENCODE_ADOPTION_EVIDENCE_GENERATION: 'a'.repeat(64),
+      FRESHELL_OPENCODE_ADOPTION_INCARNATION_ID: 'incarnation-disposal',
+      FRESHELL_OPENCODE_ADOPTION_LAUNCH_NONCE: 'launch-disposal',
+    })) vi.stubEnv(key, value)
+    const session = { id: root, parentID: null }
+    const info = { id: tail, sessionID: root }
+    let finish!: (value: unknown) => void
+    const pending = new Promise(resolve => { finish = resolve })
+    const messages = vi.fn(() => pending)
+    const abort = new AbortController()
+    let dispose!: () => void
+    const slots: Record<string, (context: unknown, props: unknown) => unknown> = {}
+    try {
+      plugin.tui({
+        state: { ready: true, session: { get: () => session, messages: () => [info] } },
+        client: { session: { get: async () => ({ data: session }), messages } },
+        route: { current: { name: 'session', params: { sessionID: root } } },
+        slots: { register: (contribution: { slots: typeof slots }) => Object.assign(slots, contribution.slots) },
+        lifecycle: { signal: abort.signal, onDispose: (callback: () => void) => { dispose = callback } },
+      })
+      await Promise.resolve()
+      expect(messages).toHaveBeenCalledOnce()
+      if (edge === 'abort') abort.abort()
+      else dispose()
+      finish({ data: [{ info, parts: [] }] })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(existsSync(join(home, '.freshell/session-signals/opencode-adoption'))).toBe(false)
+      expect(slots.session_prompt({}, { sessionID: root })).toBeNull()
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(messages).toHaveBeenCalledOnce()
+      expect(existsSync(join(home, '.freshell/session-signals/opencode-adoption'))).toBe(false)
+    } finally {
+      abort.abort()
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
   it('registers slots, polls route.current, and stops on lifecycle abort — without throwing', () => {
     const home = mkdtempSync(join(tmpdir(), 'freshell-slot-api-'))
     vi.stubEnv('HOME', home)

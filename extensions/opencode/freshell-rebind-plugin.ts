@@ -77,6 +77,7 @@ interface AdoptionTuiApi {
 
 export interface EmitterDeps {
   env: Record<string, string | undefined>
+  signal?: AbortSignal
   writeFile?: (dir: string, name: string, body: string) => void
   readExpectation?: (path: string) => string | null
   now?: () => number
@@ -468,6 +469,7 @@ export function createObservationEmitter(
   let lastRefusal: string | null = null
   let inFlight = false
   const refuse = (current: AdoptionExpectation, reason: NativeRefusalReason): void => {
+    if (deps.signal?.aborted) return
     const record: NativeObservationRefusal = {
       severity: 'warning', event: 'runtime.opencode.native_observation_refused',
       terminalId: current.terminalId, nativeSessionId: current.rootSessionId,
@@ -483,7 +485,7 @@ export function createObservationEmitter(
     } catch { /* A diagnostic failure cannot change the native gate or break the renderer. */ }
   }
   return async (apiValue: unknown): Promise<void> => {
-    if (inFlight) return
+    if (deps.signal?.aborted || inFlight) return
     inFlight = true
     let active = expected
     try {
@@ -505,7 +507,9 @@ export function createObservationEmitter(
         return refuse(current, 'tui_root_not_loaded')
       }
 
+      if (deps.signal?.aborted) return
       const read = await readNativeHistory(api, current.rootSessionId)
+      if (deps.signal?.aborted) return
       const native = 'failure' in read ? null : read
       if (currentRouteSessionId(api.route?.current) !== current.rootSessionId || state.ready !== true) return refuse(current, 'tui_context_changed')
       const selected = asRecord(sessionState.get(current.rootSessionId))
@@ -557,6 +561,7 @@ export function createObservationEmitter(
       if (signature === lastEmitted) return
       seq += 1
       const nonce = `${String(now()).padStart(14, '0')}-${String(seq).padStart(6, '0')}-${process.pid}`
+      if (deps.signal?.aborted) return
       write(
         current.dir,
         `${current.terminalId}__${nonce}`,
@@ -584,11 +589,6 @@ export default {
     try {
       emitHello({ env: process.env })
       const env = process.env
-      const managedAdoption = hasAdoptionExpectation(env)
-      const emitLegacy = managedAdoption ? undefined : createEmitter({ env })
-      const emitObservation = managedAdoption
-        ? createObservationEmitter({ env })
-        : undefined
       const a = api as {
         slots?: { register?: (plugin: TuiSlotContribution) => unknown }
         route?: { current?: unknown }
@@ -597,6 +597,33 @@ export default {
           onDispose?: (fn: () => void) => unknown
         }
       } | undefined
+      const cancellation = new AbortController()
+      let timer: ReturnType<typeof setInterval> | undefined
+      const stop = (): void => {
+        cancellation.abort()
+        if (timer !== undefined) clearInterval(timer)
+        try {
+          a?.lifecycle?.signal?.removeEventListener?.('abort', stop)
+        } catch {
+          /* lifecycle cleanup must not break the renderer */
+        }
+      }
+      try {
+        if (a?.lifecycle?.signal?.aborted) stop()
+        else a?.lifecycle?.signal?.addEventListener?.('abort', stop, { once: true })
+      } catch {
+        /* no lifecycle signal */
+      }
+      try {
+        a?.lifecycle?.onDispose?.(stop)
+      } catch {
+        /* no onDispose */
+      }
+      const managedAdoption = hasAdoptionExpectation(env)
+      const emitLegacy = managedAdoption ? undefined : createEmitter({ env })
+      const emitObservation = managedAdoption
+        ? createObservationEmitter({ env, signal: cancellation.signal })
+        : undefined
       // Unmanaged panes keep their route/slot rebind signal. For managed
       // launches, these edges only trigger a fresh TUI-state check; their
       // route and slot arguments never qualify as adoption evidence. The
@@ -606,6 +633,7 @@ export default {
           a?.slots?.register?.({
             slots: {
               [slot]: (_context: unknown, props: unknown) => {
+                if (cancellation.signal.aborted) return null
                 if (emitLegacy) emitLegacy(props)
                 if (emitObservation) void emitObservation(a)
                 return null
@@ -619,6 +647,7 @@ export default {
       // PRIMARY edge: 1s poll covers the slots' visibility gaps. In managed
       // mode, route state only triggers a check and cannot emit adoption.
       const tick = (): void => {
+        if (cancellation.signal.aborted) return
         try {
           if (emitLegacy) emitLegacy(a?.route?.current)
           if (emitObservation) void emitObservation(a)
@@ -627,18 +656,7 @@ export default {
         }
       }
       tick()
-      const timer = setInterval(tick, POLL_INTERVAL_MS)
-      const stop = (): void => clearInterval(timer)
-      try {
-        a?.lifecycle?.signal?.addEventListener?.('abort', stop)
-      } catch {
-        /* no lifecycle signal */
-      }
-      try {
-        a?.lifecycle?.onDispose?.(stop)
-      } catch {
-        /* no onDispose */
-      }
+      if (!cancellation.signal.aborted) timer = setInterval(tick, POLL_INTERVAL_MS)
     } catch {
       // Version tolerance: silently no-op.
     }
