@@ -324,13 +324,17 @@ impl DockerEngineBackend {
                 &projection.provider_launch_context,
             )
             .map_err(|_| fail("Claude candidate ordinary mounts unavailable"))?;
-            let labels = json!({"com.freshell.installation-id":installation,
+            let mut labels = json!({"com.freshell.installation-id":installation,
                 "com.freshell.soul-id":request.soul_id,"com.freshell.runtime-test-run-id":test_run_id,
                 "com.freshell.source-request-id":request.observation_request.request_id,
                 "com.freshell.source-binary-sha256":digest,
                 "com.freshell.input-generation":projection.publication.generation_id,
-                "com.freshell.source-reservation-id":reservation_id,
                 "com.freshell.claude-candidate":"ordinary"});
+            if let Some(reservation_id) = reservation_id {
+                labels["com.freshell.source-reservation-id"] = json!(reservation_id);
+            } else if let Some(attempt) = &projection.publication.registry_attempt_id {
+                labels["com.freshell.source-recovery-attempt-id"] = json!(attempt);
+            }
             scratch = Some(CandidateScratch {
                 name: format!(
                     "freshell-claude-candidate-{}",

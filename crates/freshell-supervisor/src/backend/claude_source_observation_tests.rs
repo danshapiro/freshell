@@ -1085,7 +1085,11 @@ async fn qualify_candidate_helper_transport(
                             seen.lock().unwrap().push((line.clone(),body.clone()));
                             let (status,value)=if line.contains("/info "){(200,json!({"ID":daemon,"SecurityOptions":["name=rootless"]}))}
                             else if line.contains("/images/"){(200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_IMAGE_CREDENTIAL_SENTINEL"]}}))}
-                            else if line.starts_with("POST") && line.contains("/volumes/create "){assert_eq!(body["Name"],expected_scratch,"private candidate request must identify its exact scratch backing before creation");let actual=json!({"Name":body["Name"],"Driver":"local","Options":{},"Labels":body["Labels"],"Mountpoint":"/synthetic/ordinary-volume"});*backing.lock().unwrap()=Some(actual.clone());(201,actual)}
+                            else if line.starts_with("POST") && line.contains("/volumes/create "){
+                                assert_eq!(body["Name"],expected_scratch,"private candidate request must identify its exact scratch backing before creation");
+                                if serde_json::from_value::<BTreeMap<String,String>>(body["Labels"].clone()).is_err() { (400,json!({"message":"volume labels require string metadata"})) }
+                                else { let actual=json!({"Name":body["Name"],"Driver":"local","Options":{},"Labels":body["Labels"],"Mountpoint":"/synthetic/ordinary-volume"});*backing.lock().unwrap()=Some(actual.clone());(201,actual) }
+                            }
                             else if line.starts_with("GET") && line.contains("/volumes/"){if retained_name.as_ref().is_some_and(|name|line.contains(name)) {(200,json!({"Name":retained_name,"Driver":"local","Options":{},"Mountpoint":"/synthetic/retained-home"}))} else {match backing.lock().unwrap().clone(){Some(v) if line.contains(v["Name"].as_str().unwrap())=>(200,v),_=>(404,json!({}))}}}
                             else if line.starts_with("DELETE") && line.contains("/volumes/"){assert!(bodies.lock().unwrap().is_empty(),"candidate helpers must be gone before volume deletion");if mode!="volume-still-present" {*backing.lock().unwrap()=None;}(204,json!({}))}
                             else if line.contains("/containers/create?"){
