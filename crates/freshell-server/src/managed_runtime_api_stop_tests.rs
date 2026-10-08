@@ -171,8 +171,37 @@ async fn fixture_fresh_soul_with_cleanup(
         )
         .await
         .unwrap();
-    registry
+    let grant = registry
         .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+        .await
+        .unwrap();
+    let context = registry.recovery_context(soul_id.clone()).await.unwrap();
+    let launch = registry
+        .bind_native_identity_launch(NativeIdentityLaunch {
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+            evidence_revision: context.evidence_revision,
+            execution_generation: grant.execution_generation,
+            requested_native_session_id: context.native_session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let context = registry.recovery_context(soul_id.clone()).await.unwrap();
+    // Controlled setup for the retained-runtime backend fixture, not native
+    // qualification: exercise the production current-launch publication gate.
+    registry
+        .record_native_identity_observation(
+            soul_id.clone(),
+            NativeIdentityObservation {
+                native_session_id: native_id.into(),
+                incarnation_id: launch.incarnation_id,
+                launch_nonce: launch.launch_nonce,
+                evidence_revision: launch.evidence_revision,
+                source: NativeIdentitySource::FreshProviderHandshake,
+                evidence_digest: "a".repeat(64),
+            },
+            context.write_fence(),
+        )
         .await
         .unwrap();
     registry

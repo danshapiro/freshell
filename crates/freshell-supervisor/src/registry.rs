@@ -2826,7 +2826,7 @@ impl Registry {
         .await
     }
 
-    pub(crate) async fn bind_native_identity_launch(
+    pub async fn bind_native_identity_launch(
         &self,
         launch: freshell_runtime_protocol::NativeIdentityLaunch,
     ) -> Result<freshell_runtime_protocol::NativeIdentityLaunch, RegistryError> {
@@ -2854,7 +2854,7 @@ impl Registry {
         }).await
     }
 
-    pub(crate) async fn record_native_identity_observation(
+    pub async fn record_native_identity_observation(
         &self,
         soul_id: SoulId,
         observation: freshell_runtime_protocol::NativeIdentityObservation,
