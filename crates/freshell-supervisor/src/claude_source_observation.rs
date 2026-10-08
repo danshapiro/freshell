@@ -76,8 +76,29 @@ impl Supervisor {
                     return Err(denied());
                 }
                 let handle = authority.start.context.prior_handle.clone();
+                let recovery_source = if request.candidate.is_some() {
+                    let context = handle
+                        .terminal()
+                        .and_then(|spec| spec.provider_launch_context.as_ref())
+                        .or_else(|| {
+                            handle
+                                .fresh_agent()
+                                .and_then(|spec| spec.provider_launch_context.as_ref())
+                        })
+                        .ok_or_else(denied)?;
+                    Some(self.claude_recovery_source_binding(
+                        &authority.start,
+                        attempt_id,
+                        context,
+                    )?)
+                } else {
+                    None
+                };
                 recovery = Some(authority.start);
-                ClaudeSourceOwner::Retained { handle }
+                ClaudeSourceOwner::Retained {
+                    handle,
+                    recovery_source,
+                }
             }
         };
         let raw = freshell_runtime_protocol::bounded_json_bytes(
@@ -166,7 +187,11 @@ mod tests {
     };
     use freshell_runtime_protocol::*;
 
-    struct ReplyBackend(StdMutex<Option<Box<dyn FnOnce() + Send>>>);
+    struct ReplyBackend(
+        StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+        StdMutex<Option<ClaudeRecoverySourceBinding>>,
+        std::sync::atomic::AtomicUsize,
+    );
     #[async_trait]
     impl RuntimeBackend for ReplyBackend {
         async fn observe_claude_sources(
@@ -175,10 +200,31 @@ mod tests {
             request: &ObserveClaudeSourcesRequest,
             _: &str,
         ) -> Result<ObservationReply, BackendError> {
-            let ClaudeSourceOwner::Retained { handle } = owner else {
+            self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ClaudeSourceOwner::Retained {
+                handle,
+                recovery_source,
+            } = owner
+            else {
                 panic!("requires retained fixture owner");
             };
             assert_eq!(handle.soul_id(), &request.soul_id);
+            if let Some(expected) = self.1.lock().unwrap().as_ref() {
+                let supplied = recovery_source.as_ref().ok_or_else(|| {
+                    BackendError::Unavailable("current registry source provenance missing".into())
+                })?;
+                if supplied.provider != expected.provider
+                    || supplied.registry_attempt_id != expected.registry_attempt_id
+                    || supplied.intent_revision != expected.intent_revision
+                    || supplied.prior_generation_id != expected.prior_generation_id
+                    || supplied.authority_sha256 != expected.authority_sha256
+                    || supplied.git_common_dir != expected.git_common_dir
+                {
+                    return Err(BackendError::Unavailable(
+                        "current registry source provenance changed".into(),
+                    ));
+                }
+            }
             let action = self.0.lock().unwrap().take();
             if let Some(action) = action {
                 action();
@@ -249,7 +295,15 @@ mod tests {
 
     #[tokio::test]
     async fn provider_claude_nested_source_reply_requires_live_scope_after_private_ipc() {
-        for mode in ["live", "dropped", "expired"] {
+        for mode in [
+            "live",
+            "dropped",
+            "expired",
+            "candidate",
+            "candidate-dropped",
+            "candidate-expired",
+            "candidate-unrecorded-prior",
+        ] {
             let owned = tempfile::tempdir().unwrap();
             let binary = owned.path().join("host");
             std::fs::write(&binary, b"synthetic helper artifact").unwrap();
@@ -263,6 +317,15 @@ mod tests {
                 swap_bytes: 0,
                 pids_max: 32,
             };
+            let prior_generation = format!("grant-{}", uuid::Uuid::new_v4());
+            let prior_context:ProviderLaunchContext = serde_json::from_value(serde_json::json!({
+                "preparation":{"claude":{"mcp_args":[]}},"config":[],
+                "mcpCapability":{"grantId":prior_generation,"endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
+                "preparedInputs":{"generationId":prior_generation,"manifest":{"relativePath":".freshell/input-manifest.json","sha256":"a".repeat(64),"sourceCount":0,"aliasCount":0,"recipeCount":0}}
+            })).unwrap();
+            let terminal = (mode.starts_with("candidate")).then(||serde_json::from_value::<TerminalLaunchSpec>(serde_json::json!({
+                "terminalId":"source-provenance","streamId":"source-stream","mode":"claude","program":"claude","args":[],"cwd":owned.path(),"workspacePath":owned.path(),"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"synthetic-workspace","providerLaunchContext":if mode=="candidate-unrecorded-prior" {None} else {Some(&prior_context)}
+            })).unwrap());
             let prepared = registry
                 .prepare_launch(LaunchPreparation {
                     soul_id: soul.clone(),
@@ -276,7 +339,7 @@ mod tests {
                     profile: RuntimeProfile::Custom,
                     project_key: "synthetic-workspace".into(),
                     fixture: None,
-                    terminal: None,
+                    terminal,
                     fresh_agent: None,
                     view_intent: None,
                     admission: crate::admission::AdmissionPolicy::default(),
@@ -306,7 +369,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let backend = Arc::new(ReplyBackend(StdMutex::new(None)));
+            let backend = Arc::new(ReplyBackend(
+                StdMutex::new(None),
+                StdMutex::new(None),
+                std::sync::atomic::AtomicUsize::new(0),
+            ));
             let supervisor = Supervisor::new(
                 registry,
                 backend.clone(),
@@ -325,19 +392,22 @@ mod tests {
             let lock = supervisor.lifecycle_lock(&soul).await;
             let _held = lock.lock().await;
             let scope = supervisor.auth_lookup_scope(&start);
-            if mode != "live" {
+            if matches!(
+                mode,
+                "dropped" | "expired" | "candidate-dropped" | "candidate-expired"
+            ) {
                 let authorities = supervisor.auth_lookup_authorities.clone();
                 let key = scope.key.clone();
                 *backend.0.lock().unwrap() = Some(Box::new(move || {
                     let mut map = authorities.lock().unwrap();
-                    if mode == "dropped" {
+                    if mode.ends_with("dropped") {
                         map.remove(&key);
                     } else {
                         map.get_mut(&key).unwrap().expires = Instant::now();
                     }
                 }));
             }
-            let request: ObserveClaudeSourcesRequest=serde_json::from_value(serde_json::json!({
+            let mut request: ObserveClaudeSourcesRequest=serde_json::from_value(serde_json::json!({
                 "expectedControlEpoch":supervisor.registry.control_epoch(),"soulId":soul,"provider":"claude",
                 "authority":{"kind":"recovery_attempt","attemptId":scope.key},
                 "workspacePath":owned.path(),"gitCommonDir":null,"candidate":null,
@@ -345,6 +415,41 @@ mod tests {
                     "cwd":owned.path(),"home":"/home/freshell/provider","settingSources":["local"],
                     "selectorManifestSha256":"b".repeat(64),"planRevision":0}
             })).unwrap();
+            if mode.starts_with("candidate") {
+                let source_binding = ClaudeRecoverySourceBinding {
+                    provider: "claude".into(),
+                    git_common_dir: None,
+                    authority_sha256: format!(
+                        "{:x}",
+                        Sha256::digest(
+                            bounded_json_bytes(&request.authority, MAX_CONTROL_FRAME_BYTES)
+                                .unwrap()
+                        )
+                    ),
+                    registry_attempt_id: start.attempt_id.clone(),
+                    intent_revision: start.context.intent_revision,
+                    prior_generation_id: prior_generation,
+                };
+                let mut candidate = prior_context.clone();
+                let generation = format!("grant-{}", uuid::Uuid::new_v4());
+                candidate.mcp_capability.as_mut().unwrap().grant_id = generation.clone();
+                candidate.prepared_inputs.as_mut().unwrap().generation_id = generation.clone();
+                request.candidate = Some(PreparedProviderContext {
+                    provider_launch_context: candidate,
+                    provider_secret_references: vec![],
+                });
+                request.observation_request.candidate_binding = Some(
+                    freshell_platform::claude_inputs::observation::CandidateBinding {
+                        soul_id: soul.as_str().into(),
+                        generation_id: generation,
+                        authority_sha256: source_binding.authority_sha256.clone(),
+                        publication_sha256: "c".repeat(64),
+                        manifest_sha256: "a".repeat(64),
+                        prepared_result_sha256: "d".repeat(64),
+                    },
+                );
+                *backend.1.lock().unwrap() = Some(source_binding);
+            }
             let mut envelope = Envelope::new(
                 RequestId::new(),
                 ControlRole::Web,
@@ -358,10 +463,11 @@ mod tests {
             .await
             .expect("nested Claude source lookup must not reacquire the held soul lifecycle lock")
             .result;
+            assert_eq!(backend.2.load(std::sync::atomic::Ordering::SeqCst),usize::from(mode!="candidate-unrecorded-prior"),"unrecorded prior inputs must block before the backend; valid provenance reaches it once");
             assert_eq!(
                 result.is_ok(),
-                mode == "live",
-                "{mode}: changed scoped authority after IPC cannot qualify source evidence"
+                matches!(mode,"live"|"candidate"),
+                "{mode}: changed scoped authority after IPC cannot qualify source evidence: {result:?}"
             );
             if let Err(error) = result {
                 assert_eq!(error.code, RuntimeErrorCode::InvalidRequest);

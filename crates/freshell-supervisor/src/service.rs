@@ -61,6 +61,7 @@ struct McpCapabilityRequest<'a> {
     tui_source: Option<&'a freshell_runtime_protocol::ProviderConfigReference>,
     workspace: Option<&'a str>,
     auth_lookup_authority: Option<&'a str>,
+    claude_recovery_source: Option<&'a freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
     cwd: Option<&'a str>,
     prior_context: Option<&'a freshell_runtime_protocol::ProviderLaunchContext>,
     provider_secret_references: Option<&'a [freshell_runtime_protocol::ProviderSecretReference]>,
@@ -2005,6 +2006,7 @@ impl Supervisor {
                 tui_source: None,
                 workspace: None,
                 auth_lookup_authority: None,
+                claude_recovery_source: None,
                 cwd: None,
                 prior_context: None,
                 provider_secret_references: None,
@@ -2103,6 +2105,73 @@ impl Supervisor {
         }
     }
 
+    fn claude_recovery_source_binding(
+        &self,
+        start: &crate::registry::RecoveryStart,
+        scope_key: &str,
+        context: &freshell_runtime_protocol::ProviderLaunchContext,
+    ) -> Result<freshell_runtime_protocol::ClaudeRecoverySourceBinding, RuntimeError> {
+        use sha2::Digest;
+        let unavailable = || {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "Claude prior source generation unavailable; retain inputs and reprepare",
+            )
+        };
+        let saved = start
+            .context
+            .prior_handle
+            .terminal()
+            .and_then(|spec| spec.provider_launch_context.as_ref())
+            .or_else(|| {
+                start
+                    .context
+                    .prior_handle
+                    .fresh_agent()
+                    .and_then(|spec| spec.provider_launch_context.as_ref())
+            })
+            .ok_or_else(unavailable)?;
+        context.validate("claude")?;
+        let inputs = context.prepared_inputs.as_ref().ok_or_else(unavailable)?;
+        if saved
+            .prepared_inputs
+            .as_ref()
+            .map(|inputs| inputs.generation_id.as_str())
+            != Some(inputs.generation_id.as_str())
+        {
+            return Err(unavailable());
+        }
+        let authority = freshell_runtime_protocol::ClaudeSourceAuthority::RecoveryAttempt {
+            attempt_id: scope_key.into(),
+        };
+        let raw = freshell_runtime_protocol::bounded_json_bytes(
+            &authority,
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+        )
+        .map_err(|_| unavailable())?;
+        let binding = freshell_runtime_protocol::ClaudeRecoverySourceBinding {
+            provider: start.context.provider.clone(),
+            git_common_dir: start
+                .context
+                .prior_handle
+                .terminal()
+                .and_then(|spec| spec.git_common_dir.clone())
+                .or_else(|| {
+                    start
+                        .context
+                        .prior_handle
+                        .fresh_agent()
+                        .and_then(|spec| spec.git_common_dir.clone())
+                }),
+            authority_sha256: format!("{:x}", sha2::Sha256::digest(raw)),
+            registry_attempt_id: start.attempt_id.clone(),
+            intent_revision: start.context.intent_revision,
+            prior_generation_id: inputs.generation_id.clone(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
     pub(crate) async fn issue_replacement_mcp_capability(
         &self,
         start: &crate::registry::RecoveryStart,
@@ -2119,6 +2188,13 @@ impl Supervisor {
             _ => None,
         };
         let scope = self.auth_lookup_scope(start);
+        let claude_recovery_source = if provider == "claude"
+            && matches!(start.context.provider.as_str(), "claude" | "kilroy")
+        {
+            Some(self.claude_recovery_source_binding(start, &scope.key, context)?)
+        } else {
+            None
+        };
         let path_inputs = self.bound_provider_path_inputs(
             &start.context.soul_id,
             context
@@ -2136,6 +2212,7 @@ impl Supervisor {
                 tui_source,
                 workspace: Some(workspace),
                 auth_lookup_authority: Some(&scope.key),
+                claude_recovery_source: claude_recovery_source.as_ref(),
                 cwd: Some(cwd),
                 prior_context: Some(context),
                 provider_secret_references: Some(references),
@@ -2174,6 +2251,7 @@ impl Supervisor {
                 "tuiSource": request.tui_source,
                 "workspace": request.workspace,
                 "authLookupAuthority": request.auth_lookup_authority,
+                "claudeRecoverySource": request.claude_recovery_source,
                 "cwd":request.cwd,
                 "priorContext":request.prior_context,
                 "providerSecretReferences":request.provider_secret_references,

@@ -2948,6 +2948,46 @@ pub struct ClaudeCandidatePublication {
     pub git_common_dir: Option<String>,
 }
 
+/// Finite provenance supplied by the authenticated recovery callback owner.
+/// The scope key itself is confined to the existing private callback channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeRecoverySourceBinding {
+    pub provider: String,
+    pub git_common_dir: Option<String>,
+    pub authority_sha256: String,
+    pub registry_attempt_id: RecoveryAttemptId,
+    pub intent_revision: u64,
+    pub prior_generation_id: String,
+}
+
+impl ClaudeRecoverySourceBinding {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if !matches!(self.provider.as_str(), "claude" | "kilroy")
+            || self.authority_sha256.len() != 64
+            || !self
+                .authority_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || RecoveryAttemptId::parse(self.registry_attempt_id.as_str()).is_err()
+            || self.intent_revision == 0
+            || !self.prior_generation_id.starts_with("grant-")
+            || uuid::Uuid::parse_str(&self.prior_generation_id[6..]).is_err()
+            || self.git_common_dir.as_ref().is_some_and(|path| {
+                path.len() > 64 * 1024
+                    || path.chars().any(char::is_control)
+                    || !std::path::Path::new(path).is_absolute()
+            })
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "Claude recovery source binding is unavailable; retain inputs and reprepare",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ClaudeCandidateProjectionRequest {
     pub fn validate(&self) -> Result<(), RuntimeError> {
         use sha2::Digest;

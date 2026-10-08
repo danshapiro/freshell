@@ -130,6 +130,7 @@ pub enum ClaudeSourceOwner {
     },
     Retained {
         handle: OwnedRuntimeHandle,
+        recovery_source: Option<freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
     },
 }
 

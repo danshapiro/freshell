@@ -46,6 +46,7 @@ pub(crate) struct OpencodeEphemeralInput<'a> {
     pub claude_inline_settings: Option<&'a str>,
     pub claude_reservation_provider: Option<&'a str>,
     pub claude_git_common_dir: Option<&'a Path>,
+    pub claude_recovery_source: Option<&'a freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
     pub amplifier_manifest: Option<&'a freshell_platform::amplifier_inputs::AmplifierInputManifest>,
     pub inline_config: Option<&'a str>,
     pub tui_config_path: Option<&'a str>,
@@ -270,6 +271,7 @@ struct CapabilityCallback {
     tui_source: Option<ProviderConfigReference>,
     workspace: Option<PathBuf>,
     auth_lookup_authority: Option<String>,
+    claude_recovery_source: Option<freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
     cwd: Option<PathBuf>,
     provider_secret_references: Option<Vec<freshell_runtime_protocol::ProviderSecretReference>>,
     prior_context: Option<freshell_runtime_protocol::ProviderLaunchContext>,
@@ -298,6 +300,40 @@ async fn apply_prepared_callback(
         .provider
         .as_deref()
         .ok_or("missing managed MCP provider")?;
+    if let Some(binding) = callback.claude_recovery_source.as_ref() {
+        binding
+            .validate()
+            .map_err(|_| "Claude callback source provenance unavailable")?;
+        let authority = freshell_runtime_protocol::ClaudeSourceAuthority::RecoveryAttempt {
+            attempt_id: callback
+                .auth_lookup_authority
+                .as_ref()
+                .ok_or("Claude callback source scope unavailable")?
+                .clone(),
+        };
+        let prior = callback
+            .prior_context
+            .as_ref()
+            .and_then(|context| context.prepared_inputs.as_ref())
+            .ok_or("Claude callback prior generation unavailable")?;
+        if provider != "claude"
+            || prior.generation_id != binding.prior_generation_id
+            || format!(
+                "{:x}",
+                Sha256::digest(
+                    freshell_runtime_protocol::bounded_json_bytes(
+                        &authority,
+                        freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+                    )
+                    .map_err(|_| "Claude callback source scope profile exceeded")?
+                )
+            ) != binding.authority_sha256
+        {
+            return Err(
+                "Claude callback source provenance changed; retain inputs and reprepare".into(),
+            );
+        }
+    }
     if let Some(reply) = store.pending_prepared_context(
         &callback.soul_id,
         directory,
@@ -383,6 +419,16 @@ async fn apply_prepared_callback(
                     workspace: Some(&manifest.workspace),
                     claude_manifest: Some(manifest),
                     claude_inline_settings: inline_settings.as_deref(),
+                    claude_reservation_provider: callback
+                        .claude_recovery_source
+                        .as_ref()
+                        .map(|binding| binding.provider.as_str()),
+                    claude_recovery_source: callback.claude_recovery_source.as_ref(),
+                    claude_git_common_dir: callback
+                        .claude_recovery_source
+                        .as_ref()
+                        .and_then(|binding| binding.git_common_dir.as_deref())
+                        .map(Path::new),
                     ..Default::default()
                 },
             ),
@@ -1907,10 +1953,6 @@ fn publish_claude_candidate_binding(
     };
     let unavailable =
         || "Claude candidate issuer authority unavailable; retain inputs and reprepare".to_string();
-    let reservation = input.initial_auth_reservation.ok_or_else(unavailable)?;
-    if reservation.len() != 36 || uuid::Uuid::parse_str(reservation).is_err() {
-        return Err(unavailable());
-    }
     let flavor = input.claude_reservation_provider.unwrap_or(provider);
     if !matches!(flavor, "claude" | "kilroy")
         || (flavor == "kilroy"
@@ -1922,7 +1964,7 @@ fn publish_claude_candidate_binding(
         return Err(unavailable());
     }
     let inputs = context.prepared_inputs.as_ref().ok_or_else(unavailable)?;
-    if inputs.initial_auth_reservation.as_deref() != Some(reservation)
+    if inputs.initial_auth_reservation.as_deref() != input.initial_auth_reservation
         || inputs.indexed_files.is_some()
         || inputs.manifest.source_count != 0
         || inputs.manifest.alias_count != 0
@@ -1942,8 +1984,55 @@ fn publish_claude_candidate_binding(
     if cwd != plan.observation.cwd || !cwd.starts_with(&workspace) {
         return Err(unavailable());
     }
-    let authority = ClaudeSourceAuthority::InitialReservation {
-        reservation_id: reservation.into(),
+    let (
+        authority_sha256,
+        initial_reservation_id,
+        registry_attempt_id,
+        intent_revision,
+        prior_generation_id,
+    ) = match (input.initial_auth_reservation, input.claude_recovery_source) {
+        (Some(reservation), None) => {
+            if reservation.len() != 36 || uuid::Uuid::parse_str(reservation).is_err() {
+                return Err(unavailable());
+            }
+            let authority = ClaudeSourceAuthority::InitialReservation {
+                reservation_id: reservation.into(),
+            };
+            (
+                format!(
+                    "{:x}",
+                    Sha256::digest(
+                        bounded_json_bytes(&authority, MAX_CONTROL_FRAME_BYTES)
+                            .map_err(|_| unavailable())?
+                    )
+                ),
+                Some(reservation.into()),
+                None,
+                1,
+                None,
+            )
+        }
+        (None, Some(recovery)) => {
+            recovery.validate().map_err(|_| unavailable())?;
+            let prior = input
+                .launch_context
+                .and_then(|context| context.prepared_inputs.as_ref())
+                .ok_or_else(unavailable)?;
+            if prior.generation_id != recovery.prior_generation_id
+                || inputs.generation_id == recovery.prior_generation_id
+                || recovery.provider != flavor
+            {
+                return Err(unavailable());
+            }
+            (
+                recovery.authority_sha256.clone(),
+                None,
+                Some(recovery.registry_attempt_id.clone()),
+                recovery.intent_revision,
+                Some(recovery.prior_generation_id.clone()),
+            )
+        }
+        _ => return Err(unavailable()),
     };
     let result = PreparedProviderContext {
         provider_launch_context: context.clone(),
@@ -1954,17 +2043,11 @@ fn publish_claude_candidate_binding(
         version: 1,
         soul_id: soul.clone(),
         provider: flavor.into(),
-        authority_sha256: format!(
-            "{:x}",
-            Sha256::digest(
-                bounded_json_bytes(&authority, MAX_CONTROL_FRAME_BYTES)
-                    .map_err(|_| unavailable())?
-            )
-        ),
-        initial_reservation_id: Some(reservation.into()),
-        registry_attempt_id: None,
-        intent_revision: 1,
-        prior_generation_id: None,
+        authority_sha256,
+        initial_reservation_id,
+        registry_attempt_id,
+        intent_revision,
+        prior_generation_id,
         generation_id: inputs.generation_id.clone(),
         manifest_sha256: inputs.manifest.sha256.clone(),
         prepared_context_sha256: format!(
@@ -2282,15 +2365,31 @@ impl CapabilityStore {
             });
         }
         let retained = recoverable_input_path(directory, &soul_id)?;
-        let prior_stage = self
-            .grants
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(_, grant)| grant.soul_id == soul_id)
-            .map(|(grant_id, _)| staged_provider_root_path(directory, grant_id))
-            .transpose()?
-            .or_else(|| retained.is_dir().then_some(retained));
+        let prior_stage = if let Some(recovery) = input.claude_recovery_source {
+            recovery.validate().map_err(|error| error.message)?;
+            if !self
+                .grants
+                .lock()
+                .unwrap()
+                .get(&recovery.prior_generation_id)
+                .is_some_and(|grant| grant.soul_id == soul_id)
+            {
+                return Err("Claude exact prior generation ownership unavailable; retain inputs and reprepare".into());
+            }
+            Some(staged_provider_root_path(
+                directory,
+                &recovery.prior_generation_id,
+            )?)
+        } else {
+            self.grants
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, grant)| grant.soul_id == soul_id)
+                .map(|(grant_id, _)| staged_provider_root_path(directory, grant_id))
+                .transpose()?
+                .or_else(|| retained.is_dir().then_some(retained))
+        };
         let replacement = self.issue(
             soul_id.clone(),
             directory,
@@ -3544,29 +3643,111 @@ except Exception as error:
             let projection = request
                 .candidate_projection(publication)
                 .expect("published owner binding must permit the owned ordinary consumer");
+            let recovery_authority = ClaudeSourceAuthority::RecoveryAttempt {
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+            };
+            let recovery_binding = freshell_runtime_protocol::ClaudeRecoverySourceBinding {
+                provider: flavor.into(),
+                git_common_dir: None,
+                authority_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(
+                        bounded_json_bytes(&recovery_authority, MAX_CONTROL_FRAME_BYTES).unwrap()
+                    )
+                ),
+                registry_attempt_id: freshell_runtime_protocol::RecoveryAttemptId::new(),
+                intent_revision: 7,
+                prior_generation_id: capability.grant_id.clone(),
+            };
+            let mut revised = manifest.clone();
+            revised.accepted_native_plan.as_mut().unwrap().plan_revision = 1;
+            let replacement = store.issue_replacement_with_inputs(
+                request.soul_id.clone(),&directory,"http://host.docker.internal:4000".into(),Some(("claude",&home,&[])),OpencodeEphemeralInput {
+                    claude_manifest:Some(&revised),claude_observation:Some(&observation),claude_reservation_provider:Some(flavor),claude_recovery_source:Some(&recovery_binding),cwd:Some(&workspace),workspace:Some(&workspace),launch_context:Some(&context),secret_references:Some(&[]),..Default::default()
+                }
+            ).expect("current recovery provenance must permit publication without replacing the prior lease");
+            assert_ne!(replacement.grant_id, capability.grant_id);
+            assert!(
+                store
+                    .grants
+                    .lock()
+                    .unwrap()
+                    .contains_key(&capability.grant_id),
+                "prior lease must survive candidate issuance"
+            );
+            let replacement_context = read_prepared_context(&directory, &replacement).unwrap();
+            let replacement_stage =
+                staged_provider_root_path(&directory, &replacement.grant_id).unwrap();
+            let replacement_publication_bytes =
+                std::fs::read(replacement_stage.join(".freshell/claude-candidate-binding.json"))
+                    .unwrap();
+            let replacement_publication: ClaudeCandidatePublication =
+                serde_json::from_slice(&replacement_publication_bytes).unwrap();
+            let replacement_ready = PreparedProviderContext {
+                provider_launch_context: replacement_context.clone(),
+                provider_secret_references: vec![],
+            };
+            let mut replacement_request = request.clone();
+            replacement_request.authority = recovery_authority;
+            replacement_request.candidate = Some(replacement_ready.clone());
+            replacement_request.observation_request.plan_revision = 1;
+            replacement_request.observation_request.candidate_binding = Some(CandidateBinding {
+                soul_id: request.soul_id.as_str().into(),
+                generation_id: replacement.grant_id.clone(),
+                authority_sha256: recovery_binding.authority_sha256.clone(),
+                publication_sha256: format!("{:x}", Sha256::digest(&replacement_publication_bytes)),
+                manifest_sha256: replacement_context
+                    .prepared_inputs
+                    .as_ref()
+                    .unwrap()
+                    .manifest
+                    .sha256
+                    .clone(),
+                prepared_result_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(
+                        bounded_json_bytes(&replacement_ready, MAX_CONTROL_FRAME_BYTES).unwrap()
+                    )
+                ),
+            });
+            let mut stale_scope = replacement_request.clone();
+            stale_scope.authority = ClaudeSourceAuthority::RecoveryAttempt {
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+            };
+            assert!(stale_scope
+                .candidate_projection(replacement_publication.clone())
+                .is_err());
+            let replacement_projection = replacement_request.candidate_projection(replacement_publication).expect("replacement publication must bind its current authority and exact prior generation");
             std::fs::remove_dir_all(&home).unwrap();
-            let selected = projection
-                .provider_launch_context
-                .prepared_inputs
-                .as_ref()
-                .unwrap()
-                .resource_mounts
-                .iter()
-                .find(|mount| mount.logical_destination == "/home/freshell/provider/.claude/skills")
-                .expect("selected skills must retain their provider destination");
-            let output = std::process::Command::new("node")
-                .arg(
-                    stage
-                        .join(&selected.stage_relative_path)
-                        .join("probe/consumer.cjs"),
-                )
-                .env_clear()
-                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-                .current_dir(&workspace)
-                .output()
-                .unwrap();
-            assert!(output.status.success());
-            assert_eq!(output.stdout, b"issued-frozen-dependency");
+            for (stage, projection) in [
+                (&stage, &projection),
+                (&replacement_stage, &replacement_projection),
+            ] {
+                let selected = projection
+                    .provider_launch_context
+                    .prepared_inputs
+                    .as_ref()
+                    .unwrap()
+                    .resource_mounts
+                    .iter()
+                    .find(|mount| {
+                        mount.logical_destination == "/home/freshell/provider/.claude/skills"
+                    })
+                    .expect("selected skills must retain their provider destination");
+                let output = std::process::Command::new("node")
+                    .arg(
+                        stage
+                            .join(&selected.stage_relative_path)
+                            .join("probe/consumer.cjs"),
+                    )
+                    .env_clear()
+                    .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                    .current_dir(&workspace)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"issued-frozen-dependency");
+            }
             assert!(!home.exists());
         }
     }

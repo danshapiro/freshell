@@ -120,7 +120,7 @@ impl DockerEngineBackend {
                         None,
                     )
                 }
-                ClaudeSourceOwner::Retained { handle } => {
+                ClaudeSourceOwner::Retained { handle, .. } => {
                     let provider = handle
                         .terminal()
                         .map(|spec| spec.mode.as_str())
