@@ -27,6 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const CAPABILITY_PATH: &str = ".freshell/mcp-capability.json";
 const GRANT_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 const RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+const MAX_CAPABILITY_METADATA_BYTES: usize = 128 * 1024;
 mod amplifier_resources;
 mod amplifier_stage;
 mod claude_memory;
@@ -1342,7 +1343,6 @@ fn cleanup_unrecoverable_inputs(
 }
 
 fn protected_preparation_ids(directory: &Path) -> Result<HashSet<String>, String> {
-    use std::io::Read;
     let mut protected = HashSet::new();
     for entry in
         std::fs::read_dir(directory).map_err(|_| "provider preparation inventory unavailable")?
@@ -1358,19 +1358,7 @@ fn protected_preparation_ids(directory: &Path) -> Result<HashSet<String>, String
         {
             continue;
         }
-        let mut bytes = Vec::new();
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        file.take(128 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "provider preparation metadata read failed")?;
-        if bytes.len() > 128 * 1024 {
-            return Err("provider preparation metadata profile limit exceeded".into());
-        }
-        let Ok(stored) = serde_json::from_slice::<StoredCapabilityFile>(&bytes) else {
-            continue;
-        };
+        let stored = read_stored_capability(directory, id)?;
         if let Some(preparation) = stored.preparation {
             if preparation.phase != InputPreparationPhase::Committed
                 || !preparation.prior_grant_ids.is_empty()
@@ -1962,6 +1950,28 @@ struct StoredCapabilityFile {
     preparation: Option<InputPreparation>,
 }
 
+fn read_stored_capability(directory: &Path, id: &str) -> Result<StoredCapabilityFile, String> {
+    grant_path(directory, id)?;
+    let bytes = read_prepared_metadata(directory, &format!("{id}.json"), MAX_CAPABILITY_METADATA_BYTES)
+        .map_err(|_| {
+            tracing::warn!(event="provider.inputs.preparation.journal_blocked",stage="controller",
+                operation="read",grant_id=id,permitted_bytes=MAX_CAPABILITY_METADATA_BYTES,
+                "Provider preparation ownership journal unavailable; retain inputs and reconcile");
+            "provider preparation ownership journal unavailable or exceeds 128 KiB; retain inputs and reconcile"
+        })?;
+    serde_json::from_slice(&bytes).map_err(|_| {
+        tracing::warn!(
+            event = "provider.inputs.preparation.journal_blocked",
+            stage = "controller",
+            operation = "decode",
+            grant_id = id,
+            "Provider preparation ownership journal incomplete; retain inputs and reconcile"
+        );
+        "provider preparation ownership journal invalid or incomplete; retain inputs and reconcile"
+            .into()
+    })
+}
+
 fn restored_grant_at(
     stored: StoredCapabilityFile,
     incarnation_id: IncarnationId,
@@ -1997,26 +2007,48 @@ fn restored_grant(
 }
 
 fn write_capability(path: &Path, grant: &Grant) -> Result<(), String> {
-    let bytes = serde_json::to_vec(&CapabilityFile {
-        endpoint: &grant.endpoint,
-        scope: &grant.token,
-        soul_id: &grant.soul_id,
-        incarnation_id: grant.incarnation_id.as_ref(),
-        expires_at: grant.expires_at,
-        preparation: grant.preparation.as_ref(),
+    let result: Result<(), String> = (|| {
+        let bytes = freshell_runtime_protocol::bounded_json_bytes(
+            &CapabilityFile {
+                endpoint: &grant.endpoint,
+                scope: &grant.token,
+                soul_id: &grant.soul_id,
+                incarnation_id: grant.incarnation_id.as_ref(),
+                expires_at: grant.expires_at,
+                preparation: grant.preparation.as_ref(),
+            },
+            MAX_CAPABILITY_METADATA_BYTES,
+        )
+        .map_err(|_| {
+            "provider preparation ownership journal exceeds 128 KiB; retain inputs and reconcile"
+        })?;
+        let parent = path
+            .parent()
+            .ok_or("provider preparation journal parent unavailable")?;
+        // A partial write must never erase the prior generation's ownership. The
+        // temporary file is private and drops itself on every pre-publication error.
+        let mut file = tempfile::Builder::new()
+            .prefix(".freshell-grant-")
+            .tempfile_in(parent)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.as_file()
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        file.persist(path)
+            .map_err(|error| error.error.to_string())?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    result.map_err(|reason| {
+        tracing::warn!(event="provider.inputs.preparation.journal_blocked",stage="controller",
+            operation="publish",soul_id=%grant.soul_id,cause=%reason,
+            "Provider preparation journal publication failed; retain inputs and reconcile");
+        format!("provider preparation journal publication failed: {reason}; retain inputs and reconcile")
     })
-    .map_err(|error| error.to_string())?;
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path).map_err(|error| error.to_string())?;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
-    Ok(())
 }
 
 fn publish_prepared_context_metadata(
@@ -2569,7 +2601,8 @@ impl CapabilityStore {
                     "provider input preparation commit has no matching accepted incarnation".into(),
                 );
             }
-            let Some(preparation) = grant.preparation.as_mut() else {
+            let mut updated = grant.clone();
+            let Some(preparation) = updated.preparation.as_mut() else {
                 return Ok(());
             };
             if preparation.phase == InputPreparationPhase::Pending {
@@ -2578,7 +2611,8 @@ impl CapabilityStore {
             let changed = preparation.phase != InputPreparationPhase::Committed;
             preparation.phase = InputPreparationPhase::Committed;
             let prior = preparation.prior_grant_ids.clone();
-            write_capability(&grant.path, grant)?;
+            write_capability(&updated.path, &updated)?;
+            *grant = updated;
             (prior, changed)
         };
         for prior_id in prior {
@@ -2588,10 +2622,12 @@ impl CapabilityStore {
         let grant = grants
             .get_mut(grant_id)
             .ok_or("committed provider preparation disappeared")?;
-        if let Some(preparation) = grant.preparation.as_mut() {
+        let mut updated = grant.clone();
+        if let Some(preparation) = updated.preparation.as_mut() {
             preparation.prior_grant_ids.clear();
         }
-        write_capability(&grant.path, grant)?;
+        write_capability(&updated.path, &updated)?;
+        *grant = updated;
         if changed {
             tracing::info!(event="provider.inputs.preparation.committed",grant_id,
             soul_id=%soul_id,incarnation_id=%incarnation_id);
@@ -3021,12 +3057,7 @@ pub(crate) async fn rehydrate_running_capabilities(
                 continue;
             }
         }
-        let Ok(file) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(stored) = serde_json::from_slice::<StoredCapabilityFile>(&file) else {
-            continue;
-        };
+        let stored = read_stored_capability(&directory, &grant_id)?;
         if protected.contains(&grant_id) {
             let current = stored.endpoint == endpoint()? && !stored.scope.is_empty();
             store().grants.lock().unwrap().insert(
@@ -3128,6 +3159,327 @@ pub(crate) async fn scoped_auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_mcp_preparation_journal_partial_write_preserves_prior_and_startup_ownership() {
+        const CHILD: &str = "FRESHELL_TEST_PREPARATION_PARTIAL_WRITE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "managed_mcp_capability::tests::managed_mcp_preparation_journal_partial_write_preserves_prior_and_startup_ownership", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("preparation_partial_write_fixture_ready"),
+                "the isolated partial-write fixture must execute"
+            );
+            eprintln!(
+                "preparation_partial_write_child status={} prior_ownership_erased={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("failed journal publication erased prior accepted ownership")
+            );
+            assert!(
+                output.status.success(),
+                "partial journal write did not preserve prior ownership: {}",
+                output.status
+            );
+            return;
+        }
+        let owned = tempfile::tempdir().unwrap();
+        let directory = owned.path().join("mcp-capabilities");
+        std::fs::create_dir(&directory).unwrap();
+        let path = grant_path(&directory, "grant-pending").unwrap();
+        let prior = staged_provider_root_path(&directory, "grant-prior").unwrap();
+        let pending = staged_provider_root_path(&directory, "grant-pending").unwrap();
+        let orphan = staged_provider_root_path(&directory, "grant-orphan").unwrap();
+        for root in [&prior, &pending, &orphan] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        std::fs::write(prior.join("usable-resource"), b"prior-resource-nonce").unwrap();
+        let mut grant = Grant {
+            soul_id: SoulId::new(),
+            incarnation_id: None,
+            token: "synthetic-prior-scope".into(),
+            expires_at: 1,
+            endpoint: "http://host.docker.internal:4000".into(),
+            path: path.clone(),
+            preparation: Some(InputPreparation {
+                phase: InputPreparationPhase::Pending,
+                prior_grant_ids: vec!["grant-prior".into()],
+            }),
+        };
+        write_capability(&path, &grant).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        grant.token = "synthetic-replacement-scope".into();
+        grant.incarnation_id = Some(IncarnationId::new());
+        grant.preparation.as_mut().unwrap().phase = InputPreparationPhase::Bound;
+        let mut previous = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut previous) },
+            0
+        );
+        let restricted = libc::rlimit {
+            rlim_cur: 16,
+            rlim_max: previous.rlim_max,
+        };
+        println!("preparation_partial_write_fixture_ready");
+        let old_signal = unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &restricted) },
+            0
+        );
+        let result = write_capability(&path, &grant);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &previous) }, 0);
+        unsafe {
+            libc::signal(libc::SIGXFSZ, old_signal);
+        }
+        assert!(
+            result.is_err(),
+            "fixture must force a real partial write failure"
+        );
+        assert!(
+            std::fs::read(&path).unwrap() == before,
+            "failed journal publication erased prior accepted ownership"
+        );
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            1,
+            "failed journal publication left a temporary generation"
+        );
+        cleanup_orphaned_provider_roots(&directory).unwrap();
+        assert!(prior.join("usable-resource").is_file());
+        assert!(pending.is_dir());
+        assert!(!orphan.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_mcp_preparation_inventory_rejects_oversize_before_payload_read() {
+        use std::io::Read;
+        let owned = tempfile::tempdir().unwrap();
+        let path = grant_path(owned.path(), "grant-pending").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(128 * 1024 + 1).unwrap();
+        let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
+            .unwrap();
+        file.read_exact(&mut [0]).unwrap();
+        assert_ne!(
+            file.metadata().unwrap().accessed().unwrap(),
+            old_access,
+            "fixture filesystem must observe payload reads"
+        );
+        file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
+            .unwrap();
+        drop(file);
+        assert!(protected_preparation_ids(owned.path()).is_err());
+        assert_eq!(
+            std::fs::metadata(path).unwrap().accessed().unwrap(),
+            old_access,
+            "oversized preparation inventory payload was read"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_mcp_preparation_failed_commit_replays_bound_generation_until_durable_commit() {
+        const CHILD: &str = "FRESHELL_TEST_PREPARATION_COMMIT_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "managed_mcp_capability::tests::managed_mcp_preparation_failed_commit_replays_bound_generation_until_durable_commit", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(String::from_utf8_lossy(&output.stdout)
+                .contains("preparation_commit_failure_fixture_ready"));
+            eprintln!(
+                "preparation_commit_failure_child status={} third_preparation_authorized={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("failed commit authorized a third preparation")
+            );
+            assert!(
+                output.status.success(),
+                "failed commit lost its bound generation: {}",
+                output.status
+            );
+            return;
+        }
+        let owned = tempfile::tempdir().unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let endpoint = "http://host.docker.internal:4000";
+        let first = store
+            .issue(
+                soul.clone(),
+                owned.path(),
+                endpoint.into(),
+                None,
+                Default::default(),
+                None,
+            )
+            .unwrap();
+        let first_incarnation = IncarnationId::new();
+        store
+            .activate(
+                &first.grant_id,
+                soul.clone(),
+                first_incarnation.clone(),
+                owned.path(),
+                endpoint,
+            )
+            .unwrap();
+        store
+            .commit_preparation(&first.grant_id, &soul, &first_incarnation, owned.path())
+            .unwrap();
+        let second = store
+            .issue_replacement(
+                soul.clone(),
+                owned.path(),
+                endpoint.into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let incarnation = IncarnationId::new();
+        store
+            .activate(
+                &second.grant_id,
+                soul.clone(),
+                incarnation.clone(),
+                owned.path(),
+                endpoint,
+            )
+            .unwrap();
+        let second_path = grant_path(owned.path(), &second.grant_id).unwrap();
+        let accepted = std::fs::read(&second_path).unwrap();
+        let prior_scope = store
+            .grants
+            .lock()
+            .unwrap()
+            .get(&first.grant_id)
+            .unwrap()
+            .token
+            .clone();
+        let mut previous = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut previous) },
+            0
+        );
+        let restricted = libc::rlimit {
+            rlim_cur: 16,
+            rlim_max: previous.rlim_max,
+        };
+        println!("preparation_commit_failure_fixture_ready");
+        let old_signal = unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &restricted) },
+            0
+        );
+        let result = store.commit_preparation(&second.grant_id, &soul, &incarnation, owned.path());
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &previous) }, 0);
+        unsafe {
+            libc::signal(libc::SIGXFSZ, old_signal);
+        }
+        assert!(result.is_err());
+        assert!(std::fs::read(&second_path).unwrap() == accepted);
+        assert!(
+            store.authenticates(&prior_scope),
+            "failed commit retired the prior lease"
+        );
+        let repeated = store
+            .issue_replacement(
+                soul.clone(),
+                owned.path(),
+                endpoint.into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            repeated.grant_id == second.grant_id,
+            "failed commit authorized a third preparation"
+        );
+        assert_eq!(std::fs::read_dir(owned.path()).unwrap().count(), 2);
+        store
+            .commit_preparation(&second.grant_id, &soul, &incarnation, owned.path())
+            .unwrap();
+        assert!(!store.authenticates(&prior_scope));
+        assert!(!grant_path(owned.path(), &first.grant_id).unwrap().exists());
+        assert_eq!(std::fs::read_dir(owned.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn managed_mcp_preparation_inventory_accepts_exact_profile_and_tracks_pending_prior() {
+        let owned = tempfile::tempdir().unwrap();
+        let path = grant_path(owned.path(), "grant-pending").unwrap();
+        let grant = Grant {
+            soul_id: SoulId::new(),
+            incarnation_id: None,
+            token: "synthetic-scope".into(),
+            expires_at: 1,
+            endpoint: "http://host.docker.internal:4000".into(),
+            path: path.clone(),
+            preparation: Some(InputPreparation {
+                phase: InputPreparationPhase::Pending,
+                prior_grant_ids: vec!["grant-prior".into()],
+            }),
+        };
+        write_capability(&path, &grant).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.resize(128 * 1024, b' ');
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            protected_preparation_ids(owned.path()).unwrap(),
+            ["grant-pending".to_owned(), "grant-prior".to_owned()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn managed_mcp_preparation_incomplete_journal_blocks_startup_cleanup() {
+        let owned = tempfile::tempdir().unwrap();
+        let directory = owned.path().join("mcp-capabilities");
+        std::fs::create_dir(&directory).unwrap();
+        let prior = staged_provider_root_path(&directory, "grant-prior-unrecorded").unwrap();
+        let pending = staged_provider_root_path(&directory, "grant-pending").unwrap();
+        for root in [&prior, &pending] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        std::fs::write(prior.join("usable-resource"), b"retained-resource").unwrap();
+        std::fs::write(
+            grant_path(&directory, "grant-pending").unwrap(),
+            b"{\"preparation\":",
+        )
+        .unwrap();
+        assert!(
+            cleanup_orphaned_provider_roots(&directory).is_err(),
+            "incomplete ownership cannot authorize orphan cleanup"
+        );
+        assert!(prior.join("usable-resource").is_file());
+        assert!(pending.is_dir());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -4994,9 +5346,21 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         let orphan = staged_provider_root_path(&capabilities, "grant-orphan").unwrap();
         std::fs::create_dir_all(&active).unwrap();
         std::fs::create_dir_all(&orphan).unwrap();
-        std::fs::write(
-            grant_path(&capabilities, "grant-active").unwrap(),
-            "running grant",
+        let path = grant_path(&capabilities, "grant-active").unwrap();
+        write_capability(
+            &path,
+            &Grant {
+                soul_id: SoulId::new(),
+                incarnation_id: Some(IncarnationId::new()),
+                token: "synthetic-scope".into(),
+                expires_at: 1,
+                endpoint: "http://host.docker.internal:4000".into(),
+                path: path.clone(),
+                preparation: Some(InputPreparation {
+                    phase: InputPreparationPhase::Committed,
+                    prior_grant_ids: vec![],
+                }),
+            },
         )
         .unwrap();
         cleanup_orphaned_provider_roots(&capabilities).unwrap();
