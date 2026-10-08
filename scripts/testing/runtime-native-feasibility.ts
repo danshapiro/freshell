@@ -1342,7 +1342,7 @@ if not native.is_file() or native.is_symlink() or hashlib.sha256(native.read_byt
 if not producer.is_file() or hashlib.sha256(producer.read_bytes()).hexdigest()!=producer_pin:
  raise RuntimeError('pinned native Amplifier producer differs')
 workspace=pathlib.Path.cwd().resolve()
-owned=re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/amplifier-(missing-history|load-failure|missing-context-restore)-workspace',str(workspace))
+owned=re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/amplifier-(missing-history|load-failure|missing-context-restore|timeout|provider-exit|stop-cancellation)-workspace',str(workspace))
 if owned:
  fault=owned[1]
  from amplifier_app_cli.freshell_native_resume import managed_launch,load_native
@@ -1363,6 +1363,11 @@ if owned:
   file=workspace/'native-startup-fault.json'
   with file.open('x',encoding='utf8') as out:json.dump(value,out);out.write('\n')
   file.chmod(0o660)
+ def native_context(session):
+  context=session.coordinator.get('context')
+  if context is None or not callable(getattr(context,'set_messages',None)):
+   raise RuntimeError('native original context restore method missing before fault')
+  return context
  if fault in ['missing-history','load-failure']:
   from amplifier_app_cli.session_store import SessionStore
   original_load=SessionStore.load
@@ -1384,14 +1389,12 @@ if owned:
     malformedSha256=hashlib.sha256((directory/'transcript.jsonl').read_bytes()).hexdigest() if (directory/'transcript.jsonl').exists() else None)
    return original_load(store,session_id)
   SessionStore.load=fault_load
- else:
+ elif fault=='missing-context-restore':
   from amplifier_app_cli import session_runner
   original_create=session_runner._create_bundle_session
   async def fault_create(*args,**kwargs):
    session=await original_create(*args,**kwargs)
-   original_get=session.coordinator.get;context=original_get('context')
-   if context is None or not callable(getattr(context,'set_messages',None)):
-    raise RuntimeError('native original context restore method missing before fault')
+   original_get=session.coordinator.get;context=native_context(session)
    class ContextWithoutRestore:
     def __getattr__(self,name):
      if name=='set_messages':raise AttributeError(name)
@@ -1404,6 +1407,28 @@ if owned:
     hasRestoreBefore=True,hasRestoreAfter=hasattr(session.coordinator.get('context'),'set_messages'))
    return session
   session_runner._create_bundle_session=fault_create
+ else:
+  import time
+  from amplifier_app_cli import freshell_native_resume
+  async def fault_publish(session,config):
+   if session.session_id!=root or session.parent_id is not None or not config.is_resume:
+    raise RuntimeError('native paused selected root differs')
+   witness=getattr(config.initial_transcript,'native_load_witness',None)
+   if witness is None or witness['sessionId']!=root or witness['parentId'] is not None:
+    raise RuntimeError('native paused load witness missing')
+   context=native_context(session)
+   accepted=await context.get_messages();original=list(config.initial_transcript)
+   if accepted!=original and not (accepted and accepted[0].get('role')=='system' and accepted[1:]==original):
+    raise RuntimeError('native paused context restore differs')
+   freshell_native_resume._revalidate(witness)
+   record('before-native-publication',nativeRoot=session.session_id,nativeParent=session.parent_id,
+    originalLoad=witness,acceptedMessageCount=len(accepted))
+   # A finite observation fault. No input or fabricated loader event is used,
+   # and expiration cannot later publish an acknowledgement.
+   time.sleep(12)
+   await session.cleanup()
+   raise RuntimeError('owned native startup publication withheld')
+  freshell_native_resume.publish_initialized=fault_publish
 runpy.run_path(str(native),run_name='__main__')
 `
 
