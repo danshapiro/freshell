@@ -73,6 +73,58 @@ fn selections(mounts: &docker::TerminalMounts) -> Result<Vec<Mountpoint>, Backen
 }
 
 impl DockerEngineBackend {
+    async fn cleanup_provider_mountpoint_helper(
+        &self,
+        name: &str,
+        body: &Value,
+    ) -> Result<(), BackendError> {
+        let inspected = self
+            .request_bounded(
+                "GET",
+                &format!("{DOCKER_API}/containers/{name}/json"),
+                None,
+                1024 * 1024,
+            )
+            .await?;
+        if inspected.status == 404 {
+            return Ok(());
+        }
+        let actual: Value = serde_json::from_slice(&inspected.body)
+            .map_err(|_| fail("provider mountpoint cleanup metadata invalid"))?;
+        let id = actual["Id"]
+            .as_str()
+            .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| fail("provider mountpoint cleanup identity invalid"))?;
+        if inspected.status != 200 || !input_publisher::owned_helper(&actual, body) {
+            return Err(fail("provider mountpoint cleanup ownership changed"));
+        }
+        let removed = self
+            .request_bounded(
+                "DELETE",
+                &format!("{DOCKER_API}/containers/{id}?force=1"),
+                None,
+                64 * 1024,
+            )
+            .await?;
+        if !matches!(removed.status, 204 | 404) {
+            return Err(fail("provider mountpoint helper cleanup failed"));
+        }
+        // An acknowledged delete does not release a candidate's mounts until
+        // the exact inspected helper is confirmed absent.
+        let absent = self
+            .request_bounded(
+                "GET",
+                &format!("{DOCKER_API}/containers/{id}/json"),
+                None,
+                64 * 1024,
+            )
+            .await?;
+        if absent.status != 404 {
+            return Err(fail("provider mountpoint helper cleanup not confirmed"));
+        }
+        Ok(())
+    }
+
     pub(super) async fn prepare_provider_mountpoints(
         &self,
         spec: &CreateRuntimeSpec,
@@ -226,42 +278,12 @@ impl DockerEngineBackend {
             .await
             .unwrap_or_else(|_| Err(fail("provider mountpoint preparation timed out")));
         if attempted {
-            let cleanup = async {
-                let inspected = self
-                    .request_bounded(
-                        "GET",
-                        &format!("{DOCKER_API}/containers/{name}/json"),
-                        None,
-                        1024 * 1024,
-                    )
-                    .await?;
-                if inspected.status == 404 {
-                    return Ok(());
-                }
-                let actual: Value = serde_json::from_slice(&inspected.body)
-                    .map_err(|_| fail("provider mountpoint cleanup metadata invalid"))?;
-                let id = actual["Id"]
-                    .as_str()
-                    .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-                    .ok_or_else(|| fail("provider mountpoint cleanup identity invalid"))?;
-                if inspected.status != 200 || !input_publisher::owned_helper(&actual, &body) {
-                    return Err(fail("provider mountpoint cleanup ownership changed"));
-                }
-                let removed = self
-                    .request(
-                        "DELETE",
-                        &format!("{DOCKER_API}/containers/{id}?force=1"),
-                        None,
-                    )
-                    .await?;
-                if !matches!(removed.status, 204 | 404) {
-                    return Err(fail("provider mountpoint helper cleanup failed"));
-                }
-                Ok(())
-            };
-            tokio::time::timeout(Duration::from_secs(5), cleanup)
-                .await
-                .map_err(|_| fail("provider mountpoint cleanup timed out"))??;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                self.cleanup_provider_mountpoint_helper(&name, &body),
+            )
+            .await
+            .map_err(|_| fail("provider mountpoint cleanup timed out"))??;
         }
         tracing::debug!(soul_id=%spec.soul_id,entries=selected.len(),succeeded=result.is_ok(),"runtime.provider_mountpoints_settled");
         result
@@ -274,6 +296,96 @@ mod tests {
     use freshell_runtime_protocol::{
         ProviderConfigBind, ProviderResourceKind, ProviderResourceMount,
     };
+
+    #[tokio::test]
+    async fn provider_mountpoint_cleanup_requires_confirmed_absence_after_delete() {
+        for mode in [
+            "present-after-delete",
+            "removed",
+            "already-absent",
+            "foreign",
+            "lost-delete-ack",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let body = json!({"Image":"synthetic-image","User":"0:0","Tty":false,
+                "Entrypoint":["/runtime/freshell-session-host"],"Cmd":["prepare-provider-mountpoints"],
+                "Labels":{"com.freshell.soul-id":"synthetic-owner"},"Env":[],
+                "HostConfig":{"Mounts":[],"LogConfig":{"Type":"none"}}});
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let requests = seen.clone();
+            let expected = body.clone();
+            let listener = tokio::net::UnixListener::bind(temp.path().join("docker.sock")).unwrap();
+            let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let mut deleted = false;
+                loop {
+                    let accepted = tokio::select! {
+                        _ = &mut stopped => break,
+                        accepted = listener.accept() => accepted,
+                    };
+                    let (mut stream, _) = accepted.unwrap();
+                    let mut header = Vec::new();
+                    let mut byte = [0];
+                    while !header.ends_with(b"\r\n\r\n") {
+                        stream.read_exact(&mut byte).await.unwrap();
+                        header.push(byte[0]);
+                        assert!(header.len() <= 32 * 1024);
+                    }
+                    let header = String::from_utf8(header).unwrap();
+                    let line = header.lines().next().unwrap().to_owned();
+                    requests.lock().unwrap().push(line.clone());
+                    let (status, value) = if line.starts_with("DELETE") {
+                        deleted = true;
+                        (if mode == "lost-delete-ack" { 503 } else { 204 }, json!({}))
+                    } else if mode == "already-absent" || (deleted && mode == "removed") {
+                        (404, json!({}))
+                    } else {
+                        let mut actual = expected.clone();
+                        if mode == "foreign" {
+                            actual["User"] = json!("foreign");
+                        }
+                        (
+                            200,
+                            json!({"Id":"a".repeat(64),"Config":actual,"HostConfig":actual["HostConfig"]}),
+                        )
+                    };
+                    let raw = value.to_string();
+                    stream.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}", raw.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let backend = DockerEngineBackend::new(temp.path().join("docker.sock"));
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                backend.cleanup_provider_mountpoint_helper("freshell-mountpoints-synthetic", &body),
+            )
+            .await
+            .unwrap();
+            let _ = stop.send(());
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let requests = seen.lock().unwrap();
+            assert_eq!(
+                result.is_ok(),
+                matches!(mode, "removed" | "already-absent"),
+                "delete acknowledgement cannot prove cleanup for {mode}"
+            );
+            if mode == "removed" {
+                assert_eq!(
+                    requests.len(),
+                    3,
+                    "owned deletion must be followed by exact absence inspection"
+                );
+            }
+            if matches!(mode, "foreign" | "already-absent") {
+                assert!(
+                    !requests.iter().any(|line| line.starts_with("DELETE")),
+                    "cleanup must not delete foreign or already absent objects"
+                );
+            }
+        }
+    }
 
     #[test]
     fn provider_mountpoints_precreate_private_leaf_inside_external_selected_root() {
