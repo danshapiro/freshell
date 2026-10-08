@@ -399,12 +399,14 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       } else expect(() => execFileSync('python3', ['-c', script], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' })).toThrow()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['freshcodex', 'freshopencode'].flatMap(mode => ['valid', 'published', 'admitted-input', 'requested-echo', 'missing-native-receipt', 'commands-present', 'wrong-uid'].map(fault => [mode, fault])))
+  it.each(['freshcodex', 'freshopencode'].flatMap(mode => ['valid', 'delayed-current-start', 'published', 'admitted-input', 'requested-echo', 'missing-native-receipt', 'commands-present', 'wrong-uid'].map(fault => [mode, fault])))
     ('requires actual fresh native wrong-root receiver and refuses initial input (%s, %s; orchestration only)', async (mode, fault) => {
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-native-wrong-')), root = mode === 'freshopencode' ? 'ses_actual' : randomUUID()
       const provider = mode === 'freshcodex' ? 'codex' : 'opencode'
       let expected = '', soul = '', cwd = '', settle: (value: any) => void = () => {}
       const requests: any[] = [], nonce = 'actual-current-nonce', incarnation = 'current-inc'
+      const clockStart=Date.now();let elapsed=0,allocated=false,firstCapture=true
+      const clock=fault==='delayed-current-start'?vi.spyOn(Date,'now').mockImplementation(()=>clockStart+elapsed):undefined
       const faultSource = path.join(directory, 'fault-image.json')
       fs.writeFileSync(faultSource, JSON.stringify({ kind: 'owned-native-receiver-load-fault-image', imageDigest,
         wrapperSha256: createHash('sha256').update(nativeReceiverLoadFaultWrapper).digest('hex'),
@@ -417,19 +419,26 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
           if (request.method === 'launch') {
             expected = request.params.nativeSessionId; soul = request.params.soulId; cwd = request.params.freshAgent.cwd
             expect(request.params.freshAgent.nativeSessionId).toBe(expected)
-            return new Promise(resolve => { settle = resolve })
+            return new Promise(resolve => {
+              settle = resolve
+              if(fault==='published')setTimeout(()=>settle({result:{Err:{code:'HOST_UNREACHABLE'}}}),10)
+            })
           }
           if (request.method === 'fresh_agent_send') return { result: { Err: { code: fault === 'admitted-input' ? 'OTHER_ERROR' : 'UNKNOWN_SOUL' } } }
           throw new Error('unexpected command')
         },
-        adminOk: async () => ({ data: [{ soulId: soul, launchState: fault === 'published' ? 'running' : 'starting',
-          incarnationId: incarnation, containerId: 'owned-current', nativeSessionId: expected, nativeIdentityObservation: null }] }),
+        adminOk: async () => {
+          if(fault==='delayed-current-start'&&!allocated){elapsed=5000;allocated=true}
+          return { data: [{ soulId: soul, launchState: fault === 'published' ? 'running' : 'starting',
+            incarnationId: incarnation, containerId: 'owned-current', nativeSessionId: expected, nativeIdentityObservation: null }] }
+        },
         execOwnedContainerAsExact: async (_: string, uid: string, command: string[]) => {
           expect(uid).toBe('65534:0')
           const refusal = { result: { Err: { code: 'HOST_UNREACHABLE', message: provider === 'codex'
             ? `codex thread/resume returned wrong thread id ${root} (requested ${expected}); refusing to adopt the wrong thread`
             : 'native OpenCode loaded a different or parent-bearing root' } } }
           if (command[2].includes('native-receiver-load-fault-observation.json')) {
+            if(fault==='delayed-current-start'&&firstCapture){firstCapture=false;elapsed=6200;setTimeout(()=>settle(refusal),100);throw new Error('current native response not yet published')}
             if (fault === 'published') setTimeout(() => settle(refusal), 10)
             return JSON.stringify({ schemaVersion: 1, provider, mode, caseId: 'wrong-root', expectedRoot: expected,
               nativeSessionId: fault === 'requested-echo' ? expected : root, incarnationId: incarnation, launchNonce: nonce,
@@ -447,14 +456,14 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       sources.push({ name: provider + '/native-fault/receiver-load.json', path: faultSource, sha256: createHash('sha256').update(fs.readFileSync(faultSource)).digest('hex') })
       try {
         const run = executeManagedNativeCase(harness, sources, { mode: mode as 'freshcodex' | 'freshopencode', case: 'startup' }, 'wrong-root')
-        if (fault === 'valid') {
+        if (fault === 'valid'||fault==='delayed-current-start') {
           expect((await run).assertions.every(row => row.pass)).toBe(true)
           expect(expected).not.toBe(root); expect(requests.map(row => row.method)).toEqual(['launch', 'fresh_agent_send'])
         } else await expect(run).rejects.toThrow(fault === 'published' ? 'actual initial fresh wrong-root publication was not contained'
           : fault === 'admitted-input' ? 'actual fresh wrong-root admitted input'
           : fault === 'wrong-uid' ? 'actual native receiver namespace/profile/pin/TLS differs'
           : 'actual current fresh receiver does not prove a different native root')
-      } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+      } finally { clock?.mockRestore();fs.rmSync(directory, { recursive: true, force: true }) }
     })
   it.each(['freshcodex','freshopencode','codex'].flatMap(mode => ['valid','copied-volume','wrong-incarnation','wrong-root','store-changed','profile-changed','wrong-outcome'].map(fault => [mode,fault])))('executes exact receiver recovery only after completed native history and preserves its original volume (%s, %s; controlled orchestration)', async (mode,fault) => {
     const directory=fs.mkdtempSync(path.join(os.tmpdir(),'receiver-exact-recovery-')), provider=mode==='freshcodex'||mode==='codex'?'codex':'opencode'

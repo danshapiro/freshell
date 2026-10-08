@@ -1168,17 +1168,20 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       error => { failure = error; finished = true })
     try {
       let receipt: any, namespace: any, view: any
-      const diagnostics: string[] = [], deadline = Date.now() + 6_000
-      while (!finished && Date.now() < deadline) {
+      const diagnostics: string[] = [], allocationStartedAt = Date.now(), allocationDeadline = allocationStartedAt + 6_000
+      let nativeCaptureStartedAt: number | undefined
+      while (!finished && Date.now() < (nativeCaptureStartedAt === undefined ? allocationDeadline : nativeCaptureStartedAt + 6_000)) {
         const owned = harness.broker.receipts().find(row => row.soulId === soulId)
         if (owned) {
           try {
-            receipt = JSON.parse(await harness.execOwnedContainerAsExact(owned.containerId, '65534:0',
-              ['python3', '-c', receiverLoadFaultReceipt, workspace]))
             const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
             view = inventory.data.find((row: any) => row.soulId === soulId)
-            if (!view || view.containerId !== owned.containerId || view.incarnationId !== receipt.incarnationId
+            if (!view || view.containerId !== owned.containerId || !view.incarnationId
               || view.launchState !== 'starting' || view.nativeIdentityObservation) throw new Error('actual initial fresh wrong-root publication was not contained')
+            nativeCaptureStartedAt ??= Date.now()
+            receipt = JSON.parse(await harness.execOwnedContainerAsExact(owned.containerId, '65534:0',
+              ['python3', '-c', receiverLoadFaultReceipt, workspace]))
+            if (view.incarnationId !== receipt.incarnationId) throw new Error('actual initial fresh wrong-root publication was not contained')
             namespace = JSON.parse(await harness.execOwnedContainerAsExact(owned.containerId, '65534:0',
               ['python3', '-c', receiverNativeNamespace, provider, receipt.nativeSessionId, workspace]))
             break
@@ -1187,6 +1190,8 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
         await new Promise(resolve => setTimeout(resolve, 25))
       }
       harness.writeArtifact(`${scenario}-capture-diagnostics.json`, diagnostics)
+      harness.writeArtifact(`${scenario}-capture-phase.json`, { allocationStartedAt, nativeCaptureStartedAt: nativeCaptureStartedAt ?? null,
+        captureFinishedAt: Date.now(), phaseBudgetMs: 6_000 })
       harness.writeArtifact(`${scenario}-current-native-receiver.json`, receipt ?? null)
       harness.writeArtifact(`${scenario}-namespace-private.json`, namespace ?? null)
       if (!view || view.launchState !== 'starting' || view.nativeIdentityObservation) {
