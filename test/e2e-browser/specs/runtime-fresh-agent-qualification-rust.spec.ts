@@ -36,8 +36,8 @@ type Definition = {
 }
 
 const DEFINITIONS: Record<QualifiableFreshAgentMode, Definition> = {
-  freshclaude: { mode: 'freshclaude', agent: 'claude', provider: 'claude', version: '2.1.263', model: 'haiku', effort: 'low', versionCommand: ['claude', '--version'], processPattern: /(?:^|\s)claude(?:$|\s)/m, pendingApproval: true },
-  kilroy: { mode: 'kilroy', agent: 'kilroy', provider: 'claude', version: '2.1.263', model: 'haiku', effort: 'low', versionCommand: ['claude', '--version'], processPattern: /(?:^|\s)claude(?:$|\s)/m, pendingApproval: true },
+  freshclaude: { mode: 'freshclaude', agent: 'claude', provider: 'claude', version: '2.1.237', model: 'haiku', effort: 'low', versionCommand: ['/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude', '--version'], processPattern: /(?:^|\s)\/opt\/freshell-claude-sidecar\/node_modules\/@anthropic-ai\/claude-agent-sdk-linux-x64\/claude(?:$|\s)/m, pendingApproval: true },
+  kilroy: { mode: 'kilroy', agent: 'kilroy', provider: 'claude', version: '2.1.237', model: 'haiku', effort: 'low', versionCommand: ['/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude', '--version'], processPattern: /(?:^|\s)\/opt\/freshell-claude-sidecar\/node_modules\/@anthropic-ai\/claude-agent-sdk-linux-x64\/claude(?:$|\s)/m, pendingApproval: true },
   freshcodex: { mode: 'freshcodex', agent: 'codex', provider: 'codex', version: '0.147.0', model: 'gpt-5.6-luna', effort: 'low', versionCommand: ['codex', '--version'], processPattern: /codex.*app-server|app-server.*codex/m, pendingApproval: false },
   freshopencode: { mode: 'freshopencode', agent: 'opencode', provider: 'opencode', version: '1.18.21', model: 'opencode/big-pickle', effort: 'provider-default', versionCommand: ['opencode', '--version'], processPattern: /opencode.*serve/m, pendingApproval: false },
 }
