@@ -301,6 +301,53 @@ describe('fixed owned session-host process state', () => {
   })
 })
 
+describe('fixed fresh Codex saved-history ownership facts', () => {
+  it('counts actual matching receipts, starts, launches and scheduled recoveries', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-history-ownership-'))
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused ownership web') }, process.cwd(), 3,
+      {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...current, provider: 'codex', freshAgentSessionType: 'freshcodex', launchState: 'running', intentRevision: 1 }])
+    Object.assign(rig, { supervisor: { runtimeRoot: path.join(root, 'runtime') } })
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(root, 'unused.sock'), proxySocketPath: path.join(root, 'proxy.sock'),
+      runtimeRootPrefix: root, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId, logPath: path.join(root, 'broker.jsonl') })
+    const receipt = { soulId: current.soulId, incarnationId: current.incarnationId, containerId: current.containerId,
+      imageRef: 'fixture', runtimeDir: root, createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64) }
+    const receipts = vi.spyOn(rig.runtime.broker, 'receipts').mockReturnValue([receipt, { ...receipt, soulId: 'other-soul' }])
+    const start = { at: new Date().toISOString(), severity: 'info', method: 'POST', url: `/v1.47/containers/${current.containerId}/start`,
+      decision: 'forward', containerId: current.containerId, destructive: false, unsafeAttempt: false } as const
+    const events = vi.spyOn(rig.runtime.broker, 'eventsSnapshot').mockReturnValue([start, { ...start, url: '/v1.47/containers/other/start' }])
+    const launch = { event: 'supervisor.launch_running', at: 100, data: { soulId: current.soulId,
+      incarnationId: current.incarnationId, containerId: current.containerId, workerLaunchCount: 1 } }
+    const file = path.join(root, 'evidence', 'lifecycle.jsonl')
+    await fsp.mkdir(path.dirname(file), { recursive: true })
+    await fsp.writeFile(file, `${JSON.stringify(launch)}\n${JSON.stringify({ ...launch, data: { ...launch.data, soulId: 'other-soul' } })}\n`)
+    try {
+      await expect(rig.freshCodexSavedHistoryOwnershipFacts(current)).resolves.toEqual({ receiptContainerIds: [current.containerId],
+        startCount: 1, launches: [launch], targetSoulRecoveries: [] })
+      const descriptor = external.resolveManagedExternalDescriptor({ FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+        FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws', FRESHELL_E2E_TARGET_TOKEN: 'private-token',
+        FRESHELL_RUNTIME_EXTERNAL_RUN_ID: rig.runtime.runId, FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: rig.runtime.candidateSha })!
+      const control = external.createExternalRuntimeControl(rig, descriptor)
+      const remote = new external.ExternalManagedRuntimeRig(descriptor, async (_url, init) => (
+        new Response(JSON.stringify(await control(JSON.parse(String(init?.body)))), { status: 200 })
+      ))
+      await expect(remote.freshCodexSavedHistoryOwnershipFacts(current)).resolves.toEqual({ receiptContainerIds: [current.containerId],
+        startCount: 1, launches: [launch], targetSoulRecoveries: [] })
+      await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha, scenarioId: 'browser-managed-runtime',
+        operationId: 'foreign-ownership-path', action: 'freshcodex-history-ownership', handle: current, path: '/foreign/lifecycle' })).rejects.toThrow(/operation/)
+      receipts.mockReturnValue([receipt, receipt]); events.mockReturnValue([start, start])
+      const recovery = { event: 'supervisor.runtime_observer.recovery_scheduled', at: 200, data: { soulId: current.soulId } }
+      await fsp.appendFile(file, `${JSON.stringify(recovery)}\n`)
+      await expect(rig.freshCodexSavedHistoryOwnershipFacts(current)).resolves.toEqual({ receiptContainerIds: [current.containerId, current.containerId],
+        startCount: 2, launches: [launch], targetSoulRecoveries: [recovery] })
+      await fsp.appendFile(file, 'malformed\n')
+      await expect(rig.freshCodexSavedHistoryOwnershipFacts(current)).rejects.toThrow()
+    } finally { await fsp.rm(root, { recursive: true, force: true }) }
+  })
+})
+
 describe('finite Phase 4 browser receipt publication', () => {
   it('writes the existing observation privately on its owner and refuses worker paths or transcript fields', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-phase4-receipt-'))

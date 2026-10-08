@@ -10,8 +10,6 @@
  */
 import { expect, type Page } from '@playwright/test'
 import WebSocket from 'ws'
-import fs from 'node:fs/promises'
-import path from 'node:path'
 
 import { test } from '../helpers/fixtures.js'
 import { ManagedRuntimeBrowserRig, createManagedRuntimeBrowserRig } from '../helpers/managed-runtime.js'
@@ -331,9 +329,6 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       // Its saved source is the owned provider volume, never a coincident web-local file.
       await page.unroute('**/api/fresh-agent/threads/**')
       await rig.prepareCoincidentFreshCodexHistory(rig.exactRuntimeHandle(view))
-      const lifecyclePath = path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')
-      const readLifecycle = async () => (await fs.readFile(lifecyclePath, 'utf8'))
-        .split('\n').filter(Boolean).map((line) => JSON.parse(line))
       // Finish healthy preparation before starting this owned controller's
       // first observation window. Its startup must reattach the original host.
       const oldControllerId = (await rig.ownershipFacts()).supervisorContainerId
@@ -449,13 +444,11 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
       expect(await rig.freshCodexSavedHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
       expect(await rig.coincidentFreshCodexHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
-      const managedReceipts = rig.runtime.broker.receipts().filter((receipt) => receipt.soulId === view.soulId)
-      expect(managedReceipts).toHaveLength(1)
-      expect(managedReceipts[0].containerId).toBe(view.containerId)
-      expect(rig.runtime.broker.eventsSnapshot().filter((event) => event.containerId === view.containerId
-        && event.method === 'POST' && event.url === `/v1.47/containers/${view.containerId}/start`)).toHaveLength(1)
-      const lifecycle = await readLifecycle()
-      const launches = lifecycle.filter((event) => event.event === 'supervisor.launch_running' && event.data.soulId === view.soulId)
+      const ownership = await rig.freshCodexSavedHistoryOwnershipFacts(rig.exactRuntimeHandle(view))
+      expect(ownership.receiptContainerIds).toHaveLength(1)
+      expect(ownership.receiptContainerIds[0]).toBe(view.containerId)
+      expect(ownership.startCount).toBe(1)
+      const launches = ownership.launches
       expect(launches).toHaveLength(1)
       expect(launches[0].data).toMatchObject({ incarnationId: view.incarnationId, containerId: view.containerId, workerLaunchCount: 1 })
       expectOnlyCanonicalBootstrap()
@@ -481,8 +474,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
       expectOnlyCanonicalBootstrap()
       expect(bootstrapLifecycle()).toHaveLength(settledLifecycleCount)
-      const targetSoulRecoveries = (await readLifecycle()).filter((event) => event.event === 'supervisor.runtime_observer.recovery_scheduled'
-        && event.data.soulId === view.soulId)
+      const { targetSoulRecoveries } = await rig.freshCodexSavedHistoryOwnershipFacts(rig.exactRuntimeHandle(view))
       expect(targetSoulRecoveries).toHaveLength(0)
       rig.runtime.writeBrowserArtifact('owned-host-history-preservation', { ...historyEvidence,
         observerWindow: { intervalMs: observerIntervalMs, controllerReattachment, startupFinished, firstObservationNotBefore,
