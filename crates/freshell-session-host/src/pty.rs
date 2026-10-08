@@ -145,9 +145,9 @@ impl HostedPty {
         // never precede the provider's no-input create/resume acknowledgement.
         if launch.mode == "codex"
             && native_identity_launch.is_some()
-            && !native_args.windows(2).any(|pair| {
-                pair[0] == "-c" && pair[1] == "check_for_update_on_startup=false"
-            })
+            && !native_args
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == "check_for_update_on_startup=false")
         {
             native_args.splice(
                 0..0,

@@ -6389,6 +6389,185 @@ print('native-startup-without-update-input')
     }
 
     #[tokio::test]
+    async fn controlled_claude_parity_uses_configured_current_native_channels_before_input() {
+        use std::os::unix::fs::PermissionsExt;
+        let node = std::process::Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+            .unwrap();
+        assert!(node.status.success());
+        let node = String::from_utf8(node.stdout).unwrap().trim().to_string();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for case in [
+            "startup",
+            "resume",
+            "missing-settings",
+            "disabled-hooks",
+            "wrong-root",
+            "stale-launch",
+        ] {
+            let owned = tempfile::tempdir().unwrap();
+            let root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            let actual = if case == "wrong-root" {
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            } else {
+                root
+            };
+            let provider = owned.path().join("parity-claude");
+            let source = owned.path().join("source");
+            std::fs::create_dir(&source).unwrap();
+            let producer = source.join("parity-claude");
+            std::fs::copy(
+                repo.join("test/fixtures/providers/parity-provider.mjs"),
+                &producer,
+            )
+            .unwrap();
+            std::fs::write(
+                &provider,
+                format!(
+                    "#!/bin/sh\nexec '{}' '{}' \"$@\"\n",
+                    node,
+                    producer.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let module = repo
+                .join("crates/freshell-claude-sidecar/native-session-channel.mjs")
+                .canonicalize()
+                .unwrap();
+            let binary = owned.path().join("bin");
+            std::fs::create_dir(&binary).unwrap();
+            let wrapper = binary.join("node");
+            let state = test_host_state();
+            let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: state.incarnation_id.clone(),
+                launch_nonce: format!("parity-{case}"),
+                evidence_revision: 2,
+                execution_generation: 1,
+                requested_native_session_id: Some(root.into()),
+            };
+            let stale = if case == "stale-launch" {
+                let mut previous = binding.clone();
+                previous.launch_nonce = "previous-launch".into();
+                format!(
+                    "export FRESHELL_NATIVE_IDENTITY_LAUNCH='{}'\n",
+                    serde_json::to_string(&previous).unwrap()
+                )
+            } else {
+                String::new()
+            };
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nshift\n{stale}exec '{}' '{}' \"$@\"\n",
+                    node,
+                    module.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if case == "disabled-hooks" {
+                std::fs::create_dir(owned.path().join(".claude")).unwrap();
+                std::fs::write(
+                    owned.path().join(".claude/settings.json"),
+                    r#"{"disableAllHooks":true}"#,
+                )
+                .unwrap();
+            }
+            let resume = case != "startup";
+            let mut args = vec![];
+            if case != "missing-settings" {
+                args.extend([
+                    "--settings".into(),
+                    freshell_platform::cli_launch::claude_settings_json(
+                        freshell_platform::cli_launch::ProviderTarget::Unix,
+                    ),
+                ]);
+            }
+            args.extend([
+                if resume { "--resume" } else { "--session-id" }.into(),
+                actual.into(),
+                "--model".into(),
+                "selected-fixture-model".into(),
+            ]);
+            let launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                "terminalId":"controlled-parity", "streamId":"controlled-parity", "mode":"claude",
+                "program":provider, "args":args, "resumeSessionId":if resume { Some(root) } else { None },
+                "cwd":owned.path(), "workspacePath":owned.path(), "projectKey":"owned-controlled-parity", "cols":80,"rows":24,
+                "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+                "env":{"HOME":owned.path(),"PATH":format!("{}:{}",binary.display(),std::env::var("PATH").unwrap())}
+            })).unwrap();
+            let pty = HostedPty::spawn(
+                &state.state_dir,
+                state.incarnation_id.clone(),
+                &launch,
+                std::collections::BTreeMap::from([(
+                    providers::native_identity::LAUNCH_ENV.into(),
+                    serde_json::to_string(&binding).unwrap(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            *state.pty.lock().await = Some(pty);
+            let signal = owned.path().join(format!(
+                ".freshell/native-identity/parity-{case}/statusline-loaded.json"
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !signal.exists() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // Observe the completed configured commands through the real host gate.
+            let status = dispatch(
+                authenticated_host_envelope(
+                    &state,
+                    HostCommand::Status {
+                        incarnation_id: state.incarnation_id.clone(),
+                    },
+                ),
+                &state,
+            )
+            .await
+            .unwrap();
+            let mut pty = state.pty.lock().await.take().unwrap();
+            pty.stop().await;
+            assert!(
+                !owned.path().join(".claude/projects").exists(),
+                "controlled startup must not invent a transcript or user turn"
+            );
+            if case == "disabled-hooks" {
+                assert!(signal.exists());
+                assert!(!signal.with_file_name("session-start.json").exists());
+            }
+            if case == "stale-launch" {
+                let published: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&signal).unwrap()).unwrap();
+                assert_eq!(published["launch"]["launchNonce"], "previous-launch");
+            }
+            match case {
+                "startup" | "resume" => assert!(
+                    matches!(status,HostResult::Status { native_session_id:Some(ref id), native_identity_observation:Some(ref observation),.. }
+                    if id==root && observation.native_session_id==root && observation.launch_nonce==binding.launch_nonce),
+                    "configured current producer did not reach host gate: {case}: {status:?}"
+                ),
+                _ => assert!(
+                    matches!(
+                        status,
+                        HostResult::Status {
+                            native_session_id: None,
+                            native_identity_observation: None,
+                            ..
+                        }
+                    ),
+                    "missing/wrong native response must stay unobserved: {case}: {status:?}"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn requested_identity_is_not_provider_observation() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
