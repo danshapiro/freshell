@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from 'vitest'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
