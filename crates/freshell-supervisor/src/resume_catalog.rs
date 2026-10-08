@@ -6,13 +6,13 @@
 
 use crate::registry::{NativeImportState, RecoveryContext};
 use freshell_agent_runtime::{
-    build_resume_spec, pinned_provider_version, ResumeSpecInput, PROVIDER_HOME,
+    build_resume_spec, pinned_fresh_provider_version, pinned_provider_version, ResumeSpecInput,
+    PROVIDER_HOME,
 };
 use freshell_runtime_protocol::{
-    AllocationState, CheckpointReference, CredentialReference, DurablePosition, FreshProvider,
-    IdentityProvenance, OpenCodeAdoptionBaseline, ProviderSessionRef, ProviderVolumeRef,
-    RecoveryBlockReason, RecoveryPath, RecoveryProbe, ResumeSpec, RetryHint,
-    RESUME_SPEC_SCHEMA_VERSION,
+    AllocationState, CheckpointReference, CredentialReference, DurablePosition, IdentityProvenance,
+    OpenCodeAdoptionBaseline, ProviderSessionRef, ProviderVolumeRef, RecoveryBlockReason,
+    RecoveryPath, RecoveryProbe, ResumeSpec, RetryHint, RESUME_SPEC_SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
 
@@ -122,14 +122,6 @@ fn derive_completed_import_baseline(
         })
 }
 
-fn fresh_provider_version(provider: &FreshProvider) -> Option<String> {
-    match provider {
-        // The SDK's selected default child is separate from terminal Claude.
-        FreshProvider::Claude | FreshProvider::Kilroy => Some("2.1.237".into()),
-        _ => pinned_provider_version(provider.as_str()),
-    }
-}
-
 fn exact_resume_candidate_base(
     context: &RecoveryContext,
     observed_native_session_id: Option<&str>,
@@ -198,7 +190,7 @@ fn exact_resume_candidate_base(
             reasoning_effort: agent.effort.clone(),
             permission_mode: agent.permission_mode.clone(),
             image_ref: Some(context.prior_handle.image_ref().to_string()),
-            provider_version: fresh_provider_version(&agent.provider),
+            provider_version: pinned_fresh_provider_version(&agent.provider),
             credential_references: agent
                 .provider_bootstrap_files
                 .iter()

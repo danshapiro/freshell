@@ -20,7 +20,7 @@ use std::{
 };
 
 mod provider_inventory;
-pub use provider_inventory::pinned_provider_version;
+pub use provider_inventory::{pinned_fresh_provider_version, pinned_provider_version};
 mod qualification_policy;
 pub use qualification_policy::{
     process_qualification_policy, qualification_managed_provider_enabled,
