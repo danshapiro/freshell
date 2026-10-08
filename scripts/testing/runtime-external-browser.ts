@@ -18,7 +18,7 @@ import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, R
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, runtimeWebStripPrefixes,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema,
-  FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -29,7 +29,7 @@ import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
-import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState } from './runtime-sandbox.js'
+import type { Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts } from './runtime-sandbox.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 
@@ -814,6 +814,9 @@ export class ExternalManagedRuntimeRig {
         swapMax: z.string().regex(/^(?:max|\d+)$/), pidsMax: z.string().regex(/^(?:max|\d+)$/) }).strict(),
       unsafeBrokerAttempts: z.number().int().nonnegative() }).strict(), { handle })
   }
+  async webProcessFacts(): Promise<RuntimeWebProcessFacts> {
+    return this.rpc('web-process-facts', RuntimeWebProcessFactsSchema)
+  }
   runtimeEnclosureHandle(view: Pick<ManagedRuntimeView, 'soulId' | 'incarnationId' | 'containerId' | 'hostBootId'>): RuntimeEnclosureHandle {
     return createRuntimeEnclosureHandle(this.descriptor, view)
   }
@@ -1048,6 +1051,7 @@ export function createExternalRuntimeControl(
       case 'synthetic-source-follow-up': result = await owner.syntheticOpenCodeFollowUpMessageId(handle()); break
       case 'inventory-snapshot': result = await owner.inventorySnapshot(); break
       case 'control-epoch': result = await owner.controlEpoch(); break
+      case 'web-process-facts': result = await owner.webProcessFacts(); break
       case 'managed-opt-in':
         if (request.expectedControlEpoch === undefined) throw new Error('exact managed preset controller epoch required')
         result = await owner.applyManagedOptIn(request.expectedControlEpoch)

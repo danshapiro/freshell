@@ -272,7 +272,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
           ? evidence
           : null
       }, 60_000)
-      const webBefore = rig.web.processEvidence()
+      const webBefore = await rig.webProcessFacts()
       const webBootBefore = await harness.getBootId()
       const webStarted = monotonicMs()
       const readyAt = await harness.getLastReadyAt()
@@ -283,7 +283,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         const text = await terminal.getVisibleText(currentId ?? terminalId)
         return text.includes('Permission required') && text.includes('Allow once') ? true : null
       }, 90_000)
-      const webAfter = rig.web.processEvidence()
+      const webAfter = await rig.webProcessFacts()
       const webBootAfter = await harness.getBootId()
       const webEnded = monotonicMs()
       const firstRuntime = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)
@@ -331,7 +331,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       }, 60_000)
 
       for (let cycle = 2; cycle <= 100; cycle += 1) {
-        const beforeProcess = rig.web.processEvidence()
+        const beforeProcess = await rig.webProcessFacts()
         const beforeBootId = await harness.getBootId()
         const startedMonotonicMs = monotonicMs()
         const previousReady = await harness.getLastReadyAt()
@@ -348,7 +348,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         )
         expect(currentLeaf.content.terminalId).toBe(terminalId)
         expect(currentLeaf.content.sessionRef?.sessionId).toBe(providerSessionId)
-        const afterProcess = rig.web.processEvidence()
+        const afterProcess = await rig.webProcessFacts()
         const afterBootId = await harness.getBootId()
         const endedMonotonicMs = monotonicMs()
         const runtime = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)

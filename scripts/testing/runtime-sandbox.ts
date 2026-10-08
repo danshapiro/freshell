@@ -604,6 +604,9 @@ export type SyntheticOpenCodeHistoryFacts = z.infer<typeof SyntheticOpenCodeHist
 export const FreshAgentLaunchFactsSchema = z.object({ provider: z.enum(['claude', 'codex', 'opencode']),
   version: z.string().regex(/^\d+\.\d+\.\d+$/), workerPid: z.number().int().min(2) }).strict()
 export type FreshAgentLaunchFacts = z.infer<typeof FreshAgentLaunchFactsSchema>
+export const RuntimeWebProcessFactsSchema = z.object({ pid: z.number().int().positive(),
+  bootAttemptCount: z.number().int().positive() }).strict()
+export type RuntimeWebProcessFacts = z.infer<typeof RuntimeWebProcessFactsSchema>
 
 export const OwnedContainerStateSchema = z.discriminatedUnion('present', [
   z.object({ present: z.literal(false), running: z.literal(false) }).strict(),
@@ -629,7 +632,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   action: z.enum([
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
-    'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt',
+    'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts',
     'managed-opt-in', 'opencode-version', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort',
@@ -2849,6 +2852,11 @@ export class ManagedRuntimeOwner {
 
   async restartWebGracefully(): Promise<RuntimeWebInfo> {
     return this.withManagedBin(() => this.web.restart())
+  }
+
+  async webProcessFacts(): Promise<RuntimeWebProcessFacts> {
+    if (!this.web) throw new Error('owned web process is not prepared')
+    return RuntimeWebProcessFactsSchema.parse(this.web.processEvidence())
   }
 
   async restartWeb(): Promise<RuntimeWebInfo> {

@@ -254,9 +254,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
             redux: window.__FRESHELL_TEST_HARNESS__?.getState()?.connection,
             managedRuntime: window.__FRESHELL_TEST_HARNESS__?.getState()?.managedRuntime,
           })).catch(() => null)
-          const webProcess = (() => {
-            try { return rig.web.processEvidence() } catch { return null }
-          })()
+          const webProcess = await rig.webProcessFacts().catch(() => null)
           const output = rig.web.capturedOutput()
           const terminalText = await terminal.getVisibleText(pane.terminalId).catch(() => '')
           throw new Error(`${error instanceof Error ? error.message : String(error)}; diagnostics=${JSON.stringify({

@@ -966,6 +966,23 @@ describe('closed external owner control', () => {
     expect(web).toHaveBeenCalledOnce()
     expect(supervisor).toHaveBeenCalledOnce()
   })
+  it('observes only the owned web process PID and boot count through the closed control', async () => {
+    const { owned, context, request } = fixture()
+    const facts = { pid: 42, bootAttemptCount: 3 }
+    Object.assign(owned, { web: { processEvidence: () => facts } })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
+      await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    await expect(rig.webProcessFacts()).resolves.toEqual(facts)
+    facts.pid = 43
+    facts.bootAttemptCount = 4
+    await expect(rig.webProcessFacts()).resolves.toEqual({ pid: 43, bootAttemptCount: 4 })
+    facts.pid = 0
+    await expect(control({ ...request, operationId: 'invalid-web-process', action: 'web-process-facts' })).rejects.toThrow()
+    Object.assign(owned, { web: undefined })
+    await expect(control({ ...request, operationId: 'unprepared-web-process', action: 'web-process-facts' })).rejects.toThrow(/prepared/)
+  })
   it('stops only the exact owned incarnation with its observed intent and controller revisions', async () => {
     const { owned, context, request, inventory } = fixture()
     const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'stop-owned-soul',
