@@ -7147,6 +7147,92 @@ describe('FreshAgentView', () => {
     },
   )
 
+  it('recovers managed Codex loss when an older coalesced reader first displays the current live response', async () => {
+    vi.useFakeTimers()
+    const bridge = createPerfAuditBridge()
+    const store = createStore()
+    const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: native.threadId }
+    const currentSession = () => store.getState().freshAgent.sessions[`freshcodex:codex:${native.threadId}`]
+    const makeLive = () => ({ ...native, revision: 0, status: 'idle' as const,
+      capabilities: { ...native.capabilities, send: true },
+      extensions: { codex: { statusFromLiveState: true, ownerKind: 'fresh-agent' } } })
+    const content = { kind: 'fresh-agent' as const, ...locator,
+      sessionRef: { provider: 'codex' as const, sessionId: native.threadId }, resumeSessionId: native.threadId,
+      createRequestId: 'coalesced-live-recovery', status: 'idle' as const, soulId: 'coalesced-live-soul', soulIntentRevision: 7,
+      recoverySummary: { desiredState: 'running' as const, recoveryState: 'live' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    const handlers = new Set<(message: any) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const outcomeStates: Array<{ requestSerial: unknown; ran: unknown; lost: boolean | undefined; status: string }> = []
+    installPerfAuditBridge({ ...bridge, addPerfEvent(event) {
+      bridge.addPerfEvent(event)
+      if (event.event === 'fresh_agent.snapshot_request' && event.stage === 'outcome_received') {
+        outcomeStates.push({ requestSerial: event.requestSerial, ran: event.ran,
+          lost: currentSession()?.lost, status: currentSession()?.status })
+      }
+    } })
+    try {
+      store.dispatch(sessionInit(locator))
+      store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => makeLive())
+      await act(async () => {
+        render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      expect(composer).not.toBeDisabled()
+      fireEvent.change(composer, { target: { value: 'Coalesced recovery draft' } })
+      const pending = createDeferred<unknown>()
+      const followup = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockClear()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => pending.promise)
+        .mockImplementationOnce(() => followup.promise)
+      wsMock.send.mockClear()
+      act(() => {
+        handlers.forEach((handler) => handler({ type: 'freshAgent.event', ...locator,
+          event: { type: 'freshAgent.session.changed', sessionId: native.threadId, reason: 'codex-thread' } }))
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      // The loss reader queues behind the pre-loss live read. A newer busy
+      // event then queues the current reader, whose run serves both readers.
+      act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+        event: { type: 'freshAgent.error', code: 'INVALID_SESSION_ID', message: 'Stale managed lookup' } }))
+      const lostStatusVersion = currentSession().statusVersion
+      act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+        event: { type: 'freshAgent.status', status: 'running' } }))
+      expect(currentSession().statusVersion).toBeGreaterThan(lostStatusVersion ?? -1)
+      await act(async () => { pending.resolve(makeLive()); await vi.advanceTimersByTimeAsync(0) })
+      expect(currentSession()).toMatchObject({ lost: true, status: 'running' })
+      expect(composer).toBeDisabled()
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(currentSession()).toMatchObject({ lost: true, status: 'running' })
+      expect(composer).toBeDisabled()
+      // Resolve only the current native run. The production scheduler shares
+      // this exact object with the older queued reader, in resolver order.
+      await act(async () => { followup.resolve(makeLive()); await vi.advanceTimersByTimeAsync(0) })
+      const cohort = outcomeStates.slice(-2)
+      expect(cohort).toEqual([
+        { requestSerial: expect.any(Number), ran: false, lost: true, status: 'running' },
+        { requestSerial: expect.any(Number), ran: true, lost: true, status: 'running' },
+      ])
+      const displays = bridge.snapshot().perfEvents.filter((event) => event.event === 'fresh_agent.snapshot_request'
+        && event.stage === 'display_committed' && cohort.some((reader) => reader.requestSerial === event.requestSerial))
+      expect(displays.map((event) => event.accepted)).toEqual([true, false])
+      expect(composer).not.toBeDisabled()
+      expect(currentSession()).toMatchObject({ lost: false, status: 'idle' })
+      expect(composer).toHaveValue('Coalesced recovery draft')
+      expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+      expect(getFreshAgentPaneContent(store)).toMatchObject(content)
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    } finally { cleanup(); resetSnapshotSchedulerForTests(); installPerfAuditBridge(null); vi.useRealTimers() }
+  })
+
   it.each([
     ['freshcodex', 'codex', savedCodexNativeHistory, 'no rollout found for thread id'],
     ['freshopencode', 'opencode', savedOpenCodeNativeHistory, 'Saved provider temporarily unavailable'],
@@ -7531,7 +7617,7 @@ describe('FreshAgentView', () => {
     expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
   })
 
-  it.each(['native', 'vacant', 'wrong-thread', 'wrong-provider', 'wrong-type', 'owner-change', 'boot-change', 'recovering', 'revision-change'] as const)(
+  it.each(['native', 'vacant', 'wrong-thread', 'wrong-provider', 'wrong-type', 'owner-change', 'boot-change', 'recovering', 'revision-change', 'older-display-revision'] as const)(
     'retains managed loss when HTTP truth is %s', async (scenario) => {
       const store = createStore()
       const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
@@ -7546,7 +7632,9 @@ describe('FreshAgentView', () => {
         recoverySummary: { desiredState: 'running' as const, recoveryState: 'live' as const,
           durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
       store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
-      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...native, capabilities: { ...native.capabilities, send: true }, extensions: {} })
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...native,
+        ...(scenario === 'older-display-revision' ? { revision: 2 } : {}),
+        capabilities: { ...native.capabilities, send: true }, extensions: {} })
       render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
       await expectRenderedText('Saved native Codex answer')
       const pending = createDeferred<unknown>()
@@ -7571,6 +7659,7 @@ describe('FreshAgentView', () => {
       }
       const current = getFreshAgentPaneContent(store)
       const result = { ...native, capabilities: { ...native.capabilities, send: true },
+        ...(scenario === 'older-display-revision' ? { revision: 1 } : {}),
         sessionType: scenario === 'wrong-type' ? 'freshopencode' : native.sessionType,
         threadId: scenario === 'wrong-thread' ? 'different-conversation' : native.threadId,
         provider: scenario === 'wrong-provider' ? 'opencode' : 'codex',
