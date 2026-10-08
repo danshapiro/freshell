@@ -1704,6 +1704,54 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('publishes continuity observations only to owner-selected receipt files with current identity and provenance', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-continuity-receipt-'))
+    vi.stubEnv('FRESHELL_RUNTIME_BROWSER_RECEIPT', path.join(directory, 'shell.json'))
+    vi.stubEnv('FRESHELL_RUNTIME_OPENCODE_RECEIPT', path.join(directory, 'opencode.json'))
+    try {
+      const { owned, context, inventory, request } = fixture()
+      const row = { soulId: 'receipt-soul', incarnationId: 'receipt-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'receipt-boot', nativeSessionId: 'ses_receipt', provider: 'shell', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { imageRef: receipt.imageRef, broker: { receipts: () => [receipt] } })
+      const shell = { caseId: 'P2-G01' as const, status: 'PASS' as const, restartCycles: 10 as const,
+        soulId: row.soulId, incarnationId: row.incarnationId, containerId: row.containerId, hostBootId: row.hostBootId,
+        childPid: 123, outputAdvanced: true as const, inputUsable: true as const, viewAssociations: 1 as const,
+        createRequestId: 'request-owned', terminalId: 'terminal-owned' }
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const wire: unknown[] = []
+      const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      const enclosure = rig.runtimeEnclosureHandle(row)
+      const result = await rig.publishTerminalContinuityReceipt(enclosure, shell)
+      const bytes = await fsp.readFile(path.join(directory, 'shell.json'))
+      expect(result).toEqual({ artifactRef: `terminal-continuity-receipt:${createHash('sha256').update(bytes).digest('hex')}` })
+      expect(JSON.parse(bytes.toString())).toEqual({ ...shell, candidateSha: context.candidateSha, runtimeImage: receipt.imageRef })
+      expect((await fsp.stat(path.join(directory, 'shell.json'))).mode & 0o777).toBe(0o600)
+      const native = { caseId: 'P2-G04' as const, status: 'PASS' as const, provider: 'opencode' as const,
+        modelProvider: 'openai', opencodeVersion: '1.18.21', model: 'openai/gpt-5.4', resolvedModel: 'gpt-5.4',
+        freeTier: false as const, nativeSessionId: row.nativeSessionId, sameNativeSession: true as const,
+        sameIncarnation: true as const, soulId: row.soulId, incarnationId: row.incarnationId,
+        containerId: row.containerId, hostBootId: row.hostBootId, toolCompletionCount: 1 as const,
+        followupSucceeded: true as const, providerLaunchCount: 1 as const }
+      inventory.mockResolvedValue([{ ...row, provider: 'opencode' }])
+      await rig.publishTerminalContinuityReceipt(enclosure, native)
+      expect(JSON.parse(await fsp.readFile(path.join(directory, 'opencode.json'), 'utf8'))).toEqual({ ...native,
+        candidateSha: context.candidateSha, runtimeImage: receipt.imageRef })
+      expect(JSON.stringify(wire)).not.toContain(directory)
+      await expect(owned.publishTerminalContinuityReceipt(enclosure, { ...native, providerLaunchCount: 2 })).rejects.toThrow(/one observed provider launch/)
+      await expect(owned.publishTerminalContinuityReceipt(enclosure, { ...native, nativeSessionId: 'ses_foreign' })).rejects.toThrow(/current.*root/)
+      await expect(owned.publishTerminalContinuityReceipt(enclosure, { ...shell, hostBootId: 'foreign' })).rejects.toThrow(/identity/)
+      await expect(control({ ...request, action: 'terminal-continuity-receipt', enclosure, continuityObservation: shell, path: '/foreign' })).rejects.toThrow(/operation/)
+      inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement' }])
+      await expect(owned.publishTerminalContinuityReceipt(enclosure, shell)).rejects.toThrow(/current/)
+    } finally { vi.unstubAllEnvs(); await fsp.rm(directory, { recursive: true, force: true }) }
+  })
   it('captures fixed terminal continuity diagnostics privately and returns their actual artifact hash', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-terminal-diagnostics-'))
     try {

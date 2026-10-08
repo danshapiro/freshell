@@ -10,6 +10,7 @@ export {
   type ExactRuntimeHandle, type FixtureNativeState, type RuntimeHostFacts, type NativeToolEvidence,
   type SyntheticOpenCodeSourceFacts,
   type Phase3BrowserObservation,
+  type RuntimeTerminalContinuityObservation,
 } from '../../../scripts/testing/runtime-sandbox.js'
 
 /** The browser fixture supplies its owned web process to the shared owner. */

@@ -9,11 +9,8 @@
 import { expect } from '@playwright/test'
 
 import { test } from '../helpers/fixtures.js'
-import fs from 'node:fs'
-import path from 'node:path'
-
-import { ManagedRuntimeBrowserRig, P2_OPENCODE_MODEL, P2_OPENCODE_VERSION, type ManagedRuntimeView } from '../helpers/managed-runtime.js'
-import { requireOpenCodeOnecliBootstrap } from '../helpers/opencode-auth-file.js'
+import { createManagedRuntimeBrowserRig, createManagedOpenCodeRuntimeBrowserRig, P2_OPENCODE_MODEL, P2_OPENCODE_VERSION,
+  type ManagedFixtureRig, type ManagedRuntimeView, type RuntimeTerminalContinuityObservation } from '../helpers/managed-runtime.js'
 import { waitForOpenCodeTerminalCondition } from '../helpers/opencode-native-history.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
@@ -80,7 +77,7 @@ function waitForTerminalIdentity(harness: TestHarness, timeoutMs: number): Promi
 }
 
 function waitForRunningView(
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   terminalId: string,
   timeoutMs: number,
 ): Promise<ManagedRuntimeView> {
@@ -140,7 +137,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       }
     })
 
-    const rig = new ManagedRuntimeBrowserRig()
+    const rig = createManagedRuntimeBrowserRig()
     try {
       const info = await rig.start()
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -242,7 +239,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       }
 
       expect(outputAdvanced).toBe(true)
-      const receipt = {
+      const receipt: RuntimeTerminalContinuityObservation = {
         caseId: 'P2-G01',
         status: 'PASS',
         restartCycles: 10,
@@ -252,12 +249,10 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         viewAssociations: 1,
         createRequestId: initialPane.createRequestId,
         terminalId: initialPane.terminalId,
-        candidateSha: rig.runtime.candidateSha,
-        runtimeImage: rig.runtime.imageRef,
       }
-      const receiptPath = rig.writeBrowserReceipt(receipt)
+      const { artifactRef } = await rig.publishTerminalContinuityReceipt(childEnclosure, receipt)
       // eslint-disable-next-line no-console
-      console.log(`[P2-G01] browser continuity receipt: ${receiptPath}`)
+      console.log(`[P2-G01] browser continuity receipt: ${artifactRef}`)
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
@@ -267,16 +262,8 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
   test('P2-G04: OpenAI-authenticated OpenCode tool turn survives web replacement in one native session', async ({ page }) => {
     test.setTimeout(900_000)
 
-    // The rig runs the web server with an isolated HOME. Pass the native
-    // OpenCode OAuth stub, OneCLI proxy settings, and gateway CA as typed
-    // grants so the provider uses the dedicated OneCLI gateway.
-    const onecli = requireOpenCodeOnecliBootstrap()
-    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 2, {
-      FRESHELL_BIND_HOST: '0.0.0.0',
-      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: onecli.authFile,
-      FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: onecli.environmentFile,
-      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: onecli.caFile,
-    })
+    // Private native grants are validated and mounted by the rig owner.
+    const rig = createManagedOpenCodeRuntimeBrowserRig(process.cwd(), 2)
     try {
       const info = await rig.start()
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -389,7 +376,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       expect(hostFacts.workerLaunchCount).toBe(1)
       expect((await content())?.sessionRef?.sessionId).toBe(sessionId)
 
-      const receipt = {
+      const receipt: RuntimeTerminalContinuityObservation = {
         caseId: 'P2-G04',
         status: 'PASS',
         provider: 'opencode',
@@ -408,12 +395,10 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         toolCompletionCount: 1,
         followupSucceeded: true,
         providerLaunchCount: hostFacts.workerLaunchCount,
-        candidateSha: rig.runtime.candidateSha,
-        runtimeImage: rig.runtime.imageRef,
       }
-      const receiptPath = rig.writeOpencodeReceipt(receipt)
+      const { artifactRef } = await rig.publishTerminalContinuityReceipt(continuityEnclosure, receipt)
       // eslint-disable-next-line no-console
-      console.log(`[P2-G04] real OpenCode continuity receipt: ${receiptPath}`)
+      console.log(`[P2-G04] real OpenCode continuity receipt: ${artifactRef}`)
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)

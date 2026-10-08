@@ -875,6 +875,22 @@ export const OpencodeContinuityFirstReplySchema = z.object({
   resolvedProvider: z.string(), resolvedModel: z.string(),
 }).strict()
 export type OpencodeContinuityFirstReply = z.infer<typeof OpencodeContinuityFirstReplySchema>
+const TerminalContinuityIdentitySchema = z.object({
+  soulId: z.string().min(1), incarnationId: z.string().min(1),
+  containerId: z.string().regex(/^[a-f0-9]{64}$/), hostBootId: z.string().min(1),
+})
+export const RuntimeTerminalContinuityObservationSchema = z.discriminatedUnion('caseId', [
+  TerminalContinuityIdentitySchema.extend({ caseId: z.literal('P2-G01'), status: z.literal('PASS'),
+    restartCycles: z.literal(10), childPid: z.number().int().positive(), outputAdvanced: z.literal(true),
+    inputUsable: z.literal(true), viewAssociations: z.literal(1), createRequestId: z.string().min(1),
+    terminalId: z.string().min(1) }).strict(),
+  TerminalContinuityIdentitySchema.extend({ caseId: z.literal('P2-G04'), status: z.literal('PASS'), provider: z.literal('opencode'),
+    modelProvider: z.string().min(1), opencodeVersion: z.string().min(1), model: z.string().min(1),
+    resolvedModel: z.string().min(1), freeTier: z.literal(false), nativeSessionId: z.string().min(1),
+    sameNativeSession: z.literal(true), sameIncarnation: z.literal(true), toolCompletionCount: z.literal(1),
+    followupSucceeded: z.literal(true), providerLaunchCount: z.number().int().refine((value): boolean => value === 1, 'one observed provider launch required') }).strict(),
+])
+export type RuntimeTerminalContinuityObservation = z.infer<typeof RuntimeTerminalContinuityObservationSchema>
 export const RuntimeTerminalChildFactsSchema = z.union([
   z.object({ pid: z.number().int().positive(), running: z.boolean() }).strict(),
   z.object({ pid: z.null(), running: z.literal(false) }).strict(),
@@ -950,6 +966,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   action: z.enum([
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
+    'terminal-continuity-receipt',
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
@@ -983,6 +1000,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   chaosEvidence: RuntimeChaosEvidenceSchema.optional(),
   lossAssertions: RuntimeLossAssertionsSchema.optional(),
   freshAgentObservations: z.array(RuntimeFreshAgentObservationSchema).optional(),
+  continuityObservation: RuntimeTerminalContinuityObservationSchema.optional(),
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
@@ -4057,6 +4075,24 @@ export class ManagedRuntimeOwner {
     fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
     fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
     return target
+  }
+  async publishTerminalContinuityReceipt(handle: RuntimeEnclosureHandle, input: RuntimeTerminalContinuityObservation): Promise<{ artifactRef: string }> {
+    if (this.runtime.phase !== 2) throw new Error('Phase 2 terminal continuity fixture required')
+    await this.currentRuntimeEnclosure(handle)
+    const observation = RuntimeTerminalContinuityObservationSchema.parse(input)
+    if (observation.soulId !== handle.soulId || observation.incarnationId !== handle.incarnationId
+      || observation.containerId !== handle.containerId || observation.hostBootId !== handle.hostBootId) {
+      throw new Error('continuity observation belongs to another identity')
+    }
+    if (observation.caseId === 'P2-G04') {
+      await this.assertOpenCodeContinuityEnclosure(handle)
+      await this.assertCurrentHandle({ ...handle, nativeSessionId: observation.nativeSessionId })
+    }
+    const receipt = { ...observation, candidateSha: this.runtime.candidateSha, runtimeImage: this.runtime.imageRef }
+    const target = observation.caseId === 'P2-G01' ? this.writeBrowserReceipt(receipt) : this.writeOpencodeReceipt(receipt)
+    const artifactRef = `terminal-continuity-receipt:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
+    this.runtime.recordLifecycle('external.terminal_continuity_receipt_published', { severity: 'info', artifactRef, caseId: observation.caseId })
+    return { artifactRef }
   }
 
   writeOpencodeReceipt(value: unknown): string {

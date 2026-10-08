@@ -24,7 +24,8 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, OpencodeLossRecoverySchema,
   OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema,
   RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema,
-  OpencodeContinuityStartupFactsSchema, OpencodeContinuityFirstReplySchema, requireOpenCodeOnecliBootstrap, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
+  OpencodeContinuityStartupFactsSchema, OpencodeContinuityFirstReplySchema, RuntimeTerminalContinuityObservationSchema,
+  requireOpenCodeOnecliBootstrap, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
@@ -716,7 +717,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'continuityObservation'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -879,6 +880,12 @@ export class ExternalManagedRuntimeRig {
     return this.rpc('terminal-continuity-diagnostics', z.object({
       artifactRef: z.string().regex(/^terminal-continuity-diagnostics:[a-f0-9]{64}$/),
     }).strict(), { enclosure })
+  }
+  async publishTerminalContinuityReceipt(enclosure: RuntimeEnclosureHandle,
+    continuityObservation: z.infer<typeof RuntimeTerminalContinuityObservationSchema>): Promise<{ artifactRef: string }> {
+    return this.rpc('terminal-continuity-receipt', z.object({
+      artifactRef: z.string().regex(/^terminal-continuity-receipt:[a-f0-9]{64}$/),
+    }).strict(), { enclosure, continuityObservation })
   }
   async publishFreshAgentQualification(freshAgentObservations: FreshAgentQualificationRow[]): Promise<RuntimeFreshAgentReceiptArtifacts> {
     return this.rpc('fresh-agent-receipt', RuntimeFreshAgentReceiptArtifactsSchema, { freshAgentObservations })
@@ -1169,6 +1176,10 @@ export function createExternalRuntimeControl(
       case 'terminal-continuity-diagnostics':
         if (!request.enclosure) throw new Error('exact terminal enclosure required')
         result = await owner.captureTerminalContinuityDiagnostics(request.enclosure)
+        break
+      case 'terminal-continuity-receipt':
+        if (!request.enclosure || !request.continuityObservation) throw new Error('exact enclosure and continuity observations required')
+        result = await owner.publishTerminalContinuityReceipt(request.enclosure, request.continuityObservation)
         break
       case 'candidate-integrity': result = await owner.captureCandidateIntegrity(); break
       case 'web-process-facts': result = await owner.webProcessFacts(); break
