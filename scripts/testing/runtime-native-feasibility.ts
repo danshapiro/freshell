@@ -828,9 +828,34 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     harness.writeArtifact(`${scenario}-completed-store-probe.json`, probe)
     if (probe.data.kind !== 'reattach_ready') throw new Error('completed terminal Claude store not readable before death')
     if (restorationFailure) {
+      const mutation = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0', ['python3', '-c', String.raw`
+import pathlib,json,hashlib,os,sys
+root=sys.argv[1];expected=sys.argv[2];identity=json.loads(sys.argv[3]);home=pathlib.Path('/home/freshell/provider/.claude/projects')
+files=list(home.glob('*/'+root+'.jsonl'));assert len(files)==1 and files[0].is_file() and not files[0].is_symlink()
+file=files[0];before=file.stat();raw=file.read_bytes();assert raw.endswith(b'\n') and hashlib.sha256(raw).hexdigest()==expected
+assert [str(before.st_dev),str(before.st_ino)]==identity[:2]
+rows=[json.loads(line) for line in raw.splitlines()];changed=0
+for row in rows:
+ if row.get('type')=='assistant':
+  assert row.get('sessionId')==root and isinstance(row.get('message',{}).get('content'),list)
+  assert not any(part.get('type')=='tool_use' for part in row['message']['content'])
+  row['message']['content']='owned malformed native assistant';changed+=1
+assert changed>0
+modified=b''.join((json.dumps(row,separators=(',',':'))+'\n').encode() for row in rows)
+with file.open('r+b') as handle:handle.write(modified);handle.truncate();handle.flush();os.fsync(handle.fileno())
+after=file.stat();assert before.st_dev==after.st_dev and before.st_ino==after.st_ino
+print(json.dumps({'root':root,'beforeSha256':hashlib.sha256(raw).hexdigest(),'afterSha256':hashlib.sha256(file.read_bytes()).hexdigest(),
+ 'afterBytes':after.st_size,'changedAssistantRows':changed,'identity':[str(after.st_dev),str(after.st_ino)],'uid':os.getuid(),'gid':os.getgid()}))
+`, nativeRoot, seed.transcript.sha256, JSON.stringify(seed.transcript.identity)]))
+      harness.writeArtifact(`${scenario}-owned-before-load-mutation-private.json`, mutation)
+      const malformedProbe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
+      harness.writeArtifact(`${scenario}-malformed-before-load-store-probe.json`, malformedProbe)
+      if (malformedProbe.data.kind !== 'reattach_ready' || mutation.uid !== 65534 || mutation.gid !== 0
+        || mutation.beforeSha256 !== seed.transcript.sha256 || mutation.changedAssistantRows < 1) {
+        throw new Error('bounded native loader fault did not retain the owned current store route')
+      }
       const controlPath = path.join(workspace, 'native-restoration-fault-control.json')
-      fs.writeFileSync(controlPath, JSON.stringify({ root: nativeRoot, seedSha256: seed.transcript.sha256,
-        seedBytes: Buffer.from(seed.transcript.bytesBase64, 'base64').length }), { mode: 0o660 }); fs.chmodSync(controlPath, 0o660)
+      fs.writeFileSync(controlPath, JSON.stringify(mutation), { mode: 0o660 }); fs.chmodSync(controlPath, 0o660)
     }
     await harness.killOwnedRuntimeExact(view.containerId)
     await harness.waitForContainerExit(view.containerId)
@@ -845,18 +870,21 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
       harness.writeArtifact(`${scenario}-restoration-fault-private.json`, fault)
       const inventory = await harness.adminOk(supervisor, harness.inventoryBody())
       harness.writeArtifact(`${scenario}-after-restoration-failure-inventory.json`, inventory)
-      const current = inventory.data.find((row: any) => row.soulId === soulId)
+      const current = inventory.data.filter((row: any) => row.soulId === soulId)
+      const contained = recovery.result?.Ok?.data?.outcome === 'blocked'
+        && current.every((row: any) => row.launchState !== 'running'
+          && row.nativeIdentityObservation?.incarnationId !== fault.hook.launch.incarnationId)
+      if (!contained) throw new Error('native restoration fault published Running; no input probe dispatched')
       const input = await harness.adminRaw(supervisor, harness.terminalInputBody(soulId, 'Owned failed restoration input probe. Do not use tools.\r'))
       harness.writeArtifact(`${scenario}-after-restoration-failure-input-refusal.json`, input)
-      const contained = recovery.result?.Err?.code === 'RECOVERY_BLOCKED' && current?.launchState !== 'running'
-        && !current?.nativeIdentityObservation
       const inputRefused = !!input.result?.Err
       const nativeExitedUnloaded = fault.nativeExited === true && fault.loadedSha256 === null
       const currentHook = fault.hook.native.source === 'resume' && fault.hook.native.session_id === nativeRoot
         && fault.hook.launch.requestedNativeSessionId === nativeRoot
         && fault.hook.launch.launchNonce !== namespace.hook.launch.launchNonce
         && fault.hook.launch.incarnationId !== view.incarnationId
-      const ownedFault = fault.beforePrefixSha256 === seed.transcript.sha256 && fault.beforeSha256 !== fault.afterSha256
+      const ownedFault = fault.beforeSha256 === seed.transcript.sha256 && fault.beforeSha256 !== fault.afterSha256
+        && fault.observedFaultPrefixSha256 === fault.afterSha256
         && fault.changedAssistantRows >= 1 && fault.uid === 65534 && fault.gid === 0
         && fault.nativeExecutableSha256 === namespace.executableSha256
       if (!contained || !inputRefused || !nativeExitedUnloaded || !currentHook || !ownedFault) {
@@ -1511,22 +1539,13 @@ if(process.argv[2]==='--observe') {
   const transcript=path.resolve(native.transcript_path),store=path.resolve(process.env.CLAUDE_CONFIG_DIR,'projects')+path.sep
   if(!transcript.startsWith(store) || path.basename(transcript)!==control.root+'.jsonl' || !fs.lstatSync(transcript).isFile()) throw new Error('unowned transcript fault refused')
   const original=fs.readFileSync(transcript)
-  if(original.at(-1)!==10 || digest(original.subarray(0,control.seedBytes))!==control.seedSha256) throw new Error('owned original native seed changed')
-  let changedAssistantRows=0
-  const rows=original.toString('utf8').trimEnd().split('\n').map(line=>JSON.parse(line))
-  for(const row of rows) if(row.type==='assistant') {
-   if(row.sessionId!==control.root || !Array.isArray(row.message?.content) || row.message.content.some(part=>part.type==='tool_use')) throw new Error('non-solo tool-free native seed refused')
-   row.message.content=42;changedAssistantRows++
-  }
-  if(!changedAssistantRows)throw new Error('completed native assistant missing')
+  if(original.at(-1)!==10 || digest(original.subarray(0,control.afterBytes))!==control.afterSha256) throw new Error('owned malformed native source changed')
   const selected='/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe'
   const nativeExecutableSha256=digest(fs.readFileSync(selected))
   const pids=fs.readdirSync('/proc').filter(id=>/^\d+$/.test(id)).filter(id=>{try{return digest(fs.readFileSync('/proc/'+id+'/exe'))===nativeExecutableSha256}catch{return false}})
   if(pids.length!==1)throw new Error('current native writer ambiguous')
-  const modified=Buffer.from(rows.map(row=>JSON.stringify(row)+'\n').join(''))
-  fs.writeFileSync(transcript,modified)
   const config={hook,signalDirectory,nativePid:Number(pids[0]),nativeExecutableSha256,uid:process.getuid(),gid:process.getgid(),
-   beforeSha256:digest(original),beforePrefixSha256:digest(original.subarray(0,control.seedBytes)),afterSha256:digest(fs.readFileSync(transcript)),changedAssistantRows,
+   beforeSha256:control.beforeSha256,afterSha256:control.afterSha256,observedFaultPrefixSha256:digest(original.subarray(0,control.afterBytes)),changedAssistantRows:control.changedAssistantRows,
    observationPath:path.join(workspace,'native-restoration-fault-observation.json')}
   const observer=spawn(process.execPath,[fileURLToPath(import.meta.url),'--observe',JSON.stringify(config)],{stdio:'ignore'})
   observer.unref()
