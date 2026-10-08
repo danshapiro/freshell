@@ -23,6 +23,7 @@ import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../..
 import { stopManagedRuntimeSoul, createManagedOpenCodeRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { structuredChaosLog } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
 import type { BrokerReceipt } from '../../../../scripts/testing/runtime-test-broker.js'
+import type { ProviderQualificationRow } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import type { FreshAgentQualificationRow } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
 
 beforeEach(() => execute.mockReset())
@@ -1617,6 +1618,60 @@ describe('closed external owner control', () => {
     } finally {
       await fsp.rm(directory, { recursive: true, force: true })
     }
+  })
+  it('routes provider publication after cleanup while refusing unregistered and custody-only rows', async () => {
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused provider receipt web') }, process.cwd(), 5)
+    vi.spyOn(owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
+    const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      try { return new Response(JSON.stringify(await control(JSON.parse(String(init.body)))), { status: 200 }) }
+      catch { return new Response(JSON.stringify({ error: 'runtime_owner_refused' }), { status: 409 }) }
+    })
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    const row: ProviderQualificationRow = { provider: 'opencode', modes: ['opencode'], providerVersion: '1.18.21',
+      model: 'openai/gpt-5.6-luna', reasoningEffort: 'provider-default', nativeSessionId: 'custody-only-root',
+      nonceSha256: 'e'.repeat(64), nativeTurnProofs: [
+        { schemaVersion: 2, stage: 'initial', nativeSessionId: 'custody-only-root',
+          nativeEvidence: { kind: 'identified_message', turnId: 'custody-turn', messageId: 'custody-message', parentMessageId: null },
+          completedAt: 1, responseSha256: 'f'.repeat(64), responseContainsNonce: true, toolCallCount: 0, toolCallTypes: [],
+          resolvedProvider: 'fixture', resolvedModel: 'fixture', resolvedReasoningEffort: 'fixture',
+          providerProvenance: 'fixture', modelProvenance: 'fixture', reasoningEffortProvenance: 'fixture' },
+        { schemaVersion: 2, stage: 'after_session_host_crash', nativeSessionId: 'custody-only-root',
+          nativeEvidence: { kind: 'append_only_record', recordIndex: 0, byteStart: 1, byteEnd: 2,
+            recordSha256: '1'.repeat(64), prefixSha256Before: '2'.repeat(64), completionEventOrdinal: 0, completionEventSha256: '3'.repeat(64) },
+          completedAt: 'fixture', responseSha256: 'f'.repeat(64), responseContainsNonce: true, toolCallCount: 0, toolCallTypes: [],
+          resolvedProvider: 'fixture', resolvedModel: 'fixture', resolvedReasoningEffort: 'fixture',
+          providerProvenance: 'fixture', modelProvenance: 'fixture', reasoningEffortProvenance: 'fixture' },
+      ], actualProviderBinary: false, completedTurn: false,
+      nativeStateCaptured: false, runtimeOwned: false, limitsVerified: false, swapMaxVerified: false,
+      limitEvidence: { cpuMax: 'fixture', memoryMax: 'fixture', swapMax: 'fixture', pidsMax: 'fixture' },
+      automaticResume: false, profileVerified: false, releaseBinary: false, nativeRecovery: false,
+      exactNativeRecovery: false, sameNativeSession: false, followUpCompleted: false, onlyOneWriter: false,
+      writerClaim: { provider: 'opencode', providerStoreId: 'custody-store', nativeSessionId: 'custody-only-root',
+        soulId: 'custody-soul', incarnationId: 'custody-incarnation', activeClaimCount: 0, globalConflictingClaimCount: 0 },
+      oldEnclosureVerifiedEmpty: false, verifiedEmptyOrdering: { stopOutcome: 'verified_empty',
+        activeClaimCountAfterStop: 0, globalConflictingClaimCountAfterStop: 0, oldContainerRunningAfterStop: false },
+      lostNoticeCount: 0, crashKinds: [], nonceRecovery: { sameSoul: false, sameNativeSession: false,
+        newIncarnation: false, oldEnclosureVerifiedEmpty: false, recalledNonce: false, followUpCompleted: false,
+        workspaceOrToolReadUsed: false }, repairedSameSoul: false, repairedSameNativeSession: false,
+      blockers: [{ reason: 'fixture', outcome: 'blocked', lost: false }], blockerEvidence: ['fixture'] }
+    const finalize = vi.spyOn(owned, 'finalizeProviderQualificationReceipt')
+    await expect(owned.publishProviderQualification([row])).rejects.toThrow(/cleanup/)
+    await expect(owned.publishProviderQualification([{ ...row, provider: 'codex' }])).rejects.toThrow(/registered/)
+    await expect(owned.publishProviderQualification([row, row])).rejects.toThrow(/registered/)
+    Object.assign(owned, { stopSettlement: Promise.resolve({ ok: false, errors: ['fixture cleanup failure'] }) })
+    await expect(owned.publishProviderQualification([row])).rejects.toThrow(/cleanup failed/)
+    expect(finalize).not.toHaveBeenCalled()
+    Object.assign(owned, { stopSettlement: Promise.resolve({ ok: true, errors: [] }) })
+    await rig.stop()
+    await expect(rig.publishProviderQualification([row])).rejects.toThrow(/refused: 409/)
+    expect(finalize).toHaveBeenCalledExactlyOnceWith([row])
+    await expect(control({ runId: context.runId, candidateSha: context.candidateSha, operationId: 'foreign-provider-path',
+      action: 'provider-receipt', providerObservations: [row], outputPath: '/foreign/receipt.json' })).rejects.toThrow(/operation/)
+    await expect(rig.publishProviderQualification([{ ...row, transcript: 'private conversation' }])).rejects.toThrow()
+    expect(finalize).toHaveBeenCalledTimes(1)
+    await expect(owned.publishProviderQualification([row])).rejects.toThrow(/run manifest is missing/)
   })
   it('observes current owner broker counts and supervisor identity without exposing receipts or secrets', async () => {
     const { owned, context, request } = fixture()

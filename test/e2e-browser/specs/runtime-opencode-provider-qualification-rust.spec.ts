@@ -13,14 +13,13 @@ import { expect, type Page } from '@playwright/test'
 
 import { test } from '../helpers/fixtures.js'
 import {
-  ManagedRuntimeBrowserRig, stopManagedRuntimeSoul,
+  createManagedOpenCodeRuntimeBrowserRig, type ManagedFixtureRig, stopManagedRuntimeSoul,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
   type OpencodeQualificationTurn, type OpencodeQualificationProofStage,
   type OpencodeReadinessDiagnostic,
 } from '../helpers/managed-runtime.js'
-import { requireOpenCodeOnecliBootstrap } from '../helpers/opencode-auth-file.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -89,7 +88,7 @@ function waitForModeLeaf(
 }
 
 function waitForRunningView(
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   terminalId: string,
   predicate: (view: ManagedRuntimeView) => boolean,
   timeoutMs: number,
@@ -169,7 +168,7 @@ async function createOpencodePane(
   page: Page,
   harness: TestHarness,
   terminal: TerminalHelper,
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   tabId: string,
   priorPaneIds: Set<string>,
 ): Promise<{ paneId: string; terminalId: string; view: ManagedRuntimeView }> {
@@ -232,7 +231,7 @@ async function paneStreamId(harness: TestHarness, tabId: string, paneId: string)
 async function waitForReplacementPrompt(
   page: Page,
   harness: TestHarness,
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   tabId: string,
   paneId: string,
   view: ManagedRuntimeView,
@@ -343,7 +342,7 @@ async function paneSessionId(
 async function nextNativeAssistantTurn(
   page: Page,
   terminalId: string,
-  rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string,
+  rig: ManagedFixtureRig, view: ManagedRuntimeView, sessionId: string,
   challengeId: string, stage: OpencodeQualificationProofStage,
   priorMessageIds: ReadonlySet<string>, otherChallengeId?: string,
 ): Promise<OpencodeQualificationTurn> {
@@ -388,16 +387,10 @@ test.describe.serial('OpenCode provider qualification', () => {
     )
     test.setTimeout(1_800_000)
 
-    const onecli = requireOpenCodeOnecliBootstrap(process.env, 'OpenCode provider qualification')
-    const rig = new ManagedRuntimeBrowserRig(
+    const rig = createManagedOpenCodeRuntimeBrowserRig(
       process.cwd(),
       5,
-      {
-        FRESHELL_BIND_HOST: '0.0.0.0',
-        FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: onecli.authFile,
-        FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: onecli.environmentFile,
-        FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: onecli.caFile,
-      },
+      {},
       { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750' },
       'release',
     )
@@ -701,9 +694,10 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
     if (!providerRow) throw new Error('OpenCode qualification produced no provider evidence')
-    const finalized = rig.finalizeProviderQualificationReceipt([providerRow])
-    expect(finalized.receipt.schemaVersion).toBe(2)
+    const finalized = await rig.publishProviderQualification([providerRow])
+    expect(finalized.schemaVersion).toBe(2)
+    expect(finalized.rowCount).toBe(1)
     // eslint-disable-next-line no-console
-    console.log(`[provider-qualification] OpenCode receipts: ${finalized.paths.join(', ')}`)
+    console.log(`[provider-qualification] OpenCode receipts: ${finalized.artifactRefs.join(', ')}`)
   })
 })

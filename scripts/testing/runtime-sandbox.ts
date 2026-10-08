@@ -921,6 +921,38 @@ export const OpencodeQualificationTurnSchema = z.object({ messageId: z.string().
   }).strict(),
 }).strict()
 export type OpencodeQualificationTurn = z.infer<typeof OpencodeQualificationTurnSchema>
+export const RuntimeProviderObservationSchema: z.ZodType<ProviderQualificationRow> = z.object({
+  provider: z.string().min(1), modes: z.array(z.string().min(1)), providerVersion: z.string().min(1),
+  model: z.string().min(1), reasoningEffort: z.string().min(1), nativeSessionId: z.string().min(1),
+  nonceSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  nativeTurnProofs: z.array(OpencodeQualificationTurnSchema.shape.proof.extend({
+    nativeEvidence: z.discriminatedUnion('kind', [OpencodeQualificationNativeEvidenceSchema,
+      z.object({ kind: z.literal('append_only_record'), recordIndex: z.number().int().nonnegative(),
+        byteStart: z.number().int().nonnegative(), byteEnd: z.number().int().nonnegative(),
+        recordSha256: z.string(), prefixSha256Before: z.string(), completionEventOrdinal: z.number().int().nonnegative(),
+        completionEventSha256: z.string() }).strict()]),
+  })),
+  actualProviderBinary: z.boolean(), completedTurn: z.boolean(), nativeStateCaptured: z.boolean(), runtimeOwned: z.boolean(),
+  limitsVerified: z.boolean(), swapMaxVerified: z.boolean(),
+  limitEvidence: z.object({ cpuMax: z.string(), memoryMax: z.string(), swapMax: z.string(), pidsMax: z.string() }).strict(),
+  automaticResume: z.boolean(), profileVerified: z.boolean(), releaseBinary: z.boolean(), nativeRecovery: z.boolean(),
+  exactNativeRecovery: z.boolean(), sameNativeSession: z.boolean(), followUpCompleted: z.boolean(), onlyOneWriter: z.boolean(),
+  writerClaim: z.object({ provider: z.string(), providerStoreId: z.string(), nativeSessionId: z.string(), soulId: z.string(),
+    incarnationId: z.string(), activeClaimCount: z.number(), globalConflictingClaimCount: z.number() }).strict(),
+  oldEnclosureVerifiedEmpty: z.boolean(), verifiedEmptyOrdering: z.object({ stopOutcome: z.literal('verified_empty'),
+    activeClaimCountAfterStop: z.number(), globalConflictingClaimCountAfterStop: z.number(), oldContainerRunningAfterStop: z.boolean() }).strict(),
+  lostNoticeCount: z.number(), crashKinds: z.array(z.string()),
+  nonceRecovery: z.object({ sameSoul: z.boolean(), sameNativeSession: z.boolean(), newIncarnation: z.boolean(),
+    oldEnclosureVerifiedEmpty: z.boolean(), recalledNonce: z.boolean(), followUpCompleted: z.boolean(),
+    workspaceOrToolReadUsed: z.boolean() }).strict().optional(),
+  repairedSameSoul: z.boolean().optional(), repairedSameNativeSession: z.boolean().optional(),
+  blockers: z.array(z.object({ reason: z.string(), outcome: z.literal('blocked'), lost: z.literal(false) }).strict()).optional(),
+  blockerEvidence: z.array(z.string()).optional(),
+}).strict()
+export const RuntimeProviderReceiptArtifactsSchema = z.object({ schemaVersion: z.literal(2),
+  rowCount: z.number().int().positive(), artifactRefs: z.array(z.string().regex(/^provider-qualification:[a-f0-9]{64}$/)).nonempty(),
+}).strict()
+export type RuntimeProviderReceiptArtifacts = z.infer<typeof RuntimeProviderReceiptArtifactsSchema>
 const TerminalContinuityIdentitySchema = z.object({
   soulId: z.string().min(1), incarnationId: z.string().min(1),
   containerId: z.string().regex(/^[a-f0-9]{64}$/), hostBootId: z.string().min(1),
@@ -1027,7 +1059,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'provider-receipt', 'fresh-agent-launch-facts', 'container-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -1057,6 +1089,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   chaosEvidence: RuntimeChaosEvidenceSchema.optional(),
   lossAssertions: RuntimeLossAssertionsSchema.optional(),
   freshAgentObservations: z.array(RuntimeFreshAgentObservationSchema).optional(),
+  providerObservations: z.array(RuntimeProviderObservationSchema).optional(),
   continuityObservation: RuntimeTerminalContinuityObservationSchema.optional(),
   qualificationTerminalId: z.string().min(1).max(200).optional(),
   qualificationNonce: z.string().regex(/^p-[A-Za-z0-9_-]{22}$/).optional(),
@@ -4366,6 +4399,27 @@ export class ManagedRuntimeOwner {
           : `${providers[0]?.provider ?? 'provider'}-provider-qualification.json`,
       ),
     }
+  }
+
+  async publishProviderQualification(input: ProviderQualificationRow[]): Promise<RuntimeProviderReceiptArtifacts> {
+    const rows = z.array(RuntimeProviderObservationSchema).parse(input)
+    const providers = new Set(rows.map(row => row.provider))
+    if (this.runtime.phase !== 5 || this.fixtureFreshAgentModes.length !== 0 || providers.size !== rows.length
+      || providers.size === 0 || providers.size !== this.enabledProviders.length
+      || this.enabledProviders.some(provider => !providers.has(provider))) throw new Error('exact registered managed providers required')
+    if (!this.stopSettlement) throw new Error('owned cleanup must settle before provider receipt publication')
+    const cleanup = await this.stopSettlement
+    if (!cleanup.ok || cleanup.errors.length > 0) throw new Error('owned cleanup failed before provider receipt publication')
+    const finalized = this.finalizeProviderQualificationReceipt(rows)
+    const artifactRefs = finalized.paths.map(target => {
+      fs.chmodSync(target, 0o600)
+      return `provider-qualification:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
+    })
+    const result = RuntimeProviderReceiptArtifactsSchema.parse({ schemaVersion: finalized.receipt.schemaVersion,
+      rowCount: finalized.receipt.providers.length, artifactRefs })
+    process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'external.provider_receipt_published',
+      runId: this.runtime.runId, candidateSha: this.runtime.candidateSha, ...result })}\n`)
+    return result
   }
 
   async validateFreshAgentIngressInventory(): Promise<void> {

@@ -23,7 +23,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
   OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, OpencodeLossRecoverySchema,
   OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema,
-  RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema,
+  RuntimeProviderReceiptArtifactsSchema, RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema,
   OpencodeContinuityStartupFactsSchema, OpencodeContinuityFirstReplySchema, RuntimeTerminalContinuityObservationSchema,
   OpencodeQualificationStartupFactsSchema,
   OpencodeReplacementReadinessSchema,
@@ -47,6 +47,8 @@ import type { OpencodeLossCredentialEvidence, OpencodeLossAbsenceEvidence, Openc
 import type { RuntimeLossAssertions, RuntimeLossAssertionsArtifact, RuntimeLossReceiptArtifact } from './runtime-sandbox.js'
 import type { RuntimeFreshAgentReceiptArtifacts, RuntimeOwnershipFacts, RuntimeTerminalChildFacts } from './runtime-sandbox.js'
 import type { OpencodeContinuityStartupFacts } from './runtime-sandbox.js'
+import type { ProviderQualificationRow } from './provider-qualification-receipt.js'
+import type { RuntimeProviderReceiptArtifacts } from './runtime-sandbox.js'
 import type { FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
@@ -722,7 +724,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -891,6 +893,9 @@ export class ExternalManagedRuntimeRig {
     return this.rpc('terminal-continuity-receipt', z.object({
       artifactRef: z.string().regex(/^terminal-continuity-receipt:[a-f0-9]{64}$/),
     }).strict(), { enclosure, continuityObservation })
+  }
+  async publishProviderQualification(providerObservations: ProviderQualificationRow[]): Promise<RuntimeProviderReceiptArtifacts> {
+    return this.rpc('provider-receipt', RuntimeProviderReceiptArtifactsSchema, { providerObservations })
   }
   async publishFreshAgentQualification(freshAgentObservations: FreshAgentQualificationRow[]): Promise<RuntimeFreshAgentReceiptArtifacts> {
     return this.rpc('fresh-agent-receipt', RuntimeFreshAgentReceiptArtifactsSchema, { freshAgentObservations })
@@ -1186,7 +1191,7 @@ export function createExternalRuntimeControl(
   const execute = async (request: RuntimeOwnerOperationRequest) => {
     if (finished && request.action !== 'finish' && request.action !== 'abort'
       && request.action !== 'candidate-integrity' && request.action !== 'chaos-receipt' && request.action !== 'loss-receipt'
-      && request.action !== 'fresh-agent-receipt') {
+      && request.action !== 'fresh-agent-receipt' && request.action !== 'provider-receipt') {
       throw new Error('external owned runtime is finished')
     }
     const handle = () => {
@@ -1387,6 +1392,10 @@ export function createExternalRuntimeControl(
         result = await owner.freshAgentLaunchFacts(request.enclosure)
         break
       case 'fresh-agent-ingresses': await owner.validateFreshAgentIngressInventory(); result = { completed: true }; break
+      case 'provider-receipt':
+        if (!request.providerObservations) throw new Error('observed provider rows required')
+        result = await owner.publishProviderQualification(request.providerObservations)
+        break
       case 'fresh-agent-receipt':
         if (!request.freshAgentObservations) throw new Error('observed fresh-agent rows required')
         result = await owner.publishFreshAgentQualification(request.freshAgentObservations)
