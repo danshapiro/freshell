@@ -887,6 +887,18 @@ export const OpencodeReplacementReadinessSchema = z.object({
 export type OpencodeReplacementReadiness = z.infer<typeof OpencodeReplacementReadinessSchema>
 export const OpencodeReadinessConfirmationSchema = OpencodeReplacementReadinessSchema.pick({ terminalId: true, streamEpoch: true, headSeq: true })
 export type OpencodeReadinessConfirmation = z.infer<typeof OpencodeReadinessConfirmationSchema>
+export const OpencodeReadinessDiagnosticSchema = z.object({
+  soulId: z.string().min(1), incarnationId: z.string().min(1), terminalId: z.string().min(1), stableLaunchStreamId: z.string().min(1),
+  paneStreamId: z.string().optional(), paneIncarnationId: z.string().optional(),
+  browserInputReady: z.boolean().optional(), browserModelBanner: z.boolean().optional(),
+  sourceIncarnationId: z.string().optional(), sourceStreamEpoch: z.string().optional(), sourceTerminalId: z.string().optional(),
+  sourceExited: z.boolean().optional(), sourceReady: z.boolean().optional(),
+  sourceCursor: OpencodeReplacementReadinessSchema.shape.headSeq.optional(),
+  observedStreamChanges: z.array(z.object({ terminalId: z.string(), streamId: z.string(), reason: z.string(),
+    attachRequestId: z.string().nullable() }).strict()).max(10),
+  observedWebSocketFrameTypes: z.array(z.string()), observedWebSocketCount: z.number().int().nonnegative(),
+}).strict()
+export type OpencodeReadinessDiagnostic = z.infer<typeof OpencodeReadinessDiagnosticSchema>
 const OpencodeQualificationProofStageSchema = z.enum(['initial', 'after_session_host_crash', 'after_provider_process_crash'])
 export type OpencodeQualificationProofStage = z.infer<typeof OpencodeQualificationProofStageSchema>
 const OpencodeQualificationNativeEvidenceSchema = z.object({ kind: z.literal('identified_message'),
@@ -1005,6 +1017,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'opencode-qualification-blockers',
     'opencode-replacement-readiness',
     'opencode-readiness-confirm',
+    'opencode-readiness-diagnostic',
     'opencode-qualification-second-view',
     'opencode-qualification-notice-count',
     'opencode-qualification-message-ids',
@@ -1051,6 +1064,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   priorMessageIds: z.array(z.string().min(1)).max(128).optional(),
   otherChallengeId: z.string().min(1).optional(),
   qualificationReadiness: OpencodeReadinessConfirmationSchema.optional(),
+  qualificationDiagnostic: OpencodeReadinessDiagnosticSchema.optional(),
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
@@ -3741,6 +3755,19 @@ export class ManagedRuntimeOwner {
       soulId: handle.soulId, incarnationId: handle.incarnationId, terminalId: observed.terminalId,
       streamEpoch: observed.streamEpoch, cursor: observed.headSeq,
     })
+  }
+  async publishOpenCodeReadinessDiagnostic(handle: RuntimeEnclosureHandle, input: OpencodeReadinessDiagnostic): Promise<{ artifactRef: string }> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    const diagnostic = OpencodeReadinessDiagnosticSchema.parse(input)
+    if (diagnostic.soulId !== handle.soulId || diagnostic.incarnationId !== handle.incarnationId) {
+      throw new Error('readiness diagnostic belongs to another identity')
+    }
+    const target = this.runtime.writeBrowserArtifact('opencode-replacement-readiness', diagnostic)
+    const artifactRef = `opencode-replacement-readiness:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
+    this.runtime.recordLifecycle('external.opencode_readiness_diagnostic_published', { severity: 'info', artifactRef,
+      soulId: handle.soulId, incarnationId: handle.incarnationId })
+    return { artifactRef }
   }
   async registerOpenCodeQualificationNonce(handle: ExactRuntimeHandle, nonce: string): Promise<{ challengeId: string }> {
     if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')

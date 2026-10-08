@@ -18,6 +18,7 @@ import {
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
   type OpencodeQualificationTurn, type OpencodeQualificationProofStage,
+  type OpencodeReadinessDiagnostic,
 } from '../helpers/managed-runtime.js'
 import { requireOpenCodeOnecliBootstrap } from '../helpers/opencode-auth-file.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -244,7 +245,7 @@ async function waitForReplacementPrompt(
   if (!terminalId) throw new Error('replacement provider has no terminal identity')
   if (!view.terminalStreamId) throw new Error('replacement provider has no stable launch stream identity')
   const modelTexts = ['GPT-5.6 Luna', P2_OPENCODE_MODEL]
-  let diagnostic: Record<string, unknown> = {
+  let diagnostic: Omit<OpencodeReadinessDiagnostic, 'observedStreamChanges' | 'observedWebSocketFrameTypes' | 'observedWebSocketCount'> = {
     soulId: view.soulId,
     incarnationId: view.incarnationId,
     terminalId,
@@ -315,12 +316,16 @@ async function waitForReplacementPrompt(
     })
   } catch (error) {
     // Keep identity/readiness facts, never conversation text, in failure receipts.
-    rig.runtime.writeBrowserArtifact('opencode-replacement-readiness', {
-      ...diagnostic,
-      observedStreamChanges: observedStreamChanges.slice(-10),
-      observedWebSocketFrameTypes: [...observedWebSocketFrameTypes].sort(),
-      observedWebSocketCount: observedWebSocketCount.value,
-    })
+    try {
+      await rig.publishOpenCodeReadinessDiagnostic(rig.runtimeEnclosureHandle(view), {
+        ...diagnostic,
+        observedStreamChanges: observedStreamChanges.slice(-10),
+        observedWebSocketFrameTypes: [...observedWebSocketFrameTypes].sort(),
+        observedWebSocketCount: observedWebSocketCount.value,
+      })
+    } catch (diagnosticError) {
+      throw new AggregateError([error, diagnosticError], 'OpenCode readiness failure and owner diagnostic publication failed')
+    }
     throw error
   }
 }

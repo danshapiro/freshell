@@ -1942,6 +1942,38 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('publishes only fixed readiness diagnostic metadata to the owner private artifact', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-readiness-diagnostic-'))
+    try {
+      const { owned, context, inventory, request } = fixture()
+      Object.assign(owned.runtime, { phase: 5, browserDir: directory })
+      const row = { soulId: 'diagnostic-soul', incarnationId: 'diagnostic-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'diagnostic-boot', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+      const diagnostic = { soulId: row.soulId, incarnationId: row.incarnationId, terminalId: 'owned-terminal',
+        stableLaunchStreamId: 'stable-launch-stream', paneStreamId: 'browser-stream', browserInputReady: false,
+        browserModelBanner: true, observedStreamChanges: [{ terminalId: 'owned-terminal', streamId: 'browser-stream',
+          reason: 'host_replacement', attachRequestId: null }], observedWebSocketFrameTypes: ['ready'], observedWebSocketCount: 1 }
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => new Response(JSON.stringify(
+        await control(JSON.parse(String(init.body)))), { status: 200 }))
+      const enclosure = rig.runtimeEnclosureHandle(row)
+      const result = await rig.publishOpenCodeReadinessDiagnostic(enclosure, diagnostic)
+      const filename = path.join(directory, 'opencode-replacement-readiness.json')
+      const bytes = await fsp.readFile(filename)
+      expect(result).toEqual({ artifactRef: `opencode-replacement-readiness:${createHash('sha256').update(bytes).digest('hex')}` })
+      expect(JSON.parse(bytes.toString())).toEqual(diagnostic)
+      expect((await fsp.stat(filename)).mode & 0o777).toBe(0o600)
+      await expect(owned.publishOpenCodeReadinessDiagnostic(enclosure, { ...diagnostic, soulId: 'foreign-soul' })).rejects.toThrow(/identity/)
+      await expect(control({ ...request, action: 'opencode-readiness-diagnostic', enclosure,
+        qualificationDiagnostic: { ...diagnostic, transcript: 'private body' } })).rejects.toThrow(/operation/)
+      inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement' }])
+      await expect(owned.publishOpenCodeReadinessDiagnostic(enclosure, diagnostic)).rejects.toThrow(/current/)
+    } finally { await fsp.rm(directory, { recursive: true, force: true }) }
+  })
   it('selects and hashes the existing qualification native turn on the owner without returning response bodies', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-qualification-proof-'))
     const filename = path.join(directory, 'opencode.db')

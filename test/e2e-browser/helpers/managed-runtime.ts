@@ -12,6 +12,7 @@ export {
   type Phase3BrowserObservation,
   type RuntimeTerminalContinuityObservation,
   type OpencodeQualificationTurn, type OpencodeQualificationProofStage,
+  type OpencodeReadinessDiagnostic,
 } from '../../../scripts/testing/runtime-sandbox.js'
 
 /** The browser fixture supplies its owned web process to the shared owner. */
