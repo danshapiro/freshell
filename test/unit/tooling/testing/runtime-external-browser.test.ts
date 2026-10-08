@@ -1942,6 +1942,73 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('selects and hashes the existing qualification native turn on the owner without returning response bodies', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-qualification-proof-'))
+    const filename = path.join(directory, 'opencode.db')
+    const db = new DatabaseSync(filename)
+    try {
+      const { owned, context, inventory, request } = fixture()
+      Object.assign(owned.runtime, { phase: 5 })
+      const row = { soulId: 'proof-soul', incarnationId: 'proof-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'proof-boot', nativeSessionId: 'ses_proof', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+      const other = { ...row, soulId: 'other-soul', incarnationId: 'other-incarnation', containerId: 'c'.repeat(64),
+        hostBootId: 'other-boot', nativeSessionId: 'ses_other' }
+      inventory.mockResolvedValue([row, other])
+      const receipts: BrokerReceipt[] = [row, other].map(view => ({ containerId: view.containerId, soulId: view.soulId,
+        incarnationId: view.incarnationId, createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64),
+        imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }))
+      Object.assign(owned.runtime, { broker: { receipts: () => receipts } })
+      const nonce = `p-${'A'.repeat(22)}`, otherNonce = `p-${'B'.repeat(22)}`
+      let text = `${nonce} private native response body`
+      db.exec('CREATE TABLE session(id TEXT); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT)')
+      db.prepare('INSERT INTO session VALUES (?)').run(row.nativeSessionId)
+      for (const [order, id] of ['msg_old', 'msg_fresh'].entries()) {
+        db.prepare('INSERT INTO message VALUES (?,?,?,?)').run(id, row.nativeSessionId, order + 1,
+          JSON.stringify({ role: 'assistant', time: { completed: order + 1 }, providerID: 'openai', modelID: 'gpt-5.6-luna' }))
+        db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run(`part_${id}`, row.nativeSessionId, id, order + 1,
+          JSON.stringify({ type: 'text', text }))
+      }
+      const read = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (_id, args) => {
+        const child = spawnSync(process.execPath, [...args.slice(1, -2), filename, args[args.length - 1]], { encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('private native turn probe failed')
+        return child.stdout
+      })
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const wire: unknown[] = []
+      const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      const handle = rig.exactRuntimeHandle(row)
+      const challenge = await rig.registerOpenCodeQualificationNonce(handle, nonce)
+      const otherChallenge = await rig.registerOpenCodeQualificationNonce(rig.exactRuntimeHandle(other), otherNonce)
+      const result = await rig.openCodeQualificationTurn(handle, challenge.challengeId, 'initial', ['msg_old'], otherChallenge.challengeId)
+      expect(result).toMatchObject({ messageId: 'msg_fresh', containsOtherNonce: false,
+        proof: { schemaVersion: 2, stage: 'initial', nativeSessionId: row.nativeSessionId,
+          nativeEvidence: { kind: 'identified_message', messageId: 'msg_fresh', turnId: 'msg_fresh' },
+          responseSha256: createHash('sha256').update(text).digest('hex'), responseContainsNonce: true,
+          toolCallCount: 0, toolCallTypes: [], resolvedProvider: 'openai', resolvedModel: 'gpt-5.6-luna' } })
+      await expect(rig.openCodeQualificationTurn(handle, challenge.challengeId, 'initial', ['msg_old', 'msg_fresh'])).resolves.toBeNull()
+      text += ` ${otherNonce}`
+      db.prepare('UPDATE part SET data=? WHERE id=?').run(JSON.stringify({ type: 'text', text }), 'part_msg_fresh')
+      expect(await rig.openCodeQualificationTurn(handle, challenge.challengeId, 'after_session_host_crash', ['msg_old'], otherChallenge.challengeId))
+        .toMatchObject({ containsOtherNonce: true, proof: { stage: 'after_session_host_crash' } })
+      db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('part_tool', row.nativeSessionId, 'msg_fresh', 3,
+        JSON.stringify({ type: 'tool', tool: 'bash' }))
+      await expect(rig.openCodeQualificationTurn(handle, challenge.challengeId, 'initial', ['msg_old'])).resolves.toBeNull()
+      expect(JSON.stringify(wire)).not.toContain('private native response')
+      expect(JSON.stringify(wire)).not.toContain(nonce)
+      expect(JSON.stringify(wire)).not.toContain(otherNonce)
+      read.mockClear()
+      await expect(owned.openCodeQualificationTurn(handle, 'unknown-challenge', 'initial', [])).rejects.toThrow(/registered/)
+      await expect(control({ ...request, action: 'opencode-qualification-turn', handle, challengeId: challenge.challengeId,
+        qualificationProofStage: 'arbitrary', priorMessageIds: [] })).rejects.toThrow(/operation/)
+      inventory.mockResolvedValue([{ ...row, nativeSessionId: 'ses_replacement' }, other])
+      await expect(owned.openCodeQualificationTurn(handle, challenge.challengeId, 'initial', [])).rejects.toThrow(/current/)
+      expect(read).not.toHaveBeenCalled()
+    } finally { db.close(); await fsp.rm(directory, { recursive: true, force: true }) }
+  })
   it('registers only the fixed qualification nonce shape against the exact current native root', async () => {
     const { owned, context, inventory, request } = fixture()
     Object.assign(owned.runtime, { phase: 5 })

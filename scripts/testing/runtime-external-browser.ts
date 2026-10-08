@@ -27,6 +27,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   OpencodeContinuityStartupFactsSchema, OpencodeContinuityFirstReplySchema, RuntimeTerminalContinuityObservationSchema,
   OpencodeQualificationStartupFactsSchema,
   OpencodeReplacementReadinessSchema,
+  OpencodeQualificationTurnSchema,
   requireOpenCodeOnecliBootstrap, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
@@ -719,7 +720,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -932,6 +933,12 @@ export class ExternalManagedRuntimeRig {
   }
   async registerOpenCodeQualificationNonce(handle: ExactRuntimeHandle, qualificationNonce: string): Promise<{ challengeId: string }> {
     return this.rpc('opencode-qualification-nonce', z.object({ challengeId: z.string().uuid() }).strict(), { handle, qualificationNonce })
+  }
+  async openCodeQualificationTurn(handle: ExactRuntimeHandle, challengeId: string,
+    qualificationProofStage: z.infer<typeof OpencodeQualificationTurnSchema>['proof']['stage'],
+    priorMessageIds: string[], otherChallengeId?: string): Promise<z.infer<typeof OpencodeQualificationTurnSchema> | null> {
+    return this.rpc('opencode-qualification-turn', OpencodeQualificationTurnSchema.nullable(),
+      { handle, challengeId, qualificationProofStage, priorMessageIds, otherChallengeId })
   }
   async openCodeContinuityFirstTurnCompleted(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
     return this.rpc('opencode-continuity-first-turn', z.boolean(), { enclosure })
@@ -1333,6 +1340,11 @@ export function createExternalRuntimeControl(
       case 'opencode-qualification-nonce':
         if (!request.qualificationNonce) throw new Error('fixed qualification nonce required')
         result = await owner.registerOpenCodeQualificationNonce(handle(), request.qualificationNonce)
+        break
+      case 'opencode-qualification-turn':
+        if (!request.challengeId || !request.qualificationProofStage || !request.priorMessageIds) throw new Error('registered challenge, stage and prior IDs required')
+        result = await owner.openCodeQualificationTurn(handle(), request.challengeId, request.qualificationProofStage,
+          request.priorMessageIds, request.otherChallengeId)
         break
       case 'opencode-continuity-effect-count':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')

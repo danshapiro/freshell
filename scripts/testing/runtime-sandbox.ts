@@ -885,6 +885,28 @@ export const OpencodeReplacementReadinessSchema = z.object({
   exited: z.boolean(), headSeq: z.union([z.number().int().nonnegative(), z.string().regex(/^\d+$/)]), sourceReady: z.boolean(),
 }).strict()
 export type OpencodeReplacementReadiness = z.infer<typeof OpencodeReplacementReadinessSchema>
+const OpencodeQualificationProofStageSchema = z.enum(['initial', 'after_session_host_crash', 'after_provider_process_crash'])
+export type OpencodeQualificationProofStage = z.infer<typeof OpencodeQualificationProofStageSchema>
+const OpencodeQualificationNativeEvidenceSchema = z.object({ kind: z.literal('identified_message'),
+  turnId: z.string(), messageId: z.string(), parentMessageId: z.string().nullable() }).strict()
+const OpencodeQualificationNativeTurnSchema = z.object({
+  nativeEvidence: OpencodeQualificationNativeEvidenceSchema, turnId: z.string().optional(), messageId: z.string().optional(),
+  parentMessageId: z.string().nullable().optional(), completedAt: z.union([z.string(), z.number()]), text: z.string(),
+  toolCalls: z.array(z.object({ type: z.string(), name: z.string().optional() })),
+  resolvedProvider: z.string(), resolvedModel: z.string(), resolvedReasoningEffort: z.string(),
+  providerProvenance: z.string(), modelProvenance: z.string(), reasoningEffortProvenance: z.string(),
+})
+export const OpencodeQualificationTurnSchema = z.object({ messageId: z.string().min(1),
+  containsOtherNonce: z.boolean().nullable(), proof: z.object({ schemaVersion: z.literal(2),
+    stage: OpencodeQualificationProofStageSchema, nativeSessionId: z.string().min(1),
+    nativeEvidence: OpencodeQualificationNativeEvidenceSchema, completedAt: z.union([z.string(), z.number()]),
+    responseSha256: z.string().regex(/^[a-f0-9]{64}$/), responseContainsNonce: z.literal(true),
+    toolCallCount: z.number().int().nonnegative(), toolCallTypes: z.array(z.string()),
+    resolvedProvider: z.string(), resolvedModel: z.string(), resolvedReasoningEffort: z.string(),
+    providerProvenance: z.string(), modelProvenance: z.string(), reasoningEffortProvenance: z.string(),
+  }).strict(),
+}).strict()
+export type OpencodeQualificationTurn = z.infer<typeof OpencodeQualificationTurnSchema>
 const TerminalContinuityIdentitySchema = z.object({
   soulId: z.string().min(1), incarnationId: z.string().min(1),
   containerId: z.string().regex(/^[a-f0-9]{64}$/), hostBootId: z.string().min(1),
@@ -984,6 +1006,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'opencode-qualification-notice-count',
     'opencode-qualification-message-ids',
     'opencode-qualification-nonce',
+    'opencode-qualification-turn',
     'terminal-continuity-receipt',
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
@@ -1021,6 +1044,9 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   continuityObservation: RuntimeTerminalContinuityObservationSchema.optional(),
   qualificationTerminalId: z.string().min(1).max(200).optional(),
   qualificationNonce: z.string().regex(/^p-[A-Za-z0-9_-]{22}$/).optional(),
+  qualificationProofStage: OpencodeQualificationProofStageSchema.optional(),
+  priorMessageIds: z.array(z.string().min(1)).max(128).optional(),
+  otherChallengeId: z.string().min(1).optional(),
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
@@ -3703,6 +3729,27 @@ export class ManagedRuntimeOwner {
     const challengeId = randomUUID()
     this.nativeChallenges.set(challengeId, { soulId: handle.soulId, nativeSessionId: handle.nativeSessionId, marker: nonce })
     return { challengeId }
+  }
+  async openCodeQualificationTurn(handle: ExactRuntimeHandle, challengeId: string, stage: OpencodeQualificationProofStage,
+    priorMessageIds: readonly string[], otherChallengeId?: string): Promise<OpencodeQualificationTurn | null> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    const marker = await this.nativeChallengeMarker(handle, challengeId)
+    if (!/^p-[A-Za-z0-9_-]{22}$/.test(marker)) throw new Error('registered qualification nonce required')
+    const other = otherChallengeId ? this.nativeChallenges.get(otherChallengeId) : undefined
+    if (otherChallengeId && (!other || !/^p-[A-Za-z0-9_-]{22}$/.test(other.marker))) {
+      throw new Error('other registered qualification nonce required')
+    }
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
+      '/home/freshell/provider/.local/share/opencode/opencode.db', handle.nativeSessionId])
+    const history = z.object({ schemaVersion: z.literal(1), nativeSessionId: z.literal(handle.nativeSessionId),
+      turns: z.array(OpencodeQualificationNativeTurnSchema) }).passthrough().parse(JSON.parse(raw))
+    const { selectNativeAssistantTurn, nativeTurnProof } = await import('./provider-native-history.js')
+    const turn = selectNativeAssistantTurn(history.turns, new Set(priorMessageIds), marker)
+    if (!turn) return null
+    return OpencodeQualificationTurnSchema.parse({ messageId: turn.messageId,
+      proof: nativeTurnProof(stage, handle.nativeSessionId, turn, marker),
+      containsOtherNonce: other ? turn.text.includes(other.marker) : null })
   }
   async openCodeQualificationAssistantMessageIds(handle: ExactRuntimeHandle): Promise<string[]> {
     if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')

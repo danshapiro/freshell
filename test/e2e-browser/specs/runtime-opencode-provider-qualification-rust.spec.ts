@@ -17,6 +17,7 @@ import {
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
+  type OpencodeQualificationTurn, type OpencodeQualificationProofStage,
 } from '../helpers/managed-runtime.js'
 import { requireOpenCodeOnecliBootstrap } from '../helpers/opencode-auth-file.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -24,11 +25,7 @@ import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import {
   hasOpenCodePromptModelText,
-  nativeTurnProof,
   openCodeCredentialFailureMessage,
-  OPENCODE_NATIVE_HISTORY_SCRIPT,
-  selectNativeAssistantTurn,
-  type NativeAssistantTurn,
 } from '../helpers/opencode-native-history.js'
 import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
 
@@ -340,26 +337,16 @@ async function paneSessionId(
   return typeof content?.sessionRef?.sessionId === 'string' ? content.sessionRef.sessionId : null
 }
 
-async function nativeAssistantTurns(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string): Promise<NativeAssistantTurn[]> {
-  if (!view.containerId) throw new Error('native evidence probe has no exact owned container')
-  const raw = (await rig.ownedProviderExec(view.containerId, [
-    'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
-    '/home/freshell/provider/.local/share/opencode/opencode.db', sessionId,
-  ]))
-  const evidence = JSON.parse(raw)
-  expect(evidence.schemaVersion).toBe(1)
-  expect(evidence.nativeSessionId).toBe(sessionId)
-  return evidence.turns
-}
-
 async function nextNativeAssistantTurn(
   page: Page,
   terminalId: string,
   rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string,
-  priorMessageIds: ReadonlySet<string>, expectedText: string,
-): Promise<NativeAssistantTurn> {
+  challengeId: string, stage: OpencodeQualificationProofStage,
+  priorMessageIds: ReadonlySet<string>, otherChallengeId?: string,
+): Promise<OpencodeQualificationTurn> {
   return waitForValue('the correlated completed native assistant response, not a rendered echo', async () => (
-    selectNativeAssistantTurn((await nativeAssistantTurns(rig, view, sessionId)), priorMessageIds, expectedText)
+    rig.openCodeQualificationTurn(rig.exactRuntimeHandle({ ...view, nativeSessionId: sessionId }),
+      challengeId, stage, [...priorMessageIds], otherChallengeId)
   ), 180_000, async () => {
     const terminalOutput = await page.evaluate((id) => (
       window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer?.(id) ?? ''
@@ -369,10 +356,11 @@ async function nextNativeAssistantTurn(
   })
 }
 
-function verifyMemoryAnswer(turn: NativeAssistantTurn, projectName: string): void {
-  expect(turn.toolCalls, 'conversation recall must not consult workspace files or tools').toEqual([])
-  expect(`${turn.resolvedProvider}/${turn.resolvedModel}`).toBe(P2_OPENCODE_MODEL)
-  expect(turn.text).toContain(projectName)
+function verifyMemoryAnswer(turn: OpencodeQualificationTurn): void {
+  expect(turn.proof.toolCallCount, 'conversation recall must not consult workspace files or tools').toBe(0)
+  expect(turn.proof.toolCallTypes).toEqual([])
+  expect(`${turn.proof.resolvedProvider}/${turn.proof.resolvedModel}`).toBe(P2_OPENCODE_MODEL)
+  expect(turn.proof.responseContainsNonce).toBe(true)
 }
 
 function cgroupLimitEvidence(view: ManagedRuntimeView, actual: NonNullable<ProviderQualificationRow['limitEvidence']>): ProviderQualificationRow['limitEvidence'] {
@@ -498,9 +486,11 @@ test.describe.serial('OpenCode provider qualification', () => {
         await paneSessionId(harness, tabId, first.paneId)
       ), 120_000)
       expect(nativeSessionId).toMatch(/^ses_/)
-      const firstAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, first.view, nativeSessionId, new Set(), nonce)
-      verifyMemoryAnswer(firstAnswer, nonce)
-      const nativeTurnProofs = [nativeTurnProof('initial', nativeSessionId, firstAnswer, nonce)]
+      const firstChallenge = await rig.registerOpenCodeQualificationNonce(rig.exactRuntimeHandle({ ...first.view, nativeSessionId }), nonce)
+      const firstAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, first.view, nativeSessionId,
+        firstChallenge.challengeId, 'initial', new Set())
+      verifyMemoryAnswer(firstAnswer)
+      const nativeTurnProofs = [firstAnswer.proof]
 
       // Session-host/container loss: exact old enclosure must be empty before
       // the new incarnation becomes the sole writer.
@@ -533,10 +523,11 @@ test.describe.serial('OpenCode provider qualification', () => {
         rig.exactRuntimeHandle({ ...afterHostCrash, nativeSessionId })))
       await executeInPane(page, first.paneId,
         'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
-      const recalledAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterHostCrash, nativeSessionId, beforeRecall, nonce)
-      verifyMemoryAnswer(recalledAnswer, nonce)
+      const recalledAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterHostCrash, nativeSessionId,
+        firstChallenge.challengeId, 'after_session_host_crash', beforeRecall)
+      verifyMemoryAnswer(recalledAnswer)
       expect(recalledAnswer.messageId).not.toBe(firstAnswer.messageId)
-      nativeTurnProofs.push(nativeTurnProof('after_session_host_crash', nativeSessionId, recalledAnswer, nonce))
+      nativeTurnProofs.push(recalledAnswer.proof)
       const recalledNonce = true
 
       // Provider-process loss: kill only the exact host-recorded worker PID,
@@ -570,10 +561,11 @@ test.describe.serial('OpenCode provider qualification', () => {
         rig.exactRuntimeHandle({ ...afterProviderCrash, nativeSessionId })))
       await executeInPane(page, first.paneId,
         'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
-      const providerAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup, nonce)
-      verifyMemoryAnswer(providerAnswer, nonce)
+      const providerAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterProviderCrash, nativeSessionId,
+        firstChallenge.challengeId, 'after_provider_process_crash', beforeProviderFollowup)
+      verifyMemoryAnswer(providerAnswer)
       expect(providerAnswer.messageId).not.toBe(recalledAnswer.messageId)
-      nativeTurnProofs.push(nativeTurnProof('after_provider_process_crash', nativeSessionId, providerAnswer, nonce))
+      nativeTurnProofs.push(providerAnswer.proof)
       const providerFollowUpCompleted = true
 
       // A second OpenCode soul is independently owned, while an explicit
@@ -587,9 +579,11 @@ test.describe.serial('OpenCode provider qualification', () => {
       const secondSessionId = await waitForValue('second exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, second.paneId)
       ), 120_000)
-      const secondAnswer = await nextNativeAssistantTurn(page, second.terminalId, rig, second.view, secondSessionId, new Set(), secondNonce)
-      verifyMemoryAnswer(secondAnswer, secondNonce)
-      expect(secondAnswer.text).not.toContain(nonce)
+      const secondChallenge = await rig.registerOpenCodeQualificationNonce(rig.exactRuntimeHandle({ ...second.view, nativeSessionId: secondSessionId }), secondNonce)
+      const secondAnswer = await nextNativeAssistantTurn(page, second.terminalId, rig, second.view, secondSessionId,
+        secondChallenge.challengeId, 'initial', new Set(), firstChallenge.challengeId)
+      verifyMemoryAnswer(secondAnswer)
+      expect(secondAnswer.containsOtherNonce).toBe(false)
       expect(second.view.soulId).not.toBe(first.view.soulId)
       expect(second.view.containerId).not.toBe(afterProviderCrash.containerId)
       expect(secondSessionId).not.toBe(nativeSessionId)
