@@ -181,6 +181,11 @@ impl HostedPty {
         };
         let mut provider_env = launch.env.clone();
         provider_env.extend(child_secret_env);
+        if launch.mode == "opencode" && native_identity_launch.is_some() {
+            // The managed image owns the native version; an automatic install
+            // cannot precede its no-input loader acknowledgement.
+            provider_env.insert("OPENCODE_DISABLE_AUTOUPDATE".into(), "true".into());
+        }
         if let Some(settings) = statusline_settings {
             provider_env.insert("FRESHELL_NATIVE_STATUSLINE_SETTINGS".into(), settings);
         }

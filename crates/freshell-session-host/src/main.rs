@@ -6389,6 +6389,103 @@ print('native-startup-without-update-input')
     }
 
     #[tokio::test]
+    async fn managed_opencode_default_spawn_keeps_image_pin_before_native_startup() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("owned-opencode-startup");
+        std::fs::write(&program, r#"#!/usr/bin/python3
+import os,sys
+args=sys.argv[1:]
+if '--model' not in args or args[args.index('--model')+1]!='openai/gpt-5.6-luna':sys.exit(8)
+if '--session' in args and args[args.index('--session')+1]!='ses_ownedroot':sys.exit(9)
+print('native-startup-without-update-input' if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 'native-update-input-gate')
+sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
+"#).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root.path().join("ordinary-native-settings");
+        std::fs::write(&config, b"selected ordinary settings\n").unwrap();
+        for (mode, managed, resume, caller_setting, expected_exit) in [
+            ("opencode", true, false, None, 0),
+            ("opencode", true, true, None, 0),
+            ("opencode", true, true, Some("false"), 0),
+            ("opencode", true, false, Some("true"), 0),
+            ("opencode", false, false, None, 7),
+            ("opencode", false, true, Some("false"), 7),
+            ("opencode", false, true, Some("true"), 0),
+            ("shell", true, false, None, 7),
+        ] {
+            let state = test_host_state();
+            let mut args = vec!["--model", "openai/gpt-5.6-luna"];
+            if resume {
+                args.extend(["--session", "ses_ownedroot"]);
+            }
+            let mut launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                "terminalId":"owned-pinned-startup", "streamId":"owned-pinned-startup", "mode":mode, "program":program,
+                "args":args, "cwd":root.path(), "workspacePath":root.path(), "projectKey":"owned-pinned-startup",
+                "cols":80, "rows":24, "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+                "env":{"HOME":root.path(),"PATH":"/usr/bin:/bin"}, "resumeSessionId":resume.then_some("ses_ownedroot")
+            })).unwrap();
+            if let Some(setting) = caller_setting {
+                launch
+                    .env
+                    .insert("OPENCODE_DISABLE_AUTOUPDATE".into(), setting.into());
+            }
+            let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: state.incarnation_id.clone(),
+                launch_nonce: "owned-pinned-launch".into(),
+                evidence_revision: 0,
+                execution_generation: 1,
+                requested_native_session_id: resume.then(|| "ses_ownedroot".into()),
+            };
+            let child_env = if managed {
+                std::collections::BTreeMap::from([(
+                    providers::native_identity::LAUNCH_ENV.into(),
+                    serde_json::to_string(&binding).unwrap(),
+                )])
+            } else {
+                Default::default()
+            };
+            let pty = HostedPty::spawn(
+                &state.state_dir,
+                state.incarnation_id.clone(),
+                &launch,
+                child_env,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            for _ in 0..100 {
+                if pty.exited() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(pty.exited(), "owned child must finish before input");
+            let output = pty
+                .read_output(state.incarnation_id.clone(), 0, 65536, None)
+                .unwrap();
+            assert_eq!(pty.exit_code(), expected_exit, "mode={mode} managed={managed} resume={resume} caller={caller_setting:?}: {output:?}");
+            assert!(output
+                .frames
+                .iter()
+                .any(|frame| frame.data.contains(if expected_exit == 0 {
+                    "native-startup-without-update-input"
+                } else {
+                    "native-update-input-gate"
+                })));
+            assert_eq!(
+                std::fs::read(&config).unwrap(),
+                b"selected ordinary settings\n"
+            );
+            assert!(
+                pty.native_identity_observation().is_none(),
+                "controlled child supplies no native identity proof"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn controlled_claude_parity_uses_configured_current_native_channels_before_input() {
         use std::os::unix::fs::PermissionsExt;
         let node = std::process::Command::new("node")
