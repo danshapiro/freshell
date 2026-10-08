@@ -181,6 +181,8 @@ pub(crate) async fn prepare_managed(
             claude_manifest: Some(&manifest),
             claude_observation: Some(&observation.observation),
             claude_inline_settings: inline_settings,
+            claude_reservation_provider: Some(request.reservation_provider),
+            claude_git_common_dir: request.git_common_dir,
             cwd: Some(request.cwd),
             workspace: Some(request.workspace),
             secret_references: Some(request.references),

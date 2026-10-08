@@ -44,6 +44,8 @@ pub(crate) struct OpencodeEphemeralInput<'a> {
     pub claude_observation:
         Option<&'a freshell_platform::claude_inputs::observation::NativeObservation>,
     pub claude_inline_settings: Option<&'a str>,
+    pub claude_reservation_provider: Option<&'a str>,
+    pub claude_git_common_dir: Option<&'a Path>,
     pub amplifier_manifest: Option<&'a freshell_platform::amplifier_inputs::AmplifierInputManifest>,
     pub inline_config: Option<&'a str>,
     pub tui_config_path: Option<&'a str>,
@@ -1883,6 +1885,121 @@ fn publish_prepared_context_metadata(
     Ok(())
 }
 
+fn publish_claude_candidate_binding(
+    root: &Path,
+    soul: &SoulId,
+    provider: &str,
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    input: OpencodeEphemeralInput<'_>,
+) -> Result<(), String> {
+    use freshell_runtime_protocol::{
+        bounded_json_bytes, ClaudeCandidatePublication, ClaudeSourceAuthority,
+        PreparedProviderContext, MAX_CONTROL_FRAME_BYTES,
+    };
+    if provider != "claude" {
+        return Ok(());
+    }
+    let Some(manifest) = input.claude_manifest else {
+        return Ok(());
+    };
+    let Some(plan) = &manifest.accepted_native_plan else {
+        return Ok(());
+    };
+    let unavailable =
+        || "Claude candidate issuer authority unavailable; retain inputs and reprepare".to_string();
+    let reservation = input.initial_auth_reservation.ok_or_else(unavailable)?;
+    if reservation.len() != 36 || uuid::Uuid::parse_str(reservation).is_err() {
+        return Err(unavailable());
+    }
+    let flavor = input.claude_reservation_provider.unwrap_or(provider);
+    if !matches!(flavor, "claude" | "kilroy")
+        || (flavor == "kilroy"
+            && plan.observation.native_source_runtime
+                != freshell_platform::claude_inputs::NativeSourceRuntime::Sdk)
+        || manifest.native_source_runtime != Some(plan.observation.native_source_runtime)
+        || plan.observation.setting_sources != manifest.setting_sources
+    {
+        return Err(unavailable());
+    }
+    let inputs = context.prepared_inputs.as_ref().ok_or_else(unavailable)?;
+    if inputs.initial_auth_reservation.as_deref() != Some(reservation)
+        || inputs.indexed_files.is_some()
+        || inputs.manifest.source_count != 0
+        || inputs.manifest.alias_count != 0
+        || inputs.manifest.recipe_count != 0
+    {
+        return Err(unavailable());
+    }
+    let selectors = bounded_json_bytes(&manifest.original_selectors(), 64 * 1024 * 1024)
+        .map_err(|_| unavailable())?;
+    if format!("{:x}", Sha256::digest(selectors)) != plan.selector_manifest_sha256 {
+        return Err(unavailable());
+    }
+    let workspace = std::fs::canonicalize(input.workspace.ok_or_else(unavailable)?)
+        .map_err(|_| unavailable())?;
+    let cwd =
+        std::fs::canonicalize(input.cwd.ok_or_else(unavailable)?).map_err(|_| unavailable())?;
+    if cwd != plan.observation.cwd || !cwd.starts_with(&workspace) {
+        return Err(unavailable());
+    }
+    let authority = ClaudeSourceAuthority::InitialReservation {
+        reservation_id: reservation.into(),
+    };
+    let result = PreparedProviderContext {
+        provider_launch_context: context.clone(),
+        provider_secret_references: input.secret_references.ok_or_else(unavailable)?.to_vec(),
+    };
+    result.validate("claude").map_err(|_| unavailable())?;
+    let publication = ClaudeCandidatePublication {
+        version: 1,
+        soul_id: soul.clone(),
+        provider: flavor.into(),
+        authority_sha256: format!(
+            "{:x}",
+            Sha256::digest(
+                bounded_json_bytes(&authority, MAX_CONTROL_FRAME_BYTES)
+                    .map_err(|_| unavailable())?
+            )
+        ),
+        initial_reservation_id: Some(reservation.into()),
+        registry_attempt_id: None,
+        intent_revision: 1,
+        prior_generation_id: None,
+        generation_id: inputs.generation_id.clone(),
+        manifest_sha256: inputs.manifest.sha256.clone(),
+        prepared_context_sha256: format!(
+            "{:x}",
+            Sha256::digest(
+                bounded_json_bytes(context, MAX_CONTROL_FRAME_BYTES).map_err(|_| unavailable())?
+            )
+        ),
+        prepared_result_sha256: format!(
+            "{:x}",
+            Sha256::digest(
+                bounded_json_bytes(&result, MAX_CONTROL_FRAME_BYTES).map_err(|_| unavailable())?
+            )
+        ),
+        selector_manifest_sha256: plan.selector_manifest_sha256.clone(),
+        plan_revision: plan.plan_revision,
+        native_source_runtime: plan.observation.native_source_runtime,
+        workspace_path: workspace.to_str().ok_or_else(unavailable)?.into(),
+        cwd,
+        git_common_dir: input
+            .claude_git_common_dir
+            .map(|path| {
+                std::fs::canonicalize(path)
+                    .map_err(|_| unavailable())
+                    .and_then(|path| path.to_str().map(str::to_owned).ok_or_else(unavailable))
+            })
+            .transpose()?,
+    };
+    let bytes =
+        bounded_json_bytes(&publication, MAX_CONTROL_FRAME_BYTES).map_err(|_| unavailable())?;
+    let path = root.join(".freshell/claude-candidate-binding.json");
+    write_private_bytes(&path, &bytes)?;
+    allow_controller_stage_read(&path)
+}
+
 impl CapabilityStore {
     fn renew_active_at(&self, now: u64, active: &HashSet<(SoulId, IncarnationId)>) {
         for grant in self.grants.lock().unwrap().values_mut() {
@@ -2003,7 +2120,16 @@ impl CapabilityStore {
                     provider,
                     &context,
                     opencode_input.secret_references,
-                );
+                )
+                .and_then(|()| {
+                    publish_claude_candidate_binding(
+                        root,
+                        &soul_id,
+                        provider,
+                        &context,
+                        opencode_input,
+                    )
+                });
                 if let Err(error) = result {
                     let _ = std::fs::remove_dir_all(root);
                     return Err(error);
@@ -3225,6 +3351,224 @@ except Exception as error:
             std::fs::read_to_string(home.join(".amplifier/settings.yaml")).unwrap(),
             format!("bundle:\n  active: file://{}\n", bundle.display())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_claude_issuer_publication_gates_owned_dependency_consumer() {
+        use freshell_platform::claude_inputs::{
+            observation::{observe, CandidateBinding, ObservationRequest},
+            AcceptedNativeSourcePlan, ClaudeInputManifest, ClaudeSettingSource,
+            NativeSourceRuntime,
+        };
+        use freshell_runtime_protocol::{
+            bounded_json_bytes, ClaudeCandidatePublication, ClaudeSourceAuthority,
+            ObserveClaudeSourcesRequest, PreparedProviderContext, ProviderLaunchContext,
+            ProviderPreparation, MAX_CONTROL_FRAME_BYTES,
+        };
+        for (flavor, runtime) in [
+            ("claude", NativeSourceRuntime::Terminal),
+            ("claude", NativeSourceRuntime::Sdk),
+            ("kilroy", NativeSourceRuntime::Sdk),
+        ] {
+            let owned = tempfile::tempdir().unwrap();
+            let directory = owned.path().join("capabilities");
+            let home = owned.path().join("original-home");
+            let workspace = owned.path().join("workspace");
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::create_dir(&workspace).unwrap();
+            let skill = home.join(".claude/skills/probe");
+            std::fs::create_dir_all(skill.join("node_modules/selected-dependency")).unwrap();
+            std::fs::write(
+                skill.join("node_modules/selected-dependency/index.js"),
+                "module.exports='issued-frozen-dependency'",
+            )
+            .unwrap();
+            std::fs::write(
+                skill.join("consumer.cjs"),
+                "process.stdout.write(require('selected-dependency'))",
+            )
+            .unwrap();
+            let mut manifest: ClaudeInputManifest = serde_json::from_value(serde_json::json!({"version":1,"nativeSourceRuntime":runtime,"originalHome":home,"cwd":workspace,"workspace":workspace,"configRoot":home.join(".claude"),"settingSources":["user"],"pluginDirs":[]})).unwrap();
+            let selector = format!(
+                "{:x}",
+                Sha256::digest(
+                    bounded_json_bytes(&manifest.original_selectors(), 64 * 1024 * 1024).unwrap()
+                )
+            );
+            let observation =
+                observe(&workspace, &home, runtime, &[ClaudeSettingSource::User]).unwrap();
+            manifest.accepted_native_plan = Some(AcceptedNativeSourcePlan {
+                selector_manifest_sha256: selector.clone(),
+                plan_revision: 0,
+                observation: observation.clone(),
+            });
+            let context = ProviderLaunchContext {
+                preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+                config: vec![],
+                mcp_capability: None,
+                prepared_inputs: None,
+            };
+            let store = CapabilityStore::default();
+            let soul = SoulId::new();
+            let reservation = uuid::Uuid::new_v4().to_string();
+            let capability = store
+                .issue(
+                    soul.clone(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("claude", &home, &[])),
+                    OpencodeEphemeralInput {
+                        claude_manifest: Some(&manifest),
+                        claude_observation: Some(&observation),
+                        claude_reservation_provider: Some(flavor),
+                        cwd: Some(&workspace),
+                        workspace: Some(&workspace),
+                        launch_context: Some(&context),
+                        secret_references: Some(&[]),
+                        initial_auth_reservation: Some(&reservation),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let context = read_prepared_context(&directory, &capability).unwrap();
+            let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+            let published = std::fs::read(stage.join(".freshell/claude-candidate-binding.json"))
+            .expect("issued candidate must publish its ownership binding before any consumer can be selected");
+            let publication: ClaudeCandidatePublication =
+                serde_json::from_slice(&published).unwrap();
+            let ready = PreparedProviderContext {
+                provider_launch_context: context.clone(),
+                provider_secret_references: vec![],
+            };
+            let request = ObserveClaudeSourcesRequest {
+                expected_control_epoch: None,
+                soul_id: soul,
+                provider: flavor.into(),
+                authority: ClaudeSourceAuthority::InitialReservation {
+                    reservation_id: reservation,
+                },
+                workspace_path: workspace.to_str().unwrap().into(),
+                git_common_dir: None,
+                candidate: Some(ready.clone()),
+                observation_request: ObservationRequest {
+                    version: 1,
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    native_source_runtime: runtime,
+                    cwd: workspace.clone(),
+                    home: "/home/freshell/provider".into(),
+                    setting_sources: vec![ClaudeSettingSource::User],
+                    selector_manifest_sha256: selector,
+                    plan_revision: 0,
+                    candidate_binding: Some(CandidateBinding {
+                        soul_id: publication.soul_id.as_str().into(),
+                        generation_id: capability.grant_id.clone(),
+                        authority_sha256: publication.authority_sha256.clone(),
+                        publication_sha256: format!("{:x}", Sha256::digest(&published)),
+                        manifest_sha256: context
+                            .prepared_inputs
+                            .as_ref()
+                            .unwrap()
+                            .manifest
+                            .sha256
+                            .clone(),
+                        prepared_result_sha256: format!(
+                            "{:x}",
+                            Sha256::digest(
+                                bounded_json_bytes(&ready, MAX_CONTROL_FRAME_BYTES).unwrap()
+                            )
+                        ),
+                    }),
+                },
+            };
+            for fault in [
+                "soul",
+                "reservation",
+                "authority-purpose",
+                "flavor",
+                "common-dir",
+                "result",
+            ] {
+                let mut wrong = request.clone();
+                match fault {
+                    "soul" => wrong.soul_id = SoulId::new(),
+                    "reservation" => {
+                        wrong.authority = ClaudeSourceAuthority::InitialReservation {
+                            reservation_id: uuid::Uuid::new_v4().to_string(),
+                        }
+                    }
+                    "authority-purpose" => {
+                        wrong.authority = ClaudeSourceAuthority::RecoveryAttempt {
+                            attempt_id: uuid::Uuid::new_v4().to_string(),
+                        }
+                    }
+                    "flavor" => {
+                        wrong.provider = if flavor == "claude" {
+                            "kilroy"
+                        } else {
+                            "claude"
+                        }
+                        .into()
+                    }
+                    "common-dir" => {
+                        wrong.git_common_dir = Some(
+                            workspace
+                                .join("different-common-dir")
+                                .to_str()
+                                .unwrap()
+                                .into(),
+                        )
+                    }
+                    "result" => {
+                        wrong
+                            .candidate
+                            .as_mut()
+                            .unwrap()
+                            .provider_launch_context
+                            .mcp_capability
+                            .as_mut()
+                            .unwrap()
+                            .endpoint = "http://host.docker.internal:4999".into()
+                    }
+                    _ => unreachable!(),
+                }
+                wrong
+                    .validate()
+                    .expect("coherent outer substitutions must reach the ownership/digest gate");
+                assert!(
+                    wrong.candidate_projection(publication.clone()).is_err(),
+                    "changed {fault} must block before selecting an executable consumer"
+                );
+            }
+            let projection = request
+                .candidate_projection(publication)
+                .expect("published owner binding must permit the owned ordinary consumer");
+            std::fs::remove_dir_all(&home).unwrap();
+            let selected = projection
+                .provider_launch_context
+                .prepared_inputs
+                .as_ref()
+                .unwrap()
+                .resource_mounts
+                .iter()
+                .find(|mount| mount.logical_destination == "/home/freshell/provider/.claude/skills")
+                .expect("selected skills must retain their provider destination");
+            let output = std::process::Command::new("node")
+                .arg(
+                    stage
+                        .join(&selected.stage_relative_path)
+                        .join("probe/consumer.cjs"),
+                )
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .current_dir(&workspace)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"issued-frozen-dependency");
+            assert!(!home.exists());
+        }
     }
 
     #[cfg(unix)]

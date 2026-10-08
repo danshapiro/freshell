@@ -3043,6 +3043,50 @@ impl ClaudeCandidateProjectionRequest {
 }
 
 impl ObserveClaudeSourcesRequest {
+    pub fn candidate_projection(
+        &self,
+        publication: ClaudeCandidatePublication,
+    ) -> Result<ClaudeCandidateProjectionRequest, RuntimeError> {
+        use sha2::Digest;
+        self.validate()?;
+        let unavailable = || {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "Claude candidate publication binding unavailable; retain inputs and reprepare",
+            )
+        };
+        let candidate = self.candidate.as_ref().ok_or_else(unavailable)?;
+        let authority = bounded_json_bytes(&self.authority, MAX_CONTROL_FRAME_BYTES)
+            .map_err(|_| unavailable())?;
+        let result =
+            bounded_json_bytes(candidate, MAX_CONTROL_FRAME_BYTES).map_err(|_| unavailable())?;
+        if publication.soul_id != self.soul_id
+            || publication.provider != self.provider
+            || publication.workspace_path != self.workspace_path
+            || publication.git_common_dir != self.git_common_dir
+            || publication.authority_sha256 != format!("{:x}", Sha256::digest(authority))
+            || publication.prepared_result_sha256 != format!("{:x}", Sha256::digest(result))
+            || match &self.authority {
+                ClaudeSourceAuthority::InitialReservation { reservation_id } => {
+                    publication.initial_reservation_id.as_ref() != Some(reservation_id)
+                }
+                ClaudeSourceAuthority::RecoveryAttempt { .. } => {
+                    publication.initial_reservation_id.is_some()
+                }
+            }
+        {
+            return Err(unavailable());
+        }
+        let projection = ClaudeCandidateProjectionRequest {
+            source_request: self.observation_request.clone(),
+            workspace_path: self.workspace_path.clone(),
+            provider_launch_context: candidate.provider_launch_context.clone(),
+            publication,
+        };
+        projection.validate()?;
+        Ok(projection)
+    }
+
     pub fn validate(&self) -> Result<(), RuntimeError> {
         let invalid = || {
             RuntimeError::new(RuntimeErrorCode::InvalidRequest,
