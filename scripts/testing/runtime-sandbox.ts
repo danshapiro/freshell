@@ -875,6 +875,11 @@ export const OpencodeContinuityFirstReplySchema = z.object({
   resolvedProvider: z.string(), resolvedModel: z.string(),
 }).strict()
 export type OpencodeContinuityFirstReply = z.infer<typeof OpencodeContinuityFirstReplySchema>
+export const OpencodeQualificationStartupFactsSchema = z.object({
+  modelProcessPresent: z.boolean(), authPresent: z.boolean(), modelAvailable: z.boolean(),
+  limits: z.object({ cpuMax: z.string(), memoryMax: z.string(), swapMax: z.string(), pidsMax: z.string() }).strict(),
+}).strict()
+export type OpencodeQualificationStartupFacts = z.infer<typeof OpencodeQualificationStartupFactsSchema>
 const TerminalContinuityIdentitySchema = z.object({
   soulId: z.string().min(1), incarnationId: z.string().min(1),
   containerId: z.string().regex(/^[a-f0-9]{64}$/), hostBootId: z.string().min(1),
@@ -966,6 +971,8 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   action: z.enum([
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker',
     'provider-volume', 'fixture-decision-allow',
+    'opencode-qualification-startup',
+    'opencode-qualification-limits',
     'terminal-continuity-receipt',
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
@@ -3634,6 +3641,24 @@ export class ManagedRuntimeOwner {
     return OpencodeContinuityStartupFactsSchema.parse({ authPresent: auth.trim() === 'onecli managed OpenAI stub and CA present',
       modelAvailable: models.includes(P2_OPENCODE_MODEL.split('/')[1]), explicitModelArg: processes.includes(`--model ${P2_OPENCODE_MODEL}`),
       loopbackHostname: processes.includes('--hostname 127.0.0.1'), explicitPort: processes.includes('--port 4096') })
+  }
+  async openCodeQualificationStartupFacts(handle: RuntimeEnclosureHandle): Promise<OpencodeQualificationStartupFacts> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    const processes = this.ownedContainerProcessTable(handle.containerId)
+    const auth = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '-e',
+      "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||openai.type!=='oauth'||openai.access!=='onecli-managed'||openai.refresh!=='onecli-managed'||openai.expires<Date.now()+3600000)process.exit(2);fs.accessSync('/home/freshell/provider/.config/onecli/gateway-ca.pem',fs.constants.R_OK);process.stdout.write('OneCLI OpenAI stub and CA present')"])
+    const models = await this.ownedProviderExec(handle.containerId, ['opencode', 'models', 'openai'])
+    return OpencodeQualificationStartupFactsSchema.parse({ modelProcessPresent: processes.includes(P2_OPENCODE_MODEL),
+      authPresent: auth.trim() === 'OneCLI OpenAI stub and CA present', modelAvailable: models.includes(P2_OPENCODE_MODEL.split('/')[1]),
+      limits: await this.openCodeQualificationLimits(handle) })
+  }
+  async openCodeQualificationLimits(handle: RuntimeEnclosureHandle): Promise<OpencodeQualificationStartupFacts['limits']> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 OpenCode qualification fixture required')
+    await this.assertCurrentOpenCodeEnclosure(handle)
+    const raw = this.ownedContainerExec(handle.containerId, ['sh', '-lc',
+      `printf '{"cpuMax":"%s","memoryMax":"%s","swapMax":"%s","pidsMax":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/memory.swap.max)" "$(cat /sys/fs/cgroup/pids.max)"`])
+    return OpencodeQualificationStartupFactsSchema.shape.limits.parse(JSON.parse(raw))
   }
 
   async lossCredentialEvidence(handle: RuntimeEnclosureHandle): Promise<OpencodeLossCredentialEvidence> {

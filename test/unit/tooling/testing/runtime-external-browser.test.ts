@@ -1942,6 +1942,73 @@ describe('closed external owner control', () => {
       await fsp.rm(directory, { recursive: true, force: true })
     }
   })
+  it('observes qualification auth model process and exact cgroup limits privately on the owner', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-qualification-startup-'))
+    try {
+      const { owned, context, inventory, request } = fixture()
+      Object.assign(owned.runtime, { phase: 5 })
+      const row = { soulId: 'qualification-soul', incarnationId: 'qualification-incarnation', containerId: 'b'.repeat(64),
+        hostBootId: 'qualification-boot', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+      inventory.mockResolvedValue([row])
+      const receipt: BrokerReceipt = { containerId: row.containerId, soulId: row.soulId, incarnationId: row.incarnationId,
+        createdAt: new Date().toISOString(), requestDigest: 'c'.repeat(64), imageRef: `sha256:${'d'.repeat(64)}`, runtimeDir: directory }
+      Object.assign(owned.runtime, { broker: { receipts: () => [receipt] } })
+      const auth = path.join(directory, 'auth.json'), ca = path.join(directory, 'gateway-ca.pem'), mapper = path.join(directory, 'mapper.cjs')
+      await fsp.writeFile(auth, JSON.stringify({ openai: { type: 'oauth', access: 'onecli-managed', refresh: 'onecli-managed', expires: Date.now() + 7_200_000 } }))
+      await fsp.writeFile(ca, 'private readability fixture')
+      await fsp.writeFile(mapper, `const fs=require('node:fs');const read=fs.readFileSync,access=fs.accessSync;fs.readFileSync=function(file,...args){return read.call(fs,file==='/home/freshell/provider/.local/share/opencode/auth.json'?${JSON.stringify(auth)}:file,...args)};fs.accessSync=function(file,...args){return access.call(fs,file==='/home/freshell/provider/.config/onecli/gateway-ca.pem'?${JSON.stringify(ca)}:file,...args)};`)
+      const limitValues = { 'cpu.max': '200000 100000', 'memory.max': '4294967296', 'memory.swap.max': '0', 'pids.max': '512' }
+      for (const [name, value] of Object.entries(limitValues)) await fsp.writeFile(path.join(directory, name), value)
+      let models = 'openai/gpt-5.6-luna', processTable = '40 opencode --model openai/gpt-5.6-luna'
+      const read = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (_id, args) => {
+        if (args[0] === 'opencode') return models
+        const child = spawnSync(process.execPath, ['--require', mapper, ...args.slice(1)], { encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('private qualification auth probe refused')
+        return child.stdout
+      })
+      const processes = vi.spyOn(owned, 'ownedContainerProcessTable').mockImplementation(() => processTable)
+      const limits = vi.spyOn(owned, 'ownedContainerExec').mockImplementation((_id, args) => {
+        const child = spawnSync('sh', ['-lc', args[2].replaceAll('/sys/fs/cgroup/', `${directory}/`)], { encoding: 'utf8' })
+        if (child.status !== 0) throw new Error('private qualification limits probe refused')
+        return child.stdout
+      })
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const wire: unknown[] = []
+      const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      })
+      const enclosure = rig.runtimeEnclosureHandle(row)
+      await expect(rig.openCodeQualificationStartupFacts(enclosure)).resolves.toEqual({ modelProcessPresent: true,
+        authPresent: true, modelAvailable: true, limits: { cpuMax: '200000 100000', memoryMax: '4294967296', swapMax: '0', pidsMax: '512' } })
+      await fsp.writeFile(path.join(directory, 'pids.max'), '256')
+      await expect(rig.openCodeQualificationLimits(enclosure)).resolves.toEqual({ cpuMax: '200000 100000', memoryMax: '4294967296', swapMax: '0', pidsMax: '256' })
+      models = 'different model'; processTable = 'unrelated process'
+      expect(await rig.openCodeQualificationStartupFacts(enclosure)).toMatchObject({ modelProcessPresent: false, modelAvailable: false })
+      expect(JSON.stringify(wire)).not.toContain('onecli-managed')
+      expect(JSON.stringify(wire)).not.toContain('opencode --model')
+      await fsp.writeFile(auth, JSON.stringify({ openai: { type: 'oauth', access: 'onecli-managed', refresh: 'onecli-managed', expires: 0 } }))
+      await expect(owned.openCodeQualificationStartupFacts(enclosure)).rejects.toThrow(/auth probe refused/)
+      read.mockClear(); processes.mockClear(); limits.mockClear()
+      await expect(rig.openCodeQualificationLimits(enclosure)).resolves.toMatchObject({ pidsMax: '256' })
+      expect(read).not.toHaveBeenCalled(); expect(processes).not.toHaveBeenCalled()
+      limits.mockReturnValueOnce('{"cpuMax":')
+      await expect(owned.openCodeQualificationLimits(enclosure)).rejects.toThrow()
+      limits.mockClear()
+      inventory.mockResolvedValue([{ ...row, hostBootId: 'replacement' }])
+      await expect(owned.openCodeQualificationStartupFacts(enclosure)).rejects.toThrow(/current/)
+      await expect(owned.openCodeQualificationLimits(enclosure)).rejects.toThrow(/current/)
+      await expect(control({ ...request, action: 'opencode-qualification-startup', enclosure, command: ['arbitrary'] })).rejects.toThrow(/operation/)
+      expect(read).not.toHaveBeenCalled(); expect(processes).not.toHaveBeenCalled(); expect(limits).not.toHaveBeenCalled()
+      inventory.mockResolvedValue([{ ...row, provider: 'claude' }])
+      await expect(owned.openCodeQualificationStartupFacts(enclosure)).rejects.toThrow(/OpenCode/)
+      await expect(owned.openCodeQualificationLimits(enclosure)).rejects.toThrow(/OpenCode/)
+      Object.assign(owned.runtime, { phase: 2 })
+      await expect(owned.openCodeQualificationStartupFacts(enclosure)).rejects.toThrow(/Phase 5/)
+      await expect(owned.openCodeQualificationLimits(enclosure)).rejects.toThrow(/Phase 5/)
+    } finally { await fsp.rm(directory, { recursive: true, force: true }) }
+  })
   it('observes only the fixed continuity markers, effect count and long-tool process', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-continuity-effects-'))
     try {

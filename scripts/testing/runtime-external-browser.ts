@@ -25,6 +25,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema,
   RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema,
   OpencodeContinuityStartupFactsSchema, OpencodeContinuityFirstReplySchema, RuntimeTerminalContinuityObservationSchema,
+  OpencodeQualificationStartupFactsSchema,
   requireOpenCodeOnecliBootstrap, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
@@ -907,6 +908,12 @@ export class ExternalManagedRuntimeRig {
   async openCodeContinuityStartupFacts(enclosure: RuntimeEnclosureHandle): Promise<OpencodeContinuityStartupFacts> {
     return this.rpc('opencode-continuity-startup', OpencodeContinuityStartupFactsSchema, { enclosure })
   }
+  async openCodeQualificationStartupFacts(enclosure: RuntimeEnclosureHandle): Promise<z.infer<typeof OpencodeQualificationStartupFactsSchema>> {
+    return this.rpc('opencode-qualification-startup', OpencodeQualificationStartupFactsSchema, { enclosure })
+  }
+  async openCodeQualificationLimits(enclosure: RuntimeEnclosureHandle): Promise<z.infer<typeof OpencodeQualificationStartupFactsSchema>['limits']> {
+    return this.rpc('opencode-qualification-limits', OpencodeQualificationStartupFactsSchema.shape.limits, { enclosure })
+  }
   async openCodeContinuityFirstTurnCompleted(enclosure: RuntimeEnclosureHandle): Promise<boolean> {
     return this.rpc('opencode-continuity-first-turn', z.boolean(), { enclosure })
   }
@@ -1277,6 +1284,14 @@ export function createExternalRuntimeControl(
         break
       case 'opencode-continuity-first-reply':
         result = await owner.openCodeContinuityFirstReply(handle())
+        break
+      case 'opencode-qualification-startup':
+        if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
+        result = await owner.openCodeQualificationStartupFacts(request.enclosure)
+        break
+      case 'opencode-qualification-limits':
+        if (!request.enclosure) throw new Error('exact OpenCode enclosure required')
+        result = await owner.openCodeQualificationLimits(request.enclosure)
         break
       case 'opencode-continuity-effect-count':
         if (!request.enclosure) throw new Error('exact OpenCode enclosure required')

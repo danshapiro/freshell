@@ -396,15 +396,9 @@ function verifyMemoryAnswer(turn: NativeAssistantTurn, projectName: string): voi
   expect(turn.text).toContain(projectName)
 }
 
-function cgroupLimitEvidence(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): ProviderQualificationRow['limitEvidence'] {
-  if (!view.containerId) throw new Error('OpenCode view has no container for limit evidence')
+function cgroupLimitEvidence(view: ManagedRuntimeView, actual: NonNullable<ProviderQualificationRow['limitEvidence']>): ProviderQualificationRow['limitEvidence'] {
   const expected = (view as any).effectiveLimits
   if (!expected) throw new Error('OpenCode view has no effective limits')
-  const raw = rig.ownedContainerExec(view.containerId, [
-    'sh', '-lc',
-    `printf '{"cpuMax":"%s","memoryMax":"%s","swapMax":"%s","pidsMax":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/memory.swap.max)" "$(cat /sys/fs/cgroup/pids.max)"`,
-  ])
-  const actual = JSON.parse(raw)
   const [quotaRaw, periodRaw] = String(actual.cpuMax).trim().split(/\s+/)
   const cpuMilli = quotaRaw === 'max'
     ? Number.POSITIVE_INFINITY
@@ -518,16 +512,11 @@ test.describe.serial('OpenCode provider qualification', () => {
       }
       expect((await rig.openCodeVersionFacts(rig.runtimeEnclosureHandle(first.view))).version)
         .toBe(P2_OPENCODE_VERSION)
-      const processArgs = rig.ownedContainerProcessTable(first.view.containerId)
-      expect(processArgs).toContain(P2_OPENCODE_MODEL)
-      const authProbe = (await rig.ownedProviderExec(first.view.containerId, [
-        'node', '--no-warnings', '-e',
-        "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||openai.type!=='oauth'||openai.access!=='onecli-managed'||openai.refresh!=='onecli-managed'||openai.expires<Date.now()+3600000)process.exit(2);fs.accessSync('/home/freshell/provider/.config/onecli/gateway-ca.pem',fs.constants.R_OK);process.stdout.write('OneCLI OpenAI stub and CA present')",
-      ]))
-      expect(authProbe.trim()).toBe('OneCLI OpenAI stub and CA present')
-      const availableModels = (await rig.ownedProviderExec(first.view.containerId, ['opencode', 'models', 'openai']))
-      expect(availableModels).toContain(P2_OPENCODE_MODEL.split('/')[1])
-      const exactLimits = cgroupLimitEvidence(rig, first.view)
+      const startup = await rig.openCodeQualificationStartupFacts(rig.runtimeEnclosureHandle(first.view))
+      expect(startup.modelProcessPresent).toBe(true)
+      expect(startup.authPresent).toBe(true)
+      expect(startup.modelAvailable).toBe(true)
+      const exactLimits = cgroupLimitEvidence(first.view, startup.limits)
       expect(exactLimits.swapMax).toBe('0')
 
       // A plain conversation task avoids synthetic marker-assembly prompts.
@@ -644,7 +633,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(second.view.soulId).not.toBe(first.view.soulId)
       expect(second.view.containerId).not.toBe(afterProviderCrash.containerId)
       expect(secondSessionId).not.toBe(nativeSessionId)
-      expect(cgroupLimitEvidence(rig, second.view).swapMax).toBe('0')
+      expect(cgroupLimitEvidence(second.view, await rig.openCodeQualificationLimits(rig.runtimeEnclosureHandle(second.view))).swapMax).toBe('0')
 
       let snapshot = await rig.inventorySnapshot()
       const firstSoul = snapshot.souls
