@@ -8,7 +8,7 @@ import { createServer } from 'node:net'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
-  runNativeFeasibility, executeManagedNativeCase, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
+  runNativeFeasibility, executeManagedNativeCase, staleNativeSignalBindingMatches, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained,
   type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
@@ -27,6 +27,23 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['valid', 'current-nonce', 'current-incarnation', 'wrong-root', 'wrong-loaded-root', 'missing-loaded', 'wrong-active-launch', 'hooks-enabled', 'missing-prior-nonce'])('requires the actual old/current native signal binding for the stale fault (%s)', (fault) => {
+    const prior = { launchNonce: 'old-launch', incarnationId: 'old-incarnation' }
+    const current = { launchNonce: 'current-launch', incarnationId: 'current-incarnation' }
+    const captured: any = { hooksDisabled: true, nativeLaunch: { ...current },
+      hook: { native: { session_id: 'owned-root' }, launch: { ...prior } },
+      loaded: { native: { session_id: 'owned-root' }, launch: { ...prior } } }
+    if (fault === 'current-nonce') current.launchNonce = prior.launchNonce
+    if (fault === 'current-incarnation') current.incarnationId = prior.incarnationId
+    if (fault === 'wrong-root') captured.hook.native.session_id = 'other-root'
+    if (fault === 'wrong-loaded-root') captured.loaded.native.session_id = 'other-root'
+    if (fault === 'missing-loaded') captured.loaded = null
+    if (fault === 'wrong-active-launch') captured.nativeLaunch = prior
+    if (fault === 'hooks-enabled') captured.hooksDisabled = false
+    if (fault === 'missing-prior-nonce') prior.launchNonce = ''
+    expect(staleNativeSignalBindingMatches(captured, prior, current, 'owned-root')).toBe(fault === 'valid')
+  })
+
   it('makes only the owned current signal directory unwritable through the actual ordinary startup hook', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-unwritable-'))
     const source = path.join(directory, 'preferences.json'); fs.writeFileSync(source, '{}')
@@ -130,7 +147,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       .rejects.toThrow('actual terminal recovery requires the owned real server artifact')
     expect(launch).not.toHaveBeenCalled()
   })
-  it.each(['create', 'wrong-root', 'disabled-hooks', 'trust-refusal', 'timeout', 'provider-exit', 'stop-cancellation'])('sends terminal Claude %s through its real launch route with the selected profile', async (caseId) => {
+  it.each(['create', 'wrong-root', 'disabled-hooks', 'trust-refusal', 'timeout', 'provider-exit', 'stop-cancellation', 'stale-shared-signal'])('sends terminal Claude %s through its real launch route with the selected profile', async (caseId) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-claude-route-'))
     let home: string
     const launch = vi.fn(async (_supervisor: unknown, request: any) => {
@@ -146,7 +163,8 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     const sources = ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'].map((name) => ({
       name: 'claude/' + name, path: path.join(directory, path.basename(name)), sha256: 'e'.repeat(64) }))
     fs.writeFileSync(sources[2]!.path, JSON.stringify({ theme: 'dark', hasCompletedOnboarding: true,
-      projects: { [path.join(directory, `claude-${caseId}-workspace`)]: { hasTrustDialogAccepted: true } } }))
+      projects: { [path.join(directory, `claude-${caseId}-workspace`)]: { hasTrustDialogAccepted: true },
+        [path.join(directory, 'claude-create-workspace')]: { hasTrustDialogAccepted: true } } }))
     try {
       await expect(executeManagedNativeCase(harness, sources, { provider: 'claude', case: 'startup' }, caseId))
         .rejects.toThrow('controlled terminal launch boundary')

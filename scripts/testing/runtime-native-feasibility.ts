@@ -22,6 +22,18 @@ export type NativeExperimentOriginal = {
   assertions: { name: string; pass: boolean }[]
 }
 
+export function staleNativeSignalBindingMatches(captured: any, priorLaunch: any, currentLaunch: any, root: string): boolean {
+  return captured.hooksDisabled === true && captured.hook?.native.session_id === root
+    && captured.loaded?.native.session_id === root
+    && JSON.stringify(captured.hook.launch) === JSON.stringify(priorLaunch)
+    && JSON.stringify(captured.loaded.launch) === JSON.stringify(priorLaunch)
+    && JSON.stringify(captured.nativeLaunch) === JSON.stringify(currentLaunch)
+    && !!priorLaunch?.launchNonce && !!priorLaunch?.incarnationId
+    && !!currentLaunch?.launchNonce && !!currentLaunch?.incarnationId
+    && currentLaunch.launchNonce !== priorLaunch?.launchNonce
+    && currentLaunch.incarnationId !== priorLaunch?.incarnationId
+}
+
 export function parseNativeFeasibilityArguments(args: readonly string[]): NativeSelection {
   if (args.length !== 4 || !['--provider', '--mode'].includes(args[0] ?? '') || args[2] !== '--case') {
     throw new Error('usage: runtime-native-feasibility --provider claude|codex|opencode|amplifier OR --mode freshclaude|kilroy|freshcodex|freshopencode --case startup|native-turn|approval-checkpoint')
@@ -263,7 +275,7 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'claude' && ['create', 'wrong-root', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'current-native-turn'].includes(caseId)) {
+  if (selection.provider === 'claude' && ['create', 'wrong-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'current-native-turn'].includes(caseId)) {
     return executeManagedTerminalClaude(harness, sources, caseId, serverPath, servers)
   }
   if (selection.provider === 'amplifier' && ['create', 'current-native-turn'].includes(caseId)) {
@@ -423,8 +435,25 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   const unwritableSignal = caseId === 'unwritable-signal'
   const providerExit = caseId === 'provider-exit'
   const stopCancellation = caseId === 'stop-cancellation'
+  const staleSignal = caseId === 'stale-shared-signal'
   const startupFault = providerExit || stopCancellation
-  const hooksDisabled = caseId === 'disabled-hooks' || nativeTimeout || startupFault
+  const pendingFault = startupFault || staleSignal
+  let priorSignals: any
+  if (staleSignal) {
+    // Obtain genuine current native bytes in this owned rig, then close their
+    // sole writer before presenting them to a different launch as a fault.
+    await executeManagedTerminalClaude(harness, sources, 'create', serverPath, servers)
+    const read = (name: string) => JSON.parse(fs.readFileSync(path.join(harness.evidenceDir, name), 'utf8'))
+    const priorView = read('claude-create-current-view.json')
+    priorSignals = read('claude-create-signal-native-private.json').processes.find((row: any) =>
+      row.launch?.incarnationId === priorView.incarnationId)
+    if (!priorSignals || priorSignals.signals.length !== 2 || priorSignals.signals.some((row: any) => !row.bytesBase64 || !row.sha256)) {
+      throw new Error('genuine owned prior-launch native signals missing')
+    }
+    harness.killOwnedRuntimeExact(priorView.containerId)
+    await harness.waitForContainerExit(priorView.containerId)
+  }
+  const hooksDisabled = caseId === 'disabled-hooks' || nativeTimeout || pendingFault
   if (resumes && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   const grants = (['env_file', 'ca_file'] as const).map((suffix) => {
     const file = sources.find((source) => source.name === `claude/grants/${suffix}`)
@@ -463,7 +492,7 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
   const supervisor = await harness.startSupervisor({ scenarioId: scenario, binaryKind: 'release',
     env: { HOME: home, FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude' } })
   const soulId = 'soul-' + randomUUID()
-  const nativeRoot = randomUUID()
+  const nativeRoot = staleSignal ? JSON.parse(Buffer.from(priorSignals.signals.find((row: any) => row.name === 'session-start.json').bytesBase64, 'base64').toString('utf8')).native.session_id : randomUUID()
   const actualRoot = caseId === 'wrong-root' ? randomUUID() : nativeRoot
   let managedPreparation: any
   if (resumes) {
@@ -531,14 +560,14 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
     ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal', ...(hooksDisabled ? ['disabled-hooks'] : trustRefusal ? ['trust-refusal'] : unwritableSignal ? ['unwritable-signal'] : [])]))
   const wrongRoot = caseId === 'wrong-root'
   const startupRefusal = wrongRoot || hooksDisabled || trustRefusal || unwritableSignal
-  const refusalReason = unwritableSignal ? 'unwritable current native signal directory' : trustRefusal ? 'unaccepted native trust' : nativeTimeout ? 'native startup timeout'
+  const refusalReason = staleSignal ? 'stale shared native signals' : unwritableSignal ? 'unwritable current native signal directory' : trustRefusal ? 'unaccepted native trust' : nativeTimeout ? 'native startup timeout'
     : providerExit ? 'exited native provider' : stopCancellation ? 'cancelled native startup'
       : hooksDisabled ? 'disabled native hooks' : 'wrong current native root'
   const launchStartedAt = Date.now()
   let beforeFault: any
   let faultResult: any
   let result: any
-  if (startupFault) {
+  if (pendingFault) {
     let finished = false
     let launchError: unknown
     const launch = harness.adminRaw(supervisor, request).then(
@@ -572,7 +601,24 @@ async function executeManagedTerminalClaude(harness: RuntimeHarness,
       throw new Error('actual unobserved native child unavailable before startup fault')
     }
     harness.writeArtifact(`${scenario}-before-fault-native-private.json`, beforeFault)
-    if (providerExit) harness.killOwnedRuntimePidExact(receipt.containerId, beforeFault.nativePid, 'TERM')
+    if (staleSignal) {
+      faultResult = JSON.parse(await harness.execOwnedContainerAsExact(receipt.containerId, '65534:0', ['python3', '-c', String.raw`
+import pathlib,os,json,hashlib,base64,sys
+pid=sys.argv[1];prior=json.loads(sys.argv[2]);p=pathlib.Path('/proc')/pid
+env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(b'\0') if b'=' in v)
+current=json.loads(env['FRESHELL_NATIVE_IDENTITY_LAUNCH']);directory=pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'])
+assert current['launchNonce']!=prior['launch']['launchNonce'] and current['incarnationId']!=prior['launch']['incarnationId']
+assert directory.parent==pathlib.Path('/home/freshell/provider/.freshell/native-identity') and directory.name==current['launchNonce']
+directory.mkdir(parents=True,exist_ok=True)
+for row in prior['signals']:
+ assert row['name'] in ['session-start.json','statusline-loaded.json']
+ raw=base64.b64decode(row['bytesBase64']);assert len(raw)<=65536 and hashlib.sha256(raw).hexdigest()==row['sha256']
+ parsed=json.loads(raw);assert parsed['launch']==prior['launch']
+ target=directory/row['name'];assert not target.exists();target.write_bytes(raw)
+print(json.dumps({'priorLaunch':prior['launch'],'currentLaunch':current,'signalSha256':[hashlib.sha256((directory/row['name']).read_bytes()).hexdigest() for row in prior['signals']]}))
+`, String(beforeFault.nativePid), JSON.stringify(priorSignals)]))
+      harness.writeArtifact(`${scenario}-stale-signal-injection-private.json`, faultResult)
+    } else if (providerExit) harness.killOwnedRuntimePidExact(receipt.containerId, beforeFault.nativePid, 'TERM')
     else {
       faultResult = await harness.adminOk(supervisor, harness.stopBody(soulId))
       harness.writeArtifact(`${scenario}-ordinary-stop.json`, faultResult)
@@ -643,12 +689,13 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     && observation.nativeSessionId === nativeRoot && view.nativeSessionId === nativeRoot
     && observation.incarnationId === view.incarnationId
   if (startupRefusal ? !!observation : !currentObservation) throw new Error('terminal Claude current post-load observation missing')
-  const namespace = beforeFault ?? await inspectTerminalNative(view.containerId)
+  const namespace = staleSignal ? await inspectTerminalNative(view.containerId) : beforeFault ?? await inspectTerminalNative(view.containerId)
   harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
   const noCallbacks = hooksDisabled || trustRefusal || unwritableSignal
   const selectedModel = noCallbacks ? namespace.nativeArgv?.[namespace.nativeArgv.indexOf('--model') + 1] : namespace.loaded?.native?.model?.id
   const selectedCwd = noCallbacks ? namespace.nativeCwd : namespace.loaded?.native?.workspace?.current_dir
-  const loaderMatches = noCallbacks
+  const staleMatches = (captured: any) => staleNativeSignalBindingMatches(captured, priorSignals.launch, faultResult.currentLaunch, nativeRoot)
+  const loaderMatches = staleSignal ? staleMatches(namespace) : noCallbacks
     ? namespace.hook === null && namespace.loaded === null
       && (trustRefusal ? namespace.nativePreferences?.workspaceTrust === false : unwritableSignal
         ? namespace.signalWritable === false && namespace.signalMode === '0o500' && namespace.hooksDisabled !== true
@@ -670,7 +717,7 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     harness.writeArtifact(`${scenario}-pre-input-store-probe.json`, await harness.adminOk(supervisor,
       harness.probeRecoveryBody(soulId)))
   }
-  const assertions = startupRefusal ? [{ name: unwritableSignal ? 'actual-native-signal-write-refused-before-running-and-input' : trustRefusal ? 'actual-native-trust-refused-before-running-and-input'
+  const assertions = startupRefusal ? [{ name: staleSignal ? 'genuine-prior-launch-shared-signals-refused-before-running-and-input' : unwritableSignal ? 'actual-native-signal-write-refused-before-running-and-input' : trustRefusal ? 'actual-native-trust-refused-before-running-and-input'
     : nativeTimeout ? 'bounded-actual-native-startup-timeout-before-running-and-input'
       : providerExit ? 'actual-native-provider-exit-refused-before-running-and-input'
         : stopCancellation ? 'ordinary-stop-cancels-native-startup-before-running-and-input'
@@ -691,7 +738,8 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     // admissible target. Inspect actual provider state separately.
     const nativeStateSafe = startupFault ? namespace.completedTurns === 0 && namespace.toolEvents === 0
       : JSON.stringify(namespace.transcript) === JSON.stringify(after.transcript)
-        && (noCallbacks ? (!after.hook && !after.loaded && (trustRefusal ? after.nativePreferences?.workspaceTrust === false
+        && (staleSignal ? staleMatches(after) && after.completedTurns === 0 && after.toolEvents === 0
+          : noCallbacks ? (!after.hook && !after.loaded && (trustRefusal ? after.nativePreferences?.workspaceTrust === false
           : unwritableSignal ? after.signalWritable === false && after.signalMode === '0o500' && after.hooksDisabled !== true : after.hooksDisabled === true)
           && after.completedTurns === 0 && after.toolEvents === 0)
           : (actualRoot !== nativeRoot && namespace.hook.native.session_id === actualRoot
@@ -1396,7 +1444,7 @@ last_text=''.join(part.get('text','') for part in (assistants[-1].get('message',
 preferences=json.loads((home/'.claude.json').read_text()) if terminal else None
 native_preferences={key:preferences.get(key) for key in ['theme','hasCompletedOnboarding']} if preferences else None
 if native_preferences is not None:native_preferences['workspaceTrust']=preferences.get('projects',{}).get(str(cwd),{}).get('hasTrustDialogAccepted')
-print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':hook['native']['session_id'] if hook else None,'hook':hook,'loaded':loaded,'hooksDisabled':settings.get('disableAllHooks'),'signalDirectory':str(signal_dir),'signalWritable':os.access(signal_dir,os.W_OK),'signalMode':oct(signal_dir.stat().st_mode&0o777) if signal_dir.exists() else None,'nativeArgv':native_argv,'nativeCwd':str((p/'cwd').resolve()),'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'nativePreferences':native_preferences,'completedTurns':len(completed_ids),'toolEvents':tool_events,'lastAssistantText':last_text,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':hook['native']['session_id'] if hook else None,'hook':hook,'loaded':loaded,'hooksDisabled':settings.get('disableAllHooks'),'nativeLaunch':json.loads(env['FRESHELL_NATIVE_IDENTITY_LAUNCH']),'signalDirectory':str(signal_dir),'signalWritable':os.access(signal_dir,os.W_OK),'signalMode':oct(signal_dir.stat().st_mode&0o777) if signal_dir.exists() else None,'nativeArgv':native_argv,'nativeCwd':str((p/'cwd').resolve()),'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'nativePreferences':native_preferences,'completedTurns':len(completed_ids),'toolEvents':tool_events,'lastAssistantText':last_text,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
 `
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
