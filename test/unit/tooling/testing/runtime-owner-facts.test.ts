@@ -10,6 +10,7 @@ import { runTask2RetainedFixture } from '../../../../scripts/testing/task002-con
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import * as retained from '../../../../scripts/testing/task002-retained-fixture.js'
 import { RestrictedDockerBroker } from '../../../../scripts/testing/runtime-test-broker.js'
+import type { NativeHistory } from '../../../../scripts/testing/provider-native-history.js'
 
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
@@ -1322,6 +1323,58 @@ describe('run-scoped owner operation settlement', () => {
 })
 
 describe('current handle admission before owner mutation', () => {
+  it('reads unchanged stopped history through the tracked helper and returns only the original three proofs', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-stopped-proofs-'))
+    const nonce = `codename-${'e'.repeat(32)}`
+    const historyFile = path.join(root, 'history.json')
+    const callsFile = path.join(root, 'calls.jsonl')
+    const helperId = 'c'.repeat(64)
+    const docker = path.join(root, 'docker')
+    await fsp.writeFile(docker, `#!${process.execPath}\nconst fs=require('node:fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(callsFile)},JSON.stringify({args:a,host:process.env.DOCKER_HOST,api:process.env.DOCKER_API_VERSION})+'\\n');if(a[0]==='create')process.stdout.write('${helperId}');else if(a[0]==='wait')process.stdout.write('0');else if(a[0]==='logs')process.stdout.write(fs.readFileSync(${JSON.stringify(historyFile)},'utf8'));else if(!['start','rm'].includes(a[0]))process.exit(10);\n`, { mode: 0o700 })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused stopped-proof web') }, process.cwd(), 5,
+      {}, {}, 'release', { enabledProviders: ['codex'], freshAgentModes: [] })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    const row = { ...current, provider: 'codex', launchState: 'stopped', desiredState: 'stopped', cleanupState: 'verified_empty', intentRevision: 1 }
+    const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([row])
+    Object.defineProperty(rig.runtime, 'broker', { value: { proxySocketPath: path.join(root, 'broker.sock'),
+      receiptIds: () => new Set([current.containerId, helperId]), receipts: () => [{ ...current,
+        providerVolumeName: 'freshell-provider-aaaaaaaaaaaaaaaaaaaaaaaa', workspacePath: rig.repoRoot, imageRef: rig.runtime.imageRef }] } })
+    vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: false, running: false })
+    const claim = vi.spyOn(rig, 'writerClaimFacts').mockResolvedValue({ provider: 'codex', providerStoreId: 'owned-store',
+      nativeSessionId: current.nativeSessionId, soulId: current.soulId, incarnationId: current.incarnationId,
+      activeClaimCount: 0, globalConflictingClaimCount: 0 })
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const history: NativeHistory = { schemaVersion: 1, provider: 'codex', nativeSessionId: current.nativeSessionId,
+      turns: [1, 2, 3].map(index => ({ nativeEvidence: { kind: 'identified_message', turnId: `turn-${index}`, messageId: `message-${index}`, parentMessageId: null },
+        text: `private native answer ${nonce} ${index}`, completedAt: index, toolCalls: [], resolvedProvider: 'openai', resolvedModel: 'gpt-5.6-luna',
+        resolvedReasoningEffort: 'low', providerProvenance: 'native-fixture', modelProvenance: 'native-fixture', reasoningEffortProvenance: 'native-fixture' })) }
+    await fsp.writeFile(historyFile, JSON.stringify(history))
+    vi.stubEnv('PATH', `${root}${path.delimiter}${process.env.PATH}`)
+    try {
+      const proofs = await rig.managedTerminalStoppedProofs(current, nonce)
+      expect(proofs.map(proof => proof.stage)).toEqual(['initial', 'after_session_host_crash', 'after_provider_process_crash'])
+      expect(proofs.map(proof => proof.nativeEvidence)).toEqual(history.turns.map(turn => turn.nativeEvidence))
+      expect(JSON.stringify(proofs)).not.toContain('private native answer')
+      expect(JSON.stringify(proofs)).not.toContain(nonce)
+      const calls = (await fsp.readFile(callsFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+      expect(calls.map(call => call.args[0])).toEqual(['create', 'start', 'wait', 'logs', 'rm'])
+      expect(calls.every(call => call.host === `unix://${rig.runtime.broker.proxySocketPath}` && call.api === '1.47')).toBe(true)
+      await fsp.writeFile(historyFile, JSON.stringify({ ...history, nativeSessionId: 'foreign-native-root' }))
+      await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/identity differs/)
+      expect(JSON.parse((await fsp.readFile(callsFile, 'utf8')).trim().split('\n').at(-1) ?? '{}').args[0]).toBe('rm')
+      await fsp.writeFile(historyFile, JSON.stringify({ ...history, turns: history.turns.slice(0, 2) }))
+      await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/exactly three/)
+      expect(JSON.parse((await fsp.readFile(callsFile, 'utf8')).trim().split('\n').at(-1) ?? '{}').args[0]).toBe('rm')
+      const before = await fsp.readFile(callsFile, 'utf8')
+      claim.mockResolvedValue({ provider: 'codex', providerStoreId: 'owned-store', nativeSessionId: current.nativeSessionId,
+        soulId: current.soulId, incarnationId: current.incarnationId, activeClaimCount: 1, globalConflictingClaimCount: 0 })
+      await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/writer/)
+      expect(await fsp.readFile(callsFile, 'utf8')).toBe(before)
+      inventory.mockResolvedValue([{ ...row, launchState: 'running' }])
+      await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/stopped/)
+      expect(await fsp.readFile(callsFile, 'utf8')).toBe(before)
+    } finally { vi.unstubAllEnvs(); await fsp.rm(root, { recursive: true, force: true }) }
+  })
   it.each([
     { provider: 'claude', version: '2.1.263', process: '42 /usr/bin/claude --model haiku --effort low', identities: ['haiku', 'low'], effortAbsent: false },
     { provider: 'codex', version: '0.147.0', process: '42 /usr/bin/codex -m gpt-5.6-luna --reasoning-effort low', identities: ['low', 'gpt-5.6-luna'], effortAbsent: false },

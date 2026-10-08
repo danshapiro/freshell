@@ -1077,17 +1077,18 @@ export const Phase4BrowserObservationSchema = z.object({
   browserTabId: z.string(), createdTabIds: z.array(z.string()),
 }).strict()
 export type Phase4BrowserObservation = z.infer<typeof Phase4BrowserObservationSchema>
+export const RuntimeProviderNativeTurnProofsSchema = z.array(OpencodeQualificationTurnSchema.shape.proof.extend({
+  nativeEvidence: z.discriminatedUnion('kind', [OpencodeQualificationNativeEvidenceSchema,
+    z.object({ kind: z.literal('append_only_record'), recordIndex: z.number().int().nonnegative(),
+      byteStart: z.number().int().nonnegative(), byteEnd: z.number().int().nonnegative(),
+      recordSha256: z.string(), prefixSha256Before: z.string(), completionEventOrdinal: z.number().int().nonnegative(),
+      completionEventSha256: z.string() }).strict()]),
+}))
 export const RuntimeProviderObservationSchema: z.ZodType<ProviderQualificationRow> = z.object({
   provider: z.string().min(1), modes: z.array(z.string().min(1)), providerVersion: z.string().min(1),
   model: z.string().min(1), reasoningEffort: z.string().min(1), nativeSessionId: z.string().min(1),
   nonceSha256: z.string().regex(/^[a-f0-9]{64}$/),
-  nativeTurnProofs: z.array(OpencodeQualificationTurnSchema.shape.proof.extend({
-    nativeEvidence: z.discriminatedUnion('kind', [OpencodeQualificationNativeEvidenceSchema,
-      z.object({ kind: z.literal('append_only_record'), recordIndex: z.number().int().nonnegative(),
-        byteStart: z.number().int().nonnegative(), byteEnd: z.number().int().nonnegative(),
-        recordSha256: z.string(), prefixSha256Before: z.string(), completionEventOrdinal: z.number().int().nonnegative(),
-        completionEventSha256: z.string() }).strict()]),
-  })),
+  nativeTurnProofs: RuntimeProviderNativeTurnProofsSchema,
   actualProviderBinary: z.boolean(), completedTurn: z.boolean(), nativeStateCaptured: z.boolean(), runtimeOwned: z.boolean(),
   limitsVerified: z.boolean(), swapMaxVerified: z.boolean(),
   limitEvidence: z.object({ cpuMax: z.string(), memoryMax: z.string(), swapMax: z.string(), pidsMax: z.string() }).strict(),
@@ -1210,7 +1211,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   scenarioId: z.string().min(1), operationId: z.string().min(1),
   action: z.enum([
     'describe', 'inventory', 'inventory-snapshot', 'control-epoch', 'candidate-integrity', 'ownership-facts', 'terminal-child-facts', 'terminal-web-cycle', 'writer-claim', 'host-facts', 'fixture-state', 'fixture-worker', 'freshcodex-history-preservation-artifact', 'freshcodex-history-measurement-artifact', 'freshcodex-controller-reattachment', 'freshcodex-history-measurement-finish', 'freshcodex-history-measurement-start', 'freshcodex-history-ownership', 'freshcodex-controller-startup', 'freshcodex-history-snapshot', 'freshcodex-history-prepare', 'freshcodex-history-unchanged', 'freshcodex-coincident-prepare', 'freshcodex-coincident-unchanged',
-    'provider-volume', 'managed-terminal-startup', 'managed-provider-notice-count', 'fixture-decision-allow',
+    'provider-volume', 'managed-terminal-stopped-proofs', 'managed-terminal-startup', 'managed-provider-notice-count', 'fixture-decision-allow',
     'opencode-qualification-startup',
     'opencode-qualification-limits',
     'opencode-qualification-blockers',
@@ -1266,6 +1267,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   continuityObservation: RuntimeTerminalContinuityObservationSchema.optional(),
   qualificationTerminalId: z.string().min(1).max(200).optional(),
   qualificationNonce: z.string().regex(/^p-[A-Za-z0-9_-]{22}$/).optional(),
+  terminalQualificationNonce: z.string().regex(/^codename-[a-f0-9]{32}$/).optional(),
   qualificationProofStage: OpencodeQualificationProofStageSchema.optional(),
   priorMessageIds: z.array(z.string().min(1)).max(128).optional(),
   otherChallengeId: z.string().min(1).optional(),
@@ -4440,6 +4442,74 @@ export class ManagedRuntimeOwner {
     return z.array(z.unknown()).parse(this.dataOf(result, 'pending_notices')).length
   }
 
+  async managedTerminalStoppedProofs(handle: ExactRuntimeHandle, nonce: string): Promise<ProviderQualificationRow['nativeTurnProofs']> {
+    if (this.runtime.phase !== 5) throw new Error('Phase 5 managed terminal qualification required')
+    if (!/^codename-[a-f0-9]{32}$/.test(nonce)) throw new Error('fixed terminal qualification nonce required')
+    const rows = (await this.inventory()).filter(row => row.soulId === handle.soulId)
+    const row = rows[0]
+    if (handle.runId !== this.runtime.runId || handle.candidateSha !== this.runtime.candidateSha || rows.length !== 1
+      || row.launchState !== 'stopped' || row.desiredState !== 'stopped' || row.cleanupState !== 'verified_empty'
+      || row.incarnationId !== handle.incarnationId || row.containerId !== handle.containerId || row.hostBootId !== handle.hostBootId
+      || row.nativeSessionId !== handle.nativeSessionId || !row.provider || !this.enabledProviders.includes(row.provider)
+      || row.freshAgentSessionType) throw new Error('exact registered stopped terminal handle required')
+    const provider = ManagedTerminalStartupFactsSchema.shape.provider.parse(row.provider)
+    const receipts = this.runtime.broker.receipts().filter(receipt => receipt.soulId === handle.soulId
+      && receipt.incarnationId === handle.incarnationId && receipt.containerId === handle.containerId)
+    const receipt = receipts[0]
+    if (receipts.length !== 1 || !receipt.providerVolumeName || receipt.workspacePath !== this.repoRoot
+      || receipt.imageRef !== this.runtime.imageRef) throw new Error('exact stopped provider source receipt required')
+    if ((await this.ownedContainerState(handle)).running) throw new Error('stopped provider enclosure is still running')
+    const claim = await this.writerClaimFacts(handle)
+    if (claim.provider !== provider || claim.soulId !== handle.soulId || claim.incarnationId !== handle.incarnationId
+      || claim.nativeSessionId !== handle.nativeSessionId || claim.activeClaimCount !== 0 || claim.globalConflictingClaimCount !== 0) {
+      throw new Error('stopped native history requires a current zero-writer claim')
+    }
+    const source = provider === 'claude' ? '/home/freshell/provider/.claude/projects'
+      : provider === 'codex' ? '/home/freshell/provider/.codex/sessions'
+      : provider === 'opencode' ? '/home/freshell/provider/.local/share/opencode/opencode.db' : '/home/freshell/provider/.amplifier/projects'
+    const helperName = `freshell-history-${randomUUID()}`
+    let failure: unknown
+    try {
+      const helperId = (await this.trackedDockerProbe(handle.containerId, ['create', '--name', helperName, '--tty',
+        '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '65534:0',
+        '--memory', '256m', '--memory-swap', '256m', '--cpus', '0.5', '--pids-limit', '32',
+        '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m', '--env', 'HOME=/home/freshell/provider',
+        '--mount', `type=volume,source=${receipt.providerVolumeName},target=/home/freshell/provider,readonly`,
+        '--mount', `type=bind,source=${this.repoRoot},target=${this.repoRoot},readonly`, '--workdir', this.repoRoot,
+        '--entrypoint', 'node', this.runtime.imageRef, '--no-warnings', '--import', path.join(this.repoRoot, 'node_modules/tsx/dist/loader.mjs'),
+        path.join(this.repoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts'), provider, source, handle.nativeSessionId,
+      ], true)).trim()
+      if (!/^[a-f0-9]{64}$/.test(helperId)) throw new Error('native history helper acknowledgement is invalid')
+      await this.trackedDockerProbe(handle.containerId, ['start', helperId], true)
+      const status = (await this.trackedDockerProbe(handle.containerId, ['wait', helperId], true)).trim()
+      if (status !== '0') throw new Error('native history helper refused the exact stopped source')
+      const raw = await this.trackedDockerProbe(handle.containerId, ['logs', helperId], true)
+      const history: import('./provider-native-history.js').NativeHistory = JSON.parse(raw)
+      if (history.schemaVersion !== 1 || history.provider !== provider || history.nativeSessionId !== handle.nativeSessionId) {
+        throw new Error('stopped native history identity differs')
+      }
+      const turns = history.turns.filter(turn => turn.text.includes(nonce))
+      if (turns.length !== 3) throw new Error(`native exact-session history must contain exactly three nonce-bearing completed assistant responses; found ${turns.length}`)
+      const [initial, hostCrash, providerCrash] = turns
+      if (!initial || !hostCrash || !providerCrash) throw new Error('three stopped native turns are required')
+      const { nativeTurnProof } = await import('./provider-native-history.js')
+      return RuntimeProviderNativeTurnProofsSchema.parse([
+        nativeTurnProof('initial', handle.nativeSessionId, initial, nonce),
+        nativeTurnProof('after_session_host_crash', handle.nativeSessionId, hostCrash, nonce),
+        nativeTurnProof('after_provider_process_crash', handle.nativeSessionId, providerCrash, nonce),
+      ])
+    } catch (error) {
+      failure = error
+      throw error
+    } finally {
+      try { await this.trackedDockerProbe(handle.containerId, ['rm', '--force', helperName], true) }
+      catch (cleanupError) {
+        if (failure) throw new AggregateError([failure, cleanupError], 'stopped native history read and helper cleanup failed')
+        throw cleanupError
+      }
+    }
+  }
+
   async fixtureWorkerFacts(handle: ExactRuntimeHandle): Promise<{ provider: string; workerPid: number }> {
     await this.assertCurrentHandle(handle)
     const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
@@ -4686,7 +4756,7 @@ export class ManagedRuntimeOwner {
       'env', 'HOME=/home/freshell/provider', ...args])
   }
 
-  private async trackedDockerProbe(containerId: string, args: string[]): Promise<string> {
+  private async trackedDockerProbe(containerId: string, args: string[], historyHelper = false): Promise<string> {
     if (!this.runtime.broker.receiptIds().has(containerId)
       && !this.runtime.transferOwnedIds().containers.includes(containerId)) throw new Error('exact owned provider probe container required')
     const probeId = randomUUID()
@@ -4702,6 +4772,7 @@ export class ManagedRuntimeOwner {
       this.runtime.recordLifecycle('external.provider_probe_started', { severity: 'info', probeId, containerId })
       record.child = execFile('docker', args, {
         cwd: this.repoRoot, encoding: 'utf8', timeout: 120_000, maxBuffer: 32 * 1024 * 1024,
+        ...(historyHelper ? { env: { ...process.env, DOCKER_HOST: `unix://${this.runtime.broker.proxySocketPath}`, DOCKER_API_VERSION: '1.47' } } : {}),
       }, (error, stdout, stderr) => {
         this.providerProbes.delete(probeId)
         try {

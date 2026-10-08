@@ -475,6 +475,7 @@ export class RestrictedDockerBroker {
     const host = parsed.HostConfig ?? {}
     if (Object.keys(parsed.Labels ?? {}).length !== 0) return
     const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
+    if (same(parsed.Entrypoint, ['node'])) return this.validateNodeHistoryHelper(parsed)
     if (parsed.User !== '65534:0'
       || !same(parsed.Entrypoint, ['/runtime/freshell-session-host'])) return
     const cmd = parsed.Cmd
@@ -499,12 +500,7 @@ export class RestrictedDockerBroker {
       || cmd[3] !== '--session-id' || typeof cmd[4] !== 'string' || !cmd[4]
       || cmd[5] !== '--provider-home' || cmd[6] !== '/home/freshell/provider'
       || !same(parsed.Env, ['HOME=/home/freshell/provider'])) return
-    if (host.NetworkMode !== 'none' || host.ReadonlyRootfs !== true || host.Privileged === true
-      || (host.PidMode ?? '') !== '' || (host.Binds?.length ?? 0) !== 0 || (host.CapAdd?.length ?? 0) !== 0
-      || !same(host.CapDrop, ['ALL']) || !same(host.SecurityOpt, ['no-new-privileges'])
-      || host.Memory !== 256 * 1024 * 1024 || host.MemorySwap !== 256 * 1024 * 1024
-      || host.NanoCpus !== 500_000_000 || host.PidsLimit !== 32
-      || !same(host.Tmpfs, { '/tmp': retained ? 'rw,noexec,nosuid,nodev,size=64m' : 'rw,noexec,nosuid,nodev,size=16m' })) return
+    if (!this.validHistoryHelperHost(host, retained)) return
     const mounts = host.Mounts
     if (!Array.isArray(mounts) || (retained ? ![3, 4].includes(mounts.length) : mounts.length !== 2)) return
     const binary = mounts.find((mount) => mount.Type === 'bind' && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
@@ -522,6 +518,41 @@ export class RestrictedDockerBroker {
     }
     return this.receipts().find((receipt) => receipt.providerVolumeName === volume.Source
       && receipt.imageRef === parsed.Image && receipt.hostBinaryPath === binary.Source)
+  }
+
+  private validHistoryHelperHost(host: Record<string, any>, retained: boolean): boolean {
+    const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
+    return host.NetworkMode === 'none' && host.ReadonlyRootfs === true && host.Privileged !== true
+      && (host.PidMode ?? '') === '' && (host.Binds?.length ?? 0) === 0 && (host.CapAdd?.length ?? 0) === 0
+      && same(host.CapDrop, ['ALL']) && same(host.SecurityOpt, ['no-new-privileges'])
+      && host.Memory === 256 * 1024 * 1024 && host.MemorySwap === 256 * 1024 * 1024
+      && host.NanoCpus === 500_000_000 && host.PidsLimit === 32
+      && same(host.Tmpfs, { '/tmp': retained ? 'rw,noexec,nosuid,nodev,size=64m' : 'rw,noexec,nosuid,nodev,size=16m' })
+  }
+
+  private validateNodeHistoryHelper(parsed: Record<string, any>): BrokerReceipt | undefined {
+    const host = parsed.HostConfig ?? {}
+    const cmd = parsed.Cmd
+    const workspace = parsed.WorkingDir
+    const sources: Record<string, string> = {
+      claude: '/home/freshell/provider/.claude/projects', codex: '/home/freshell/provider/.codex/sessions',
+      opencode: '/home/freshell/provider/.local/share/opencode/opencode.db', amplifier: '/home/freshell/provider/.amplifier/projects',
+    }
+    if (parsed.User !== '65534:0' || parsed.Tty !== true || !this.validHistoryHelperHost(host, false)
+      || JSON.stringify(parsed.Env) !== JSON.stringify(['HOME=/home/freshell/provider'])
+      || typeof workspace !== 'string' || path.normalize(workspace) !== workspace || !this.isAllowedWorkspacePath(workspace)
+      || !Array.isArray(cmd) || cmd.length !== 7 || cmd[0] !== '--no-warnings' || cmd[1] !== '--import'
+      || cmd[2] !== path.join(workspace, 'node_modules/tsx/dist/loader.mjs')
+      || cmd[3] !== path.join(workspace, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts')
+      || typeof cmd[4] !== 'string' || !Object.hasOwn(sources, cmd[4]) || cmd[5] !== sources[cmd[4]]
+      || typeof cmd[6] !== 'string' || !cmd[6] || !this.policy.allowedImageRefs.has(parsed.Image)) return
+    const mounts = host.Mounts
+    if (!Array.isArray(mounts) || mounts.length !== 2) return
+    const volume = mounts.find(mount => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === true)
+    const source = mounts.find(mount => mount.Type === 'bind' && mount.Source === workspace && mount.Target === workspace && mount.ReadOnly === true)
+    if (!volume || !source) return
+    return this.receipts().find(receipt => receipt.providerVolumeName === volume.Source
+      && receipt.workspacePath === workspace && receipt.imageRef === parsed.Image)
   }
 
   private isAllowedWorkspacePath(candidate: string): boolean {

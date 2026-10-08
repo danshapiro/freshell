@@ -34,14 +34,12 @@ import { ExternalManagedRuntimeRig, resolveManagedExternalDescriptor } from '../
 import { task2RetainedPublicContext, type Task2RetainedPublicContext } from '../../../scripts/testing/task002-retained-fixture.js'
 import { managedRecoveryBlockedMessage } from '../../../src/lib/managed-runtime-recovery-message.js'
 import {
-  ManagedRuntimeBrowserRig, stopManagedRuntimeSoul,
+  createManagedRuntimeBrowserRig, stopManagedRuntimeSoul, type ManagedFixtureRig,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
-import { nativeTurnProof } from '../helpers/provider-native-history/proof.js'
-import type { NativeAssistantTurn, NativeHistory } from '../helpers/provider-native-history/types.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
 const LIVE_ENV = 'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE'
@@ -203,50 +201,6 @@ async function executeAndAwaitNonceOutput(
   ), timeoutMs)
 }
 
-function nativeHistorySource(provider: ProviderDefinition['provider']): string {
-  if (provider === 'claude') return '/home/freshell/provider/.claude/projects'
-  if (provider === 'codex') return '/home/freshell/provider/.codex/sessions'
-  if (provider === 'opencode') return '/home/freshell/provider/.local/share/opencode/opencode.db'
-  return '/home/freshell/provider/.amplifier/projects'
-}
-
-function stoppedNativeHistory(
-  rig: ManagedRuntimeBrowserRig,
-  providerVolumeName: string,
-  definition: ProviderDefinition,
-  nativeSessionId: string,
-): NativeHistory {
-  if (!/^freshell-provider-[A-Za-z0-9_.-]+$/.test(providerVolumeName)) {
-    throw new Error('provider history probe requires an exact managed provider volume')
-  }
-  const probe = path.join(rig.repoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts')
-  const tsxLoader = path.join(rig.repoRoot, 'node_modules/tsx/dist/loader.mjs')
-  const raw = rig.runtime.runCommand('docker', [
-    'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
-    '--security-opt', 'no-new-privileges', '--user', '65534:0',
-    '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m',
-    '-v', `${providerVolumeName}:/home/freshell/provider:ro`,
-    '-v', `${rig.repoRoot}:${rig.repoRoot}:ro`,
-    '--workdir', rig.repoRoot,
-    rig.runtime.imageRef,
-    'node', '--no-warnings', '--import', tsxLoader, probe,
-    definition.provider, nativeHistorySource(definition.provider), nativeSessionId,
-  ])
-  const history = JSON.parse(raw) as NativeHistory
-  expect(history.schemaVersion).toBe(1)
-  expect(history.provider).toBe(definition.provider)
-  expect(history.nativeSessionId).toBe(nativeSessionId)
-  return history
-}
-
-function nonceTurns(history: NativeHistory, nonce: string): NativeAssistantTurn[] {
-  const turns = history.turns.filter((turn) => turn.text.includes(nonce))
-  if (turns.length !== 3) {
-    throw new Error(`native exact-session history must contain exactly three nonce-bearing completed assistant responses; found ${turns.length}`)
-  }
-  return turns
-}
-
 async function paneNativeId(
   harness: TestHarness,
   tabId: string,
@@ -261,7 +215,7 @@ async function paneNativeId(
 async function createProviderPane(
   page: Page,
   harness: TestHarness,
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   tabId: string,
   definition: ProviderDefinition,
 ): Promise<{ paneId: string; terminalId: string; view: ManagedRuntimeView }> {
@@ -300,7 +254,7 @@ function limitEvidence(view: ManagedRuntimeView, actual: ManagedTerminalStartupF
 }
 
 async function waitForReplacement(
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   terminalId: string,
   priorIncarnationId: string,
 ): Promise<ManagedRuntimeView> {
@@ -313,7 +267,7 @@ async function waitForReplacement(
 async function qualifyProvider(
   page: Page,
   harness: TestHarness,
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   tabId: string,
   definition: ProviderDefinition,
 ): Promise<ProviderQualificationRow> {
@@ -345,12 +299,14 @@ async function qualifyProvider(
     await paneNativeId(harness, tabId, created.paneId, definition.provider)
   ), 180_000)
   expect(nativeSessionId).toMatch(definition.nativeIdPattern)
-  const inventoryNativeId = await waitForValue('inventory native session id', async () => (
-    (await rig.runningViewForTerminal(created.terminalId))?.nativeSessionId
-  ), 120_000)
-  expect(inventoryNativeId).toBe(nativeSessionId)
-  const initialEnclosure = rig.runtimeEnclosureHandle(created.view)
-  await rig.crashRuntimeHost(rig.exactRuntimeHandle(created.view))
+  const initialCurrent = await waitForValue('inventory native session id', async () => {
+    const current = await rig.runningViewForTerminal(created.terminalId)
+    return current?.nativeSessionId ? current : null
+  }, 120_000)
+  expect(initialCurrent).toMatchObject({ nativeSessionId, soulId: created.view.soulId,
+    containerId: created.view.containerId, incarnationId: created.view.incarnationId, hostBootId: created.view.hostBootId })
+  const initialEnclosure = rig.runtimeEnclosureHandle(initialCurrent)
+  await rig.crashRuntimeHost(rig.exactRuntimeHandle(initialCurrent))
   const afterHostLoss = await waitForReplacement(rig, created.terminalId, created.view.incarnationId)
   expect(afterHostLoss.soulId).toBe(created.view.soulId)
   expect(afterHostLoss.nativeSessionId).toBe(nativeSessionId)
@@ -405,21 +361,7 @@ async function qualifyProvider(
   const oldContainerRunningAfterStop = (await rig.ownedContainerState(rig.runtimeEnclosureHandle(afterProviderLoss))).running
   expect(oldContainerRunningAfterStop).toBe(false)
   expect((await rig.ownershipFacts()).unsafeBrokerAttempts).toBe(0)
-  const providerReceipt = rig.runtime.broker.receipts()
-    .find((candidate) => candidate.containerId === afterProviderLoss.containerId)
-  if (!providerReceipt?.providerVolumeName) throw new Error('stopped soul has no exact provider-volume receipt')
-  const nativeHistory = stoppedNativeHistory(
-    rig,
-    providerReceipt.providerVolumeName,
-    definition,
-    nativeSessionId,
-  )
-  const [initialTurn, hostCrashTurn, providerCrashTurn] = nonceTurns(nativeHistory, nonce)
-  const nativeTurnProofs = [
-    nativeTurnProof('initial', nativeSessionId, initialTurn, nonce),
-    nativeTurnProof('after_session_host_crash', nativeSessionId, hostCrashTurn, nonce),
-    nativeTurnProof('after_provider_process_crash', nativeSessionId, providerCrashTurn, nonce),
-  ]
+  const nativeTurnProofs = await rig.managedTerminalStoppedProofs(writerHandle, nonce)
   if (definition.provider === 'amplifier') {
     const evidence = nativeTurnProofs.map((proof) => proof.nativeEvidence)
     expect(evidence.every((value) => value.kind === 'append_only_record')).toBe(true)
@@ -500,7 +442,7 @@ test.describe.serial('selectable managed-provider qualification', () => {
     )
     test.setTimeout(3_600_000)
     const definitions = providerDefinitions()
-    const rig = new ManagedRuntimeBrowserRig(
+    const rig = createManagedRuntimeBrowserRig(
       process.cwd(),
       5,
       {},
@@ -533,11 +475,11 @@ test.describe.serial('selectable managed-provider qualification', () => {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
-    const finalized = rig.finalizeProviderQualificationReceipt(providers)
-    expect(finalized.receipt.schemaVersion).toBe(2)
-    expect(finalized.receipt.providers).toHaveLength(definitions.length)
+    const finalized = await rig.publishProviderQualification(providers)
+    expect(finalized.schemaVersion).toBe(2)
+    expect(finalized.rowCount).toBe(definitions.length)
     // eslint-disable-next-line no-console
-    console.log(`[provider-qualification] selected-provider receipts: ${finalized.paths.join(', ')}`)
+    console.log(`[provider-qualification] selected-provider receipts: ${finalized.artifactRefs.join(', ')}`)
   })
 })
 

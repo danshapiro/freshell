@@ -25,7 +25,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema,
   RuntimeProviderReceiptArtifactsSchema, RuntimeFreshAgentReceiptArtifactsSchema, RuntimeOwnershipFactsSchema, RuntimeTerminalChildFactsSchema,
   OpencodeContinuityStartupFactsSchema, OpencodeContinuityFirstReplySchema, RuntimeTerminalContinuityObservationSchema,
-  OpencodeQualificationStartupFactsSchema, ManagedTerminalStartupFactsSchema,
+  OpencodeQualificationStartupFactsSchema, ManagedTerminalStartupFactsSchema, RuntimeProviderNativeTurnProofsSchema,
   OpencodeReplacementReadinessSchema,
   OpencodeReadinessConfirmationSchema,
   OpencodeReadinessDiagnosticSchema,
@@ -725,7 +725,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'historyControllerReattachment' | 'historyMeasurement' | 'historyPreservation' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'historyControllerReattachment' | 'historyMeasurement' | 'historyPreservation' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'terminalQualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -874,6 +874,9 @@ export class ExternalManagedRuntimeRig {
   }
   async managedTerminalStartupFacts(handle: RuntimeEnclosureHandle): Promise<ManagedTerminalStartupFacts> {
     return this.rpc('managed-terminal-startup', ManagedTerminalStartupFactsSchema, { enclosure: this.runtimeEnclosureHandle(handle) })
+  }
+  async managedTerminalStoppedProofs(handle: ExactRuntimeHandle, terminalQualificationNonce: string): Promise<ProviderQualificationRow['nativeTurnProofs']> {
+    return this.rpc('managed-terminal-stopped-proofs', RuntimeProviderNativeTurnProofsSchema, { handle, terminalQualificationNonce })
   }
   async chaosHostFacts(handle: ExactRuntimeHandle): Promise<RuntimeHostFacts> {
     return this.rpc('host-facts', z.object({ workerPid: z.number().int().positive(), workerLaunchCount: z.number().int().nonnegative(),
@@ -1512,6 +1515,10 @@ export function createExternalRuntimeControl(
       case 'managed-terminal-startup':
         if (!request.enclosure) throw new Error('current registered terminal enclosure required')
         result = await owner.managedTerminalStartupFacts(request.enclosure)
+        break
+      case 'managed-terminal-stopped-proofs':
+        if (!request.terminalQualificationNonce) throw new Error('fixed terminal qualification nonce required')
+        result = await owner.managedTerminalStoppedProofs(handle(), request.terminalQualificationNonce)
         break
       case 'fixture-decision-allow':
         if (!request.challengeId) throw new Error('actual pending fixture decision required')

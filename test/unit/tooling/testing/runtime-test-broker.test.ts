@@ -336,6 +336,47 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
 }
 
 describe('receipt-owned read-only history HTTP routes', () => {
+  it('admits only the fixed Node native reader on the exact receipt workspace and read-only provider source', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))
+      const body = () => {
+        const original = historyHelperBody()
+        return { ...original, Entrypoint: ['node'], WorkingDir: '/workspace',
+          Cmd: ['--no-warnings', '--import', '/workspace/node_modules/tsx/dist/loader.mjs',
+            '/workspace/test/e2e-browser/helpers/provider-native-history/probe-cli.ts', 'codex', '/home/freshell/provider/.codex/sessions', 'native-owned'],
+          HostConfig: { ...original.HostConfig, Mounts: [original.HostConfig.Mounts[1],
+            { Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true }] } }
+      }
+      const mutations: ((input: ReturnType<typeof body>) => void)[] = [
+        input => { input.Entrypoint = ['/bin/sh'] },
+        input => { input.Cmd[0] = '-e' },
+        input => { input.Cmd[2] = '/workspace/other-loader.js' },
+        input => { input.Cmd[3] = '/workspace/other-probe.ts' },
+        input => { input.Cmd[4] = 'foreign-provider' },
+        input => { input.Cmd[5] = '/home/freshell/provider/foreign-source' },
+        input => { input.HostConfig.Mounts[0].Source = 'foreign-volume' },
+        input => { input.HostConfig.Mounts[1].ReadOnly = false },
+        input => { input.HostConfig.Mounts[1].Target = '/other-workspace' },
+        input => { input.Image = 'sha256:other-approved-image' },
+        input => { input.HostConfig.NetworkMode = 'bridge' },
+      ]
+      for (const mutate of mutations) {
+        const input = body()
+        mutate(input)
+        const before = forwarded.length
+        expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, input)).status).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, body())).status).toBe(201)
+      expect(broker.historyHelperNames()).toContain(helperName)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({ ownerContainerId: ownedId, providerVolumeName: providerVolume })
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=0`)).body).toContain('native-owned')
+      expect((await request('POST', `/v1.47/containers/${helperId}/kill`)).status).toBe(403)
+      expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
   it('admits current-image exact retained-store reads with no writer or provider control authority', async () => {
     await withHttpBroker(async ({request,forwarded,broker})=>{
       expect((await request('POST','/v1.47/containers/create?name=owned-runtime',createBody([...ordinaryBinds,actorBind]))).status).toBe(201)
