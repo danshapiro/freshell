@@ -2,7 +2,6 @@ import { stripVTControlCharacters } from 'node:util'
 
 export type { NativeAssistantTurn, NativeHistory } from './provider-native-history/types.js'
 export { nativeTurnProof } from './provider-native-history/proof.js'
-import type { NativeAssistantTurn } from './provider-native-history/types.js'
 
 export function openCodeCredentialFailureMessage(output: string): string | null {
   const terminalText = stripVTControlCharacters(output)
@@ -44,18 +43,7 @@ export async function waitForOpenCodeTerminalCondition(params: {
  */
 export { OPENCODE_NATIVE_HISTORY_SCRIPT } from '../../../scripts/testing/runtime-sandbox.js'
 
-export function selectNativeAssistantTurn(
-  turns: readonly NativeAssistantTurn[],
-  priorMessageIds: ReadonlySet<string>,
-  expectedText: string,
-): NativeAssistantTurn | null {
-  return turns.find((turn) => (
-    typeof turn.messageId === 'string' && turn.messageId.length > 0
-    && !priorMessageIds.has(turn.messageId)
-    && turn.toolCalls.length === 0
-    && turn.text.includes(expectedText)
-  )) ?? null
-}
+export { selectNativeAssistantTurn } from '../../../scripts/testing/provider-native-history.js'
 
 /** The configured model must appear after Build in the same visible header line. */
 export function hasOpenCodePromptModelText(

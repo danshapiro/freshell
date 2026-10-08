@@ -8,6 +8,7 @@
   "include": [
     "scripts/testing/provider-certification.ts",
     "scripts/testing/provider-qualification-receipt.ts",
+    "scripts/testing/provider-native-history.ts",
     "scripts/testing/provider-qualification-selection.ts",
     "scripts/testing/fresh-agent-qualification-receipt.ts",
     "scripts/testing/fresh-agent-qualification-selection.ts",
