@@ -138,6 +138,16 @@ impl BrokerAuthorizedBackend {
 }
 #[async_trait]
 impl RuntimeBackend for BrokerAuthorizedBackend {
+    async fn observe_claude_sources(
+        &self,
+        owner: &freshell_supervisor::backend::ClaudeSourceOwner,
+        request: &ObserveClaudeSourcesRequest,
+        test_run_id: &str,
+    ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
+        self.real
+            .observe_claude_sources(owner, request, test_run_id)
+            .await
+    }
     async fn observe_initial_auth_volume(
         &self,
         reservation: &OwnedInputReservation,
@@ -1039,6 +1049,91 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         .await
         .unwrap()
         .unwrap();
+    async fn qualify_private_source_reader(
+        client: &freshell_runtime_client::RuntimeClient,
+        soul: SoulId,
+        provider: &str,
+        seed: &str,
+        workspace: &Path,
+        runtime: freshell_platform::claude_inputs::NativeSourceRuntime,
+    ) {
+        use freshell_platform::claude_inputs::{observation::LocalDecision, ClaudeSettingSource};
+        use std::os::unix::fs::MetadataExt;
+        let cwd = workspace.join("source-observer/nested");
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        let local = cwd.join(".claude/settings.local.json");
+        std::fs::write(&local, b"{}").unwrap();
+        let reservation = client
+            .reserve_provider_inputs(soul.clone(), provider.into(), seed.into())
+            .await
+            .expect("same initial creation must reserve absent HOME before source observation");
+        let request = ObserveClaudeSourcesRequest {
+            expected_control_epoch: None,
+            soul_id: soul,
+            provider: provider.into(),
+            authority: ClaudeSourceAuthority::InitialReservation {
+                reservation_id: reservation.reservation_id,
+            },
+            workspace_path: workspace.to_str().unwrap().into(),
+            git_common_dir: None,
+            candidate: None,
+            observation_request:
+                freshell_platform::claude_inputs::observation::ObservationRequest {
+                    version: 1,
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    native_source_runtime: runtime,
+                    cwd: cwd.clone(),
+                    home: "/home/freshell/provider".into(),
+                    setting_sources: vec![ClaudeSettingSource::Local],
+                    selector_manifest_sha256: "a".repeat(64),
+                    plan_revision: 0,
+                },
+        };
+        let reply = client.observe_claude_sources(request).await.expect(
+            "actual scoped private source reader must finish and clean up before native creation",
+        );
+        let observed = reply.observation;
+        assert_eq!(
+            (observed.uid, observed.euid, observed.gid, observed.egid),
+            (65534, 65534, 0, 0)
+        );
+        assert_eq!(observed.native_source_runtime, runtime);
+        assert_eq!(observed.cwd, cwd);
+        assert_eq!(
+            observed.home.as_deref(),
+            Some(Path::new("/home/freshell/provider"))
+        );
+        let owner = std::fs::metadata(workspace).unwrap().uid();
+        assert_ne!(
+            owner, 65534,
+            "fixture ownership must exercise the actual reader UID predicate"
+        );
+        assert_eq!(observed.root_uid, Some(owner));
+        assert_eq!(observed.local_decision, LocalDecision::RootOwnerMismatch);
+        let roots = observed.roots.unwrap();
+        assert_eq!(roots.checkout, workspace);
+        assert_eq!(roots.canonical, workspace);
+        assert_eq!(observed.local_settings, [local.clone()]);
+        assert_eq!(std::fs::read(&local).unwrap(), b"{}");
+        println!(
+            "provider_source_observer {}",
+            json!({"runtime":runtime,"uid":observed.uid,"gid":observed.gid,"decision":observed.local_decision,"localCount":observed.local_settings.len(),"sourceBytesPreserved":true})
+        );
+    }
+    let client = controller.runtime_client();
+    qualify_private_source_reader(
+        &client,
+        SoulId::parse(format!(
+            "soul-terminal-{}",
+            &format!("{:x}", Sha256::digest(b"closed-native-terminal-create"))[..32]
+        ))
+        .unwrap(),
+        "claude",
+        "closed-native-terminal-create",
+        &workspace,
+        freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+    )
+    .await;
     let cwd = workspace.to_str().unwrap().to_string();
     let ambient_home = fixture.join("ambient-home");
     std::fs::create_dir_all(ambient_home.join(".claude")).unwrap();
@@ -1089,7 +1184,6 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         })
         .await
         .expect("complete native Claude terminal startup");
-    let client = controller.runtime_client();
     async fn consumed(path: &Path) -> Option<Value> {
         tokio::time::timeout(Duration::from_secs(45), async {
             loop {
@@ -1332,6 +1426,24 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     .unwrap();
     let flavor = std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_FLAVOR").unwrap();
     assert!(matches!(flavor.as_str(), "freshclaude" | "kilroy"));
+    let source_provider = if flavor == "kilroy" {
+        "kilroy"
+    } else {
+        "claude"
+    };
+    qualify_private_source_reader(
+        &client,
+        SoulId::parse(format!(
+            "soul-fresh-{source_provider}-{}",
+            &format!("{:x}", Sha256::digest(b"closed-native-fresh-create"))[..32]
+        ))
+        .unwrap(),
+        source_provider,
+        "closed-native-fresh-create",
+        &workspace,
+        freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
+    )
+    .await;
     Arc::clone(&proxy).dispatch(HostedFreshAgentCommand::Create(serde_json::from_value(json!({"requestId":"closed-native-fresh-create","sessionType":flavor,"provider":"claude","cwd":cwd,"plugins":[plugin.to_str().unwrap()]})).unwrap())).await;
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
