@@ -11,7 +11,9 @@
 //! proves nothing either: only current holders are reported.
 //!
 //! One-shot reads only; nothing here waits or polls. Holders are named by
-//! process name, never by command line (argv can carry secrets).
+//! process name, never by command line (argv can carry secrets). File
+//! identities are read without a server round trip (see [`file_id`]), so a
+//! lookup does not wait on a slow or unreachable network mount.
 
 use std::path::{Path, PathBuf};
 
@@ -49,15 +51,13 @@ pub fn lock_holders(paths: &[PathBuf]) -> Vec<LockHolder> {
 /// (pid, path).
 #[cfg(target_os = "linux")]
 pub fn lock_holders_among(paths: &[PathBuf], pids: &[u32]) -> Vec<LockHolder> {
-    use std::os::unix::fs::MetadataExt;
-
     let mut wanted: Vec<(&PathBuf, FileId)> = Vec::new();
     for path in paths {
         if wanted.iter().any(|(p, _)| *p == path) {
             continue;
         }
-        if let Ok(meta) = std::fs::metadata(path) {
-            wanted.push((path, (meta.dev(), meta.ino())));
+        if let Some(id) = file_id(path) {
+            wanted.push((path, id));
         }
     }
     if wanted.is_empty() {
@@ -107,17 +107,55 @@ pub fn lock_holders_among(paths: &[PathBuf], pids: &[u32]) -> Vec<LockHolder> {
 #[cfg(target_os = "linux")]
 type FileId = (u64, u64);
 
+/// The (device, inode) of the file `path` names (following symlinks, so a
+/// `/proc/<pid>/fd/<n>` link gives its open file), read with
+/// `statx(AT_STATX_DONT_SYNC, STATX_INO)`. A plain `stat` asks an NFS, CIFS
+/// or FUSE server for fresh attributes once its cache expires, and waits
+/// for that server's timeout when the mount is unreachable (minutes on a
+/// soft mount, forever on a hard one). With `AT_STATX_DONT_SYNC` those
+/// filesystems answer from the attributes the kernel already has; the
+/// device comes from the mount and the inode never changes, so nothing is
+/// lost. (9p ignores the flag.)
+#[cfg(target_os = "linux")]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: a NUL-terminated path and a writable, correctly sized buffer.
+    let rc = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_STATX_DONT_SYNC,
+            libc::STATX_INO,
+            buf.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: statx succeeded, so it filled the (already zeroed) buffer.
+    let stx = unsafe { buf.assume_init() };
+    if stx.stx_mask & libc::STATX_INO == 0 {
+        return None; // no inode number: the file cannot be matched
+    }
+    Some((
+        libc::makedev(stx.stx_dev_major, stx.stx_dev_minor),
+        stx.stx_ino,
+    ))
+}
+
 /// The wanted file that descriptor `fd` of `pid` refers to, when the kernel
 /// lists a lock on that descriptor. The checks run cheapest first: the link
 /// target (sockets, pipes and anonymous inodes are never lock files), then
-/// the fdinfo `lock:` line, and only then a `stat` through the descriptor.
-/// So a scan never reaches into the filesystem of an unlocked file: a `stat`
-/// on a slow or hung network mount can block for seconds, and a full scan
-/// passes thousands of other processes' open files.
+/// the fdinfo `lock:` line (both are kernel bookkeeping and never reach the
+/// file's filesystem), and only then the identity of the open file, read
+/// without a server round trip ([`file_id`]). A full scan passes thousands
+/// of other processes' open files, so it reads the identity of locked ones
+/// only.
 #[cfg(target_os = "linux")]
 fn fd_holds_lock(pid: u32, fd: &str, wanted: &[FileId]) -> Option<FileId> {
-    use std::os::unix::fs::MetadataExt;
-
     let link = format!("/proc/{pid}/fd/{fd}");
     if !std::fs::read_link(&link).ok()?.is_absolute() {
         return None;
@@ -126,14 +164,20 @@ fn fd_holds_lock(pid: u32, fd: &str, wanted: &[FileId]) -> Option<FileId> {
     if !fdinfo_has_lock(&fdinfo) {
         return None;
     }
-    let meta = std::fs::metadata(&link).ok()?; // follows to the open file
-    let id = (meta.dev(), meta.ino());
+    let id = file_id(Path::new(&link))?; // follows to the open file
     wanted.contains(&id).then_some(id)
 }
 
-/// True when an fdinfo text lists a lock. The kernel lists only the locks
-/// held through that descriptor's open file description (flock) or by its
-/// process on that file (POSIX), so the line means "this descriptor holds".
+/// True when an fdinfo text has a `lock:` line. In `/proc/<pid>/fdinfo/<fd>`
+/// the kernel lists a lock (or lease, which prints a `lock:` line too) only
+/// when it was taken through that descriptor's open file description and is
+/// owned either by that description (flock and OFD locks, leases) or by the
+/// process's descriptor table (POSIX locks). So a flock or OFD lock shows on
+/// every descriptor sharing the description, in any process (dup'ed or
+/// inherited across fork), and a POSIX lock shows only in the process that
+/// took it, on the descriptors sharing the description it was taken
+/// through. Either way the line means this descriptor holds a lock on its
+/// file; another descriptor of the same file shows none.
 #[cfg(target_os = "linux")]
 fn fdinfo_has_lock(fdinfo: &str) -> bool {
     fdinfo.lines().any(|line| line.starts_with("lock:"))
