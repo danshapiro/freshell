@@ -20,22 +20,34 @@ use std::{
 // argv/environment bytes stay transient; only profile compliance is reported.
 const NATIVE_EXEC_PROFILE: &str = r#"
 function nativeExecProfile(target) {
+ let operation='select_native_process';
+ const ancestry=[];
+ try {
  let pid=target==='self'?process.pid:process.ppid;
  if(target==='claude') {
   let found=false;
   for(let depth=0;depth<16&&pid>1;depth++) {
-   if(fs.readlinkSync('/proc/'+pid+'/exe').split('/').pop()==='claude') {found=true;break;}
+   const executable=fs.readlinkSync('/proc/'+pid+'/exe').split('/').pop();
+   const comm=fs.readFileSync('/proc/'+pid+'/comm','utf8').trim();
+   ancestry.push({executable:executable==='claude'?'claude':executable.includes('claude')?'claude_variant':['node','bash','sh','timeout','freshell-session-host'].includes(executable)?executable:'other',comm:comm==='claude'?'claude':comm.includes('claude')?'claude_variant':['node','bash','sh','timeout','freshell-sessio'].includes(comm)?comm:'other'});
+   if(comm==='claude'&&executable.includes('claude')) {found=true;break;}
    const status=fs.readFileSync('/proc/'+pid+'/status','utf8');
    pid=Number(status.match(/^PPid:\s+(\d+)/m)[1]);
   }
   if(!found)throw Error('closed native hook ancestry unavailable');
  }
- const prefix='/proc/'+pid+'/',argv=fs.readFileSync(prefix+'cmdline'),env=fs.readFileSync(prefix+'environ');
+ const prefix='/proc/'+pid+'/';
+ operation='read_native_argv'; const argv=fs.readFileSync(prefix+'cmdline');
+ operation='read_native_environment'; const env=fs.readFileSync(prefix+'environ');
  const strings=[...argv.toString().split('\0').filter(Boolean),...env.toString().split('\0').filter(Boolean)];
- const stack=fs.readFileSync(prefix+'limits','utf8').match(/^Max stack size\s+(\S+)/m)[1];
+ operation='read_native_stack'; const stack=fs.readFileSync(prefix+'limits','utf8').match(/^Max stack size\s+(\S+)/m)[1];
  const result={stackAtLeast8MiB:stack==='unlimited'||Number(stack)>=8388608,aggregateWithin1MiB:argv.length+env.length+8*(strings.length+2)+Buffer.byteLength(fs.readlinkSync(prefix+'exe'))+1<=1048576,completeStringsWithin32Pages:strings.every(value=>Buffer.byteLength(value)+1<=131072)};
  if(Object.values(result).some(value=>!value))throw Error('closed final native execution profile exceeded');
  return result;
+ } catch(error) {
+  if(target==='claude')fs.writeFileSync(process.argv[2]+'.profile-failure.json',JSON.stringify({operation,code:['ENOENT','EACCES','EPERM'].includes(error.code)?error.code:error.message==='closed native hook ancestry unavailable'?'NATIVE_NOT_FOUND':error instanceof TypeError?'TYPE_ERROR':'unclassified',ancestry}));
+  throw Error('closed native profile observation failed');
+ }
 }
 "#;
 
@@ -1629,11 +1641,8 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
  fs.writeFileSync(process.argv[2],JSON.stringify(record));
 });
 "#;
-    std::fs::write(
-        plugin.join("scripts/consume.cjs"),
-        format!("{NATIVE_EXEC_PROFILE}{consumer}"),
-    )
-    .unwrap();
+    let consumer = format!("{NATIVE_EXEC_PROFILE}{consumer}");
+    std::fs::write(plugin.join("scripts/consume.cjs"), &consumer).unwrap();
     let flag_receipt = workspace.join("claude-flag-receipt.json");
     std::fs::write(plugin.join("scripts/flag.cjs"), "const fs=require('node:fs'),crypto=require('node:crypto');const hash=v=>crypto.createHash('sha256').update(v).digest('hex');let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{const input=JSON.parse(raw);fs.writeFileSync(process.argv[2],JSON.stringify({flag:input.hook_event_name==='SessionStart'&&process.env.CLAUDE_SELECTED_NONCE==='closed-explicit-settings',resource:hash(require('node:child_process').execFileSync(__dirname+'/run')),dependency:hash(require('probe-dependency'))}))})").unwrap();
     let flag_commands = selected_config.join("commands");
@@ -2212,6 +2221,16 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
             println!(
                 "provider_launch_diagnostic {}",
                 json!({"provider":"claude","route":"terminal","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"classes":classes})
+            );
+            let failure = std::fs::read(format!(
+                "{}.profile-failure.json",
+                receipt.to_str().unwrap()
+            ))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            println!(
+                "provider_native_profile_diagnostic {}",
+                json!({"observed":failure.is_some(),"failure":failure})
             );
         }
         assert_eq!(
