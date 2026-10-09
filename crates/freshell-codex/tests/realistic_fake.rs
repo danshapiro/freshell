@@ -51,15 +51,20 @@ fn locks_row_pid(path: &Path) -> Option<u32> {
         .ok()
 }
 
+/// How a directly run launcher ended (see [`launcher_exit`]).
+struct LauncherRun {
+    /// `None` when it was still running after 5 s.
+    code: Option<i32>,
+    stderr: String,
+    /// The native's last manifest, when it wrote one.
+    native: Option<NativeManifest>,
+}
+
 /// Runs the launcher directly (stderr captured) under a throwaway `HOME`, with
-/// `CODEX_HOME` set only when given, and waits up to 5 s for it to exit. Returns its
-/// exit code and stderr, or `None` when it still runs (its native and every process
-/// the native pinned are then killed).
-async fn launcher_exit(
-    behavior: Value,
-    home: &Path,
-    codex_home: Option<&str>,
-) -> (Option<i32>, String) {
+/// `CODEX_HOME` set only when given, and waits up to 5 s for it to exit. A launcher
+/// still running then is reported with no exit code, and its native and every
+/// process the native pinned are killed.
+async fn launcher_exit(behavior: Value, home: &Path, codex_home: Option<&str>) -> LauncherRun {
     use tokio::io::AsyncReadExt;
     let manifest_dir = home.join("manifests");
     let mut cmd = tokio::process::Command::new("node");
@@ -90,15 +95,21 @@ async fn launcher_exit(
         text
     });
     match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(status) => (
-            status.expect("wait for the launcher").code(),
-            stderr.await.expect("stderr reader"),
-        ),
+        Ok(status) => LauncherRun {
+            code: status.expect("wait for the launcher").code(),
+            stderr: stderr.await.expect("stderr reader"),
+            native: read_native_manifest(&manifest_dir, launcher),
+        },
         Err(_) => {
-            if let Some(native) = read_native_manifest(&manifest_dir, launcher) {
+            let native = read_native_manifest(&manifest_dir, launcher);
+            if let Some(native) = &native {
                 native.kill_all();
             }
-            (None, String::new())
+            LauncherRun {
+                code: None,
+                stderr: String::new(),
+                native,
+            }
         }
     }
 }
@@ -1214,13 +1225,14 @@ async fn the_native_refuses_to_run_without_an_explicit_codex_home() {
     // where the native would create, lock and delete real thread lock files.
     for codex_home in [None, Some("")] {
         let home = tempfile::tempdir().unwrap();
-        let (code, stderr) = launcher_exit(
+        let run = launcher_exit(
             json!({"preloadedThreads": ["t-home"]}),
             home.path(),
             codex_home,
         )
         .await;
-        assert_eq!(code, Some(1), "CODEX_HOME={codex_home:?}: {stderr}");
+        let stderr = &run.stderr;
+        assert_eq!(run.code, Some(1), "CODEX_HOME={codex_home:?}: {stderr}");
         assert!(
             stderr.contains("requires an explicit CODEX_HOME"),
             "CODEX_HOME={codex_home:?}: {stderr}"
@@ -1301,5 +1313,53 @@ async fn a_refused_start_or_resume_holds_no_lock() {
         dup.native().await.threads,
         vec![first],
         "the native holds only the first thread's lock"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preloaded_thread_held_elsewhere_fails_the_native_at_startup() {
+    let home = tempfile::tempdir().unwrap();
+    let holder =
+        FakeAppServer::spawn(json!({"threadStartThreadId": "t-pre"}), home.path(), &[]).await;
+    let mut rpc = connected(holder.port).await;
+    rpc.call("thread/start", json!({})).await.unwrap();
+    let held = thread_lock_path(home.path(), "t-pre");
+
+    let run = launcher_exit(
+        json!({"preloadedThreads": ["t-free", "t-pre"], "spawnHelperProcess": true, "mcpChild": true}),
+        home.path(),
+        Some(home.path().to_str().unwrap()),
+    )
+    .await;
+    assert_eq!(
+        run.code,
+        Some(1),
+        "a setup mistake fails at startup: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains(
+            "preloaded thread t-pre could not be locked: \
+             thread-store conflict: thread t-pre already has an active writer"
+        ),
+        "{}",
+        run.stderr
+    );
+    let native = run.native.expect("the failed native's manifest");
+    assert_eq!(
+        native.children.helper, None,
+        "no child starts before the preloads are locked"
+    );
+    assert_eq!(
+        native.children.mcp, None,
+        "no child starts before the preloads are locked"
+    );
+    assert!(
+        holds_lock_fd(holder.native().await.pid, &held),
+        "the holder keeps its lock"
+    );
+    assert!(
+        !lock_held(&thread_lock_path(home.path(), "t-free")),
+        "the failed native's other preload ended with it"
     );
 }

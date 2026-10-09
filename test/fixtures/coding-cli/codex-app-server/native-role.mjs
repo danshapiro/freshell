@@ -278,14 +278,22 @@ export function createNativeRole({ behavior, codexHome, broadcast, openConnectio
   })
 
   // Preloaded threads stay loaded and locked for the native's whole life, like
-  // conversations opened earlier in the pane. The app-server listens only after this.
+  // conversations opened earlier in the pane. They are locked before any child
+  // starts, and one held elsewhere is a setup mistake: the native fails at startup
+  // (stderr, exit 1) instead of running without it. The app-server listens only
+  // after this.
   const ready = (async () => {
+    for (const id of behavior.preloadedThreads ?? []) {
+      const lock = await acquireThreadLock(codexHome, id)
+      if (!lock.ok) {
+        writeManifest()
+        process.stderr.write(`preloaded thread ${id} could not be locked: ${lock.message}\n`)
+        process.exit(1)
+      }
+      registerThread(id, { preloaded: true }, [])
+    }
     if (behavior.spawnHelperProcess) spawnOwnGroupHelper()
     if (behavior.mcpChild) spawnMcpChild()
-    writeManifest()
-    for (const id of behavior.preloadedThreads ?? []) {
-      if (!(await lockOrError(id))) registerThread(id, { preloaded: true }, [])
-    }
     writeManifest()
   })()
 
