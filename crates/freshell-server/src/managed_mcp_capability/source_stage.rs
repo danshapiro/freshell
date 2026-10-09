@@ -12,6 +12,28 @@ mod configured_resource_tests {
     use super::*;
     use crate::managed_provider_references::sources::*;
     use freshell_platform::provider_environment::{copy_environment, CopySelection};
+
+    fn execute_selected_resource(path: &Path) -> std::io::Result<std::process::Output> {
+        let mut command = std::process::Command::new(path);
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap());
+        // Match the existing copied-script helper's finite spawn retry, while
+        // retaining this consumer's isolated environment. ETXTBSY has no child.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match command.output() {
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                result => return result,
+            }
+        }
+    }
+
     #[test]
     fn managed_provider_duplicate_resource_members_select_only_native_winners_after_both_copies() {
         use std::os::unix::fs::PermissionsExt;
@@ -121,11 +143,19 @@ mod configured_resource_tests {
             if index == 1 {
                 assert_eq!(std::fs::read(&projected).unwrap(), b"winning-instruction");
             } else {
-                let output = std::process::Command::new(projected.join("run"))
-                    .env_clear()
-                    .env("PATH", std::env::var_os("PATH").unwrap())
-                    .output()
+                // A concurrent fork can retain this owned copy's writer until
+                // exec closes it. Exercise that exact transient spawn error.
+                let writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(projected.join("run"))
                     .unwrap();
+                let release = std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    drop(writer);
+                });
+                let result = execute_selected_resource(&projected.join("run"));
+                release.join().unwrap();
+                let output = result.unwrap();
                 assert!(
                     output.status.success(),
                     "winning resource/dependency executable failed: {output:?}"
@@ -134,6 +164,33 @@ mod configured_resource_tests {
                 assert!(std::fs::read_to_string(projected.join("SKILL.md"))
                     .unwrap()
                     .contains("name: winning"));
+                if index == 0 {
+                    let writer = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(projected.join("run"))
+                        .unwrap();
+                    let started = std::time::Instant::now();
+                    let blocked = execute_selected_resource(&projected.join("run"));
+                    drop(writer);
+                    assert_eq!(blocked.unwrap_err().raw_os_error(), Some(libc::ETXTBSY));
+                    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+                    std::fs::set_permissions(
+                        projected.join("run"),
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        execute_selected_resource(&projected.join("run"))
+                            .unwrap_err()
+                            .kind(),
+                        std::io::ErrorKind::PermissionDenied
+                    );
+                    std::fs::set_permissions(
+                        projected.join("run"),
+                        std::fs::Permissions::from_mode(0o755),
+                    )
+                    .unwrap();
+                }
             }
             std::fs::rename(&hidden, owned.path().join("external")).unwrap();
             assert_eq!(std::fs::read_to_string(&config).unwrap(), *raw);
