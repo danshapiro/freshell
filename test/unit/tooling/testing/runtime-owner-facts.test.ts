@@ -531,7 +531,8 @@ describe('Task7 registered physical stopped fixture preparation', () => {
     } finally { vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
   })
 
-  it('projects actual current repair SQLite records through the fixed reader and refuses absent or foreign operations', async () => {
+  it.each(['running', 'blocked stopped', 'retained failed Retry'] as const)(
+    'projects actual current repair SQLite records for %s and refuses absent or foreign operations', async (attempt) => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused batch reader web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
     const batch = await browserFixture(rig)
@@ -662,6 +663,54 @@ describe('Task7 registered physical stopped fixture preparation', () => {
       vi.spyOn(rig.runtime.broker, 'receipts').mockReturnValue([...originalReceipts,
         { ...originalReceipts[0], containerId: resumed.containerId, incarnationId: resumed.incarnationId }])
       const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([resumed])
+      const persistedInventory = () => {
+        const registry = new DatabaseSync(database, { readOnly: true })
+        try {
+          return registry.prepare(`SELECT i.incarnation_id,i.container_id,i.host_boot_id,i.launch_state,i.execution_generation,
+            s.desired_state,s.recovery_state,s.intent_revision FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id
+            ORDER BY i.created_at,i.incarnation_id`).all().map(row => ({ ...resumed,
+              incarnationId: String(row.incarnation_id), containerId: row.container_id === null ? undefined : String(row.container_id),
+              hostBootId: row.host_boot_id === null ? undefined : String(row.host_boot_id), launchState: String(row.launch_state),
+              executionGeneration: Number(row.execution_generation), desiredState: String(row.desired_state),
+              recoveryState: String(row.recovery_state), intentRevision: Number(row.intent_revision),
+              nativeIdentityObservation: row.incarnation_id === resumed.incarnationId ? resumed.nativeIdentityObservation : undefined }))
+        } finally { registry.close() }
+      }
+      if (attempt === 'blocked stopped') {
+        const blocked = { ...resumed, launchState: 'stopped', recoveryState: 'blocked' }
+        const failedResume = new DatabaseSync(database)
+        failedResume.exec("UPDATE souls SET recovery_state='blocked' WHERE soul_id='soul-0'; UPDATE incarnations SET launch_state='stopped'; DELETE FROM writer_claims")
+        failedResume.close()
+        inventory.mockImplementation(async () => persistedInventory())
+        await fsp.writeFile(inspection, JSON.stringify([{ Id: resumed.containerId, State: { Running: false } }]))
+        const blockedObservation = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
+        expect(blockedObservation.souls[0]).toMatchObject({ desiredState: 'running', recoveryState: 'blocked', activeWriters: 0 })
+        expect(blockedObservation.nativeObservations[0]).toEqual({ rootSessionId: root.rootSessionId,
+          canonicalSoulId: root.soulId, state: 'unavailable', reason: 'host_unavailable' })
+        expect(blockedObservation.installedStores[0]).toEqual(changedEdges.installedStores[0])
+        inventory.mockResolvedValueOnce([blocked]).mockResolvedValueOnce([{ ...blocked, intentRevision: 3 }])
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/changed/)
+        const stoppedWriter = new DatabaseSync(database)
+        stoppedWriter.prepare('INSERT INTO writer_claims VALUES(?,?,?,?,?,?)').run(root.soulId, 'opencode', root.providerStoreId,
+          root.rootSessionId, resumed.incarnationId, 2)
+        stoppedWriter.close()
+        read.mockClear()
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/writer/)
+        expect(read).not.toHaveBeenCalled()
+        const retry = new DatabaseSync(database)
+        retry.exec("UPDATE souls SET recovery_state='live' WHERE soul_id='soul-0'; UPDATE incarnations SET launch_state='running'")
+        retry.close()
+        inventory.mockResolvedValue([resumed])
+      }
+      if (attempt === 'retained failed Retry') {
+        const predecessor = { ...resumed, incarnationId: 'incarnation-retired', containerId: undefined,
+          hostBootId: undefined, launchState: 'failed', executionGeneration: 1, nativeIdentityObservation: undefined }
+        const retired = new DatabaseSync(database)
+        retired.prepare('INSERT INTO incarnations VALUES(?,?,?,?,?,?,?,?)').run(root.soulId, predecessor.incarnationId,
+          'private-retired-nonce', null, null, 'failed', 1, 90)
+        retired.close()
+        inventory.mockImplementation(async () => persistedInventory())
+      }
       const adoptionNonce = '1234567890abcdef'.repeat(2), adoptionGeneration = '9'.repeat(64)
       hostStatus = { state: 'observed', data: { observation: {
         terminalId: resumed.terminalId, rootSessionId: root.rootSessionId, tailMessageId: null,
@@ -711,7 +760,29 @@ describe('Task7 registered physical stopped fixture preparation', () => {
         inventory.mockResolvedValue([changedView])
         await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/current/)
       }
+      for (const conflictingViews of [
+        [resumed, resumed],
+        ...['prepared', 'created', 'starting', 'running', 'stopping'].map(launchState =>
+          [resumed, { ...resumed, incarnationId: 'incarnation-conflicting', launchState }]),
+      ]) {
+        inventory.mockResolvedValue(conflictingViews)
+        read.mockClear()
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/current/)
+        expect(read).not.toHaveBeenCalled()
+        inventory.mockResolvedValueOnce([resumed]).mockResolvedValueOnce(conflictingViews)
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/changed/)
+      }
       inventory.mockResolvedValue([resumed])
+      const duplicateWriter = new DatabaseSync(database)
+      duplicateWriter.prepare('INSERT INTO writer_claims VALUES(?,?,?,?,?,?)').run(root.soulId, 'opencode', root.providerStoreId,
+        root.rootSessionId, resumed.incarnationId, 2)
+      duplicateWriter.close()
+      read.mockClear()
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/writer/)
+      expect(read).not.toHaveBeenCalled()
+      const removeDuplicate = new DatabaseSync(database)
+      removeDuplicate.exec('DELETE FROM writer_claims WHERE rowid=(SELECT MAX(rowid) FROM writer_claims)')
+      removeDuplicate.close()
       const foreignLiveWriter = new DatabaseSync(database)
       foreignLiveWriter.prepare('UPDATE writer_claims SET soul_id = ?, incarnation_id = ?').run('foreign-soul', 'incarnation-foreign')
       foreignLiveWriter.close()
@@ -808,6 +879,8 @@ describe('Task7 registered physical stopped fixture preparation', () => {
     } finally {
       if (hostServer) await new Promise<void>(resolve => hostServer!.close(() => resolve()))
       vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true })
+      expect(fs.existsSync(path.join(hostRuntimeDir, 'host.sock'))).toBe(false)
+      expect(fs.existsSync(rig.runtime.testRoot)).toBe(false)
     }
   })
 

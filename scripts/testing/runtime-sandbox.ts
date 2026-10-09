@@ -4399,6 +4399,16 @@ export class ManagedRuntimeOwner {
       throw new Error('stopped store observation requires zero current writers')
     }
     const currentViews = resumedSouls.size ? await this.inventory() : []
+    const selectCurrentView = (views: ManagedRuntimeView[], current?: Task007CurrentIncarnation): ManagedRuntimeView | undefined => {
+      if (!current) return undefined
+      const rows = views.filter(row => row.soulId === current.soulId)
+      const matches = rows.filter(row => row.incarnationId === current.incarnationId)
+      // Registry selects current authority; failed/stopped history is retained.
+      // Another active incarnation remains a conflict on either side of the read.
+      if (matches.length !== 1 || rows.some(row => row.incarnationId !== current.incarnationId
+        && ['prepared', 'created', 'starting', 'running', 'stopping'].includes(row.launchState))) return undefined
+      return matches[0]
+    }
     const installedStores: SyntheticStoppedRepairBatchObservation['installedStores'] = []
     const nativeObservations: SyntheticStoppedRepairBatchObservation['nativeObservations'] = []
     const resumedReads: Array<{ root: SyntheticStoppedRepairBatchObservation['roots'][number]; view: ManagedRuntimeView;
@@ -4409,15 +4419,15 @@ export class ManagedRuntimeOwner {
         || soul.providerStoreId !== root.destinationStoreId) throw new Error('current store/root differs from repair receipt')
       let view: ManagedRuntimeView | undefined
       if (soul.desiredState === 'running') {
-        const matches = currentViews.filter(view => view.soulId === soul.soulId && view.launchState !== 'stopped')
-        view = matches[0]
         const current = currentIncarnations.find(current => current.soulId === soul.soulId)
-        if (matches.length !== 1 || !view || !current || view.incarnationId !== current.incarnationId
+        view = selectCurrentView(currentViews, current)
+        if (!view || !current || view.incarnationId !== current.incarnationId
           || view.containerId !== current.containerId || (view.hostBootId ?? null) !== current.hostBootId
           || view.launchState !== current.launchState || view.executionGeneration !== current.executionGeneration
           || view.provider !== 'opencode' || view.nativeSessionId !== root.rootSessionId
           || view.intentRevision !== soul.intentRevision || view.desiredState !== soul.desiredState
           || view.recoveryState !== soul.recoveryState || soul.activeWriters > 1
+          || (view.launchState === 'stopped' && soul.activeWriters !== 0)
           || soul.writerClaims.some(writer => writer.soulId !== soul.soulId || writer.incarnationId !== current.incarnationId
             || writer.intentRevision !== soul.intentRevision || writer.provider !== 'opencode'
             || writer.providerStoreId !== soul.providerStoreId || writer.nativeSessionId !== root.rootSessionId)) {
@@ -4431,9 +4441,9 @@ export class ManagedRuntimeOwner {
       installedStores.push(await this.readTask007InstalledStore(batch, root, view))
     }
     for (const { root, soul, view, current, native } of resumedReads) {
-      const after = (await this.inventory()).filter(row => row.soulId === view.soulId && row.launchState !== 'stopped')
-      if (after.length !== 1 || JSON.stringify(after[0]) !== JSON.stringify(view)
-        || JSON.stringify(await this.readTask007NativeObservation(root, soul, after[0], current)) !== JSON.stringify(native)) {
+      const after = selectCurrentView(await this.inventory(), current)
+      if (!after || JSON.stringify(after) !== JSON.stringify(view)
+        || JSON.stringify(await this.readTask007NativeObservation(root, soul, after, current)) !== JSON.stringify(native)) {
         throw new Error('current native Resume observation changed during installed store read')
       }
     }
