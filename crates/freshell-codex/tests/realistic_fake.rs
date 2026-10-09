@@ -1231,3 +1231,75 @@ async fn the_native_refuses_to_run_without_an_explicit_codex_home() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_start_or_resume_holds_no_lock() {
+    // (1) Error overrides: real Codex holds nothing for a start or resume it refused.
+    let home = tempfile::tempdir().unwrap();
+    let refusal = json!({"code": -32603, "message": "fixture refusal"});
+    let refusing = FakeAppServer::spawn(
+        json!({"threadStartThreadId": "t-ref",
+               "overrides": {"thread/start": {"error": refusal},
+                             "thread/resume": {"error": refusal}}}),
+        home.path(),
+        &[],
+    )
+    .await;
+    let mut rpc = connected(refusing.port).await;
+    let start = rpc
+        .call("thread/start", json!({}))
+        .await
+        .expect_err("start refused");
+    assert_eq!(start, refusal);
+    let resume = rpc
+        .call("thread/resume", json!({"threadId": "t-res"}))
+        .await
+        .expect_err("resume refused");
+    assert_eq!(resume, refusal);
+    let loaded = rpc.call("thread/loaded/list", json!({})).await.unwrap();
+    assert_eq!(
+        loaded["data"],
+        json!([]),
+        "a refused thread is never loaded"
+    );
+    for id in ["t-ref", "t-res"] {
+        assert!(
+            !lock_held(&thread_lock_path(home.path(), id)),
+            "{id}: a refused open holds no lock"
+        );
+    }
+    // Another app-server can open both right away.
+    let other = FakeAppServer::spawn(json!({}), home.path(), &[]).await;
+    let mut rpc2 = connected(other.port).await;
+    for id in ["t-ref", "t-res"] {
+        rpc2.call("thread/resume", json!({"threadId": id}))
+            .await
+            .unwrap_or_else(|e| panic!("{id} is free to open elsewhere: {e}"));
+    }
+
+    // (2) assertNoDuplicateActiveThread: the refused second start holds nothing.
+    let home2 = tempfile::tempdir().unwrap();
+    let dup = FakeAppServer::spawn(
+        json!({"assertNoDuplicateActiveThread": true}),
+        home2.path(),
+        &[],
+    )
+    .await;
+    let mut rpc3 = connected(dup.port).await;
+    let first = rpc3.call("thread/start", json!({})).await.unwrap()["thread"]["id"]
+        .as_str()
+        .expect("first thread id")
+        .to_string();
+    let refused = rpc3
+        .call("thread/start", json!({}))
+        .await
+        .expect_err("a second active thread is refused");
+    assert_eq!(refused["code"], -32001);
+    let loaded = rpc3.call("thread/loaded/list", json!({})).await.unwrap();
+    assert_eq!(loaded["data"], json!([first]));
+    assert_eq!(
+        dup.native().await.threads,
+        vec![first],
+        "the native holds only the first thread's lock"
+    );
+}

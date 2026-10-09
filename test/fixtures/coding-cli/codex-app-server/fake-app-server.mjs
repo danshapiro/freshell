@@ -812,19 +812,6 @@ function handleConnection(socket) {
       return
     }
 
-    const requestContext = { socket }
-    if (nativeRole) {
-      const answer = await nativeRole.intercept(method, message.params, socket, requestContext)
-      if (answer?.error) {
-        socket.send(JSON.stringify({ id: message.id, error: answer.error }))
-        return
-      }
-      if (answer && 'result' in answer) {
-        socket.send(JSON.stringify({ id: message.id, result: answer.result }))
-        return
-      }
-    }
-
     // This fixture writes realistic rollout files on turn/start. Require BOTH a test-owned
     // CODEX_HOME and a fixture-only opt-in so an ambient or production CODEX_HOME can never
     // accidentally authorize durable-looking fake sessions.
@@ -921,6 +908,22 @@ function handleConnection(socket) {
         }))
       }, delayMs)
       return
+    }
+
+    // The native role runs only after every refusal above, because it takes the
+    // thread's writer lock: like real Codex, a start or resume the fixture refuses
+    // must not leave a lock (or a loaded thread) behind.
+    const requestContext = { socket }
+    if (nativeRole) {
+      const answer = await nativeRole.intercept(method, message.params, socket, requestContext)
+      if (answer?.error) {
+        socket.send(JSON.stringify({ id: message.id, error: answer.error }))
+        return
+      }
+      if (answer && 'result' in answer) {
+        socket.send(JSON.stringify({ id: message.id, result: answer.result }))
+        return
+      }
     }
 
     setTimeout(async () => {
