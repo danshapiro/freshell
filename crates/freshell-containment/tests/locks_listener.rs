@@ -14,7 +14,7 @@ use freshell_containment::{
 };
 
 /// Test-only bounded wait (product code never polls).
-async fn eventually(what: &str, f: impl Fn() -> bool) {
+async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !f() {
         assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
@@ -57,20 +57,110 @@ impl Drop for OwnChild {
     }
 }
 
-/// A grandchild pinned by pidfd while its parent (the test's child) was
-/// alive; SIGKILLed when dropped. Never reaches a recycled pid.
-struct PinnedGrandchild(ProcWatch);
+/// `(parent pid, start time)` from ONE read of `/proc/<pid>/stat`.
+fn parent_and_start(pid: u32) -> Option<(u32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = stat
+        .get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .collect();
+    Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+}
 
-impl PinnedGrandchild {
+/// The test's grandchild: the child of one of its own children, identified
+/// by its parent, not by timing. Its pid and start time come from one stat
+/// read that names that child as parent while the child is unreaped (so
+/// its pid names no one else), and the guard exists before anything else
+/// is read, asserted or pinned. SIGKILLed when dropped: through its pidfd,
+/// or, if pinning failed, by pid only while the pid has that start time.
+struct Grandchild {
+    pid: u32,
+    start: u64,
+    watch: Option<ProcWatch>,
+}
+
+impl Grandchild {
+    /// The first child of `parent` (bounded test-only wait), pinned.
+    async fn of(parent: &OwnChild) -> Self {
+        let parent_pid = parent.pid();
+        let mut found = None;
+        eventually("the test's child starts its own child", || {
+            found =
+                process::children(parent_pid).into_iter().find_map(|pid| {
+                    match parent_and_start(pid) {
+                        Some((ppid, start)) if ppid == parent_pid => Some((pid, start)),
+                        _ => None,
+                    }
+                });
+            found.is_some()
+        })
+        .await;
+        let (pid, start) = found.expect("found above");
+        let mut grandchild = Self {
+            pid,
+            start,
+            watch: None,
+        };
+        grandchild.watch = Some(ProcWatch::open_expecting(pid, start).expect("pin the grandchild"));
+        grandchild
+    }
+
+    fn watch(&self) -> &ProcWatch {
+        self.watch.as_ref().expect("pinned in `of`")
+    }
+
     fn kill(&self) {
-        let _ = self.0.signal(Sig::Kill);
+        match &self.watch {
+            Some(watch) => {
+                let _ = watch.signal(Sig::Kill);
+            }
+            None => {
+                if process::start_time(self.pid).is_ok_and(|s| s == self.start) {
+                    // SAFETY: plain kill(2) of a pid whose start time was
+                    // just checked (it is still this test's grandchild).
+                    unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
+                }
+            }
+        }
     }
 }
 
-impl Drop for PinnedGrandchild {
+impl Drop for Grandchild {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+/// True when one of `pid`'s descriptors is open on `path`.
+fn has_open(pid: u32, path: &Path) -> bool {
+    let target = std::fs::canonicalize(path).expect("canonical path");
+    std::fs::read_dir(format!("/proc/{pid}/fd")).is_ok_and(|fds| {
+        fds.flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|t| t == target))
+    })
+}
+
+/// `sh` that opens `$0` as fd 3, takes an exclusive flock through it, says
+/// `locked`, and execs `sleep 600` holding it: one long-lived pid owns the
+/// only descriptor, while the lock table names the exited `flock(1)` helper
+/// (the realistic fake's shape).
+const HOLD: &str = r#"exec 3>>"$0"; flock -x -n 3 || exit 1; echo locked; exec sleep 600"#;
+
+/// Starts a [`HOLD`] holder of `lock` and waits until it is `sleep`.
+async fn spawn_holder(lock: &Path) -> OwnChild {
+    let mut child = OwnChild::spawn(
+        Command::new("sh")
+            .args(["-c", HOLD])
+            .arg(lock)
+            .stdout(Stdio::piped()),
+    );
+    assert_eq!(child.read_line(), "locked", "the holder took the lock");
+    let pid = child.pid();
+    eventually("the holder execs sleep", || {
+        process::name(pid).is_ok_and(|n| n == "sleep")
+    })
+    .await;
+    child
 }
 
 fn holder(pid: u32, name: &str, path: &Path) -> LockHolder {
@@ -110,24 +200,9 @@ async fn lock_holders_attributes_a_lock_to_the_process_holding_its_descriptor() 
         "an existing, unlocked file has no holders"
     );
 
-    // One long-lived pid owns the only descriptor; the lock was taken by a
-    // `flock(1)` helper that has exited (the realistic fake's shape), so the
-    // lock table's pid column names a dead process.
-    let mut child = OwnChild::spawn(
-        Command::new("sh")
-            .args([
-                "-c",
-                r#"exec 3>>"$0"; flock -x -n 3 || exit 1; echo locked; exec sleep 600"#,
-            ])
-            .arg(&lock)
-            .stdout(Stdio::piped()),
-    );
-    assert_eq!(child.read_line(), "locked", "the holder took the lock");
+    // The lock table's pid column names the exited `flock(1)` helper.
+    let mut child = spawn_holder(&lock).await;
     let pid = child.pid();
-    eventually("the holder execs sleep", || {
-        process::name(pid).is_ok_and(|n| n == "sleep")
-    })
-    .await;
 
     let expected = vec![holder(pid, "sleep", &lock)];
     assert_eq!(lock_holders(std::slice::from_ref(&lock)), expected);
@@ -148,6 +223,72 @@ async fn lock_holders_attributes_a_lock_to_the_process_holding_its_descriptor() 
 }
 
 #[tokio::test]
+async fn a_process_with_the_lock_file_open_but_unlocked_is_not_a_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("t.lock");
+    std::fs::write(&lock, b"").unwrap();
+
+    // Keeps the lock file open without locking it (the shape of Codex's own
+    // refused second writer).
+    let mut opener = OwnChild::spawn(
+        Command::new("sh")
+            .args(["-c", r#"exec 3>>"$0"; echo open; exec sleep 600"#])
+            .arg(&lock)
+            .stdout(Stdio::piped()),
+    );
+    assert_eq!(opener.read_line(), "open");
+    let opener_pid = opener.pid();
+    assert!(has_open(opener_pid, &lock), "the opener has the file open");
+
+    assert_eq!(
+        lock_holders_among(std::slice::from_ref(&lock), &[opener_pid]),
+        vec![],
+        "an open descriptor without a lock is not a holder"
+    );
+    assert_eq!(lock_holders(std::slice::from_ref(&lock)), vec![]);
+
+    // The real holder, alongside the opener: only it is listed.
+    let holder_child = spawn_holder(&lock).await;
+    let expected = vec![holder(holder_child.pid(), "sleep", &lock)];
+    assert_eq!(lock_holders(std::slice::from_ref(&lock)), expected);
+    assert_eq!(
+        lock_holders_among(
+            std::slice::from_ref(&lock),
+            &[opener_pid, holder_child.pid()]
+        ),
+        expected
+    );
+    assert!(has_open(opener_pid, &lock), "the opener still has it open");
+}
+
+#[tokio::test]
+async fn a_lock_on_one_file_is_not_reported_for_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.lock");
+    let b = dir.path().join("b.lock");
+    std::fs::write(&a, b"").unwrap();
+    std::fs::write(&b, b"").unwrap();
+
+    let holder_child = spawn_holder(&a).await;
+    let pid = holder_child.pid();
+
+    assert_eq!(
+        lock_holders_among(std::slice::from_ref(&b), &[pid]),
+        vec![],
+        "a lock on a.lock is not a lock on b.lock"
+    );
+    assert_eq!(lock_holders(std::slice::from_ref(&b)), vec![]);
+    let on_a = vec![holder(pid, "sleep", &a)];
+    assert_eq!(lock_holders(&[a.clone(), b.clone()]), on_a);
+    assert_eq!(lock_holders_among(&[b.clone(), a.clone()], &[pid]), on_a);
+    // Repeated paths and pids give one entry per (pid, path).
+    assert_eq!(
+        lock_holders_among(&[a.clone(), a.clone()], &[pid, pid]),
+        on_a
+    );
+}
+
+#[tokio::test]
 async fn a_lock_shared_by_two_processes_stays_held_until_both_are_gone() {
     let dir = tempfile::tempdir().unwrap();
     let lock = dir.path().join("t.lock");
@@ -162,14 +303,9 @@ async fn a_lock_shared_by_two_processes_stays_held_until_both_are_gone() {
             .args(["sleep", "600"]),
     );
     let flock_pid = flock.pid();
-    eventually("flock starts its child", || {
-        !process::children(flock_pid).is_empty()
-    })
-    .await;
-    let sleep_pid = process::children(flock_pid)[0];
-    // Pinned while its parent (the test's child) is alive, before anything
-    // can fail, so a failed assertion never leaves it running.
-    let sleep = PinnedGrandchild(ProcWatch::open(sleep_pid).expect("pin the sleep child"));
+    // Pinned before anything is read from it or asserted.
+    let sleep = Grandchild::of(&flock).await;
+    let sleep_pid = sleep.pid;
     eventually("the child execs sleep", || {
         process::name(sleep_pid).is_ok_and(|n| n == "sleep")
     })
@@ -195,7 +331,7 @@ async fn a_lock_shared_by_two_processes_stays_held_until_both_are_gone() {
     );
 
     sleep.kill();
-    tokio::time::timeout(Duration::from_secs(10), sleep.0.exited())
+    tokio::time::timeout(Duration::from_secs(10), sleep.watch().exited())
         .await
         .expect("the sleep child exits")
         .expect("exit watch");
@@ -208,26 +344,24 @@ async fn a_lock_shared_by_two_processes_stays_held_until_both_are_gone() {
 #[tokio::test]
 async fn listening_socket_owner_finds_only_a_listener_inside_the_candidates_trees() {
     // A wrapper whose `node` child owns the listener (the launcher -> native
-    // shape). Node picks a free port and prints it, so no port is guessed.
+    // shape). Node picks a free port and prints it, so no port is guessed,
+    // and exits by itself after ten minutes like the tests' `sleep 600`s.
     let mut wrapper = OwnChild::spawn(
         Command::new("sh")
             .args([
                 "-c",
-                r#"node -e "const s = require('net').createServer().listen(0, '127.0.0.1', () => console.log(s.address().port))" & wait"#,
+                r#"node -e "setTimeout(() => process.exit(0), 600000); const s = require('net').createServer().listen(0, '127.0.0.1', () => console.log(s.address().port))" & wait"#,
             ])
             .stdout(Stdio::piped()),
     );
+    let wrapper_pid = wrapper.pid();
+    // Pinned before anything is read from it or asserted.
+    let node = Grandchild::of(&wrapper).await;
+    let node_pid = node.pid;
     let port: u16 = wrapper
         .read_line()
         .parse()
         .expect("node prints its listening port");
-    let wrapper_pid = wrapper.pid();
-    // Pinned while its parent (the test's child) is alive, before anything
-    // can fail, so a failed assertion never leaves it running.
-    let node_pid = *process::children(wrapper_pid)
-        .first()
-        .expect("node is the wrapper's child");
-    let node = PinnedGrandchild(ProcWatch::open(node_pid).expect("pin the node child"));
     assert_eq!(process::name(node_pid).unwrap(), "node");
 
     assert_eq!(
