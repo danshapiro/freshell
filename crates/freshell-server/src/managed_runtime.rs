@@ -431,11 +431,14 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 match self.client.launch(request_id, launch).await {
                     Ok(result) => result,
                     Err(error) => {
-                        if let Some(capability) = &mcp_capability {
-                            let _ = crate::managed_mcp_capability::revoke_mcp_capability(
-                                &capability.grant_id,
-                            );
-                        }
+                        // Launch may have bound/dispatched this generation
+                        // before its reply was lost or completion failed. The
+                        // existing ownership journal must survive reconciliation.
+                        tracing::warn!(event="provider.inputs.initial_launch.unconfirmed",
+                            provider=%request.mode,soul_id=%soul_id,
+                            grant_id=mcp_capability.as_ref().map(|c|c.grant_id.as_str()),
+                            stage="controller",operation="launch",%error,
+                            "Retain provider inputs until dispatch outcome is confirmed");
                         return Err(error.to_string());
                     }
                 }

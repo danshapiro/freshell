@@ -147,6 +147,31 @@ pub(crate) fn accept_initial_replan_fixture_preparation(
     store().commit_preparation(&capability.grant_id, soul, &incarnation, &capability_dir()?)
 }
 
+#[cfg(test)]
+pub(crate) async fn apply_initial_caller_fixture_callback(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let settings = SETTINGS.get().ok_or("fixture controller is unconfigured")?;
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+    let client = freshell_runtime_client::RuntimeClient::new(
+        &settings.control_socket,
+        &settings.control_secret,
+    );
+    apply_prepared_callback(
+        bytes,
+        &settings.control_secret,
+        store(),
+        &settings.directory,
+        &settings.endpoint,
+        &home,
+        &client,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) fn initial_caller_fixture_authenticates(scope: &str) -> bool {
+    store().authenticates(scope)
+}
+
 pub(crate) fn configure(
     bind_host: &str,
     port: u16,

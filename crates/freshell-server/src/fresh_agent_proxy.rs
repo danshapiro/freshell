@@ -691,10 +691,14 @@ impl HostedFreshAgentProxy {
                 .launch(request_id, request)
                 .await
                 .map_err(|error| {
-                    let _ = crate::managed_mcp_capability::revoke_mcp_capability(
-                        &mcp_capability.grant_id,
-                    );
-                    tracing::warn!(?error, "fresh_agent.create.launch_failed");
+                    // A failed reply cannot establish that this exact
+                    // preparation was never accepted. Preserve its journal and
+                    // stage for existing same-conversation reconciliation.
+                    tracing::warn!(event="provider.inputs.initial_launch.unconfirmed",
+                        provider=provider.as_str(),soul_id=%soul,
+                        grant_id=%mcp_capability.grant_id,
+                        stage="controller",operation="launch",%error,
+                        "Retain provider inputs until dispatch outcome is confirmed");
                 })?
         };
         let naming_projection = match message.naming_handle.as_deref() {
