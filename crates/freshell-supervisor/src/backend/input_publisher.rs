@@ -88,6 +88,39 @@ fn environment(value: &Value) -> Option<BTreeMap<&str, &str>> {
     Some(result)
 }
 
+async fn open_approved_source(
+    path: &Path,
+    remaining: u64,
+) -> Result<tokio::io::Take<tokio::fs::File>, BackendError> {
+    if std::fs::canonicalize(path).map_err(|_| fail("approved input source unavailable"))? != path {
+        return Err(fail("approved input source selection changed"));
+    }
+    let limit = MAX_FILE_BYTES.min(remaining);
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|_| fail("approved input source metadata failed"))?;
+    if !metadata.is_file() {
+        return Err(fail("approved input source is not regular"));
+    }
+    if metadata.len() > limit {
+        return Err(fail("approved input source actual bytes exceed profile"));
+    }
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|_| fail("approved input source read failed"))?;
+    let opened = file
+        .metadata()
+        .await
+        .map_err(|_| fail("approved input source metadata failed"))?;
+    if !opened.is_file() {
+        return Err(fail("approved input source is not regular"));
+    }
+    if opened.len() > limit {
+        return Err(fail("approved input source actual bytes exceed profile"));
+    }
+    Ok(file.take(limit + 1))
+}
+
 pub(super) fn owned_helper(actual: &Value, expected: &Value) -> bool {
     let mounts_match = actual["HostConfig"]["Mounts"]
         .as_array()
@@ -455,25 +488,8 @@ impl DockerEngineBackend {
             .await?;
             let mut total = 0u64;
             for (source_id, path) in sources.iter().enumerate() {
-                if std::fs::canonicalize(path)
-                    .map_err(|_| fail("approved input source unavailable"))?
-                    != *path
-                {
-                    return Err(fail("approved input source selection changed"));
-                }
-                let file = tokio::fs::File::open(path)
-                    .await
-                    .map_err(|_| fail("approved input source read failed"))?;
-                if !file
-                    .metadata()
-                    .await
-                    .map_err(|_| fail("approved input source metadata failed"))?
-                    .is_file()
-                {
-                    return Err(fail("approved input source is not regular"));
-                }
                 let mut file =
-                    file.take(MAX_FILE_BYTES.min(MAX_TOTAL_BYTES.saturating_sub(total)) + 1);
+                    open_approved_source(path, MAX_TOTAL_BYTES.saturating_sub(total)).await?;
                 request(
                     &mut stream,
                     &Request::Open {
@@ -690,6 +706,76 @@ impl DockerEngineBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn provider_input_publisher_rechecks_actual_capacity_before_payload_read() {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let owned = tempfile::tempdir().unwrap();
+        let source = owned.path().join("approved-source");
+        for (bytes, remaining) in [
+            (MAX_FILE_BYTES + 1, MAX_TOTAL_BYTES),
+            (MAX_FILE_BYTES, MAX_FILE_BYTES - 1),
+        ] {
+            let file = std::fs::File::create(&source).unwrap();
+            file.set_len(bytes).unwrap();
+            file.set_times(
+                std::fs::FileTimes::new().set_accessed(UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .unwrap();
+            drop(file);
+            let result = open_approved_source(&source, remaining).await;
+            let rejected = match result {
+                Err(error) => {
+                    assert!(error.to_string().contains("exceed"));
+                    true
+                }
+                Ok(mut reader) => {
+                    let mut byte = [0];
+                    reader.read_exact(&mut byte).await.unwrap();
+                    false
+                }
+            };
+            assert!(
+                rejected,
+                "fresh oversized payload must be rejected before reading"
+            );
+            assert_eq!(std::fs::metadata(&source).unwrap().atime(), 1);
+        }
+
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(MAX_FILE_BYTES).unwrap();
+        drop(file);
+        let mut reader = open_approved_source(&source, MAX_FILE_BYTES).await.unwrap();
+        let mut bytes = [0; MAX_CHUNK_BYTES];
+        let mut observed = 0u64;
+        loop {
+            let count = reader.read(&mut bytes).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            assert!(bytes[..count].iter().all(|byte| *byte == 0));
+            observed += count as u64;
+        }
+        assert_eq!(observed, MAX_FILE_BYTES);
+
+        std::fs::write(&source, []).unwrap();
+        let mut reader = open_approved_source(&source, 0).await.unwrap();
+        assert_eq!(reader.read(&mut [0]).await.unwrap(), 0);
+
+        // Growth after acceptance remains bounded by the same one-byte
+        // lookahead used by the publisher's streaming count checks.
+        let mut reader = open_approved_source(&source, 1).await.unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(3)
+            .unwrap();
+        assert_eq!(reader.read(&mut bytes).await.unwrap(), 2);
+        assert_eq!(reader.read(&mut bytes).await.unwrap(), 0);
+    }
 
     #[test]
     fn provider_input_helper_accepts_docker_inherited_labels_and_omitted_false_without_losing_owner_fences(
@@ -976,5 +1062,6 @@ mod tests {
             .is_ok());
         drop(backend);
         server.abort();
+        let _ = server.await;
     }
 }
