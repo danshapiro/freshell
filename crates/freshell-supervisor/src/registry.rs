@@ -1889,6 +1889,24 @@ impl Registry {
             if updated != 1 {
                 return Err(RegistryError::NativeIdentityConflict);
             }
+            let (launch, nonce, generation): (Option<String>, String, u64) = tx.query_row(
+                "SELECT native_identity_launch,launch_nonce,execution_generation FROM incarnations WHERE incarnation_id=?1",
+                params![incarnation_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if let Some(launch) = launch.filter(|_| fresh_spec.is_some()) {
+                let mut launch: freshell_runtime_protocol::NativeIdentityLaunch = serde_json::from_str(&launch)?;
+                if launch.incarnation_id != incarnation_id
+                    || launch.launch_nonce != nonce
+                    || launch.execution_generation != generation
+                    || launch.requested_native_session_id.as_deref().is_some_and(|root| root != expected_parent)
+                {
+                    return Err(RegistryError::NativeIdentityConflict);
+                }
+                launch.evidence_revision = launch.evidence_revision.checked_add(1).ok_or(RegistryError::NativeIdentityConflict)?;
+                launch.requested_native_session_id = Some(child_session_id.clone());
+                tx.execute("UPDATE incarnations SET native_identity_launch=?1,native_identity_observation=NULL WHERE incarnation_id=?2",
+                    params![serde_json::to_string(&launch)?,incarnation_id.as_str()])?;
+            }
             let successor = load_recovery_write_fence(&tx, &soul_id)?;
             tx.commit()?;
             Ok(successor)
@@ -6078,7 +6096,7 @@ pub(crate) mod tests {
         prepared
     }
 
-    async fn materialize_fresh_runtime(
+    pub(crate) async fn materialize_fresh_runtime(
         registry: &Registry,
         soul_id: SoulId,
         workspace: &Path,
@@ -6618,6 +6636,33 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+        let parent_context = registry.recovery_context(soul.clone()).await.unwrap();
+        let parent_launch = registry
+            .bind_native_identity_launch(freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: parent_context.prior_handle.launch_nonce().as_str().into(),
+                evidence_revision: parent_context.evidence_revision,
+                execution_generation: 0,
+                requested_native_session_id: Some("native-parent".into()),
+            })
+            .await
+            .unwrap();
+        let parent_observation = freshell_runtime_protocol::NativeIdentityObservation {
+            native_session_id: "native-parent".into(),
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: parent_launch.launch_nonce.clone(),
+            evidence_revision: parent_launch.evidence_revision,
+            source: freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+            evidence_digest: "a".repeat(64),
+        };
+        registry
+            .record_native_identity_observation(
+                soul.clone(),
+                parent_observation.clone(),
+                parent_context.write_fence(),
+            )
+            .await
+            .unwrap();
         // Model an already-qualified parent branch. A provider-native fork
         // invalidates this exact resume/checkpoint evidence even though the
         // soul and enclosure stay live.
@@ -6663,6 +6708,29 @@ pub(crate) mod tests {
 
         let context = registry.recovery_context(soul.clone()).await.unwrap();
         assert_eq!(context.native_session_id.as_deref(), Some("native-child"));
+        let child_launch = context.native_identity_launch.as_ref().unwrap();
+        let child_observation = freshell_runtime_protocol::NativeIdentityObservation {
+            native_session_id: "native-child".into(),
+            evidence_revision: parent_launch.evidence_revision + 1,
+            ..parent_observation.clone()
+        };
+        registry
+            .record_native_identity_observation(
+                soul.clone(),
+                child_observation.clone(),
+                context.write_fence(),
+            )
+            .await
+            .expect("the current child observation must match the transitioned launch");
+        assert!(child_observation.matches_launch(child_launch));
+        assert!(registry
+            .record_native_identity_observation(
+                soul.clone(),
+                parent_observation,
+                context.write_fence()
+            )
+            .await
+            .is_err());
         assert_eq!(context.resume_spec, None);
         assert_eq!(context.allocation_state, AllocationState::Materializing);
         assert_eq!(context.durability_state, DurabilityState::LiveOnly);

@@ -729,6 +729,11 @@ async fn semantic_operation_ack_rotates_and_persists_native_identity() {
         actor.profile().await.native_session_id.as_deref(),
         Some("native-after-rollback")
     );
+    assert_eq!(
+        actor.observed_native_session_id().await.as_deref(),
+        Some("native-after-rollback"),
+        "the native operation acknowledgement retires the parent observation"
+    );
     let persisted: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("fresh-agent-state.json")).unwrap())
             .unwrap();
@@ -1482,6 +1487,11 @@ async fn provider_native_fork_transitions_the_same_actor_without_a_second_writer
         actor.profile().await.native_session_id.as_deref(),
         Some("native-child")
     );
+    assert_eq!(
+        actor.observed_native_session_id().await.as_deref(),
+        Some("native-child"),
+        "the native fork acknowledgement retires the parent observation"
+    );
     assert_eq!(transport.forks.load(Ordering::SeqCst), 1);
 
     // Lost reply/reconnect reuses durable completion and never calls provider fork twice.
@@ -1509,6 +1519,7 @@ async fn provider_native_fork_transitions_the_same_actor_without_a_second_writer
 struct HangingForkTransport {
     forks: AtomicUsize,
     entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[async_trait]
@@ -1534,7 +1545,12 @@ impl FreshAgentTransport for HangingForkTransport {
     ) -> Result<ForkTransition, DispatchFailure> {
         self.forks.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
-        std::future::pending::<Result<ForkTransition, DispatchFailure>>().await
+        self.release.notified().await;
+        Ok(ForkTransition {
+            parent_session_id: "native-parent".into(),
+            child_session_id: "native-child".into(),
+            parent_retired_by_runtime: true,
+        })
     }
     async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
         Ok(())
@@ -1556,6 +1572,7 @@ async fn interrupted_provider_fork_is_ambiguous_after_reopen_and_is_never_replay
     let first_transport = Arc::new(HangingForkTransport {
         forks: AtomicUsize::new(0),
         entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
     });
     let actor = FreshAgentHostActor::open(
         dir.path(),
@@ -1576,9 +1593,27 @@ async fn interrupted_provider_fork_is_ambiguous_after_reopen_and_is_never_replay
     )
     .await
     .expect("fork reached provider acceptance window");
+    assert_eq!(actor.observed_native_session_id().await, None);
+    assert_eq!(
+        actor.observe_native_identity("native-parent".into()).await,
+        Err(ActorError::NativeIdentityMismatch)
+    );
+    assert_eq!(
+        actor.observe_native_identity("native-child".into()).await,
+        Err(ActorError::NativeIdentityMismatch)
+    );
     spawned.abort();
     let _ = spawned.await;
     assert_eq!(first_transport.forks.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            actor.fork(RequestId::new(), "native-parent".into(), None)
+        )
+        .await,
+        Ok(Err(ActorError::NativeIdentityMismatch)),
+        "an unsettled fork must reject another native mutation"
+    );
     drop(actor);
     drop(first_transport);
 
@@ -1605,4 +1640,38 @@ async fn interrupted_provider_fork_is_ambiguous_after_reopen_and_is_never_replay
         reopened.profile().await.native_session_id.as_deref(),
         Some("native-parent")
     );
+}
+
+#[tokio::test]
+async fn stop_fences_a_late_native_fork_acknowledgement() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(HangingForkTransport {
+        forks: AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "same-store", Some("native-parent")),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let task = {
+        let actor = actor.clone();
+        tokio::spawn(async move {
+            actor
+                .fork(RequestId::new(), "native-parent".into(), None)
+                .await
+        })
+    };
+    transport.entered.notified().await;
+    actor.clone().stop().await.unwrap();
+    transport.release.notify_one();
+    assert_eq!(task.await.unwrap(), Err(ActorError::AmbiguousDispatch));
+    assert_eq!(
+        actor.profile().await.native_session_id.as_deref(),
+        Some("native-parent")
+    );
+    assert_eq!(actor.observed_native_session_id().await, None);
 }

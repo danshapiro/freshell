@@ -1567,6 +1567,9 @@ impl Supervisor {
                 "soul is not a hosted fresh-agent",
             ));
         }
+        let host = self
+            .authenticate_current_fresh_host(&soul_id, &active)
+            .await?;
         let settings_correlation = serde_json::to_vec(&settings).map_err(|_| {
             RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -1603,19 +1606,6 @@ impl Supervisor {
             .mark_input_dispatching(soul_id.clone(), request_id.clone())
             .await
             .map_err(map_registry)?;
-        let host = match self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-            .await
-        {
-            Ok(host) => host,
-            Err(error) => {
-                self.registry
-                    .mark_input_ambiguous(soul_id, request_id)
-                    .await
-                    .map_err(map_registry)?;
-                return Err(error);
-            }
-        };
         let fence = self
             .registry
             .recovery_write_fence(soul_id.clone())
@@ -1681,6 +1671,48 @@ impl Supervisor {
                 Err(error)
             }
         }
+    }
+
+    async fn authenticate_current_fresh_host(
+        &self,
+        soul_id: &SoulId,
+        active: &crate::registry::OwnedRuntimeHandle,
+    ) -> Result<AuthenticatedHost, RuntimeError> {
+        let host = self
+            .authenticate_host(active.incarnation_id(), active.runtime_dir())
+            .await?;
+        let status = self
+            .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
+            .await?;
+        let current = self
+            .registry
+            .recovery_context(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let fixture = current.fresh_agent.as_ref().is_some_and(|agent| {
+            crate::registry::deterministic_fresh_agent_fixture(&current.provider, agent)
+        });
+        if current.desired_state != freshell_runtime_protocol::DesiredState::Running
+            || current.prior_handle.incarnation_id() != active.incarnation_id()
+            || status.exited
+            || (!fixture
+                && (!host
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "native-identity-observation-v1")
+                    || crate::recovery::current_native_observation(&current, &status).is_none()))
+        {
+            append_event(
+                &self.config.lifecycle_log,
+                "fresh_agent.input_native_identity_unsettled",
+                serde_json::json!({"severity":"warn","soulId":soul_id,"incarnationId":active.incarnation_id()}),
+            );
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryBlocked,
+                "fresh-agent input requires the current committed native identity",
+            ));
+        }
+        Ok(host)
     }
 
     async fn fresh_agent_fork(
@@ -1751,12 +1783,49 @@ impl Supervisor {
         }
         // Re-materialize exact resume evidence for the child immediately. A
         // successful fork never leaves the soul recoverable only as its parent.
+        self.observe_fresh_native_transition(
+            &soul_id,
+            handle.incarnation_id(),
+            context.intent_revision,
+        )
+        .await?;
         let _ = self.probe_recovery_locked(soul_id).await;
         Ok(freshell_runtime_protocol::FreshAgentForkResult {
             parent_session_id: presentation_parent_session_id,
             child_session_id: transition.child_session_id,
             parent_retired_by_runtime: true,
         })
+    }
+
+    async fn observe_fresh_native_transition(
+        &self,
+        soul_id: &SoulId,
+        incarnation_id: &IncarnationId,
+        intent_revision: u64,
+    ) -> Result<(), RuntimeError> {
+        use crate::recovery::NativeIdentityWait;
+        let wait = self
+            .wait_for_native_identity(
+                soul_id,
+                incarnation_id,
+                intent_revision,
+                crate::recovery::native_identity_wait_timeout(false),
+                true,
+            )
+            .await;
+        match wait {
+            NativeIdentityWait::Observed { .. } => Ok(()),
+            NativeIdentityWait::StopIntent { .. } | NativeIdentityWait::IntentChanged { .. } => {
+                Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "durable intent changed during native root transition",
+                ))
+            }
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryBlocked,
+                "current native child observation is unavailable after the acknowledged transition",
+            )),
+        }
     }
 
     async fn fresh_agent_compact(
@@ -1770,7 +1839,7 @@ impl Supervisor {
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let handle = self
             .registry
-            .active_handle_for_soul(soul_id)
+            .active_handle_for_soul(soul_id.clone())
             .await
             .map_err(map_registry)?;
         if handle.fresh_agent().is_none() {
@@ -1780,7 +1849,7 @@ impl Supervisor {
             ));
         }
         let host = self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .authenticate_current_fresh_host(&soul_id, &handle)
             .await?;
         match self
             .send_authenticated_host_command(
@@ -1888,6 +1957,12 @@ impl Supervisor {
                 if identity_update != FreshAgentNativeIdentityUpdate::Unchanged {
                     // The old resume/checkpoint proof names the pre-operation
                     // branch. Re-materialize exact evidence before replacement.
+                    self.observe_fresh_native_transition(
+                        &soul_id,
+                        handle.incarnation_id(),
+                        context.intent_revision,
+                    )
+                    .await?;
                     let _ = self.probe_recovery_locked(soul_id).await;
                 }
                 Ok(state)
@@ -2013,11 +2088,11 @@ impl Supervisor {
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let handle = self
             .registry
-            .active_handle_for_soul(soul_id)
+            .active_handle_for_soul(soul_id.clone())
             .await
             .map_err(map_registry)?;
         let host = self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .authenticate_current_fresh_host(&soul_id, &handle)
             .await?;
         match self
             .send_authenticated_host_command(
@@ -3966,6 +4041,226 @@ mod opencode_transfer_restart_tests {
 
     const ATTEMPT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ATTEMPT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[tokio::test]
+    async fn fresh_native_transition_must_commit_before_input_and_recovery_probe() {
+        use freshell_runtime_protocol::{
+            NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource, RecoveryProbe,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_fresh_runtime(&registry, soul.clone(), dir.path())
+                .await;
+        let runtime = dir.path().join("owned-host");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET runtime_dir=?1,execution_generation=1 WHERE incarnation_id=?2",
+            params![runtime.to_string_lossy(), prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "native-parent".into(),
+            )
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let parent_launch = NativeIdentityLaunch {
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+            evidence_revision: 7,
+            execution_generation: 1,
+            requested_native_session_id: Some("native-parent".into()),
+        };
+        registry
+            .bind_native_identity_launch(parent_launch.clone())
+            .await
+            .unwrap();
+        let proof = |root: &str, revision: u64| NativeIdentityObservation {
+            native_session_id: root.into(),
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: parent_launch.launch_nonce.clone(),
+            evidence_revision: revision,
+            source: NativeIdentitySource::FreshProviderHandshake,
+            evidence_digest: "a".repeat(64),
+        };
+        let parent_proof = proof("native-parent", 7);
+        let child_proof = proof("native-child", 8);
+        let current_proof = Arc::new(std::sync::Mutex::new(Some(child_proof.clone())));
+        let inputs = Arc::new(AtomicUsize::new(0));
+        let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+        let responder = {
+            let current_proof = current_proof.clone();
+            let inputs = inputs.clone();
+            tokio::spawn(async move {
+                let boot = HostBootId::new();
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => HostResult::Hello {
+                            proof: host_proof(
+                                b"synthetic-secret",
+                                &challenge,
+                                &boot,
+                                &incarnation_id,
+                            ),
+                            host_boot_id: boot.clone(),
+                            capabilities: vec![
+                                "owned-provider-config-v1".into(),
+                                "provider-store-probe-v1".into(),
+                                "native-identity-observation-v1".into(),
+                            ],
+                            effective_limits: context.requested_limits,
+                        },
+                        HostCommand::Status { .. } => {
+                            let observation = current_proof.lock().unwrap().clone();
+                            HostResult::Status {
+                                native_session_id: observation
+                                    .as_ref()
+                                    .map(|proof| proof.native_session_id.clone()),
+                                native_identity_observation: observation,
+                                host_boot_id: boot.clone(),
+                                worker_pid: None,
+                                worker_launch_count: 1,
+                                max_control_epoch: 1,
+                                max_execution_generation: 1,
+                                fixture_evidence: serde_json::json!({}),
+                                exited: false,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        HostCommand::FreshAgentSend { .. } => {
+                            inputs.fetch_add(1, Ordering::SeqCst);
+                            HostResult::FreshAgentCommand {
+                                state: CommandState::ProviderAcked,
+                                native_session_id: Some("native-child".into()),
+                            }
+                        }
+                        HostCommand::FreshAgentFork { .. } => HostResult::FreshAgentFork(
+                            freshell_runtime_protocol::FreshAgentForkResult {
+                                parent_session_id: "native-parent".into(),
+                                child_session_id: "native-child".into(),
+                                parent_retired_by_runtime: true,
+                            },
+                        ),
+                        HostCommand::ProbeRecovery {
+                            resume_spec: Some(spec),
+                            ..
+                        } => HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                            evidence_revision: spec.evidence_revision,
+                            resume_spec: spec,
+                        }),
+                        other => panic!("unexpected controlled host command {other:?}"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            })
+        };
+        let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+            &dir,
+            registry.clone(),
+            crate::backend::BackendRuntimeState::Running,
+        );
+        assert!(supervisor
+            .fresh_agent_send(
+                RequestId::new(),
+                soul.clone(),
+                "blocked child input".into(),
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            inputs.load(Ordering::SeqCst),
+            0,
+            "uncommitted native child cannot receive a prompt"
+        );
+        assert_eq!(
+            supervisor
+                .fresh_agent_resolve(
+                    soul.clone(),
+                    "uncommitted-decision".into(),
+                    serde_json::json!({"behavior":"allow"})
+                )
+                .await
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::RecoveryBlocked,
+            "tool permission input also waits for the registry commit"
+        );
+        assert_eq!(
+            supervisor
+                .fresh_agent_compact(RequestId::new(), soul.clone(), None, None)
+                .await
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::RecoveryBlocked,
+            "provider compaction also waits for the registry commit"
+        );
+        let transition = supervisor
+            .fresh_agent_fork(RequestId::new(), soul.clone(), "native-parent".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(transition.child_session_id, "native-child");
+        let probe = supervisor
+            .probe_recovery_locked(soul.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(probe, RecoveryProbe::ReattachReady { .. }),
+            "current child proof should reach actual probe policy: {probe:?}"
+        );
+        assert_eq!(
+            supervisor
+                .fresh_agent_send(
+                    RequestId::new(),
+                    soul.clone(),
+                    "current child input".into(),
+                    None
+                )
+                .await
+                .unwrap(),
+            CommandState::ProviderAcked
+        );
+        assert_eq!(inputs.load(Ordering::SeqCst), 1);
+        for stale in [Some(parent_proof), None] {
+            *current_proof.lock().unwrap() = stale;
+            assert!(supervisor
+                .fresh_agent_send(RequestId::new(), soul.clone(), "stale input".into(), None)
+                .await
+                .is_err());
+            assert_eq!(inputs.load(Ordering::SeqCst), 1);
+            assert!(!matches!(
+                supervisor
+                    .probe_recovery_locked(soul.clone())
+                    .await
+                    .unwrap(),
+                RecoveryProbe::ReattachReady { .. }
+            ));
+        }
+        responder.abort();
+        let _ = responder.await;
+    }
 
     fn descriptor() -> OpenCodeTransferDescriptor {
         let payload = b"12345678";

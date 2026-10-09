@@ -658,7 +658,9 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
   if (state.nativeChannel) {
     state.nativeReadyPromise = state.nativeChannel.waitReady(sdkQuery).then(async (observation) => {
       if (sessions.get(sessionId) !== state || state.queryGeneration !== generation || abort.signal.aborted) return
-      if (req.resumeSessionId && observation.nativeSessionId !== req.resumeSessionId) throw new Error('native exact resume changed root')
+      if (state.nativeIdentityTransition) {
+        if (observation.nativeSessionId === state.nativeIdentityTransition.parentNativeSessionId) throw new Error('native rollback retained the retired root')
+      } else if (req.resumeSessionId && observation.nativeSessionId !== req.resumeSessionId) throw new Error('native exact resume changed root')
       if (await nativeProfileDigest(req, state.settings) !== state.nativeProfileDigest) throw new Error('selected native profile changed during startup')
       if (state.queryGeneration !== generation || abort.signal.aborted) return
       if (!process.env.HOME || !isAbsolute(process.env.HOME)) throw new Error('managed native checkpoint HOME is unavailable')
@@ -668,6 +670,16 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
         profileDigest: state.nativeProfileDigest, allowMissingTranscript: !req.resumeSessionId })
       state.nativeReady = true
       state.cliSessionId = observation.nativeSessionId
+      if (state.nativeIdentityTransition) {
+        // The operation selected this child once. Any later checkpoint query
+        // must resume it exactly, without repeating the original fork options.
+        state.createRequest = { ...req, resumeSessionId: observation.nativeSessionId }
+        delete state.createRequest.nativeIdentityTransition
+        delete state.createRequest.forkSession
+        delete state.createRequest.resumeSessionAt
+        delete state.createRequest.resumeDropsTurn
+      }
+      state.nativeIdentityTransition = undefined
       emit({ type: 'sdk.session.init', sessionId, cliSessionId: observation.nativeSessionId,
         cwd: observation.native.cwd, model: req.model, nativeIdentityEvidence: {
           launch, digest: observation.evidenceDigest, source: observation.native.source, queryGeneration: generation,
@@ -787,8 +799,21 @@ async function handleCreate(req) {
     // events (macrotasks) cannot interleave inside that finally.
     sessions.set(sessionId, state)
 
-    const launch = process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH
+    let launch = process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH
       ? JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) : undefined
+    if (req.nativeIdentityTransition) {
+      const transition = req.nativeIdentityTransition
+      const next = transition.launch
+      if (!launch || !next || next.incarnationId !== launch.incarnationId
+        || next.launchNonce !== launch.launchNonce || next.executionGeneration !== launch.executionGeneration
+        || !Number.isSafeInteger(next.evidenceRevision) || next.evidenceRevision <= launch.evidenceRevision
+        || next.requestedNativeSessionId !== null
+        || typeof transition.parentNativeSessionId !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(transition.parentNativeSessionId)
+        || (req.resumeSessionId && req.forkSession !== true)) throw new Error('invalid native rollback launch binding')
+      launch = next
+      state.nativeIdentityTransition = transition
+    }
     state.createRequest = req
     state.launch = launch
     if (launch) state.nativeProfileDigest = await nativeProfileDigest(req, state.settings)

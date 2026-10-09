@@ -20,7 +20,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use tokio::sync::Mutex;
 
@@ -393,8 +396,10 @@ pub struct FreshAgentHostActor {
     /// Ephemeral acknowledgement from this transport start. Saved profile
     /// identity remains a resume request and cannot populate this slot.
     observed_native_session_id: Mutex<Option<String>>,
+    native_identity_transition: AtomicBool,
+    stopped: AtomicBool,
     dispatch_lock: Mutex<()>,
-    native_recovery_released: std::sync::atomic::AtomicBool,
+    native_recovery_released: AtomicBool,
     native_recovery_prepared: bool,
     event_byte_cap: usize,
     event_count_cap: usize,
@@ -431,10 +436,7 @@ impl FreshAgentHostActor {
             );
             return Ok(());
         }
-        if self
-            .native_recovery_released
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.native_recovery_released.load(Ordering::SeqCst) {
             return Err(ActorError::AmbiguousDispatch);
         }
         let state = self.state.lock().await;
@@ -466,10 +468,7 @@ impl FreshAgentHostActor {
         {
             return Err(ActorError::NativeIdentityMismatch);
         }
-        if self
-            .native_recovery_released
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.native_recovery_released.swap(true, Ordering::SeqCst) {
             return Err(ActorError::AmbiguousDispatch);
         }
         self.transport
@@ -609,8 +608,10 @@ impl FreshAgentHostActor {
             transport: Arc::clone(&transport),
             state: Mutex::new(state),
             observed_native_session_id: Mutex::new(observed_native_session_id),
+            native_identity_transition: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             dispatch_lock: Mutex::new(()),
-            native_recovery_released: std::sync::atomic::AtomicBool::new(false),
+            native_recovery_released: AtomicBool::new(false),
             native_recovery_prepared,
             event_byte_cap,
             event_count_cap,
@@ -649,7 +650,15 @@ impl FreshAgentHostActor {
         if !self.is_live().await {
             return None;
         }
-        self.observed_native_session_id.lock().await.clone()
+        let state = self.state.lock().await;
+        if self.native_identity_transition.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.observed_native_session_id
+            .lock()
+            .await
+            .clone()
+            .filter(|observed| state.profile.native_session_id.as_ref() == Some(observed))
     }
 
     pub async fn observed_native_identity_evidence(&self) -> Option<Value> {
@@ -665,6 +674,14 @@ impl FreshAgentHostActor {
             return Err(ActorError::NativeIdentityMismatch);
         }
         let mut state = self.state.lock().await;
+        if self.native_identity_transition.load(Ordering::SeqCst)
+            || self.stopped.load(Ordering::SeqCst)
+        {
+            // Native operation acknowledgements settle a root transition. A
+            // racing lifecycle event alone cannot adopt a child or revive its
+            // retired parent while that operation is incomplete.
+            return Err(ActorError::NativeIdentityMismatch);
+        }
         match state.profile.native_session_id.as_deref() {
             Some(existing) if existing != native_session_id => {
                 return Err(ActorError::NativeIdentityMismatch)
@@ -695,6 +712,11 @@ impl FreshAgentHostActor {
         // durability transition and provider acceptance boundary within the
         // same fence so concurrent gateways cannot become double writers.
         let _dispatch_guard = self.dispatch_lock.lock().await;
+        if self.native_identity_transition.load(Ordering::SeqCst)
+            || self.stopped.load(Ordering::SeqCst)
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
         let command_material = serde_json::to_vec(&(text.as_str(), &settings)).map_err(persist)?;
         let digest = digest(&command_material);
         let dispatch_profile;
@@ -820,6 +842,11 @@ impl FreshAgentHostActor {
                     )),
                 };
             }
+            if self.native_identity_transition.load(Ordering::SeqCst)
+                || self.stopped.load(Ordering::SeqCst)
+            {
+                return Err(ActorError::NativeIdentityMismatch);
+            }
             if state.profile.native_session_id.as_deref() != Some(parent_session_id.as_str()) {
                 return Err(ActorError::NativeIdentityMismatch);
             }
@@ -843,6 +870,8 @@ impl FreshAgentHostActor {
                     .as_slice(),
             )?;
             write_state(&self.state_dir, &state)?;
+            self.native_identity_transition
+                .store(true, Ordering::SeqCst);
         }
 
         let result = self
@@ -852,7 +881,8 @@ impl FreshAgentHostActor {
         let mut state = self.state.lock().await;
         match result {
             Ok(transition) => {
-                if transition.parent_session_id != parent_session_id
+                if self.stopped.load(Ordering::SeqCst)
+                    || transition.parent_session_id != parent_session_id
                     || transition.child_session_id.is_empty()
                     || transition.child_session_id == parent_session_id
                     || transition.child_session_id.chars().any(char::is_control)
@@ -893,6 +923,10 @@ impl FreshAgentHostActor {
                     self.event_count_cap,
                 )?;
                 write_state(&self.state_dir, &state)?;
+                *self.observed_native_session_id.lock().await =
+                    Some(transition.child_session_id.clone());
+                self.native_identity_transition
+                    .store(false, Ordering::SeqCst);
                 Ok(transition)
             }
             Err(failure) => {
@@ -907,6 +941,8 @@ impl FreshAgentHostActor {
                 if failure.acceptance_ambiguous {
                     Err(ActorError::AmbiguousDispatch)
                 } else {
+                    self.native_identity_transition
+                        .store(false, Ordering::SeqCst);
                     Err(ActorError::Transport(failure.message))
                 }
             }
@@ -942,6 +978,11 @@ impl FreshAgentHostActor {
                 };
             }
         }
+        if self.native_identity_transition.load(Ordering::SeqCst)
+            || self.stopped.load(Ordering::SeqCst)
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
         if !self
             .transport
             .supports_operation(&operation)
@@ -969,6 +1010,8 @@ impl FreshAgentHostActor {
                 .expect("inserted semantic operation")
                 .state = CommandState::Dispatching;
             write_state(&self.state_dir, &state)?;
+            self.native_identity_transition
+                .store(true, Ordering::SeqCst);
         }
 
         let result = self
@@ -982,6 +1025,10 @@ impl FreshAgentHostActor {
                 .get_mut(request_id.as_str())
                 .expect("durable semantic operation");
             match result {
+                Ok(_) if self.stopped.load(Ordering::SeqCst) => {
+                    command.state = CommandState::Ambiguous;
+                    (Err(ActorError::AmbiguousDispatch), None)
+                }
                 Ok(ack) => {
                     command.provider_ack_id = ack.provider_ack_id;
                     command.state = CommandState::ProviderAcked;
@@ -1005,15 +1052,26 @@ impl FreshAgentHostActor {
                 }
             }
         };
-        if let Some(native_session_id) = native_session_id {
-            if state.profile.native_session_id.as_deref() != Some(&native_session_id) {
+        if let Some(native_session_id) = native_session_id.as_ref() {
+            if native_session_id.is_empty() || native_session_id.chars().any(char::is_control) {
+                state
+                    .commands
+                    .get_mut(request_id.as_str())
+                    .expect("durable operation")
+                    .state = CommandState::Ambiguous;
+                write_state(&self.state_dir, &state)?;
+                return Err(ActorError::AmbiguousDispatch);
+            }
+            if state.profile.native_session_id.as_deref() != Some(native_session_id) {
                 state.profile.native_session_id = Some(native_session_id.clone());
                 if let Some(reference) = state.profile.session_ref.as_mut() {
                     reference.session_id = native_session_id.clone();
                 }
                 push_event_bounded(
                     &mut state,
-                    AgentEvent::Started { native_session_id },
+                    AgentEvent::Started {
+                        native_session_id: native_session_id.clone(),
+                    },
                     self.event_byte_cap,
                     self.event_count_cap,
                 )?;
@@ -1034,6 +1092,13 @@ impl FreshAgentHostActor {
             self.event_count_cap,
         )?;
         write_state(&self.state_dir, &state)?;
+        if outcome.is_ok() || command_state == CommandState::Cancelled {
+            if let Some(native_session_id) = native_session_id {
+                *self.observed_native_session_id.lock().await = Some(native_session_id);
+            }
+            self.native_identity_transition
+                .store(false, Ordering::SeqCst);
+        }
         outcome
     }
 
@@ -1327,11 +1392,12 @@ impl FreshAgentHostActor {
     }
 
     pub async fn is_live(&self) -> bool {
-        self.transport.is_live().await
+        !self.stopped.load(Ordering::SeqCst) && self.transport.is_live().await
     }
 
     /// Only the session host's supervisor-controlled stop path may call this.
     pub async fn stop(self: Arc<Self>) -> Result<(), ActorError> {
+        self.stopped.store(true, Ordering::SeqCst);
         Arc::clone(&self.transport)
             .stop()
             .await

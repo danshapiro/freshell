@@ -60,6 +60,43 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
   }
 }
 describe('managed native startup channel', () => {
+  it('admits an authorized native rollback child while preserving ordinary exact-resume refusal', async () => {
+    for (const authorized of [true, false]) {
+      const directory = await mkdtemp(join(tmpdir(), 'native-reroot-'))
+      const sidecar = checkpointSidecar(directory)
+      try {
+        sidecar.send({ type: 'create', requestId: 'rollback-owned', cwd: directory,
+          resumeSessionId: root, resumeSessionAt: 'retained-turn', forkSession: true,
+          ...(authorized ? { nativeIdentityTransition: { parentNativeSessionId: root,
+            launch: { ...launch, evidenceRevision: launch.evidenceRevision + 1, requestedNativeSessionId: null } } } : {}) })
+        if (authorized) {
+          const observed = await sidecar.wait('sdk.session.init')
+          expect(observed.cliSessionId).toBe('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
+          expect(observed.nativeIdentityEvidence.launch.evidenceRevision).toBe(launch.evidenceRevision + 1)
+          expect(sidecar.frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
+        } else {
+          await sidecar.wait('sdk.error')
+          expect(sidecar.frames.some(frame => frame.type === 'sdk.session.init')).toBe(false)
+        }
+      } finally {
+        await sidecar.close()
+        await rm(directory, { recursive: true, force: true })
+      }
+    }
+  })
+  it.each(['incarnationId', 'launchNonce', 'executionGeneration', 'evidenceRevision', 'requestedNativeSessionId'] as const)(
+    'rejects a rollback create with stale %s before opening a native query', async (field) => {
+      const directory = await mkdtemp(join(tmpdir(), 'native-reroot-stale-'))
+      const sidecar = checkpointSidecar(directory)
+      try {
+        const next: Record<string, unknown> = { ...launch, evidenceRevision: launch.evidenceRevision + 1, requestedNativeSessionId: null }
+        next[field] = field === 'executionGeneration' ? 0 : field === 'evidenceRevision' ? launch.evidenceRevision : 'stale'
+        sidecar.send({ type: 'create', requestId: 'stale-rollback', cwd: directory, resumeSessionId: root,
+          resumeSessionAt: 'retained-turn', forkSession: true, nativeIdentityTransition: { parentNativeSessionId: root, launch: next } })
+        await sidecar.wait('create.failed')
+        expect(sidecar.frames.some(frame => frame.type === 'sdk.session.init' || frame.type === 'created' || frame.type === 'probe.native-input')).toBe(false)
+      } finally { await sidecar.close(); await rm(directory, { recursive: true, force: true }) }
+    })
   it.each(['freshclaude', 'kilroy'].flatMap(mode => ['missing-native-id', 'placeholder-id'].map(caseId => ({ mode, caseId }))))(
     'executes the production sidecar native init field fault for $mode/$caseId without input', async ({ mode, caseId }) => {
       const directory = await mkdtemp(join('/tmp', 'finite-native-init-'))
@@ -236,6 +273,26 @@ describe('native solo deferred checkpoint inspection', () => {
 })
 
 describe('production sidecar native checkpoint continuation', () => {
+  it('continues an authorized rollback child checkpoint without forking again', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-rollback-checkpoint-'))
+    const child = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: child }) + '\n')
+    const worker = checkpointSidecar(directory)
+    try {
+      worker.send({ type: 'create', requestId: 'rollback-child', cwd: directory, resumeSessionId: root,
+        resumeSessionAt: 'retained-turn', forkSession: true, permissionMode: 'default', nativeIdentityTransition: {
+          parentNativeSessionId: root, launch: { ...launch, evidenceRevision: launch.evidenceRevision + 1, requestedNativeSessionId: null } } })
+      const session = await worker.wait('created')
+      expect((await worker.wait('sdk.session.init')).cliSessionId).toBe(child)
+      worker.send({ type: 'send', sessionId: session.sessionId, text: 'owned child operation' })
+      const card = await worker.wait('sdk.permission.request')
+      expect(card.nativeCheckpoint.nativeSessionId).toBe(child)
+      expect(worker.frames.filter(frame => frame.type === 'sdk.session.init').map(frame => frame.cliSessionId)).toEqual([child, child])
+      worker.send({ type: 'permission.respond', sessionId: session.sessionId, requestId: card.requestId,
+        decision: { behavior: 'deny', message: 'owned denial' } })
+      expect((await worker.wait('sdk.tool.result')).content[0].is_error).toBe(true)
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
   it.each([true, 'incomplete'] as const)('keeps split-row native batch hooks on ordinary policy (completion: %s)', async (completion) => {
     const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-batch-'))
     await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')

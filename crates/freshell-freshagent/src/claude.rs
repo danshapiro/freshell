@@ -5468,6 +5468,18 @@ impl FreshClaudeState {
         op: crate::rollback_record::RollbackRequest,
         reply_sink: freshell_terminal::FrameSink,
     ) {
+        self.handle_rollback_with_native_launch(op, reply_sink, None)
+            .await;
+    }
+
+    /// Managed hosts authorize one new native query for this existing rollback
+    /// operation. The launch scope carries no observed child identity.
+    pub async fn handle_rollback_with_native_launch(
+        &self,
+        op: crate::rollback_record::RollbackRequest,
+        reply_sink: freshell_terminal::FrameSink,
+        native_launch: Option<Value>,
+    ) {
         use crate::claude_snapshot as snap;
         use crate::rollback_record::*;
 
@@ -6390,6 +6402,14 @@ impl FreshClaudeState {
         let spawned = loop {
             let mut create_req = Map::new();
             create_req.insert("type".to_string(), json!("create"));
+            if let Some(launch) = native_launch.as_ref() {
+                create_req.insert(
+                    "nativeIdentityTransition".into(),
+                    json!({
+                        "parentNativeSessionId":durable_id,"launch":launch,
+                    }),
+                );
+            }
             create_req.insert(
                 "requestId".to_string(),
                 json!(format!("rollback-{}", uuid::Uuid::new_v4())),
@@ -23714,9 +23734,12 @@ rl.on('line', (line) => {
 
         // Undo the edited turn: lands while redo_destroyed == true ⇒ a NEW epoch.
         let (sink, captured) = capturing_sink();
-        st.handle_rollback(
+        let native_launch = json!({"incarnationId":"current-owned","launchNonce":"current-nonce",
+            "evidenceRevision":8,"executionGeneration":2,"requestedNativeSessionId":null});
+        st.handle_rollback_with_native_launch(
             rollback_op("s-prime", "rb-epoch-1", RollbackDirection::Undo),
             sink,
+            Some(native_launch.clone()),
         )
         .await;
         let adopted = await_adopted_durable(&st, "epoch-live", "s-prime").await;
@@ -23748,6 +23771,10 @@ rl.on('line', (line) => {
         assert_eq!(creates[0]["resumeSessionId"], json!("s-prime"));
         assert_eq!(creates[0]["resumeSessionAt"], json!("a1"));
         assert_eq!(creates[0]["forkSession"], json!(true));
+        assert_eq!(
+            creates[0]["nativeIdentityTransition"],
+            json!({"parentNativeSessionId":"s-prime", "launch":native_launch})
+        );
         assert_eq!(
             creates[0]["resumeDropsTurn"],
             json!("uq"),

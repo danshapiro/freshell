@@ -3,12 +3,15 @@ import { exec } from 'node:child_process'
 import { appendFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 const nativeChildren = new Set()
+let nativeForks = 0
 export function query({ prompt, options }) {
   if (process.env.FRESHELL_SIDECAR_TEST_PREINIT_PERMISSION === '1') {
     void options.canUseTool('Bash', { command: 'owned-preinit-effect' }, {}).then((decision) =>
       process.stdout.write(JSON.stringify({ type: 'probe.preinit-permission', decision }) + '\n'))
   }
-  const nativeRoot = options.resume ?? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  const nativeRoot = options.forkSession
+    ? (++nativeForks === 1 ? 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' : 'cccccccc-cccc-4ccc-8ccc-cccccccccccc')
+    : options.resume ?? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
   const checkpointScenario = process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT === '1'
   const child = checkpointScenario && process.env.FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY === '1'
     ? options.spawnClaudeCodeProcess({ command: process.execPath,

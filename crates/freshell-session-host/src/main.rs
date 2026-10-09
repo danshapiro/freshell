@@ -59,6 +59,7 @@ struct HostState {
     child: Mutex<Option<Child>>,
     pty: Mutex<Option<HostedPty>>,
     fresh_agent: Mutex<Option<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>>>,
+    fresh_native_command: Mutex<()>,
     provider_config_paths: ProviderConfigPaths,
     opencode_transfer_mount: PathBuf,
     bootstrap_root: PathBuf,
@@ -486,6 +487,7 @@ async fn serve(args: &[String]) -> Result<(), String> {
         child: Mutex::new(None),
         pty: Mutex::new(None),
         fresh_agent: Mutex::new(None),
+        fresh_native_command: Mutex::new(()),
         provider_config_paths: ProviderConfigPaths::default(),
         opencode_transfer_mount: PathBuf::from(OPENCODE_TRANSFER_MOUNT),
         bootstrap_root: PathBuf::from("/run/freshell-bootstrap"),
@@ -693,15 +695,9 @@ async fn dispatch_with_effects(
                         });
                     } else if let Some(agent) = state.fresh_agent.lock().await.as_ref() {
                         exited = !agent.is_live().await;
-                        if let (Some(launch), Some(native)) = (
-                            persisted.native_identity_launch.as_ref(),
-                            agent.observed_native_session_id().await,
-                        ) {
-                            if let Some(evidence) = agent.observed_native_identity_evidence().await
-                            {
-                                native_identity_observation = providers::native_identity::bind_provider_observation(
-                                    launch,&native,freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,&evidence);
-                            }
+                        if let Some(launch) = persisted.native_identity_launch.as_ref() {
+                            native_identity_observation =
+                                fresh_native_observation(launch, agent).await;
                         }
                         native_session_id = native_identity_observation
                             .as_ref()
@@ -815,6 +811,7 @@ async fn dispatch_with_effects(
                     Ok(HostResult::TerminalOutput(batch))
                 }
                 HostCommand::FreshAgentResumePending { incarnation_id } => {
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_incarnation(&incarnation_id, state)?;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
@@ -843,6 +840,7 @@ async fn dispatch_with_effects(
                     settings,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
@@ -867,6 +865,7 @@ async fn dispatch_with_effects(
                     input,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
@@ -874,10 +873,12 @@ async fn dispatch_with_effects(
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
+                    let prior_native = actor.profile().await.native_session_id;
                     let transition = actor
                         .fork(request_id, parent_session_id, input)
                         .await
                         .map_err(map_actor_error)?;
+                    commit_fresh_native_transition(state, &actor, prior_native.as_deref()).await?;
                     Ok(HostResult::FreshAgentFork(
                         freshell_runtime_protocol::FreshAgentForkResult {
                             parent_session_id: transition.parent_session_id,
@@ -893,6 +894,7 @@ async fn dispatch_with_effects(
                     cwd,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
@@ -900,6 +902,7 @@ async fn dispatch_with_effects(
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
+                    let prior_native = actor.profile().await.native_session_id;
                     let command_state = actor
                         .semantic_operation(
                             request_id,
@@ -910,6 +913,7 @@ async fn dispatch_with_effects(
                         )
                         .await
                         .map_err(map_actor_error)?;
+                    commit_fresh_native_transition(state, &actor, prior_native.as_deref()).await?;
                     Ok(HostResult::FreshAgentCommand {
                         state: command_state,
                         native_session_id: actor.profile().await.native_session_id,
@@ -924,6 +928,7 @@ async fn dispatch_with_effects(
                     cwd,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
@@ -931,6 +936,7 @@ async fn dispatch_with_effects(
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
+                    let prior_native = actor.profile().await.native_session_id;
                     let command_state = actor
                         .semantic_operation(
                             request_id,
@@ -943,6 +949,7 @@ async fn dispatch_with_effects(
                         )
                         .await
                         .map_err(map_actor_error)?;
+                    commit_fresh_native_transition(state, &actor, prior_native.as_deref()).await?;
                     Ok(HostResult::FreshAgentCommand {
                         state: command_state,
                         native_session_id: actor.profile().await.native_session_id,
@@ -983,6 +990,7 @@ async fn dispatch_with_effects(
                     decision_id,
                     decision,
                 } => {
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_incarnation(&incarnation_id, state)?;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
@@ -1638,14 +1646,90 @@ async fn current_native_observation(
     }
     let launch = persisted.native_identity_launch.as_ref()?;
     let actor = state.fresh_agent.lock().await.clone()?;
+    fresh_native_observation(launch, &actor).await
+}
+
+async fn fresh_native_observation(
+    launch: &freshell_runtime_protocol::NativeIdentityLaunch,
+    actor: &freshell_agent_runtime::host_actor::FreshAgentHostActor,
+) -> Option<freshell_runtime_protocol::NativeIdentityObservation> {
     let native = actor.observed_native_session_id().await?;
     let evidence = actor.observed_native_identity_evidence().await?;
+    if actor.profile().await.native_session_id.as_deref() != Some(native.as_str())
+        || evidence["nativeSessionId"].as_str() != Some(native.as_str())
+        || evidence.get("launch").is_some_and(|value| {
+            serde_json::from_value::<freshell_runtime_protocol::NativeIdentityLaunch>(value.clone())
+                .as_ref()
+                .ok()
+                != Some(launch)
+        })
+    {
+        return None;
+    }
     providers::native_identity::bind_provider_observation(
         launch,
         &native,
         freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
         &evidence,
     )
+}
+
+async fn commit_fresh_native_transition(
+    state: &HostState,
+    actor: &Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+    parent: Option<&str>,
+) -> Result<(), RuntimeError> {
+    let child = actor.profile().await.native_session_id;
+    if child.as_deref() == parent {
+        return Ok(());
+    }
+    let refuse = || {
+        RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "native root transition lost its current host binding",
+        )
+    };
+    let child = child.ok_or_else(refuse)?;
+    if actor.observed_native_session_id().await.as_deref() != Some(child.as_str())
+        || !state
+            .fresh_agent
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, actor))
+    {
+        return Err(refuse());
+    }
+    let mut persisted = state.persisted.lock().await;
+    let Some(mut launch) = persisted.native_identity_launch.clone() else {
+        return if cfg!(feature = "fresh-agent-fixtures")
+            && persisted.fixture_evidence["fixtureTransport"] == "deterministic"
+        {
+            Ok(())
+        } else {
+            Err(refuse())
+        };
+    };
+    if launch.incarnation_id != state.incarnation_id
+        || launch.execution_generation != persisted.max_execution_generation
+        || launch
+            .requested_native_session_id
+            .as_deref()
+            .is_some_and(|root| Some(root) != parent)
+    {
+        return Err(refuse());
+    }
+    launch.evidence_revision = launch.evidence_revision.checked_add(1).ok_or_else(refuse)?;
+    launch.requested_native_session_id = Some(child);
+    let mut updated = persisted.clone();
+    updated.native_identity_launch = Some(launch);
+    write_state(&state.state_dir, &updated).map_err(registry_like_error)?;
+    *persisted = updated;
+    append_event_with_secret(&state.state_dir, &state.secret, "host.native_identity.transition_committed",
+        serde_json::json!({"severity":"info","incarnationId":state.incarnation_id,
+        "executionGeneration":persisted.max_execution_generation,
+        "evidenceRevision":persisted.native_identity_launch.as_ref().map(|launch|launch.evidence_revision)})).ok();
+    Ok(())
 }
 
 async fn ensure_current_fresh_native_observation(state: &HostState) -> Result<(), RuntimeError> {
@@ -5339,6 +5423,21 @@ mod tests {
             Ok(())
         }
 
+        async fn fork(
+            &self,
+            _request_id: &RequestId,
+            parent_session_id: &str,
+            _input: Option<serde_json::Value>,
+        ) -> Result<freshell_agent_runtime::host_actor::ForkTransition, DispatchFailure> {
+            self.operations.fetch_add(1, Ordering::SeqCst);
+            self.publish_child_observation();
+            Ok(freshell_agent_runtime::host_actor::ForkTransition {
+                parent_session_id: parent_session_id.into(),
+                child_session_id: "fixture-native-child".into(),
+                parent_retired_by_runtime: true,
+            })
+        }
+
         async fn interrupt(&self) -> Result<(), String> {
             Ok(())
         }
@@ -5353,12 +5452,23 @@ mod tests {
         async fn dispatch_operation(
             &self,
             request_id: &RequestId,
-            _operation: &FreshAgentOperation,
+            operation: &FreshAgentOperation,
         ) -> Result<OperationAck, OperationFailure> {
             self.operations.fetch_add(1, Ordering::SeqCst);
+            let changed = matches!(operation, FreshAgentOperation::Rollback { turn_id: Some(turn), .. } if turn == "reroot");
+            if changed {
+                self.publish_child_observation();
+            }
             Ok(OperationAck {
                 provider_ack_id: Some(request_id.to_string()),
-                native_session_id: Some("fixture-native-thread".into()),
+                native_session_id: Some(
+                    if changed {
+                        "fixture-native-child"
+                    } else {
+                        "fixture-native-thread"
+                    }
+                    .into(),
+                ),
             })
         }
 
@@ -5388,6 +5498,147 @@ mod tests {
 
         fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
             None
+        }
+    }
+
+    impl RpcFixtureTransport {
+        fn publish_child_observation(&self) {
+            let mut evidence = self.native_evidence.lock().unwrap();
+            let value = evidence.as_mut().unwrap();
+            value["nativeSessionId"] = serde_json::json!("fixture-native-child");
+            value["launch"]["evidenceRevision"] =
+                serde_json::json!(value["launch"]["evidenceRevision"].as_u64().unwrap() + 1);
+            value["launch"]["requestedNativeSessionId"] = serde_json::json!("fixture-native-child");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_root_transition_updates_host_status_and_input_binding() {
+        for exact_parent in [false, true] {
+            for fork in [false, true] {
+                let state = test_host_state();
+                let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                    incarnation_id: state.incarnation_id.clone(),
+                    launch_nonce: "root-transition-rpc".into(),
+                    evidence_revision: 7,
+                    execution_generation: 1,
+                    requested_native_session_id: exact_parent
+                        .then(|| "fixture-native-thread".into()),
+                };
+                state.persisted.lock().await.native_identity_launch = Some(binding.clone());
+                state.persisted.lock().await.max_execution_generation = 1;
+                let transport = Arc::new(RpcFixtureTransport {
+                    native_evidence: std::sync::Mutex::new(Some(
+                        serde_json::json!({"launch":binding,"nativeSessionId":"fixture-native-thread","queryGeneration":1}),
+                    )),
+                    dispatches: AtomicUsize::new(0),
+                    decisions: AtomicUsize::new(0),
+                    operations: AtomicUsize::new(0),
+                    captures: AtomicUsize::new(0),
+                    stops: AtomicUsize::new(0),
+                });
+                let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+                    state.state_dir.join("transition-agent"),
+                    FreshAgentProfile {
+                        provider: FreshProvider::Codex,
+                        runtime_variant: "fixture-sdk".into(),
+                        cwd: "/workspace".into(),
+                        model: None,
+                        effort: None,
+                        permission_mode: None,
+                        sandbox: None,
+                        provider_store_id: "fixture-store".into(),
+                        native_session_id: exact_parent.then(|| "fixture-native-thread".into()),
+                        plugins: None,
+                        model_selection: None,
+                        session_ref: None,
+                        provider_launch_context: None,
+                        provider_secret_references: Vec::new(),
+                    },
+                    transport.clone(),
+                )
+                .await
+                .unwrap();
+                *state.fresh_agent.lock().await = Some(actor.clone());
+                let command = if fork {
+                    HostCommand::FreshAgentFork {
+                        incarnation_id: state.incarnation_id.clone(),
+                        request_id: RequestId::new(),
+                        parent_session_id: "fixture-native-thread".into(),
+                        input: None,
+                    }
+                } else {
+                    HostCommand::FreshAgentRollback {
+                        incarnation_id: state.incarnation_id.clone(),
+                        request_id: RequestId::new(),
+                        direction: FreshAgentRollbackDirection::Undo,
+                        mode: FreshAgentRollbackMode::ToTurn,
+                        turn_id: Some("reroot".into()),
+                        cwd: None,
+                    }
+                };
+                dispatch(authenticated_host_envelope(&state, command), &state)
+                    .await
+                    .unwrap();
+                let status = dispatch(
+                    authenticated_host_envelope(
+                        &state,
+                        HostCommand::Status {
+                            incarnation_id: state.incarnation_id.clone(),
+                        },
+                    ),
+                    &state,
+                )
+                .await
+                .unwrap();
+                let HostResult::Status {
+                    native_session_id,
+                    native_identity_observation,
+                    ..
+                } = status
+                else {
+                    panic!("status")
+                };
+                assert_eq!(
+                    native_session_id.as_deref(),
+                    Some("fixture-native-child"),
+                    "fork={fork} exact={exact_parent}"
+                );
+                let observation = native_identity_observation.unwrap();
+                assert_eq!(observation.evidence_revision, 8);
+                assert!(observation.matches_launch(
+                    state
+                        .persisted
+                        .lock()
+                        .await
+                        .native_identity_launch
+                        .as_ref()
+                        .unwrap()
+                ));
+                dispatch(
+                    authenticated_host_envelope(
+                        &state,
+                        HostCommand::FreshAgentSend {
+                            incarnation_id: state.incarnation_id.clone(),
+                            request_id: RequestId::new(),
+                            text: "child input".into(),
+                            settings: None,
+                        },
+                    ),
+                    &state,
+                )
+                .await
+                .unwrap();
+                assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+                // A delayed parent producer must never reopen input for the child.
+                *transport.native_evidence.lock().unwrap() = Some(
+                    serde_json::json!({"launch":binding,"nativeSessionId":"fixture-native-thread","queryGeneration":1}),
+                );
+                assert!(ensure_current_fresh_native_observation(&state)
+                    .await
+                    .is_err());
+                actor.stop().await.unwrap();
+            }
         }
     }
 
@@ -5434,7 +5685,7 @@ mod tests {
         state.persisted.lock().await.native_identity_launch = Some(binding.clone());
         let transport = Arc::new(RpcFixtureTransport {
             native_evidence: std::sync::Mutex::new(Some(
-                serde_json::json!({"launch":binding,"queryGeneration":1}),
+                serde_json::json!({"launch":binding,"nativeSessionId":"fixture-native-thread","queryGeneration":1}),
             )),
             dispatches: AtomicUsize::new(0),
             decisions: AtomicUsize::new(0),
@@ -5522,7 +5773,7 @@ mod tests {
         state.persisted.lock().await.native_identity_launch = Some(binding.clone());
         let transport = Arc::new(RpcFixtureTransport {
             native_evidence: std::sync::Mutex::new(Some(
-                serde_json::json!({"launch":binding,"queryGeneration":1}),
+                serde_json::json!({"launch":binding,"nativeSessionId":"fixture-native-thread","queryGeneration":1}),
             )),
             dispatches: AtomicUsize::new(0),
             decisions: AtomicUsize::new(0),
@@ -7357,6 +7608,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             child: Mutex::new(None),
             pty: Mutex::new(None),
             fresh_agent: Mutex::new(None),
+            fresh_native_command: Mutex::new(()),
             provider_config_paths: ProviderConfigPaths::default(),
             opencode_transfer_mount: PathBuf::from(OPENCODE_TRANSFER_MOUNT),
             bootstrap_root: PathBuf::from("/run/freshell-bootstrap"),
@@ -8153,6 +8405,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             child: Mutex::new(None),
             pty: Mutex::new(None),
             fresh_agent: Mutex::new(None),
+            fresh_native_command: Mutex::new(()),
             provider_config_paths: ProviderConfigPaths {
                 private_mount: root.join("private"),
                 provider_home: home,
@@ -8363,6 +8616,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             child: Mutex::new(None),
             pty: Mutex::new(None),
             fresh_agent: Mutex::new(None),
+            fresh_native_command: Mutex::new(()),
             provider_config_paths: ProviderConfigPaths {
                 private_mount: root.path().join("private"),
                 provider_home: home.clone(),
@@ -8568,6 +8822,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             child: Mutex::new(None),
             pty: Mutex::new(None),
             fresh_agent: Mutex::new(None),
+            fresh_native_command: Mutex::new(()),
             provider_config_paths: ProviderConfigPaths {
                 private_mount: root.join("private"),
                 provider_home: home,
