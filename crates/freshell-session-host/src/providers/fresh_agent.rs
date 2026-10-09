@@ -65,6 +65,14 @@ struct HostedNativeIdentity {
     pending: bool,
     candidates: BTreeMap<String, Value>,
     evidence: Option<Value>,
+    rejected_parent: Option<HostedParentProof>,
+}
+
+struct HostedParentProof {
+    launch: freshell_runtime_protocol::NativeIdentityLaunch,
+    producer_launch: freshell_runtime_protocol::NativeIdentityLaunch,
+    root: String,
+    evidence: Value,
 }
 
 #[derive(PartialEq)]
@@ -75,6 +83,34 @@ enum NativeProofReception {
 }
 
 impl HostedNativeIdentity {
+    fn current_parent_proof(&self) -> Option<HostedParentProof> {
+        let launch = self.launch.as_ref()?;
+        let producer_launch = self.producer_launch.as_ref()?;
+        let root = self.root.as_ref()?;
+        let evidence = self.evidence.as_ref()?;
+        if evidence["nativeSessionId"].as_str() != Some(root.as_str())
+            || evidence["launch"] != json!(launch)
+            || evidence["providerEvidence"]["launch"] != json!(producer_launch)
+            || evidence["queryGeneration"]
+                .as_u64()
+                .is_none_or(|generation| generation == 0)
+        {
+            return None;
+        }
+        Some(HostedParentProof {
+            launch: launch.clone(),
+            producer_launch: producer_launch.clone(),
+            root: root.clone(),
+            evidence: evidence.clone(),
+        })
+    }
+
+    fn invalidate_current_query(&mut self) {
+        self.evidence = None;
+        self.candidates.clear();
+        self.rejected_parent = None;
+    }
+
     fn begin(
         &mut self,
         new_query: bool,
@@ -94,6 +130,11 @@ impl HostedNativeIdentity {
                 launch.requested_native_session_id = None;
             }
         }
+        self.rejected_parent = if new_query {
+            self.current_parent_proof()
+        } else {
+            None
+        };
         self.producer_launch = producer.clone();
         self.pending = true;
         self.candidates.clear();
@@ -101,11 +142,60 @@ impl HostedNativeIdentity {
         Ok(producer)
     }
 
+    fn reject_before_native_transition(
+        &mut self,
+        parent: &str,
+        transition_launch: &Option<freshell_runtime_protocol::NativeIdentityLaunch>,
+        code: &str,
+    ) -> bool {
+        let Some(prior) = self.rejected_parent.take() else {
+            return false;
+        };
+        // These Claude handler refusals all precede native writer retirement.
+        // INTERNAL_ERROR also occurs after teardown; BUSY_TURN can mean a
+        // timed-out quiesce probe. Neither proves the saved query is current.
+        if !matches!(
+            code,
+            "INVALID_ROLLBACK_TARGET" | "NOTHING_TO_UNDO" | "REDO_UNAVAILABLE"
+        ) || !self.pending
+            || self.root.as_deref() != Some(parent)
+            || prior.root != parent
+            || self.launch.as_ref() != Some(&prior.launch)
+            || &self.producer_launch != transition_launch
+            || !self.candidates.is_empty()
+            || self.evidence.is_some()
+        {
+            return false;
+        }
+        self.producer_launch = Some(prior.producer_launch);
+        self.evidence = Some(prior.evidence);
+        self.pending = false;
+        true
+    }
+
+    fn observe_parent_query_change(&mut self, event: &Value) {
+        let Some(prior) = self.rejected_parent.as_ref() else {
+            return;
+        };
+        let (binding, loading) = match event["type"].as_str() {
+            Some("freshAgent.session.loading") => (&event["nativeBinding"], true),
+            Some("freshAgent.session.init") => (&event["nativeIdentityEvidence"], false),
+            _ => return,
+        };
+        if binding["launch"] == json!(prior.producer_launch)
+            && (binding["queryGeneration"].as_u64() > prior.evidence["queryGeneration"].as_u64()
+                || (!loading && event["cliSessionId"].as_str() != Some(prior.root.as_str())))
+        {
+            self.rejected_parent = None;
+        }
+    }
+
     fn observe(&mut self, root: &str, evidence: Value) -> NativeProofReception {
         if root.is_empty() || root.chars().any(char::is_control) {
             return NativeProofReception::Rejected;
         }
         if self.pending {
+            self.rejected_parent = None;
             // Keep early native proof until the correlated operation ACK picks
             // its actual child. Unsolicited data cannot publish readiness.
             if self.candidates.len() < EVENT_CHANNEL_CAPACITY || self.candidates.contains_key(root)
@@ -158,6 +248,7 @@ impl HostedNativeIdentity {
         }
         self.root = Some(root.into());
         self.pending = false;
+        self.rejected_parent = None;
         let evidence = response_evidence.or_else(|| self.candidates.remove(root));
         self.candidates.clear();
         self.evidence = evidence.map(|evidence| self.bind_evidence(root, evidence));
@@ -1147,7 +1238,7 @@ impl FreshAgentTransport for HostedTransport {
                         FreshAgentRollbackMode::ToTurn => RollbackModeReq::ToTurn,
                     },
                     turn_id: turn_id.clone(),
-                    session_id,
+                    session_id: session_id.clone(),
                     session_type: self.session_type(),
                     provider: self.provider_wire(),
                     request_id: request_id.as_str().to_string(),
@@ -1166,7 +1257,7 @@ impl FreshAgentTransport for HostedTransport {
                             .handle_rollback_with_native_launch(
                                 operation,
                                 sink,
-                                next_launch.map(|launch| json!(launch)),
+                                next_launch.as_ref().map(|launch| json!(launch)),
                             )
                             .await
                     }
@@ -1185,6 +1276,27 @@ impl FreshAgentTransport for HostedTransport {
                         .await;
                 }
                 if let Some(code) = frames.iter().find_map(find_operation_error_code) {
+                    let parent_is_live = new_query
+                        && frames.iter().any(|frame| {
+                            find_correlated_rollback_error(frame, request_id.as_str(), &session_id)
+                                == Some(code)
+                        })
+                        && self.session_id.lock().await.as_ref() == Some(&session_id)
+                        && self.provider_session_is_live(&session_id).await;
+                    let restored = parent_is_live
+                        && self
+                            .native_identity
+                            .lock()
+                            .expect("native identity lock")
+                            .reject_before_native_transition(&session_id, &next_launch, code);
+                    if new_query {
+                        crate::emit_environment_event(
+                            json!({"severity":if restored {"info"} else {"warn"},
+                            "event":"host.native_identity.rollback_rejected", "provider":self.provider.as_str(),
+                            "requestId":request_id.as_str(), "code":code, "parentProofRestored":restored,
+                            "launch":next_launch}),
+                        );
+                    }
                     return Err(OperationFailure {
                         kind: if code == "UNSUPPORTED_CAPABILITY" {
                             OperationFailureKind::Unsupported
@@ -1192,7 +1304,7 @@ impl FreshAgentTransport for HostedTransport {
                             OperationFailureKind::Rejected
                         },
                         message: "provider rejected hosted rollback".into(),
-                        acceptance_ambiguous: false,
+                        acceptance_ambiguous: new_query && !restored,
                     });
                 }
                 observed_native = frames
@@ -1325,6 +1437,11 @@ impl FreshAgentTransport for HostedTransport {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
             return Arc::clone(delegate).stop().await;
+        }
+        {
+            let mut identity = self.native_identity.lock().expect("native identity lock");
+            identity.pending = true;
+            identity.invalidate_current_query();
         }
         match &self.state {
             ProviderState::Claude(state) => state.shutdown().await,
@@ -1477,7 +1594,13 @@ fn spawn_broadcast_bridge(
                 .clone();
             if query_launch != expected_launch {
                 query_launch = expected_launch.clone();
-                native_query_generation = 0;
+                native_query_generation = native_identity
+                    .lock()
+                    .expect("native identity lock")
+                    .evidence
+                    .as_ref()
+                    .and_then(|proof| proof["queryGeneration"].as_u64())
+                    .unwrap_or(0);
             }
             if let Some(outcome) = parse_send_outcome(&value) {
                 let _ = send_outcomes.send(outcome);
@@ -1546,6 +1669,10 @@ fn spawn_broadcast_bridge(
             }
             let mut captured_decision = false;
             if let Some(event) = value.get("event") {
+                native_identity
+                    .lock()
+                    .expect("native identity lock")
+                    .observe_parent_query_change(event);
                 let event_type = event
                     .get("type")
                     .and_then(Value::as_str)
@@ -1576,8 +1703,7 @@ fn spawn_broadcast_bridge(
                             {
                                 let mut identity =
                                     native_identity.lock().expect("native identity lock");
-                                identity.evidence = None;
-                                identity.candidates.clear();
+                                identity.invalidate_current_query();
                             }
                             let _ = native.send(None);
                             native_evidence.send_replace(None);
@@ -1794,6 +1920,23 @@ fn find_operation_error_code(value: &Value) -> Option<&str> {
         Value::Array(values) => values.iter().find_map(find_operation_error_code),
         _ => None,
     }
+}
+
+fn find_correlated_rollback_error<'a>(
+    value: &'a Value,
+    request_id: &str,
+    parent: &str,
+) -> Option<&'a str> {
+    if value["type"] == "freshAgent.error"
+        && value["requestId"] == request_id
+        && value["sessionId"] == parent
+        && value["rollback"] == true
+    {
+        return value["code"].as_str();
+    }
+    value
+        .get("event")
+        .and_then(|event| find_correlated_rollback_error(event, request_id, parent))
 }
 
 fn find_operation_session_id(value: &Value, request_id: &str) -> Option<String> {
@@ -2135,29 +2278,30 @@ mod tests {
         assert_eq!(evidence_rx.borrow().as_ref().unwrap()["queryGeneration"], 2);
     }
 
+    async fn drain_native_bridge(
+        sender: &broadcast::Sender<String>,
+        events: &mut mpsc::Receiver<AgentEvent>,
+    ) {
+        sender
+            .send(
+                json!({"type":"freshAgent.event","event":{"type":"proof-ordering-barrier"}})
+                    .to_string(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+                while let Some(event) = events.recv().await {
+                    if matches!(event, AgentEvent::Provider { payload } if payload["event"]["type"] == "proof-ordering-barrier") { return; }
+                }
+                panic!("bridge exited before barrier");
+            }).await.unwrap();
+    }
+
     #[tokio::test]
     async fn native_rollback_bridge_correlates_early_delayed_and_replaced_query_proof() {
         use freshell_runtime_protocol::NativeIdentityLaunch;
         const PARENT: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         const CHILD: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
         const WRONG: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-        async fn drain(
-            sender: &broadcast::Sender<String>,
-            events: &mut mpsc::Receiver<AgentEvent>,
-        ) {
-            sender
-                .send(
-                    json!({"type":"freshAgent.event","event":{"type":"proof-ordering-barrier"}})
-                        .to_string(),
-                )
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while let Some(event) = events.recv().await {
-                    if matches!(event, AgentEvent::Provider { payload } if payload["event"]["type"] == "proof-ordering-barrier") { return; }
-                }
-                panic!("bridge exited before barrier");
-            }).await.unwrap();
-        }
         for arrival in ["early", "delayed", "replaced-query"] {
             let (sender, receiver) = broadcast::channel(32);
             let (created, _) = watch::channel(None);
@@ -2204,7 +2348,7 @@ mod tests {
             }).to_string()
             };
             sender.send(init(PARENT, &parent_launch, 1)).unwrap();
-            drain(&sender, &mut event_rx).await;
+            drain_native_bridge(&sender, &mut event_rx).await;
             assert!(identity.lock().unwrap().evidence.is_some());
             let next = identity.lock().unwrap().begin(true).unwrap().unwrap();
             assert_eq!(
@@ -2235,7 +2379,7 @@ mod tests {
                 sender.send(json!({"type":"freshAgent.event","event":{"type":"freshAgent.session.loading",
                     "nativeBinding":{"launch":next,"queryGeneration":2}}}).to_string()).unwrap();
             }
-            drain(&sender, &mut event_rx).await;
+            drain_native_bridge(&sender, &mut event_rx).await;
             assert!(
                 transport.current_native_id().await.is_err(),
                 "{arrival}: unsettled reads cannot reuse the startup parent's watch value"
@@ -2275,7 +2419,7 @@ mod tests {
                 .send(init(CHILD, &parent_launch, generation + 10))
                 .unwrap();
             sender.send(init(CHILD, &next, generation)).unwrap();
-            drain(&sender, &mut event_rx).await;
+            drain_native_bridge(&sender, &mut event_rx).await;
             assert_eq!(transport.current_native_id().await.unwrap(), CHILD);
             let state = identity.lock().unwrap();
             let evidence = state
@@ -2285,6 +2429,349 @@ mod tests {
             assert_eq!(evidence["nativeSessionId"], CHILD);
             assert_eq!(evidence["queryGeneration"], generation);
             assert_eq!(evidence["launch"], json!(state.launch));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_rollback_never_restores_changed_query_launch_or_stop() {
+        use freshell_runtime_protocol::NativeIdentityLaunch;
+        const PARENT: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const CHILD: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        for case in [
+            "unchanged",
+            "loading-parent",
+            "replaced-parent",
+            "loading-child",
+            "child-proof",
+            "changed-launch",
+            "wrong-operation",
+            "unobserved",
+            "generic-error",
+            "timeout",
+            "stop",
+        ] {
+            let (sender, receiver) = broadcast::channel(32);
+            let (created, _) = watch::channel(None);
+            let (native, native_rx) = watch::channel(None);
+            let (native_evidence, _evidence_rx) = watch::channel(None);
+            let (events, mut event_rx) = mpsc::channel(32);
+            let (send_outcomes, _) = broadcast::channel(16);
+            let (kill_outcomes, _) = broadcast::channel(16);
+            let mut transport = HostedTransport::new(FreshProvider::Claude).await;
+            let identity = Arc::new(std::sync::Mutex::new(HostedNativeIdentity::default()));
+            let owned = Arc::get_mut(&mut transport).unwrap();
+            owned.native_identity = identity.clone();
+            owned.native_rx = Mutex::new(native_rx);
+            *owned.session_id.lock().await = Some(PARENT.into());
+            spawn_broadcast_bridge(
+                FreshProvider::Claude,
+                receiver,
+                BroadcastBridgeOutputs {
+                    created,
+                    native,
+                    native_evidence,
+                    native_identity: identity.clone(),
+                    events,
+                    send_outcomes,
+                    kill_outcomes,
+                    suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                    refusal_observer: None,
+                },
+            );
+            let launch: NativeIdentityLaunch = serde_json::from_value(json!({
+                "incarnationId":"rejection-incarnation","launchNonce":"rejection-nonce",
+                "evidenceRevision":7,"executionGeneration":3,"requestedNativeSessionId":PARENT
+            }))
+            .unwrap();
+            {
+                let mut identity = identity.lock().unwrap();
+                identity.launch = Some(launch.clone());
+                identity.producer_launch = Some(launch.clone());
+            }
+            let init = |root: &str, launch: &NativeIdentityLaunch, generation: u64| {
+                json!({
+                "type":"freshAgent.event","event":{"type":"freshAgent.session.init", "cliSessionId":root,
+                "nativeIdentityEvidence":{"launch":launch,"digest":"a".repeat(64),"queryGeneration":generation}}
+            }).to_string()
+            };
+            sender.send(init(PARENT, &launch, 3)).unwrap();
+            drain_native_bridge(&sender, &mut event_rx).await;
+            let prior = transport.native_identity_evidence().await.unwrap();
+            if case == "unobserved" {
+                identity.lock().unwrap().evidence = None;
+            }
+            let mut next = identity.lock().unwrap().begin(true).unwrap();
+            // Exercise the launch reset even if this operation receives no
+            // native lifecycle event before its correlated refusal.
+            drain_native_bridge(&sender, &mut event_rx).await;
+            match case {
+                "loading-parent" | "loading-child" => {
+                    let (binding, generation) = if case == "loading-parent" {
+                        (&launch, 4)
+                    } else {
+                        (next.as_ref().unwrap(), 1)
+                    };
+                    sender.send(json!({"type":"freshAgent.event","event":{"type":"freshAgent.session.loading",
+                        "nativeBinding":{"launch":binding,"queryGeneration":generation}}}).to_string()).unwrap();
+                }
+                "replaced-parent" => {
+                    sender.send(init(PARENT, &launch, 4)).unwrap();
+                }
+                "child-proof" => {
+                    sender.send(init(CHILD, next.as_ref().unwrap(), 1)).unwrap();
+                }
+                "changed-launch" => {
+                    identity
+                        .lock()
+                        .unwrap()
+                        .launch
+                        .as_mut()
+                        .unwrap()
+                        .execution_generation += 1;
+                }
+                "wrong-operation" => {
+                    next.as_mut().unwrap().evidence_revision += 1;
+                }
+                "stop" => {
+                    transport.clone().stop().await.unwrap();
+                }
+                _ => {}
+            }
+            drain_native_bridge(&sender, &mut event_rx).await;
+            let code = match case {
+                "generic-error" => "INTERNAL_ERROR",
+                "timeout" => "BUSY_TURN",
+                _ => "INVALID_ROLLBACK_TARGET",
+            };
+            let restored = identity
+                .lock()
+                .unwrap()
+                .reject_before_native_transition(PARENT, &next, code);
+            assert_eq!(restored, case == "unchanged", "{case}");
+            if restored {
+                sender.send(init(PARENT, &launch, 2)).unwrap();
+                drain_native_bridge(&sender, &mut event_rx).await;
+                assert_eq!(
+                    transport.native_identity_evidence().await,
+                    Some(prior),
+                    "previous-query proof must stay stale after rejection"
+                );
+                assert_eq!(transport.current_native_id().await.unwrap(), PARENT);
+            } else {
+                assert!(
+                    transport.native_identity_evidence().await.is_none(),
+                    "{case}"
+                );
+                assert!(transport.current_native_id().await.is_err(), "{case}");
+                assert!(
+                    identity.lock().unwrap().begin(true).is_err(),
+                    "{case}: an unsettled operation cannot dispatch another query"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_claude_rejected_rollback_preserves_current_parent_and_followup() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let keys = [
+            "HOME",
+            "CLAUDE_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+            "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+            "FRESHELL_PROVIDER_RUN_AS_UID",
+            "FRESHELL_PROVIDER_RUN_AS_GID",
+            "FRESHELL_SIDECAR_TEST_CHECKPOINT",
+            "FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY",
+        ];
+        let _restore = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        const PARENT: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let launch: freshell_runtime_protocol::NativeIdentityLaunch =
+            serde_json::from_value(json!({
+                "incarnationId":"rejection-incarnation", "launchNonce":"rejection-nonce",
+                "evidenceRevision":7, "executionGeneration":3, "requestedNativeSessionId":PARENT
+            }))
+            .unwrap();
+        for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+            for followup in ["input", "undo", "retired"] {
+                let owned = tempfile::tempdir().unwrap();
+                let config = owned.path().join(".claude");
+                let project = config.join("projects/-owned");
+                std::fs::create_dir_all(&project).unwrap();
+                let anchors: Vec<_> = (0..4).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+                let content: String = (0..4).map(|i| format!("{}\n", json!({
+                    "type":if i % 2 == 0 {"user"} else {"assistant"}, "uuid":anchors[i],
+                    "parentUuid":if i == 0 {None} else {Some(&anchors[i-1])}, "sessionId":PARENT,
+                    "cwd":project, "message":{"role":if i % 2 == 0 {"user"} else {"assistant"},
+                    "content":[{"type":"text","text":format!("controlled turn {i}")}]}
+                }))).collect();
+                let source = project.join(format!("{PARENT}.jsonl"));
+                std::fs::write(&source, &content).unwrap();
+                std::env::set_var("HOME", owned.path());
+                std::env::set_var("CLAUDE_HOME", &config);
+                std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+                std::env::set_var(
+                    "FRESHELL_CLAUDE_SIDECAR",
+                    repo.join("crates/freshell-claude-sidecar/index.mjs"),
+                );
+                let query_module = owned.path().join("query.mjs");
+                let input_receipt = owned.path().join("input-received");
+                std::fs::write(&query_module, format!(
+                    "import {{ appendFile }} from 'node:fs/promises';\nimport {{ query as controlledQuery }} from {};\nexport function query(args) {{ const options = {{...args.options, sessionId:args.options.sessionId ?? args.options.resume}}; const prompt = (async function* () {{ for await (const message of args.prompt) {{ await appendFile({}, options.sessionId + '\\n'); yield message; }} }})(); return controlledQuery({{...args, prompt, options}}) }}\n",
+                    json!(repo.join("test/unit/claude-sidecar/fixtures/native-startup-query.mjs")), json!(input_receipt))).unwrap();
+                std::env::set_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE", &query_module);
+                std::env::set_var("FRESHELL_NATIVE_IDENTITY_LAUNCH", json!(launch).to_string());
+                if followup != "undo" {
+                    std::env::remove_var("FRESHELL_SIDECAR_TEST_CHECKPOINT");
+                    std::env::remove_var("FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY");
+                } else {
+                    // The managed fork requires an observed native child exit.
+                    // This existing fixture owns a controlled no-model child.
+                    std::env::set_var("FRESHELL_SIDECAR_TEST_CHECKPOINT", "1");
+                    std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY", "1");
+                }
+                let transport = HostedTransport::new(provider.clone()).await;
+                {
+                    let mut identity = transport.native_identity.lock().unwrap();
+                    identity.launch = Some(launch.clone());
+                    identity.producer_launch = Some(launch.clone());
+                }
+                let mut profile = parity_profile(FreshProvider::Claude);
+                profile.provider = provider.clone();
+                if provider == FreshProvider::Kilroy {
+                    profile.runtime_variant = "kilroy".into();
+                }
+                profile.cwd = project.to_string_lossy().into();
+                profile.native_session_id = Some(PARENT.into());
+                profile.session_ref = None;
+                profile.provider_launch_context = None;
+                profile.provider_secret_references.clear();
+                profile.plugins = None;
+                let result: Result<(), String> = async {
+                    let actor = FreshAgentHostActor::open(owned.path().join("actor"), profile, transport.clone())
+                        .await.map_err(|error| error.to_string())?;
+                    let before = crate::fresh_native_observation(&launch, &actor).await.ok_or("initial parent observation missing")?;
+                    let proof = actor.observed_native_identity_evidence().await.ok_or("initial proof missing")?;
+                    let snapshot = actor.snapshot().await.map_err(|error| error.to_string())?;
+                    if snapshot["capabilities"]["undo"] != true { return Err("setup must support Undo".into()); }
+                    for (index, turn_id) in [None, Some("stale-turn-id".into())].into_iter().enumerate() {
+                        let rejected = actor.semantic_operation(RequestId::parse(format!("invalid-target-{index}")).unwrap(),
+                            FreshAgentOperation::Rollback { direction:FreshAgentRollbackDirection::Undo,
+                                mode:FreshAgentRollbackMode::ToTurn, turn_id, cwd:None }).await;
+                        if !matches!(rejected, Err(freshell_agent_runtime::host_actor::ActorError::Transport(_))) {
+                            return Err(format!("target must be rejected by the actual handler: {rejected:?}"));
+                        }
+                        if !transport.provider_session_is_live(PARENT).await { return Err("rejected target retired the parent".into()); }
+                        let after = crate::fresh_native_observation(&launch, &actor).await
+                            .ok_or("rejected rollback erased unchanged parent's host observation")?;
+                        if before != after || actor.observed_native_identity_evidence().await != Some(proof.clone()) {
+                            return Err("rejected rollback changed parent/query proof".into());
+                        }
+                        actor.snapshot().await.map_err(|error| error.to_string())?;
+                        let capture = actor.capture(4096).await.map_err(|error| error.to_string())?;
+                        if capture.native_session_id != PARENT || !capture.text.contains("controlled turn 0") {
+                            return Err("rejected rollback broke parent capture".into());
+                        }
+                    }
+                    let redo = transport.dispatch_operation(&RequestId::parse("redo-unavailable").unwrap(),
+                        &FreshAgentOperation::Rollback { direction:FreshAgentRollbackDirection::Redo,
+                            mode:FreshAgentRollbackMode::Step, turn_id:None, cwd:None }).await;
+                    if !matches!(redo, Err(OperationFailure { acceptance_ambiguous:false, .. }))
+                        || crate::fresh_native_observation(&launch, &actor).await != Some(before.clone()) {
+                        return Err("unavailable Redo did not preserve the current parent".into());
+                    }
+                    if followup == "input" {
+                        let inputs_before = std::fs::read_to_string(&input_receipt).unwrap_or_default();
+                        actor.dispatch(RequestId::parse("parent-input-after-refusal").unwrap(), "controlled input".into(), None)
+                            .await.map_err(|error| error.to_string())?;
+                        let inputs_after = tokio::time::timeout(Duration::from_secs(3), async {
+                            loop {
+                                let receipt = std::fs::read_to_string(&input_receipt).unwrap_or_default();
+                                if receipt.len() > inputs_before.len() { break receipt; }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }).await.map_err(|_| "parent query did not receive the subsequent input")?;
+                        if inputs_after != format!("{inputs_before}{PARENT}\n") {
+                            return Err("subsequent input reached another query root".into());
+                        }
+                        let busy = actor.semantic_operation(RequestId::parse("busy-refusal").unwrap(),
+                            FreshAgentOperation::Rollback { direction:FreshAgentRollbackDirection::Undo,
+                                mode:FreshAgentRollbackMode::Step, turn_id:None, cwd:None }).await;
+                        if !matches!(busy, Err(freshell_agent_runtime::host_actor::ActorError::AmbiguousDispatch)) {
+                            return Err(format!("busy native query must refuse rollback: {busy:?}"));
+                        }
+                        if crate::fresh_native_observation(&launch, &actor).await.is_some() {
+                            return Err("ambiguous busy/timeout refusal restored parent proof".into());
+                        }
+                    } else {
+                        let undo = actor.semantic_operation(RequestId::parse("valid-undo-after-refusal").unwrap(),
+                            FreshAgentOperation::Rollback { direction:FreshAgentRollbackDirection::Undo,
+                                mode:FreshAgentRollbackMode::Step, turn_id:None, cwd:None }).await;
+                        if followup == "retired" {
+                            if !matches!(undo, Err(freshell_agent_runtime::host_actor::ActorError::AmbiguousDispatch))
+                                || transport.provider_session_is_live(PARENT).await
+                                || crate::fresh_native_observation(&launch, &actor).await.is_some()
+                                || actor.capture(4096).await.is_ok()
+                                || actor.dispatch(RequestId::parse("retired-parent-input").unwrap(), "must not run".into(), None).await.is_ok() {
+                                return Err("post-retirement failure revived the old parent".into());
+                            }
+                            return Ok(());
+                        }
+                        if let Err(error) = undo {
+                            tokio::time::timeout(Duration::from_secs(1), async {
+                                loop {
+                                    if actor.read_events(0, 256).await.events.iter().any(|entry| matches!(&entry.event,
+                                        AgentEvent::Provider {payload} if payload["event"]["requestId"] == "valid-undo-after-refusal")) { break; }
+                                    tokio::task::yield_now().await;
+                                }
+                            }).await.ok();
+                            let detail: Vec<_> = actor.read_events(0, 256).await.events.iter().filter_map(|entry|
+                                match &entry.event { AgentEvent::Provider {payload} if find_operation_error_code(payload).is_some() => Some(payload.clone()), _ => None }).collect();
+                            return Err(format!("subsequent legitimate Undo failed: {error}; {detail:?}"));
+                        }
+                        let child = actor.profile().await.native_session_id.ok_or("missing child")?;
+                        if child == PARENT { return Err("legitimate Undo did not change root".into()); }
+                        let mut child_launch = launch.clone();
+                        child_launch.evidence_revision += 1;
+                        child_launch.requested_native_session_id = Some(child.clone());
+                        tokio::time::timeout(Duration::from_secs(3), async {
+                            while crate::fresh_native_observation(&child_launch, &actor).await.is_none() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }).await.map_err(|_| "subsequent child proof missing")?;
+                        if actor.capture(4096).await.map_err(|error| error.to_string())?.native_session_id != child {
+                            return Err("subsequent legitimate child capture broke".into());
+                        }
+                        let child_before = crate::fresh_native_observation(&child_launch, &actor).await;
+                        let invalid_child = actor.semantic_operation(RequestId::parse("child-invalid-target").unwrap(),
+                            FreshAgentOperation::Rollback { direction:FreshAgentRollbackDirection::Undo,
+                                mode:FreshAgentRollbackMode::ToTurn, turn_id:Some("stale-child-turn".into()), cwd:None }).await;
+                        if !matches!(invalid_child, Err(freshell_agent_runtime::host_actor::ActorError::Transport(_)))
+                            || crate::fresh_native_observation(&child_launch, &actor).await != child_before
+                            || actor.capture(4096).await.map_err(|error| error.to_string())?.native_session_id != child {
+                            return Err("rejected child operation lost its settled producer or parent-backed capture".into());
+                        }
+                    }
+                    if std::fs::read_to_string(&source).map_err(|error| error.to_string())? != content {
+                        return Err("controlled parent history changed".into());
+                    }
+                    Ok(())
+                }.await;
+                // Join the owned sidecar even on the expected product RED.
+                transport.clone().stop().await.unwrap();
+                assert!(!transport.is_live().await);
+                result.unwrap();
+            }
         }
     }
 
