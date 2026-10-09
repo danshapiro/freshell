@@ -61,6 +61,9 @@ freshell-terminal = { path = "../freshell-terminal" }
 # kata b8ke Task 3: the ONE runtime-ownership coordinator minted in main and
 # injected into every fresh-agent lane (plus the Starting-state watchdog).
 freshell-ownership = { path = "../freshell-ownership" }
+# codex-pane-lifecycle Task 2: the containment start-up prelude (inherited
+# unit-tag removal, open-file soft limit, the one-shot containment self-check).
+freshell-containment = { path = "../freshell-containment" }
 freshell-agent-runtime = { path = "../freshell-agent-runtime", optional = true }
 freshell-runtime-client = { path = "../freshell-runtime-client", optional = true }
 freshell-runtime-observability = { path = "../freshell-runtime-observability" }

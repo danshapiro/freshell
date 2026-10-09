@@ -785,6 +785,14 @@ async fn main() -> ExitCode {
         load_dotenv_from(&cwd);
     }
 
+    // Containment prelude, before any task, thread or child is started: a
+    // server started from inside an agent pane inherits that pane's unit tag
+    // and would hand it to every terminal and sidecar it starts, so remove it;
+    // and raise the open-file soft limit (every exit watch holds a pidfd).
+    // Both results are logged by the self-check once logging is up.
+    let removed_unit_tags = freshell_containment::startup::strip_inherited_unit_tags();
+    let nofile_limit = freshell_containment::startup::raise_nofile_limit();
+
     // AUTH_TOKEN is mandatory — refuse to start without it (matches the original).
     let auth_token = match std::env::var("AUTH_TOKEN") {
         Ok(token) => match validate_auth_token(&token) {
@@ -828,6 +836,15 @@ async fn main() -> ExitCode {
     if let Err(err) = logging::init(logging_config) {
         eprintln!("freshell-server: structured logging disabled: {err}");
     }
+
+    // One-shot confirmation that the facilities confirmed stops rest on exist
+    // on this host. A failure is logged as ERROR and the server keeps booting.
+    let containment_check = freshell_containment::startup::self_check();
+    freshell_containment::startup::log_startup(
+        &removed_unit_tags,
+        &nofile_limit,
+        &containment_check,
+    );
 
     // Boot-time parent chain for the shutdown-forensics comparison (V5:
     // WSL2 orphans reparent to the Relay subreaper, not pid 1 — the

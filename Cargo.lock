@@ -1318,6 +1318,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-containment"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "freshell-extensions"
 version = "0.1.0"
 dependencies = [
@@ -1443,6 +1457,7 @@ dependencies = [
  "freshell-agent-runtime",
  "freshell-api",
  "freshell-codex",
+ "freshell-containment",
  "freshell-extensions",
  "freshell-freshagent",
  "freshell-opencode",
