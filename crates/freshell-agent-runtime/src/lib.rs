@@ -938,13 +938,12 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
 }
 
 fn probe_selected_provider_store(provider_home: &Path, spec: &ResumeSpec) -> ProviderStoreProbe {
-    let ordinary = probe_selected_provider_identity(
-        provider_home,
-        &spec.provider_session.provider,
-        &spec.provider_session.native_session_id,
-    );
     let Some(recipe) = spec.claude_fork.as_ref() else {
-        return ordinary;
+        return probe_selected_provider_identity(
+            provider_home,
+            &spec.provider_session.provider,
+            &spec.provider_session.native_session_id,
+        );
     };
     if !matches!(spec.provider_session.provider.as_str(), "claude" | "kilroy")
         || !matches!(spec.mode.as_str(), "freshclaude" | "kilroy")
@@ -984,14 +983,16 @@ fn probe_selected_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Pro
                     None,
                 );
             }
-            return ordinary;
+            return ProviderStoreProbe::Ready {
+                evidence: vec!["native Claude child transcript identity verified".into()],
+            };
         }
         Err(probe) => return probe,
         Ok(false) => {}
     }
-    if !matches!(ordinary, ProviderStoreProbe::DefinitivelyUnavailable { .. }) {
-        return ordinary;
-    }
+    // This is positive proof of a current, explicitly observed fork's source.
+    // Native companion records need not certify any other session's absence.
+    // Keep the ordinary store census separate, including all of its blockers.
     if recipe.recovery_disabled {
         return blocked(RecoveryBlockReason::StoreUnreadable,
             "Claude child history has not materialized after a possibly accepted effect; parent-prefix recovery is disabled", Vec::new(), None);
@@ -3236,16 +3237,28 @@ mod tests {
         let first = "11111111-1111-4111-8111-111111111111";
         let last = "22222222-2222-4222-8222-222222222222";
         let removed = "33333333-3333-4333-8333-333333333333";
+        let attachment = "44444444-4444-4444-8444-444444444444";
         let parent_path = format!(".claude/projects/work/{parent}.jsonl");
         fs::create_dir_all(home.path().join(".claude/projects/work")).unwrap();
         let content = [
+            serde_json::json!({"type":"atis-latch","sessionId":parent}),
             serde_json::json!({"type":"user","sessionId":parent,"uuid":first,"parentUuid":null,"message":{"role":"user","content":"kept"}}),
-            serde_json::json!({"type":"assistant","sessionId":parent,"uuid":last,"parentUuid":first,"message":{"role":"assistant","content":[]}}),
+            serde_json::json!({"type":"attachment","sessionId":parent,"uuid":attachment,"parentUuid":first,"attachment":{"type":"invoked_skills","skills":[]}}),
+            serde_json::json!({"type":"assistant","sessionId":parent,"uuid":last,"parentUuid":attachment,"message":{"role":"assistant","content":[]}}),
             serde_json::json!({"type":"user","sessionId":parent,"uuid":removed,"parentUuid":last,"message":{"role":"user","content":"undone"}}),
+            serde_json::json!({"type":"queue-operation","operation":"remove","sessionId":parent}),
+            serde_json::json!({"type":"mode","mode":"default","sessionId":parent}),
         ].iter().map(|row| format!("{row}\n")).collect::<String>();
         fs::write(home.path().join(&parent_path), &content).unwrap();
         let mut spec = resume_spec_for_test("claude", child, home.path());
         spec.mode = "freshclaude".into();
+        assert!(
+            matches!(
+                probe_provider_store(home.path(), &spec),
+                ProviderStoreProbe::Blocked { .. }
+            ),
+            "ordinary native companion rows cannot certify another child's absence"
+        );
         spec.claude_fork = Some(freshell_runtime_protocol::ClaudeForkRecipe {
             recovery_disabled: false,
             child_session_id: child.into(),
@@ -3276,6 +3289,7 @@ mod tests {
             "missing child after an ambiguous effect is a blocker, never inspected absence"
         );
         for child_content in [
+            "{not-json}\n".into(),
             format!("{}\n", serde_json::json!({"type":"mode","sessionId":child})),
             format!(
                 "{}\n",
@@ -3285,38 +3299,57 @@ mod tests {
                 "{}",
                 serde_json::json!({"type":"user","sessionId":child,"uuid":first})
             ),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":"user","sessionId":child,"uuid":first}),
+                serde_json::json!({"type":"assistant","sessionId":parent,"uuid":last})
+            ),
         ] {
             fs::write(&child_path, child_content).unwrap();
-            assert!(
-                matches!(
-                    probe_provider_store(home.path(), &spec),
-                    ProviderStoreProbe::Blocked { .. }
-                ),
-                "partial, wrong-root, or metadata-only child must not inherit its parent proof"
-            );
+            for disabled in [false, true] {
+                spec.claude_fork.as_mut().unwrap().recovery_disabled = disabled;
+                assert!(
+                    matches!(
+                        probe_provider_store(home.path(), &spec),
+                        ProviderStoreProbe::Blocked { .. }
+                    ),
+                    "partial, ambiguous, wrong-root, or metadata-only child must block with recovery_disabled={disabled}"
+                );
+            }
         }
         fs::write(
             &child_path,
             format!(
                 "{}\n",
-                serde_json::json!({"type":"user","sessionId":child,"uuid":first})
+                serde_json::json!({"type":"user","sessionId":child,"uuid":first,"forkedFrom":{"sessionId":parent}})
             ),
         )
         .unwrap();
+        fs::write(home.path().join(&parent_path), format!("{content}{{}}\n")).unwrap();
         assert!(
             matches!(
                 probe_provider_store(home.path(), &spec),
                 ProviderStoreProbe::Ready { .. }
             ),
-            "an actual materialized child takes precedence even after source recovery is disabled"
+            "an actual materialized child takes precedence even when the source changed and recovery is disabled"
         );
         fs::remove_file(child_path).unwrap();
         spec.claude_fork.as_mut().unwrap().recovery_disabled = false;
-        fs::write(home.path().join(&parent_path), format!("{content}{{}}\n")).unwrap();
         assert!(matches!(
             probe_provider_store(home.path(), &spec),
             ProviderStoreProbe::Blocked { .. }
         ));
+        fs::write(home.path().join(&parent_path), &content).unwrap();
+        let recipe = spec.claude_fork.clone();
+        spec.claude_fork.as_mut().unwrap().target = ClaudeForkTarget::Prefix {
+            cutoff_uuid: last.into(),
+            drop_turn_uuid: Some(first.into()),
+        };
+        assert!(matches!(
+            probe_provider_store(home.path(), &spec),
+            ProviderStoreProbe::Blocked { .. }
+        ));
+        spec.claude_fork = recipe;
         fs::remove_file(home.path().join(&parent_path)).unwrap();
         assert!(matches!(
             probe_provider_store(home.path(), &spec),
