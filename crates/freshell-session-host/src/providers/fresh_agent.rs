@@ -3917,7 +3917,15 @@ mod tests {
                 }
             })
             .await;
+            let identity_before_repeat = (
+                actor.observed_native_session_id().await,
+                actor.observed_native_identity_evidence().await,
+            );
             let duplicate = actor.resume_pending_native_permissions().await;
+            let identity_after_repeat = (
+                actor.observed_native_session_id().await,
+                actor.observed_native_identity_evidence().await,
+            );
             if let ProviderState::Claude(state) = &current.state {
                 state.shutdown().await;
             }
@@ -3931,9 +3939,12 @@ mod tests {
             assert_eq!(recovered["nativeCheckpoint"], checkpoint);
             assert_eq!(recovered["nativeRequestId"], "native-new");
             assert!(
-                duplicate.is_err(),
-                "staged recovery release cannot run twice"
+                duplicate.is_ok(),
+                "settled actor release must succeed without a second native continuation: {duplicate:?}"
             );
+            assert_eq!(identity_before_repeat.0.as_deref(), Some(native));
+            assert!(identity_before_repeat.1.is_some());
+            assert_eq!(identity_after_repeat, identity_before_repeat);
             assert_eq!(
                 std::fs::read(owned.path().join("native.jsonl")).unwrap(),
                 before,

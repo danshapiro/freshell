@@ -434,6 +434,13 @@ impl Drop for WriterLock {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeRecoveryRelease {
+    Pending,
+    Unsettled,
+    Released,
+}
+
 pub struct FreshAgentHostActor {
     state_dir: PathBuf,
     transport: Arc<dyn FreshAgentTransport>,
@@ -444,7 +451,7 @@ pub struct FreshAgentHostActor {
     native_identity_transition: AtomicBool,
     stopped: AtomicBool,
     dispatch_lock: Mutex<()>,
-    native_recovery_released: AtomicBool,
+    native_recovery_release: Mutex<NativeRecoveryRelease>,
     native_recovery_prepared: bool,
     event_byte_cap: usize,
     event_count_cap: usize,
@@ -481,20 +488,22 @@ impl FreshAgentHostActor {
             );
             return Ok(());
         }
-        if self.native_recovery_released.load(Ordering::SeqCst) {
+        let mut release = self.native_recovery_release.lock().await;
+        if *release == NativeRecoveryRelease::Unsettled {
             return Err(ActorError::AmbiguousDispatch);
         }
         let state = self.state.lock().await;
         if !matches!(
             state.profile.provider,
             FreshProvider::Claude | FreshProvider::Kilroy
-        ) || native_recovery_checkpoints(&state).is_empty()
+        ) || (*release == NativeRecoveryRelease::Pending
+            && native_recovery_checkpoints(&state).is_empty())
         {
             return Ok(());
         }
         let expected = state.profile.native_session_id.clone();
         drop(state);
-        let observed = self.observed_native_session_id.lock().await.clone();
+        let observed = self.observed_native_session_id().await;
         let evidence = self
             .transport
             .native_identity_evidence()
@@ -513,9 +522,13 @@ impl FreshAgentHostActor {
         {
             return Err(ActorError::NativeIdentityMismatch);
         }
-        if self.native_recovery_released.swap(true, Ordering::SeqCst) {
-            return Err(ActorError::AmbiguousDispatch);
+        if *release == NativeRecoveryRelease::Released {
+            return Ok(());
         }
+        // This preparation belongs to this actor's transport. Cancellation or
+        // any failed dispatch stays fenced; only a confirmed acknowledgement
+        // permits later reattach to settle without another native continuation.
+        *release = NativeRecoveryRelease::Unsettled;
         self.transport
             .resume_native_permission_recovery()
             .await
@@ -525,7 +538,9 @@ impl FreshAgentHostActor {
                 } else {
                     ActorError::Transport(failure.message)
                 }
-            })
+            })?;
+        *release = NativeRecoveryRelease::Released;
+        Ok(())
     }
     pub async fn open(
         state_dir: impl Into<PathBuf>,
@@ -667,7 +682,7 @@ impl FreshAgentHostActor {
             native_identity_transition: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             dispatch_lock: Mutex::new(()),
-            native_recovery_released: AtomicBool::new(false),
+            native_recovery_release: Mutex::new(NativeRecoveryRelease::Pending),
             native_recovery_prepared,
             event_byte_cap,
             event_count_cap,

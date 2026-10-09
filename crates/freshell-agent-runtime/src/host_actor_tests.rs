@@ -470,6 +470,8 @@ impl FreshAgentTransport for OperationTransport {
 
 struct FakeTransport {
     recovery_releases: AtomicUsize,
+    recovery_result: std::sync::Mutex<Option<Result<(), DispatchFailure>>>,
+    recovery_started: tokio::sync::Notify,
     native: String,
     starts: AtomicUsize,
     dispatches: AtomicUsize,
@@ -580,6 +582,8 @@ impl FakeTransport {
             native_evidence: std::sync::Mutex::new(None),
             prepared_checkpoints: std::sync::Mutex::new(Vec::new()),
             recovery_releases: AtomicUsize::new(0),
+            recovery_result: std::sync::Mutex::new(Some(Ok(()))),
+            recovery_started: tokio::sync::Notify::new(),
         })
     }
     fn ambiguous(native: &str) -> Arc<Self> {
@@ -596,6 +600,8 @@ impl FakeTransport {
                 native_evidence: std::sync::Mutex::new(None),
                 prepared_checkpoints: std::sync::Mutex::new(Vec::new()),
                 recovery_releases: AtomicUsize::new(0),
+                recovery_result: std::sync::Mutex::new(Some(Ok(()))),
+                recovery_started: tokio::sync::Notify::new(),
             }
         })
     }
@@ -605,7 +611,12 @@ impl FakeTransport {
 impl FreshAgentTransport for FakeTransport {
     async fn resume_native_permission_recovery(&self) -> Result<(), DispatchFailure> {
         self.recovery_releases.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        self.recovery_started.notify_one();
+        let result = self.recovery_result.lock().unwrap().clone();
+        match result {
+            Some(result) => result,
+            None => std::future::pending().await,
+        }
     }
     async fn prepare_native_permission_recovery(
         &self,
@@ -1232,28 +1243,34 @@ async fn admitted_durable_fixture_decision_survives_replacement_without_native_c
     }
 }
 
-#[tokio::test]
-async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_operation() {
-    let dir = tempfile::tempdir().unwrap();
-    let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    let launch = |nonce: &str| {
-        serde_json::json!({"incarnationId":nonce,"launchNonce":nonce,
-        "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":native})
-    };
+fn native_checkpoint_evidence(native: &str, nonce: &str) -> Value {
+    serde_json::json!({"launch":{"incarnationId":nonce,"launchNonce":nonce,
+        "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":native},
+        "queryGeneration":2})
+}
+
+fn native_checkpoint_permission(native: &str, nonce: &str) -> Value {
     let input = serde_json::json!({"command":"harmless"});
     let checkpoint = serde_json::json!({"nativeSessionId":native,"toolUseID":"toolu_original1",
         "toolName":"Bash","inputDigest":digest(&serde_json::to_vec(&input).unwrap()),"profileDigest":"b".repeat(64),
         "checkpointUuid":"original-checkpoint","assistantUuid":"original-assistant",
         "checkpointDigest":"c".repeat(64),"nativeVersion":"2.1.237"});
-    let payload = |nonce: &str| {
-        serde_json::json!({"type":"freshAgent.permission.request",
+    let mut binding = native_checkpoint_evidence(native, nonce);
+    binding["nativeRequestId"] = serde_json::json!(nonce);
+    serde_json::json!({"type":"freshAgent.permission.request",
         "requestId":"same-checkpoint-card","nativeRequestId":nonce,"toolUseID":"toolu_original1",
         "tool":{"name":"Bash","input":input},"nativeCheckpoint":checkpoint,
-        "nativeBinding":{"launch":launch(nonce),"queryGeneration":2,"nativeRequestId":nonce}})
-    };
+        "nativeBinding":binding})
+}
+
+#[tokio::test]
+async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let payload = |nonce: &str| native_checkpoint_permission(native, nonce);
+    let checkpoint = payload("old")["nativeCheckpoint"].clone();
     let old = FakeTransport::new(native);
-    *old.native_evidence.lock().unwrap() =
-        Some(serde_json::json!({"launch":launch("old"),"queryGeneration":2}));
+    *old.native_evidence.lock().unwrap() = Some(native_checkpoint_evidence(native, "old"));
     let actor = FreshAgentHostActor::open(
         dir.path(),
         profile(FreshProvider::Claude, "checkpoint-store", None),
@@ -1270,8 +1287,7 @@ async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_ope
         "retained current callback is not a prepared recovered checkpoint and must not receive recovery input");
     drop(actor);
     let current = FakeTransport::new(native);
-    *current.native_evidence.lock().unwrap() =
-        Some(serde_json::json!({"launch":launch("current"),"queryGeneration":2}));
+    *current.native_evidence.lock().unwrap() = Some(native_checkpoint_evidence(native, "current"));
     let actor = FreshAgentHostActor::open(
         dir.path(),
         profile(FreshProvider::Claude, "checkpoint-store", None),
@@ -1295,11 +1311,23 @@ async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_ope
         1,
         "explicit fenced release must reach the current transport once"
     );
-    assert!(
-        actor.resume_pending_native_permissions().await.is_err(),
-        "duplicate recovery release must be refused before native input"
-    );
+    assert_eq!(actor.resume_pending_native_permissions().await, Ok(()));
     assert_eq!(current.recovery_releases.load(Ordering::SeqCst), 1);
+    let evidence = current.native_evidence.lock().unwrap().take();
+    assert_eq!(
+        actor.resume_pending_native_permissions().await,
+        Err(ActorError::NativeIdentityMismatch)
+    );
+    let mut wrong_root = evidence.clone().unwrap();
+    wrong_root["launch"]["requestedNativeSessionId"] =
+        serde_json::json!("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    *current.native_evidence.lock().unwrap() = Some(wrong_root);
+    assert_eq!(
+        actor.resume_pending_native_permissions().await,
+        Err(ActorError::NativeIdentityMismatch)
+    );
+    *current.native_evidence.lock().unwrap() = evidence;
+    assert_eq!(actor.resume_pending_native_permissions().await, Ok(()));
     assert!(actor
         .resolve_permission(
             "same-checkpoint-card",
@@ -1335,6 +1363,110 @@ async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_ope
         .await
         .unwrap();
     assert_eq!(current.decisions.load(Ordering::SeqCst), 1);
+    assert_eq!(actor.resume_pending_native_permissions().await, Ok(()));
+    assert_eq!(current.recovery_releases.load(Ordering::SeqCst), 1);
+    actor.clone().stop().await.unwrap();
+    assert_eq!(
+        actor.resume_pending_native_permissions().await,
+        Err(ActorError::NativeIdentityMismatch)
+    );
+    assert_eq!(current.recovery_releases.load(Ordering::SeqCst), 1);
+}
+
+async fn actor_with_recovered_checkpoint(
+    provider: FreshProvider,
+) -> (
+    tempfile::TempDir,
+    Arc<FreshAgentHostActor>,
+    Arc<FakeTransport>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let prior = FakeTransport::new(native);
+    *prior.native_evidence.lock().unwrap() = Some(native_checkpoint_evidence(native, "prior"));
+    let saved_profile = profile(provider, "checkpoint-store", None);
+    let actor = FreshAgentHostActor::open(dir.path(), saved_profile.clone(), prior)
+        .await
+        .unwrap();
+    actor
+        .record_permission(
+            "same-checkpoint-card".into(),
+            native_checkpoint_permission(native, "prior"),
+        )
+        .await
+        .unwrap();
+    actor.stop().await.unwrap();
+    let current = FakeTransport::new(native);
+    *current.native_evidence.lock().unwrap() = Some(native_checkpoint_evidence(native, "current"));
+    let actor = FreshAgentHostActor::open(dir.path(), saved_profile, current.clone())
+        .await
+        .unwrap();
+    (dir, actor, current)
+}
+
+#[tokio::test]
+async fn native_checkpoint_release_failures_remain_fenced_without_replay() {
+    for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+        for acceptance_ambiguous in [false, true] {
+            let (_dir, actor, transport) = actor_with_recovered_checkpoint(provider.clone()).await;
+            *transport.recovery_result.lock().unwrap() = Some(Err(DispatchFailure {
+                message: "native continuation failed".into(),
+                acceptance_ambiguous,
+            }));
+            let expected = if acceptance_ambiguous {
+                ActorError::AmbiguousDispatch
+            } else {
+                ActorError::Transport("native continuation failed".into())
+            };
+            assert_eq!(
+                actor.resume_pending_native_permissions().await,
+                Err(expected)
+            );
+            // A later healthy transport is not evidence that an earlier release settled.
+            *transport.recovery_result.lock().unwrap() = Some(Ok(()));
+            assert_eq!(
+                actor.resume_pending_native_permissions().await,
+                Err(ActorError::AmbiguousDispatch)
+            );
+            assert_eq!(transport.recovery_releases.load(Ordering::SeqCst), 1);
+            assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
+            actor.stop().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_checkpoint_release_in_progress_and_cancelled_never_complete_or_replay() {
+    for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+        let (_dir, actor, transport) = actor_with_recovered_checkpoint(provider).await;
+        *transport.recovery_result.lock().unwrap() = None;
+        let releasing_actor = actor.clone();
+        let release =
+            tokio::spawn(async move { releasing_actor.resume_pending_native_permissions().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            transport.recovery_started.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            actor.resume_pending_native_permissions()
+        )
+        .await
+        .is_err());
+        assert!(!release.is_finished());
+        release.abort();
+        assert!(release.await.unwrap_err().is_cancelled());
+        *transport.recovery_result.lock().unwrap() = Some(Ok(()));
+        assert_eq!(
+            actor.resume_pending_native_permissions().await,
+            Err(ActorError::AmbiguousDispatch)
+        );
+        assert_eq!(transport.recovery_releases.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
+        actor.stop().await.unwrap();
+    }
 }
 
 #[tokio::test]

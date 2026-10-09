@@ -4821,7 +4821,13 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
+    use freshell_agent_runtime::host_actor::{
+        ActorError, DispatchAck, DispatchFailure, FreshAgentHostActor, FreshAgentProfile,
+        FreshAgentTransport, TransportStart,
+    };
+    use freshell_runtime_protocol::{
+        FreshAgentLaunchSpec, FreshProvider, IncarnationId, RequestId,
+    };
 
     #[tokio::test]
     async fn provider_observed_replacement() {
@@ -5018,20 +5024,117 @@ pub(crate) mod tests {
     }
 
     fn pending_release_test_agent(
+        provider: &FreshProvider,
         native: &str,
         workspace: &std::path::Path,
     ) -> FreshAgentLaunchSpec {
-        serde_json::from_value(serde_json::json!({"sessionId":"pending-release","provider":"claude",
-            "sessionType":"freshclaude","runtimeVariant":"claude-sdk-sidecar","providerStoreId":"owned-store",
+        let session_type = if provider == &FreshProvider::Kilroy {
+            "kilroy"
+        } else {
+            "freshclaude"
+        };
+        serde_json::from_value(serde_json::json!({"sessionId":"pending-release","provider":provider,
+            "sessionType":session_type,"runtimeVariant":"claude-sdk-sidecar","providerStoreId":"owned-store",
             "cwd":workspace,"workspacePath":workspace,"runAsUid":65534,"runAsGid":0,"nativeSessionId":native})).unwrap()
+    }
+
+    struct PendingReleaseTransport {
+        native: String,
+        evidence: serde_json::Value,
+        prepared: std::sync::Mutex<Vec<serde_json::Value>>,
+        continuations: std::sync::atomic::AtomicUsize,
+        effects: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FreshAgentTransport for PendingReleaseTransport {
+        async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: Some(self.native.clone()),
+            })
+        }
+
+        async fn native_identity_evidence(&self) -> Option<serde_json::Value> {
+            Some(self.evidence.clone())
+        }
+
+        async fn prepare_native_permission_recovery(
+            &self,
+            checkpoints: Vec<serde_json::Value>,
+        ) -> Result<(), String> {
+            *self.prepared.lock().unwrap() = checkpoints;
+            Ok(())
+        }
+
+        async fn resume_native_permission_recovery(&self) -> Result<(), DispatchFailure> {
+            let checkpoints = std::mem::take(&mut *self.prepared.lock().unwrap());
+            assert_eq!(
+                checkpoints.len(),
+                1,
+                "continuation consumes the prepared checkpoint once"
+            );
+            assert_eq!(checkpoints[0]["nativeSessionId"], self.native);
+            self.continuations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn dispatch(
+            &self,
+            _: &RequestId,
+            _: &str,
+            _: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            panic!("checkpoint release must not dispatch a new user turn")
+        }
+
+        async fn resolve_permission(
+            &self,
+            decision_id: &str,
+            decision: serde_json::Value,
+        ) -> Result<(), DispatchFailure> {
+            assert_eq!(decision_id, "pending-release-card");
+            assert_eq!(decision["behavior"], "allow");
+            assert_eq!(
+                self.continuations.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn take_event_stream(
+            &self,
+        ) -> Option<tokio::sync::mpsc::Receiver<freshell_runtime_protocol::AgentEvent>> {
+            None
+        }
     }
 
     #[tokio::test]
     async fn pending_native_release_requires_durable_live_before_owned_host_input() {
+        assert_pending_native_release_reattaches(FreshProvider::Claude).await;
+    }
+
+    #[tokio::test]
+    async fn pending_native_release_kilroy_reattaches_without_replaying_continuation() {
+        assert_pending_native_release_reattaches(FreshProvider::Kilroy).await;
+    }
+
+    async fn assert_pending_native_release_reattaches(provider: FreshProvider) {
         use freshell_runtime_protocol::{
-            host_proof, read_frame, write_frame, Envelope, HostBootId, HostReply,
+            host_proof, read_frame, write_frame, Envelope, HostBootId, HostReply, InitialScanState,
             NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource, RecoveryState,
         };
+        use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
         let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
         let soul = SoulId::new();
@@ -5042,11 +5145,12 @@ pub(crate) mod tests {
         std::fs::create_dir(&runtime).unwrap();
         std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
         let conn = rusqlite::Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        let agent = pending_release_test_agent(&provider, native, dir.path());
         conn.execute("UPDATE incarnations SET runtime_dir=?1,execution_generation=1,fixture_kind=NULL,fresh_agent_spec=?2 WHERE incarnation_id=?3",
-            rusqlite::params![runtime.to_string_lossy(), serde_json::to_string(&pending_release_test_agent(native, dir.path())).unwrap(), prepared.incarnation_id.as_str()]).unwrap();
+            rusqlite::params![runtime.to_string_lossy(), serde_json::to_string(&agent).unwrap(), prepared.incarnation_id.as_str()]).unwrap();
         conn.execute(
-            "UPDATE souls SET provider='claude',recovery_state='recovering' WHERE soul_id=?1",
-            [soul.as_str()],
+            "UPDATE souls SET provider=?1,provider_store_id='owned-store',recovery_state='recovering' WHERE soul_id=?2",
+            rusqlite::params![provider.as_str(), soul.as_str()],
         )
         .unwrap();
         registry
@@ -5066,8 +5170,8 @@ pub(crate) mod tests {
             .unwrap();
         let observation = NativeIdentityObservation {
             native_session_id: native.into(),
-            incarnation_id: binding.incarnation_id,
-            launch_nonce: binding.launch_nonce,
+            incarnation_id: binding.incarnation_id.clone(),
+            launch_nonce: binding.launch_nonce.clone(),
             evidence_revision: binding.evidence_revision,
             source: NativeIdentitySource::FreshProviderHandshake,
             evidence_digest: "a".repeat(64),
@@ -5083,56 +5187,153 @@ pub(crate) mod tests {
             .unwrap();
         let current_observation = Arc::new(std::sync::Mutex::new(Some(observation.clone())));
         let responder_observation = current_observation.clone();
-        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let actual_releases = releases.clone();
-        let actual_registry = registry.clone();
+        let input = serde_json::json!({"command":"harmless"});
+        let checkpoint = serde_json::json!({"nativeSessionId":native,"toolUseID":"toolu_release1",
+            "toolName":"Bash","inputDigest":format!("{:x}", Sha256::digest(serde_json::to_vec(&input).unwrap())),
+            "profileDigest":"b".repeat(64),"checkpointUuid":"release-checkpoint",
+            "assistantUuid":"release-assistant","checkpointDigest":"c".repeat(64),"nativeVersion":"2.1.237"});
+        let payload = |launch: &NativeIdentityLaunch| {
+            serde_json::json!({
+            "requestId":"pending-release-card","nativeRequestId":launch.launch_nonce,
+            "toolUseID":"toolu_release1","tool":{"name":"Bash","input":input},"nativeCheckpoint":checkpoint,
+            "nativeBinding":{"launch":launch,"queryGeneration":2,"nativeRequestId":launch.launch_nonce}})
+        };
+        let transport = |launch: &NativeIdentityLaunch| {
+            Arc::new(PendingReleaseTransport {
+                native: native.into(),
+                evidence: serde_json::json!({"launch":launch,"queryGeneration":2}),
+                prepared: Default::default(),
+                continuations: Default::default(),
+                effects: Default::default(),
+            })
+        };
+        let profile: FreshAgentProfile =
+            serde_json::from_value(serde_json::to_value(&agent).unwrap()).unwrap();
+        let mut prior_binding = binding.clone();
+        prior_binding.launch_nonce = "prior-native-query".into();
+        let prior = FreshAgentHostActor::open(
+            runtime.join("actor"),
+            profile.clone(),
+            transport(&prior_binding),
+        )
+        .await
+        .unwrap();
+        prior
+            .record_permission("pending-release-card".into(), payload(&prior_binding))
+            .await
+            .unwrap();
+        prior.stop().await.unwrap();
+        let current = transport(&binding);
+        let actor = FreshAgentHostActor::open(runtime.join("actor"), profile, current.clone())
+            .await
+            .unwrap();
+        assert_eq!(*current.prepared.lock().unwrap(), vec![checkpoint.clone()]);
+        let hosted_actor = actor.clone();
+        let registry_path = dir.path().join("registry/runtime.sqlite3");
         let actual_soul = soul.clone();
         let limits = context.requested_limits;
+        let hosted_incarnation = prepared.incarnation_id.clone();
         let listener = tokio::net::UnixListener::bind(runtime.join("host.sock")).unwrap();
+        let (close_host, mut host_closed) = tokio::sync::oneshot::channel::<()>();
         let responder = tokio::spawn(async move {
             let boot = HostBootId::new();
             loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
+                let (mut socket, _) = tokio::select! {
+                    _ = &mut host_closed => break,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
                 let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                if !matches!(&request.body, HostCommand::Hello { .. }) {
+                    assert_eq!(
+                        request.auth,
+                        Some(host_proof(
+                            b"synthetic-secret",
+                            "command-auth",
+                            &boot,
+                            &hosted_incarnation
+                        ))
+                    );
+                }
                 let result = match request.body {
                     HostCommand::Hello {
                         incarnation_id,
                         challenge,
-                    } => HostResult::Hello {
+                    } => Ok(HostResult::Hello {
                         proof: host_proof(b"synthetic-secret", &challenge, &boot, &incarnation_id),
                         host_boot_id: boot.clone(),
-                        capabilities: vec!["native-identity-observation-v1".into()],
+                        capabilities: vec![
+                            "native-identity-observation-v1".into(),
+                            "owned-provider-config-v1".into(),
+                            "provider-store-probe-v1".into(),
+                        ],
                         effective_limits: limits,
-                    },
-                    HostCommand::Status { .. } => HostResult::Status {
-                        native_identity_observation: responder_observation.lock().unwrap().clone(),
-                        host_boot_id: boot.clone(),
-                        worker_pid: Some(123),
-                        worker_launch_count: 1,
-                        max_control_epoch: 1,
-                        max_execution_generation: 1,
-                        fixture_evidence: serde_json::json!({}),
-                        exited: false,
-                        native_session_id: Some(native.into()),
-                        opencode_transfer_receipt: None,
-                        opencode_adoption: Default::default(),
-                    },
-                    HostCommand::FreshAgentResumePending { .. } => {
-                        assert_eq!(
-                            actual_registry
-                                .recovery_context(actual_soul.clone())
-                                .await
-                                .unwrap()
-                                .recovery_state,
-                            RecoveryState::Live,
-                            "release cannot precede durable LIVE"
-                        );
-                        actual_releases.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        HostResult::FreshAgentCommand {
-                            state: freshell_runtime_protocol::CommandState::ProviderAcked,
-                            native_session_id: Some(native.into()),
-                            claude_fork: None,
-                        }
+                    }),
+                    HostCommand::Status { .. } => {
+                        let native_identity_observation =
+                            responder_observation.lock().unwrap().clone();
+                        Ok(HostResult::Status {
+                            native_identity_observation,
+                            host_boot_id: boot.clone(),
+                            worker_pid: Some(123),
+                            worker_launch_count: 1,
+                            max_control_epoch: 1,
+                            max_execution_generation: 1,
+                            fixture_evidence: serde_json::json!({}),
+                            exited: false,
+                            native_session_id: hosted_actor.observed_native_session_id().await,
+                            opencode_transfer_receipt: None,
+                            opencode_adoption: Default::default(),
+                        })
+                    }
+                    HostCommand::ProbeRecovery {
+                        resume_spec,
+                        run_as_uid,
+                        run_as_gid,
+                        ..
+                    } => {
+                        assert_eq!((run_as_uid, run_as_gid), (65534, 0));
+                        let resume_spec =
+                            resume_spec.expect("exact retained native resume candidate");
+                        assert_eq!(resume_spec.provider_session.native_session_id, native);
+                        Ok(HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                            evidence_revision: resume_spec.evidence_revision,
+                            resume_spec,
+                        }))
+                    }
+                    HostCommand::FreshAgentResumePending { incarnation_id } => {
+                        assert_eq!(incarnation_id, hosted_incarnation);
+                        let actual_registry = rusqlite::Connection::open(&registry_path).unwrap();
+                        let state: String = actual_registry
+                            .query_row(
+                                "SELECT recovery_state FROM souls WHERE soul_id=?1",
+                                [actual_soul.as_str()],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(state, "live", "release cannot precede durable LIVE");
+                        drop(actual_registry);
+                        hosted_actor
+                            .resume_pending_native_permissions()
+                            .await
+                            .map(|()| HostResult::FreshAgentCommand {
+                                state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                                native_session_id: Some(native.into()),
+                                claude_fork: None,
+                            })
+                            .map_err(|error| {
+                                RuntimeError::new(
+                                    match error {
+                                        ActorError::AmbiguousDispatch => {
+                                            RuntimeErrorCode::CommandAmbiguous
+                                        }
+                                        ActorError::NativeIdentityMismatch => {
+                                            RuntimeErrorCode::RecoveryWrongIdentity
+                                        }
+                                        _ => RuntimeErrorCode::HostUnreachable,
+                                    },
+                                    error.to_string(),
+                                )
+                            })
                     }
                     _ => panic!("unexpected pending-release command"),
                 };
@@ -5140,14 +5341,15 @@ pub(crate) mod tests {
                     &mut socket,
                     &HostReply {
                         request_id: request.request_id,
-                        result: Ok(result),
+                        result,
                     },
                 )
                 .await
                 .unwrap();
             }
         });
-        let supervisor = missing_supervisor(&dir, registry.clone());
+        let supervisor =
+            supervisor_with_runtime_state(&dir, registry.clone(), BackendRuntimeState::Running);
         let before = supervisor
             .release_pending_native_permissions_after_live(
                 soul.clone(),
@@ -5179,13 +5381,33 @@ pub(crate) mod tests {
                 prepared.incarnation_id.clone(),
             )
             .await;
-        *current_observation.lock().unwrap() = Some(observation);
+        *current_observation.lock().unwrap() = Some(observation.clone());
         let after = supervisor
             .release_pending_native_permissions_after_live(
                 soul.clone(),
                 prepared.incarnation_id.clone(),
             )
             .await;
+        actor
+            .record_permission("pending-release-card".into(), payload(&binding))
+            .await
+            .unwrap();
+        assert_eq!(current.effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let recover = || RecoverRequest {
+            soul_id: soul.clone(),
+            trigger: RecoveryTrigger::ManualRetry,
+            expected_intent_revision: Some(prepared.intent_revision),
+            expected_control_epoch: Some(registry.control_epoch()),
+        };
+        let pending = supervisor.recover(recover()).await;
+        actor
+            .resolve_permission(
+                "pending-release-card",
+                serde_json::json!({"behavior":"allow"}),
+            )
+            .await
+            .unwrap();
+        let resolved = supervisor.recover(recover()).await;
         conn.execute(
             "UPDATE souls SET recovery_state='recovering' WHERE soul_id=?1",
             [soul.as_str()],
@@ -5193,14 +5415,14 @@ pub(crate) mod tests {
         .unwrap();
         let context = registry.recovery_context(soul.clone()).await.unwrap();
         let lifecycle = supervisor.lifecycle_lock(&soul).await;
-        let _lifecycle_guard = lifecycle.lock().await;
+        let lifecycle_guard = lifecycle.lock().await;
         let reattached = supervisor
             .preserve_nonloss_probe(
-                soul,
+                soul.clone(),
                 RecoveryTrigger::StartupReconcile,
                 RecoveryProbe::ReattachReady {
                     handle: ReattachHandle {
-                        incarnation_id: prepared.incarnation_id,
+                        incarnation_id: prepared.incarnation_id.clone(),
                         host_boot_id: HostBootId::new(),
                         container_id: context.prior_handle.container_id().into(),
                     },
@@ -5209,7 +5431,26 @@ pub(crate) mod tests {
                 context.write_fence(),
             )
             .await;
-        responder.abort();
+        drop(lifecycle_guard);
+        drop(supervisor);
+        drop(registry);
+        let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+        let restarted =
+            supervisor_with_runtime_state(&dir, registry.clone(), BackendRuntimeState::Running);
+        let startup = restarted.reconcile_startup().await.unwrap();
+        let readiness = registry.inventory_snapshot().await.unwrap().readiness;
+        let current_context = registry.recovery_context(soul.clone()).await.unwrap();
+        close_host.send(()).unwrap();
+        responder.await.unwrap();
+        assert_eq!(
+            actor.observed_native_session_id().await.as_deref(),
+            Some(native)
+        );
+        assert_eq!(
+            actor.observed_native_identity_evidence().await,
+            Some(current.evidence.clone())
+        );
+        actor.stop().await.unwrap();
         assert!(
             before.is_err(),
             "pending release must refuse before durable LIVE"
@@ -5226,18 +5467,35 @@ pub(crate) mod tests {
             after.is_ok(),
             "current LIVE release must reach the authenticated owned host: {after:?}"
         );
-        assert!(matches!(
-            reattached,
-            Ok(RecoveryResult {
-                outcome: RecoveryOutcome::Reattached,
-                ..
-            })
-        ));
+        let reattached_ok = |result: &Result<RecoveryResult, RuntimeError>| {
+            matches!(
+                result,
+                Ok(RecoveryResult {
+                    outcome: RecoveryOutcome::Reattached,
+                    ..
+                })
+            )
+        };
+        assert!(reattached_ok(&pending) && reattached_ok(&resolved) && reattached_ok(&reattached)
+            && startup.results.iter().all(|result| result.outcome == Some(RecoveryOutcome::Reattached) && result.error.is_none()),
+            "settled release must preserve pending/resolved Recover and retained-host startup: pending={pending:?}, resolved={resolved:?}, preserved={reattached:?}, startup={startup:?}");
+        assert_eq!(startup.scanned, 1);
+        assert_eq!(readiness.initial_scan_state, InitialScanState::Complete);
+        assert!(readiness.blocked_subsystems.is_empty());
+        assert_eq!(current_context.recovery_state, RecoveryState::Live);
+        assert_eq!(current_context.native_session_id.as_deref(), Some(native));
         assert_eq!(
-            releases.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "production reattach admission must dispatch after committing durable LIVE"
+            current_context.prior_handle.incarnation_id(),
+            &prepared.incarnation_id
         );
+        assert_eq!(
+            current
+                .continuations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "successful reattach must not repeat the accepted native continuation"
+        );
+        assert_eq!(current.effects.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
