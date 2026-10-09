@@ -46,8 +46,11 @@ const handle = {
 }
 
 describe('Task7 standalone owner cancellation', () => {
-  it.each((['SIGINT', 'SIGTERM'] as const).flatMap(signal =>
-    (['wait', 'create', 'export'] as const).map(stage => ({ signal, stage }))))(
+  it.each([
+    ...(['SIGINT', 'SIGTERM'] as const).flatMap(signal =>
+      (['wait', 'create', 'export', 'export-never', 'export-abort'] as const).map(stage => ({ signal, stage }))),
+    { signal: 'SIGTERM' as const, stage: 'ordinary-wait' as const },
+  ])(
     'settles exact children and resources on $signal during $stage', async ({ signal, stage }) => {
       const directory = path.join(fixtureRepoRoot, `cancel-${signal}-${stage}`)
       await fsp.mkdir(directory, { mode: 0o700 })
@@ -55,9 +58,11 @@ describe('Task7 standalone owner cancellation', () => {
       const eventsFile = path.join(directory, 'events.jsonl')
       const readyFile = path.join(directory, 'ready.json')
       const resultFile = path.join(directory, 'owner.json')
-      const id = 'a'.repeat(64), foreignId = 'f'.repeat(64)
+      const id = 'a'.repeat(64), foreignId = 'f'.repeat(64), knownId = 'd'.repeat(64), helperId = 'e'.repeat(64)
+      const uncertain = stage === 'export-never' || stage === 'export-abort'
       const volume = `freshell-provider-${'c'.repeat(24)}`
-      const state = { containers: { [foreignId]: { Id: foreignId, Name: 'unrelated-sentinel' } }, volumes: ['unrelated-volume', volume] }
+      const allocatedVolume = uncertain ? `freshell-provider-${'e'.repeat(24)}` : volume
+      const state = { containers: { [foreignId]: { Id: foreignId, Name: 'unrelated-sentinel' }, ...(uncertain ? { [knownId]: { Id: knownId, Name: 'known-owned' } } : {}) }, volumes: ['unrelated-volume', volume] }
       await fsp.writeFile(stateFile, JSON.stringify(state))
       const docker = path.join(directory, 'docker')
       const common = `const fs=require('node:fs'),http=require('node:http');const stateFile=${JSON.stringify(stateFile)},eventsFile=${JSON.stringify(eventsFile)},readyFile=${JSON.stringify(readyFile)};const event=(kind,data={})=>fs.appendFileSync(eventsFile,JSON.stringify({kind,...data})+'\\n');`
@@ -73,7 +78,7 @@ if(args[0]==='create'){
  process.on('SIGTERM',()=>{const socket=JSON.parse(fs.readFileSync(${JSON.stringify(resultFile)})).socket;const request=http.get({socketPath:socket,path:'/_ping'},response=>{response.resume();response.on('end',()=>setTimeout(()=>{event('wait.settled');process.stderr.write('cancelled wait');process.exit(9)},75))});request.on('error',()=>process.exit(8))});
 }else if(args[0]==='logs')process.stdout.write('partial owned parent output');
 else if(args[0]==='inspect'){const item=Object.values(state.containers).find(item=>item.Id===args[1]||item.Name===args[1]);if(!item)process.exit(1);process.stdout.write(JSON.stringify([item]))}
-else if(args[0]==='rm'){if(args.at(-1)==='${foreignId}')process.exit(7);delete state.containers[args.at(-1)];fs.writeFileSync(stateFile,JSON.stringify(state));event('container.removed',{id:args.at(-1)})}
+else if(args[0]==='rm'){if(args.at(-1)==='${foreignId}')process.exit(7);const item=Object.values(state.containers).find(item=>item.Id===args.at(-1)||item.Name===args.at(-1));if(item)delete state.containers[item.Id];fs.writeFileSync(stateFile,JSON.stringify(state));event('container.removed',{id:args.at(-1)})}
 else if(args[0]==='ps')process.stdout.write(Object.values(state.containers).map(item=>args.includes('--format')?item.Name:item.Id).join('\\n'));
 else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')process.exit(7);state.volumes=state.volumes.filter(name=>name!==args[2]);fs.writeFileSync(stateFile,JSON.stringify(state));event('volume.removed')}else process.stdout.write(state.volumes.join('\\n'))}
 else if(args[0]!=='start')process.exit(4);
@@ -81,7 +86,8 @@ else if(args[0]!=='start')process.exit(4);
       const exporter = path.join(directory, 'exporter.cjs')
       await fsp.writeFile(exporter, `${common}
 const control=JSON.parse(fs.readFileSync(${JSON.stringify(resultFile)}));event('export.started',{pid:process.pid});
-const request=http.request({socketPath:control.socket,path:'/v1.47/containers/create?name=controlled-provider',method:'POST'},response=>{let body='';response.on('data',chunk=>body+=chunk);response.on('end',()=>event('export.response',{status:response.statusCode,body}))});request.on('error',error=>event('export.request_error',{message:error.message}));request.end(JSON.stringify(control.create));setInterval(()=>{},1000);
+const send=(url,body,done)=>{const request=http.request({socketPath:control.socket,path:url,method:'POST'},response=>{let text='';response.on('data',chunk=>text+=chunk);response.on('end',()=>{event('export.response',{status:response.statusCode});if(done)done()})});request.on('error',error=>event('export.request_error',{message:error.message}));request.end(body?JSON.stringify(body):undefined)};
+send('/v1.47/containers/create?name=controlled-provider',control.create,()=>{if(${JSON.stringify(stage)}==='ordinary-wait')send('/v1.47/containers/create?name='+control.helperName,control.helper,()=>{send('/v1.47/containers/${helperId}/wait?condition=not-running');setTimeout(()=>process.exit(9),200)})});setInterval(()=>{},1000);
 process.on('SIGTERM',()=>{event('export.settled');process.stderr.write('partial owned export');process.exit(9)});
 `)
       const launcher = path.join(directory, 'owner.mjs')
@@ -94,13 +100,24 @@ RuntimeHarness.prototype.prepareTask007StoppedFixture=async function(){
  if(!this.broker){
   fs.mkdirSync(this.testRoot,{recursive:true,mode:0o700});fs.mkdirSync(this.evidenceDir,{recursive:true,mode:0o700});fs.mkdirSync(this.buildDir,{recursive:true,mode:0o700});this.imageRef='sha256:${'b'.repeat(64)}';
   const realSocket=path.join(this.testRoot,'upstream.sock'),socket=path.join(this.testRoot,'proxy.sock'),host=path.join(this.testRoot,'host'),runtimeDir=path.join(this.testRoot,'r/scenario/x/incarnation');
-  upstream=http.createServer((request,response)=>{request.resume();request.on('end',()=>{if(request.method==='POST'){event('upstream.create.started');fs.writeFileSync(${JSON.stringify(readyFile)},JSON.stringify({pid:process.pid}));setTimeout(()=>{const state=JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)}));state.containers['${id}']={Id:'${id}',Name:'late-provider'};fs.writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(state));event('upstream.create.settled');response.writeHead(201);response.end(JSON.stringify({Id:'${id}'}))},250)}else response.end('OK')})});await new Promise(resolve=>upstream.listen(realSocket,resolve));
-  this.broker=new RestrictedDockerBroker({realSocketPath:realSocket,proxySocketPath:socket,runtimeRootPrefix:path.join(this.testRoot,'r'),allowedHostBinaryPaths:new Set([host]),allowedImageRefs:new Set([this.imageRef]),testRunId:this.runId,logPath:path.join(this.evidenceDir,'broker.jsonl')});await this.broker.start();this.brokerStarted=true;this.trackedVolumes.add('${volume}');this.task007Artifact=Promise.resolve({path:'/controlled-lib-test'});
+  upstream=http.createServer((request,response)=>{request.resume();request.on('end',()=>{
+   if(request.url.includes('/wait?')){event('helper.wait.started');fs.writeFileSync(${JSON.stringify(readyFile)},JSON.stringify({pid:process.pid}));const poll=setInterval(()=>{if(!JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)})).containers['${helperId}']){clearInterval(poll);event('helper.wait.settled');response.end(JSON.stringify({StatusCode:137}))}},10);response.on('close',()=>clearInterval(poll));return}
+   if(request.method!=='POST'){response.end('OK');return}
+   const helper=request.url.includes('name=freshell-history-');
+   if(!helper){event('upstream.create.started');if(${JSON.stringify(stage)}!=='ordinary-wait')fs.writeFileSync(${JSON.stringify(readyFile)},JSON.stringify({pid:process.pid}))}
+   if(${uncertain}){const state=JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)}));state.containers['${id}']={Id:'${id}',Name:'unacknowledged-provider'};state.volumes.push('${allocatedVolume}');fs.writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(state));response.once('close',()=>event('upstream.transport.closed'))}
+   if(${JSON.stringify(stage)}==='export-never')return;
+   if(${JSON.stringify(stage)}==='export-abort'){response.writeHead(201,{'content-type':'application/json'});response.write('{"Id":"');setTimeout(()=>{event('upstream.response.aborted');response.destroy()},250);return}
+   setTimeout(()=>{const state=JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)})),id=helper?'${helperId}':'${id}';state.containers[id]={Id:id,Name:helper?new URL(request.url,'http://docker').searchParams.get('name'):'late-provider'};fs.writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(state));event('upstream.create.settled');response.writeHead(201);response.end(JSON.stringify({Id:id}))},250)
+  })});await new Promise(resolve=>upstream.listen(realSocket,resolve));
+  this.broker=new RestrictedDockerBroker({realSocketPath:realSocket,proxySocketPath:socket,runtimeRootPrefix:path.join(this.testRoot,'r'),allowedHostBinaryPaths:new Set([host]),allowedImageRefs:new Set([this.imageRef]),testRunId:this.runId,logPath:path.join(this.evidenceDir,'broker.jsonl')});await this.broker.start();this.brokerStarted=true;this.trackedVolumes.add('${volume}');if(${uncertain})this.trackedContainers.add('${knownId}');this.task007Artifact=Promise.resolve({path:'/controlled-lib-test'});
   const close=this.broker.close.bind(this.broker);this.broker.close=async()=>{await close();event('broker.closed')};
-  const create={Image:this.imageRef,Labels:{project:'freshell','com.freshell.managed':'true','com.freshell.installation-id':'installation-unit','com.freshell.incarnation-id':'incarnation-unit','com.freshell.soul-id':'soul-unit','com.freshell.runtime-test-run-id':this.runId},HostConfig:{NetworkMode:'none',ReadonlyRootfs:true,Privileged:false,CapDrop:['ALL'],CapAdd:[],SecurityOpt:['no-new-privileges:true'],RestartPolicy:{Name:'no'},NanoCpus:500000000,Memory:134217728,PidsLimit:64,Tmpfs:{'/tmp':'rw,noexec,nosuid,nodev,size=128m'},Binds:[host+':/runtime/freshell-session-host:ro',runtimeDir+':/run/freshell:rw','${volume}:/home/freshell/provider:rw']}};
-  fs.writeFileSync(${JSON.stringify(resultFile)},JSON.stringify({testRoot:this.testRoot,evidenceDir:this.evidenceDir,buildDir:this.buildDir,socket,create}));
+  const create={Image:this.imageRef,Labels:{project:'freshell','com.freshell.managed':'true','com.freshell.installation-id':'installation-unit','com.freshell.incarnation-id':'incarnation-unit','com.freshell.soul-id':'soul-unit','com.freshell.runtime-test-run-id':this.runId},HostConfig:{NetworkMode:'none',ReadonlyRootfs:true,Privileged:false,CapDrop:['ALL'],CapAdd:[],SecurityOpt:['no-new-privileges:true'],RestartPolicy:{Name:'no'},NanoCpus:500000000,Memory:134217728,PidsLimit:64,Tmpfs:{'/tmp':'rw,noexec,nosuid,nodev,size=128m'},Binds:[host+':/runtime/freshell-session-host:ro',runtimeDir+':/run/freshell:rw','${allocatedVolume}:/home/freshell/provider:rw']}};
+  const helperName='freshell-history-11111111-1111-4111-8111-111111111111';
+  const helper={Image:this.imageRef,User:'65534:0',Tty:true,Entrypoint:['/runtime/freshell-session-host'],Cmd:['native-history-only','--provider','codex','--session-id','controlled-native','--provider-home','/home/freshell/provider'],Env:['HOME=/home/freshell/provider'],HostConfig:{NetworkMode:'none',ReadonlyRootfs:true,CapDrop:['ALL'],CapAdd:[],SecurityOpt:['no-new-privileges'],Memory:268435456,MemorySwap:268435456,NanoCpus:500000000,PidsLimit:32,Tmpfs:{'/tmp':'rw,noexec,nosuid,nodev,size=16m'},Mounts:[{Type:'bind',Source:host,Target:'/runtime/freshell-session-host',ReadOnly:true},{Type:'volume',Source:'${volume}',Target:'/home/freshell/provider',ReadOnly:true}]}};
+  fs.writeFileSync(${JSON.stringify(resultFile)},JSON.stringify({testRoot:this.testRoot,evidenceDir:this.evidenceDir,buildDir:this.buildDir,socket,create,helper,helperName}));
  }
- if(${JSON.stringify(stage)}==='export')await this.executeTask007Child(process.execPath,[${JSON.stringify(exporter)}],{cwd:this.repoRoot,env:{},timeout:15000,maxBuffer:1048576,encoding:'utf8'});
+ if(${JSON.stringify(stage)}.startsWith('export')||${JSON.stringify(stage)}==='ordinary-wait')await this.executeTask007Child(process.execPath,[${JSON.stringify(exporter)}],{cwd:this.repoRoot,env:{},timeout:15000,maxBuffer:1048576,encoding:'utf8'});
  return {inputFile:'/controlled-input',registryRoot:'/controlled-registry',sourceDatabaseFile:'/controlled-source',metadataFile:'/controlled-metadata'};
 };
 try{await runTask007DestructiveSandbox(${JSON.stringify(fixtureRepoRoot)})}catch(error){event('owner.failed',{message:error.message});process.exitCode=1}finally{if(upstream)await new Promise(resolve=>upstream.close(resolve))}
@@ -117,26 +134,38 @@ try{await runTask007DestructiveSandbox(${JSON.stringify(fixtureRepoRoot)})}catch
           activePid = JSON.parse(await fsp.readFile(readyFile, 'utf8')).pid
         }, { timeout: 10_000 })
         control = JSON.parse(await fsp.readFile(resultFile, 'utf8'))
-        expect(child.kill(signal)).toBe(true)
-        const completed = await completion
+        if (stage !== 'ordinary-wait') expect(child.kill(signal)).toBe(true)
+        const deadline = setTimeout(() => child.kill('SIGKILL'), 12_000)
+        const completed = await completion.finally(() => clearTimeout(deadline))
         expect(completed.signal).toBeNull()
         expect(completed.code).not.toBe(0)
         const closure = JSON.parse(await fsp.readFile(path.join(control!.evidenceDir, 'cleanup.json'), 'utf8'))
-        expect(closure, `${stage}: ${JSON.stringify(closure)}`).toMatchObject({ ok: true, verifiedResourcesAbsent: true })
+        expect(closure, `${stage}: ${JSON.stringify(closure)}`).toMatchObject({ ok: !uncertain, verifiedResourcesAbsent: !uncertain })
+        if (uncertain) {
+          expect(closure.verifiedKnownResourcesAbsent).toBe(true)
+          expect(closure.brokerSettlementFailures).toEqual(expect.arrayContaining([expect.objectContaining({ allocationUnknown: true,
+            reason: stage === 'export-never' ? 'cleanup_deadline' : 'upstream_response_incomplete' })]))
+        }
         expect(JSON.parse(await fsp.readFile(path.join(control!.evidenceDir, 'task007-destructive-owner-result.json'), 'utf8')))
-          .toMatchObject({ status: 'cancelled', signal, cleanup: { ok: true } })
+          .toMatchObject({ status: stage === 'ordinary-wait' ? 'failed' : 'cancelled', ...(stage === 'ordinary-wait' ? {} : { signal }), cleanup: { ok: !uncertain } })
         const daemon = JSON.parse(await fsp.readFile(stateFile, 'utf8'))
-        expect(daemon).toEqual({ containers: { [foreignId]: { Id: foreignId, Name: 'unrelated-sentinel' } }, volumes: ['unrelated-volume'] })
+        expect(daemon).toEqual({ containers: { [foreignId]: { Id: foreignId, Name: 'unrelated-sentinel' },
+          ...(uncertain ? { [id]: { Id: id, Name: 'unacknowledged-provider' } } : {}) }, volumes: ['unrelated-volume', ...(uncertain ? [allocatedVolume] : [])] })
         const events = (await fsp.readFile(eventsFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { kind: string; args?: string[] })
-        const settled = events.findIndex(row => row.kind === `${stage === 'export' ? 'upstream.create' : stage}.settled`)
-        expect(settled).toBeGreaterThan(-1)
-        expect(events.findIndex(row => row.kind === 'volume.removed')).toBeGreaterThan(settled)
+        if (!uncertain) {
+          const settled = events.findIndex(row => row.kind === `${stage === 'export' ? 'upstream.create' : stage === 'ordinary-wait' ? 'helper.wait' : stage}.settled`)
+          expect(settled).toBeGreaterThan(-1)
+          expect(events.findIndex(row => row.kind === 'volume.removed')).toBeGreaterThan(settled)
+          if (stage === 'ordinary-wait') expect(events.findIndex(row => row.kind === 'container.removed')).toBeLessThan(settled)
+        }
+        if (uncertain) expect(events.some(row => row.kind === 'upstream.transport.closed')).toBe(true)
+        if (stage === 'export-abort') expect(events.some(row => row.kind === 'upstream.response.aborted')).toBe(true)
         expect(events.findIndex(row => row.kind === 'broker.closed')).toBeGreaterThan(events.findIndex(row => row.kind === 'volume.removed'))
         if (stage === 'create') expect(events.some(row => row.args?.[0] === 'start')).toBe(false)
         if (stage === 'wait') expect(await fsp.readFile(path.join(control!.evidenceDir, 'task007-destructive-parents.stdout'), 'utf8')).toBe('partial owned parent output')
         if (stage === 'export') expect(events.some(row => row.kind === 'export.settled')).toBe(true)
       } finally {
-        if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
         await completion
         if (!control && fs.existsSync(resultFile)) control = JSON.parse(await fsp.readFile(resultFile, 'utf8'))
         if (!activePid && fs.existsSync(eventsFile)) {

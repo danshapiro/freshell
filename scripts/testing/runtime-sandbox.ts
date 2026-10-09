@@ -18,7 +18,7 @@ import { buildFreshAgentQualificationReceipt, type FreshAgentQualificationReceip
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
 
 import { configuredProviderOnecliGrantFiles } from './runtime-amplifier-onecli.js'
-import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
+import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt, type BrokerSettlementFailure } from './runtime-test-broker.js'
 
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
@@ -2749,28 +2749,33 @@ export class RuntimeHarness {
     const errors: string[] = []
     await Promise.allSettled([...this.task007Children])
     const brokers = [this.broker, ...this.task007Brokers].filter((broker): broker is RestrictedDockerBroker => !!broker)
-    if (this.task007Cancellation.signal.aborted) {
-      // A detached parent/helper can hold a broker wait open. Settle those exact
-      // enclosures before joining the already-forwarded broker operations.
-      const names = new Set([...this.task007HelperNames, ...brokers.flatMap(broker => broker.historyHelperNames())])
-      for (const name of names) {
-        try { await this.removeTask007Helper(name) } catch (error) { errors.push(`cancelled helper ${name}: ${String(error)}`) }
-      }
+    const supervisorIds = [...this.trackedSupervisorContainers]
+    for (const id of supervisorIds) {
+      try { this.removeContainerExact(id) } catch (error) { errors.push(`supervisor ${id}: ${String(error)}`) }
     }
+    // Stop producers before draining on ordinary errors as well as signals.
+    // Helpers may hold independent broker waits after their caller has exited.
+    const names = new Set([...this.task007HelperNames, ...brokers.flatMap(broker => broker.historyHelperNames())])
+    for (const name of names) {
+      try { await this.removeTask007Helper(name) } catch (error) { errors.push(`settling helper ${name}: ${String(error)}`) }
+    }
+    const brokerSettlementFailures: BrokerSettlementFailure[] = []
+    let brokerSettlementComplete = true
     for (const broker of brokers) {
-      try { await broker.awaitPendingRequests() } catch (error) { errors.push(`broker settlement: ${String(error)}`) }
+      try {
+        const failures = await broker.awaitPendingRequests()
+        brokerSettlementFailures.push(...failures)
+        for (const failure of failures) errors.push(`broker settlement: ${failure.reason} (${failure.method} ${failure.url})`)
+      } catch (error) { brokerSettlementComplete = false; errors.push(`broker settlement: ${String(error)}`) }
     }
     const receipts = brokers.flatMap(broker => broker.receipts())
     const exactContainerIds = [...new Set([
-      ...this.trackedSupervisorContainers, ...this.trackedForeignContainers,
+      ...supervisorIds, ...this.trackedForeignContainers,
       ...this.trackedContainers, ...receipts.map(receipt => receipt.containerId),
     ])]
     const providerVolumes = new Set(receipts.map(receipt => receipt.providerVolumeName).filter((value): value is string => !!value))
     const exactVolumes = [...new Set([...this.trackedVolumes, ...providerVolumes])]
     const historyHelperNames = [...new Set([...brokers.flatMap(broker => broker.historyHelperNames()), ...this.task007HelperNames])]
-    for (const id of [...this.trackedSupervisorContainers]) {
-      try { this.removeContainerExact(id) } catch (error) { errors.push(`supervisor ${id}: ${String(error)}`) }
-    }
     for (const id of receipts.map(receipt => receipt.containerId)) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`managed runtime ${id}: ${String(error)}`) }
     }
@@ -2795,7 +2800,7 @@ export class RuntimeHarness {
     for (const broker of this.task007Brokers) {
       try { await broker.close() } catch (error) { errors.push(`Task7 broker close: ${String(error)}`) }
     }
-    let resourcesAbsent = false
+    let knownResourcesAbsent = false
     try {
       const lines = (text: string) => text.trim() ? text.trim().split('\n').map(value => value.trim()) : []
       verifyRuntimeCleanupAbsence({ containerIds: exactContainerIds, volumes: exactVolumes, helperNames: historyHelperNames }, {
@@ -2803,8 +2808,10 @@ export class RuntimeHarness {
         volumes: lines(docker(['volume', 'ls', '--format', '{{.Name}}'])),
         containerNames: lines(docker(['ps', '-a', '--format', '{{.Names}}'])),
       })
-      resourcesAbsent = true
+      knownResourcesAbsent = true
     } catch (error) { errors.push(`runtime absence: ${error instanceof Error ? error.message : String(error)}`) }
+    const resourcesAbsent = knownResourcesAbsent && brokerSettlementComplete
+      && !brokerSettlementFailures.some(failure => failure.allocationUnknown)
     if (resourcesAbsent && this.ownedImage) {
       try { removeRunOwnedRuntimeImage(this.ownedImage) }
       catch (error) { errors.push(`runtime image cleanup: ${error instanceof Error ? error.message : String(error)}`) }
@@ -2821,6 +2828,9 @@ export class RuntimeHarness {
       exactContainerIds,
       volumes: exactVolumes,
       historyHelperNames,
+      brokerSettlementFailures,
+      brokerSettlementComplete,
+      verifiedKnownResourcesAbsent: knownResourcesAbsent,
       verifiedResourcesAbsent: resourcesAbsent,
       ownedImage: this.ownedImage,
       unsafeBrokerAttempts: this.broker?.unsafeAttempts?.() ?? [],
