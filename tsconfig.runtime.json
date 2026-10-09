@@ -19,6 +19,7 @@
     "scripts/testing/runtime-gate.ts",
     "scripts/testing/runtime-gate-args.ts",
     "scripts/testing/runtime-sandbox.ts",
+    "scripts/testing/task007-destructive-sandbox.ts",
     "scripts/testing/opencode-native-transfer-check.ts",
     "scripts/testing/opencode-restoration-rehearsal.ts",
     "scripts/testing/runtime-test-broker.ts",

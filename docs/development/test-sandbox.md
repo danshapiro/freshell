@@ -42,6 +42,26 @@ to the unprivileged `sandbox` UID before test code and the self-test verifies th
 effective capabilities. The mode never mounts Docker/admin sockets or real provider homes. The runtime gate's separate trusted broker is the only component allowed to hold the real
 Docker socket; this wrapper never grants it to tests.
 
+The exact stopped-repair selector has a finite managed-runtime route:
+
+```bash
+scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor stopped_repair_crash_ -- --ignored"
+```
+
+For this literal command only, the owner compiles the current supervisor library test
+harness with pinned Cargo, selects and copies that executable, and prepares three fresh
+historical fixtures through a restricted run-owned broker. The selected harness and its
+aborting children execute inside a disposable rootless container with UID0 mapped to
+the unprivileged host owner, zero capabilities, no network, a read-only root and only
+the private run directory writable. Private build artifacts mount read-only at their
+canonical host paths. The actual importer/read helpers still use UID65534:GID0 and
+their production permissions. No administrative socket, operator home or provider
+grant is mounted. The three parents must reach their named abort boundary, reopen the
+same surviving Registry files, and pass all original import/retraction assertions;
+compilation or listing alone is insufficient. The owner preserves logs and verifies
+exact container/helper/provider-volume cleanup. Every other selector retains the
+ordinary sandbox route, and combining this command with `--corpus` remains refused.
+
 ## Safety guarantees
 
 | What | Guarantee |

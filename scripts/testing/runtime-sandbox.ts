@@ -1274,6 +1274,10 @@ stops=[dict(r) for r in c.execute('SELECT intent_revision,outcome,revoke_pending
 print(json.dumps(dict(soul=soul,incarnations=incarnations,stops=stops,writers=c.execute('SELECT count(*) FROM writer_claims WHERE soul_id=?',(sys.argv[1],)).fetchone()[0],effects=[r[0] for r in c.execute('SELECT kind FROM stop_browser_effects')],tombstones=c.execute('SELECT count(*) FROM stop_tombstones WHERE soul_id=?',(sys.argv[1],)).fetchone()[0])))
 `
 
+export const SyntheticStoppedRepairFaultSchema = z.enum(['none', 'after_import_publication',
+  'after_repair_cas_before_withdrawal', 'during_withdrawal_before_ack', 'first_resume_observation'])
+export type SyntheticStoppedRepairFault = z.infer<typeof SyntheticStoppedRepairFaultSchema>
+
 const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
@@ -1306,6 +1310,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'synthetic-source-history', 'synthetic-source-exclusions',
     'synthetic-source-adoption',
     'synthetic-source-follow-up',
+    'synthetic-stopped-repair-facts', 'synthetic-stopped-repair-observation', 'synthetic-stopped-repair-fault',
     'phase3-browser-receipt', 'phase4-browser-receipt',
     'retained-start', 'retained-status', 'retained-observed', 'retained-finish',
   ]),
@@ -1344,6 +1349,9 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   otherChallengeId: z.string().min(1).optional(),
   qualificationReadiness: OpencodeReadinessConfirmationSchema.optional(),
   qualificationDiagnostic: OpencodeReadinessDiagnosticSchema.optional(),
+  fixtureId: z.string().min(1).max(160).optional(),
+  repairOperationId: z.string().min(1).max(160).optional(),
+  stoppedRepairFault: SyntheticStoppedRepairFaultSchema.optional(),
 }).strict()
 
 export type RuntimeOwnerOperationRequest = z.infer<typeof RuntimeOwnerOperationRequestSchema>
@@ -1612,6 +1620,468 @@ type Task2FixtureArtifacts = {
 }
 
 
+export type Task007RunChild = (file: string, args: string[], options: {
+  cwd: string; env: NodeJS.ProcessEnv; timeout: number; maxBuffer: number; encoding: 'utf8'
+}) => Promise<{ stdout: string; stderr: string }>
+
+const runTask007Child: Task007RunChild = (file, args, options) => new Promise((resolve, reject) => {
+  execFile(file, args, options, (error, stdout, stderr) => {
+    if (error) reject(new Task007ChildFailure(error.code ?? undefined, stdout, stderr))
+    else resolve({ stdout, stderr })
+  })
+})
+
+class Task007ChildFailure extends Error {
+  constructor(readonly code: string | number | undefined, readonly stdout: string, readonly stderr: string) {
+    super(`Task7 owned child failed (${code ?? 'unknown'})`)
+  }
+}
+
+export type Task007LibTestArtifact = {
+  path: string; sha256: string; candidateSha: string; packageId: string; features: string[]; sourcePath: string
+}
+
+export const TASK007_EXPORT_TEST = 'loss_report::tests::task007_export_stopped_repair_fixture'
+
+const Task007Id = z.string().min(1).max(160).regex(/^[^\x00-\x1f\x7f]+$/)
+const Task007Hex = z.string().regex(/^[a-f0-9]{64}$/)
+const Task007TargetInputSchema = z.object({ soulId: Task007Id, providerStoreId: Task007Id,
+  terminalId: Task007Id, streamId: Task007Id }).strict()
+const Task007ViewLocationSchema = z.object({ viewId: Task007Id, ownerId: Task007Id,
+  workspaceId: Task007Id, tabId: Task007Id, paneId: Task007Id }).strict()
+export const Task007FixtureInputSchema = z.object({
+  schemaVersion: z.literal(1), fixtureId: Task007Id, runId: Task007Id, candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
+  installationId: Task007Id, ownerRoot: z.string(), runtimeRoot: z.string(), workspacePath: z.string(), cwd: z.string(),
+  gitCommonDir: z.string().nullable().optional(), imageRef: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  hostBinaryPath: z.string(), hostBinarySha256: Task007Hex, dockerDaemonId: Task007Id, brokerSocketPath: z.string(),
+  source: z.object({ rootSessionIds: z.array(z.string().regex(/^ses_.+/)).length(7), unrelatedSessionId: z.string().regex(/^ses_.+/) }).strict(),
+  targets: z.array(Task007TargetInputSchema).length(9),
+  canonicalChoices: z.array(z.object({ rootOrdinal: z.number().int().min(0).max(1), targetOrdinal: z.number().int().min(0).max(8) }).strict()).length(2),
+  explicitViews: z.array(Task007ViewLocationSchema.extend({ targetOrdinal: z.number().int().min(0).max(8) }).strict()).length(4),
+  unrelated: Task007ViewLocationSchema.extend({ target: Task007TargetInputSchema }).strict(),
+}).strict()
+export type Task007FixtureInput = z.infer<typeof Task007FixtureInputSchema>
+export const Task007FixtureOutputSchema = z.object({
+  schemaVersion: z.literal(1), evidenceKind: z.literal('historical-fixture-setup'), fixtureId: Task007Id, runId: Task007Id,
+  candidateSha: z.string().regex(/^[a-f0-9]{40}$/), installationId: Task007Id, dockerDaemonId: Task007Id,
+  imageRef: z.string().regex(/^sha256:[a-f0-9]{64}$/), hostBinarySha256: Task007Hex, workspacePath: z.string(), runtimeRoot: z.string(),
+  registry: z.object({ file: z.literal('runtime.sqlite3'), schemaVersion: z.literal(7), sha256: Task007Hex }).strict(),
+  targets: z.array(z.object({ rootSessionId: z.string(), soulId: Task007Id, providerStoreId: Task007Id, incarnationId: Task007Id,
+    launchNonce: Task007Id, containerId: Task007Hex, providerVolumeName: z.string().regex(/^freshell-provider-[a-f0-9]{24}$/),
+    runtimeDir: z.string(), hostBinaryPath: z.string(), immutableConfigDigest: z.string().min(1), incidentId: Task007Id,
+    expectedIntentRevision: z.number().int().nonnegative(), viewIds: z.array(Task007Id) }).strict()).length(9),
+  canonicalChoices: z.array(z.object({ rootSessionId: z.string(), soulId: Task007Id, expectedIntentRevision: z.number().int().nonnegative() }).strict()).length(2),
+  unrelated: z.object({ soulId: Task007Id, incidentId: Task007Id, viewId: Task007Id,
+    expectedIntentRevision: z.number().int().nonnegative(), noticeIds: z.array(Task007Id), outboxEventIds: z.array(Task007Id),
+    exports: z.array(z.object({ file: z.string(), sha256: Task007Hex }).strict()) }).strict(),
+  historicalControlEpoch: z.number().int().nonnegative(),
+}).strict()
+export type Task007FixtureOutput = z.infer<typeof Task007FixtureOutputSchema>
+export type Task007StoppedFixtureKind = 'browser' | 'after_import_publication' | 'after_repair_cas_before_withdrawal' | 'during_withdrawal_before_ack'
+export type Task007PreparedStoppedFixture = {
+  input: Task007FixtureInput; output: Task007FixtureOutput; source: SyntheticSevenRootSource;
+  inputFile: string; outputDir: string; metadataFile: string; sourceDatabaseFile: string; registryRoot: string;
+  scenarioId: string; volumeName?: string
+}
+
+const Task007FamilyFactsSchema = z.object({ rootId: Task007Id, childId: Task007Id, grandchildId: Task007Id,
+  baselineMessages: z.record(z.string(), Task007Hex), baselineParts: z.record(z.string(), Task007Hex) }).strict()
+export const SyntheticStoppedRepairBatchFactsSchema = z.object({ fixtureId: Task007Id,
+  families: z.array(Task007FamilyFactsSchema).length(7),
+  targets: z.array(z.object({ soulId: Task007Id, providerStoreId: Task007Id, rootSessionId: Task007Id,
+    terminalId: Task007Id, streamId: Task007Id, incidentId: Task007Id, viewIds: z.array(Task007Id) }).strict()).length(9),
+  canonicalChoices: z.array(z.object({ rootSessionId: Task007Id, soulId: Task007Id }).strict()).length(2),
+  unrelated: z.object({ soulId: Task007Id, incidentId: Task007Id, viewId: Task007Id,
+    noticeIds: z.array(Task007Id), outboxEventIds: z.array(Task007Id), exportSha256: z.array(Task007Hex) }).strict(),
+}).strict()
+export type SyntheticStoppedRepairBatchFacts = z.infer<typeof SyntheticStoppedRepairBatchFactsSchema>
+const Task007RepairSoulSchema = z.object({ soulId: Task007Id, providerStoreId: Task007Id,
+  nativeSessionId: Task007Id.nullable(), desiredState: z.string(), recoveryState: z.string(),
+  identityRevision: z.number().int().nonnegative(), intentRevision: z.number().int().nonnegative(),
+  nativeImportRevision: z.number().int().nonnegative(), activeWriters: z.number().int().nonnegative(),
+  incidentPresent: z.boolean(), exportPresent: z.array(z.boolean()).length(2) }).strict()
+export const SyntheticStoppedRepairBatchObservationSchema = z.object({ fixtureId: Task007Id, operationId: Task007Id,
+  status: z.enum(['importing', 'withdraw_pending', 'complete']), withdrawalStatus: z.enum(['files_pending', 'files_complete']).nullable(),
+  souls: z.array(Task007RepairSoulSchema).length(9),
+  roots: z.array(z.object({ rootSessionId: Task007Id, canonicalSoulId: Task007Id, destinationStoreId: Task007Id,
+    sourceGeneration: Task007Id, transferId: Task007Id, rowCount: z.number().int().nonnegative(),
+    assetCount: z.number().int().nonnegative(), structuralSha256: Task007Hex,
+    providerUid: z.number().int().nonnegative(), providerGid: z.number().int().nonnegative(),
+    readerEnvironmentSha256: Task007Hex, adoptionBaselineSha256: Task007Hex }).strict()).max(7),
+  unrelated: z.object({ incidentPresent: z.boolean(), viewPresent: z.boolean(), noticeIds: z.array(Task007Id),
+    outboxEventIds: z.array(Task007Id), exportSha256: z.array(Task007Hex.nullable()) }).strict(),
+  installedStores: z.array(z.object({ rootSessionId: Task007Id, providerStoreId: Task007Id,
+    providerUid: z.literal(65534), providerGid: z.literal(0), providerVersion: Task007Id,
+    generation: Task007Id, sourceSchemaFingerprint: Task007Id, migrationJournalFingerprint: Task007Id,
+    rowCount: z.number().int().nonnegative() }).strict()).max(7),
+}).strict()
+const Task007RepairRecordsSchema = SyntheticStoppedRepairBatchObservationSchema.omit({ installedStores: true })
+export type SyntheticStoppedRepairBatchObservation = z.infer<typeof SyntheticStoppedRepairBatchObservationSchema>
+
+// Fixed owner-only read of current production records; browser supplies IDs,
+// never a query, database path, command, or historical evidence object.
+export const TASK007_STOPPED_REPAIR_OBSERVATION = String.raw`
+import hashlib,json,os,sqlite3,sys
+database,metadata,operation,export_root=sys.argv[1:5]
+fixture=json.load(open(metadata))
+c=sqlite3.connect('file:'+database+'?mode=ro',uri=True)
+c.row_factory=sqlite3.Row
+c.execute('BEGIN')
+op=c.execute('SELECT status,targets_json FROM stopped_repair_operations WHERE operation_id=?',(operation,)).fetchone()
+if op is None: raise RuntimeError('registered repair operation is absent')
+expected={t['soulId'] for t in fixture['targets']}
+if {t['soulId'] for t in json.loads(op['targets_json'])}!=expected: raise RuntimeError('repair operation targets differ from registered fixture')
+def present(table,key,value): return c.execute('SELECT EXISTS(SELECT 1 FROM '+table+' WHERE '+key+'=?)',(value,)).fetchone()[0]==1
+def digest(value): return hashlib.sha256(value).hexdigest()
+def file_hash(relative):
+    file=os.path.realpath(os.path.join(export_root,relative))
+    if not file.startswith(os.path.realpath(export_root)+os.sep): raise RuntimeError('export is outside registered fixture')
+    return digest(open(file,'rb').read()) if os.path.isfile(file) else None
+souls=[]
+for target in fixture['targets']:
+    row=c.execute('SELECT soul_id,provider_store_id,native_session_id,desired_state,recovery_state,identity_revision,intent_revision,native_import_revision FROM souls WHERE soul_id=?',(target['soulId'],)).fetchone()
+    if row is None: raise RuntimeError('registered repair soul is absent')
+    writers=c.execute("SELECT count(*) FROM writer_claims WHERE soul_id=? OR (provider='opencode' AND provider_store_id=? AND native_session_id=?)",(target['soulId'],row['provider_store_id'],row['native_session_id'])).fetchone()[0]
+    souls.append(dict(soulId=row['soul_id'],providerStoreId=row['provider_store_id'],nativeSessionId=row['native_session_id'],desiredState=row['desired_state'],recoveryState=row['recovery_state'],identityRevision=row['identity_revision'],intentRevision=row['intent_revision'],nativeImportRevision=row['native_import_revision'],activeWriters=writers,incidentPresent=present('loss_incidents','incident_id',target['incidentId']),exportPresent=[os.path.isfile(os.path.join(export_root,'incidents',target['incidentId']+'.'+suffix+'.json')) for suffix in ['open','closed']]))
+roots=[]
+for row in c.execute('SELECT root_session_id,canonical_soul_id,source_generation,transfer_id,import_receipt_json,readable_receipt_json FROM stopped_repair_root_receipts WHERE operation_id=? ORDER BY root_session_id',(operation,)):
+    imported=json.loads(row['import_receipt_json']);readable=json.loads(row['readable_receipt_json'])
+    roots.append(dict(rootSessionId=row['root_session_id'],canonicalSoulId=row['canonical_soul_id'],destinationStoreId=readable['destinationStoreId'],sourceGeneration=row['source_generation'],transferId=row['transfer_id'],rowCount=readable['rowCount'],assetCount=readable['assetCount'],structuralSha256=readable['structuralSha256'],providerUid=readable['providerUid'],providerGid=readable['providerGid'],readerEnvironmentSha256=readable['readerEnvironmentSha256'],adoptionBaselineSha256=digest(json.dumps(imported['adoption_baseline'],sort_keys=True,separators=(',',':')).encode())))
+withdrawal=c.execute('SELECT status FROM stopped_repair_withdrawals WHERE operation_id=?',(operation,)).fetchone()
+unrelated=fixture['unrelated']
+result=dict(fixtureId=fixture['fixtureId'],operationId=operation,status=op['status'],withdrawalStatus=withdrawal['status'] if withdrawal else None,souls=souls,roots=roots,unrelated=dict(incidentPresent=present('loss_incidents','incident_id',unrelated['incidentId']),viewPresent=present('view_intents','view_id',unrelated['viewId']),noticeIds=[id for id in unrelated['noticeIds'] if present('runtime_notices','notice_id',id)],outboxEventIds=[id for id in unrelated['outboxEventIds'] if present('outbox','event_id',id)],exportSha256=[file_hash(artifact['file']) for artifact in unrelated['exports']]))
+c.close()
+print(json.dumps(result))
+`
+
+const TASK007_PROVIDER_HOME_INITIALIZER = `import json, os, stat
+fd = os.open("/home/freshell/provider", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    before = os.fstat(fd)
+    if not stat.S_ISDIR(before.st_mode) or (before.st_uid, before.st_gid) != (0, 0):
+        raise RuntimeError("fixture volume is not a new root-owned directory")
+    if os.listdir(fd):
+        raise RuntimeError("fixture volume is not empty")
+    os.fchmod(fd, 0o700)
+    os.fchown(fd, 65534, 0)
+    os.fsync(fd)
+    after = os.fstat(fd)
+    if (after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode)) != (65534, 0, 0o700):
+        raise RuntimeError("fixture HOME handoff did not complete")
+    print(json.dumps({"kind":"historical-fixture-home-setup","uid":65534,"gid":0,"mode":448,"priorEntries":0}))
+finally:
+    os.close(fd)
+`
+
+export async function initializeTask007ProviderHome(options: {
+  input: Pick<Task007FixtureInput, 'runId' | 'candidateSha' | 'imageRef' | 'installationId'>;
+  target: Task007FixtureOutput['targets'][number]; receipt: BrokerReceipt; name: string
+}, execute: Task007RunChild = runTask007Child): Promise<{ containerId: string; uid: 65534; gid: 0; mode: 448; priorEntries: 0 }> {
+  const { input, target, receipt, name } = options
+  if (!/^freshell-task007-setup-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(name)
+    || target.containerId !== receipt.containerId || target.soulId !== receipt.soulId
+    || target.incarnationId !== receipt.incarnationId || input.imageRef !== receipt.imageRef
+    || target.runtimeDir !== receipt.runtimeDir || target.hostBinaryPath !== receipt.hostBinaryPath
+    || target.providerVolumeName !== receipt.providerVolumeName) throw new Error('Task7 HOME setup receipt binding refused')
+  const command = (args: string[]) => execute('docker', args, {
+    cwd: process.cwd(), env: { PATH: process.env.PATH, HOME: os.homedir(),
+      ...(process.env.DOCKER_HOST ? { DOCKER_HOST: process.env.DOCKER_HOST } : {}) },
+    timeout: 60_000, maxBuffer: 4 * 1024 * 1024, encoding: 'utf8',
+  })
+  const inspected = z.array(z.object({ Id: z.string(), Image: z.string(),
+    State: z.object({ Status: z.string(), Running: z.boolean(), Pid: z.number() }),
+    Config: z.object({ Labels: z.record(z.string(), z.string()) }),
+    Mounts: z.array(z.object({ Type: z.string(), Name: z.string().optional(), Destination: z.string(), RW: z.boolean() })),
+  })).length(1).parse(JSON.parse((await command(['inspect', receipt.containerId])).stdout))[0]
+  const labels = inspected.Config.Labels
+  const homeMounts = inspected.Mounts.filter(mount => mount.Destination === '/home/freshell/provider')
+  if (inspected.Id !== receipt.containerId || inspected.Image !== input.imageRef
+    || inspected.State.Status !== 'created' || inspected.State.Running || inspected.State.Pid !== 0
+    || labels['com.freshell.runtime-test-run-id'] !== input.runId || labels['com.freshell.soul-id'] !== target.soulId
+    || labels['com.freshell.incarnation-id'] !== target.incarnationId
+    || labels['com.freshell.installation-id'] !== input.installationId
+    || homeMounts.length !== 1 || homeMounts[0].Type !== 'volume' || homeMounts[0].Name !== target.providerVolumeName
+    || !homeMounts[0].RW) throw new Error('Task7 HOME setup requires the exact never-started Created enclosure')
+  const names = (await command(['ps', '-a', '--format', '{{.Names}}'])).stdout.trim().split('\n')
+  if (names.includes(name)) throw new Error('Task7 HOME setup helper name already exists')
+  let helperId: string | undefined
+  try {
+    const containerId = (await command(['create', '--name', name, '--user', '0:0', '--workdir', '/',
+      '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges',
+      '--memory', '256m', '--memory-swap', '256m', '--cpus', '0.5', '--pids-limit', '32',
+      '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m', '--label', `com.freshell.runtime-test-run-id=${input.runId}`,
+      '--label', `com.freshell.runtime-test-candidate=${input.candidateSha}`, '--label', 'com.freshell.task007-setup=provider-home',
+      '--label', `com.freshell.owner-container-id=${target.containerId}`, '--mount',
+      `type=volume,source=${target.providerVolumeName},target=/home/freshell/provider,volume-nocopy`,
+      '--entrypoint', 'python3', input.imageRef, '-I', '-c', TASK007_PROVIDER_HOME_INITIALIZER])).stdout.trim()
+    if (!/^[a-f0-9]{64}$/.test(containerId)) throw new Error('Task7 HOME helper create returned no exact container')
+    helperId = containerId
+    await command(['start', containerId])
+    if ((await command(['wait', containerId])).stdout.trim() !== '0') throw new Error('Task7 HOME initialization failed')
+    const facts = z.object({ kind: z.literal('historical-fixture-home-setup'), uid: z.literal(65534), gid: z.literal(0),
+      mode: z.literal(448), priorEntries: z.literal(0) }).strict().parse(JSON.parse((await command(['logs', containerId])).stdout))
+    return { containerId, uid: facts.uid, gid: facts.gid, mode: facts.mode, priorEntries: facts.priorEntries }
+  } finally {
+    if (helperId) await command(['rm', '--force', helperId])
+    else {
+      const remaining = (await command(['ps', '-a', '--format', '{{.Names}}'])).stdout.trim().split('\n')
+      if (remaining.includes(name)) {
+        const discovered = z.array(z.object({ Id: Task007Hex, Image: z.string(),
+          Config: z.object({ Labels: z.record(z.string(), z.string()) }),
+          Mounts: z.array(z.object({ Type: z.string(), Name: z.string().optional(), Destination: z.string() })),
+        })).length(1).parse(JSON.parse((await command(['inspect', name])).stdout))[0]
+        if (discovered.Image !== input.imageRef || discovered.Config.Labels['com.freshell.runtime-test-run-id'] !== input.runId
+          || discovered.Config.Labels['com.freshell.owner-container-id'] !== target.containerId
+          || discovered.Config.Labels['com.freshell.task007-setup'] !== 'provider-home'
+          || discovered.Mounts.length !== 1 || discovered.Mounts[0].Type !== 'volume'
+          || discovered.Mounts[0].Name !== target.providerVolumeName || discovered.Mounts[0].Destination !== '/home/freshell/provider') {
+          throw new Error('Task7 lost-ACK HOME helper ownership is unknown')
+        }
+        await command(['rm', '--force', discovered.Id])
+      }
+    }
+  }
+}
+
+function assertTask007PrivatePath(file: string, directory: boolean, mode: number): void {
+  const stat = fs.lstatSync(file)
+  if (!path.isAbsolute(file) || fs.realpathSync(file) !== file || stat.uid !== process.getuid?.()
+    || (stat.mode & 0o777) !== mode || (directory ? !stat.isDirectory() : !stat.isFile())) {
+    throw new Error('Task7 fixture path is not canonical private owner custody')
+  }
+}
+
+function task007FileHash(file: string): string {
+  return createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+}
+
+export const TASK007_HISTORICAL_SNAPSHOT_INSTALLER = `import hashlib, json, os, sqlite3, stat, sys, urllib.parse
+source, destination, expected_hash = sys.argv[1:]
+for directory in (source, destination):
+    metadata = os.lstat(directory)
+    if os.path.realpath(directory) != directory or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise RuntimeError("snapshot directory is not canonical private owner custody")
+if os.listdir(destination):
+    raise RuntimeError("historical snapshot destination is nonempty, not fresh")
+database = os.path.join(source, "runtime.sqlite3")
+for suffix in ("-wal", "-shm", "-journal"):
+    if os.path.lexists(database + suffix) and os.lstat(database + suffix).st_size:
+        raise RuntimeError("historical snapshot has active WAL/checkpoint dependency")
+files = {}
+incidents = os.path.join(source, "incidents")
+incident_metadata = os.lstat(incidents)
+if not stat.S_ISDIR(incident_metadata.st_mode) or incident_metadata.st_uid != os.geteuid() or stat.S_IMODE(incident_metadata.st_mode) != 0o700:
+    raise RuntimeError("historical incident directory is not private")
+incident_files = [os.path.join("incidents", name) for name in sorted(os.listdir(incidents))]
+for name in ("runtime.sqlite3", "lifecycle.jsonl", "metadata.json", *incident_files):
+    file = os.path.join(source, name)
+    metadata = os.lstat(file)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise RuntimeError("historical snapshot file is not private and regular")
+    fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        with os.fdopen(fd, "rb", closefd=False) as reader:
+            files[name] = reader.read(67108865)
+        if len(files[name]) > 67108864:
+            raise RuntimeError("historical snapshot file exceeds fixture bound")
+    finally:
+        os.close(fd)
+digest = hashlib.sha256(files["runtime.sqlite3"]).hexdigest()
+if digest != expected_hash:
+    raise RuntimeError("historical snapshot database digest changed")
+connection = sqlite3.connect("file:" + urllib.parse.quote(database) + "?mode=ro&immutable=1", uri=True)
+try:
+    if connection.execute("SELECT schema_version FROM installation WHERE singleton=1").fetchall() != [(7,)]:
+        raise RuntimeError("historical snapshot is not schema-seven")
+    removed = {"ordinary_stops", "recovery_retries", "stopped_repair_root_receipts", "stopped_repair_withdrawals", "stopped_repair_operations", "native_origin_owners", "cancel_recovery_retry_on_intent"}
+    if removed.intersection(row[0] for row in connection.execute("SELECT name FROM sqlite_master")):
+        raise RuntimeError("historical schema-seven retains post-7 tables or trigger")
+    absent_columns = {
+        "souls": {"identity_revision", "native_import_revision", "native_import_state", "native_import_source_store_id", "native_import_root_session_id", "native_import_source_generation", "native_import_schema_fingerprint", "native_import_migration_fingerprint", "native_import_complete_inventory", "native_import_authority", "claude_fork_recipe"},
+        "loss_incidents": {"captured_control_epoch", "captured_identity_revision", "captured_evidence_revision", "captured_native_import_revision", "captured_native_import_state", "captured_source_store_id", "captured_root_session_id", "captured_source_generation", "captured_source_schema_fingerprint", "captured_migration_fingerprint", "captured_native_import_complete", "captured_native_import_authority"},
+        "incarnations": {"launch_policy", "native_identity_launch", "native_identity_observation"}
+    }
+    for table, absent in absent_columns.items():
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(" + table + ")")}
+        if not columns or absent.intersection(columns):
+            raise RuntimeError("historical schema-seven retains post-7 columns")
+finally:
+    connection.close()
+os.mkdir(os.path.join(destination, "incidents"), 0o700)
+for name, data in files.items():
+    fd = os.open(os.path.join(destination, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as writer:
+            writer.write(data)
+            writer.flush()
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+for directory in (os.path.join(destination, "incidents"), destination):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+with open(os.path.join(destination, "runtime.sqlite3"), "rb") as reader:
+    if hashlib.sha256(reader.read()).hexdigest() != digest:
+        raise RuntimeError("installed historical snapshot digest changed")
+print(json.dumps({"kind":"historical-fixture-snapshot-install","schemaVersion":7,"sha256":digest}))
+`
+
+export async function installTask007HistoricalSnapshot(input: {
+  sourceDir: string; registryRoot: string; sha256: string
+}, execute: Task007RunChild = runTask007Child): Promise<{ schemaVersion: 7; sha256: string }> {
+  assertTask007PrivatePath(input.sourceDir, true, 0o700)
+  assertTask007PrivatePath(input.registryRoot, true, 0o700)
+  const result = await execute('python3', ['-I', '-c', TASK007_HISTORICAL_SNAPSHOT_INSTALLER,
+    input.sourceDir, input.registryRoot, input.sha256], {
+    cwd: input.sourceDir, env: {}, timeout: 60_000, maxBuffer: 1024 * 1024, encoding: 'utf8',
+  }).catch(error => {
+    if (error instanceof Task007ChildFailure) {
+      if (error.stderr.includes('destination is nonempty')) throw new Error('Task7 historical snapshot destination is not fresh', { cause: error })
+      if (error.stderr.includes('active WAL/checkpoint')) throw new Error('Task7 historical snapshot WAL checkpoint refused', { cause: error })
+      if (error.stderr.includes('schema-seven')) throw new Error('Task7 historical schema-seven refused', { cause: error })
+    }
+    throw error
+  })
+  const installed = z.object({ kind: z.literal('historical-fixture-snapshot-install'), schemaVersion: z.literal(7),
+    sha256: Task007Hex }).strict().parse(JSON.parse(result.stdout))
+  if (installed.sha256 !== input.sha256) throw new Error('Task7 installed historical snapshot digest refused')
+  return { schemaVersion: installed.schemaVersion, sha256: installed.sha256 }
+}
+
+export async function executeTask007FixtureExporter(options: {
+  repoRoot: string; artifact: Task007LibTestArtifact; inputFile: string; outputDir: string
+}, execute: Task007RunChild = runTask007Child): Promise<Task007FixtureOutput> {
+  const { artifact, inputFile, outputDir } = options
+  const repoRoot = fs.realpathSync(options.repoRoot)
+  assertTask007Candidate(repoRoot, artifact.candidateSha)
+  assertTask007PrivatePath(artifact.path, false, 0o700)
+  assertTask007PrivatePath(inputFile, false, 0o600)
+  assertTask007PrivatePath(outputDir, true, 0o700)
+  const input = Task007FixtureInputSchema.parse(JSON.parse(fs.readFileSync(inputFile, 'utf8')))
+  assertTask007PrivatePath(input.ownerRoot, true, 0o700)
+  const withinOwner = (file: string) => file.startsWith(`${input.ownerRoot}${path.sep}`)
+  if (!withinOwner(inputFile) || !withinOwner(outputDir) || !withinOwner(input.runtimeRoot)
+    || !withinOwner(input.hostBinaryPath) || !withinOwner(input.brokerSocketPath)
+    || input.candidateSha !== artifact.candidateSha || task007FileHash(artifact.path) !== artifact.sha256
+    || task007FileHash(input.hostBinaryPath) !== input.hostBinarySha256 || fs.readdirSync(outputDir).length !== 0) {
+    throw new Error('Task7 fixture input binding or fresh output custody refused')
+  }
+  const result = await execute(artifact.path, ['--exact', TASK007_EXPORT_TEST, '--nocapture', '--test-threads=1'], {
+    cwd: repoRoot, env: { FRESHELL_TASK007_STOPPED_FIXTURE_INPUT_FILE: inputFile,
+      FRESHELL_TASK007_STOPPED_FIXTURE_OUTPUT_DIR: outputDir },
+    timeout: 300_000, maxBuffer: 4 * 1024 * 1024, encoding: 'utf8',
+  })
+  fs.writeFileSync(path.join(outputDir, 'export.stdout'), result.stdout, { mode: 0o600, flag: 'wx' })
+  fs.writeFileSync(path.join(outputDir, 'export.stderr'), result.stderr, { mode: 0o600, flag: 'wx' })
+  if (!/^test result: ok\. 1 passed; 0 failed; 0 ignored;/m.test(result.stdout)) {
+    throw new Error('Task7 fixture exporter did not execute its one selected test')
+  }
+  assertTask007Candidate(repoRoot, artifact.candidateSha)
+  if (task007FileHash(artifact.path) !== artifact.sha256) throw new Error('Task7 fixture artifact changed during export')
+  const metadataFile = path.join(outputDir, 'metadata.json')
+  const databaseFile = path.join(outputDir, 'runtime.sqlite3')
+  assertTask007PrivatePath(metadataFile, false, 0o600)
+  assertTask007PrivatePath(databaseFile, false, 0o600)
+  const output = Task007FixtureOutputSchema.parse(JSON.parse(fs.readFileSync(metadataFile, 'utf8')))
+  const sameIdentity = output.fixtureId === input.fixtureId && output.runId === input.runId
+    && output.candidateSha === input.candidateSha && output.installationId === input.installationId
+    && output.dockerDaemonId === input.dockerDaemonId && output.imageRef === input.imageRef
+    && output.hostBinarySha256 === input.hostBinarySha256 && output.workspacePath === input.workspacePath
+    && output.runtimeRoot === input.runtimeRoot && output.registry.sha256 === task007FileHash(databaseFile)
+  const rootOrdinals = [0, 1, 2, 3, 4, 5, 6, 0, 1]
+  const sameTargets = output.targets.every((target, index) => {
+    const expected = input.targets[index]
+    const viewIds = input.explicitViews.filter(view => view.targetOrdinal === index).map(view => view.viewId)
+    return target.soulId === expected.soulId && target.providerStoreId === expected.providerStoreId
+      && target.rootSessionId === input.source.rootSessionIds[rootOrdinals[index]]
+      && target.runtimeDir === path.join(input.runtimeRoot, target.incarnationId)
+      && target.hostBinaryPath === input.hostBinaryPath
+      && target.providerVolumeName === `freshell-provider-${createHash('sha256').update(`${input.installationId}\0${target.soulId}`).digest('hex').slice(0, 24)}`
+      && target.viewIds.length === viewIds.length && viewIds.every(id => target.viewIds.includes(id))
+  })
+  const sameChoices = output.canonicalChoices.every((choice, index) => {
+    const expected = input.canonicalChoices[index]
+    return choice.rootSessionId === input.source.rootSessionIds[expected.rootOrdinal]
+      && choice.soulId === input.targets[expected.targetOrdinal].soulId
+      && choice.expectedIntentRevision === output.targets[expected.targetOrdinal].expectedIntentRevision
+  })
+  if (!sameIdentity || !sameTargets || !sameChoices || output.unrelated.soulId !== input.unrelated.target.soulId
+    || output.unrelated.viewId !== input.unrelated.viewId) throw new Error('Task7 fixture output identity binding refused')
+  for (const exported of output.unrelated.exports) {
+    const file = path.resolve(outputDir, exported.file)
+    if (!file.startsWith(`${outputDir}${path.sep}`)) throw new Error('Task7 fixture export path escapes output custody')
+    assertTask007PrivatePath(file, false, 0o600)
+    if (task007FileHash(file) !== exported.sha256) throw new Error('Task7 fixture unrelated export binding refused')
+  }
+  return output
+}
+
+function assertTask007Candidate(repoRoot: string, candidateSha: string): void {
+  if (!/^[a-f0-9]{40}$/.test(candidateSha) || git(repoRoot, ['rev-parse', 'HEAD']).trim() !== candidateSha) {
+    throw new Error('Task7 library artifact candidate changed')
+  }
+}
+
+export async function prepareTask007LibTestArtifact(input: {
+  repoRoot: string; buildDir: string; candidateSha: string
+}, execute: Task007RunChild = runTask007Child): Promise<Task007LibTestArtifact> {
+  const repoRoot = fs.realpathSync(input.repoRoot)
+  assertTask007Candidate(repoRoot, input.candidateSha)
+  const result = await execute(path.join(os.homedir(), '.local/bin/mise'), [
+    'exec', 'rust@1.96', '--', 'cargo', 'test', '-p', 'freshell-supervisor', '--lib', '--no-run', '--message-format=json',
+  ], { cwd: repoRoot, env: { PATH: process.env.PATH, HOME: os.homedir() },
+    timeout: 1_800_000, maxBuffer: 16 * 1024 * 1024, encoding: 'utf8' })
+  assertTask007Candidate(repoRoot, input.candidateSha)
+  const destination = path.join(input.buildDir, 'task007')
+  ensurePrivateDirectory(destination)
+  fs.writeFileSync(path.join(destination, 'compile.jsonl'), result.stdout, { mode: 0o600, flag: 'wx' })
+  fs.writeFileSync(path.join(destination, 'compile.stderr'), result.stderr, { mode: 0o600, flag: 'wx' })
+  const messages: unknown[] = result.stdout.split('\n').filter(line => line.trim()).map(line => JSON.parse(line))
+  const records = messages.map(message => objectFields(message, 'invalid Task7 compiler artifact message'))
+  if (!records.some(record => record.reason === 'build-finished' && record.success === true)
+    || records.some(record => record.reason === 'build-finished' && record.success !== true)) {
+    throw new Error('Task7 library artifact build did not finish successfully')
+  }
+  const sourcePath = fs.realpathSync(path.join(repoRoot, 'crates/freshell-supervisor/src/lib.rs'))
+  const cratePath = path.join(repoRoot, 'crates/freshell-supervisor')
+  const artifacts = records.filter(record => {
+    if (record.reason !== 'compiler-artifact' || typeof record.package_id !== 'string') return false
+    let packageUrl: URL
+    try { packageUrl = new URL(record.package_id) } catch { return false }
+    const target = objectFields(record.target, 'invalid Task7 compiler artifact target')
+    const profile = objectFields(record.profile, 'invalid Task7 compiler artifact profile')
+    return packageUrl.protocol === 'path+file:' && decodeURIComponent(packageUrl.pathname) === cratePath && !!packageUrl.hash
+      && target.name === 'freshell_supervisor' && Array.isArray(target.kind) && target.kind.includes('lib')
+      && target.src_path === sourcePath && profile.test === true && typeof record.executable === 'string'
+  })
+  if (artifacts.length !== 1) throw new Error('Task7 requires exactly one current library test artifact')
+  const artifact = artifacts[0]
+  const executable = z.string().parse(artifact.executable)
+  const stat = fs.lstatSync(executable)
+  if (!path.isAbsolute(executable) || fs.realpathSync(executable) !== executable || !stat.isFile()
+    || !executable.startsWith(`${path.join(repoRoot, 'target')}${path.sep}`)) throw new Error('Task7 library artifact executable is not canonical and owned')
+  const bytes = fs.readFileSync(executable)
+  const file = path.join(destination, 'freshell-supervisor-lib-test')
+  fs.writeFileSync(file, bytes, { mode: 0o700, flag: 'wx' })
+  fs.chmodSync(file, 0o700)
+  const sha256 = createHash('sha256').update(bytes).digest('hex')
+  if (createHash('sha256').update(fs.readFileSync(file)).digest('hex') !== sha256) throw new Error('Task7 library artifact copy changed')
+  const listing = await execute(file, ['--list', '--exact', TASK007_EXPORT_TEST], {
+    cwd: repoRoot, env: {}, timeout: 30_000, maxBuffer: 1024 * 1024, encoding: 'utf8',
+  })
+  const tests = listing.stdout.split('\n').filter(line => line.endsWith(': test'))
+  if (tests.length !== 1 || tests[0] !== `${TASK007_EXPORT_TEST}: test`
+    || !/^1 test, 0 benchmarks$/m.test(listing.stdout)) throw new Error('Task7 artifact does not select its exact fixture exporter')
+  fs.writeFileSync(path.join(destination, 'exporter-list.txt'), listing.stdout, { mode: 0o600, flag: 'wx' })
+  assertTask007Candidate(repoRoot, input.candidateSha)
+  if (createHash('sha256').update(fs.readFileSync(file)).digest('hex') !== sha256) throw new Error('Task7 library artifact changed during selection')
+  return { path: file, sha256, candidateSha: input.candidateSha, packageId: z.string().parse(artifact.package_id),
+    features: z.array(z.string()).parse(artifact.features), sourcePath }
+}
+
 export class RuntimeHarness {
   private task2FiniteFixtures = false
   task2ServerBinary = ""
@@ -1641,6 +2111,13 @@ export class RuntimeHarness {
   private readonly trackedVolumes = new Set<string>()
   private readonly assertions: AssertionRecord[] = []
   private brokerStarted = false
+  private task007Artifact?: Promise<Task007LibTestArtifact>
+  private readonly task007Brokers: RestrictedDockerBroker[] = []
+  private readonly task007HelperNames = new Set<string>()
+  private readonly task007Children = new Set<Promise<unknown>>()
+  private readonly task007Fixtures = new Map<Task007StoppedFixtureKind, Task007PreparedStoppedFixture>()
+  private readonly task007HostPaths = new Set<string>()
+  private readonly task007WorkspaceRoots = new Set<string>()
 
   constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1,
     private readonly ownerIsolation?: RuntimeOwnerIsolation) {
@@ -1708,6 +2185,9 @@ export class RuntimeHarness {
     this.recordLifecycle('gate.prepare.started', { repoRoot: this.repoRoot, candidateSha: this.candidateSha, runId: this.runId })
     this.ensureRuntimeImage()
     this.buildBinaries()
+    this.task007HostPaths.add(this.testHostBinary)
+    this.task007HostPaths.add(this.releaseHostBinary)
+    if (this.phase >= 2) for (const root of this.phase2WorkspaceRoots()) this.task007WorkspaceRoots.add(root)
 
     const realSocketPath = dockerSocketPath()
     const proxySocketPath = path.join(this.testRoot, 'broker', 'docker.sock')
@@ -1715,10 +2195,10 @@ export class RuntimeHarness {
       realSocketPath,
       proxySocketPath,
       runtimeRootPrefix: path.join(this.testRoot, 'r'),
-      allowedHostBinaryPaths: new Set([this.testHostBinary, this.releaseHostBinary]),
+      allowedHostBinaryPaths: this.task007HostPaths,
       allowedImageRefs: new Set([this.imageRef]),
       allowTerminalWorkloads: this.phase >= 2,
-      allowedWorkspaceRoots: new Set(this.phase >= 2 ? this.phase2WorkspaceRoots() : []),
+      allowedWorkspaceRoots: this.task007WorkspaceRoots,
       allowedProviderUserRoots: new Set(this.phase >= 2 ? this.phase2ProviderUserRoots() : []),
       allowedBootstrapFiles: new Set(this.phase >= 2 ? this.phase2BootstrapFiles() : []),
       testRunId: this.runId,
@@ -1731,6 +2211,241 @@ export class RuntimeHarness {
     writePrivateJson(path.join(this.evidenceDir, 'capabilities.json'), this.collectCapabilities())
     writePrivateJson(path.join(this.evidenceDir, 'build.json'), this.collectBuildInfo())
     this.recordLifecycle('gate.prepare.completed', { imageRef: this.imageRef, brokerSocket: proxySocketPath })
+  }
+
+  private readonly executeTask007Child: Task007RunChild = (file, args, options) => {
+    const reference = `task007-child-${randomUUID()}`
+    const retain = (stdout: string, stderr: string) => {
+      ensurePrivateDirectory(this.evidenceDir)
+      fs.writeFileSync(path.join(this.evidenceDir, `${reference}.stdout`), stdout, { mode: 0o600, flag: 'wx' })
+      fs.writeFileSync(path.join(this.evidenceDir, `${reference}.stderr`), stderr, { mode: 0o600, flag: 'wx' })
+      this.recordLifecycle('task007.child.settled', { reference, file, args })
+    }
+    const settlement = runTask007Child(file, args, options).then(result => {
+      retain(result.stdout, result.stderr)
+      return result
+    }, error => {
+      if (error instanceof Task007ChildFailure) retain(error.stdout, error.stderr)
+      throw error
+    })
+    this.task007Children.add(settlement)
+    void settlement.finally(() => this.task007Children.delete(settlement)).catch(() => undefined)
+    return settlement
+  }
+
+  private async task007Docker(args: string[]): Promise<string> {
+    const result = await this.executeTask007Child('docker', args, {
+      cwd: this.repoRoot, env: { PATH: process.env.PATH, HOME: os.homedir(),
+        ...(process.env.DOCKER_HOST ? { DOCKER_HOST: process.env.DOCKER_HOST } : {}) },
+      timeout: 60_000, maxBuffer: 4 * 1024 * 1024, encoding: 'utf8',
+    })
+    return result.stdout
+  }
+
+  private supervisorLocation(scenario: string): { scenarioId: string; controlDir: string; runtimeRoot: string } {
+    const scenarioId = sanitizeName(scenario)
+    const runtimeKey = `${scenarioId.slice(0, 6)}-${createHash('sha256').update(scenarioId).digest('hex').slice(0, 8)}`
+    return { scenarioId, controlDir: path.join(this.scenarioPath(scenarioId), 'control'),
+      runtimeRoot: path.join(this.testRoot, 'r', runtimeKey, 'x') }
+  }
+
+  /** Private grant-free setup; generated historical identities are not current runtime evidence. */
+  async prepareTask007StoppedFixture(kind: Task007StoppedFixtureKind): Promise<Task007PreparedStoppedFixture> {
+    if (this.phase !== 3 || !this.ownerIsolation || this.ownerIsolation.bootstrapProviders.length !== 0
+      || !['browser', 'after_import_publication', 'after_repair_cas_before_withdrawal', 'during_withdrawal_before_ack'].includes(kind)) {
+      throw new Error('Task7 batch requires an explicitly isolated phase-three owner')
+    }
+    const existing = this.task007Fixtures.get(kind)
+    if (existing) return existing
+    if (!this.brokerStarted) {
+      if (fs.existsSync(this.testRoot) || fs.existsSync(this.buildDir)) throw new Error('Task7 fixture run already exists')
+      await this.prepare()
+    }
+    if (!dockerIsRootless()) throw new Error('Task7 batch requires actual rootless Docker')
+    this.task007Artifact ??= prepareTask007LibTestArtifact({ repoRoot: this.repoRoot, buildDir: this.buildDir,
+      candidateSha: this.candidateSha }, this.executeTask007Child)
+    const artifact = await this.task007Artifact
+    const scenarioId = kind === 'browser' ? 'browser-managed-runtime' : `task007-${kind}`
+    const { runtimeRoot } = this.supervisorLocation(scenarioId)
+    const ownerRoot = kind === 'browser' ? this.testRoot : path.dirname(runtimeRoot)
+    ensurePrivateDirectory(ownerRoot)
+    ensurePrivateDirectory(runtimeRoot)
+    const workspacePath = path.join(ownerRoot, `task007-${kind}-workspace`)
+    fs.mkdirSync(workspacePath, { mode: 0o755 })
+    git(workspacePath, ['init', '--quiet'])
+    const gitCommonDir = fs.realpathSync(path.join(workspacePath, '.git'))
+    this.task007WorkspaceRoots.add(workspacePath)
+    this.task007WorkspaceRoots.add(gitCommonDir)
+    const sourceDatabaseFile = path.join(ownerRoot, `task007-${kind}-source.db`)
+    const source = seedManagedOpenCodeSource({ repoRoot: this.repoRoot, databasePath: sourceDatabaseFile,
+      workspace: workspacePath, nonce: randomUUID(), batch: 'stopped-repair-seven-roots' })
+    fs.chmodSync(sourceDatabaseFile, 0o600)
+    const hostBinaryPath = path.join(ownerRoot, `task007-${kind}-host`)
+    fs.copyFileSync(this.testHostBinary, hostBinaryPath, fs.constants.COPYFILE_EXCL)
+    fs.chmodSync(hostBinaryPath, 0o550)
+    this.task007HostPaths.add(hostBinaryPath)
+    let broker = this.broker
+    if (kind !== 'browser') {
+      broker = new RestrictedDockerBroker({ realSocketPath: dockerSocketPath(), proxySocketPath: path.join(ownerRoot, 'broker.sock'),
+        runtimeRootPrefix: ownerRoot, allowedHostBinaryPaths: new Set([hostBinaryPath]), allowedImageRefs: new Set([this.imageRef]),
+        allowTerminalWorkloads: true, allowedWorkspaceRoots: new Set([workspacePath, gitCommonDir]),
+        allowedProviderUserRoots: new Set(), allowedBootstrapFiles: new Set(), testRunId: this.runId,
+        logPath: path.join(this.evidenceDir, `task007-${kind}-broker.jsonl`) })
+      this.task007Brokers.push(broker)
+      await broker.start()
+    }
+    const target = () => ({ soulId: `soul-${randomUUID()}`, providerStoreId: `provider-store-${randomUUID()}`,
+      terminalId: `terminal-${randomUUID()}`, streamId: `stream-${randomUUID()}` })
+    const view = () => ({ viewId: `view-${randomUUID()}`, ownerId: `owner-${randomUUID()}`,
+      workspaceId: `workspace-${randomUUID()}`, tabId: `tab-${randomUUID()}`, paneId: `pane-${randomUUID()}` })
+    const input: Task007FixtureInput = { schemaVersion: 1, fixtureId: `task007-${randomUUID()}`, runId: this.runId,
+      candidateSha: this.candidateSha, installationId: `installation-${randomUUID()}`, ownerRoot, runtimeRoot,
+      workspacePath, cwd: workspacePath, gitCommonDir, imageRef: this.imageRef, hostBinaryPath,
+      hostBinarySha256: task007FileHash(hostBinaryPath), dockerDaemonId: (await this.task007Docker(['info', '--format', '{{.ID}}'])).trim(),
+      brokerSocketPath: broker.proxySocketPath, source: { rootSessionIds: source.families.map(family => family.rootId), unrelatedSessionId: source.unrelatedId },
+      targets: Array.from({ length: 9 }, target), canonicalChoices: [{ rootOrdinal: 0, targetOrdinal: 0 }, { rootOrdinal: 1, targetOrdinal: 8 }],
+      explicitViews: [0, 1, 7, 8].map(targetOrdinal => ({ ...view(), targetOrdinal })), unrelated: { ...view(), target: target() } }
+    const expectedVolumes = input.targets.map(item => `freshell-provider-${createHash('sha256').update(`${input.installationId}\0${item.soulId}`).digest('hex').slice(0, 24)}`)
+    const volumeInventory = (await this.task007Docker(['volume', 'ls', '-q'])).trim().split('\n')
+    if (expectedVolumes.some(name => volumeInventory.includes(name))) throw new Error('Task7 refuses an existing provider volume')
+    for (const name of expectedVolumes) {
+      this.trackedVolumes.add(name)
+      await this.task007Docker(['volume', 'create', '--label', `com.freshell.runtime-test-run-id=${this.runId}`,
+        '--label', `com.freshell.runtime-test-candidate=${this.candidateSha}`, '--label', 'com.freshell.task007-setup=provider-home', name])
+    }
+    const inputFile = path.join(ownerRoot, `task007-${kind}-input.json`)
+    const outputDir = path.join(ownerRoot, `task007-${kind}-output`)
+    writePrivateJson(inputFile, input)
+    ensurePrivateDirectory(outputDir)
+    const output = await executeTask007FixtureExporter({ repoRoot: this.repoRoot, artifact, inputFile, outputDir }, this.executeTask007Child)
+    for (const target of output.targets) {
+      const receipt = broker.receipts().find(receipt => receipt.containerId === target.containerId)
+      if (!receipt || receipt.workspacePath !== input.workspacePath) throw new Error('Task7 physical exporter receipt membership refused')
+      this.trackedContainers.add(target.containerId)
+      const consumers = (await this.task007Docker(['ps', '-aq', '--no-trunc', '--filter', `volume=${target.providerVolumeName}`])).trim().split('\n')
+      if (consumers.length !== 1 || consumers[0] !== target.containerId) throw new Error('Task7 provider volume has unknown or foreign consumers')
+      const name = `freshell-task007-setup-${randomUUID()}`
+      const names = (await this.task007Docker(['ps', '-a', '--format', '{{.Names}}'])).trim().split('\n')
+      if (names.includes(name)) throw new Error('Task7 setup name already exists')
+      this.task007HelperNames.add(name)
+      const initialized = await initializeTask007ProviderHome({ input, target, receipt, name }, this.executeTask007Child)
+      this.task007HelperNames.delete(name)
+      this.recordLifecycle('task007.provider_home.initialized', { fixtureId: input.fixtureId, ...initialized,
+        providerVolumeName: target.providerVolumeName, ownerContainerId: target.containerId })
+    }
+    const registryRoot = path.join(ownerRoot, `task007-${kind}-registry`)
+    ensurePrivateDirectory(registryRoot)
+    let volumeName: string | undefined
+    if (kind === 'browser') {
+      volumeName = `freshell-task007-registry-${randomUUID()}`
+      if ((await this.task007Docker(['volume', 'ls', '-q'])).trim().split('\n').includes(volumeName)) throw new Error('Task7 supervisor volume already exists')
+      this.trackedVolumes.add(volumeName)
+      await this.task007Docker(['volume', 'create', '--label', `com.freshell.runtime-test-run-id=${this.runId}`, volumeName])
+      await this.installTask007SupervisorVolume(outputDir, volumeName, output.registry.sha256)
+    } else await installTask007HistoricalSnapshot({ sourceDir: outputDir, registryRoot, sha256: output.registry.sha256 }, this.executeTask007Child)
+    const prepared: Task007PreparedStoppedFixture = { input, output, source, inputFile, outputDir,
+      metadataFile: path.join(outputDir, 'metadata.json'), sourceDatabaseFile, registryRoot, scenarioId, ...(volumeName ? { volumeName } : {}) }
+    this.task007Fixtures.set(kind, prepared)
+    this.writeArtifact(`task007-${kind}-prepared.json`, { input, output, registryRoot, sourceDatabaseFile, volumeName,
+      artifact, historicalSetupOnly: true })
+    return prepared
+  }
+
+  private async installTask007SupervisorVolume(sourceDir: string, volumeName: string, sha256: string): Promise<void> {
+    const name = `freshell-task007-copy-${randomUUID()}`
+    if ((await this.task007Docker(['ps', '-a', '--format', '{{.Names}}'])).trim().split('\n').includes(name)) throw new Error('Task7 copy helper name already exists')
+    this.task007HelperNames.add(name)
+    const containerId = (await this.task007Docker(['create', '--name', name, '--user', '0:0', '--network', 'none', '--read-only',
+      '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--memory', '256m', '--memory-swap', '256m', '--cpus', '0.5', '--pids-limit', '32',
+      '--mount', `type=bind,source=${sourceDir},target=/fixture,readonly`,
+      '--mount', `type=volume,source=${volumeName},target=/registry,volume-nocopy`,
+      '--label', `com.freshell.runtime-test-run-id=${this.runId}`, '--label', `com.freshell.runtime-test-candidate=${this.candidateSha}`,
+      '--label', 'com.freshell.task007-setup=registry-copy', '--entrypoint', 'python3', this.imageRef,
+      '-I', '-c', `import os; os.chmod('/registry',0o700)\n${TASK007_HISTORICAL_SNAPSHOT_INSTALLER}`, '/fixture', '/registry', sha256])).trim()
+    if (!/^[a-f0-9]{64}$/.test(containerId)) throw new Error('Task7 copy helper returned no exact ID')
+    this.trackedContainers.add(containerId)
+    try {
+      await this.task007Docker(['start', containerId])
+      const exit = (await this.task007Docker(['wait', containerId])).trim()
+      const stdout = await this.task007Docker(['logs', containerId])
+      writePrivateJson(path.join(this.evidenceDir, 'task007-copy-result.json'), { exit, stdout, containerId })
+      if (exit !== '0' || z.object({ sha256: z.literal(sha256), schemaVersion: z.literal(7) }).safeParse(JSON.parse(stdout)).success !== true) {
+        throw new Error('Task7 preopen supervisor snapshot installation failed')
+      }
+    } finally {
+      await this.task007Docker(['rm', '--force', containerId])
+      this.trackedContainers.delete(containerId)
+      this.task007HelperNames.delete(name)
+    }
+  }
+
+  async runTask007StoppedRepairParents(): Promise<{ executedParents: 3; passedParents: 3 }> {
+    const kinds = ['after_import_publication', 'after_repair_cas_before_withdrawal', 'during_withdrawal_before_ack'] as const
+    const fixtures: Record<string, { inputFile: string; registryRoot: string; sourceDatabaseFile: string; metadataFile: string }> = {}
+    for (const kind of kinds) {
+      const prepared = await this.prepareTask007StoppedFixture(kind)
+      fixtures[`stopped_repair_${kind}`] = { inputFile: prepared.inputFile, registryRoot: prepared.registryRoot,
+        sourceDatabaseFile: prepared.sourceDatabaseFile, metadataFile: prepared.metadataFile }
+    }
+    const artifact = await this.task007Artifact
+    if (!artifact) throw new Error('Task7 parent harness artifact is absent')
+    const manifest = path.join(this.testRoot, 'task007-crash-fixtures.json')
+    writePrivateJson(manifest, fixtures)
+    const name = `freshell-task007-parents-${randomUUID()}`
+    if ((await this.task007Docker(['ps', '-a', '--format', '{{.Names}}'])).trim().split('\n').includes(name)) throw new Error('Task7 parent enclosure name exists')
+    this.task007HelperNames.add(name)
+    const containerId = (await this.task007Docker(['create', '--name', name, '--user', '0:0', '--workdir', '/', '--init',
+      '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+      '--memory', '2g', '--memory-swap', '2g', '--cpus', '2', '--pids-limit', '256',
+      '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=64m', '--mount', `type=bind,source=${this.testRoot},target=${this.testRoot}`,
+      '--mount', `type=bind,source=${this.buildDir},target=${this.buildDir},readonly`,
+      '--label', `com.freshell.runtime-test-run-id=${this.runId}`, '--label', `com.freshell.runtime-test-candidate=${this.candidateSha}`,
+      '--label', 'com.freshell.task007-setup=destructive-parents', '-e', 'FRESHELL_SANDBOX_MODE=runtime-suite',
+      '-e', `FRESHELL_TASK007_STOPPED_REPAIR_CRASH_FIXTURES=${manifest}`, '--entrypoint', artifact.path, this.imageRef,
+      'stopped_repair_crash_', '--ignored', '--nocapture', '--test-threads=1'])).trim()
+    if (!/^[a-f0-9]{64}$/.test(containerId)) throw new Error('Task7 parent enclosure create returned no exact ID')
+    this.trackedContainers.add(containerId)
+    let exit: string | undefined
+    let logs = ''
+    const errors: unknown[] = []
+    try {
+      await this.task007Docker(['start', containerId])
+      const result = await this.executeTask007Child('docker', ['wait', containerId], {
+        cwd: this.repoRoot, env: { PATH: process.env.PATH, HOME: os.homedir(),
+          ...(process.env.DOCKER_HOST ? { DOCKER_HOST: process.env.DOCKER_HOST } : {}) },
+        timeout: 600_000, maxBuffer: 1024 * 1024, encoding: 'utf8',
+      })
+      exit = result.stdout.trim()
+    } catch (error) {
+      errors.push(error)
+    } finally {
+      try {
+        const capture = await this.executeTask007Child('docker', ['logs', containerId], {
+          cwd: this.repoRoot, env: { PATH: process.env.PATH, HOME: os.homedir(),
+            ...(process.env.DOCKER_HOST ? { DOCKER_HOST: process.env.DOCKER_HOST } : {}) },
+          timeout: 60_000, maxBuffer: 4 * 1024 * 1024, encoding: 'utf8',
+        })
+        logs = capture.stdout
+        fs.writeFileSync(path.join(this.evidenceDir, 'task007-destructive-parents.stdout'), logs, { mode: 0o600, flag: 'wx' })
+        fs.writeFileSync(path.join(this.evidenceDir, 'task007-destructive-parents.stderr'), capture.stderr, { mode: 0o600, flag: 'wx' })
+      } catch (error) { errors.push(error) }
+      try {
+        await this.task007Docker(['rm', '--force', containerId])
+        this.trackedContainers.delete(containerId)
+        this.task007HelperNames.delete(name)
+      } catch (error) { errors.push(error) }
+    }
+    if (errors.length) throw new AggregateError(errors, 'Task7 owned enclosed execution or capture/cleanup failed')
+    const expected = ['stopped_repair_crash_after_import_publication', 'stopped_repair_crash_after_repair_cas_before_withdrawal',
+      'stopped_repair_crash_during_withdrawal_before_ack']
+    // Each parent prints nested child/helper output before its trailing ok.
+    const cases = [...logs.matchAll(/test loss_report::tests::(stopped_repair_crash_[a-z_]+) \.\.\./g)]
+    if (exit !== '0' || cases.length !== 3 || expected.some(name => !cases.some(row => row[1] === name))
+      || !/test result: ok\. 3 passed; 0 failed; 0 ignored;/.test(logs)) throw new Error('Task7 actual enclosed three-parent execution failed')
+    this.writeArtifact('task007-destructive-result.json', { candidateSha: this.candidateSha, runId: this.runId,
+      imageRef: this.imageRef, containerId, artifact, executedParents: cases.length, passedParents: 3,
+      fictionalHistoricalSetup: true, nativeQualified: false })
+    return { executedParents: 3, passedParents: 3 }
   }
 
   async prepareNativeArtifacts(input: NativeArtifacts): Promise<{ sourceRoot: string; files: { name: string; path: string; sha256: string }[]; serverPath?: string }> {
@@ -1966,21 +2681,48 @@ export class RuntimeHarness {
 
   async cleanup(): Promise<{ ok: boolean; errors: string[] }> {
     const errors: string[] = []
+    await Promise.allSettled([...this.task007Children])
+    const brokers = [this.broker, ...this.task007Brokers].filter((broker): broker is RestrictedDockerBroker => !!broker)
+    const receipts = brokers.flatMap(broker => broker.receipts())
     const exactContainerIds = [...new Set([
       ...this.trackedSupervisorContainers, ...this.trackedForeignContainers,
-      ...this.trackedContainers, ...this.broker?.receiptIds?.() ?? [],
+      ...this.trackedContainers, ...receipts.map(receipt => receipt.containerId),
     ])]
-    const providerVolumes = new Set((this.broker?.receipts?.() ?? []).map(receipt => receipt.providerVolumeName).filter((value): value is string => !!value))
+    const providerVolumes = new Set(receipts.map(receipt => receipt.providerVolumeName).filter((value): value is string => !!value))
     const exactVolumes = [...new Set([...this.trackedVolumes, ...providerVolumes])]
-    const historyHelperNames = this.broker?.historyHelperNames?.() ?? []
+    const historyHelperNames = [...new Set([...brokers.flatMap(broker => broker.historyHelperNames()), ...this.task007HelperNames])]
     for (const id of [...this.trackedSupervisorContainers]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`supervisor ${id}: ${String(error)}`) }
     }
-    for (const id of [...this.broker?.receiptIds?.() ?? []]) {
+    for (const id of receipts.map(receipt => receipt.containerId)) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`managed runtime ${id}: ${String(error)}`) }
     }
     for (const name of historyHelperNames) {
-      try { this.removeContainerExact(name) } catch (error) { errors.push(`history helper ${name}: ${String(error)}`) }
+      try {
+        if (this.task007HelperNames.has(name)) {
+          const names = (await this.task007Docker(['ps', '-a', '--format', '{{.Names}}'])).trim().split('\n')
+          if (!names.includes(name)) continue
+          const observed = z.array(z.object({ Id: Task007Hex, Image: z.string(), Config: z.object({ Labels: z.record(z.string(), z.string()) }),
+            Mounts: z.array(z.object({ Type: z.string(), Name: z.string().optional(), Source: z.string().optional(), Destination: z.string(), RW: z.boolean() })) })).length(1)
+            .parse(JSON.parse(await this.task007Docker(['inspect', name])))[0]
+          const labels = observed.Config.Labels
+          const volumes = observed.Mounts.filter(mount => mount.Type === 'volume')
+          const binds = observed.Mounts.filter(mount => mount.Type === 'bind')
+          const kind = labels['com.freshell.task007-setup']
+          const parentMounts = kind === 'destructive-parents' && observed.Mounts.length === 2 && binds.length === 2
+            && binds.some(mount => mount.Source === this.testRoot && mount.Destination === this.testRoot && mount.RW)
+            && binds.some(mount => mount.Source === this.buildDir && mount.Destination === this.buildDir && !mount.RW)
+          const setupMounts = ['provider-home', 'registry-copy'].includes(kind) && volumes.length === 1
+            && !!volumes[0].Name && this.trackedVolumes.has(volumes[0].Name) && volumes[0].RW
+            && (kind === 'provider-home' ? observed.Mounts.length === 1 && volumes[0].Destination === '/home/freshell/provider'
+              : observed.Mounts.length === 2 && volumes[0].Destination === '/registry' && binds.length === 1
+                && !!binds[0].Source?.startsWith(`${this.testRoot}${path.sep}`) && binds[0].Destination === '/fixture' && !binds[0].RW)
+          if (observed.Image !== this.imageRef || labels['com.freshell.runtime-test-run-id'] !== this.runId
+            || labels['com.freshell.runtime-test-candidate'] !== this.candidateSha
+            || (!parentMounts && !setupMounts)) throw new Error('Task7 partial setup helper ownership is unknown')
+          await this.task007Docker(['rm', '--force', observed.Id])
+        } else this.removeContainerExact(name)
+      } catch (error) { errors.push(`history helper ${name}: ${String(error)}`) }
     }
     for (const id of [...this.trackedForeignContainers]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`foreign sentinel ${id}: ${String(error)}`) }
@@ -1988,15 +2730,15 @@ export class RuntimeHarness {
     for (const id of [...this.trackedContainers]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`tracked container ${id}: ${String(error)}`) }
     }
-    for (const volume of providerVolumes) {
-      try { docker(['volume', 'rm', volume]) } catch (error) { errors.push(`provider volume ${volume}: ${String(error)}`) }
-    }
-    for (const volume of [...this.trackedVolumes]) {
+    for (const volume of exactVolumes) {
       try { docker(['volume', 'rm', volume]) } catch (error) { errors.push(`volume ${volume}: ${String(error)}`) }
     }
     if (this.brokerStarted) {
       try { await this.broker.close() } catch (error) { errors.push(`broker close: ${String(error)}`) }
       this.brokerStarted = false
+    }
+    for (const broker of this.task007Brokers) {
+      try { await broker.close() } catch (error) { errors.push(`Task7 broker close: ${String(error)}`) }
     }
     let resourcesAbsent = false
     try {
@@ -2031,7 +2773,7 @@ export class RuntimeHarness {
     }
     ensurePrivateDirectory(this.evidenceDir)
     writePrivateJson(path.join(this.evidenceDir, 'cleanup.json'), cleanup)
-    writePrivateJson(path.join(this.evidenceDir, 'ownership-after.json'), { brokerReceipts: this.broker?.receipts?.() ?? [], brokerEvents: this.broker?.eventsSnapshot?.() ?? [] })
+    writePrivateJson(path.join(this.evidenceDir, 'ownership-after.json'), { brokerReceipts: receipts, brokerEvents: brokers.flatMap(broker => broker.eventsSnapshot()) })
     this.collectScenarioLifecycleLogs()
     return { ok: cleanup.ok, errors }
   }
@@ -2135,14 +2877,10 @@ export class RuntimeHarness {
     /** Exact artifact-owned historical session host for legacy enclosure proof. */
     hostBinaryPath?: string
   }): Promise<SupervisorInstance> {
-    const scenarioId = sanitizeName(options.scenarioId)
-    const scenarioRoot = this.scenarioPath(scenarioId)
-    const controlDir = path.join(scenarioRoot, 'control')
+    const { scenarioId, controlDir, runtimeRoot } = this.supervisorLocation(options.scenarioId)
     // Linux Unix-domain sockets have a small sun_path budget. Runtime paths
     // include a long incarnation UUID plus `/host.sock`, so keep the durable
     // runtime root intentionally short and deterministic across restarts.
-    const runtimeKey = `${scenarioId.slice(0, 6)}-${createHash('sha256').update(scenarioId).digest('hex').slice(0, 8)}`
-    const runtimeRoot = path.join(this.testRoot, 'r', runtimeKey, 'x')
     fs.mkdirSync(controlDir, { recursive: true, mode: 0o700 })
     fs.mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 })
     const worstHostSocket = path.join(runtimeRoot, `incarnation-${'0'.repeat(36)}`, 'host.sock')
@@ -2166,7 +2904,7 @@ export class RuntimeHarness {
       ? this.validateRunBuildBinary(options.binaryPath, 'supervisor')
       : defaultSupervisorBinary
     const hostBinary = options.hostBinaryPath
-      ? this.validateRunBuildBinary(options.hostBinaryPath, 'host')
+      ? this.validateSupervisorHostBinary(options.hostBinaryPath)
       : binaryKind === 'test' ? this.testHostBinary : this.releaseHostBinary
     const name = `freshell-p${this.phase}-supervisor-${this.runId.slice(0, 8)}-${scenarioId}-${randomUUID().slice(0, 8)}`
     const args = [
@@ -2237,6 +2975,19 @@ export class RuntimeHarness {
     const buildRoot = `${fs.realpathSync(this.buildDir)}${path.sep}`
     if (!resolved.startsWith(buildRoot) || !fs.statSync(resolved).isFile()) {
       throw new Error(`${label} binary override must be a regular file under this run's build directory`)
+    }
+    return resolved
+  }
+
+  private validateSupervisorHostBinary(candidate: string): string {
+    const fixture = [...this.task007Fixtures.values()].find(fixture => fixture.input.hostBinaryPath === candidate)
+    if (!fixture) return this.validateRunBuildBinary(candidate, 'host')
+    const resolved = fs.realpathSync(candidate)
+    const info = fs.statSync(resolved)
+    if (resolved !== candidate || !resolved.startsWith(`${fs.realpathSync(fixture.input.ownerRoot)}${path.sep}`)
+      || !info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o777) !== 0o550
+      || task007FileHash(resolved) !== fixture.input.hostBinarySha256) {
+      throw new Error('registered Task7 host artifact digest or custody changed')
     }
     return resolved
   }
@@ -3349,6 +4100,8 @@ export class ManagedRuntimeOwner {
   private readonly nativeChallenges = new Map<string, { soulId: string; nativeSessionId: string; marker: string }>()
   private readonly providerProbes = new Map<string, { child?: ChildProcess; settlement: Promise<string> }>()
   private syntheticSource?: { source: SyntheticSource; root: string; nonce: string }
+  private stoppedRepairBatch?: Task007PreparedStoppedFixture
+  private runtimePreparation?: Promise<void>
   private receiptCandidateBefore?: RuntimeCandidateIntegrity
   private chaosEvidencePublished = false
   private lossRecovery?: { handle: ExactRuntimeHandle; incidentId: string }
@@ -3419,6 +4172,143 @@ export class ManagedRuntimeOwner {
     }
   }
 
+  get workspaceCwd(): string { return this.stoppedRepairBatch?.input.workspacePath ?? this.repoRoot }
+
+  async prepareSyntheticStoppedRepairBatch(): Promise<SyntheticStoppedRepairBatchFacts> {
+    if (this.stoppedRepairBatch) return this.syntheticStoppedRepairBatchFacts()
+    if (process.env.FRESHELL_RUNTIME_SYNTHETIC_RESUME !== '1' || this.runtime.phase !== 3
+      || this.enabledProviders.length !== 0 || this.freshAgentModes.length !== 0
+      || this.supervisorBinaryKind !== 'test' || this.web || this.stopSettlement || this.syntheticSource || this.webHomeDir) {
+      throw new Error('stopped repair batch requires an isolated grant-free phase-three owner before web setup')
+    }
+    const preparation = this.runtime.prepareTask007StoppedFixture('browser')
+    this.runtimePreparation = preparation.then(() => undefined)
+    await this.runtimePreparation
+    this.stoppedRepairBatch = await preparation
+    this.webHomeDir = path.join(this.runtime.testRoot, 'task007-browser-web-home')
+    ensurePrivateDirectory(this.webHomeDir)
+    this.serverEnv.OPENCODE_DB = this.stoppedRepairBatch.sourceDatabaseFile
+    this.supervisorEnv.OPENCODE_DB = this.stoppedRepairBatch.sourceDatabaseFile
+    return this.syntheticStoppedRepairBatchFacts()
+  }
+
+  private registeredStoppedRepairBatch(fixtureId?: string): Task007PreparedStoppedFixture {
+    const batch = this.stoppedRepairBatch
+    if (!batch || (fixtureId !== undefined && fixtureId !== batch.input.fixtureId)
+      || batch.input.runId !== this.runtime.runId || batch.input.candidateSha !== this.runtime.candidateSha) {
+      throw new Error('exact registered stopped repair fixture required')
+    }
+    return batch
+  }
+
+  async syntheticStoppedRepairBatchFacts(): Promise<SyntheticStoppedRepairBatchFacts> {
+    const batch = this.registeredStoppedRepairBatch()
+    return SyntheticStoppedRepairBatchFactsSchema.parse({ fixtureId: batch.input.fixtureId,
+      families: batch.source.families.map(family => ({ rootId: family.rootId, childId: family.childId,
+        grandchildId: family.grandchildId, baselineMessages: Object.fromEntries(family.baselineMessages),
+        baselineParts: Object.fromEntries(family.baselineParts) })),
+      targets: batch.output.targets.map((target, index) => ({ soulId: target.soulId, providerStoreId: target.providerStoreId,
+        rootSessionId: target.rootSessionId, terminalId: batch.input.targets[index].terminalId,
+        streamId: batch.input.targets[index].streamId, incidentId: target.incidentId, viewIds: target.viewIds })),
+      canonicalChoices: batch.output.canonicalChoices.map(({ rootSessionId, soulId }) => ({ rootSessionId, soulId })),
+      unrelated: { soulId: batch.output.unrelated.soulId, incidentId: batch.output.unrelated.incidentId,
+        viewId: batch.output.unrelated.viewId, noticeIds: batch.output.unrelated.noticeIds,
+        outboxEventIds: batch.output.unrelated.outboxEventIds,
+        exportSha256: batch.output.unrelated.exports.map(artifact => artifact.sha256) },
+    })
+  }
+
+  async syntheticStoppedRepairBatchObservation(fixtureId: string, operationId: string): Promise<SyntheticStoppedRepairBatchObservation> {
+    const batch = this.registeredStoppedRepairBatch(fixtureId)
+    Task007Id.parse(operationId)
+    if (!this.supervisor || this.supervisor.volumeName !== batch.volumeName) throw new Error('registered batch supervisor required')
+    const records = async () => Task007RepairRecordsSchema.parse(JSON.parse(await this.ownedDockerProbe(
+      this.supervisor.containerId, ['python3', '-I', '-c', TASK007_STOPPED_REPAIR_OBSERVATION,
+        '/var/lib/freshell-supervisor/runtime.sqlite3', batch.metadataFile, operationId, '/var/lib/freshell-supervisor'], false)))
+    const observed = await records()
+    if (observed.fixtureId !== fixtureId || observed.operationId !== operationId
+      || observed.souls.some(soul => !batch.output.targets.some(target => target.soulId === soul.soulId))
+      || observed.roots.some(root => !batch.source.families.some(family => family.rootId === root.rootSessionId))) {
+      throw new Error('current repair observation differs from registered fixture and operation')
+    }
+    if (observed.souls.some(soul => soul.activeWriters !== 0)) throw new Error('stopped store observation requires zero current writers')
+    const installedStores: SyntheticStoppedRepairBatchObservation['installedStores'] = []
+    for (const root of observed.roots) {
+      const soul = observed.souls.find(soul => soul.soulId === root.canonicalSoulId)
+      if (!soul || soul.desiredState !== 'stopped' || soul.nativeSessionId !== root.rootSessionId
+        || soul.providerStoreId !== root.destinationStoreId) throw new Error('current stopped store/root differs from repair receipt')
+      installedStores.push(await this.readTask007StoppedStore(batch, root))
+    }
+    if (JSON.stringify(await records()) !== JSON.stringify(observed)) throw new Error('current stopped repair records changed during independent store observation')
+    return SyntheticStoppedRepairBatchObservationSchema.parse({ ...observed, installedStores })
+  }
+
+  private async readTask007StoppedStore(batch: Task007PreparedStoppedFixture,
+    root: SyntheticStoppedRepairBatchObservation['roots'][number]): Promise<SyntheticStoppedRepairBatchObservation['installedStores'][number]> {
+    const target = batch.output.targets.find(target => target.soulId === root.canonicalSoulId
+      && target.providerStoreId === root.destinationStoreId && target.rootSessionId === root.rootSessionId)
+    const receipt = target && this.runtime.broker.receipts().find(receipt => receipt.containerId === target.containerId
+      && receipt.soulId === target.soulId && receipt.incarnationId === target.incarnationId)
+    if (!target || !receipt || receipt.providerVolumeName !== target.providerVolumeName
+      || receipt.imageRef !== this.runtime.imageRef || receipt.workspacePath !== batch.input.workspacePath
+      || receipt.hostBinaryPath !== batch.input.hostBinaryPath) throw new Error('registered stopped store has no exact current-image receipt')
+    const state = z.array(z.object({ Id: z.literal(target.containerId), State: z.object({ Running: z.literal(false) }) })).length(1)
+    state.parse(JSON.parse(await this.trackedDockerProbe(target.containerId, ['inspect', target.containerId])))
+    const selected = { providerStoreId: root.destinationStoreId, nativeSessionId: root.rootSessionId,
+      imageRef: this.runtime.imageRef, providerHome: '/home/freshell/provider', workspacePath: batch.input.workspacePath,
+      cwd: batch.input.cwd, providerUid: 65534, providerGid: 0 }
+    const name = `freshell-history-${randomUUID()}`
+    const probe = (args: string[]) => this.trackedDockerProbe(target.containerId, args, true)
+    let failure: unknown
+    try {
+      const id = (await probe(['create', '--name', name, '--user', '65534:0', '--network', 'none', '--read-only',
+        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--memory', '256m', '--memory-swap', '256m',
+        '--cpus', '0.5', '--pids-limit', '32', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=64m',
+        '--env', 'HOME=/home/freshell/provider', '--env', 'XDG_DATA_HOME=/home/freshell/provider/.local/share',
+        '--env', 'XDG_CONFIG_HOME=/home/freshell/provider/.config', '--env', 'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db',
+        '--mount', `type=volume,source=${target.providerVolumeName},target=/home/freshell/provider,readonly`,
+        '--mount', `type=bind,source=${batch.input.hostBinaryPath},target=/runtime/freshell-session-host,readonly`,
+        '--mount', `type=bind,source=${batch.input.workspacePath},target=${batch.input.workspacePath},readonly`,
+        '--workdir', batch.input.cwd, '--entrypoint', '/runtime/freshell-session-host', this.runtime.imageRef,
+        'retained-opencode-store-worker', JSON.stringify(selected)])).trim()
+      if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('stopped store reader returned no exact helper ID')
+      await probe(['start', id])
+      const exit = (await probe(['wait', id])).trim()
+      const output = await probe(['logs', id])
+      this.runtime.writeArtifact(`task007-store-read-${root.canonicalSoulId}.json`, { fixtureId: batch.input.fixtureId, helperId: id, exit, output })
+      if (exit !== '0') throw new Error('current-image stopped store reader refused registered source')
+      const measured = z.object({ request: z.object({ providerStoreId: z.literal(selected.providerStoreId), nativeSessionId: z.literal(selected.nativeSessionId),
+        imageRef: z.literal(selected.imageRef), providerHome: z.literal(selected.providerHome), workspacePath: z.literal(selected.workspacePath),
+        cwd: z.literal(selected.cwd), providerUid: z.literal(65534), providerGid: z.literal(0) }).strict(),
+        providerVersion: Task007Id, sourceSchemaFingerprint: Task007Id, migrationJournalFingerprint: Task007Id,
+        generation: Task007Id, rowCount: z.number().int().nonnegative() }).strict().parse(JSON.parse(output))
+      return { rootSessionId: root.rootSessionId, providerStoreId: root.destinationStoreId,
+        providerUid: measured.request.providerUid, providerGid: measured.request.providerGid, providerVersion: measured.providerVersion,
+        sourceSchemaFingerprint: measured.sourceSchemaFingerprint, migrationJournalFingerprint: measured.migrationJournalFingerprint,
+        generation: measured.generation, rowCount: measured.rowCount }
+    } catch (error) { failure = error; throw error }
+    finally {
+      try { await probe(['rm', '--force', name]) }
+      catch (cleanupError) {
+        if (failure) throw new AggregateError([failure, cleanupError], 'stopped store reader and cleanup failed')
+        throw cleanupError
+      }
+    }
+  }
+
+  async setSyntheticStoppedRepairFault(fixtureId: string, preset: SyntheticStoppedRepairFault): Promise<{ controlEpoch: number | null }> {
+    const batch = this.registeredStoppedRepairBatch(fixtureId)
+    const fault = SyntheticStoppedRepairFaultSchema.parse(preset)
+    if (this.supervisorBinaryKind !== 'test') throw new Error('stopped repair faults require the feature-built supervisor')
+    if (this.supervisor && this.supervisor.volumeName !== batch.volumeName) throw new Error('registered batch supervisor differs')
+    delete this.supervisorEnv.FRESHELL_RUNTIME_CRASH_POINT
+    delete this.supervisorEnv.FRESHELL_RUNTIME_STOPPED_REPAIR_RESUME_OBSERVATION_FAIL
+    if (fault === 'first_resume_observation') this.supervisorEnv.FRESHELL_RUNTIME_STOPPED_REPAIR_RESUME_OBSERVATION_FAIL = '1'
+    else if (fault !== 'none') this.supervisorEnv.FRESHELL_RUNTIME_CRASH_POINT = `stopped_repair_${fault}`
+    if (this.supervisor) await this.replaceSupervisor('graceful')
+    return { controlEpoch: this.supervisor ? await this.controlEpoch() : null }
+  }
+
   async syntheticOpenCodeSourceFacts(): Promise<SyntheticOpenCodeSourceFacts> {
     const fixture = this.syntheticSource
     if (!fixture) throw new Error('synthetic OpenCode source is not registered')
@@ -3483,7 +4373,8 @@ export class ManagedRuntimeOwner {
   }
 
   async start(): Promise<RuntimeWebInfo> {
-    await this.runtime.prepare()
+    this.runtimePreparation ??= this.runtime.prepare()
+    await this.runtimePreparation
     this.qualificationSupervisorBin = this.buildQualificationSupervisor()
     this.serverBin = this.buildManagedServer()
     const selected = this.pendingQualificationProviders()
@@ -3520,9 +4411,13 @@ export class ManagedRuntimeOwner {
     }
     this.supervisor = await this.runtime.startSupervisor({
       scenarioId: 'browser-managed-runtime',
+      ...(this.stoppedRepairBatch ? { volumeName: this.stoppedRepairBatch.volumeName,
+        hostBinaryPath: this.stoppedRepairBatch.input.hostBinaryPath } : {}),
       binaryKind: this.supervisorBinaryKind,
       env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
       binaryPath: this.qualificationSupervisorBin,
+      ...(this.stoppedRepairBatch && this.supervisorEnv.FRESHELL_RUNTIME_CRASH_POINT
+        ? { crashPoint: this.supervisorEnv.FRESHELL_RUNTIME_CRASH_POINT } : {}),
     })
     this.web = this.webFactory({
       binary: this.serverBin, repoRoot: this.repoRoot, candidateSha: this.runtime.candidateSha,
@@ -3554,7 +4449,7 @@ export class ManagedRuntimeOwner {
         await fsp.writeFile(path.join(freshell, 'config.json'), JSON.stringify({
           version: 1,
           settings: {
-            defaultCwd: this.repoRoot,
+            defaultCwd: this.workspaceCwd,
             codingCli: {
               enabledProviders: this.enabledProviders,
               providers: {
@@ -3661,6 +4556,9 @@ export class ManagedRuntimeOwner {
       reuseSecret: true,
       env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
       binaryPath: this.qualificationSupervisorBin,
+      ...(this.stoppedRepairBatch ? { hostBinaryPath: this.stoppedRepairBatch.input.hostBinaryPath } : {}),
+      ...(this.stoppedRepairBatch && this.supervisorEnv.FRESHELL_RUNTIME_CRASH_POINT
+        ? { crashPoint: this.supervisorEnv.FRESHELL_RUNTIME_CRASH_POINT } : {}),
       ...(crashPoint ? { crashPoint } : {}),
     })
     return this.supervisor

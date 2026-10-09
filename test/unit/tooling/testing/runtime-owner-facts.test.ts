@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as owner from '../../../../scripts/testing/runtime-sandbox.js'
 import * as external from '../../../../scripts/testing/runtime-external-browser.js'
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
+import http from 'node:http'
+import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -41,6 +44,527 @@ const handle = {
   incarnationId: 'incarnation-owned', containerId: 'b'.repeat(64),
   hostBootId: 'boot-owned', nativeSessionId: 'native-owned',
 }
+
+describe('Task7 exact library test artifact packaging', () => {
+  it('packages the actual Cargo-selected library harness through an asynchronous process and refuses decoys', async () => {
+    const crate = path.join(fixtureRepoRoot, 'crates/freshell-supervisor')
+    const source = path.join(crate, 'src/lib.rs')
+    const executable = path.join(fixtureRepoRoot, 'target/debug/deps/freshell_supervisor-fixture')
+    await fsp.mkdir(path.dirname(source), { recursive: true })
+    await fsp.writeFile(source, '// controlled compiler source fixture\n')
+    await fsp.mkdir(path.dirname(executable), { recursive: true })
+    const invocation = path.join(fixtureRepoRoot, 'harness-invocation.json')
+    await fsp.writeFile(executable, `#!${process.execPath}\nconst fs=require('node:fs');fs.writeFileSync(${JSON.stringify(invocation)},JSON.stringify(process.argv.slice(2)));process.stdout.write('loss_report::tests::task007_export_stopped_repair_fixture: test\\n\\n1 test, 0 benchmarks\\n')\n`, { mode: 0o700 })
+    const harness = new owner.RuntimeHarness(fixtureRepoRoot, 'task007-packaging-unit', 3, { bootstrapProviders: [] })
+    const artifact = { reason: 'compiler-artifact', package_id: `path+file://${crate}#0.1.0`,
+      target: { name: 'freshell_supervisor', kind: ['lib'], src_path: source },
+      profile: { test: true }, features: [], executable }
+    const input = path.join(fixtureRepoRoot, 'compiler-messages.jsonl')
+    const childScript = path.join(fixtureRepoRoot, 'compiler-fixture.cjs')
+    const commandLog = path.join(fixtureRepoRoot, 'compiler-command.json')
+    await fsp.writeFile(childScript, `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(commandLog)},JSON.stringify(process.argv.slice(2)));setTimeout(()=>process.stdout.write(fs.readFileSync(${JSON.stringify(input)})),10)\n`)
+    const execute: owner.Task007RunChild = (file, args, options) => new Promise((resolve, reject) => {
+      const compiler = file.endsWith('/mise')
+      execFile(compiler ? process.execPath : file, compiler ? [childScript, file, ...args] : args, options, (error, stdout, stderr) => {
+        if (error) reject(error)
+        else resolve({ stdout: String(stdout), stderr: String(stderr) })
+      })
+    })
+    const messages = (records: unknown[]) => records.map(record => JSON.stringify(record)).join('\n') + '\n'
+    const build = { reason: 'build-finished', success: true }
+    const buildDir = path.join(fixtureRepoRoot, 'private-build')
+    await fsp.writeFile(input, messages([{ ...artifact, target: { ...artifact.target, kind: ['bin'] }, profile: { test: false } }, artifact, build]))
+    const packaged = await owner.prepareTask007LibTestArtifact({ repoRoot: fixtureRepoRoot, buildDir, candidateSha: harness.candidateSha }, execute)
+    expect(await fsp.readFile(packaged.path)).toEqual(await fsp.readFile(executable))
+    expect((await fsp.stat(packaged.path)).mode & 0o777).toBe(0o700)
+    expect(packaged.candidateSha).toBe(harness.candidateSha)
+    expect(JSON.parse(await fsp.readFile(invocation, 'utf8'))).toEqual(['--list', '--exact', 'loss_report::tests::task007_export_stopped_repair_fixture'])
+    expect(JSON.parse(await fsp.readFile(commandLog, 'utf8'))).toEqual([
+      path.join(os.homedir(), '.local/bin/mise'), 'exec', 'rust@1.96', '--', 'cargo', 'test',
+      '-p', 'freshell-supervisor', '--lib', '--no-run', '--message-format=json',
+    ])
+    const invalid = [
+      [build], [artifact, artifact, build], [artifact, { ...build, success: false }],
+      [{ ...artifact, profile: { test: false } }, build],
+      [{ ...artifact, target: { ...artifact.target, src_path: path.join(crate, 'src/main.rs') } }, build],
+      [{ ...artifact, package_id: `path+file://${fixtureRepoRoot}/foreign#0.1.0` }, build],
+    ]
+    for (let index = 0; index < invalid.length; index++) {
+      await fsp.writeFile(input, messages(invalid[index]))
+      await expect(owner.prepareTask007LibTestArtifact({ repoRoot: fixtureRepoRoot,
+        buildDir: path.join(fixtureRepoRoot, `rejected-build-${index}`), candidateSha: harness.candidateSha }, execute)).rejects.toThrow(/artifact|build/)
+    }
+  })
+})
+
+describe('Task7 asynchronous private fixture exporter', () => {
+  it('keeps the real Unix broker responsive during child export and verifies private output custody', async () => {
+    const root = fixtureRepoRoot
+    const harness = new owner.RuntimeHarness(root, 'task007-export-unit', 3, { bootstrapProviders: [] })
+    const imageRef = `sha256:${'a'.repeat(64)}`
+    const host = path.join(root, 'pinned-host')
+    await fsp.writeFile(host, 'controlled host artifact', { mode: 0o500 })
+    const digest = (bytes: string | Buffer) => createHash('sha256').update(bytes).digest('hex')
+    const socket = path.join(root, 'daemon.sock')
+    const broker = new RestrictedDockerBroker({ realSocketPath: socket, proxySocketPath: path.join(root, 'broker.sock'),
+      runtimeRootPrefix: path.join(root, 'r'), allowedHostBinaryPaths: new Set([host]), allowedImageRefs: new Set([imageRef]),
+      testRunId: harness.runId, logPath: path.join(root, 'broker.jsonl') })
+    let requests = 0
+    const upstream = http.createServer((_req, res) => { requests++; res.end('OK') })
+    const target = (index: number) => ({ soulId: `soul-unit-${index}`, providerStoreId: `store-unit-${index}`, terminalId: `terminal-unit-${index}`, streamId: `stream-unit-${index}` })
+    const view = (index: number) => ({ viewId: `view-unit-${index}`, ownerId: 'owner-unit', workspaceId: 'workspace-unit', tabId: `tab-unit-${index}`, paneId: `pane-unit-${index}` })
+    const input: owner.Task007FixtureInput = { schemaVersion: 1, fixtureId: 'fixture-unit', runId: harness.runId,
+      candidateSha: harness.candidateSha, installationId: 'installation-unit', ownerRoot: root,
+      runtimeRoot: path.join(root, 'r/case/x'), workspacePath: root, cwd: root, gitCommonDir: null,
+      imageRef, hostBinaryPath: host, hostBinarySha256: digest(await fsp.readFile(host)), dockerDaemonId: 'daemon-unit',
+      brokerSocketPath: broker.proxySocketPath, source: { rootSessionIds: Array.from({ length: 7 }, (_, index) => `ses_unit_${index}`), unrelatedSessionId: 'ses_unrelated' },
+      targets: Array.from({ length: 9 }, (_, index) => target(index)), canonicalChoices: [{ rootOrdinal: 0, targetOrdinal: 0 }, { rootOrdinal: 1, targetOrdinal: 8 }],
+      explicitViews: [0, 1, 7, 8].map(index => ({ ...view(index), targetOrdinal: index })), unrelated: { ...view(9), target: target(9) } }
+    const bytes = 'controlled checkpointed database bytes'
+    const output: owner.Task007FixtureOutput = { schemaVersion: 1, evidenceKind: 'historical-fixture-setup', fixtureId: input.fixtureId,
+      runId: input.runId, candidateSha: input.candidateSha, installationId: input.installationId, dockerDaemonId: input.dockerDaemonId,
+      imageRef, hostBinarySha256: input.hostBinarySha256, workspacePath: root, runtimeRoot: input.runtimeRoot,
+      registry: { file: 'runtime.sqlite3', schemaVersion: 7, sha256: digest(bytes) }, historicalControlEpoch: 1,
+      targets: input.targets.map((item, index) => ({ soulId: item.soulId, providerStoreId: item.providerStoreId, rootSessionId: input.source.rootSessionIds[[0, 1, 2, 3, 4, 5, 6, 0, 1][index]],
+        incarnationId: `incarnation-unit-${index}`, launchNonce: `launch-unit-${index}`, containerId: String(index + 1).repeat(64),
+        providerVolumeName: `freshell-provider-${digest(input.installationId + '\0' + item.soulId).slice(0, 24)}`,
+        runtimeDir: path.join(input.runtimeRoot, `incarnation-unit-${index}`), hostBinaryPath: host, immutableConfigDigest: `sha256:${'b'.repeat(64)}`,
+        incidentId: `incident-unit-${index}`, expectedIntentRevision: 1, viewIds: input.explicitViews.filter(item => item.targetOrdinal === index).map(item => item.viewId) })),
+      canonicalChoices: input.canonicalChoices.map(choice => ({ rootSessionId: input.source.rootSessionIds[choice.rootOrdinal], soulId: input.targets[choice.targetOrdinal].soulId, expectedIntentRevision: 1 })),
+      unrelated: { soulId: input.unrelated.target.soulId, incidentId: 'incident-unrelated', viewId: input.unrelated.viewId, expectedIntentRevision: 1, noticeIds: ['notice-unrelated'], outboxEventIds: ['event-unrelated'], exports: [] } }
+    const inputFile = path.join(root, 'input.json')
+    const metadataControl = path.join(root, 'metadata-control.json')
+    const calls = path.join(root, 'export-child-call.json')
+    const executable = path.join(root, 'controlled-exporter.cjs')
+    await fsp.writeFile(inputFile, JSON.stringify(input), { mode: 0o600 })
+    await fsp.writeFile(metadataControl, JSON.stringify(output), { mode: 0o600 })
+    await fsp.mkdir(input.runtimeRoot, { recursive: true })
+    await fsp.writeFile(executable, `#!${process.execPath}\nconst fs=require('node:fs'),http=require('node:http'),path=require('node:path');fs.writeFileSync(${JSON.stringify(calls)},JSON.stringify({args:process.argv.slice(2),env:process.env}));const input=JSON.parse(fs.readFileSync(process.env.FRESHELL_TASK007_STOPPED_FIXTURE_INPUT_FILE));const request=http.request({socketPath:input.brokerSocketPath,path:'/_ping'},res=>{res.resume();res.on('end',()=>{const out=process.env.FRESHELL_TASK007_STOPPED_FIXTURE_OUTPUT_DIR;fs.writeFileSync(path.join(out,'runtime.sqlite3'),${JSON.stringify(bytes)},{mode:0o600});fs.writeFileSync(path.join(out,'metadata.json'),fs.readFileSync(${JSON.stringify(metadataControl)}),{mode:0o600});process.stdout.write('test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\\n')})});request.on('error',()=>process.exit(2));request.end();\n`, { mode: 0o700 })
+    const artifact = { path: executable, sha256: digest(await fsp.readFile(executable)), candidateSha: harness.candidateSha,
+      packageId: 'controlled-export-unit', features: [], sourcePath: path.join(root, 'controlled-source') }
+    try {
+      await new Promise<void>(resolve => upstream.listen(socket, resolve))
+      await broker.start()
+      vi.stubEnv('UNRELATED_OWNER_ENV', 'must-not-inherit')
+      const outputDir = path.join(root, 'output')
+      await fsp.mkdir(outputDir, { mode: 0o700 })
+      const result = await owner.executeTask007FixtureExporter({ repoRoot: root, artifact, inputFile, outputDir })
+      expect(result).toEqual(output)
+      expect(requests).toBe(1)
+      const child = JSON.parse(await fsp.readFile(calls, 'utf8'))
+      expect(child.args).toEqual(['--exact', owner.TASK007_EXPORT_TEST, '--nocapture', '--test-threads=1'])
+      expect(child.env).toEqual({ FRESHELL_TASK007_STOPPED_FIXTURE_INPUT_FILE: inputFile, FRESHELL_TASK007_STOPPED_FIXTURE_OUTPUT_DIR: outputDir })
+      await fsp.writeFile(metadataControl, JSON.stringify({ ...output, candidateSha: 'f'.repeat(40) }))
+      const invalidOutput = path.join(root, 'invalid-output')
+      await fsp.mkdir(invalidOutput, { mode: 0o700 })
+      await expect(owner.executeTask007FixtureExporter({ repoRoot: root, artifact, inputFile, outputDir: invalidOutput })).rejects.toThrow(/fixture.*bind|identity/)
+    } finally {
+      vi.unstubAllEnvs()
+      await broker.close()
+      await new Promise<void>(resolve => upstream.close(() => resolve()))
+    }
+  })
+})
+
+describe('Task7 empty provider HOME initialization', () => {
+  it('joins an actual Created inspection to its receipt and starts only the fixed private helper', async () => {
+    const directory = path.join(fixtureRepoRoot, 'home-initializer')
+    await fsp.mkdir(directory, { mode: 0o700 })
+    const calls = path.join(directory, 'calls.jsonl')
+    const state = path.join(directory, 'state.json')
+    const executable = path.join(directory, 'docker-control.cjs')
+    const containerId = 'a'.repeat(64), imageRef = `sha256:${'b'.repeat(64)}`
+    const receipt = { containerId, createdAt: 'controlled', requestDigest: 'controlled-request-only', incarnationId: 'incarnation-unit',
+      soulId: 'soul-unit', imageRef, runtimeDir: path.join(fixtureRepoRoot, 'r/x/incarnation-unit'), providerVolumeName: `freshell-provider-${'c'.repeat(24)}`,
+      workspacePath: fixtureRepoRoot, hostBinaryPath: path.join(fixtureRepoRoot, 'host') }
+    const target: owner.Task007FixtureOutput['targets'][number] = { ...receipt, rootSessionId: 'ses_unit', providerStoreId: 'store-unit',
+      providerVolumeName: receipt.providerVolumeName, hostBinaryPath: receipt.hostBinaryPath, launchNonce: 'nonce-unit',
+      immutableConfigDigest: 'actual-config-only', incidentId: 'incident-unit', expectedIntentRevision: 1, viewIds: [] }
+    const input = { runId: 'owned-home-unit', candidateSha: 'd'.repeat(40), imageRef, installationId: 'installation-unit' }
+    const inspection = { Id: containerId, Image: imageRef, State: { Status: 'created', Running: false, Pid: 0 },
+      Config: { Labels: { 'com.freshell.runtime-test-run-id': input.runId, 'com.freshell.soul-id': receipt.soulId,
+        'com.freshell.incarnation-id': receipt.incarnationId, 'com.freshell.installation-id': input.installationId } },
+      Mounts: [{ Type: 'volume', Name: receipt.providerVolumeName, Destination: '/home/freshell/provider', RW: true }] }
+    await fsp.writeFile(state, JSON.stringify(inspection), { mode: 0o600 })
+    await fsp.writeFile(executable, `#!${process.execPath}\nconst fs=require('node:fs');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='inspect')process.stdout.write(JSON.stringify([JSON.parse(fs.readFileSync(${JSON.stringify(state)}))]));else if(args[0]==='ps')process.stdout.write('');else if(args[0]==='create')process.stdout.write('${'e'.repeat(64)}');else if(args[0]==='wait')process.stdout.write('0');else if(args[0]==='logs')process.stdout.write(JSON.stringify({kind:'historical-fixture-home-setup',uid:65534,gid:0,mode:448,priorEntries:0}));else if(!['start','rm'].includes(args[0]))process.exit(3);\n`, { mode: 0o700 })
+    const execute: owner.Task007RunChild = (_file, args, options) => new Promise((resolve, reject) => {
+      execFile(executable, args, options, (error, stdout, stderr) => error ? reject(error) : resolve({ stdout, stderr }))
+    })
+    const name = `freshell-task007-setup-${'01234567-89ab-4cde-8fab-0123456789ab'}`
+    await expect(owner.initializeTask007ProviderHome({ input, target, receipt, name }, execute)).resolves.toMatchObject({ uid: 65534, gid: 0, mode: 448, priorEntries: 0 })
+    const firstCalls = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+    const create = firstCalls.find(args => args[0] === 'create')!
+    expect(create).toContain('--read-only')
+    expect(create.slice(create.indexOf('--cap-add'), create.indexOf('--cap-add') + 2)).toEqual(['--cap-add', 'CHOWN'])
+    expect(create).not.toContain('DAC_OVERRIDE')
+    expect(create).toContain(`type=volume,source=${receipt.providerVolumeName},target=/home/freshell/provider,volume-nocopy`)
+    expect(firstCalls.filter(args => args[0] === 'start')).toEqual([['start', 'e'.repeat(64)]])
+    expect(firstCalls.at(-1)).toEqual(['rm', '--force', 'e'.repeat(64)])
+    await fsp.writeFile(state, JSON.stringify({ ...inspection, State: { Status: 'running', Running: true, Pid: 7 } }))
+    await expect(owner.initializeTask007ProviderHome({ input, target, receipt, name }, execute)).rejects.toThrow(/Created|never.started/)
+    const finalCalls = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+    expect(finalCalls.filter(args => args[0] === 'create')).toHaveLength(1)
+    await fsp.writeFile(state, JSON.stringify({ ...inspection, Config: { Labels: { ...inspection.Config.Labels, 'com.freshell.installation-id': 'foreign-installation' } } }))
+    await expect(owner.initializeTask007ProviderHome({ input, target, receipt, name }, execute)).rejects.toThrow(/ownership|Created/)
+  })
+})
+
+describe('Task7 closed historical snapshot installation', () => {
+  it('installs private schema-seven bytes before any ordinary opener and refuses current schema or active WAL', async () => {
+    const sourceDir = path.join(fixtureRepoRoot, 'closed-snapshot')
+    const registryRoot = path.join(fixtureRepoRoot, 'new-registry')
+    await fsp.mkdir(sourceDir, { mode: 0o700 })
+    await fsp.mkdir(registryRoot, { mode: 0o700 })
+    const databaseFile = path.join(sourceDir, 'runtime.sqlite3')
+    const db = new DatabaseSync(databaseFile)
+    db.exec('CREATE TABLE installation(singleton INTEGER,schema_version INTEGER); INSERT INTO installation VALUES(1,7); CREATE TABLE souls(soul_id TEXT); CREATE TABLE incarnations(incarnation_id TEXT); CREATE TABLE loss_incidents(incident_id TEXT);')
+    db.close()
+    await fsp.chmod(databaseFile, 0o600)
+    await fsp.writeFile(path.join(sourceDir, 'lifecycle.jsonl'), 'historical setup only\n', { mode: 0o600 })
+    await fsp.writeFile(path.join(sourceDir, 'metadata.json'), '{"evidenceKind":"historical-fixture-setup"}', { mode: 0o600 })
+    await fsp.mkdir(path.join(sourceDir, 'incidents'), { mode: 0o700 })
+    await fsp.writeFile(path.join(sourceDir, 'incidents/incident-unit.json'), '{"historical":true}', { mode: 0o600 })
+    const digest = () => createHash('sha256').update(fs.readFileSync(databaseFile)).digest('hex')
+    await expect(owner.installTask007HistoricalSnapshot({ sourceDir, registryRoot, sha256: digest() })).resolves.toMatchObject({ schemaVersion: 7, sha256: digest() })
+    expect(await fsp.readFile(path.join(registryRoot, 'runtime.sqlite3'))).toEqual(await fsp.readFile(databaseFile))
+    expect((await fsp.stat(path.join(registryRoot, 'runtime.sqlite3'))).mode & 0o777).toBe(0o600)
+    expect(await fsp.readFile(path.join(registryRoot, 'incidents/incident-unit.json'), 'utf8')).toBe('{"historical":true}')
+    expect(await fsp.readFile(path.join(registryRoot, 'metadata.json'))).toEqual(await fsp.readFile(path.join(sourceDir, 'metadata.json')))
+    expect(await fsp.readFile(path.join(sourceDir, 'incidents/incident-unit.json'), 'utf8')).toBe('{"historical":true}')
+    await expect(owner.installTask007HistoricalSnapshot({ sourceDir, registryRoot, sha256: digest() })).rejects.toThrow(/nonempty|fresh/)
+    const invalidRoot = path.join(fixtureRepoRoot, 'invalid-registry')
+    await fsp.mkdir(invalidRoot, { mode: 0o700 })
+    await fsp.writeFile(`${databaseFile}-wal`, 'uncheckpointed bytes', { mode: 0o600 })
+    await expect(owner.installTask007HistoricalSnapshot({ sourceDir, registryRoot: invalidRoot, sha256: digest() })).rejects.toThrow(/WAL|checkpoint/)
+    expect(await fsp.readdir(invalidRoot)).toEqual([])
+    await fsp.rm(`${databaseFile}-wal`)
+    const modified = new DatabaseSync(databaseFile)
+    modified.exec('ALTER TABLE souls ADD COLUMN identity_revision INTEGER')
+    modified.close()
+    await expect(owner.installTask007HistoricalSnapshot({ sourceDir, registryRoot: invalidRoot, sha256: digest() })).rejects.toThrow(/schema.seven|post.7/)
+    expect(await fsp.readdir(invalidRoot)).toEqual([])
+  })
+})
+
+describe('Task7 registered physical stopped fixture preparation', () => {
+  async function browserFixture(rig: owner.ManagedRuntimeOwner): Promise<owner.Task007PreparedStoppedFixture> {
+    const root = rig.runtime.testRoot
+    await fsp.mkdir(root, { recursive: true, mode: 0o700 })
+    const sourceDatabaseFile = path.join(root, 'source.db')
+    const source = owner.seedManagedOpenCodeSource({ repoRoot: fixtureRepoRoot, databasePath: sourceDatabaseFile,
+      workspace: root, nonce: 'batch-browser-unit', batch: 'stopped-repair-seven-roots' })
+    const host = path.join(root, 'host')
+    await fsp.writeFile(host, 'controlled registered host artifact', { mode: 0o550 })
+    await fsp.chmod(host, 0o550)
+    const target = (index: number) => ({ soulId: `soul-${index}`, providerStoreId: `store-${index}`, terminalId: `terminal-${index}`, streamId: `stream-${index}` })
+    const view = { viewId: 'unrelated-view', ownerId: 'owner-unit', workspaceId: 'workspace-unit', tabId: 'tab-unit', paneId: 'pane-unit' }
+    const input: owner.Task007FixtureInput = { schemaVersion: 1, fixtureId: 'fixture-browser-unit', runId: rig.runtime.runId,
+      candidateSha: rig.runtime.candidateSha, installationId: 'installation-unit', ownerRoot: root, runtimeRoot: path.join(root, 'r/browser/x'),
+      workspacePath: root, cwd: root, imageRef: `sha256:${'a'.repeat(64)}`, hostBinaryPath: host,
+      hostBinarySha256: createHash('sha256').update(await fsp.readFile(host)).digest('hex'),
+      dockerDaemonId: 'daemon-unit', brokerSocketPath: path.join(root, 'broker.sock'),
+      source: { rootSessionIds: source.families.map(family => family.rootId), unrelatedSessionId: source.unrelatedId },
+      targets: Array.from({ length: 9 }, (_, index) => target(index)), canonicalChoices: [{ rootOrdinal: 0, targetOrdinal: 0 }, { rootOrdinal: 1, targetOrdinal: 8 }],
+      explicitViews: [0, 1, 7, 8].map(index => ({ ...view, viewId: `view-${index}`, targetOrdinal: index })),
+      unrelated: { ...view, target: target(9) } }
+    const output: owner.Task007FixtureOutput = { schemaVersion: 1, evidenceKind: 'historical-fixture-setup', fixtureId: input.fixtureId,
+      runId: input.runId, candidateSha: input.candidateSha, installationId: input.installationId, dockerDaemonId: input.dockerDaemonId,
+      imageRef: input.imageRef, hostBinarySha256: input.hostBinarySha256, workspacePath: root, runtimeRoot: input.runtimeRoot,
+      registry: { file: 'runtime.sqlite3', schemaVersion: 7, sha256: 'c'.repeat(64) }, historicalControlEpoch: 1,
+      targets: input.targets.map((item, index) => ({ soulId: item.soulId, providerStoreId: item.providerStoreId,
+        rootSessionId: source.families[[0, 1, 2, 3, 4, 5, 6, 0, 1][index]].rootId,
+        incarnationId: `incarnation-${index}`, launchNonce: `launch-${index}`, containerId: String(index + 1).repeat(64),
+        providerVolumeName: `freshell-provider-${String(index).repeat(24)}`, runtimeDir: path.join(input.runtimeRoot, `incarnation-${index}`),
+        hostBinaryPath: input.hostBinaryPath, immutableConfigDigest: `sha256:${'d'.repeat(64)}`,
+        incidentId: `incident-${index}`, expectedIntentRevision: 1, viewIds: [] })),
+      canonicalChoices: input.canonicalChoices.map(choice => ({ rootSessionId: source.families[choice.rootOrdinal].rootId,
+        soulId: input.targets[choice.targetOrdinal].soulId, expectedIntentRevision: 1 })),
+      unrelated: { soulId: 'soul-9', incidentId: 'incident-9', viewId: view.viewId, expectedIntentRevision: 1,
+        noticeIds: ['notice-unrelated'], outboxEventIds: ['event-unrelated'], exports: [{ file: 'incidents/incident-9.closed.json', sha256: 'e'.repeat(64) }] } }
+    const metadataFile = path.join(root, 'metadata.json')
+    await fsp.writeFile(metadataFile, JSON.stringify(output), { mode: 0o600 })
+    return { input, output, source, inputFile: path.join(root, 'input.json'), outputDir: root, metadataFile,
+      sourceDatabaseFile, registryRoot: path.join(root, 'registry'), scenarioId: 'browser-managed-runtime', volumeName: 'registered-unit-volume' }
+  }
+
+  it('starts only the exact registered historical host copy and refuses changed artifact bytes', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused copied-host web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    const directory = path.join(fixtureRepoRoot, 'host-launch-control')
+    await fsp.mkdir(directory)
+    await fsp.mkdir(rig.runtime.buildDir, { recursive: true, mode: 0o700 })
+    const calls = path.join(directory, 'calls.jsonl')
+    await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(calls)},JSON.stringify(process.argv.slice(2))+'\\n');process.stdout.write('${'a'.repeat(64)}');\n`, { mode: 0o700 })
+    Object.assign(rig.runtime, { task007Fixtures: new Map([['browser', batch]]) })
+    rig.runtime.imageRef = batch.input.imageRef
+    rig.runtime.testSupervisorBinary = '/controlled-supervisor'
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: '/controlled-unused', proxySocketPath: batch.input.brokerSocketPath,
+      runtimeRootPrefix: batch.input.ownerRoot, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(),
+      testRunId: rig.runtime.runId, logPath: path.join(directory, 'broker.jsonl') })
+    vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
+    try {
+      await rig.runtime.startSupervisor({ scenarioId: batch.scenarioId, volumeName: batch.volumeName,
+        hostBinaryPath: batch.input.hostBinaryPath, waitForHealth: false })
+      const launches = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+      const last = launches.at(-1)!
+      expect(last[last.indexOf('--image-ref') + 1]).toBe(batch.input.imageRef)
+      expect(launches.at(-1)).toContain(batch.input.hostBinaryPath)
+      await fsp.chmod(batch.input.hostBinaryPath, 0o750)
+      await fsp.writeFile(batch.input.hostBinaryPath, 'changed artifact')
+      await fsp.chmod(batch.input.hostBinaryPath, 0o550)
+      await expect(rig.runtime.startSupervisor({ scenarioId: batch.scenarioId, volumeName: batch.volumeName,
+        hostBinaryPath: batch.input.hostBinaryPath, waitForHealth: false })).rejects.toThrow(/changed|digest/)
+      expect((await fsp.readFile(calls, 'utf8')).trim().split('\n')).toHaveLength(2)
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it('keeps registered original baselines across fault replacements without reinstalling historical state', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused batch web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    const preparation = vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    const ordinary = vi.spyOn(rig.runtime, 'prepare')
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const previous: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    const stop = vi.spyOn(rig.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    const launch = vi.spyOn(rig.runtime, 'startSupervisor').mockResolvedValue({ ...previous, containerId: 'b'.repeat(64) })
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
+    try {
+      const original = await rig.prepareSyntheticStoppedRepairBatch()
+      expect(original.families[0].baselineMessages).toEqual(Object.fromEntries(batch.source.families[0].baselineMessages))
+      expect(JSON.stringify(original)).not.toContain(batch.sourceDatabaseFile)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'after_import_publication')).resolves.toEqual({ controlEpoch: null })
+      rig.supervisor = previous
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'first_resume_observation')).resolves.toEqual({ controlEpoch: 12 })
+      expect(launch.mock.calls.at(-1)?.[0]).toMatchObject({ volumeName: previous.volumeName, hostBinaryPath: batch.input.hostBinaryPath,
+        env: { FRESHELL_RUNTIME_STOPPED_REPAIR_RESUME_OBSERVATION_FAIL: '1' } })
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+      expect(launch.mock.calls.at(-1)?.[0].env).toEqual({ OPENCODE_DB: batch.sourceDatabaseFile })
+      await expect(rig.prepareSyntheticStoppedRepairBatch()).resolves.toEqual(original)
+      expect(preparation).toHaveBeenCalledOnce()
+      expect(ordinary).not.toHaveBeenCalled()
+      await expect(rig.setSyntheticStoppedRepairFault('foreign-fixture', 'none')).rejects.toThrow(/registered/)
+      expect(stop).toHaveBeenCalledTimes(2)
+    } finally { vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it('projects actual current repair SQLite records through the fixed reader and refuses absent or foreign operations', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused batch reader web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch()
+      await fsp.mkdir(batch.registryRoot)
+      const database = path.join(batch.registryRoot, 'runtime.sqlite3')
+      const db = new DatabaseSync(database)
+      db.exec(`CREATE TABLE stopped_repair_operations(operation_id TEXT,status TEXT,targets_json TEXT);
+        CREATE TABLE stopped_repair_withdrawals(operation_id TEXT,status TEXT);
+        CREATE TABLE stopped_repair_root_receipts(operation_id TEXT,root_session_id TEXT,canonical_soul_id TEXT,source_generation TEXT,transfer_id TEXT,import_receipt_json TEXT,readable_receipt_json TEXT);
+        CREATE TABLE souls(soul_id TEXT,provider_store_id TEXT,native_session_id TEXT,desired_state TEXT,recovery_state TEXT,identity_revision INTEGER,intent_revision INTEGER,native_import_revision INTEGER);
+        CREATE TABLE writer_claims(soul_id TEXT,provider TEXT,provider_store_id TEXT,native_session_id TEXT);CREATE TABLE loss_incidents(incident_id TEXT);
+        CREATE TABLE view_intents(view_id TEXT);CREATE TABLE runtime_notices(notice_id TEXT);CREATE TABLE outbox(event_id TEXT);`)
+      db.prepare('INSERT INTO stopped_repair_operations VALUES(?,?,?)').run('repair-current', 'complete', JSON.stringify(batch.output.targets.map(target => ({ soulId: target.soulId }))))
+      db.prepare('INSERT INTO stopped_repair_operations VALUES(?,?,?)').run('repair-foreign', 'complete', '[]')
+      db.prepare('INSERT INTO stopped_repair_withdrawals VALUES(?,?)').run('repair-current', 'files_complete')
+      for (const target of batch.output.targets) db.prepare('INSERT INTO souls VALUES(?,?,?,?,?,?,?,?)').run(target.soulId, target.providerStoreId, target.rootSessionId, 'stopped', 'data_repair_complete', 2, 1, 2)
+      db.prepare('INSERT INTO loss_incidents VALUES(?)').run('incident-9')
+      db.prepare('INSERT INTO view_intents VALUES(?)').run(batch.output.unrelated.viewId)
+      db.prepare('INSERT INTO runtime_notices VALUES(?)').run('notice-unrelated')
+      db.prepare('INSERT INTO outbox VALUES(?)').run('event-unrelated')
+      const root = batch.output.targets[0]
+      db.prepare('INSERT INTO stopped_repair_root_receipts VALUES(?,?,?,?,?,?,?)').run('repair-current', root.rootSessionId, root.soulId,
+        'generation-current', 'transfer-current', JSON.stringify({ adoption_baseline: { manifestSha256: 'f'.repeat(64) } }),
+        JSON.stringify({ destinationStoreId: root.providerStoreId, rowCount: 318, assetCount: 0, structuralSha256: 'a'.repeat(64),
+          providerUid: 65534, providerGid: 0, readerEnvironmentSha256: 'b'.repeat(64) }))
+      db.close()
+      await fsp.mkdir(path.join(batch.registryRoot, 'incidents'))
+      await fsp.writeFile(path.join(batch.registryRoot, 'incidents/incident-9.closed.json'), 'unchanged unrelated artifact')
+      await fsp.mkdir(path.join(batch.outputDir, 'incidents'))
+      await fsp.writeFile(path.join(batch.outputDir, 'incidents/incident-9.closed.json'), 'historical backup must not masquerade as current registry exports')
+      rig.supervisor = { scenarioId: batch.scenarioId, volumeName: batch.volumeName!, containerId: 'c'.repeat(64),
+        runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled', controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+      vi.spyOn(Object.getPrototypeOf(rig), 'ownedDockerProbe').mockImplementation(async (_container: string, args: string[]) => new Promise<string>((resolve, reject) => {
+        expect(args.slice(0, 3)).toEqual(['python3', '-I', '-c'])
+        const exports = args[7] === '/var/lib/freshell-supervisor' ? batch.registryRoot : args[7]
+        execFile('python3', [args[1], args[2], args[3], database, args[5], args[6], exports], { encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout))
+      }))
+      rig.runtime.imageRef = batch.input.imageRef
+      rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: '/controlled-unused', proxySocketPath: batch.input.brokerSocketPath,
+        runtimeRootPrefix: batch.input.ownerRoot, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(),
+        testRunId: rig.runtime.runId, logPath: path.join(batch.input.ownerRoot, 'broker.jsonl') })
+      vi.spyOn(rig.runtime.broker, 'receipts').mockReturnValue([{ soulId: root.soulId, incarnationId: root.incarnationId,
+        containerId: root.containerId, imageRef: rig.runtime.imageRef, providerVolumeName: root.providerVolumeName,
+        workspacePath: batch.input.workspacePath, hostBinaryPath: batch.input.hostBinaryPath, runtimeDir: root.runtimeDir,
+        createdAt: 'controlled', requestDigest: 'controlled' }])
+      const probeScript = path.join(batch.outputDir, 'readonly-control.cjs')
+      const calls = path.join(batch.outputDir, 'readonly-calls.jsonl')
+      const selected = path.join(batch.outputDir, 'readonly-request.json')
+      await fsp.writeFile(probeScript, `const fs=require('node:fs'),args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='inspect')process.stdout.write(JSON.stringify([{Id:${JSON.stringify(root.containerId)},State:{Running:false}}]));else if(args[0]==='create'){fs.writeFileSync(${JSON.stringify(selected)},args.at(-1));process.stdout.write('${'d'.repeat(64)}')}else if(args[0]==='wait')process.stdout.write('0');else if(args[0]==='logs')process.stdout.write(JSON.stringify({request:JSON.parse(fs.readFileSync(${JSON.stringify(selected)})),providerVersion:'1.18.21',sourceSchemaFingerprint:'schema-current',migrationJournalFingerprint:'migration-current',generation:'generation-current',rowCount:318}));else if(!['start','rm'].includes(args[0]))process.exit(4);\n`)
+      const read = vi.spyOn(Object.getPrototypeOf(rig), 'trackedDockerProbe').mockImplementation(async (_container: string, args: string[]) => new Promise<string>((resolve, reject) => {
+        execFile(process.execPath, [probeScript, ...args], { encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout))
+      }))
+      const observed = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
+      expect(observed.status).toBe('complete')
+      expect(observed.souls).toHaveLength(9)
+      expect(observed.souls.every(soul => soul.activeWriters === 0 && !soul.incidentPresent)).toBe(true)
+      expect(observed.roots[0]).toMatchObject({ rootSessionId: root.rootSessionId, providerUid: 65534, rowCount: 318 })
+      expect(observed.installedStores).toEqual([{ rootSessionId: root.rootSessionId, providerStoreId: root.providerStoreId,
+        providerUid: 65534, providerGid: 0, providerVersion: '1.18.21', sourceSchemaFingerprint: 'schema-current',
+        migrationJournalFingerprint: 'migration-current', generation: 'generation-current', rowCount: 318 }])
+      const actual = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+      expect(actual.map(args => args[0])).toEqual(['inspect', 'create', 'start', 'wait', 'logs', 'rm'])
+      expect(actual[1]).toContain('retained-opencode-store-worker')
+      expect(actual[1]).toContain(`type=volume,source=${root.providerVolumeName},target=/home/freshell/provider,readonly`)
+      expect(actual.at(-1)?.slice(0, 2)).toEqual(['rm', '--force'])
+      expect(observed.unrelated).toEqual({ incidentPresent: true, viewPresent: true, noticeIds: ['notice-unrelated'],
+        outboxEventIds: ['event-unrelated'], exportSha256: [createHash('sha256').update('unchanged unrelated artifact').digest('hex')] })
+      const changed = new DatabaseSync(database)
+      changed.prepare('INSERT INTO writer_claims VALUES(?,?,?,?)').run(root.soulId, 'opencode', root.providerStoreId, root.rootSessionId)
+      changed.close()
+      read.mockClear()
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/writer/)
+      expect(read).not.toHaveBeenCalled()
+      const foreignWriter = new DatabaseSync(database)
+      foreignWriter.exec('DELETE FROM writer_claims')
+      foreignWriter.prepare('INSERT INTO writer_claims VALUES(?,?,?,?)').run('foreign-soul', 'opencode', root.providerStoreId, root.rootSessionId)
+      foreignWriter.close()
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/writer/)
+      expect(read).not.toHaveBeenCalled()
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'absent')).rejects.toThrow(/absent/)
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-foreign')).rejects.toThrow(/differ/)
+      await expect(rig.syntheticStoppedRepairBatchObservation('foreign-fixture', 'repair-current')).rejects.toThrow(/registered/)
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it('refuses browser batch setup before any preparation unless the owner is isolated, grant-free and explicitly opted in', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused batch web') }, fixtureRepoRoot, 3)
+    const prepare = vi.spyOn(rig.runtime, 'prepare')
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    try {
+      await expect(rig.prepareSyntheticStoppedRepairBatch()).rejects.toThrow(/isolated|grant.free/)
+      expect(prepare).not.toHaveBeenCalled()
+    } finally { vi.unstubAllEnvs() }
+  })
+  it('refuses a pre-existing run root before ordinary preparation can remove its files', async () => {
+    const harness = new owner.RuntimeHarness(fixtureRepoRoot, randomUUID(), 3, { bootstrapProviders: [] })
+    const prepare = vi.spyOn(harness, 'prepare').mockRejectedValue(new Error('ordinary preparation reached'))
+    await fsp.mkdir(harness.testRoot, { recursive: true, mode: 0o700 })
+    const sentinel = path.join(harness.testRoot, 'existing-owner-file')
+    await fsp.writeFile(sentinel, 'preserve prior state')
+    try {
+      await expect(harness.prepareTask007StoppedFixture('browser')).rejects.toThrow(/already exists/)
+      expect(prepare).not.toHaveBeenCalled()
+      expect(await fsp.readFile(sentinel, 'utf8')).toBe('preserve prior state')
+    } finally { await fsp.rm(harness.testRoot, { recursive: true, force: true }) }
+  })
+  it('captures enclosure stdout and stderr before removal even when the parent wait transport fails', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused parent failure web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    const harness = rig.runtime
+    await fsp.mkdir(harness.evidenceDir, { recursive: true, mode: 0o700 })
+    const directory = path.join(fixtureRepoRoot, 'parent-wait-control')
+    await fsp.mkdir(directory)
+    const calls = path.join(directory, 'calls.jsonl')
+    await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='create')process.stdout.write('${'a'.repeat(64)}');else if(args[0]==='wait'){process.stderr.write('wait transport failed');process.exit(9)}else if(args[0]==='logs'){process.stdout.write('owned container stdout');process.stderr.write('owned container stderr')}else if(!['ps','start','rm'].includes(args[0]))process.exit(4);\n`, { mode: 0o700 })
+    vi.spyOn(harness, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    Object.assign(harness, { task007Artifact: Promise.resolve({ path: '/controlled-copied-harness', candidateSha: harness.candidateSha }) })
+    harness.imageRef = batch.input.imageRef
+    vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
+    try {
+      await expect(harness.runTask007StoppedRepairParents()).rejects.toThrow(/failed/)
+      expect(await fsp.readFile(path.join(harness.evidenceDir, 'task007-destructive-parents.stdout'), 'utf8')).toBe('owned container stdout')
+      expect(await fsp.readFile(path.join(harness.evidenceDir, 'task007-destructive-parents.stderr'), 'utf8')).toBe('owned container stderr')
+      const actual = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+      expect(actual.map(args => args[0])).toEqual(['ps', 'create', 'start', 'wait', 'logs', 'rm'])
+      expect(actual.at(-1)).toEqual(['rm', '--force', 'a'.repeat(64)])
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(harness.testRoot, { recursive: true, force: true }) }
+  })
+  it('refuses a fixture outside the explicitly isolated phase-three owner before preparation', async () => {
+    const ordinary = new owner.RuntimeHarness(fixtureRepoRoot, 'task007-ordinary-refusal', 1)
+    const prepare = vi.spyOn(ordinary, 'prepare')
+    await expect(ordinary.prepareTask007StoppedFixture('after_import_publication')).rejects.toThrow(/isolated.*phase.three/)
+    expect(prepare).not.toHaveBeenCalled()
+  })
+
+  it('removes a preallocated provider volume once when its actual receipt also owns it', async () => {
+    const directory = path.join(fixtureRepoRoot, 'cleanup-control')
+    await fsp.mkdir(directory, { mode: 0o700 })
+    const calls = path.join(directory, 'calls.jsonl')
+    const executable = path.join(directory, 'docker')
+    const volume = `freshell-provider-${'c'.repeat(24)}`
+    await fsp.writeFile(executable, `#!${process.execPath}\nconst fs=require('node:fs');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='run')process.stdout.write('${'a'.repeat(64)}');else if(args[0]==='inspect')process.exit(1);else if(args[0]==='volume'&&args[1]==='rm'){const lines=fs.readFileSync(${JSON.stringify(calls)},'utf8').trim().split('\\n').map(JSON.parse);if(lines.filter(a=>a[0]==='volume'&&a[1]==='rm').length>1)process.exit(9)}else if(!['volume','ps','rm'].includes(args[0]))process.exit(4);\n`, { mode: 0o700 })
+    const harness = new owner.RuntimeHarness(fixtureRepoRoot, 'task007-volume-cleanup', 1, { bootstrapProviders: [] })
+    harness.imageRef = `sha256:${'b'.repeat(64)}`
+    harness.testSupervisorBinary = '/controlled-supervisor'
+    harness.testHostBinary = '/controlled-host'
+    const broker = new RestrictedDockerBroker({ realSocketPath: '/controlled-unused', proxySocketPath: path.join(harness.testRoot, 'broker.sock'),
+      runtimeRootPrefix: harness.testRoot, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: harness.runId, logPath: path.join(directory, 'broker.jsonl') })
+    harness.broker = broker
+    vi.spyOn(broker, 'receipts').mockReturnValue([{ containerId: 'd'.repeat(64), incarnationId: 'incarnation-unit', soulId: 'soul-unit',
+      createdAt: 'controlled', requestDigest: 'controlled', imageRef: harness.imageRef, runtimeDir: '/controlled-runtime', providerVolumeName: volume }])
+    try {
+      vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
+      await harness.startSupervisor({ scenarioId: 'preallocated-volume', volumeName: volume, waitForHealth: false })
+      await expect(harness.cleanup()).resolves.toEqual({ ok: true, errors: [] })
+      const actual = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+      expect(actual.filter(args => args[0] === 'volume' && args[1] === 'rm')).toEqual([['volume', 'rm', volume]])
+    } finally {
+      vi.unstubAllEnvs()
+      await fsp.rm(harness.testRoot, { recursive: true, force: true })
+    }
+  })
+  it('reconciles a lost parent-create acknowledgement only through its exact owned image, labels and two mounts', async () => {
+    const harness = new owner.RuntimeHarness(fixtureRepoRoot, 'task007-parent-lost-ack', 3, { bootstrapProviders: [] })
+    await fsp.mkdir(harness.evidenceDir, { recursive: true, mode: 0o700 })
+    const directory = path.join(fixtureRepoRoot, 'parent-cleanup-control')
+    await fsp.mkdir(directory)
+    const calls = path.join(directory, 'calls.jsonl')
+    const removed = path.join(directory, 'removed')
+    const name = 'freshell-task007-parents-controlled'
+    const id = 'c'.repeat(64)
+    harness.imageRef = `sha256:${'a'.repeat(64)}`
+    const observed = { Id: id, Image: harness.imageRef, Config: { Labels: { 'com.freshell.runtime-test-run-id': harness.runId,
+      'com.freshell.runtime-test-candidate': harness.candidateSha, 'com.freshell.task007-setup': 'destructive-parents' } },
+      Mounts: [{ Type: 'bind', Source: harness.testRoot, Destination: harness.testRoot, RW: true },
+        { Type: 'bind', Source: harness.buildDir, Destination: harness.buildDir, RW: false }] }
+    await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='ps'&&args.includes('--format')&&!fs.existsSync(${JSON.stringify(removed)}))process.stdout.write(${JSON.stringify(name)});else if(args[0]==='inspect')process.stdout.write(JSON.stringify([${JSON.stringify(observed)}]));else if(args[0]==='rm')fs.writeFileSync(${JSON.stringify(removed)},'removed');else if(!['ps','volume'].includes(args[0]))process.exit(4);\n`, { mode: 0o700 })
+    Object.assign(harness, { task007HelperNames: new Set([name]) })
+    vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
+    try {
+      await expect(harness.cleanup()).resolves.toEqual({ ok: true, errors: [] })
+      expect(await fsp.readFile(removed, 'utf8')).toBe('removed')
+      const actual = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+      expect(actual.filter(args => args[0] === 'rm')).toEqual([['rm', '--force', id]])
+    } finally { vi.unstubAllEnvs(); await fsp.rm(harness.testRoot, { recursive: true, force: true }) }
+  })
+})
+
+describe('Task7 literal destructive sandbox dispatch', () => {
+  it('runs only the fixed owner adapter for the exact corpus-free command and preserves corpus refusal', async () => {
+    const directory = path.join(fixtureRepoRoot, 'route-control')
+    await fsp.mkdir(directory, { mode: 0o700 })
+    const calls = path.join(directory, 'calls.jsonl')
+    for (const file of ['pnpm', 'docker']) {
+      await fsp.writeFile(path.join(directory, file), `#!${process.execPath}\nconst fs=require('node:fs');fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify({file:${JSON.stringify(file)},args:process.argv.slice(2)})+'\\n');process.exit(${file === 'pnpm' ? 0 : 81});\n`, { mode: 0o700 })
+    }
+    const wrapper = path.join(sourceRoot, 'scripts/sandbox-test.sh')
+    const command = 'cargo test -p freshell-supervisor stopped_repair_crash_ -- --ignored'
+    const options = { cwd: fixtureRepoRoot, env: { PATH: `${directory}${path.delimiter}${process.env.PATH}`, HOME: directory }, encoding: 'utf8' as const }
+    const run = (args: string[]) => new Promise<void>((resolve, reject) => execFile(wrapper, args, options, error => error ? reject(error) : resolve()))
+    await run(['--runtime-suite', command])
+    const actual = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    expect(actual).toEqual([{ file: 'pnpm', args: ['exec', 'tsx', path.join(sourceRoot, 'scripts/testing/task007-destructive-sandbox.ts')] }])
+    await expect(run(['--corpus', '--runtime-suite', command])).rejects.toThrow()
+    expect((await fsp.readFile(calls, 'utf8')).trim().split('\n')).toHaveLength(1)
+  })
+})
 
 describe('fixed observations of an owned prior enclosure', () => {
   it('distinguishes stopped, running, absent and failed Docker inspection for the exact recorded boot', async () => {

@@ -15,7 +15,9 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
+import type { SyntheticStoppedRepairBatchFacts, SyntheticStoppedRepairBatchObservation, SyntheticStoppedRepairFault } from './runtime-sandbox.js'
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, stripRuntimeWebEnvironment,
+  SyntheticStoppedRepairBatchFactsSchema, SyntheticStoppedRepairBatchObservationSchema,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema, Phase4BrowserObservationSchema,
   FreshCodexSavedHistoryPreservationSchema, FreshCodexSavedHistoryMeasurementSchema, FreshCodexControllerReattachmentSchema, FreshCodexHistoryMeasurementFinishSchema, FreshCodexHistoryMeasurementStartSchema, FreshCodexSavedHistoryOwnershipFactsSchema, FreshCodexControllerStartupFactsSchema, FreshCodexRetainedSnapshotFactsSchema, FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHostProcessStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
@@ -728,7 +730,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'historyControllerReattachment' | 'historyMeasurement' | 'historyPreservation' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'terminalQualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic' | 'interruptedStopRetainedTurns'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'historyControllerReattachment' | 'historyMeasurement' | 'historyPreservation' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'terminalQualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic' | 'interruptedStopRetainedTurns' | 'fixtureId' | 'repairOperationId' | 'stoppedRepairFault'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -778,6 +780,20 @@ export class ExternalManagedRuntimeRig {
   }
   async syntheticOpenCodeSourceFacts(): Promise<SyntheticOpenCodeSourceFacts> {
     return this.rpc('synthetic-source-facts', SyntheticOpenCodeSourceFactsSchema)
+  }
+  async prepareSyntheticStoppedRepairBatch(): Promise<SyntheticStoppedRepairBatchFacts> {
+    return this.syntheticStoppedRepairBatchFacts()
+  }
+  async syntheticStoppedRepairBatchFacts(): Promise<SyntheticStoppedRepairBatchFacts> {
+    return this.rpc('synthetic-stopped-repair-facts', SyntheticStoppedRepairBatchFactsSchema)
+  }
+  async syntheticStoppedRepairBatchObservation(fixtureId: string, operationId: string): Promise<SyntheticStoppedRepairBatchObservation> {
+    return this.rpc('synthetic-stopped-repair-observation', SyntheticStoppedRepairBatchObservationSchema,
+      { fixtureId, repairOperationId: operationId })
+  }
+  async setSyntheticStoppedRepairFault(fixtureId: string, preset: SyntheticStoppedRepairFault): Promise<{ controlEpoch: number | null }> {
+    return this.rpc('synthetic-stopped-repair-fault', z.object({ controlEpoch: z.number().int().nonnegative().nullable() }).strict(),
+      { fixtureId, stoppedRepairFault: preset })
   }
   async syntheticOpenCodeHistoryFacts(handle: ExactRuntimeHandle): Promise<SyntheticOpenCodeHistoryFacts> {
     return this.rpc('synthetic-source-history', SyntheticOpenCodeHistoryFactsSchema, { handle })
@@ -1280,11 +1296,20 @@ export function createExternalRuntimeControl(
     let result: unknown
     switch (request.action) {
       case 'describe':
-        result = { workspaceCwd: owner.repoRoot, info: { baseUrl: descriptor.baseUrl, wsUrl: descriptor.wsUrl, token: descriptor.token },
+        result = { workspaceCwd: owner.workspaceCwd, info: { baseUrl: descriptor.baseUrl, wsUrl: descriptor.wsUrl, token: descriptor.token },
           registration: owner.fixtureRegistrationFacts() }
         break
       case 'inventory': result = await owner.inventory(); break
       case 'synthetic-source-facts': result = await owner.syntheticOpenCodeSourceFacts(); break
+      case 'synthetic-stopped-repair-facts': result = await owner.syntheticStoppedRepairBatchFacts(); break
+      case 'synthetic-stopped-repair-observation':
+        if (!request.fixtureId || !request.repairOperationId) throw new Error('registered fixture and repair operation IDs required')
+        result = await owner.syntheticStoppedRepairBatchObservation(request.fixtureId, request.repairOperationId)
+        break
+      case 'synthetic-stopped-repair-fault':
+        if (!request.fixtureId || !request.stoppedRepairFault) throw new Error('registered fixture and fixed fault required')
+        result = await owner.setSyntheticStoppedRepairFault(request.fixtureId, request.stoppedRepairFault)
+        break
       case 'synthetic-source-history': result = await owner.syntheticOpenCodeHistoryFacts(handle()); break
       case 'synthetic-source-exclusions': result = await owner.syntheticOpenCodeExcludedSentinels(handle()); break
       case 'synthetic-source-adoption': result = await owner.syntheticOpenCodeAdoptionStatus(handle()); break
@@ -2105,6 +2130,18 @@ function selectsSyntheticSource(selection: ExternalBrowserSelection, environment
     && (!selection.grep || new RegExp(selection.grep).test(title))
 }
 
+function selectsStoppedRepairBatch(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv): boolean {
+  if (path.basename(selection.spec) !== 'runtime-provider-resurrection-rust.spec.ts' || !selection.grep) return false
+  const selector = new RegExp(selection.grep)
+  if (!selector.test('stopped nine-soul restoration runbook')) return false
+  requireOptIn(environment, 'FRESHELL_RUNTIME_SYNTHETIC_RESUME')
+  if (selection.provider || selection.mode || selectsSyntheticSource(selection, environment)
+    || selector.test('Phase 3 provider resurrection › P3-G10: pending native approval survives exact provider resurrection')) {
+    throw new Error('stopped repair batch requires a separate exact fixture registration')
+  }
+  return true
+}
+
 function selectsPhase3Approval(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv): boolean {
   const title = 'Phase 3 provider resurrection › P3-G10: pending native approval survives exact provider resurrection'
   return path.basename(selection.spec) === 'runtime-provider-resurrection-rust.spec.ts'
@@ -2155,7 +2192,8 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
   if (tabs && tabsCases.length !== 1) throw new Error('tabs cases require separate owned registrations')
   const history = tabs && new RegExp(tabsCases[0].grep).test(TABS_CASE_TITLES[0])
   const interruptedStop = selectsInterruptedOrdinaryStop(selection, environment)
-  const deterministic = fixture || smoke || history || interruptedStop
+  const stoppedRepairBatch = selectsStoppedRepairBatch(selection, environment)
+  const deterministic = fixture || smoke || history || interruptedStop || stoppedRepairBatch
   const sourceSelection = selectsSyntheticSource(selection, environment)
   const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : smoke ? ['freshopencode'] : history || interruptedStop ? ['freshcodex'] : selection.mode ? [selection.mode] : []
   const providers = deterministic || selection.mode ? [] : selection.provider ? [selection.provider] : ['opencode']
@@ -2202,6 +2240,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     const security = JSON.parse(execFileSync('docker', ['info', '--format', '{{json .SecurityOptions}}'], { encoding: 'utf8' }))
     if (!Array.isArray(security) || !security.includes('name=rootless')) throw new Error('owned runtime Docker daemon is not rootless')
     const sourceSelection = selectsSyntheticSource(selection, this.environment)
+    const stoppedRepairBatch = selectsStoppedRepairBatch(selection, this.environment)
     const retainedSelection = path.basename(selection.spec) === 'runtime-managed-provider-qualification-rust.spec.ts'
       && this.environment.FRESHELL_RUNTIME_SYNTHETIC_RESUME === '1'
     const retainedArtifacts = retainedSelection ? readRetainedArtifacts(this.environment.FRESHELL_TASK002_FIXTURE_ARTIFACT_MANIFEST,
@@ -2211,6 +2250,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
       this.owner.runtime.recordLifecycle('external.web_diagnostics', { severity: 'info', ...record })
     }), Boolean(retainedArtifacts))
     if (sourceSelection) await this.owner.prepareSyntheticOpenCodeSource()
+    if (stoppedRepairBatch) await this.owner.prepareSyntheticStoppedRepairBatch()
     execFileSync('pnpm', ['run', 'build:client'], { cwd: root, stdio: 'inherit' })
     execFileSync('pnpm', ['run', 'build:tools'], { cwd: root, stdio: 'inherit' })
     await this.owner.start()
