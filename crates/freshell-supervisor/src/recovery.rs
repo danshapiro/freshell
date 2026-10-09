@@ -2628,14 +2628,15 @@ impl Supervisor {
             resume_spec: prepared.resume_spec.clone(),
         };
         let opencode_readiness = workload.opencode_tui_readiness_required(&start.context.provider);
-        let launch = self
-            .activate_prepared_observed(
-                prepared.prepared.clone(),
-                workload,
-                start.context.requested_limits,
-                verdict_fence.clone(),
-            )
-            .await;
+        // Keep activation's owned launch/grant state off the replacement
+        // polling frame, as at the other large recovery async boundaries.
+        let launch = Box::pin(self.activate_prepared_observed(
+            prepared.prepared.clone(),
+            workload,
+            start.context.requested_limits,
+            verdict_fence.clone(),
+        ))
+        .await;
         match launch {
             Ok((_, successor)) => {
                 verdict_fence = successor;
