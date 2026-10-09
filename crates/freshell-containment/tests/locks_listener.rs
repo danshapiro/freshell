@@ -288,6 +288,167 @@ async fn a_lock_on_one_file_is_not_reported_for_another() {
     );
 }
 
+/// The exact name of [`lock_holders_fall_back_to_stat_where_statx_is_refused`].
+const STATX_REFUSED_TEST: &str = "lock_holders_fall_back_to_stat_where_statx_is_refused";
+/// Set (to the errno the filter answers) in a re-run of this test binary
+/// whose `statx` is refused.
+const STATX_REFUSED_ENV: &str = "FRESHELL_TEST_STATX_REFUSED_WITH";
+/// Printed by that re-run once every check passed (so a re-run that ran no
+/// test cannot pass).
+const STATX_REFUSED_DONE: &str = "statx-refused lookups: all checks passed";
+
+/// Where `statx` is missing or refused, the lookups still find the holder.
+/// The identity read then fails with EINVAL (on a kernel without `statx`,
+/// glibc's emulation rejects `AT_STATX_DONT_SYNC`) or EPERM (a seccomp
+/// filter). The test re-runs itself as a child process whose `statx` is
+/// refused from its first instruction, as in such an environment; the filter
+/// never applies to this process.
+#[tokio::test]
+async fn lock_holders_fall_back_to_stat_where_statx_is_refused() {
+    if let Ok(errno) = std::env::var(STATX_REFUSED_ENV) {
+        return check_lookups_with_statx_refused(errno.parse().expect("an errno")).await;
+    }
+    let failures: Vec<String> = [libc::ENOSYS, libc::EPERM]
+        .into_iter()
+        .filter_map(|errno| {
+            let out = run_with_statx_refused(errno);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let passed = out.status.success() && stdout.contains(STATX_REFUSED_DONE);
+            (!passed).then(|| {
+                format!(
+                    "with statx answering errno {errno}: {}\nstdout:\n{stdout}\nstderr:\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The checks, run inside the re-run whose `statx` answers `errno`.
+async fn check_lookups_with_statx_refused(errno: i32) {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("t.lock");
+    let other = dir.path().join("other.lock");
+    std::fs::write(&lock, b"").unwrap();
+    std::fs::write(&other, b"").unwrap();
+
+    // The filter is in place: the identity read's own call fails.
+    let refused_with = statx_dont_sync_errno(&lock);
+    let expected_errnos: &[i32] = if errno == libc::ENOSYS {
+        &[libc::EINVAL, libc::ENOSYS] // glibc emulates, or passes ENOSYS on
+    } else {
+        &[errno]
+    };
+    assert!(
+        refused_with.is_some_and(|e| expected_errnos.contains(&e)),
+        "statx(AT_STATX_DONT_SYNC) is refused here: {refused_with:?}"
+    );
+
+    let holder_child = spawn_holder(&lock).await;
+    let pid = holder_child.pid();
+    let expected = vec![holder(pid, "sleep", &lock)];
+    assert_eq!(lock_holders(std::slice::from_ref(&lock)), expected);
+    assert_eq!(
+        lock_holders_among(&[other.clone(), lock.clone()], &[pid]),
+        expected
+    );
+    assert_eq!(lock_holders(std::slice::from_ref(&other)), vec![]);
+    println!("{STATX_REFUSED_DONE}");
+}
+
+/// The errno of `statx(AT_STATX_DONT_SYNC, STATX_INO)` on `path`, `None`
+/// when it succeeds.
+fn statx_dont_sync_errno(path: &Path) -> Option<i32> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: a NUL-terminated path and a writable, correctly sized buffer.
+    let rc = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_STATX_DONT_SYNC,
+            libc::STATX_INO,
+            buf.as_mut_ptr(),
+        )
+    };
+    (rc != 0).then(|| std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+}
+
+/// Re-runs [`STATX_REFUSED_TEST`] alone, in a child process whose `statx`
+/// answers `errno`.
+fn run_with_statx_refused(errno: i32) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.args([STATX_REFUSED_TEST, "--exact", "--nocapture"])
+        .env(STATX_REFUSED_ENV, errno.to_string())
+        .stdin(Stdio::null());
+    // SAFETY: the hook only builds a filter on its own stack and makes two
+    // prctl calls, which is safe between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || refuse_statx(errno));
+    }
+    cmd.output()
+        .expect("re-run this test binary with statx refused")
+}
+
+/// Installs a seccomp filter on the calling thread that answers `statx` with
+/// `errno` and allows every other system call. It is kept across exec and
+/// inherited by children. The process uses only its native system-call
+/// table, so the filter needs no architecture check.
+fn refuse_statx(errno: i32) -> std::io::Result<()> {
+    let insn = |code: u32, jt: u8, jf: u8, k: u32| libc::sock_filter {
+        code: code as u16,
+        jt,
+        jf,
+        k,
+    };
+    let filter = [
+        insn(
+            libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+            0,
+            0,
+            std::mem::offset_of!(libc::seccomp_data, nr) as u32,
+        ),
+        insn(
+            libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+            0,
+            1,
+            libc::SYS_statx as u32,
+        ),
+        insn(
+            libc::BPF_RET | libc::BPF_K,
+            0,
+            0,
+            libc::SECCOMP_RET_ERRNO | (errno as u32 & libc::SECCOMP_RET_DATA),
+        ),
+        insn(libc::BPF_RET | libc::BPF_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+    ];
+    let prog = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr().cast_mut(),
+    };
+    // SAFETY: plain prctl calls; `prog` points at `filter`, both alive here.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+            &prog as *const libc::sock_fprog,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_lock_shared_by_two_processes_stays_held_until_both_are_gone() {
     let dir = tempfile::tempdir().unwrap();

@@ -115,25 +115,37 @@ type FileId = (u64, u64);
 /// soft mount, forever on a hard one). With `AT_STATX_DONT_SYNC` those
 /// filesystems answer from the attributes the kernel already has; the
 /// device comes from the mount and the inode never changes, so nothing is
-/// lost. (9p ignores the flag.)
+/// lost. (CIFS still asks its server once its cached attributes have been
+/// invalidated, for example after a truncate; 9p ignores the flag.)
+///
+/// Where `statx` is missing or refused (on a kernel without it, glibc's
+/// emulation rejects `AT_STATX_DONT_SYNC` with EINVAL; a seccomp filter may
+/// answer ENOSYS or EPERM), the identity is read with a plain `stat`
+/// instead, which may ask a network server: a holder must never be missed.
 #[cfg(target_os = "linux")]
 fn file_id(path: &Path) -> Option<FileId> {
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
 
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
     // SAFETY: a NUL-terminated path and a writable, correctly sized buffer.
     let rc = unsafe {
         libc::statx(
             libc::AT_FDCWD,
-            path.as_ptr(),
+            c_path.as_ptr(),
             libc::AT_STATX_DONT_SYNC,
             libc::STATX_INO,
             buf.as_mut_ptr(),
         )
     };
     if rc != 0 {
-        return None;
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENOSYS | libc::EPERM | libc::EINVAL) => std::fs::metadata(path)
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino())),
+            _ => None, // missing or unreadable: no file to match
+        };
     }
     // SAFETY: statx succeeded, so it filled the (already zeroed) buffer.
     let stx = unsafe { buf.assume_init() };
