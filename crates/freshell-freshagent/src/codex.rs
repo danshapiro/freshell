@@ -5776,6 +5776,15 @@ impl FreshCodexState {
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
     }
 
+    /// Read-only identity of this registered native process. A same-thread
+    /// crash recovery has a different token; this is not native session proof.
+    pub async fn live_session_incarnation(&self, session_id: &str) -> Option<String> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        (!session.exited.load(Ordering::SeqCst) && !session.sidecar_ownership_id.is_empty())
+            .then(|| session.sidecar_ownership_id.clone())
+    }
+
     pub(crate) async fn local_snapshot_owner(
         &self,
         native_id: &str,

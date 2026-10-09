@@ -56,6 +56,7 @@ pub struct HostedPty {
     native_identity_launch: Option<freshell_runtime_protocol::NativeIdentityLaunch>,
     provider_mode: String,
     native_signal: Option<(PathBuf, u32, u32, String)>,
+    amplifier_signal_reader: Mutex<crate::providers::native_identity::AmplifierObservationReader>,
     native_cwd: PathBuf,
     opencode_adoption: Option<Arc<Mutex<OpenCodeAdoptionGate>>>,
     codex: Option<CodexLifecycle>,
@@ -140,6 +141,19 @@ impl HostedPty {
         let mut provider_args = crate::provider_identity_args(launch.run_as_uid, launch.run_as_gid);
         provider_args.push(launch.program.clone());
         let mut native_args = launch.args.clone();
+        // Managed images own the native pin. An updater's input prompt must
+        // never precede the provider's no-input create/resume acknowledgement.
+        if launch.mode == "codex"
+            && native_identity_launch.is_some()
+            && !native_args
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == "check_for_update_on_startup=false")
+        {
+            native_args.splice(
+                0..0,
+                ["-c".into(), "check_for_update_on_startup=false".into()],
+            );
+        }
         let mut statusline_settings = None;
         if launch.mode == "claude" && native_identity_launch.is_some() {
             for index in 0..native_args.len().saturating_sub(1) {
@@ -167,6 +181,11 @@ impl HostedPty {
         };
         let mut provider_env = launch.env.clone();
         provider_env.extend(child_secret_env);
+        if launch.mode == "opencode" && native_identity_launch.is_some() {
+            // The managed image owns the native version; an automatic install
+            // cannot precede its no-input loader acknowledgement.
+            provider_env.insert("OPENCODE_DISABLE_AUTOUPDATE".into(), "true".into());
+        }
         if let Some(settings) = statusline_settings {
             provider_env.insert("FRESHELL_NATIVE_STATUSLINE_SETTINGS".into(), settings);
         }
@@ -184,7 +203,9 @@ impl HostedPty {
                 .entry("HOME".into())
                 .or_insert_with(|| freshell_agent_runtime::PROVIDER_HOME.into());
         }
-        let native_signal = if matches!(launch.mode.as_str(), "claude" | "amplifier") {
+        let native_signal = if matches!(launch.mode.as_str(), "claude" | "amplifier")
+            || (launch.mode == "opencode" && opencode_adoption.is_none())
+        {
             native_identity_launch
                 .as_ref()
                 .map(|binding| {
@@ -198,10 +219,10 @@ impl HostedPty {
                         crate::providers::native_identity::SIGNAL_DIR_ENV.into(),
                         directory.to_string_lossy().into(),
                     );
-                    let name = if launch.mode == "amplifier" {
-                        "amplifier-loaded-context.json"
-                    } else {
-                        "session-start.json"
+                    let name = match launch.mode.as_str() {
+                        "amplifier" => "amplifier-loaded-context.json",
+                        "opencode" => "opencode-loaded.json",
+                        _ => "session-start.json",
                     };
                     Ok::<_, String>((
                         directory.join(name),
@@ -250,7 +271,10 @@ impl HostedPty {
         // Codex must report the thread identity through its app-server proxy;
         // do not treat the requested resume id as provider-observed evidence.
         let native_session_id = Arc::new(Mutex::new(None));
-        if launch.mode == "opencode" && launch.resume_session_id.is_none() {
+        if launch.mode == "opencode"
+            && launch.resume_session_id.is_none()
+            && native_identity_launch.is_none()
+        {
             spawn_opencode_identity_watcher(
                 launch,
                 launch_floor_ms,
@@ -271,7 +295,7 @@ impl HostedPty {
                     pty.kill();
                     return Err(error);
                 }
-            } else {
+            } else if native_identity_launch.is_none() {
                 spawn_opencode_signal_relay(
                     &launch.terminal_id,
                     launch.run_as_uid,
@@ -314,6 +338,7 @@ impl HostedPty {
             native_identity_launch,
             provider_mode: launch.mode.clone(),
             native_signal,
+            amplifier_signal_reader: Mutex::default(),
             native_cwd: PathBuf::from(&launch.cwd),
             opencode_adoption,
             codex,
@@ -457,10 +482,15 @@ impl HostedPty {
         }
         let launch = self.native_identity_launch.as_ref()?;
         if let Some((path, uid, gid, source)) = self.native_signal.as_ref() {
-            let result = if self.provider_mode == "amplifier" {
-                crate::providers::native_identity::read_amplifier_observation(
-                    path, *uid, *gid, launch, source,
+            let result = if self.provider_mode == "opencode" {
+                crate::providers::native_identity::read_opencode_observation(
+                    path, *uid, *gid, launch,
                 )
+            } else if self.provider_mode == "amplifier" {
+                self.amplifier_signal_reader
+                    .lock()
+                    .map_err(|_| "native Amplifier reader state unavailable".to_string())
+                    .and_then(|mut reader| reader.read(path, *uid, *gid, launch, source))
             } else {
                 crate::providers::native_identity::read_claude_observation(
                     path,
@@ -475,7 +505,7 @@ impl HostedPty {
                 Ok(observation) if !self.exited() => observation,
                 Ok(_) => None,
                 Err(reason) => {
-                    tracing::warn!(incarnation_id=%launch.incarnation_id,launch_nonce=%launch.launch_nonce,provider=%self.provider_mode,reason,"managed_provider.native_identity_blocked");
+                    tracing::warn!(incarnation_id=%launch.incarnation_id,launch_nonce=%launch.launch_nonce,evidence_revision=launch.evidence_revision,execution_generation=launch.execution_generation,provider=%self.provider_mode,reason,"managed_provider.native_identity_blocked");
                     None
                 }
             };
@@ -646,6 +676,7 @@ impl OpenCodeAdoptionGate {
                 current
             }
             Err(error) => {
+                self.emit_validation_result("warning", "current_store_unavailable");
                 self.observation = None;
                 self.released = false;
                 if !self.verification_failed {
@@ -668,6 +699,7 @@ impl OpenCodeAdoptionGate {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
+            self.emit_validation_result("warning", "current_store_identity_mismatch");
             self.observation = None;
             self.released = false;
             if !self.verification_failed {
@@ -693,10 +725,25 @@ impl OpenCodeAdoptionGate {
             self.rotate_nonce();
             self.observation = None;
             self.released = false;
+            self.emit_validation_result("info", "current_evidence_changed");
             self.publish_expectation()?;
             return Ok(false);
         }
+        self.emit_validation_result("info", "current_store_verified");
         Ok(true)
+    }
+
+    fn emit_validation_result(&self, severity: &str, reason: &str) {
+        crate::emit_environment_event(serde_json::json!({
+            "severity": severity,
+            "event": "managed_opencode.current_store_revalidation",
+            "terminal_id": self.terminal_id,
+            "provider_store_id": self.expectation.baseline.descriptor.destination_store_id,
+            "incarnation_id": self.incarnation_id,
+            "launch_nonce": self.expectation.launch_nonce,
+            "evidence_generation": self.expectation.evidence_generation,
+            "reason": reason,
+        }));
     }
 
     fn rotate_nonce(&mut self) {
@@ -1799,6 +1846,70 @@ mod managed_opencode_adoption_tests {
         assert!(gate.observe(fresh_observation));
         assert!(gate.release_input());
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn current_store_revalidation_emits_bound_body_free_results() {
+        const CHILD_ENV: &str = "FRESHELL_OPENCODE_GATE_EVENT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "pty::managed_opencode_adoption_tests::current_store_revalidation_emits_bound_body_free_results", "--nocapture"])
+                .env(CHILD_ENV, "1").output().unwrap();
+            assert!(output.status.success(), "owned behavioral child must pass");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(!stderr.contains("private-reader-payload"));
+            let events = stderr
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| event["event"] == "managed_opencode.current_store_revalidation")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events.len(),
+                4,
+                "actual verifier transitions must be diagnosable"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event["reason"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "current_store_verified",
+                    "current_evidence_changed",
+                    "current_store_verified",
+                    "current_store_unavailable"
+                ]
+            );
+            for event in &events {
+                assert_eq!(event["terminal_id"], "terminal-opencode-adoption");
+                assert_eq!(event["incarnation_id"], "incarnation-opencode-adoption");
+                assert!(event["launch_nonce"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()));
+                assert_eq!(event["evidence_generation"].as_str().unwrap().len(), 64);
+            }
+            assert_eq!(events[3]["severity"], "warning");
+            return;
+        }
+        let expected = expectation(OpenCodeVerifiedRootTail::Message {
+            message_id: "msg_current_tail".into(),
+        });
+        let initial = evidence(
+            &expected,
+            &expected.evidence_generation,
+            expected.root_tail.clone(),
+        );
+        let (mut gate, current, _, _owned_signal_root) =
+            gate_with_evidence(expected.clone(), initial);
+        assert!(gate.observe(observation(&expected)));
+        *current.lock().unwrap() = evidence(&expected, &"c".repeat(64), expected.root_tail.clone());
+        assert!(!gate.release_input());
+        assert!(gate.observation.is_none());
+        assert!(gate.observe(observation(&gate.expectation)));
+        gate.verifier = Arc::new(|_| Err("private-reader-payload".into()));
+        assert!(!gate.observe(observation(&gate.expectation)));
+        assert!(gate.observation.is_none());
+        assert!(!gate.input_allowed());
     }
 
     #[test]

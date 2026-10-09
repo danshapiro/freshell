@@ -405,4 +405,203 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
     }
   })
 
+  test('synthetic interrupted ordinary Stop preserves history', async ({ page }) => {
+    test.skip(process.env.FRESHELL_RUNTIME_SYNTHETIC_RESUME !== '1', 'requires the explicit synthetic runtime lane')
+    test.setTimeout(900_000)
+    const supervisorEnv = {
+      FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS: '5000',
+      FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS: '10000',
+      FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000',
+    }
+    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {}, supervisorEnv, 'test', {
+      enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'],
+      providerSettings: { freshcodex: {} },
+    })
+    const sent: any[] = []
+    const received: any[] = []
+    page.on('websocket', (socket) => {
+      socket.on('framesent', (frame) => { sent.push(JSON.parse(String(frame.payload))) })
+      socket.on('framereceived', (frame) => { received.push(JSON.parse(String(frame.payload))) })
+    })
+    try {
+      const info = await rig.start()
+      const settings = await fetch(`${info.baseUrl}/api/settings`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json', 'x-auth-token': info.token },
+        body: JSON.stringify({ codingCli: { enabledProviders: ['codex'] } }),
+      })
+      expect(settings.ok).toBe(true)
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await page.getByRole('button', { name: 'Freshcodex', exact: true }).click()
+      await page.getByRole('option', { name: rig.repoRoot, exact: true }).click()
+      const created = await waitForValue('registered synthetic pane', async () => {
+        const state = await harness.getState()
+        const tabId = state.tabs.activeTabId!
+        const leaf = state.panes.layouts[tabId]
+        return leaf?.type === 'leaf' && leaf.content.kind === 'fresh-agent' && leaf.content.sessionId
+          ? { tabId, paneId: leaf.id, sessionId: leaf.content.sessionId } : null
+      }, 60_000)
+      const view = await waitForValue('synthetic managed native root', async () => {
+        const current = await rig.runningViewForFreshSession(created.sessionId)
+        return current?.containerId && current.nativeSessionId ? current : null
+      }, 90_000)
+      const nativeId = view.nativeSessionId!
+      const transcript = [
+        { type: 'session_meta', payload: { id: nativeId, cwd: '/workspace', model_provider: 'openai' } },
+        ...[0, 1, 2].flatMap((index) => [
+          { type: 'event_msg', payload: { type: 'task_started', turn_id: `stop-retained-${index}` } },
+          { type: 'event_msg', payload: { type: 'user_message', message: `Synthetic saved prompt ${index}` } },
+          { type: 'event_msg', payload: { type: 'task_complete', turn_id: `stop-retained-${index}`,
+            last_agent_message: `Synthetic saved answer ${index}` } },
+        ]),
+      ].map((row) => JSON.stringify(row)).join('\n') + '\n'
+      await rig.ownedProviderExec(view.containerId!, ['node', '--input-type=module', '-e',
+        'import fs from "node:fs"; import path from "node:path"; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1],process.argv[2]);',
+        `/home/freshell/provider/.codex/sessions/2026/03/01/rollout-${nativeId}.jsonl`, transcript])
+      const history = async () => {
+        const response = await fetch(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${nativeId}`, {
+          headers: { 'x-auth-token': info.token },
+        })
+        expect(response.ok).toBe(true)
+        return response.json()
+      }
+      const retained = await history()
+      expect(retained.threadId).toBe(nativeId)
+      expect(retained.turns).toHaveLength(6)
+      expect(retained.turns.flatMap((turn: any) => turn.items).map((item: any) => item.text))
+        .toEqual([0, 1, 2].flatMap((index) => [`Synthetic saved prompt ${index}`, `Synthetic saved answer ${index}`]))
+
+      // Arm only the test supervisor. Its durable registry, secret, native
+      // store and existing provider remain the exact registered originals.
+      const previous = rig.supervisor
+      await rig.runtime.stopSupervisorExact(previous)
+      await rig.runtime.removeContainerExact(previous.containerId)
+      rig.supervisor = await rig.runtime.startSupervisor({
+        scenarioId: previous.scenarioId, volumeName: previous.volumeName, binaryKind: 'test',
+        reuseSecret: true, env: supervisorEnv, crashPoint: 'ordinary_stop_after_intent',
+      })
+      let ready = await harness.getLastReadyAt()
+      await rig.restartWebGracefully()
+      await harness.waitForConnectionAfter(ready, 90_000)
+      await page.reload()
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      const pane = page.locator(`[data-pane-id="${created.paneId}"]`)
+      await expect(pane.getByText('Synthetic saved answer 2', { exact: true })).toBeVisible({ timeout: 60_000 })
+      const original = (await harness.getPaneLayout(created.tabId)).content
+      expect(original.soulId).toBe(view.soulId)
+      expect(original.sessionRef.sessionId).toBe(nativeId)
+      const canonical = { soulId: original.soulId, sessionRef: original.sessionRef,
+        resumeSessionId: original.resumeSessionId, createRequestId: original.createRequestId }
+      const readDurable = async (installCounters = false) => JSON.parse(await rig.runtime.execOwnedContainerExact(
+        rig.supervisor.containerId, ['python3', '-c', `
+import json,sqlite3,sys
+c=sqlite3.connect('/var/lib/freshell-supervisor/runtime.sqlite3')
+c.row_factory=sqlite3.Row
+if sys.argv[2]=='install':
+ c.executescript("""CREATE TABLE stop_browser_effects(kind TEXT NOT NULL);
+ CREATE TRIGGER stop_browser_incarnation AFTER INSERT ON incarnations BEGIN INSERT INTO stop_browser_effects VALUES('replacement'); END;
+ CREATE TRIGGER stop_browser_writer AFTER INSERT ON writer_claims BEGIN INSERT INTO stop_browser_effects VALUES('writer'); END;
+ CREATE TRIGGER stop_browser_grant AFTER UPDATE OF execution_generation,grant_id ON incarnations WHEN NEW.execution_generation!=OLD.execution_generation OR NEW.grant_id IS NOT OLD.grant_id BEGIN INSERT INTO stop_browser_effects VALUES('grant'); END;
+ CREATE TRIGGER stop_browser_recovery AFTER INSERT ON recovery_attempts BEGIN INSERT INTO stop_browser_effects VALUES('recovery'); END;""")
+soul=dict(c.execute('SELECT soul_id,provider_store_id,provider_volume_name,native_session_id,intent_revision,desired_state FROM souls WHERE soul_id=?',(sys.argv[1],)).fetchone())
+incarnations=[dict(r) for r in c.execute('SELECT incarnation_id,container_id,execution_generation,grant_id,launch_state,cleanup_state FROM incarnations WHERE soul_id=? ORDER BY created_at,rowid',(sys.argv[1],))]
+stops=[dict(r) for r in c.execute('SELECT intent_revision,outcome,revoke_pending,settled FROM ordinary_stops WHERE soul_id=?',(sys.argv[1],))]
+print(json.dumps(dict(soul=soul,incarnations=incarnations,stops=stops,writers=c.execute('SELECT count(*) FROM writer_claims WHERE soul_id=?',(sys.argv[1],)).fetchone()[0],effects=[r[0] for r in c.execute('SELECT kind FROM stop_browser_effects')],tombstones=c.execute('SELECT count(*) FROM stop_tombstones WHERE soul_id=?',(sys.argv[1],)).fetchone()[0])))
+`, view.soulId, installCounters ? 'install' : 'read'],
+      ))
+      const before = await readDurable(true)
+      expect(before.incarnations).toHaveLength(1)
+      expect(before.writers).toBe(1)
+      const receiptCount = (await rig.runtime.broker.receipts()).length
+      const runtimeDir = await rig.runtime.runtimeDir(rig.supervisor, view.incarnationId)
+      const hostState = async () => JSON.parse(await rig.runtime.execOwnedContainerExact(
+        rig.supervisor.containerId, ['cat', path.join(runtimeDir, 'host-state.json')],
+      ))
+      const workerLaunchCount = (await hostState()).workerLaunchCount
+      const sentAtStop = sent.length
+      const receivedAtStop = received.length
+      const crashed = rig.supervisor
+
+      // Close pane sends the fenced, acknowledged ordinary Stop. Composer
+      // Stop interrupts a turn and does not commit durable stopped intent.
+      await pane.getByRole('button', { name: 'Close pane', exact: true }).click()
+      await expect.poll(async () => rig.runtime.isContainerRunning(crashed.containerId), { timeout: 30_000 }).toBe(false)
+      const crashLogs = await rig.runtime.containerLogs(crashed.containerId)
+      expect(crashLogs.split('\n').some((line) => {
+        try { const row = JSON.parse(line); return row.event === 'supervisor.test_crash' && row.point === 'ordinary_stop_after_intent' }
+        catch { return false }
+      })).toBe(true)
+      expect((await rig.runtime.inspectContainer(crashed.containerId)).State.ExitCode).toBe(134)
+      await expect.poll(() => received.slice(receivedAtStop).some((message) => {
+        const event = message.type === 'freshAgent.event' ? message.event : message
+        return message.sessionId === original.sessionId && event.type === 'freshAgent.killed' && event.success === false
+      }), { timeout: 30_000 }).toBe(true)
+      expect(sent.slice(sentAtStop).filter((frame) => frame.type === 'freshAgent.kill')).toHaveLength(1)
+      await expect(pane).toBeVisible()
+      expect((await harness.getPaneLayout(created.tabId)).content).toMatchObject(canonical)
+      await expect(pane.getByText('Synthetic saved answer 2', { exact: true })).toBeVisible()
+
+      await rig.runtime.removeContainerExact(crashed.containerId)
+      rig.supervisor = await rig.runtime.startSupervisor({
+        scenarioId: crashed.scenarioId, volumeName: crashed.volumeName, binaryKind: 'test',
+        reuseSecret: true, env: supervisorEnv,
+      })
+      const stopped = await waitForValue('restarted supervisor finishes the original Stop', async () => {
+        const current = (await rig.inventory()).find((row) => row.soulId === view.soulId)
+        return current?.launchState === 'stopped' && current.cleanupState === 'verified_empty' ? current : null
+      }, 60_000)
+      expect(stopped).toMatchObject({ soulId: view.soulId, incarnationId: view.incarnationId,
+        containerId: view.containerId, nativeSessionId: nativeId, desiredState: 'stopped',
+        intentRevision: before.soul.intent_revision + 1 })
+      expect(await rig.runtime.isContainerRunning(view.containerId!)).toBe(false)
+      ready = await harness.getLastReadyAt()
+      await rig.restartWebGracefully()
+      await harness.waitForConnectionAfter(ready, 90_000)
+      await page.reload()
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await expect(pane).toBeVisible()
+      expect((await harness.getPaneLayout(created.tabId)).content).toMatchObject(canonical)
+      await expect(pane.getByText('Synthetic saved answer 2', { exact: true })).toBeVisible({ timeout: 60_000 })
+      await expect(pane.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+      const afterHistory = await history()
+      expect(afterHistory.threadId).toBe(nativeId)
+      expect(afterHistory.turns).toEqual(retained.turns)
+      expect(afterHistory.capabilities.send).toBe(false)
+      const after = await readDurable()
+      expect(after.soul).toEqual({ ...before.soul, desired_state: 'stopped', intent_revision: stopped.intentRevision })
+      expect(after.incarnations).toEqual(before.incarnations.map((incarnation: any) => ({
+        ...incarnation, launch_state: 'stopped', cleanup_state: 'verified_empty',
+      })))
+      expect(after.stops).toEqual([{ intent_revision: stopped.intentRevision,
+        outcome: 'verified_empty', revoke_pending: 0, settled: 1 }])
+      expect(after.tombstones).toBe(before.tombstones + 1)
+      expect(after.writers).toBe(0)
+      expect(after.effects).toEqual([])
+      expect((await hostState()).workerLaunchCount).toBe(workerLaunchCount)
+      expect((await rig.runtime.broker.receipts()).length).toBe(receiptCount)
+      expect(sent.slice(sentAtStop).filter((frame) => ['freshAgent.create', 'terminal.create'].includes(frame.type))).toEqual([])
+      const lifecycle = (await rig.runtime.execOwnedContainerExact(rig.supervisor.containerId,
+        ['cat', path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')]))
+        .split('\n').filter(Boolean).map((line) => JSON.parse(line))
+        .filter((event) => event.data?.soulId === view.soulId)
+      expect(lifecycle.filter((event) => event.event === 'supervisor.stop_committed').map((event) => event.data.intentRevision))
+        .toEqual([stopped.intentRevision])
+      expect(lifecycle.some((event) => event.event === 'supervisor.stop_continuation'
+        && event.data.intentRevision === stopped.intentRevision)).toBe(true)
+      await rig.runtime.writeArtifact('task006-interrupted-stop.json', {
+        caseName: 'synthetic interrupted ordinary Stop preserves history', status: 'PASS',
+        soulId: view.soulId, incarnationId: view.incarnationId, nativeSessionId: nativeId,
+        intentRevision: stopped.intentRevision, crashPoint: 'ordinary_stop_after_intent', crashExitCode: 134,
+        retainedTurns: afterHistory.turns.length, workerLaunchCount, effects: after.effects,
+      })
+    } finally {
+      const cleanup = await rig.stop()
+      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+    }
+  })
+
 })

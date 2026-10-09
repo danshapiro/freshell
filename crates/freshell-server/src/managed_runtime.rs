@@ -3,8 +3,8 @@
 use freshell_runtime_client::{ClientError, RuntimeClient};
 use freshell_runtime_protocol::{
     DesiredState, IncarnationId, LaunchRequest, LaunchState, OpenCodeTransferChunk,
-    OpenCodeTransferDescriptor, OpenCodeTransferFile, OpenCodeTransferResult, RecoveryBlockReason,
-    RecoveryOutcome, RecoveryProbe, RecoveryResult, RecoveryTrigger, RequestId, RuntimeErrorCode,
+    OpenCodeTransferDescriptor, OpenCodeTransferFile, OpenCodeTransferResult, RecoveryOutcome,
+    RecoveryProbe, RecoveryResult, RecoveryState, RecoveryTrigger, RequestId, RuntimeErrorCode,
     RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
     ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
     OPENCODE_TRANSFER_DESTINATION_DB,
@@ -33,7 +33,40 @@ mod managed_output_validation;
 #[derive(Default)]
 struct ManagedRecoveryState {
     in_flight: Mutex<HashSet<String>>,
-    blocked: Mutex<HashMap<String, String>>,
+    blocked: Mutex<HashMap<String, ManagedRecoveryBlock>>,
+}
+
+#[derive(Clone)]
+struct ManagedRecoveryBlock {
+    intent_revision: u64,
+    message: String,
+}
+
+impl ManagedRecoveryState {
+    async fn record_result(&self, soul_id: &str, result: &RecoveryResult) {
+        let mut blocked = self.blocked.lock().await;
+        if blocked
+            .get(soul_id)
+            .is_some_and(|current| current.intent_revision > result.view.intent_revision)
+        {
+            return;
+        }
+        if matches!(
+            result.outcome,
+            RecoveryOutcome::Replaced | RecoveryOutcome::Reattached | RecoveryOutcome::AlreadyLive
+        ) || recovery_pending(result)
+        {
+            blocked.remove(soul_id);
+        } else {
+            blocked.insert(
+                soul_id.to_owned(),
+                ManagedRecoveryBlock {
+                    intent_revision: result.view.intent_revision,
+                    message: recovery_failure_message(result),
+                },
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -77,8 +110,56 @@ impl ServerManagedRuntimeController {
         self.recovery.in_flight.lock().await.contains(soul_id)
     }
 
-    async fn blocked_recovery(&self, soul_id: &str) -> Option<String> {
-        self.recovery.blocked.lock().await.get(soul_id).cloned()
+    async fn blocked_recovery(&self, soul_id: &str) -> Result<Option<String>, String> {
+        let Some(blocked) = self.recovery.blocked.lock().await.get(soul_id).cloned() else {
+            return Ok(None);
+        };
+        let views = self
+            .client
+            .inventory()
+            .await
+            .map_err(|error| error.to_string())?;
+        let current = views
+            .iter()
+            .find(|view| view.soul_id.as_str() == soul_id)
+            .ok_or_else(|| "managed soul is no longer in supervisor inventory".to_string())?;
+        // An observer can recover this soul without a web request, and a
+        // delayed reply can belong to an older deliberate intent. The current
+        // supervisor state wins over this presentation cache. Retain a newer
+        // policy block so later input can still request deliberate recovery.
+        let same_intent = current.intent_revision == blocked.intent_revision;
+        let current_block = (matches!(
+            current.recovery_state,
+            RecoveryState::Blocked | RecoveryState::Lost
+        ) || (same_intent
+            && current.recovery_state == RecoveryState::Stopped))
+            .then(|| {
+                current.recovery_reason.clone().unwrap_or_else(|| {
+                    if same_intent {
+                        blocked.message.clone()
+                    } else {
+                        "managed soul recovery is blocked".into()
+                    }
+                })
+            });
+        let mut cache = self.recovery.blocked.lock().await;
+        if cache.get(soul_id).is_some_and(|entry| {
+            entry.intent_revision == blocked.intent_revision
+                && entry.intent_revision <= current.intent_revision
+        }) {
+            if let Some(message) = &current_block {
+                cache.insert(
+                    soul_id.to_owned(),
+                    ManagedRecoveryBlock {
+                        intent_revision: current.intent_revision,
+                        message: message.clone(),
+                    },
+                );
+            } else {
+                cache.remove(soul_id);
+            }
+        }
+        Ok(current_block)
     }
 
     async fn schedule_recovery(&self, soul: SoulId, trigger: RecoveryTrigger) {
@@ -96,30 +177,15 @@ impl ServerManagedRuntimeController {
             if let Some(delay) = managed_recovery_test_delay() {
                 tokio::time::sleep(delay).await;
             }
-            let result = recover_with_policy(&client, soul, trigger).await;
+            let result = client.recover(soul, trigger).await;
             match result {
-                Ok(result)
-                    if matches!(
-                        result.outcome,
-                        RecoveryOutcome::Replaced
-                            | RecoveryOutcome::Reattached
-                            | RecoveryOutcome::AlreadyLive
-                    ) =>
-                {
-                    state.blocked.lock().await.remove(&key);
-                }
                 Ok(result) => {
-                    state.blocked.lock().await.insert(
-                        key.clone(),
-                        format!(
-                            "managed soul recovery ended in {:?}: {}",
-                            result.outcome,
-                            recovery_probe_summary(result.probe.as_ref())
-                        ),
-                    );
+                    // Timing and exhaustion belong to the persisted supervisor
+                    // policy. Output polling can stay attached while it waits.
+                    state.record_result(&key, &result).await;
                 }
                 Err(error) => {
-                    state.blocked.lock().await.insert(key.clone(), error);
+                    tracing::warn!(event = "managed.recovery.request_failed", soul_id = %key, error_code = ?error.runtime_code(), "supervisor recovery request failed");
                 }
             }
             state.in_flight.lock().await.remove(&key);
@@ -383,7 +449,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     "managed soul recovery is in progress; input was not dispatched".into(),
                 );
             }
-            if self.blocked_recovery(&soul_key).await.is_some() {
+            if self.blocked_recovery(&soul_key).await?.is_some() {
                 // New user input is an explicit retry/repair signal. Re-arm the
                 // persisted flap ceiling and prove continuity before accepting
                 // any bytes; never substitute a fresh provider session.
@@ -392,24 +458,13 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     .recover(soul.clone(), RecoveryTrigger::ManualRetry)
                     .await
                     .map_err(|error| error.to_string())?;
+                self.recovery.record_result(&soul_key, &recovered).await;
                 match recovered.outcome {
                     RecoveryOutcome::Reattached
                     | RecoveryOutcome::Replaced
-                    | RecoveryOutcome::AlreadyLive => {
-                        self.recovery.blocked.lock().await.remove(&soul_key);
-                    }
+                    | RecoveryOutcome::AlreadyLive => {}
                     _ => {
-                        let message = format!(
-                            "managed soul recovery ended in {:?}: {}",
-                            recovered.outcome,
-                            recovery_probe_summary(recovered.probe.as_ref())
-                        );
-                        self.recovery
-                            .blocked
-                            .lock()
-                            .await
-                            .insert(soul_key, message.clone());
-                        return Err(message);
+                        return Err(recovery_failure_message(&recovered));
                     }
                 }
             }
@@ -471,7 +526,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         Box::pin(async move {
             let soul_key = terminal.soul_id.clone();
             let soul = SoulId::parse(&soul_key).map_err(|e| e.to_string())?;
-            if let Some(error) = self.blocked_recovery(&soul_key).await {
+            if let Some(error) = self.blocked_recovery(&soul_key).await? {
                 return Err(error);
             }
             if self.recovery_in_flight(&soul_key).await {
@@ -518,8 +573,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             managed_output_validation::validate(&output, &terminal.terminal_id)?;
             if output.exited {
                 // Never hold the WS poll's 500ms timeout across stop/start or
-                // retry backoff. A single per-soul background task owns the
-                // 2s/10s retry policy and leaves the pane attached meanwhile.
+                // recovery work. The supervisor owns retry timing; this
+                // per-soul task only reports the observed exit.
                 self.schedule_recovery(soul, RecoveryTrigger::ProviderExit)
                     .await;
             }
@@ -577,58 +632,30 @@ fn recoverable_host_error(error: &ClientError) -> bool {
     )
 }
 
-const AUTOMATIC_RECOVERY_RETRY_DELAYS: [std::time::Duration; 2] = [
-    std::time::Duration::from_secs(2),
-    std::time::Duration::from_secs(10),
-];
-
-async fn recover_with_policy(
-    client: &RuntimeClient,
-    soul: SoulId,
-    trigger: RecoveryTrigger,
-) -> Result<RecoveryResult, String> {
-    let mut last_result = None;
-    let mut last_error = None;
-    for attempt in 0..=AUTOMATIC_RECOVERY_RETRY_DELAYS.len() {
-        if attempt > 0 {
-            tokio::time::sleep(AUTOMATIC_RECOVERY_RETRY_DELAYS[attempt - 1]).await;
-        }
-        match client.recover(soul.clone(), trigger).await {
-            Ok(result) => {
-                if !automatic_retryable(&result) {
-                    return Ok(result);
-                }
-                last_result = Some(result);
-            }
-            Err(error) => last_error = Some(error.to_string()),
-        }
-    }
-    if last_result.is_some() {
-        return client
-            .recover(soul, RecoveryTrigger::RetryExhausted)
-            .await
-            .map_err(|error| error.to_string());
-    }
-    Err(last_error.unwrap_or_else(|| "managed recovery exhausted without a verdict".into()))
-}
-
-fn automatic_retryable(result: &RecoveryResult) -> bool {
+fn recovery_pending(result: &RecoveryResult) -> bool {
     if result.outcome != RecoveryOutcome::Blocked {
         return false;
     }
     matches!(
         result.probe.as_ref(),
         Some(RecoveryProbe::Blocked {
-            reason: RecoveryBlockReason::RateLimited
-                | RecoveryBlockReason::CapabilityPending
-                | RecoveryBlockReason::ProviderUnavailable
-                | RecoveryBlockReason::StoreUnreadable
-                | RecoveryBlockReason::WorkspaceUnavailable
-                | RecoveryBlockReason::InsufficientResources
-                | RecoveryBlockReason::OldRuntimeNotEmpty,
+            retry_hint: freshell_runtime_protocol::RetryHint {
+                automatic_after_ms: Some(_),
+                ..
+            },
             ..
         })
     )
+}
+
+fn recovery_failure_message(result: &RecoveryResult) -> String {
+    result.view.recovery_reason.clone().unwrap_or_else(|| {
+        format!(
+            "managed soul recovery ended in {:?}: {}",
+            result.outcome,
+            recovery_probe_summary(result.probe.as_ref())
+        )
+    })
 }
 
 fn recovery_probe_summary(probe: Option<&RecoveryProbe>) -> String {
@@ -1196,6 +1223,796 @@ mod tests {
     };
     use std::collections::HashSet;
     use tokio::net::{UnixListener, UnixStream};
+
+    mod recovery_integration {
+        use super::*;
+        use freshell_runtime_protocol::{
+            host_proof, AdminCommand, CommandState, DockerDaemonId, FixtureKind, HostBootId,
+            HostCommand, HostReply, HostResult, RecoveryState, RuntimeOutputBatch,
+            RuntimeOutputFrame,
+        };
+        use freshell_supervisor::{
+            backend::{
+                BackendCreated, BackendError, BackendInspection, BackendRuntimeState,
+                CreateRuntimeSpec, RuntimeBackend,
+            },
+            registry::{BackendCreatedRecord, LaunchPreparation, OwnedRuntimeHandle, Registry},
+            service::{Supervisor, SupervisorConfig},
+        };
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Mutex as StdMutex,
+        };
+        use tokio::{
+            sync::Notify,
+            task::JoinHandle,
+            time::{timeout, Duration},
+        };
+
+        #[derive(Default)]
+        struct ReplyGate {
+            hold_next: AtomicBool,
+            ready: Notify,
+            release: Notify,
+            recover_calls: AtomicUsize,
+            manual_calls: AtomicUsize,
+            exhausted_calls: AtomicUsize,
+        }
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct InputObservation {
+            incarnation_id: IncarnationId,
+            native_session_id: String,
+            data: String,
+            intent_revision: u64,
+            recovery_state: String,
+            command_state: String,
+        }
+
+        struct RecoveryBackend {
+            provider_home: PathBuf,
+            failure: AtomicUsize,
+            creates: AtomicUsize,
+            reads: Arc<AtomicUsize>,
+            inputs: Arc<StdMutex<Vec<InputObservation>>>,
+            hosts: StdMutex<Vec<JoinHandle<()>>>,
+        }
+        impl Drop for RecoveryBackend {
+            fn drop(&mut self) {
+                for host in self.hosts.get_mut().unwrap().drain(..) {
+                    host.abort();
+                }
+            }
+        }
+        #[async_trait::async_trait]
+        impl RuntimeBackend for RecoveryBackend {
+            async fn inspect(
+                &self,
+                handle: &OwnedRuntimeHandle,
+            ) -> Result<BackendInspection, BackendError> {
+                match self.failure.load(Ordering::SeqCst) {
+                    1 => {
+                        return Err(BackendError::Unavailable(
+                            "private test dependency unavailable".into(),
+                        ))
+                    }
+                    2 => {
+                        return Err(BackendError::OwnershipMismatch(
+                            "private test ownership mismatch".into(),
+                        ))
+                    }
+                    _ => {}
+                }
+                Ok(BackendInspection {
+                    state: if handle.runtime_dir().join("stopped").exists() {
+                        BackendRuntimeState::Exited
+                    } else if handle.runtime_dir().join("created").exists() {
+                        BackendRuntimeState::Running
+                    } else {
+                        BackendRuntimeState::Missing
+                    },
+                    configured_limits: handle.requested_limits(),
+                })
+            }
+            async fn create_stopped(
+                &self,
+                spec: &CreateRuntimeSpec,
+            ) -> Result<BackendCreated, BackendError> {
+                self.creates.fetch_add(1, Ordering::SeqCst);
+                let container = format!("web-retry-{}", spec.incarnation_id);
+                std::fs::write(spec.runtime_dir.join("created"), &container).unwrap();
+                Ok(BackendCreated {
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: container,
+                    immutable_config_digest: "private-retry".into(),
+                })
+            }
+            async fn start_host(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+                let listener = UnixListener::bind(handle.runtime_dir().join("host.sock")).unwrap();
+                let secret = std::fs::read(handle.runtime_dir().join("secret")).unwrap();
+                let incarnation = handle.incarnation_id().clone();
+                let original = handle.container_id() == "web-retry-original";
+                let limits = handle.requested_limits();
+                let provider_home = self.provider_home.clone();
+                let reads = self.reads.clone();
+                let inputs = self.inputs.clone();
+                let task = tokio::spawn(async move {
+                    let boot = HostBootId::new();
+                    let mut generation = u64::from(original);
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let request: Envelope<HostCommand> = read_frame(&mut stream).await.unwrap();
+                        let native: serde_json::Value = serde_json::from_slice(
+                            &std::fs::read(provider_home.join("native-session-state.json"))
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        let native = native["sessionId"].as_str().unwrap().to_owned();
+                        let result = match request.body {
+                            HostCommand::Hello {
+                                incarnation_id,
+                                challenge,
+                            } => HostResult::Hello {
+                                proof: host_proof(&secret, &challenge, &boot, &incarnation_id),
+                                host_boot_id: boot.clone(),
+                                capabilities: vec![],
+                                effective_limits: limits,
+                            },
+                            HostCommand::GrantExecution {
+                                execution_generation,
+                                resume_spec,
+                                ..
+                            } => {
+                                assert_eq!(
+                                    resume_spec.unwrap().provider_session.native_session_id,
+                                    native
+                                );
+                                generation = execution_generation;
+                                HostResult::GrantAccepted {
+                                    host_boot_id: boot.clone(),
+                                    worker_pid: 42,
+                                    worker_launch_count: 1,
+                                    fixture_evidence: serde_json::json!({}),
+                                    native_session_id: Some(native),
+                                    native_identity_observation: None,
+                                    opencode_transfer_receipt: None,
+                                    opencode_adoption: Default::default(),
+                                }
+                            }
+                            HostCommand::Status { .. } => HostResult::Status {
+                                host_boot_id: boot.clone(),
+                                worker_pid: Some(42),
+                                worker_launch_count: 1,
+                                max_control_epoch: 1,
+                                max_execution_generation: generation,
+                                fixture_evidence: serde_json::json!({}),
+                                exited: false,
+                                native_session_id: Some(native),
+                                native_identity_observation: None,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            },
+                            HostCommand::ProbeRecovery { resume_spec, .. } => {
+                                let spec = resume_spec.unwrap();
+                                assert!(matches!(
+                                    freshell_agent_runtime::probe_provider_store(
+                                        &provider_home,
+                                        &spec
+                                    ),
+                                    freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
+                                ));
+                                HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                                    evidence_revision: spec.evidence_revision,
+                                    resume_spec: spec,
+                                })
+                            }
+                            HostCommand::TerminalReadOutput { .. } if original => {
+                                write_frame(
+                                    &mut stream,
+                                    &HostReply {
+                                        request_id: request.request_id,
+                                        result: Err(RuntimeError::new(
+                                            RuntimeErrorCode::HostUnreachable,
+                                            "private original output transport unavailable",
+                                        )),
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                                continue;
+                            }
+                            HostCommand::TerminalReadOutput { .. } => {
+                                reads.fetch_add(1, Ordering::SeqCst);
+                                let epoch = incarnation.to_string();
+                                HostResult::TerminalOutput(RuntimeOutputBatch {
+                                    incarnation_id: incarnation.clone(),
+                                    terminal_id: "web-retry-terminal".into(),
+                                    stream_epoch: epoch.clone(),
+                                    retained_from_seq: 1,
+                                    head_seq: 1,
+                                    reset_required: true,
+                                    truncated: false,
+                                    exited: false,
+                                    exit_code: None,
+                                    native_session_id: Some(native),
+                                    frames: vec![RuntimeOutputFrame {
+                                        terminal_id: "web-retry-terminal".into(),
+                                        stream_epoch: epoch,
+                                        seq_start: 1,
+                                        seq_end: 1,
+                                        data: "recovered output".into(),
+                                    }],
+                                })
+                            }
+                            HostCommand::TerminalInput {
+                                incarnation_id,
+                                request_id,
+                                data,
+                            } => {
+                                let connection = rusqlite::Connection::open(
+                                    provider_home
+                                        .parent()
+                                        .unwrap()
+                                        .join("registry/runtime.sqlite3"),
+                                )
+                                .unwrap();
+                                let (intent_revision, recovery_state, command_state) = connection
+                                    .query_row(
+                                        "SELECT s.intent_revision,s.recovery_state,c.state FROM souls s JOIN input_commands c ON c.soul_id=s.soul_id WHERE c.request_id=?1",
+                                        [request_id.as_str()],
+                                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                                    )
+                                    .unwrap();
+                                inputs.lock().unwrap().push(InputObservation {
+                                    incarnation_id,
+                                    native_session_id: native,
+                                    data,
+                                    intent_revision,
+                                    recovery_state,
+                                    command_state,
+                                });
+                                HostResult::TerminalInput {
+                                    state: CommandState::Completed,
+                                }
+                            }
+                            HostCommand::Stop { .. } => HostResult::Stopped,
+                            other => panic!("unexpected recovery integration command: {other:?}"),
+                        };
+                        write_frame(
+                            &mut stream,
+                            &HostReply {
+                                request_id: request.request_id,
+                                result: Ok(result),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                });
+                self.hosts.lock().unwrap().push(task);
+                Ok(())
+            }
+            async fn request_stop(
+                &self,
+                handle: &OwnedRuntimeHandle,
+                _: u64,
+            ) -> Result<(), BackendError> {
+                if handle.runtime_dir().exists() {
+                    std::fs::write(handle.runtime_dir().join("stopped"), b"stopped").unwrap();
+                }
+                Ok(())
+            }
+            async fn force_stop(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+                self.request_stop(handle, 0).await
+            }
+            async fn verify_empty(
+                &self,
+                handle: &OwnedRuntimeHandle,
+            ) -> Result<bool, BackendError> {
+                Ok(!handle.runtime_dir().join("created").exists()
+                    || handle.runtime_dir().join("stopped").exists())
+            }
+            async fn read_limits(
+                &self,
+                handle: &OwnedRuntimeHandle,
+            ) -> Result<RuntimeLimits, BackendError> {
+                Ok(handle.requested_limits())
+            }
+            async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+                Ok(())
+            }
+            async fn list_known(
+                &self,
+                handles: &[OwnedRuntimeHandle],
+            ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+                let mut result = vec![];
+                for handle in handles {
+                    result.push((handle.incarnation_id().clone(), self.inspect(handle).await?));
+                }
+                Ok(result)
+            }
+        }
+
+        struct RecoveryFixture {
+            dir: tempfile::TempDir,
+            supervisor: Supervisor,
+            backend: Arc<RecoveryBackend>,
+            controller: ServerManagedRuntimeController,
+            terminal: ManagedTerminalDescriptor,
+            soul: SoulId,
+            gate: Arc<ReplyGate>,
+            ipc: Option<JoinHandle<()>>,
+        }
+        impl Drop for RecoveryFixture {
+            fn drop(&mut self) {
+                if let Some(ipc) = self.ipc.take() {
+                    ipc.abort();
+                }
+            }
+        }
+        impl RecoveryFixture {
+            async fn new() -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+                std::fs::create_dir(dir.path().join("original")).unwrap();
+                std::fs::write(dir.path().join("original/secret"), b"private-host-secret").unwrap();
+                let soul = SoulId::new();
+                let limits = RuntimeLimits {
+                    cpu_milli: 1000,
+                    memory_bytes: 128 * 1024 * 1024,
+                    swap_bytes: 0,
+                    pids_max: 64,
+                };
+                let prepared = registry
+                    .prepare_launch(LaunchPreparation {
+                        soul_id: soul.clone(),
+                        provider: "native-session-fixture".into(),
+                        provider_store_id: "web-retry-store".into(),
+                        native_session_id: None,
+                        creation_seed_ref: "web-retry-seed".into(),
+                        request_id: RequestId::new(),
+                        payload_digest: "web-retry".into(),
+                        requested_limits: limits,
+                        profile: RuntimeProfile::Custom,
+                        project_key: "web-retry".into(),
+                        fixture: Some(FixtureKind::NativeSession),
+                        terminal: None,
+                        fresh_agent: None,
+                        view_intent: None,
+                        admission: Default::default(),
+                    })
+                    .await
+                    .unwrap();
+                registry
+                    .commit_created(
+                        prepared.incarnation_id.clone(),
+                        BackendCreatedRecord {
+                            daemon_id: DockerDaemonId::new(),
+                            container_id: "web-retry-original".into(),
+                            image_ref: "private-test-image".into(),
+                            runtime_dir: dir.path().join("original"),
+                            host_binary_path: std::env::current_exe().unwrap(),
+                            immutable_config_digest: "private-test".into(),
+                            launch_policy: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                registry
+                    .commit_execution_grant(
+                        prepared.incarnation_id.clone(),
+                        HostBootId::new(),
+                        limits,
+                    )
+                    .await
+                    .unwrap();
+                registry
+                    .mark_running(prepared.incarnation_id.clone())
+                    .await
+                    .unwrap();
+                registry
+                    .record_native_session(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        "web-retry-root".into(),
+                    )
+                    .await
+                    .unwrap();
+                let context = registry.recovery_context(soul.clone()).await.unwrap();
+                let resume =
+                    freshell_supervisor::resume_catalog::exact_resume_candidate(&context, None)
+                        .unwrap()
+                        .unwrap();
+                registry
+                    .store_verified_resume_spec(soul.clone(), resume)
+                    .await
+                    .unwrap();
+                let provider_home = dir.path().join("provider");
+                std::fs::create_dir(&provider_home).unwrap();
+                std::fs::write(
+                    provider_home.join("native-session-state.json"),
+                    b"{\"sessionId\":\"web-retry-root\",\"history\":[\"synthetic\"]}",
+                )
+                .unwrap();
+                let backend = Arc::new(RecoveryBackend {
+                    provider_home,
+                    failure: AtomicUsize::new(0),
+                    creates: AtomicUsize::new(0),
+                    reads: Arc::new(AtomicUsize::new(0)),
+                    inputs: Arc::new(StdMutex::new(vec![])),
+                    hosts: StdMutex::new(vec![]),
+                });
+                backend
+                    .start_host(
+                        &registry
+                            .owned_handle(prepared.incarnation_id.clone())
+                            .await
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let socket = dir.path().join("control.sock");
+                let supervisor = Supervisor::new(
+                    registry,
+                    backend.clone(),
+                    SupervisorConfig {
+                        runtime_root: dir.path().join("runtime"),
+                        control_socket_path: socket.clone(),
+                        host_binary_path: std::env::current_exe().unwrap(),
+                        image_ref: format!("sha256:{}", "a".repeat(64)),
+                        test_run_id: "web-recovery-integration".into(),
+                        control_secret: "private-test-secret".into(),
+                        lifecycle_log: dir.path().join("lifecycle.jsonl"),
+                        admission: Default::default(),
+                    },
+                )
+                .unwrap();
+                let listener = UnixListener::bind(&socket).unwrap();
+                let service = supervisor.clone();
+                let gate = Arc::new(ReplyGate::default());
+                let listener_gate = gate.clone();
+                let ipc = tokio::spawn(async move {
+                    let mut clients = tokio::task::JoinSet::new();
+                    loop {
+                        tokio::select! {
+                            accepted = listener.accept() => {
+                                let (mut stream, _) = accepted.unwrap();
+                                let service = service.clone();
+                                let gate = listener_gate.clone();
+                                clients.spawn(async move {
+                                    let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                                    let recovery = matches!(&request.body, AdminCommand::Recover(_));
+                                    if let AdminCommand::Recover(request) = &request.body {
+                                        gate.recover_calls.fetch_add(1, Ordering::SeqCst);
+                                        if request.trigger == RecoveryTrigger::ManualRetry { gate.manual_calls.fetch_add(1, Ordering::SeqCst); }
+                                        if request.trigger == RecoveryTrigger::RetryExhausted { gate.exhausted_calls.fetch_add(1, Ordering::SeqCst); }
+                                    }
+                                    let reply = service.dispatch(request).await;
+                                    if recovery && gate.hold_next.swap(false, Ordering::SeqCst) {
+                                        gate.ready.notify_one();
+                                        gate.release.notified().await;
+                                    }
+                                    write_frame(&mut stream, &reply).await.unwrap();
+                                });
+                            }
+                            result = clients.join_next(), if !clients.is_empty() => { result.unwrap().unwrap(); }
+                        }
+                    }
+                });
+                let controller = ServerManagedRuntimeController {
+                    client: RuntimeClient::new(&socket, "private-test-secret"),
+                    recovery: Arc::new(ManagedRecoveryState::default()),
+                };
+                let terminal = ManagedTerminalDescriptor {
+                    soul_id: soul.to_string(),
+                    incarnation_id: prepared.incarnation_id.to_string(),
+                    terminal_id: "web-retry-terminal".into(),
+                    stream_id: "original-stream".into(),
+                    mode: "native-session-fixture".into(),
+                    cwd: dir.path().to_string_lossy().into_owned(),
+                    resume_session_id: Some("web-retry-root".into()),
+                    create_request_id: None,
+                };
+                Self {
+                    dir,
+                    supervisor,
+                    backend,
+                    controller,
+                    terminal,
+                    soul,
+                    gate,
+                    ipc: Some(ipc),
+                }
+            }
+            async fn wait_for_request(&self) {
+                timeout(Duration::from_secs(1), async {
+                    while self.gate.recover_calls.load(Ordering::SeqCst) == 0
+                        || self.controller.recovery_in_flight(self.soul.as_str()).await
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the web request must settle without owning supervisor retry delays");
+            }
+            fn attempts(&self) -> u64 {
+                rusqlite::Connection::open(self.dir.path().join("registry/runtime.sqlite3"))
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM recovery_attempts", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            }
+            async fn close(&mut self) {
+                if let Some(ipc) = self.ipc.take() {
+                    ipc.abort();
+                    assert!(ipc.await.unwrap_err().is_cancelled());
+                }
+                let hosts: Vec<_> = self.backend.hosts.lock().unwrap().drain(..).collect();
+                for host in hosts {
+                    host.abort();
+                    assert!(host.await.unwrap_err().is_cancelled());
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn observer_retry_reaches_web_output_without_input() {
+            let mut fixture = Box::pin(RecoveryFixture::new()).await;
+            fixture.backend.failure.store(1, Ordering::SeqCst);
+            Box::pin(fixture.supervisor.observe_once()).await.unwrap();
+            assert_eq!(fixture.attempts(), 1);
+            fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .unwrap();
+            fixture.wait_for_request().await;
+            let pending = fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await;
+            assert_eq!(
+                fixture.attempts(),
+                1,
+                "web polling cannot spend the supervisor's pending attempt"
+            );
+            fixture.backend.failure.store(0, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(2_100)).await;
+            Box::pin(fixture.supervisor.observe_once()).await.unwrap();
+            let current = fixture
+                .supervisor
+                .registry()
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(current.recovery_state, RecoveryState::Live);
+            assert_eq!(current.successful_recoveries_in_window, 1);
+            assert_eq!(current.native_session_id.as_deref(), Some("web-retry-root"));
+            let output = fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .expect(
+                    "observer recovery must clear a stale web block without input or manual retry",
+                );
+            assert_eq!(output.chunks[0].data, "recovered output");
+            assert!(pending
+                .expect("pending recovery keeps the pane attached")
+                .chunks
+                .is_empty());
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.attempts(), 2);
+            assert_eq!(fixture.gate.exhausted_calls.load(Ordering::SeqCst), 0);
+            fixture.close().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn web_recovery_request_does_not_own_retry_delays() {
+            let mut fixture = Box::pin(RecoveryFixture::new()).await;
+            fixture.backend.failure.store(1, Ordering::SeqCst);
+            fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .unwrap();
+            fixture.wait_for_request().await;
+            assert_eq!(fixture.attempts(), 1);
+            assert_eq!(fixture.gate.recover_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.gate.exhausted_calls.load(Ordering::SeqCst), 0);
+            fixture.close().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn current_policy_block_survives_but_late_old_intent_reply_does_not() {
+            let mut fixture = Box::pin(RecoveryFixture::new()).await;
+            fixture.backend.failure.store(2, Ordering::SeqCst);
+            Box::pin(fixture.supervisor.observe_once()).await.unwrap();
+            fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .unwrap();
+            fixture.wait_for_request().await;
+            assert!(fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .is_err());
+            fixture.backend.failure.store(0, Ordering::SeqCst);
+            assert!(
+                fixture
+                    .controller
+                    .read_output(fixture.terminal.clone(), 0, 4096)
+                    .await
+                    .is_err(),
+                "repairing a dependency alone cannot erase a current policy block"
+            );
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 0);
+            let revision = fixture
+                .supervisor
+                .registry()
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap()
+                .intent_revision;
+            fixture.gate.hold_next.store(true, Ordering::SeqCst);
+            fixture
+                .controller
+                .schedule_recovery(fixture.soul.clone(), RecoveryTrigger::HostUnreachable)
+                .await;
+            timeout(Duration::from_secs(1), fixture.gate.ready.notified())
+                .await
+                .unwrap();
+            let current = fixture
+                .controller
+                .client
+                .recover_expected(
+                    fixture.soul.clone(),
+                    RecoveryTrigger::ManualRetry,
+                    Some(revision),
+                )
+                .await
+                .unwrap();
+            assert_eq!(current.outcome, RecoveryOutcome::Replaced);
+            assert_eq!(current.view.intent_revision, revision + 1);
+            fixture.gate.release.notify_one();
+            fixture.wait_for_request().await;
+            let output = fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .expect("late old-intent reply cannot hide the current live output");
+            assert_eq!(output.chunks[0].data, "recovered output");
+            fixture.close().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn newer_policy_block_survives_output_poll_until_deliberate_input_recovers() {
+            let mut fixture = Box::pin(RecoveryFixture::new()).await;
+            fixture.backend.failure.store(2, Ordering::SeqCst);
+            Box::pin(fixture.supervisor.observe_once()).await.unwrap();
+            fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .unwrap();
+            fixture.wait_for_request().await;
+            assert!(fixture
+                .controller
+                .blocked_recovery(fixture.soul.as_str())
+                .await
+                .unwrap()
+                .is_some());
+            let revision = fixture
+                .supervisor
+                .registry()
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap()
+                .intent_revision;
+            // The public retry route delegates directly to RuntimeClient, so
+            // its newer result does not enter the controller's local cache.
+            let newer = fixture
+                .controller
+                .runtime_client()
+                .recover_expected_with_request_id(
+                    RequestId::new(),
+                    fixture.soul.clone(),
+                    RecoveryTrigger::ManualRetry,
+                    Some(revision),
+                )
+                .await
+                .unwrap();
+            assert_eq!(newer.outcome, RecoveryOutcome::Blocked);
+            assert_eq!(newer.view.intent_revision, revision + 1);
+            assert!(!recovery_pending(&newer));
+            assert_eq!(fixture.attempts(), 2);
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 0);
+            let newer_message = newer.view.recovery_reason.unwrap();
+            assert_eq!(
+                fixture
+                    .controller
+                    .read_output(fixture.terminal.clone(), 0, 4096)
+                    .await
+                    .unwrap_err(),
+                newer_message
+            );
+            let retained_block = fixture
+                .controller
+                .blocked_recovery(fixture.soul.as_str())
+                .await
+                .unwrap();
+            assert_eq!(fixture.gate.recover_calls.load(Ordering::SeqCst), 2);
+            assert!(fixture.backend.inputs.lock().unwrap().is_empty());
+
+            fixture.backend.failure.store(0, Ordering::SeqCst);
+            let input = fixture
+                .controller
+                .input(fixture.terminal.clone(), "deliberate input".into())
+                .await;
+            let current = fixture
+                .supervisor
+                .registry()
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap();
+            let connection =
+                rusqlite::Connection::open(fixture.dir.path().join("registry/runtime.sqlite3"))
+                    .unwrap();
+            let attempts: Vec<(u64, String, bool)> = connection
+                .prepare("SELECT intent_revision,verdict,finished_at IS NOT NULL FROM recovery_attempts ORDER BY intent_revision")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let completed_inputs: u64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM input_commands WHERE state='completed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(connection);
+            fixture.close().await;
+
+            assert_eq!(
+                retained_block,
+                Some(newer_message),
+                "output polling must retain the newer block for deliberate retry; input result: {input:?}"
+            );
+            input.expect("deliberate input must recover the blocked soul before dispatch");
+            assert_eq!(current.intent_revision, revision + 2);
+            assert_eq!(current.recovery_state, RecoveryState::Live);
+            assert_eq!(current.native_session_id.as_deref(), Some("web-retry-root"));
+            assert_eq!(current.successful_recoveries_in_window, 1);
+            assert_eq!(
+                attempts,
+                vec![
+                    (revision, "blocked".into(), true),
+                    (revision + 1, "blocked".into(), true),
+                    (revision + 2, "succeeded".into(), true),
+                ]
+            );
+            assert_eq!(fixture.gate.recover_calls.load(Ordering::SeqCst), 3);
+            assert_eq!(fixture.gate.manual_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(fixture.gate.exhausted_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 1);
+            assert_eq!(completed_inputs, 1);
+            assert_eq!(
+                *fixture.backend.inputs.lock().unwrap(),
+                vec![InputObservation {
+                    incarnation_id: current.prior_handle.incarnation_id().clone(),
+                    native_session_id: "web-retry-root".into(),
+                    data: "deliberate input".into(),
+                    intent_revision: revision + 2,
+                    recovery_state: "live".into(),
+                    command_state: "dispatching".into(),
+                }]
+            );
+        }
+    }
 
     #[test]
     fn managed_env_drops_server_and_provider_secrets() {

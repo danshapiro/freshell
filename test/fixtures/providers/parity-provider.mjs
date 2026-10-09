@@ -196,12 +196,61 @@ append({
   mcpRecipePresent: Boolean(mcpRecipe()),
 })
 rpcProbe(mcpRecipe())
+// This controlled terminal fixture runs the configured native commands. It
+// never writes identity receipts itself, and startup emits no user transcript.
+async function configuredClaudeStartup() {
+  if (!nativeId) return
+  const settings = {
+    ...(readJson(path.join(providerHome, 'settings.json')) ?? {}),
+    ...(readJson(path.join(cwd, '.claude/settings.json')) ?? {}),
+    ...(readJson(path.join(cwd, '.claude/settings.local.json')) ?? {}),
+  }
+  for (let index = 0; index < argv.length - 1; index++) {
+    if (argv[index] !== '--settings') continue
+    let selected
+    try { selected = JSON.parse(argv[index + 1]) } catch { selected = readJson(argv[index + 1]) }
+    if (selected) Object.assign(settings, selected)
+  }
+  const source = argv.includes('--resume') ? 'resume' : 'startup'
+  const transcript = path.join(providerHome, 'projects/provider-parity', `${nativeId}.jsonl`)
+  const command = (selected, input) => new Promise((resolve, reject) => {
+    const child = spawn('/bin/sh', ['-c', selected], { env: process.env, cwd, stdio: ['pipe', 'inherit', 'inherit'] })
+    const timer = setTimeout(() => { child.kill(); reject(new Error('configured native command timeout')) }, 5000)
+    child.once('error', error => { clearTimeout(timer); reject(error) })
+    child.once('close', code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error('configured native command refused')) })
+    child.stdin.on('error', () => {})
+    child.stdin.end(JSON.stringify(input))
+  })
+  if (settings.disableAllHooks !== true) {
+    for (const group of settings.hooks?.SessionStart ?? []) {
+      if (group.matcher && !new RegExp(group.matcher).test(source)) continue
+      for (const hook of group.hooks ?? []) {
+        if (hook.type === 'command' && typeof hook.command === 'string') {
+          await command(hook.command, { hook_event_name: 'SessionStart', session_id: nativeId, source, cwd, transcript_path: transcript })
+        }
+      }
+    }
+  }
+  if (settings.statusLine?.type === 'command' && typeof settings.statusLine.command === 'string') {
+    const model = argv.indexOf('--model')
+    await command(settings.statusLine.command, { session_id: nativeId, transcript_path: transcript,
+      version: '2.1.263', model: { id: model >= 0 ? argv[model + 1] : settings.model ?? 'controlled-fixture-model' },
+      workspace: { current_dir: cwd }, context_window: { context_window_size: 200000, current_usage: null } })
+  }
+}
+if (provider === 'claude') {
+  try { await configuredClaudeStartup() }
+  catch (error) { append({ kind: 'native-startup', result: 'refused', errorKind: error?.name ?? 'Error' }); process.exitCode = 1 }
+}
 if (provider === 'codex' || provider === 'opencode') {
-  // These CLIs materialize native identity on the first submitted prompt.
-  // Drive the existing behavioral terminal fakes after recording the launch.
+  // Keep ordinary fake transcripts Enter-bound. Only this managed Codex
+  // parity wrapper requests the current proxy handshake before input.
   const fake = path.join(import.meta.dirname,
     provider === 'codex' ? 'fake-codex-terminal.mjs' : 'fake-opencode-terminal.mjs')
-  const terminal = spawn(process.execPath, [fake, ...argv], { stdio: ['inherit', 'pipe', 'inherit'] })
+  const terminal = spawn(process.execPath, [fake, ...argv], {
+    env: provider === 'codex' ? { ...process.env, FAKE_CODEX_TERMINAL_PARITY_STARTUP: '1' } : process.env,
+    stdio: ['inherit', 'pipe', 'inherit'],
+  })
   let output = ''
   terminal.stdout.on('data', chunk => {
     output += String(chunk)

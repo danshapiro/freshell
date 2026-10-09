@@ -30,6 +30,53 @@ async function scenario(run: (store: any, reopen: (profile?: string) => any, pat
 }
 
 describe('restricted native checkpoint durable phases', () => {
+  it('admits the first child input only from the verified native parent prefix and prefers an existing child', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'native-parent-fork-'))
+    const parent = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const parentPath = join(directory, parent + '.jsonl')
+    const transcriptPath = join(directory, root + '.jsonl')
+    const rows = [
+      { type: 'user', sessionId: parent, uuid: 'first-user', parentUuid: null, message: { content: 'kept' } },
+      { type: 'assistant', sessionId: parent, uuid: 'first-answer', parentUuid: 'first-user', message: { content: [] } },
+      { type: 'user', sessionId: parent, uuid: 'undone-user', parentUuid: 'first-answer', message: { content: 'removed' } },
+    ]
+    const bytes = rows.map((row) => JSON.stringify(row) + '\n').join('')
+    const parentFork = { childSessionId: root, parentSessionId: parent, parentTranscript: parentPath,
+      childTranscript: transcriptPath, parentSha256: createHash('sha256').update(bytes).digest('hex'),
+      target: { kind: 'prefix', cutoffUuid: 'first-answer', dropTurnUuid: 'undone-user' } }
+    const open = (recipe: typeof parentFork & { recoveryDisabled?: boolean } = parentFork) => createNativeCheckpointStore({ recordPath: join(directory, 'checkpoint.json'),
+      transcriptPath, nativeSessionId: root, profileDigest, parentFork: recipe })
+    try {
+      await writeFile(parentPath, bytes)
+      expect(await open().inputState()).toBe('clear')
+      const live = open()
+      expect(await live.inputState()).toBe('clear')
+      live.disableParentFork()
+      expect(await live.inputState()).toBe('blocked')
+      expect(await open({ ...parentFork, childSessionId: parent }).inputState()).toBe('blocked')
+      expect(await open({ ...parentFork, recoveryDisabled: true }).inputState()).toBe('blocked')
+      expect(await open({ ...parentFork, target: { ...parentFork.target, cutoffUuid: 'missing' } }).inputState()).toBe('blocked')
+      expect(await open({ ...parentFork, target: { ...parentFork.target, dropTurnUuid: 'wrong' } }).inputState()).toBe('blocked')
+      const unfinished = rows.map((row, index) => JSON.stringify(index === 1 ? { ...row,
+        message: { content: [{ type: 'tool_use', id: 'toolu_parentPending', name: 'Bash', input }] } } : row) + '\n').join('')
+      await writeFile(parentPath, unfinished)
+      expect(await open({ ...parentFork, parentSha256: createHash('sha256').update(unfinished).digest('hex') }).inputState()).toBe('blocked')
+      await writeFile(parentPath, bytes + '{}\n')
+      expect(await open().inputState()).toBe('blocked')
+      await writeFile(parentPath, bytes)
+      await writeFile(transcriptPath, '{partial')
+      expect(await open().inputState()).toBe('blocked')
+      for (const row of [{ type: 'mode', sessionId: root }, { type: 'user', sessionId: parent }]) {
+        await writeFile(transcriptPath, JSON.stringify(row) + '\n')
+        expect(await open().inputState()).toBe('blocked')
+      }
+      await writeFile(transcriptPath, JSON.stringify({ type: 'assistant', sessionId: root,
+        message: { content: [{ type: 'tool_use', id: 'toolu_unfinished', name: 'Bash', input }] } }) + '\n')
+      expect(await open().inputState()).toBe('blocked')
+      await rm(parentPath)
+      expect(await open().inputState()).toBe('blocked')
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
   it.each([1, 2])('blocks %i unfinished native tools without a checkpoint or callback to replay', async (count) => scenario(async (store, reopen, paths) => {
     const tools = Array.from({ length: count }, (_, index) => ({ type: 'tool_use', id: 'toolu_unfinished' + index, name: 'Bash', input }))
     const assistant = { type: 'assistant', sessionId: root, message: { content: tools } }

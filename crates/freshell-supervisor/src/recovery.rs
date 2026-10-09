@@ -1,7 +1,7 @@
 //! Serialized automatic recovery for managed souls.
 //!
 //! Replacement ordering is intentionally strict:
-//! probe -> durable recovery attempt -> stop exact owned enclosure -> verify
+//! durable recovery attempt -> probe -> stop exact owned enclosure -> verify
 //! empty -> prepare one replacement claim -> exact resume -> verify the native
 //! identity -> publish LIVE. No branch can substitute a fresh provider session
 //! for a failed native resume.
@@ -12,6 +12,7 @@ use crate::{
     loss_report::{
         hash_loss_certificate, path_name, IncidentExporter, LossDecisionInput, LostDecision,
     },
+    recovery_retry::{RecoveryRetry, TransientRecoveryFailure},
     registry::{
         NativeImportState, OwnedRuntimeHandle, RecoveryContext, RecoveryWriteFence, RegistryError,
         StoppedRepairOwnerCandidate, StoppedRepairRootReceipt,
@@ -66,6 +67,7 @@ pub(crate) enum NativeIdentityWait {
     HostUnavailable {
         message: String,
         elapsed_ms: u64,
+        transient: Option<TransientRecoveryFailure>,
     },
     TimedOut {
         adoption_pending: bool,
@@ -80,7 +82,7 @@ pub(crate) enum NativeIdentityWait {
 }
 
 const NATIVE_IDENTITY_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-const OPENCODE_ADOPTION_READINESS_TIMEOUT: Duration = Duration::from_secs(180);
+const OPENCODE_TUI_READINESS_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn retained_runtime_probe(
     exited: bool,
@@ -159,9 +161,9 @@ pub(crate) fn current_native_observation<'a>(
     .then_some(observation)
 }
 
-pub(crate) fn native_identity_wait_timeout(opencode_adoption_required: bool) -> Duration {
-    if opencode_adoption_required {
-        OPENCODE_ADOPTION_READINESS_TIMEOUT
+pub(crate) fn native_identity_wait_timeout(opencode_tui_readiness_required: bool) -> Duration {
+    if opencode_tui_readiness_required {
+        OPENCODE_TUI_READINESS_TIMEOUT
     } else {
         NATIVE_IDENTITY_STARTUP_TIMEOUT
     }
@@ -1519,12 +1521,30 @@ impl Supervisor {
         &self,
         soul_id: SoulId,
     ) -> Result<(RecoveryProbe, RecoveryContext), RuntimeError> {
+        let (probe, context, _) = self.probe_recovery_for_attempt(soul_id).await?;
+        Ok((probe, context))
+    }
+
+    async fn probe_recovery_for_attempt(
+        &self,
+        soul_id: SoulId,
+    ) -> Result<
+        (
+            RecoveryProbe,
+            RecoveryContext,
+            Option<TransientRecoveryFailure>,
+        ),
+        RuntimeError,
+    > {
         let mut context = self
             .registry
             .recovery_context(soul_id)
             .await
             .map_err(map_registry)?;
-        let probe = self.probe_recovery_context(&mut context).await?;
+        let mut transient = None;
+        let probe = self
+            .probe_recovery_context(&mut context, &mut transient)
+            .await?;
         let probe = match probe {
             RecoveryProbe::ResumeReady { resume_spec, .. }
                 if context.resume_spec.as_ref() != Some(&*resume_spec) =>
@@ -1614,15 +1634,17 @@ impl Supervisor {
                 "blockReason": block_reason,
                 "repair": preflight_diagnostic_repair(repair),
                 "matcherReason": preflight_diagnostic_repair(repair),
-                "attemptReserved": false,
+                "attemptReserved": context.recovery_attempt_id.is_some(),
             }),
         );
-        Ok((probe, context))
+        let transient = transient.filter(|failure| matches!(&probe,RecoveryProbe::Blocked { reason, .. } if failure.permits(*reason)));
+        Ok((probe, context, transient))
     }
 
     async fn probe_recovery_context(
         &self,
         context: &mut RecoveryContext,
+        transient: &mut Option<TransientRecoveryFailure>,
     ) -> Result<RecoveryProbe, RuntimeError> {
         if context.desired_state == DesiredState::Stopped {
             return Ok(blocked(
@@ -1652,12 +1674,13 @@ impl Supervisor {
                 ));
             }
             Err(error) => {
+                *transient = TransientRecoveryFailure::from_backend(&error);
                 return Ok(blocked(
                     RecoveryPath::Reattach,
                     RecoveryBlockReason::ProviderUnavailable,
                     &error.to_string(),
                     Some(2_000),
-                ))
+                ));
             }
         };
 
@@ -1706,6 +1729,7 @@ impl Supervisor {
                             return offline_probe(context);
                         }
                         Err(error) => {
+                            *transient = TransientRecoveryFailure::from_runtime(&error);
                             return Ok(blocked(
                                 RecoveryPath::Reattach,
                                 RecoveryBlockReason::ProviderUnavailable,
@@ -1858,12 +1882,13 @@ impl Supervisor {
                     return offline_probe(context);
                 }
                 Err(error) => {
+                    *transient = TransientRecoveryFailure::from_runtime(&error);
                     return Ok(blocked(
                         RecoveryPath::Reattach,
                         RecoveryBlockReason::ProviderUnavailable,
                         &error.message,
                         Some(2_000),
-                    ))
+                    ));
                 }
             }
         }
@@ -1912,7 +1937,7 @@ impl Supervisor {
                 "evidenceRevision": context.evidence_revision,
                 "controlEpoch": context.control_epoch,
                 "reason": reason,
-                "attemptReserved": false,
+                "attemptReserved": context.recovery_attempt_id.is_some(),
             }),
         );
         let candidate = resume_catalog::exact_resume_candidate(context, None);
@@ -1952,7 +1977,7 @@ impl Supervisor {
                             crate::service::append_event(
                                 &self.config.lifecycle_log,
                                 "supervisor.recovery.retained_store_compatible",
-                                serde_json::json!({"severity":"info","soulId":context.soul_id,"incarnationId":context.prior_handle.incarnation_id(),"intentRevision":context.intent_revision,"evidenceRevision":context.evidence_revision,"controlEpoch":context.control_epoch,"launchPolicy":context.prior_handle.launch_policy(),"reason":reason,"receipt":receipt,"attemptReserved":false}),
+                                serde_json::json!({"severity":"info","soulId":context.soul_id,"incarnationId":context.prior_handle.incarnation_id(),"intentRevision":context.intent_revision,"evidenceRevision":context.evidence_revision,"controlEpoch":context.control_epoch,"launchPolicy":context.prior_handle.launch_policy(),"reason":reason,"receipt":receipt,"attemptReserved":context.recovery_attempt_id.is_some()}),
                             );
                             RecoveryProbe::ResumeReady {
                                 resume_spec: Box::new(spec),
@@ -2034,8 +2059,18 @@ impl Supervisor {
         &self,
         request: RecoverRequest,
     ) -> Result<RecoveryResult, RuntimeError> {
+        self.recover_scheduled(request, false).await
+    }
+
+    pub(crate) async fn recover_scheduled(
+        &self,
+        request: RecoverRequest,
+        only_due_retry: bool,
+    ) -> Result<RecoveryResult, RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
         let _recovery_guard = lifecycle_lock.lock().await;
+        #[cfg(test)]
+        automatic_retry_tests::crash_boundary("before_reservation");
         self.registry
             .assert_soul_intent_revision(request.soul_id.clone(), request.expected_intent_revision)
             .await
@@ -2045,6 +2080,35 @@ impl Supervisor {
             .recovery_context(request.soul_id.clone())
             .await
             .map_err(map_registry)?;
+        if only_due_retry
+            && !self
+                .registry
+                .recovery_retry(request.soul_id.clone(), before_retry.intent_revision)
+                .await
+                .map_err(map_registry)?
+                .is_some_and(|retry| {
+                    retry.reserved_attempt_id.is_some()
+                        || retry.is_due(self.registry.recovery_now_ms())
+                })
+        {
+            return Ok(RecoveryResult {
+                outcome: match before_retry.recovery_state {
+                    freshell_runtime_protocol::RecoveryState::Live => RecoveryOutcome::Reattached,
+                    freshell_runtime_protocol::RecoveryState::Lost => RecoveryOutcome::Lost,
+                    freshell_runtime_protocol::RecoveryState::Stopped => RecoveryOutcome::Stopped,
+                    _ => RecoveryOutcome::Blocked,
+                },
+                view: self
+                    .view_for(before_retry.prior_handle.incarnation_id())
+                    .await?,
+                probe: None,
+                prior_incarnation_id: None,
+                attempt_id: None,
+                expected_native_session_id: before_retry.native_session_id,
+                observed_native_session_id: None,
+                incident_id: None,
+            });
+        }
         if request.trigger == RecoveryTrigger::ManualRetry
             && before_retry.desired_state == DesiredState::Stopped
             && before_retry.recovery_state
@@ -2065,6 +2129,26 @@ impl Supervisor {
                 &self.config.lifecycle_log,
                 "supervisor.stopped_data_repair_resume_requested",
                 serde_json::json!({"soulId":request.soul_id,"intentRevision":next_revision}),
+            );
+        }
+        if request.trigger == RecoveryTrigger::ManualRetry
+            && before_retry.desired_state == DesiredState::Running
+            && before_retry.recovery_state != freshell_runtime_protocol::RecoveryState::Lost
+        {
+            let revision = self
+                .registry
+                .rearm_recovery_retry(request.soul_id.clone(), before_retry.intent_revision)
+                .await
+                .map_err(map_registry)?;
+            let generation = self
+                .view_for(before_retry.prior_handle.incarnation_id())
+                .await
+                .ok()
+                .map(|view| view.execution_generation);
+            crate::service::append_event(
+                &self.config.lifecycle_log,
+                "supervisor.recovery_retry.cancelled",
+                serde_json::json!({"severity":"info","soulId":request.soul_id,"incarnationId":before_retry.prior_handle.incarnation_id(),"attemptId":before_retry.recovery_attempt_id,"executionGeneration":generation,"intentRevision":before_retry.intent_revision,"nextIntentRevision":revision,"controlEpoch":self.registry.control_epoch(),"reason":"manual_rearm"}),
             );
         }
         if let Some(view) = self
@@ -2145,12 +2229,257 @@ impl Supervisor {
                 incident_id: None,
             });
         }
-        let (probe, observed_context) = self
-            .probe_recovery_observed(request.soul_id.clone())
+        let context = self
+            .registry
+            .recovery_context(request.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if context.desired_state == DesiredState::Stopped {
+            return self
+                .complete_recovery_probe(
+                    request,
+                    blocked(
+                        RecoveryPath::Reattach,
+                        RecoveryBlockReason::StopIntent,
+                        "the durable desired state is STOPPED",
+                        None,
+                    ),
+                    context,
+                    None,
+                )
+                .await;
+        }
+        let reserved = match self
+            .registry
+            .reserved_recovery_retry(request.soul_id.clone(), context.intent_revision)
+            .await
+            .map_err(map_registry)?
+        {
+            Some(reserved) => Some(reserved),
+            None => self
+                .registry
+                .reserve_due_recovery_retry(
+                    request.soul_id.clone(),
+                    context.intent_revision,
+                    self.registry.recovery_now_ms(),
+                )
+                .await
+                .map_err(map_registry)?,
+        };
+        let Some(reserved) = reserved else {
+            let context = self
+                .registry
+                .recovery_context(request.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            let pending = self
+                .registry
+                .recovery_retry(request.soul_id.clone(), context.intent_revision)
+                .await
+                .map_err(map_registry)?;
+            let probe = pending.and_then(|retry| {
+                retry.next_due_at_ms.map(|due| {
+                    blocked(
+                        RecoveryPath::Reattach,
+                        if retry.last_reason == "preparation_unavailable" {
+                            RecoveryBlockReason::CapabilityPending
+                        } else {
+                            RecoveryBlockReason::ProviderUnavailable
+                        },
+                        "the supervisor has scheduled another recovery attempt",
+                        Some(due.saturating_sub(self.registry.recovery_now_ms()).max(0) as u64),
+                    )
+                })
+            });
+            return Ok(RecoveryResult {
+                outcome: RecoveryOutcome::Blocked,
+                view: self.view_for(context.prior_handle.incarnation_id()).await?,
+                probe,
+                prior_incarnation_id: None,
+                attempt_id: None,
+                expected_native_session_id: context.native_session_id,
+                observed_native_session_id: None,
+                incident_id: None,
+            });
+        };
+        self.log_recovery_retry(
+            "reserved",
+            &reserved,
+            &reserved.reserved_attempt_id,
+            &context,
+        )
+        .await;
+        #[cfg(test)]
+        automatic_retry_tests::crash_boundary("after_reservation_before_dispatch");
+        let mut result = Box::pin(self.run_reserved_recovery(request.clone())).await;
+        if let Err(error) = &result {
+            let current = self
+                .registry
+                .recovery_context(request.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if current.desired_state == DesiredState::Running
+                && current.intent_revision == reserved.intent_revision
+                && current.recovery_attempt_id == reserved.reserved_attempt_id
+            {
+                let transient = TransientRecoveryFailure::from_runtime(error);
+                self.registry
+                    .mark_recovery_blocked_with_retry(
+                        request.soul_id.clone(),
+                        reserved.reserved_attempt_id.clone(),
+                        match error.code {
+                            RuntimeErrorCode::RecoveryRetryBudget => {
+                                RecoveryBlockReason::RetryBudget
+                            }
+                            RuntimeErrorCode::RecoveryWrongIdentity => {
+                                RecoveryBlockReason::WrongNativeIdentity
+                            }
+                            _ => RecoveryBlockReason::ProviderUnavailable,
+                        },
+                        vec![error.message.clone()],
+                        current.write_fence(),
+                        transient,
+                    )
+                    .await
+                    .map_err(map_registry)?;
+            }
+        }
+        let settled = self
+            .registry
+            .recovery_retry(request.soul_id.clone(), reserved.intent_revision)
+            .await
+            .map_err(map_registry)?;
+        if let Some(retry) = &settled {
+            let state = if retry.last_reason == "retry_exhausted" {
+                "exhausted"
+            } else if retry.next_due_at_ms.is_some() {
+                "scheduled"
+            } else {
+                "settled"
+            };
+            self.log_recovery_retry(state, retry, &reserved.reserved_attempt_id, &context)
+                .await;
+            if let Ok(result) = &mut result {
+                if let Some(RecoveryProbe::Blocked {
+                    reason, retry_hint, ..
+                }) = &mut result.probe
+                {
+                    retry_hint.automatic_after_ms = retry.next_due_at_ms.map(|due| {
+                        due.saturating_sub(self.registry.recovery_now_ms()).max(0) as u64
+                    });
+                    if retry.last_reason == "retry_exhausted" {
+                        *reason = RecoveryBlockReason::RetryBudget;
+                    }
+                }
+            }
+        } else {
+            let recovered = result.as_ref().is_ok_and(|result| {
+                matches!(
+                    result.outcome,
+                    RecoveryOutcome::Reattached | RecoveryOutcome::Replaced
+                )
+            });
+            let mut finished = reserved.clone();
+            finished.reserved_attempt_id = None;
+            finished.last_reason = if recovered { "recovered" } else { "cancelled" }.into();
+            self.log_recovery_retry(
+                if recovered { "settled" } else { "cancelled" },
+                &finished,
+                &reserved.reserved_attempt_id,
+                &context,
+            )
+            .await;
+        }
+        #[cfg(test)]
+        automatic_retry_tests::crash_boundary("after_settlement");
+        result
+    }
+
+    async fn log_recovery_retry(
+        &self,
+        state: &str,
+        retry: &RecoveryRetry,
+        attempt_id: &Option<RecoveryAttemptId>,
+        context: &RecoveryContext,
+    ) {
+        // Settlement can advance to an owned replacement. Observe that exact
+        // incarnation while retaining the attempt identity after its row has
+        // been cleared. Diagnostics never turn a committed result into failure.
+        let current = self
+            .registry
+            .recovery_context(retry.soul_id.clone())
+            .await
+            .ok()
+            .filter(|current| current.intent_revision == retry.intent_revision);
+        let context = current.as_ref().unwrap_or(context);
+        let generation = self
+            .view_for(context.prior_handle.incarnation_id())
+            .await
+            .ok()
+            .map(|view| view.execution_generation);
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            &format!("supervisor.recovery_retry.{state}"),
+            serde_json::json!({
+                "severity":if state == "exhausted" {"warn"} else {"info"},"soulId":retry.soul_id,
+                "incarnationId":context.prior_handle.incarnation_id(),"intentRevision":retry.intent_revision,
+                "controlEpoch":self.registry.control_epoch(),"attemptId":attempt_id,
+                "executionGeneration":generation,
+                "attemptCount":retry.attempt_count,"nextDueAtMs":retry.next_due_at_ms,"reason":retry.last_reason,
+            }),
+        );
+    }
+
+    async fn run_reserved_recovery(
+        &self,
+        request: RecoverRequest,
+    ) -> Result<RecoveryResult, RuntimeError> {
+        if let Some((prepared, context)) = self
+            .registry
+            .pending_owned_replacement(request.soul_id.clone())
+            .await
+            .map_err(map_registry)?
+        {
+            // Inspect the registered object before resuming its idempotent
+            // activation. Never repeat create_stopped for a reserved attempt.
+            let inspection = self
+                .backend
+                .inspect(&context.prior_handle)
+                .await
+                .map_err(crate::service::map_backend)?;
+            if !matches!(
+                inspection.state,
+                BackendRuntimeState::Created | BackendRuntimeState::Running
+            ) {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::RecoveryBlocked,
+                    "reserved replacement is no longer an owned startable runtime",
+                ));
+            }
+            let workload = LaunchWorkload {
+                soul_id: request.soul_id.clone(),
+                fixture: context.fixture,
+                terminal: context.terminal.clone(),
+                fresh_agent: context.fresh_agent.clone(),
+                resume_spec: context.resume_spec.clone(),
+            };
+            if let Err(error) = Box::pin(self.activate_prepared_observed(
+                prepared.clone(),
+                workload,
+                context.requested_limits,
+                context.write_fence(),
+            ))
+            .await
+            {
+                self.cleanup_failed_replacement(&prepared.incarnation_id)
+                    .await;
+                return Err(error);
+            }
+        }
+        let (probe, observed_context, transient) = self
+            .probe_recovery_for_attempt(request.soul_id.clone())
             .await?;
-        // Select one boxed action rather than polling every recovery branch
-        // in a single large future on the default debug worker stack.
-        self.complete_recovery_probe(request, probe, observed_context)
+        self.complete_recovery_probe(request, probe, observed_context, transient)
             .await
     }
 
@@ -2159,6 +2488,7 @@ impl Supervisor {
         request: RecoverRequest,
         probe: RecoveryProbe,
         observed_context: RecoveryContext,
+        transient: Option<TransientRecoveryFailure>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<RecoveryResult, RuntimeError>> + Send + '_>,
     > {
@@ -2209,12 +2539,13 @@ impl Supervisor {
                     });
                 }
                 self.registry
-                    .mark_recovery_blocked(
+                    .mark_recovery_blocked_with_retry(
                         request.soul_id.clone(),
                         None,
                         reason,
                         evidence,
                         observed_context.write_fence(),
+                        transient,
                     )
                     .await
                     .map_err(map_registry)?;
@@ -2253,8 +2584,8 @@ impl Supervisor {
                 // Loss authority requires a fresh second probe after every
                 // recovery path has already reported a negative. A late host,
                 // store, checkpoint, or stop-intent transition cancels loss.
-                let (rechecked, rechecked_context) = self
-                    .probe_recovery_observed(request.soul_id.clone())
+                let (rechecked, rechecked_context, rechecked_transient) = self
+                    .probe_recovery_for_attempt(request.soul_id.clone())
                     .await?;
                 match rechecked.clone() {
                     RecoveryProbe::ReattachReady { handle, .. } => {
@@ -2313,12 +2644,13 @@ impl Supervisor {
                         reason, evidence, ..
                     } => {
                         self.registry
-                            .mark_recovery_blocked(
+                            .mark_recovery_blocked_with_retry(
                                 request.soul_id.clone(),
                                 None,
                                 reason,
                                 evidence,
                                 rechecked_context.write_fence(),
+                                rechecked_transient,
                             )
                             .await
                             .map_err(map_registry)?;
@@ -2540,14 +2872,14 @@ impl Supervisor {
                     .issue_replacement_mcp_capability(&soul_id, &terminal.mode, tui_source, &terminal.workspace_path, &terminal.cwd)
                     .await
                     .and_then(|context| {
-                        let reference=context.context.mcp_capability.as_ref().ok_or_else(||RuntimeError::new(RuntimeErrorCode::HostUnreachable,"capability_pending: exact provider preparation omitted its scoped grant"))?;
+                        let reference=context.context.mcp_capability.as_ref().ok_or_else(||RuntimeError::new(RuntimeErrorCode::RecoveryBlocked,"capability_pending: exact provider preparation omitted its scoped grant"))?;
                         crate::backend::docker::staged_provider_root_for_grant(
                             &reference.grant_id,
                         )
                         .map(|staged_root| (context, staged_root))
                         .map_err(|error| {
                             RuntimeError::new(
-                                    RuntimeErrorCode::HostUnreachable,
+                                    RuntimeErrorCode::RecoveryBlocked,
                                     format!("capability_pending: staged provider root unavailable: {error}"),
                                 )
                         })
@@ -2557,12 +2889,14 @@ impl Supervisor {
                     Err(error) => {
                         let reason = RecoveryBlockReason::CapabilityPending;
                         self.registry
-                            .mark_recovery_blocked(
+                            .mark_recovery_blocked_with_retry(
                                 soul_id.clone(),
                                 Some(attempt_id.clone()),
                                 reason,
                                 vec![error.message.clone()],
                                 verdict_fence.clone(),
+                                TransientRecoveryFailure::from_runtime(&error)
+                                    .map(|_| TransientRecoveryFailure::Preparation),
                             )
                             .await
                             .map_err(map_registry)?;
@@ -2620,27 +2954,34 @@ impl Supervisor {
         };
 
         verdict_fence = verdict_fence.for_incarnation(prepared.prepared.incarnation_id.clone());
-        let launch = self
-            .activate_prepared_observed(
-                prepared.prepared.clone(),
-                LaunchWorkload {
-                    soul_id: soul_id.clone(),
-                    fixture: prepared.fixture,
-                    terminal: prepared.terminal.clone(),
-                    fresh_agent: prepared.fresh_agent.clone(),
-                    resume_spec: prepared.resume_spec.clone(),
-                },
-                start.context.requested_limits,
-                verdict_fence.clone(),
-            )
-            .await;
+        let workload = LaunchWorkload {
+            soul_id: soul_id.clone(),
+            fixture: prepared.fixture,
+            terminal: prepared.terminal.clone(),
+            fresh_agent: prepared.fresh_agent.clone(),
+            resume_spec: prepared.resume_spec.clone(),
+        };
+        let opencode_readiness = workload.opencode_tui_readiness_required(&start.context.provider);
+        // Keep activation's owned launch/grant state off the replacement
+        // polling frame, as at the other large recovery async boundaries.
+        let launch = Box::pin(self.activate_prepared_observed(
+            prepared.prepared.clone(),
+            workload,
+            start.context.requested_limits,
+            verdict_fence.clone(),
+        ))
+        .await;
         match launch {
             Ok((_, successor)) => {
                 verdict_fence = successor;
             }
             Err(error) => {
+                let mut transient = TransientRecoveryFailure::from_runtime(&error);
                 let reason = if error.message.starts_with("capability_pending:") {
+                    transient = transient.map(|_| TransientRecoveryFailure::Preparation);
                     RecoveryBlockReason::CapabilityPending
+                } else if transient.is_some() {
+                    RecoveryBlockReason::ProviderUnavailable
                 } else {
                     classify_provider_failure(&error.message)
                 };
@@ -2660,12 +3001,13 @@ impl Supervisor {
                 self.cleanup_failed_replacement(&prepared.prepared.incarnation_id)
                     .await;
                 self.registry
-                    .mark_recovery_blocked(
+                    .mark_recovery_blocked_with_retry(
                         soul_id.clone(),
                         Some(attempt_id.clone()),
                         reason,
                         vec![error.message.clone()],
                         verdict_fence.clone(),
+                        transient,
                     )
                     .await
                     .map_err(map_registry)?;
@@ -2696,15 +3038,12 @@ impl Supervisor {
             );
         let observed_native_session_id = if expected_native_session_id.is_some() || requires_native
         {
-            let adoption_required = resume_spec
-                .as_ref()
-                .is_some_and(|spec| spec.opencode_adoption_baseline.is_some());
             let wait = self
                 .wait_for_native_identity(
                     &soul_id,
                     &prepared.prepared.incarnation_id,
                     start.context.intent_revision,
-                    native_identity_wait_timeout(adoption_required),
+                    native_identity_wait_timeout(opencode_readiness),
                     true,
                 )
                 .await;
@@ -2751,6 +3090,10 @@ impl Supervisor {
                 .or(observed.as_deref())
                 .unwrap_or("");
             if let Err((reason, message)) = validate_native_identity_wait(expected, wait.clone()) {
+                let transient = match &wait {
+                    NativeIdentityWait::HostUnavailable { transient, .. } => *transient,
+                    _ => None,
+                };
                 let (wait_outcome, adoption_pending, elapsed_ms) = match wait {
                     NativeIdentityWait::Observed { elapsed_ms, .. } => {
                         ("identity_mismatch", false, elapsed_ms)
@@ -2788,12 +3131,13 @@ impl Supervisor {
                 self.cleanup_failed_replacement(&prepared.prepared.incarnation_id)
                     .await;
                 self.registry
-                    .mark_recovery_blocked(
+                    .mark_recovery_blocked_with_retry(
                         soul_id.clone(),
                         Some(attempt_id.clone()),
                         reason,
                         vec![message.clone()],
                         verdict_fence.clone(),
+                        transient,
                     )
                     .await
                     .map_err(map_registry)?;
@@ -2821,7 +3165,8 @@ impl Supervisor {
         };
 
         if requires_native {
-            let (current_probe, current) = self.probe_recovery_observed(soul_id.clone()).await?;
+            let (current_probe, current, transient) =
+                self.probe_recovery_for_attempt(soul_id.clone()).await?;
             let ready = matches!(&current_probe,RecoveryProbe::ReattachReady {handle,..}
                 if handle.incarnation_id==prepared.prepared.incarnation_id);
             verdict_fence = current.write_fence_for_attempt(attempt_id.clone());
@@ -2838,12 +3183,13 @@ impl Supervisor {
                 self.cleanup_failed_replacement(&prepared.prepared.incarnation_id)
                     .await;
                 self.registry
-                    .mark_recovery_blocked(
+                    .mark_recovery_blocked_with_retry(
                         soul_id.clone(),
                         Some(attempt_id.clone()),
                         reason,
                         vec![message.clone()],
                         verdict_fence.clone(),
+                        transient,
                     )
                     .await
                     .map_err(map_registry)?;
@@ -2862,6 +3208,8 @@ impl Supervisor {
             }
         }
 
+        #[cfg(test)]
+        automatic_retry_tests::crash_boundary("after_replacement_before_settlement");
         let provider = start.context.provider.clone();
         self.registry
             .mark_recovery_success(
@@ -4245,6 +4593,7 @@ impl Supervisor {
             Ok(handle) => handle,
             Err(error) => {
                 return NativeIdentityWait::HostUnavailable {
+                    transient: None,
                     message: map_registry(error).message,
                     elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 }
@@ -4262,16 +4611,17 @@ impl Supervisor {
                     .any(|value| value == "native-identity-observation-v1")
             });
             let status = match host {
-                Ok(host) => self
-                    .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), &host)
-                    .await
-                    .map_err(|error| error.message),
-                Err(error) => Err(error.message),
+                Ok(host) => {
+                    self.host_status(handle.incarnation_id().clone(), handle.runtime_dir(), &host)
+                        .await
+                }
+                Err(error) => Err(error),
             };
             let current = match self.registry.recovery_context(soul_id.clone()).await {
                 Ok(current) => current,
                 Err(error) => {
                     return NativeIdentityWait::HostUnavailable {
+                        transient: None,
                         message: map_registry(error).message,
                         elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                     }
@@ -4287,9 +4637,10 @@ impl Supervisor {
             }
             let status = match status {
                 Ok(status) => status,
-                Err(message) => {
+                Err(error) => {
                     return NativeIdentityWait::HostUnavailable {
-                        message,
+                        transient: TransientRecoveryFailure::from_runtime(&error),
+                        message: error.message,
                         elapsed_ms,
                     }
                 }
@@ -4340,6 +4691,7 @@ impl Supervisor {
                             Ok(fence) => fence,
                             Err(error) => {
                                 return NativeIdentityWait::HostUnavailable {
+                                    transient: None,
                                     message: map_registry(error).message,
                                     elapsed_ms,
                                 }
@@ -4356,6 +4708,7 @@ impl Supervisor {
                         .await
                     {
                         return NativeIdentityWait::HostUnavailable {
+                            transient: None,
                             message: map_registry(error).message,
                             elapsed_ms,
                         };
@@ -4766,7 +5119,7 @@ fn install_replacement_provider_context(
     let context = preparation.context;
     if context.preparation.provider() != terminal.mode || context.mcp_capability.is_none() {
         return Err(RuntimeError::new(
-            RuntimeErrorCode::HostUnreachable,
+            RuntimeErrorCode::RecoveryBlocked,
             "capability_pending: exact provider preparation does not match the selected provider",
         ));
     }
@@ -4821,7 +5174,13 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
+    use freshell_agent_runtime::host_actor::{
+        ActorError, DispatchAck, DispatchFailure, FreshAgentHostActor, FreshAgentProfile,
+        FreshAgentTransport, TransportStart,
+    };
+    use freshell_runtime_protocol::{
+        FreshAgentLaunchSpec, FreshProvider, IncarnationId, RequestId,
+    };
 
     #[tokio::test]
     async fn provider_observed_replacement() {
@@ -5018,20 +5377,117 @@ pub(crate) mod tests {
     }
 
     fn pending_release_test_agent(
+        provider: &FreshProvider,
         native: &str,
         workspace: &std::path::Path,
     ) -> FreshAgentLaunchSpec {
-        serde_json::from_value(serde_json::json!({"sessionId":"pending-release","provider":"claude",
-            "sessionType":"freshclaude","runtimeVariant":"claude-sdk-sidecar","providerStoreId":"owned-store",
+        let session_type = if provider == &FreshProvider::Kilroy {
+            "kilroy"
+        } else {
+            "freshclaude"
+        };
+        serde_json::from_value(serde_json::json!({"sessionId":"pending-release","provider":provider,
+            "sessionType":session_type,"runtimeVariant":"claude-sdk-sidecar","providerStoreId":"owned-store",
             "cwd":workspace,"workspacePath":workspace,"runAsUid":65534,"runAsGid":0,"nativeSessionId":native})).unwrap()
+    }
+
+    struct PendingReleaseTransport {
+        native: String,
+        evidence: serde_json::Value,
+        prepared: std::sync::Mutex<Vec<serde_json::Value>>,
+        continuations: std::sync::atomic::AtomicUsize,
+        effects: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FreshAgentTransport for PendingReleaseTransport {
+        async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: Some(self.native.clone()),
+            })
+        }
+
+        async fn native_identity_evidence(&self) -> Option<serde_json::Value> {
+            Some(self.evidence.clone())
+        }
+
+        async fn prepare_native_permission_recovery(
+            &self,
+            checkpoints: Vec<serde_json::Value>,
+        ) -> Result<(), String> {
+            *self.prepared.lock().unwrap() = checkpoints;
+            Ok(())
+        }
+
+        async fn resume_native_permission_recovery(&self) -> Result<(), DispatchFailure> {
+            let checkpoints = std::mem::take(&mut *self.prepared.lock().unwrap());
+            assert_eq!(
+                checkpoints.len(),
+                1,
+                "continuation consumes the prepared checkpoint once"
+            );
+            assert_eq!(checkpoints[0]["nativeSessionId"], self.native);
+            self.continuations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn dispatch(
+            &self,
+            _: &RequestId,
+            _: &str,
+            _: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            panic!("checkpoint release must not dispatch a new user turn")
+        }
+
+        async fn resolve_permission(
+            &self,
+            decision_id: &str,
+            decision: serde_json::Value,
+        ) -> Result<(), DispatchFailure> {
+            assert_eq!(decision_id, "pending-release-card");
+            assert_eq!(decision["behavior"], "allow");
+            assert_eq!(
+                self.continuations.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn take_event_stream(
+            &self,
+        ) -> Option<tokio::sync::mpsc::Receiver<freshell_runtime_protocol::AgentEvent>> {
+            None
+        }
     }
 
     #[tokio::test]
     async fn pending_native_release_requires_durable_live_before_owned_host_input() {
+        assert_pending_native_release_reattaches(FreshProvider::Claude).await;
+    }
+
+    #[tokio::test]
+    async fn pending_native_release_kilroy_reattaches_without_replaying_continuation() {
+        assert_pending_native_release_reattaches(FreshProvider::Kilroy).await;
+    }
+
+    async fn assert_pending_native_release_reattaches(provider: FreshProvider) {
         use freshell_runtime_protocol::{
-            host_proof, read_frame, write_frame, Envelope, HostBootId, HostReply,
+            host_proof, read_frame, write_frame, Envelope, HostBootId, HostReply, InitialScanState,
             NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource, RecoveryState,
         };
+        use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
         let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
         let soul = SoulId::new();
@@ -5042,11 +5498,12 @@ pub(crate) mod tests {
         std::fs::create_dir(&runtime).unwrap();
         std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
         let conn = rusqlite::Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        let agent = pending_release_test_agent(&provider, native, dir.path());
         conn.execute("UPDATE incarnations SET runtime_dir=?1,execution_generation=1,fixture_kind=NULL,fresh_agent_spec=?2 WHERE incarnation_id=?3",
-            rusqlite::params![runtime.to_string_lossy(), serde_json::to_string(&pending_release_test_agent(native, dir.path())).unwrap(), prepared.incarnation_id.as_str()]).unwrap();
+            rusqlite::params![runtime.to_string_lossy(), serde_json::to_string(&agent).unwrap(), prepared.incarnation_id.as_str()]).unwrap();
         conn.execute(
-            "UPDATE souls SET provider='claude',recovery_state='recovering' WHERE soul_id=?1",
-            [soul.as_str()],
+            "UPDATE souls SET provider=?1,provider_store_id='owned-store',recovery_state='recovering' WHERE soul_id=?2",
+            rusqlite::params![provider.as_str(), soul.as_str()],
         )
         .unwrap();
         registry
@@ -5066,8 +5523,8 @@ pub(crate) mod tests {
             .unwrap();
         let observation = NativeIdentityObservation {
             native_session_id: native.into(),
-            incarnation_id: binding.incarnation_id,
-            launch_nonce: binding.launch_nonce,
+            incarnation_id: binding.incarnation_id.clone(),
+            launch_nonce: binding.launch_nonce.clone(),
             evidence_revision: binding.evidence_revision,
             source: NativeIdentitySource::FreshProviderHandshake,
             evidence_digest: "a".repeat(64),
@@ -5083,55 +5540,153 @@ pub(crate) mod tests {
             .unwrap();
         let current_observation = Arc::new(std::sync::Mutex::new(Some(observation.clone())));
         let responder_observation = current_observation.clone();
-        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let actual_releases = releases.clone();
-        let actual_registry = registry.clone();
+        let input = serde_json::json!({"command":"harmless"});
+        let checkpoint = serde_json::json!({"nativeSessionId":native,"toolUseID":"toolu_release1",
+            "toolName":"Bash","inputDigest":format!("{:x}", Sha256::digest(serde_json::to_vec(&input).unwrap())),
+            "profileDigest":"b".repeat(64),"checkpointUuid":"release-checkpoint",
+            "assistantUuid":"release-assistant","checkpointDigest":"c".repeat(64),"nativeVersion":"2.1.237"});
+        let payload = |launch: &NativeIdentityLaunch| {
+            serde_json::json!({
+            "requestId":"pending-release-card","nativeRequestId":launch.launch_nonce,
+            "toolUseID":"toolu_release1","tool":{"name":"Bash","input":input},"nativeCheckpoint":checkpoint,
+            "nativeBinding":{"launch":launch,"queryGeneration":2,"nativeRequestId":launch.launch_nonce}})
+        };
+        let transport = |launch: &NativeIdentityLaunch| {
+            Arc::new(PendingReleaseTransport {
+                native: native.into(),
+                evidence: serde_json::json!({"launch":launch,"queryGeneration":2}),
+                prepared: Default::default(),
+                continuations: Default::default(),
+                effects: Default::default(),
+            })
+        };
+        let profile: FreshAgentProfile =
+            serde_json::from_value(serde_json::to_value(&agent).unwrap()).unwrap();
+        let mut prior_binding = binding.clone();
+        prior_binding.launch_nonce = "prior-native-query".into();
+        let prior = FreshAgentHostActor::open(
+            runtime.join("actor"),
+            profile.clone(),
+            transport(&prior_binding),
+        )
+        .await
+        .unwrap();
+        prior
+            .record_permission("pending-release-card".into(), payload(&prior_binding))
+            .await
+            .unwrap();
+        prior.stop().await.unwrap();
+        let current = transport(&binding);
+        let actor = FreshAgentHostActor::open(runtime.join("actor"), profile, current.clone())
+            .await
+            .unwrap();
+        assert_eq!(*current.prepared.lock().unwrap(), vec![checkpoint.clone()]);
+        let hosted_actor = actor.clone();
+        let registry_path = dir.path().join("registry/runtime.sqlite3");
         let actual_soul = soul.clone();
         let limits = context.requested_limits;
+        let hosted_incarnation = prepared.incarnation_id.clone();
         let listener = tokio::net::UnixListener::bind(runtime.join("host.sock")).unwrap();
+        let (close_host, mut host_closed) = tokio::sync::oneshot::channel::<()>();
         let responder = tokio::spawn(async move {
             let boot = HostBootId::new();
             loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
+                let (mut socket, _) = tokio::select! {
+                    _ = &mut host_closed => break,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
                 let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                if !matches!(&request.body, HostCommand::Hello { .. }) {
+                    assert_eq!(
+                        request.auth,
+                        Some(host_proof(
+                            b"synthetic-secret",
+                            "command-auth",
+                            &boot,
+                            &hosted_incarnation
+                        ))
+                    );
+                }
                 let result = match request.body {
                     HostCommand::Hello {
                         incarnation_id,
                         challenge,
-                    } => HostResult::Hello {
+                    } => Ok(HostResult::Hello {
                         proof: host_proof(b"synthetic-secret", &challenge, &boot, &incarnation_id),
                         host_boot_id: boot.clone(),
-                        capabilities: vec!["native-identity-observation-v1".into()],
+                        capabilities: vec![
+                            "native-identity-observation-v1".into(),
+                            "owned-provider-config-v1".into(),
+                            "provider-store-probe-v1".into(),
+                        ],
                         effective_limits: limits,
-                    },
-                    HostCommand::Status { .. } => HostResult::Status {
-                        native_identity_observation: responder_observation.lock().unwrap().clone(),
-                        host_boot_id: boot.clone(),
-                        worker_pid: Some(123),
-                        worker_launch_count: 1,
-                        max_control_epoch: 1,
-                        max_execution_generation: 1,
-                        fixture_evidence: serde_json::json!({}),
-                        exited: false,
-                        native_session_id: Some(native.into()),
-                        opencode_transfer_receipt: None,
-                        opencode_adoption: Default::default(),
-                    },
-                    HostCommand::FreshAgentResumePending { .. } => {
-                        assert_eq!(
-                            actual_registry
-                                .recovery_context(actual_soul.clone())
-                                .await
-                                .unwrap()
-                                .recovery_state,
-                            RecoveryState::Live,
-                            "release cannot precede durable LIVE"
-                        );
-                        actual_releases.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        HostResult::FreshAgentCommand {
-                            state: freshell_runtime_protocol::CommandState::ProviderAcked,
-                            native_session_id: Some(native.into()),
-                        }
+                    }),
+                    HostCommand::Status { .. } => {
+                        let native_identity_observation =
+                            responder_observation.lock().unwrap().clone();
+                        Ok(HostResult::Status {
+                            native_identity_observation,
+                            host_boot_id: boot.clone(),
+                            worker_pid: Some(123),
+                            worker_launch_count: 1,
+                            max_control_epoch: 1,
+                            max_execution_generation: 1,
+                            fixture_evidence: serde_json::json!({}),
+                            exited: false,
+                            native_session_id: hosted_actor.observed_native_session_id().await,
+                            opencode_transfer_receipt: None,
+                            opencode_adoption: Default::default(),
+                        })
+                    }
+                    HostCommand::ProbeRecovery {
+                        resume_spec,
+                        run_as_uid,
+                        run_as_gid,
+                        ..
+                    } => {
+                        assert_eq!((run_as_uid, run_as_gid), (65534, 0));
+                        let resume_spec =
+                            resume_spec.expect("exact retained native resume candidate");
+                        assert_eq!(resume_spec.provider_session.native_session_id, native);
+                        Ok(HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                            evidence_revision: resume_spec.evidence_revision,
+                            resume_spec,
+                        }))
+                    }
+                    HostCommand::FreshAgentResumePending { incarnation_id } => {
+                        assert_eq!(incarnation_id, hosted_incarnation);
+                        let actual_registry = rusqlite::Connection::open(&registry_path).unwrap();
+                        let state: String = actual_registry
+                            .query_row(
+                                "SELECT recovery_state FROM souls WHERE soul_id=?1",
+                                [actual_soul.as_str()],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(state, "live", "release cannot precede durable LIVE");
+                        drop(actual_registry);
+                        hosted_actor
+                            .resume_pending_native_permissions()
+                            .await
+                            .map(|()| HostResult::FreshAgentCommand {
+                                state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                                native_session_id: Some(native.into()),
+                                claude_fork: None,
+                            })
+                            .map_err(|error| {
+                                RuntimeError::new(
+                                    match error {
+                                        ActorError::AmbiguousDispatch => {
+                                            RuntimeErrorCode::CommandAmbiguous
+                                        }
+                                        ActorError::NativeIdentityMismatch => {
+                                            RuntimeErrorCode::RecoveryWrongIdentity
+                                        }
+                                        _ => RuntimeErrorCode::HostUnreachable,
+                                    },
+                                    error.to_string(),
+                                )
+                            })
                     }
                     _ => panic!("unexpected pending-release command"),
                 };
@@ -5139,14 +5694,15 @@ pub(crate) mod tests {
                     &mut socket,
                     &HostReply {
                         request_id: request.request_id,
-                        result: Ok(result),
+                        result,
                     },
                 )
                 .await
                 .unwrap();
             }
         });
-        let supervisor = missing_supervisor(&dir, registry.clone());
+        let supervisor =
+            supervisor_with_runtime_state(&dir, registry.clone(), BackendRuntimeState::Running);
         let before = supervisor
             .release_pending_native_permissions_after_live(
                 soul.clone(),
@@ -5178,13 +5734,43 @@ pub(crate) mod tests {
                 prepared.incarnation_id.clone(),
             )
             .await;
-        *current_observation.lock().unwrap() = Some(observation);
+        *current_observation.lock().unwrap() = Some(observation.clone());
         let after = supervisor
             .release_pending_native_permissions_after_live(
                 soul.clone(),
                 prepared.incarnation_id.clone(),
             )
             .await;
+        actor
+            .record_permission("pending-release-card".into(), payload(&binding))
+            .await
+            .unwrap();
+        assert_eq!(current.effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let recover = |revision| RecoverRequest {
+            soul_id: soul.clone(),
+            trigger: RecoveryTrigger::ManualRetry,
+            expected_intent_revision: Some(revision),
+            expected_control_epoch: Some(registry.control_epoch()),
+        };
+        let revision = registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .intent_revision;
+        let pending = supervisor.recover(recover(revision)).await;
+        actor
+            .resolve_permission(
+                "pending-release-card",
+                serde_json::json!({"behavior":"allow"}),
+            )
+            .await
+            .unwrap();
+        let revision = registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .intent_revision;
+        let resolved = supervisor.recover(recover(revision)).await;
         conn.execute(
             "UPDATE souls SET recovery_state='recovering' WHERE soul_id=?1",
             [soul.as_str()],
@@ -5192,14 +5778,14 @@ pub(crate) mod tests {
         .unwrap();
         let context = registry.recovery_context(soul.clone()).await.unwrap();
         let lifecycle = supervisor.lifecycle_lock(&soul).await;
-        let _lifecycle_guard = lifecycle.lock().await;
+        let lifecycle_guard = lifecycle.lock().await;
         let reattached = supervisor
             .preserve_nonloss_probe(
-                soul,
+                soul.clone(),
                 RecoveryTrigger::StartupReconcile,
                 RecoveryProbe::ReattachReady {
                     handle: ReattachHandle {
-                        incarnation_id: prepared.incarnation_id,
+                        incarnation_id: prepared.incarnation_id.clone(),
                         host_boot_id: HostBootId::new(),
                         container_id: context.prior_handle.container_id().into(),
                     },
@@ -5208,7 +5794,26 @@ pub(crate) mod tests {
                 context.write_fence(),
             )
             .await;
-        responder.abort();
+        drop(lifecycle_guard);
+        drop(supervisor);
+        drop(registry);
+        let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+        let restarted =
+            supervisor_with_runtime_state(&dir, registry.clone(), BackendRuntimeState::Running);
+        let startup = restarted.reconcile_startup().await.unwrap();
+        let readiness = registry.inventory_snapshot().await.unwrap().readiness;
+        let current_context = registry.recovery_context(soul.clone()).await.unwrap();
+        close_host.send(()).unwrap();
+        responder.await.unwrap();
+        assert_eq!(
+            actor.observed_native_session_id().await.as_deref(),
+            Some(native)
+        );
+        assert_eq!(
+            actor.observed_native_identity_evidence().await,
+            Some(current.evidence.clone())
+        );
+        actor.stop().await.unwrap();
         assert!(
             before.is_err(),
             "pending release must refuse before durable LIVE"
@@ -5225,18 +5830,35 @@ pub(crate) mod tests {
             after.is_ok(),
             "current LIVE release must reach the authenticated owned host: {after:?}"
         );
-        assert!(matches!(
-            reattached,
-            Ok(RecoveryResult {
-                outcome: RecoveryOutcome::Reattached,
-                ..
-            })
-        ));
+        let reattached_ok = |result: &Result<RecoveryResult, RuntimeError>| {
+            matches!(
+                result,
+                Ok(RecoveryResult {
+                    outcome: RecoveryOutcome::Reattached,
+                    ..
+                })
+            )
+        };
+        assert!(reattached_ok(&pending) && reattached_ok(&resolved) && reattached_ok(&reattached)
+            && startup.results.iter().all(|result| result.outcome == Some(RecoveryOutcome::Reattached) && result.error.is_none()),
+            "settled release must preserve pending/resolved Recover and retained-host startup: pending={pending:?}, resolved={resolved:?}, preserved={reattached:?}, startup={startup:?}");
+        assert_eq!(startup.scanned, 1);
+        assert_eq!(readiness.initial_scan_state, InitialScanState::Complete);
+        assert!(readiness.blocked_subsystems.is_empty());
+        assert_eq!(current_context.recovery_state, RecoveryState::Live);
+        assert_eq!(current_context.native_session_id.as_deref(), Some(native));
         assert_eq!(
-            releases.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "production reattach admission must dispatch after committing durable LIVE"
+            current_context.prior_handle.incarnation_id(),
+            &prepared.incarnation_id
         );
+        assert_eq!(
+            current
+                .continuations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "successful reattach must not repeat the accepted native continuation"
+        );
+        assert_eq!(current.effects.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -5266,6 +5888,7 @@ pub(crate) mod tests {
             validate_native_identity_wait(
                 "ses_expected",
                 NativeIdentityWait::HostUnavailable {
+                    transient: Some(TransientRecoveryFailure::Host),
                     message: "host status socket unavailable".into(),
                     elapsed_ms: 1_000,
                 },
@@ -5995,5 +6618,1721 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(reference.grant_id, "grant-new");
         assert_eq!(reference.endpoint, "http://host.docker.internal:4001");
+    }
+}
+
+#[cfg(test)]
+mod automatic_retry_tests {
+    use super::*;
+    use crate::{backend::*, registry::Registry, service::SupervisorConfig};
+    use freshell_runtime_protocol::{
+        host_proof, read_frame, write_frame, DockerDaemonId, Envelope, HostBootId, HostReply,
+        IncarnationId, RecoveryState, RuntimeLimits,
+    };
+    use rusqlite::Connection;
+    use std::sync::{
+        atomic::{AtomicI64, Ordering},
+        Mutex,
+    };
+
+    // These four subprocess tests are only entered by the documented runtime
+    // sandbox. Abrupt exit skips every Rust destructor, including SQLite owners.
+    pub(super) fn crash_boundary(point: &str) {
+        if std::env::var("FRESHELL_RETRY_TEST_CRASH").ok().as_deref() != Some(point) {
+            return;
+        }
+        assert_eq!(
+            std::env::var("FRESHELL_SANDBOX_MODE").as_deref(),
+            Ok("runtime-suite")
+        );
+        assert!(Path::new("/.dockerenv").exists());
+        let root = PathBuf::from(std::env::var_os("FRESHELL_RETRY_TEST_ROOT").unwrap());
+        std::fs::write(root.join("crash-boundary"), point).unwrap();
+        std::process::abort();
+    }
+
+    struct RetryBackend {
+        root: PathBuf,
+        clock: Arc<AtomicI64>,
+        hosts: Mutex<Vec<(PathBuf, tokio::task::JoinHandle<()>)>>,
+    }
+    impl Drop for RetryBackend {
+        fn drop(&mut self) {
+            for (_, task) in self.hosts.get_mut().unwrap().drain(..) {
+                task.abort();
+            }
+        }
+    }
+    impl RetryBackend {
+        fn new(root: &Path, clock: Arc<AtomicI64>) -> Self {
+            Self {
+                root: root.into(),
+                clock,
+                hosts: Mutex::new(vec![]),
+            }
+        }
+        fn record(&self, name: &str, value: &str) {
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.root.join(name))
+                    .unwrap(),
+                "{value}"
+            )
+            .unwrap();
+        }
+        fn count(&self, name: &str) -> usize {
+            std::fs::read_to_string(self.root.join(name))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        }
+        fn state(&self, handle: &OwnedRuntimeHandle) -> BackendRuntimeState {
+            let object = handle.runtime_dir().join("fixture-object");
+            if !object.exists() {
+                return BackendRuntimeState::Missing;
+            }
+            assert_eq!(
+                std::fs::read_to_string(object).unwrap(),
+                handle.container_id()
+            );
+            if handle.runtime_dir().join("fixture-stopped").exists() {
+                BackendRuntimeState::Exited
+            } else if handle.runtime_dir().join("fixture-started").exists() {
+                BackendRuntimeState::Running
+            } else {
+                BackendRuntimeState::Created
+            }
+        }
+        fn unavailable(&self, unavailable: bool) {
+            let path = self.root.join("backend-unavailable");
+            if unavailable {
+                std::fs::write(path, b"unavailable").unwrap();
+            } else if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        async fn host(&self, handle: &OwnedRuntimeHandle) {
+            let runtime = handle.runtime_dir().to_path_buf();
+            let mut hosts = self.hosts.lock().unwrap();
+            if hosts.iter().any(|(path, _)| path == &runtime) {
+                return;
+            }
+            let socket = runtime.join("host.sock");
+            if socket.exists() {
+                std::fs::remove_file(&socket).unwrap();
+            }
+            let listener = tokio::net::UnixListener::bind(socket).unwrap();
+            let secret = std::fs::read(runtime.join("secret")).unwrap();
+            let limits = handle.requested_limits();
+            let boot_path = runtime.join("fixture-boot");
+            let boot = if boot_path.exists() {
+                HostBootId::parse(std::fs::read_to_string(&boot_path).unwrap()).unwrap()
+            } else {
+                let boot = HostBootId::new();
+                std::fs::write(boot_path, boot.as_str()).unwrap();
+                boot
+            };
+            let generation_path = runtime.join("fixture-generation");
+            let native_launch_path = runtime.join("native-launch.json");
+            let provider_home = self.root.join("provider");
+            let native_file = provider_home.join(".codex/sessions/rollout-retry-root.jsonl");
+            let native_required = native_file.exists();
+            let final_identity_path = runtime.join("final-wrong-identity");
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    let generation: u64 = std::fs::read_to_string(&generation_path)
+                        .unwrap_or_else(|_| "0".into())
+                        .parse()
+                        .unwrap();
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => HostResult::Hello {
+                            proof: host_proof(&secret, &challenge, &boot, &incarnation_id),
+                            host_boot_id: boot.clone(),
+                            capabilities: if native_required {
+                                vec![
+                                    "native-identity-observation-v1".into(),
+                                    "owned-provider-config-v1".into(),
+                                    "provider-store-probe-v1".into(),
+                                ]
+                            } else {
+                                vec![]
+                            },
+                            effective_limits: limits,
+                        },
+                        HostCommand::GrantExecution {
+                            execution_generation,
+                            resume_spec,
+                            native_identity_launch,
+                            ..
+                        } => {
+                            assert_eq!(
+                                resume_spec.unwrap().provider_session.native_session_id,
+                                "retry-root"
+                            );
+                            std::fs::write(&generation_path, execution_generation.to_string())
+                                .unwrap();
+                            if native_required {
+                                std::fs::write(
+                                    &native_launch_path,
+                                    serde_json::to_vec(&native_identity_launch.unwrap()).unwrap(),
+                                )
+                                .unwrap();
+                            }
+                            HostResult::GrantAccepted {
+                                host_boot_id: boot.clone(),
+                                worker_pid: 42,
+                                worker_launch_count: 1,
+                                fixture_evidence: serde_json::json!({}),
+                                native_session_id: Some("retry-root".into()),
+                                native_identity_observation: None,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        HostCommand::Status { .. } => {
+                            let observation = native_required.then(|| {
+                                let launch: freshell_runtime_protocol::NativeIdentityLaunch = serde_json::from_slice(&std::fs::read(&native_launch_path).unwrap()).unwrap();
+                                let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&native_file).unwrap()).unwrap();
+                                freshell_runtime_protocol::NativeIdentityObservation {
+                                    native_session_id: if final_identity_path.exists() { "wrong-root".into() } else { record["payload"]["id"].as_str().unwrap().into() },
+                                    incarnation_id: launch.incarnation_id,
+                                    launch_nonce: launch.launch_nonce,
+                                    evidence_revision: launch.evidence_revision,
+                                    source: freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+                                    evidence_digest: format!("{:x}", Sha256::digest(std::fs::read(&native_file).unwrap())),
+                                }
+                            });
+                            HostResult::Status {
+                                host_boot_id: boot.clone(),
+                                worker_pid: Some(42),
+                                worker_launch_count: 1,
+                                max_control_epoch: 1,
+                                max_execution_generation: generation,
+                                fixture_evidence: serde_json::json!({}),
+                                exited: false,
+                                native_session_id: observation
+                                    .as_ref()
+                                    .map(|observation| observation.native_session_id.clone())
+                                    .or_else(|| Some("retry-root".into())),
+                                native_identity_observation: observation,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        HostCommand::ProbeRecovery { resume_spec, .. } => {
+                            let spec = resume_spec.unwrap();
+                            if native_required {
+                                assert!(matches!(
+                                    freshell_agent_runtime::probe_provider_store(
+                                        &provider_home,
+                                        &spec
+                                    ),
+                                    freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
+                                ));
+                            }
+                            HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                                evidence_revision: spec.evidence_revision,
+                                resume_spec: spec,
+                            })
+                        }
+                        HostCommand::Stop { .. } => HostResult::Stopped,
+                        other => panic!("unexpected retry fixture command: {other:?}"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            hosts.push((runtime, task));
+        }
+    }
+    #[async_trait::async_trait]
+    impl RuntimeBackend for RetryBackend {
+        async fn inspect(
+            &self,
+            handle: &OwnedRuntimeHandle,
+        ) -> Result<BackendInspection, BackendError> {
+            self.record("inspects", handle.incarnation_id().as_str());
+            if self.root.join("backend-unavailable").exists() {
+                return Err(BackendError::Unavailable("test backend offline".into()));
+            }
+            if let Ok(failure) = std::fs::read_to_string(self.root.join("final-inspection-failure"))
+            {
+                let activated: bool = Connection::open(self.root.join("registry/runtime.sqlite3")).unwrap().query_row(
+                    "SELECT launch_state='running' AND native_identity_observation IS NOT NULL FROM incarnations WHERE incarnation_id=?1",
+                    [handle.incarnation_id().as_str()], |row| row.get(0),
+                ).unwrap();
+                if activated {
+                    self.record("final-inspection", handle.incarnation_id().as_str());
+                    self.clock.store(750, Ordering::SeqCst);
+                    if failure == "transient" {
+                        return Err(BackendError::Unavailable(
+                            "final native inspection temporarily unavailable".into(),
+                        ));
+                    }
+                    std::fs::write(
+                        handle.runtime_dir().join("final-wrong-identity"),
+                        b"wrong-root",
+                    )
+                    .unwrap();
+                }
+            }
+            let state = self.state(handle);
+            if state == BackendRuntimeState::Running {
+                self.host(handle).await;
+            }
+            Ok(BackendInspection {
+                state,
+                configured_limits: handle.requested_limits(),
+            })
+        }
+        async fn create_stopped(
+            &self,
+            spec: &CreateRuntimeSpec,
+        ) -> Result<BackendCreated, BackendError> {
+            if let Ok(kind) = std::fs::read_to_string(self.root.join("create-failure")) {
+                return Err(match kind.as_str() {
+                    "transient" => BackendError::Unavailable("temporary dependency".into()),
+                    "ownership" => BackendError::OwnershipMismatch("temporary dependency".into()),
+                    "policy" => BackendError::PolicyMismatch("temporary dependency".into()),
+                    "malformed" => BackendError::Malformed("temporary dependency".into()),
+                    _ => BackendError::InvalidConfig("temporary dependency".into()),
+                });
+            }
+            let container = format!("retry-container-{}", spec.incarnation_id);
+            self.record("creates", &container);
+            std::fs::write(spec.runtime_dir.join("fixture-object"), &container).unwrap();
+            Ok(BackendCreated {
+                daemon_id: DockerDaemonId::parse("retry-daemon").unwrap(),
+                container_id: container,
+                immutable_config_digest: "retry-fixture".into(),
+            })
+        }
+        async fn start_host(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            std::fs::write(handle.runtime_dir().join("fixture-started"), b"started").unwrap();
+            self.host(handle).await;
+            Ok(())
+        }
+        async fn request_stop(
+            &self,
+            handle: &OwnedRuntimeHandle,
+            _: u64,
+        ) -> Result<(), BackendError> {
+            // Like Docker, no-op Stop on a never-started enclosure leaves it
+            // Created. Inspection must not silently start its host either.
+            if handle.runtime_dir().join("fixture-started").exists() {
+                std::fs::write(handle.runtime_dir().join("fixture-stopped"), b"stopped").unwrap();
+            }
+            Ok(())
+        }
+        async fn force_stop(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            self.request_stop(handle, 0).await
+        }
+        async fn verify_empty(&self, handle: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+            Ok(matches!(
+                self.state(handle),
+                BackendRuntimeState::Missing
+                    | BackendRuntimeState::Created
+                    | BackendRuntimeState::Exited
+            ))
+        }
+        async fn read_limits(
+            &self,
+            handle: &OwnedRuntimeHandle,
+        ) -> Result<RuntimeLimits, BackendError> {
+            Ok(handle.requested_limits())
+        }
+        async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn list_known(
+            &self,
+            handles: &[OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+            let mut result = vec![];
+            for handle in handles {
+                result.push((handle.incarnation_id().clone(), self.inspect(handle).await?));
+            }
+            Ok(result)
+        }
+    }
+
+    fn open(root: &Path, now: i64) -> (Supervisor, Arc<RetryBackend>, Arc<AtomicI64>) {
+        let mut registry = Registry::open(root.join("registry"), None).unwrap();
+        let clock = Arc::new(AtomicI64::new(now));
+        registry.retry_clock = Some(clock.clone());
+        let backend = Arc::new(RetryBackend::new(root, clock.clone()));
+        let supervisor = Supervisor::new(
+            registry,
+            backend.clone(),
+            SupervisorConfig {
+                runtime_root: root.join("runtime"),
+                control_socket_path: root.join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "automatic-retry".into(),
+                control_secret: "synthetic-secret".into(),
+                lifecycle_log: root.join("lifecycle.jsonl"),
+                admission: crate::admission::AdmissionPolicy::default(),
+            },
+        )
+        .unwrap();
+        (supervisor, backend, clock)
+    }
+    async fn seed(supervisor: &Supervisor) -> SoulId {
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_test_runtime(&supervisor.registry, soul.clone())
+                .await;
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='native-session-fixture' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fixture_kind='native_session' WHERE incarnation_id=?1",
+            [prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        supervisor
+            .registry
+            .record_native_session(soul.clone(), prepared.incarnation_id, "retry-root".into())
+            .await
+            .unwrap();
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let spec = resume_catalog::exact_resume_candidate(&context, None)
+            .unwrap()
+            .unwrap();
+        supervisor
+            .registry
+            .store_verified_resume_spec(soul.clone(), spec)
+            .await
+            .unwrap();
+        soul
+    }
+    async fn seed_native(supervisor: &Supervisor, root: &Path) -> SoulId {
+        let soul = seed(supervisor).await;
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let provider_home = root.join("provider");
+        std::fs::create_dir_all(provider_home.join(".codex/sessions")).unwrap();
+        std::fs::write(
+            provider_home.join(".codex/sessions/rollout-retry-root.jsonl"),
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"retry-root\"}}\n",
+        )
+        .unwrap();
+        let agent: freshell_runtime_protocol::FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
+            "sessionId":"retry-fresh-codex", "provider":"codex", "sessionType":"freshcodex", "runtimeVariant":"codex-app-server-v1",
+            "providerStoreId":context.provider_store_id, "cwd":root, "workspacePath":root,
+            "runAsUid":65534, "runAsGid":0
+        })).unwrap();
+        agent.validate().unwrap();
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='codex',resume_spec=NULL WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fixture_kind=NULL,fresh_agent_spec=?1 WHERE incarnation_id=?2",
+            rusqlite::params![
+                serde_json::to_string(&agent).unwrap(),
+                context.prior_handle.incarnation_id().as_str()
+            ],
+        )
+        .unwrap();
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let spec = resume_catalog::exact_resume_candidate(&context, None)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            freshell_agent_runtime::probe_provider_store(&provider_home, &spec),
+            freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
+        ));
+        supervisor
+            .registry
+            .store_verified_resume_spec(soul.clone(), spec)
+            .await
+            .unwrap();
+        soul
+    }
+    fn attempts(root: &Path) -> Vec<(String, String)> {
+        let conn = Connection::open(root.join("registry/runtime.sqlite3")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT attempt_id,verdict FROM recovery_attempts ORDER BY started_at,rowid")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+    fn due(root: &Path) -> Option<i64> {
+        let conn = Connection::open(root.join("registry/runtime.sqlite3")).unwrap();
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='recovery_retries')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if !exists {
+            return None;
+        }
+        conn.query_row("SELECT next_due_at_ms FROM recovery_retries", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(None)
+    }
+    async fn assert_root_and_successes(supervisor: &Supervisor, soul: &SoulId, successes: u64) {
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(context.native_session_id.as_deref(), Some("retry-root"));
+        assert_eq!(context.successful_recoveries_in_window, successes);
+    }
+
+    #[tokio::test]
+    async fn retry_final_native_inspection_keeps_typed_transient() {
+        for failure in ["transient", "identity"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, _) = open(dir.path(), 0);
+            let soul = seed_native(&supervisor, dir.path()).await;
+            std::fs::write(dir.path().join("final-inspection-failure"), failure).unwrap();
+            supervisor.reconcile_startup().await.unwrap();
+            assert_eq!(
+                backend.count("final-inspection"),
+                1,
+                "must reach the activated native replacement's final inspection"
+            );
+            assert_eq!(backend.count("creates"), 1);
+            assert_eq!(attempts(dir.path()).len(), 1);
+            assert_eq!(
+                due(dir.path()),
+                (failure == "transient").then_some(2_750),
+                "{failure}: delay starts at final failure settlement"
+            );
+            assert_root_and_successes(&supervisor, &soul, 0).await;
+            std::fs::remove_file(dir.path().join("final-inspection-failure")).unwrap();
+            drop(supervisor);
+            drop(backend);
+            let (supervisor, backend, clock) = open(dir.path(), 2_000);
+            supervisor.reconcile_startup().await.unwrap();
+            assert_eq!(attempts(dir.path()).len(), 1);
+            clock.store(2_750, Ordering::SeqCst);
+            supervisor.observe_once().await.unwrap();
+            let current = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            if failure == "transient" {
+                assert_eq!(current.recovery_state, RecoveryState::Live);
+                assert_eq!(backend.count("creates"), 2);
+                assert_eq!(attempts(dir.path()).len(), 2);
+                assert_root_and_successes(&supervisor, &soul, 1).await;
+            } else {
+                assert_eq!(current.recovery_state, RecoveryState::Blocked);
+                assert_eq!(backend.count("creates"), 1);
+                assert_eq!(attempts(dir.path()).len(), 1);
+                assert_root_and_successes(&supervisor, &soul, 0).await;
+            }
+            assert_eq!(due(dir.path()), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_retry_survives_restart_without_budget_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        backend.unavailable(true);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(backend.count("inspects"), 1);
+        drop(supervisor);
+        drop(backend);
+        let (supervisor, backend, clock) = open(dir.path(), 1_000);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(
+            backend.count("inspects"),
+            1,
+            "restart before the deadline must not spend another automatic attempt"
+        );
+        assert_eq!(due(dir.path()), Some(2_000));
+        clock.store(2_000, Ordering::SeqCst);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(backend.count("inspects"), 2);
+        assert_eq!(due(dir.path()), Some(12_000));
+        drop(supervisor);
+        drop(backend);
+        let (supervisor, backend, clock) = open(dir.path(), 3_000);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(backend.count("inspects"), 2);
+        clock.store(-1_000, Ordering::SeqCst);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(
+            backend.count("inspects"),
+            2,
+            "clock rollback cannot mint an attempt"
+        );
+        clock.store(12_000, Ordering::SeqCst);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(backend.count("inspects"), 3);
+        assert_eq!(attempts(dir.path()).len(), 3);
+        assert_eq!(due(dir.path()), None);
+        assert_root_and_successes(&supervisor, &soul, 0).await;
+        drop(supervisor);
+        drop(backend);
+        let (supervisor, backend, _) = open(dir.path(), 1_000_000);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(
+            backend.count("inspects"),
+            3,
+            "exhaustion must survive restart"
+        );
+        assert!(supervisor
+            .registry
+            .inventory()
+            .await
+            .unwrap()
+            .iter()
+            .any(|v| v.soul_id == soul
+                && v.recovery_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("RETRY_BUDGET"))));
+    }
+
+    #[tokio::test]
+    async fn retry_dependency_available_on_second_attempt_resumes_same_root_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, clock) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        backend.unavailable(true);
+        supervisor.reconcile_startup().await.unwrap();
+        backend.unavailable(false);
+        clock.store(2_000, Ordering::SeqCst);
+        let report = supervisor.reconcile_startup().await.unwrap();
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|r| r.outcome == Some(RecoveryOutcome::Replaced)),
+            "{report:?}"
+        );
+        assert_eq!(
+            attempts(dir.path()).len(),
+            2,
+            "both failures and successes have reserved journals"
+        );
+        assert_eq!(backend.count("creates"), 1);
+        assert_root_and_successes(&supervisor, &soul, 1).await;
+        assert_eq!(due(dir.path()), None);
+        let journals = attempts(dir.path());
+        let events: Vec<serde_json::Value> =
+            std::fs::read_to_string(dir.path().join("lifecycle.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let scheduled = events
+            .iter()
+            .find(|event| event["event"] == "supervisor.recovery_retry.scheduled")
+            .unwrap()
+            .get("data")
+            .unwrap();
+        assert_eq!(scheduled["attemptId"], journals[0].0);
+        assert_eq!(scheduled["nextDueAtMs"], 2_000);
+        let settled = events
+            .iter()
+            .rev()
+            .find(|event| event["event"] == "supervisor.recovery_retry.settled")
+            .unwrap()
+            .get("data")
+            .unwrap();
+        let current = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let view = supervisor
+            .view_for(current.prior_handle.incarnation_id())
+            .await
+            .unwrap();
+        assert_eq!(settled["attemptId"], journals[1].0);
+        assert_eq!(settled["incarnationId"], view.incarnation_id.as_str());
+        assert_eq!(settled["executionGeneration"], view.execution_generation);
+        assert_eq!(settled["intentRevision"], view.intent_revision);
+        assert_eq!(settled["reason"], "recovered");
+        assert_eq!(settled["severity"], "info");
+    }
+
+    #[tokio::test]
+    async fn retry_manual_rearm_survives_early_transient_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        Connection::open(supervisor.registry.database_path()).unwrap().execute(
+            "UPDATE souls SET recovery_window_started_at=?1,successful_recoveries_in_window=5 WHERE soul_id=?2",
+            rusqlite::params![crate::registry::now_millis(), soul.as_str()],
+        ).unwrap();
+        backend.unavailable(true);
+        let first = supervisor
+            .recover(RecoverRequest {
+                soul_id: soul.clone(),
+                trigger: RecoveryTrigger::ManualRetry,
+                expected_intent_revision: Some(context.intent_revision),
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.outcome, RecoveryOutcome::Blocked);
+        assert_eq!(due(dir.path()), Some(2_000));
+        assert_eq!(backend.count("creates"), 0);
+        drop(supervisor);
+        drop(backend);
+
+        let (supervisor, backend, clock) = open(dir.path(), 1_000);
+        backend.unavailable(false);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(attempts(dir.path()).len(), 1);
+        clock.store(2_000, Ordering::SeqCst);
+        supervisor.observe_once().await.unwrap();
+        let current = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(current.recovery_state, RecoveryState::Live);
+        assert_eq!(current.intent_revision, context.intent_revision + 1);
+        assert_eq!(backend.count("creates"), 1);
+        assert_eq!(attempts(dir.path()).len(), 2);
+        assert_root_and_successes(&supervisor, &soul, 1).await;
+        assert_eq!(due(dir.path()), None);
+        // A subsequent automatic replacement spends another success from the
+        // same window; only the deliberate action above may rearm it.
+        backend
+            .request_stop(&current.prior_handle, 0)
+            .await
+            .unwrap();
+        let next = supervisor
+            .recover(RecoverRequest {
+                soul_id: soul.clone(),
+                trigger: RecoveryTrigger::ProviderExit,
+                expected_intent_revision: Some(current.intent_revision),
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.outcome, RecoveryOutcome::Replaced);
+        assert_root_and_successes(&supervisor, &soul, 2).await;
+        assert_eq!(next.view.intent_revision, context.intent_revision + 1);
+    }
+
+    #[tokio::test]
+    async fn retry_activation_eligibility_uses_the_typed_failure() {
+        for (kind, retryable) in [
+            ("transient", true),
+            ("ownership", false),
+            ("policy", false),
+            ("malformed", false),
+            ("config", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, clock) = open(dir.path(), 0);
+            let soul = seed(&supervisor).await;
+            std::fs::write(dir.path().join("create-failure"), kind).unwrap();
+            supervisor.reconcile_startup().await.unwrap();
+            assert_eq!(due(dir.path()), retryable.then_some(2_000), "{kind}");
+            let count = backend.count("inspects");
+            clock.store(20_000, Ordering::SeqCst);
+            supervisor.observe_once().await.unwrap();
+            assert_eq!(
+                attempts(dir.path()).len(),
+                if retryable { 2 } else { 1 },
+                "{kind}"
+            );
+            if !retryable {
+                assert_eq!(
+                    backend.count("inspects"),
+                    count,
+                    "{kind} must require deliberate correction"
+                );
+            }
+            assert_root_and_successes(&supervisor, &soul, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_valid_wrong_provider_preparation_is_not_transient() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let grants = tempfile::tempdir().unwrap();
+        std::fs::create_dir(grants.path().join("mcp-capabilities")).unwrap();
+        std::fs::create_dir_all(grants.path().join("provider-roots/grant-retry-test")).unwrap();
+        crate::backend::docker::configure_capability_dir(&grants.path().join("control.sock"))
+            .unwrap();
+        assert_eq!(
+            crate::backend::docker::staged_provider_root_for_grant("grant-retry-test").unwrap(),
+            grants.path().join("provider-roots/grant-retry-test")
+        );
+        for case in ["wrong_provider", "missing_capability", "unavailable"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, clock) = open(dir.path(), 0);
+            let soul = seed(&supervisor).await;
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let launch_context = serde_json::json!({
+                "preparation":{"codex":{"tui_args":[],"sidecar_args":[]}},
+                "mcpCapability":{"grantId":"grant-retry-test", "endpoint":"http://host.docker.internal:9", "providerRelativePath":".freshell/mcp-capability.json"},
+                "config":[]
+            });
+            let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                "terminalId":"preparation-retry", "streamId":"preparation-stream", "mode":"codex", "program":"codex",
+                "cwd":dir.path(), "workspacePath":dir.path(), "projectKey":"preparation-retry",
+                "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24, "providerLaunchContext":launch_context,
+            })).unwrap();
+            terminal.validate().unwrap();
+            Connection::open(supervisor.registry.database_path())
+                .unwrap()
+                .execute(
+                    "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                    rusqlite::params![
+                        serde_json::to_string(&terminal).unwrap(),
+                        context.prior_handle.incarnation_id().as_str()
+                    ],
+                )
+                .unwrap();
+            let server = if case == "unavailable" {
+                None
+            } else {
+                let listener = tokio::net::UnixListener::bind(dir.path().join("mcp.sock")).unwrap();
+                let mut response = terminal.provider_launch_context.unwrap();
+                if case == "wrong_provider" {
+                    response.preparation =
+                        freshell_runtime_protocol::ProviderPreparation::Opencode {
+                            project_config: vec![],
+                            tui_config: None,
+                            tui_source: None,
+                            inline_config: false,
+                        };
+                } else {
+                    response.mcp_capability = None;
+                }
+                let response = serde_json::to_vec(
+                    &freshell_runtime_protocol::ProviderReplacementPreparation {
+                        context: response,
+                        secret_references: vec![],
+                    },
+                )
+                .unwrap();
+                Some(tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = vec![];
+                    stream.read_to_end(&mut request).await.unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                    assert_eq!(request["action"], "issue");
+                    assert_eq!(request["provider"], "codex");
+                    stream.write_all(&response).await.unwrap();
+                }))
+            };
+            let report = supervisor.reconcile_startup().await.unwrap();
+            if let Some(server) = server {
+                server.await.unwrap();
+            }
+            assert_eq!(
+                due(dir.path()),
+                (case == "unavailable").then_some(2_000),
+                "{case}: {report:?}"
+            );
+            let journals = attempts(dir.path());
+            assert_eq!(journals.len(), 1);
+            assert_eq!(journals[0].1, "blocked");
+            let unfinished: u64 = Connection::open(supervisor.registry.database_path())
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_attempts WHERE finished_at IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unfinished, 0);
+            assert_eq!(
+                backend.count("creates"),
+                0,
+                "a mismatched preparation cannot dispatch a provider"
+            );
+            clock.store(2_000, Ordering::SeqCst);
+            supervisor.observe_once().await.unwrap();
+            assert_eq!(
+                attempts(dir.path()).len(),
+                if case == "unavailable" { 2 } else { 1 }
+            );
+            assert_eq!(backend.count("creates"), 0);
+            assert_root_and_successes(&supervisor, &soul, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_preparation_callback_retries_only_transport_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for response in [
+            None,
+            Some(b"host unavailable".to_vec()),
+            Some(vec![b'x'; 256 * 1024 + 1]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, _, _) = open(dir.path(), 0);
+            let soul = seed(&supervisor).await;
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let reserved = supervisor
+                .registry
+                .reserve_due_recovery_retry(soul.clone(), context.intent_revision, 0)
+                .await
+                .unwrap()
+                .unwrap();
+            let unavailable = response.is_none();
+            let server = response.map(|response| {
+                let listener = tokio::net::UnixListener::bind(dir.path().join("mcp.sock")).unwrap();
+                tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    stream.read_to_end(&mut request).await.unwrap();
+                    stream.write_all(&response).await.unwrap();
+                })
+            });
+            let error = supervisor
+                .issue_replacement_mcp_capability(&soul, "codex", None, "/tmp", "/tmp")
+                .await
+                .unwrap_err();
+            if let Some(server) = server {
+                server.await.unwrap();
+            }
+            assert_eq!(
+                error.code,
+                if unavailable {
+                    RuntimeErrorCode::HostUnreachable
+                } else {
+                    RuntimeErrorCode::RecoveryBlocked
+                }
+            );
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            supervisor
+                .registry
+                .mark_recovery_blocked_with_retry(
+                    soul.clone(),
+                    reserved.reserved_attempt_id,
+                    RecoveryBlockReason::CapabilityPending,
+                    vec![error.message.clone()],
+                    context.write_fence(),
+                    TransientRecoveryFailure::from_runtime(&error)
+                        .map(|_| TransientRecoveryFailure::Preparation),
+                )
+                .await
+                .unwrap();
+            assert_eq!(due(dir.path()), unavailable.then_some(2_000));
+            assert_root_and_successes(&supervisor, &soul, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_startup_and_observer_share_one_due_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, clock) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        backend.unavailable(true);
+        supervisor.reconcile_startup().await.unwrap();
+        backend.unavailable(false);
+        clock.store(2_000, Ordering::SeqCst);
+        let (startup, observer) =
+            tokio::join!(supervisor.reconcile_startup(), supervisor.observe_once());
+        startup.unwrap();
+        observer.unwrap();
+        assert_eq!(
+            attempts(dir.path()).len(),
+            2,
+            "startup and observer must dispatch the same due reservation only once"
+        );
+        assert_eq!(backend.count("creates"), 1);
+        assert_root_and_successes(&supervisor, &soul, 1).await;
+    }
+
+    #[tokio::test]
+    async fn retry_reservation_cancellation_and_manual_rearm_are_transactional() {
+        for action in ["stop", "new_intent", "lost", "manual"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, clock) = open(dir.path(), 0);
+            let soul = seed(&supervisor).await;
+            let revision = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .intent_revision;
+            let (left, right) = tokio::join!(
+                supervisor
+                    .registry
+                    .reserve_due_recovery_retry(soul.clone(), revision, 0),
+                supervisor
+                    .registry
+                    .reserve_due_recovery_retry(soul.clone(), revision, 0)
+            );
+            let reservations: Vec<_> = [left.unwrap(), right.unwrap()]
+                .into_iter()
+                .flatten()
+                .collect();
+            assert_eq!(reservations.len(), 1);
+            let attempt = reservations[0].reserved_attempt_id.clone().unwrap();
+            assert!(supervisor
+                .registry
+                .reserve_due_recovery_retry(soul.clone(), revision + 1, 0)
+                .await
+                .unwrap()
+                .is_none());
+            match action {
+                "stop" => {
+                    supervisor
+                        .registry
+                        .begin_stop_expected(soul.clone(), Some(revision))
+                        .await
+                        .unwrap();
+                }
+                "manual" => {
+                    supervisor
+                        .registry
+                        .settle_recovery_retry(
+                            soul.clone(),
+                            revision,
+                            attempt.clone(),
+                            true,
+                            false,
+                            0,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(due(dir.path()), Some(2_000));
+                    backend.unavailable(true);
+                    clock.store(1_000, Ordering::SeqCst);
+                    supervisor
+                        .recover(RecoverRequest {
+                            soul_id: soul.clone(),
+                            trigger: RecoveryTrigger::ManualRetry,
+                            expected_intent_revision: Some(revision),
+                            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(attempts(dir.path()).len(), 2);
+                    assert_eq!(
+                        supervisor
+                            .registry
+                            .recovery_context(soul.clone())
+                            .await
+                            .unwrap()
+                            .intent_revision,
+                        revision + 1
+                    );
+                    assert_eq!(due(dir.path()), Some(3_000));
+                    let stale = supervisor
+                        .recover(RecoverRequest {
+                            soul_id: soul.clone(),
+                            trigger: RecoveryTrigger::ManualRetry,
+                            expected_intent_revision: Some(revision),
+                            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                        })
+                        .await
+                        .unwrap_err();
+                    assert_eq!(stale.code, RuntimeErrorCode::StaleIntentRevision);
+                    assert_eq!(attempts(dir.path()).len(), 2);
+                }
+                "new_intent" | "lost" => {
+                    // These are the same durable soul UPDATEs used by intent
+                    // and loss writers; the migration trigger is the shared
+                    // production cancellation path inside their transaction.
+                    let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+                    conn.execute(
+                        if action == "lost" {
+                            "UPDATE souls SET recovery_state='lost' WHERE soul_id=?1"
+                        } else {
+                            "UPDATE souls SET intent_revision=intent_revision+1 WHERE soul_id=?1"
+                        },
+                        [soul.as_str()],
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let expected_due = due(dir.path());
+            supervisor
+                .registry
+                .settle_recovery_retry(soul.clone(), revision, attempt.clone(), true, false, 50_000)
+                .await
+                .unwrap();
+            supervisor
+                .registry
+                .settle_recovery_retry(soul.clone(), revision, attempt, false, true, 60_000)
+                .await
+                .unwrap();
+            assert_eq!(
+                due(dir.path()),
+                expected_due,
+                "a stale completion must not rearm or clear the newer action"
+            );
+            assert!(supervisor
+                .registry
+                .recovery_retry(soul.clone(), revision)
+                .await
+                .unwrap()
+                .is_none());
+            drop(supervisor);
+            drop(backend);
+            let (supervisor, _, _) = open(dir.path(), 70_000);
+            assert!(supervisor
+                .registry
+                .recovery_retry(soul.clone(), revision)
+                .await
+                .unwrap()
+                .is_none());
+            assert_root_and_successes(&supervisor, &soul, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_unqualified_native_store_does_not_rearm_from_a_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, clock) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE souls SET resume_spec=NULL WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(due(dir.path()), None);
+        clock.store(20_000, Ordering::SeqCst);
+        supervisor.reconcile_startup().await.unwrap();
+        supervisor.observe_once().await.unwrap();
+        assert_eq!(backend.count("inspects"), 1);
+        assert_eq!(backend.count("creates"), 0);
+        assert_root_and_successes(&supervisor, &soul, 0).await;
+    }
+
+    struct ReservedReplacement {
+        supervisor: Supervisor,
+        backend: Arc<RetryBackend>,
+        soul: SoulId,
+        original_intent_revision: u64,
+        attempt_id: String,
+        handle: OwnedRuntimeHandle,
+    }
+
+    async fn reserved_replacement(root: &Path, starting: bool) -> ReservedReplacement {
+        let (supervisor, backend, _) = open(root, 0);
+        let soul = seed(&supervisor).await;
+        let original = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let reserved = supervisor
+            .registry
+            .reserve_due_recovery_retry(soul.clone(), original.intent_revision, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let start = supervisor
+            .registry
+            .begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::ProviderExit,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        supervisor
+            .registry
+            .mark_stop_outcome(
+                original.prior_handle.incarnation_id().clone(),
+                StopOutcome::VerifiedEmpty,
+            )
+            .await
+            .unwrap();
+        let replacement = supervisor
+            .registry
+            .prepare_replacement(
+                start,
+                None,
+                None,
+                original.resume_spec,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        let runtime = root
+            .join("runtime")
+            .join(replacement.prepared.incarnation_id.as_str());
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"retry-secret").unwrap();
+        let created = backend
+            .create_stopped(&CreateRuntimeSpec {
+                installation_id: supervisor.registry.installation_id().clone(),
+                soul_id: soul.clone(),
+                incarnation_id: replacement.prepared.incarnation_id.clone(),
+                image_ref: supervisor.config.image_ref.clone(),
+                host_binary_path: supervisor.config.host_binary_path.clone(),
+                runtime_dir: runtime.clone(),
+                limits: original.requested_limits,
+                test_run_id: "retry-reopen".into(),
+                terminal: None,
+                fresh_agent: None,
+                opencode_transfer_dir: None,
+                provider_volume_name: "retry-volume".into(),
+            })
+            .await
+            .unwrap();
+        supervisor
+            .registry
+            .commit_created(
+                replacement.prepared.incarnation_id.clone(),
+                crate::registry::BackendCreatedRecord {
+                    daemon_id: created.daemon_id,
+                    container_id: created.container_id.clone(),
+                    image_ref: supervisor.config.image_ref.clone(),
+                    runtime_dir: runtime,
+                    host_binary_path: supervisor.config.host_binary_path.clone(),
+                    immutable_config_digest: created.immutable_config_digest,
+                    launch_policy: None,
+                },
+            )
+            .await
+            .unwrap();
+        if starting {
+            let handle = supervisor
+                .registry
+                .owned_handle(replacement.prepared.incarnation_id.clone())
+                .await
+                .unwrap();
+            backend.start_host(&handle).await.unwrap();
+            supervisor
+                .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+                .await
+                .unwrap();
+            let boot = HostBootId::parse(
+                std::fs::read_to_string(handle.runtime_dir().join("fixture-boot")).unwrap(),
+            )
+            .unwrap();
+            supervisor
+                .registry
+                .commit_execution_grant(
+                    handle.incarnation_id().clone(),
+                    boot,
+                    original.requested_limits,
+                )
+                .await
+                .unwrap();
+        }
+        let handle = supervisor
+            .registry
+            .owned_handle(replacement.prepared.incarnation_id)
+            .await
+            .unwrap();
+        ReservedReplacement {
+            supervisor,
+            backend,
+            soul,
+            original_intent_revision: original.intent_revision,
+            attempt_id: reserved.reserved_attempt_id.unwrap().to_string(),
+            handle,
+        }
+    }
+
+    async fn close_retry_hosts(backend: &RetryBackend) {
+        let hosts = backend
+            .hosts
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|(_, task)| task)
+            .collect::<Vec<_>>();
+        for task in hosts {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_resumes_owned_created_and_starting_replacements_without_creation() {
+        for starting in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let ReservedReplacement {
+                supervisor,
+                backend,
+                soul,
+                original_intent_revision: _,
+                attempt_id,
+                handle,
+            } = reserved_replacement(dir.path(), starting).await;
+            close_retry_hosts(&backend).await;
+            drop(supervisor);
+            drop(backend);
+            let (supervisor, backend, _) = open(dir.path(), 1_000);
+            let report = supervisor.reconcile_startup().await.unwrap();
+            let current = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                current.recovery_state,
+                RecoveryState::Live,
+                "starting={starting}: {report:?}"
+            );
+            assert_eq!(
+                current.prior_handle.incarnation_id(),
+                handle.incarnation_id()
+            );
+            assert_eq!(current.prior_handle.container_id(), handle.container_id());
+            assert_eq!(backend.count("creates"), 1);
+            assert_eq!(attempts(dir.path()), vec![(attempt_id, "succeeded".into())]);
+            assert_root_and_successes(&supervisor, &soul, 1).await;
+            close_retry_hosts(&backend).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_cancels_reserved_created_and_starting_replacements() {
+        for starting in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let ReservedReplacement {
+                supervisor,
+                backend,
+                soul,
+                original_intent_revision,
+                attempt_id,
+                handle,
+            } = reserved_replacement(dir.path(), starting).await;
+            let stop = supervisor.registry.begin_stop(soul.clone()).await.unwrap();
+            assert_eq!(stop.incarnation_id(), handle.incarnation_id());
+            assert!(supervisor
+                .registry
+                .recovery_retry(soul.clone(), original_intent_revision)
+                .await
+                .unwrap()
+                .is_none());
+            close_retry_hosts(&backend).await;
+            drop(supervisor);
+            drop(backend);
+            let (supervisor, backend, _) = open(dir.path(), 1_000);
+            let report = supervisor.reconcile_startup().await.unwrap();
+            assert!(
+                report.results.iter().all(|result| result.error.is_none()),
+                "{report:?}"
+            );
+            let current = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(current.desired_state, DesiredState::Stopped);
+            assert_eq!(
+                current.intent_revision,
+                stop.stop_fence().unwrap().intent_revision
+            );
+            assert_eq!(
+                current.prior_handle.incarnation_id(),
+                handle.incarnation_id()
+            );
+            assert_eq!(current.prior_handle.container_id(), handle.container_id());
+            assert_eq!(backend.count("creates"), 1);
+            assert_eq!(attempts(dir.path()), vec![(attempt_id, "cancelled".into())]);
+            assert!(supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .is_empty());
+            assert_root_and_successes(&supervisor, &soul, 0).await;
+            let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+            let (generation, writers): (u64,u64) = conn.query_row(
+                "SELECT execution_generation,(SELECT count(*) FROM writer_claims WHERE soul_id=?1) FROM incarnations WHERE incarnation_id=?2",
+                rusqlite::params![soul.as_str(), handle.incarnation_id().as_str()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(generation, u64::from(starting));
+            assert_eq!(writers, 0);
+            assert_eq!(
+                backend.inspect(&handle).await.unwrap().state,
+                if starting {
+                    BackendRuntimeState::Exited
+                } else {
+                    BackendRuntimeState::Created
+                }
+            );
+            assert_eq!(
+                handle.runtime_dir().join("fixture-started").exists(),
+                starting
+            );
+            close_retry_hosts(&backend).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_schema14_upgrade_preserves_identity_and_schedules_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        let original = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute_batch("DROP TRIGGER cancel_recovery_retry_on_intent; DROP TABLE recovery_retries; UPDATE installation SET schema_version=14;").unwrap();
+        drop(conn);
+        drop(supervisor);
+        drop(backend);
+        let (supervisor, backend, _) = open(dir.path(), 0);
+        backend.unavailable(true);
+        supervisor.reconcile_startup().await.unwrap();
+        let migrated = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            migrated.prior_handle.incarnation_id(),
+            original.prior_handle.incarnation_id()
+        );
+        assert_eq!(migrated.native_session_id, original.native_session_id);
+        assert_eq!(migrated.resume_spec, original.resume_spec);
+        assert_eq!(due(dir.path()), Some(2_000));
+        drop(supervisor);
+        drop(backend);
+        let (supervisor, backend, _) = open(dir.path(), 1_000);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(backend.count("inspects"), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_deadlines_follow_settlement_and_duplicate_completion_is_inert() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _, _) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        let revision = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .intent_revision;
+        let first = supervisor
+            .registry
+            .reserve_due_recovery_retry(soul.clone(), revision, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_id = first.reserved_attempt_id.unwrap();
+        supervisor
+            .registry
+            .settle_recovery_retry(soul.clone(), revision, first_id.clone(), true, false, 1_500)
+            .await
+            .unwrap();
+        assert_eq!(due(dir.path()), Some(3_500));
+        supervisor
+            .registry
+            .settle_recovery_retry(soul.clone(), revision, first_id, true, false, 9_000)
+            .await
+            .unwrap();
+        assert_eq!(due(dir.path()), Some(3_500));
+        assert!(supervisor
+            .registry
+            .reserve_due_recovery_retry(soul.clone(), revision, 3_499)
+            .await
+            .unwrap()
+            .is_none());
+        let second = supervisor
+            .registry
+            .reserve_due_recovery_retry(soul.clone(), revision, 3_500)
+            .await
+            .unwrap()
+            .unwrap();
+        supervisor
+            .registry
+            .settle_recovery_retry(
+                soul.clone(),
+                revision,
+                second.reserved_attempt_id.unwrap(),
+                true,
+                false,
+                6_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(due(dir.path()), Some(16_000));
+        let third = supervisor
+            .registry
+            .reserve_due_recovery_retry(soul.clone(), revision, 16_000)
+            .await
+            .unwrap()
+            .unwrap();
+        supervisor
+            .registry
+            .settle_recovery_retry(
+                soul.clone(),
+                revision,
+                third.reserved_attempt_id.unwrap(),
+                true,
+                false,
+                -1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(due(dir.path()), None);
+        assert!(supervisor
+            .registry
+            .reserve_due_recovery_retry(soul, revision, i64::MAX)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_settlement_rejects_conflicting_attempt_and_unverified_success() {
+        for conflicting in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, _, _) = open(dir.path(), 0);
+            let soul = seed(&supervisor).await;
+            let revision = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .intent_revision;
+            let reserved = supervisor
+                .registry
+                .reserve_due_recovery_retry(soul.clone(), revision, 0)
+                .await
+                .unwrap()
+                .unwrap();
+            let attempt = reserved.reserved_attempt_id.clone().unwrap();
+            let current_attempt = if conflicting {
+                let newer = RecoveryAttemptId::new();
+                let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+                conn.execute("INSERT INTO recovery_attempts(attempt_id,soul_id,prior_incarnation_id,intent_revision,path,verdict,started_at) SELECT ?1,soul_id,prior_incarnation_id,intent_revision,path,'started',1 FROM recovery_attempts WHERE attempt_id=?2", rusqlite::params![newer.as_str(),attempt.as_str()]).unwrap();
+                conn.execute(
+                    "UPDATE souls SET recovery_attempt_id=?1 WHERE soul_id=?2",
+                    rusqlite::params![newer.as_str(), soul.as_str()],
+                )
+                .unwrap();
+                newer
+            } else {
+                attempt.clone()
+            };
+            supervisor
+                .registry
+                .settle_recovery_retry(
+                    soul.clone(),
+                    revision,
+                    attempt,
+                    conflicting,
+                    !conflicting,
+                    1_000,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                supervisor
+                    .registry
+                    .recovery_retry(soul.clone(), revision)
+                    .await
+                    .unwrap(),
+                Some(reserved),
+                "a conflicting attempt or unverified success must not settle the reservation"
+            );
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(context.recovery_attempt_id, Some(current_attempt));
+            assert_eq!(context.recovery_state, RecoveryState::Recovering);
+            assert_eq!(attempts(dir.path())[0].1, "started");
+            assert_root_and_successes(&supervisor, &soul, 0).await;
+        }
+    }
+
+    #[test]
+    fn retry_subprocess_driver() {
+        let Some(root) = std::env::var_os("FRESHELL_RETRY_TEST_ROOT") else {
+            return;
+        };
+        assert_eq!(
+            std::env::var("FRESHELL_SANDBOX_MODE").as_deref(),
+            Ok("runtime-suite")
+        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (supervisor, _, _) = open(Path::new(&root), 0);
+            supervisor.reconcile_startup().await.unwrap();
+            panic!("requested production crash boundary was not reached");
+        });
+    }
+    async fn crash_case(point: &str) {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            std::env::var("FRESHELL_SANDBOX_MODE").as_deref(),
+            Ok("runtime-suite")
+        );
+        assert!(Path::new("/.dockerenv").exists());
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        backend.unavailable(point != "after_replacement_before_settlement");
+        drop(supervisor);
+        drop(backend);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "recovery::automatic_retry_tests::retry_subprocess_driver",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("FRESHELL_RETRY_TEST_ROOT", dir.path())
+            .env("FRESHELL_RETRY_TEST_CRASH", point)
+            .output()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("crash-boundary"))
+                .ok()
+                .as_deref(),
+            Some(point),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            child.status.signal(),
+            Some(6),
+            "child must actually abort at the named boundary"
+        );
+        let prior_attempts = attempts(dir.path());
+        assert_eq!(
+            prior_attempts.len(),
+            usize::from(point != "before_reservation"),
+            "reservation must be durable before provider work"
+        );
+        let (supervisor, backend, _) = open(dir.path(), 1_000);
+        let before = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let owned = before.prior_handle.clone();
+        supervisor.reconcile_startup().await.unwrap();
+        let after = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        if point == "after_replacement_before_settlement" {
+            assert_eq!(after.recovery_state, RecoveryState::Live);
+            assert_eq!(after.prior_handle.incarnation_id(), owned.incarnation_id());
+            assert_eq!(after.prior_handle.container_id(), owned.container_id());
+            assert_eq!(
+                backend.count("creates"),
+                1,
+                "restart must adopt the exact owned replacement"
+            );
+            assert_eq!(
+                attempts(dir.path()),
+                vec![(prior_attempts[0].0.clone(), "succeeded".into())]
+            );
+            assert_root_and_successes(&supervisor, &soul, 1).await;
+        } else {
+            assert_eq!(attempts(dir.path()).len(), 1);
+            if !prior_attempts.is_empty() {
+                assert_eq!(attempts(dir.path())[0].0, prior_attempts[0].0);
+            }
+            assert_eq!(backend.count("creates"), 0);
+            assert_eq!(
+                due(dir.path()),
+                Some(if point == "after_settlement" {
+                    2_000
+                } else {
+                    3_000
+                })
+            );
+            assert_root_and_successes(&supervisor, &soul, 0).await;
+        }
+        drop(supervisor);
+        drop(backend);
+        let (supervisor, backend, _) = open(dir.path(), 1_500);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_root_and_successes(
+            &supervisor,
+            &soul,
+            u64::from(point == "after_replacement_before_settlement"),
+        )
+        .await;
+        assert_eq!(
+            backend.count("creates"),
+            usize::from(point == "after_replacement_before_settlement")
+        );
+    }
+    #[tokio::test]
+    #[ignore = "destructive subprocess crash; Docker --runtime-suite sandbox only"]
+    async fn automatic_retry_crash_before_reservation() {
+        crash_case("before_reservation").await;
+    }
+    #[tokio::test]
+    #[ignore = "destructive subprocess crash; Docker --runtime-suite sandbox only"]
+    async fn automatic_retry_crash_after_reservation_before_dispatch() {
+        crash_case("after_reservation_before_dispatch").await;
+    }
+    #[tokio::test]
+    #[ignore = "destructive subprocess crash; Docker --runtime-suite sandbox only"]
+    async fn automatic_retry_crash_after_replacement_before_settlement() {
+        crash_case("after_replacement_before_settlement").await;
+    }
+    #[tokio::test]
+    #[ignore = "destructive subprocess crash; Docker --runtime-suite sandbox only"]
+    async fn automatic_retry_crash_after_settlement() {
+        crash_case("after_settlement").await;
     }
 }

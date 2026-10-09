@@ -772,6 +772,7 @@ mod tests {
 
     fn fixture_resume_spec(native_session_id: &str) -> ResumeSpec {
         ResumeSpec {
+            claude_fork: None,
             schema_version: freshell_runtime_protocol::RESUME_SPEC_SCHEMA_VERSION,
             provider_session: freshell_runtime_protocol::ProviderSessionRef {
                 provider: "codex".into(),

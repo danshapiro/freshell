@@ -298,14 +298,35 @@ fn prepare_provider_features_for_identity(
         .args(args)
         .output()
         .map_err(|error| format!("prepare provider features: {error}"))?;
+    finish_provider_feature_worker(args.first().copied().unwrap_or("unknown"), uid, gid, output)
+}
+
+fn finish_provider_feature_worker(
+    operation: &str,
+    uid: u32,
+    gid: u32,
+    output: std::process::Output,
+) -> Result<Option<String>, String> {
     if !output.status.success() {
+        #[cfg(unix)]
+        let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
+        #[cfg(not(unix))]
+        let signal: Option<i32> = None;
+        crate::emit_environment_event(serde_json::json!({
+            "event": "provider.feature_preparation.failed",
+            "severity": "error",
+            "operation": operation,
+            "exit_code": output.status.code(),
+            "signal": signal,
+            "uid": uid,
+            "gid": gid,
+            "stdout_bytes": output.stdout.len(),
+            "stderr_bytes": output.stderr.len(),
+        }));
         let _ = std::io::Write::write_all(&mut std::io::stderr(), &output.stderr);
-        return Err(format!(
-            "prepare provider features failed: {}",
-            args.first().unwrap_or(&"unknown")
-        ));
+        return Err(format!("prepare provider features failed: {operation}"));
     }
-    parse_provider_feature_worker_output(args.first().copied().unwrap_or("unknown"), &output.stdout)
+    parse_provider_feature_worker_output(operation, &output.stdout)
 }
 
 fn parse_provider_feature_worker_output(
@@ -568,6 +589,7 @@ pub async fn probe_resume(
     };
     match result {
         Ok(ProviderStoreProbe::Ready { evidence }) => {
+            resume_spec.claude_fork = None;
             if matches!(
                 provider.as_str(),
                 "phase1-fixture" | "native-session-fixture"
@@ -596,6 +618,10 @@ pub async fn probe_resume(
                 resume_spec: Box::new(resume_spec),
             }
         }
+        Ok(ProviderStoreProbe::ParentBackedClaudeFork { .. }) => RecoveryProbe::ResumeReady {
+            evidence_revision: resume_spec.evidence_revision,
+            resume_spec: Box::new(resume_spec),
+        },
         Ok(ProviderStoreProbe::DefinitivelyUnavailable {
             reason,
             evidence,
@@ -684,6 +710,70 @@ mod provider_secret_context_tests {
             Some("fixture-scope")
         );
         assert_eq!(env.get("FRESHELL").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn feature_worker_nonzero_exit_preserves_opaque_error_and_selector_stdout() {
+        let owned = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let run_owned = |script: &str| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .current_dir(owned.path())
+                .env("HOME", owned.path())
+                .output()
+                .unwrap()
+        };
+        let output =
+            run_owned("printf private-fixture-stdout; printf private-fixture-stderr >&2; exit 23");
+        assert_eq!(output.status.code(), Some(23));
+        let result = finish_provider_feature_worker("amplifier-profile", uid, gid, output);
+        assert_eq!(
+            result.unwrap_err(),
+            "prepare provider features failed: amplifier-profile"
+        );
+        let output = run_owned("printf '/owned/selector.json\\n'");
+        assert_eq!(
+            finish_provider_feature_worker("opencode-rebind", uid, gid, output).unwrap(),
+            Some("/owned/selector.json".into())
+        );
+    }
+
+    #[test]
+    fn feature_worker_spawned_failure_reports_body_free_exit_status() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "providers::provider_secret_context_tests::feature_worker_nonzero_exit_preserves_opaque_error_and_selector_stdout", "--nocapture"]).output().unwrap();
+        assert!(output.status.success(), "owned behavior child failed");
+        assert!(
+            std::str::from_utf8(&output.stdout)
+                .unwrap()
+                .contains("test result: ok. 1 passed;"),
+            "actual spawned behavior must execute exactly one test"
+        );
+        let events = std::str::from_utf8(&output.stderr)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events.len(),
+            1,
+            "actual nonzero worker status must produce one structured refusal"
+        );
+        assert_eq!(events[0]["event"], "provider.feature_preparation.failed");
+        assert_eq!(events[0]["severity"], "error");
+        assert_eq!(events[0]["operation"], "amplifier-profile");
+        assert_eq!(events[0]["exit_code"], 23);
+        assert!(events[0]["signal"].is_null());
+        assert_eq!(events[0]["uid"], unsafe { libc::geteuid() });
+        assert_eq!(events[0]["gid"], unsafe { libc::getegid() });
+        assert!(events[0]["stdout_bytes"].as_u64().unwrap() > 0);
+        assert!(events[0]["stderr_bytes"].as_u64().unwrap() > 0);
+        assert!(!serde_json::to_string(&events)
+            .unwrap()
+            .contains("private-fixture"));
+        assert!(!serde_json::to_string(&events).unwrap().contains("/owned"));
     }
 
     #[test]

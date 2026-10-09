@@ -265,6 +265,10 @@ pub struct CredentialReference {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumeSpec {
+    /// Native UUID-preserving recovery of an acknowledged Claude fork before
+    /// its first input materializes a child transcript. Intent, not observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_fork: Option<ClaudeForkRecipe>,
     #[serde(default = "default_resume_spec_schema_version")]
     pub schema_version: u32,
     pub provider_session: ProviderSessionRef,
@@ -319,6 +323,76 @@ pub struct ResumeSpec {
     /// True only when the durable command journal proves no provider input was
     /// ever dispatched. It is the sole authority for pristine-seed recovery.
     pub never_dispatched: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeForkRecipe {
+    /// Retains the missing-child blocker after a potentially accepted effect.
+    /// A disabled source can never recreate its older prefix.
+    #[serde(default)]
+    pub recovery_disabled: bool,
+    pub child_session_id: String,
+    pub parent_session_id: String,
+    pub parent_transcript: String,
+    pub child_transcript: String,
+    pub parent_sha256: String,
+    pub target: ClaudeForkTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ClaudeForkTarget {
+    Prefix {
+        cutoff_uuid: String,
+        drop_turn_uuid: Option<String>,
+    },
+    Empty,
+}
+
+impl ClaudeForkRecipe {
+    pub fn validate(&self, child: &str) -> Result<(), String> {
+        let uuid = |value: &str| uuid::Uuid::parse_str(value).is_ok();
+        let path = |value: &str, root: &str| {
+            let path = std::path::Path::new(value);
+            value.len() <= 4096
+                && path.starts_with(".claude/projects")
+                && path
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+                && path.file_name().and_then(|name| name.to_str())
+                    == Some(format!("{root}.jsonl").as_str())
+        };
+        if self.child_session_id != child
+            || !uuid(child)
+            || !uuid(&self.parent_session_id)
+            || child == self.parent_session_id
+            || !path(&self.parent_transcript, &self.parent_session_id)
+            || !path(&self.child_transcript, child)
+            || self.parent_sha256.len() != 64
+            || !self
+                .parent_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err("invalid Claude parent-backed fork recipe".into());
+        }
+        if let ClaudeForkTarget::Prefix {
+            cutoff_uuid,
+            drop_turn_uuid,
+        } = &self.target
+        {
+            if !uuid(cutoff_uuid) || drop_turn_uuid.as_ref().is_some_and(|id| !uuid(id)) {
+                return Err("invalid Claude fork cutoff".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1887,6 +1961,76 @@ mod provider_launch_context_tests {
     }
 
     #[test]
+    fn managed_claude_fork_requires_one_exact_root_selector() {
+        let root = "112fa138-8ed5-4f98-8977-4444e8433207";
+        let args = vec!["--resume".into(), root.into(), "--fork-session".into()];
+        assert!(validate_managed_terminal_args("claude", &args).is_ok());
+        assert!(durable_managed_terminal_args("claude", args, None).is_ok());
+        assert!(validate_managed_terminal_args(
+            "claude",
+            &["--session-id".into(), root.into(), "--fork-session".into()]
+        )
+        .is_ok());
+        for invalid in [
+            vec!["--fork-session".into()],
+            vec![
+                "--session-id".into(),
+                root.into(),
+                "--resume".into(),
+                root.into(),
+                "--fork-session".into(),
+            ],
+            vec!["--model".into(), "--resume".into(), "--fork-session".into()],
+            vec![
+                "--resume".into(),
+                root.into(),
+                "--fork-session".into(),
+                "true".into(),
+            ],
+            vec![
+                "--resume".into(),
+                "bad\nroot".into(),
+                "--fork-session".into(),
+            ],
+        ] {
+            assert!(validate_managed_terminal_args("claude", &invalid).is_err());
+        }
+        assert!(validate_managed_terminal_args("codex", &["--fork-session".into()]).is_err());
+    }
+
+    #[test]
+    fn managed_codex_pinned_update_setting_survives_durable_resume_without_expanding_overrides() {
+        let args = vec![
+            "--model".into(),
+            "gpt-5.6-luna".into(),
+            "-c".into(),
+            "model_reasoning_effort=\"low\"".into(),
+            "-c".into(),
+            "check_for_update_on_startup=false".into(),
+            "resume".into(),
+            "thread-current".into(),
+        ];
+        validate_managed_terminal_args("codex", &args).unwrap();
+        let durable = durable_managed_terminal_args("codex", args, None).unwrap();
+        validate_managed_terminal_args("codex", &durable).unwrap();
+        for value in [
+            "check_for_update_on_startup=true",
+            "check_for_update_on_startup=false\napi_key=secret",
+            "check_for_update_on_startup=\"false\"",
+            "check_for_update_on_startup=false;token=secret",
+        ] {
+            assert!(validate_managed_terminal_args("codex", &["-c".into(), value.into()]).is_err());
+        }
+        for provider in ["claude", "opencode", "amplifier"] {
+            assert!(validate_managed_terminal_args(
+                provider,
+                &["-c".into(), "check_for_update_on_startup=false".into()]
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn managed_codex_accepts_only_the_packaged_mcp_recipe_after_preparation() {
         let args = vec![
             "-c".into(), "mcp_servers.freshell.command=\"node\"".into(),
@@ -2547,8 +2691,15 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
         )
     };
     let mut index = 0;
+    let mut claude_fork = false;
+    let mut claude_root_selectors = 0;
     while index < args.len() {
         let flag = args[index].as_str();
+        if mode == "claude" && flag == "--fork-session" {
+            claude_fork = true;
+            index += 1;
+            continue;
+        }
         if mode == "codex" && flag == "resume" && index + 1 < args.len() {
             if !safe_selector(&args[index + 1]) {
                 return Err(invalid());
@@ -2585,13 +2736,17 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
                 value.as_str(),
                 ".claude/freshell-mcp.json" | "/home/freshell/provider/.claude/freshell-mcp.json"
             ),
-            ("claude", "--session-id" | "--resume") => safe_selector(value),
+            ("claude", "--session-id" | "--resume") => {
+                claude_root_selectors += 1;
+                safe_selector(value)
+            }
             ("claude", "--model" | "--effort" | "--permission-mode") => safe_selector(value),
             ("claude", "--plugin-dir") => safe_selector(value),
             ("codex", "-c") => {
                 matches!(
                     value.as_str(),
                     "tui.notification_method=bel"
+                        | "check_for_update_on_startup=false"
                         | "tui.notifications=['agent-turn-complete']"
                         | "features.apps=false"
                         | "mcp_servers.freshell.command=\"node\""
@@ -2616,6 +2771,9 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
             return Err(invalid());
         }
         index += 2;
+    }
+    if claude_fork && claude_root_selectors != 1 {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -4144,6 +4302,8 @@ pub enum HostResult {
     TerminalOutput(RuntimeOutputBatch),
     FreshAgentCommand {
         state: CommandState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_fork: Option<ClaudeForkRecipe>,
         /// Provider identity observed and durably recorded by the host actor
         /// at the same acceptance boundary as this acknowledgement.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4521,6 +4681,7 @@ mod tests {
     #[test]
     fn recovery_contract_serializes_references_not_credential_bytes() {
         let spec = ResumeSpec {
+            claude_fork: None,
             schema_version: RESUME_SPEC_SCHEMA_VERSION,
             provider_session: ProviderSessionRef {
                 provider: "claude".into(),

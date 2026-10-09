@@ -59,6 +59,7 @@ struct HostState {
     child: Mutex<Option<Child>>,
     pty: Mutex<Option<HostedPty>>,
     fresh_agent: Mutex<Option<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>>>,
+    fresh_native_command: Mutex<()>,
     provider_config_paths: ProviderConfigPaths,
     opencode_transfer_mount: PathBuf,
     bootstrap_root: PathBuf,
@@ -417,6 +418,7 @@ async fn run() -> Result<(), String> {
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
         Some("native-identity-read") => providers::native_identity::run_signal_read_worker(&args[2..]),
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
+        Some("claude-history-read-worker") => freshell_freshagent::claude::run_claude_history_read_worker(),
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
         Some("publish-provider-files") => {
             if args.len()!=4 { return Err("publish-provider-files requires stage and provider HOME".into()); }
@@ -486,6 +488,7 @@ async fn serve(args: &[String]) -> Result<(), String> {
         child: Mutex::new(None),
         pty: Mutex::new(None),
         fresh_agent: Mutex::new(None),
+        fresh_native_command: Mutex::new(()),
         provider_config_paths: ProviderConfigPaths::default(),
         opencode_transfer_mount: PathBuf::from(OPENCODE_TRANSFER_MOUNT),
         bootstrap_root: PathBuf::from("/run/freshell-bootstrap"),
@@ -693,15 +696,9 @@ async fn dispatch_with_effects(
                         });
                     } else if let Some(agent) = state.fresh_agent.lock().await.as_ref() {
                         exited = !agent.is_live().await;
-                        if let (Some(launch), Some(native)) = (
-                            persisted.native_identity_launch.as_ref(),
-                            agent.observed_native_session_id().await,
-                        ) {
-                            if let Some(evidence) = agent.observed_native_identity_evidence().await
-                            {
-                                native_identity_observation = providers::native_identity::bind_provider_observation(
-                                    launch,&native,freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,&evidence);
-                            }
+                        if let Some(launch) = persisted.native_identity_launch.as_ref() {
+                            native_identity_observation =
+                                fresh_native_observation(launch, agent).await;
                         }
                         native_session_id = native_identity_observation
                             .as_ref()
@@ -815,6 +812,7 @@ async fn dispatch_with_effects(
                     Ok(HostResult::TerminalOutput(batch))
                 }
                 HostCommand::FreshAgentResumePending { incarnation_id } => {
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_incarnation(&incarnation_id, state)?;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
@@ -832,6 +830,7 @@ async fn dispatch_with_effects(
                         .await
                         .map(|observation| observation.native_session_id);
                     Ok(HostResult::FreshAgentCommand {
+                        claude_fork: actor.claude_fork_recipe().await,
                         state: freshell_runtime_protocol::CommandState::ProviderAcked,
                         native_session_id,
                     })
@@ -843,6 +842,7 @@ async fn dispatch_with_effects(
                     settings,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
@@ -856,6 +856,7 @@ async fn dispatch_with_effects(
                         .map_err(map_actor_error)?;
                     let native_session_id = actor.profile().await.native_session_id;
                     Ok(HostResult::FreshAgentCommand {
+                        claude_fork: actor.claude_fork_recipe().await,
                         state: command_state,
                         native_session_id,
                     })
@@ -867,6 +868,7 @@ async fn dispatch_with_effects(
                     input,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
@@ -874,10 +876,12 @@ async fn dispatch_with_effects(
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
+                    let prior_native = actor.profile().await.native_session_id;
                     let transition = actor
                         .fork(request_id, parent_session_id, input)
                         .await
                         .map_err(map_actor_error)?;
+                    commit_fresh_native_transition(state, &actor, prior_native.as_deref()).await?;
                     Ok(HostResult::FreshAgentFork(
                         freshell_runtime_protocol::FreshAgentForkResult {
                             parent_session_id: transition.parent_session_id,
@@ -893,6 +897,7 @@ async fn dispatch_with_effects(
                     cwd,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
@@ -900,6 +905,7 @@ async fn dispatch_with_effects(
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
+                    let prior_native = actor.profile().await.native_session_id;
                     let command_state = actor
                         .semantic_operation(
                             request_id,
@@ -910,7 +916,9 @@ async fn dispatch_with_effects(
                         )
                         .await
                         .map_err(map_actor_error)?;
+                    commit_fresh_native_transition(state, &actor, prior_native.as_deref()).await?;
                     Ok(HostResult::FreshAgentCommand {
+                        claude_fork: actor.claude_fork_recipe().await,
                         state: command_state,
                         native_session_id: actor.profile().await.native_session_id,
                     })
@@ -924,6 +932,7 @@ async fn dispatch_with_effects(
                     cwd,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
@@ -931,6 +940,7 @@ async fn dispatch_with_effects(
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
+                    let prior_native = actor.profile().await.native_session_id;
                     let command_state = actor
                         .semantic_operation(
                             request_id,
@@ -943,7 +953,9 @@ async fn dispatch_with_effects(
                         )
                         .await
                         .map_err(map_actor_error)?;
+                    commit_fresh_native_transition(state, &actor, prior_native.as_deref()).await?;
                     Ok(HostResult::FreshAgentCommand {
+                        claude_fork: actor.claude_fork_recipe().await,
                         state: command_state,
                         native_session_id: actor.profile().await.native_session_id,
                     })
@@ -983,6 +995,7 @@ async fn dispatch_with_effects(
                     decision_id,
                     decision,
                 } => {
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_incarnation(&incarnation_id, state)?;
                     ensure_current_fresh_native_observation(state).await?;
                     let actor = state
@@ -997,6 +1010,7 @@ async fn dispatch_with_effects(
                         .map_err(map_actor_error)?;
                     let native_session_id = actor.profile().await.native_session_id;
                     Ok(HostResult::FreshAgentCommand {
+                        claude_fork: actor.claude_fork_recipe().await,
                         state: freshell_runtime_protocol::CommandState::Completed,
                         native_session_id,
                     })
@@ -1496,25 +1510,17 @@ async fn grant_execution(
                 launch.cwd = resume.cwd.clone();
             }
             if !exact_resume {
-                prepare_provider_bootstrap_files(
-                    launch.provider.as_str(),
-                    &launch.provider_bootstrap_files,
-                    launch.run_as_uid,
-                    launch.run_as_gid,
+                prepare_fresh_provider_state_at(
+                    &launch,
+                    &state.provider_config_paths,
+                    Path::new("/run/freshell-bootstrap"),
                 )
                 .map_err(|error| {
                     RuntimeError::new(
                         RuntimeErrorCode::HostUnreachable,
-                        format!("prepare hosted provider bootstrap: {error}"),
+                        format!("prepare hosted provider state: {error}"),
                     )
                 })?;
-                prepare_fresh_provider_context_at(&launch, &ProviderConfigPaths::default())
-                    .map_err(|error| {
-                        RuntimeError::new(
-                            RuntimeErrorCode::HostUnreachable,
-                            format!("prepare hosted provider config: {error}"),
-                        )
-                    })?;
             } else {
                 refresh_provider_context(
                     launch.provider_launch_context.as_ref(),
@@ -1638,14 +1644,90 @@ async fn current_native_observation(
     }
     let launch = persisted.native_identity_launch.as_ref()?;
     let actor = state.fresh_agent.lock().await.clone()?;
+    fresh_native_observation(launch, &actor).await
+}
+
+async fn fresh_native_observation(
+    launch: &freshell_runtime_protocol::NativeIdentityLaunch,
+    actor: &freshell_agent_runtime::host_actor::FreshAgentHostActor,
+) -> Option<freshell_runtime_protocol::NativeIdentityObservation> {
     let native = actor.observed_native_session_id().await?;
     let evidence = actor.observed_native_identity_evidence().await?;
+    if actor.profile().await.native_session_id.as_deref() != Some(native.as_str())
+        || evidence["nativeSessionId"].as_str() != Some(native.as_str())
+        || evidence.get("launch").is_some_and(|value| {
+            serde_json::from_value::<freshell_runtime_protocol::NativeIdentityLaunch>(value.clone())
+                .as_ref()
+                .ok()
+                != Some(launch)
+        })
+    {
+        return None;
+    }
     providers::native_identity::bind_provider_observation(
         launch,
         &native,
         freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
         &evidence,
     )
+}
+
+async fn commit_fresh_native_transition(
+    state: &HostState,
+    actor: &Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+    parent: Option<&str>,
+) -> Result<(), RuntimeError> {
+    let child = actor.profile().await.native_session_id;
+    if child.as_deref() == parent {
+        return Ok(());
+    }
+    let refuse = || {
+        RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "native root transition lost its current host binding",
+        )
+    };
+    let child = child.ok_or_else(refuse)?;
+    if actor.observed_native_session_id().await.as_deref() != Some(child.as_str())
+        || !state
+            .fresh_agent
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, actor))
+    {
+        return Err(refuse());
+    }
+    let mut persisted = state.persisted.lock().await;
+    let Some(mut launch) = persisted.native_identity_launch.clone() else {
+        return if cfg!(feature = "fresh-agent-fixtures")
+            && persisted.fixture_evidence["fixtureTransport"] == "deterministic"
+        {
+            Ok(())
+        } else {
+            Err(refuse())
+        };
+    };
+    if launch.incarnation_id != state.incarnation_id
+        || launch.execution_generation != persisted.max_execution_generation
+        || launch
+            .requested_native_session_id
+            .as_deref()
+            .is_some_and(|root| Some(root) != parent)
+    {
+        return Err(refuse());
+    }
+    launch.evidence_revision = launch.evidence_revision.checked_add(1).ok_or_else(refuse)?;
+    launch.requested_native_session_id = Some(child);
+    let mut updated = persisted.clone();
+    updated.native_identity_launch = Some(launch);
+    write_state(&state.state_dir, &updated).map_err(registry_like_error)?;
+    *persisted = updated;
+    append_event_with_secret(&state.state_dir, &state.secret, "host.native_identity.transition_committed",
+        serde_json::json!({"severity":"info","incarnationId":state.incarnation_id,
+        "executionGeneration":persisted.max_execution_generation,
+        "evidenceRevision":persisted.native_identity_launch.as_ref().map(|launch|launch.evidence_revision)})).ok();
+    Ok(())
 }
 
 async fn ensure_current_fresh_native_observation(state: &HostState) -> Result<(), RuntimeError> {
@@ -3228,20 +3310,63 @@ fn transfer_created_paths(
     Ok(())
 }
 
-fn prepare_provider_bootstrap_files(
-    provider: &str,
-    files: &[ProviderBootstrapFile],
-    run_as_uid: u32,
-    run_as_gid: u32,
+fn prepare_fresh_provider_state_at(
+    launch: &FreshAgentLaunchSpec,
+    paths: &ProviderConfigPaths,
+    bootstrap_root: &Path,
 ) -> Result<(), String> {
-    let home = Path::new("/home/freshell/provider");
+    let home = &paths.provider_home;
+    let metadata = std::fs::symlink_metadata(home).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("managed provider HOME must be a physical directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if launch.native_session_id.is_some() && metadata.uid() == launch.run_as_uid {
+            if metadata.gid() != launch.run_as_gid || metadata.permissions().mode() & 0o777 != 0o700
+            {
+                return Err("selected provider HOME ownership handoff is incomplete".into());
+            }
+            // Initial preparation assigns HOME ownership last. An explicitly
+            // selected native session can reuse that completed handoff, but
+            // still needs actual native observation before it earns evidence.
+            emit_environment_event(serde_json::json!({
+                "severity": "info", "event": "provider.environment.ownership.reused",
+                "stage": "session_host", "provider": launch.provider.as_str(),
+                "provider_uid": launch.run_as_uid, "provider_gid": launch.run_as_gid
+            }));
+            return refresh_provider_context(
+                launch.provider_launch_context.as_ref(),
+                launch.provider.native_family(),
+                &launch.workspace_path,
+                launch.run_as_uid,
+                launch.run_as_gid,
+                paths,
+            );
+        }
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.gid() != unsafe { libc::getegid() }
+        {
+            return Err(
+                "provider HOME is not owned by the selected provider or initial host".into(),
+            );
+        }
+    }
     let created = write_provider_bootstrap_files(
-        provider,
-        files,
+        launch.provider.as_str(),
+        &launch.provider_bootstrap_files,
         home,
-        Path::new("/run/freshell-bootstrap"),
+        bootstrap_root,
     )?;
-    transfer_created_paths(provider, home, &created, run_as_uid, run_as_gid)
+    transfer_created_paths(
+        launch.provider.as_str(),
+        home,
+        &created,
+        launch.run_as_uid,
+        launch.run_as_gid,
+    )?;
+    prepare_fresh_provider_context_at(launch, paths)
 }
 
 fn rollback_created_provider_paths(paths: &[PathBuf]) {
@@ -4947,6 +5072,123 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn fresh_selected_native_home_refreshes_completed_handoff_without_bootstrap() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let history = home.join(".claude/projects/work/native.jsonl");
+        std::fs::create_dir_all(history.parent().unwrap()).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&history, b"retained native history\n").unwrap();
+        let before = std::fs::metadata(&history).unwrap();
+        let selected = br#"{"permissions":{"deny":["Bash"]}}"#;
+        std::fs::write(root.path().join("settings.json"), selected).unwrap();
+        let mut launch = kilroy_typed_launch(root.path());
+        launch.native_session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+        launch.provider_bootstrap_files = vec![ProviderBootstrapFile {
+            source_path: "already-consumed-bootstrap".into(),
+            provider_relative_path: ".claude/settings.json".into(),
+        }];
+        launch.provider_launch_context.as_mut().unwrap().config =
+            vec![freshell_runtime_protocol::ProviderConfigReference {
+                root: freshell_runtime_protocol::ProviderConfigRoot::Workspace,
+                relative_path: "settings.json".into(),
+                provider_relative_path: ".claude/settings.json".into(),
+                format: "json".into(),
+            }];
+        let paths = ProviderConfigPaths {
+            private_mount: root.path().join("private"),
+            provider_home: home.clone(),
+        };
+        prepare_fresh_provider_state_at(&launch, &paths, &root.path().join("absent-bootstrap"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(home.join(".claude/settings.json")).unwrap(),
+            selected
+        );
+        assert_eq!(
+            std::fs::read(&history).unwrap(),
+            b"retained native history\n"
+        );
+        assert_eq!(std::fs::metadata(&history).unwrap().ino(), before.ino());
+        assert_eq!(std::fs::metadata(&home).unwrap().mode() & 0o777, 0o700);
+
+        launch.provider_launch_context.as_mut().unwrap().preparation =
+            freshell_runtime_protocol::ProviderPreparation::Codex {
+                tui_args: Vec::new(),
+                sidecar_args: Vec::new(),
+            };
+        assert!(prepare_fresh_provider_state_at(
+            &launch,
+            &paths,
+            &root.path().join("absent-bootstrap")
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(home.join(".claude/settings.json")).unwrap(),
+            selected
+        );
+        assert_eq!(std::fs::metadata(&history).unwrap().ino(), before.ino());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_selected_native_home_refuses_incomplete_or_indirect_handoff() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        for case in ["mode", "group", "symlink", "file"] {
+            let root = tempfile::tempdir().unwrap();
+            let real_home = root.path().join("home");
+            std::fs::create_dir(&real_home).unwrap();
+            std::fs::set_permissions(&real_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let history = real_home.join("history");
+            std::fs::write(&history, b"unchanged").unwrap();
+            let before = std::fs::metadata(&history).unwrap();
+            let mut launch = kilroy_typed_launch(root.path());
+            launch.native_session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+            let home = match case {
+                "mode" => {
+                    std::fs::set_permissions(&real_home, std::fs::Permissions::from_mode(0o750))
+                        .unwrap();
+                    real_home.clone()
+                }
+                "group" => {
+                    launch.run_as_gid = launch.run_as_gid.wrapping_add(1);
+                    real_home.clone()
+                }
+                "symlink" => {
+                    let link = root.path().join("linked-home");
+                    symlink(&real_home, &link).unwrap();
+                    link
+                }
+                "file" => history.clone(),
+                _ => unreachable!(),
+            };
+            let mode = std::fs::metadata(&real_home).unwrap().mode();
+            let paths = ProviderConfigPaths {
+                private_mount: root.path().join("private"),
+                provider_home: home,
+            };
+            assert!(
+                prepare_fresh_provider_state_at(&launch, &paths, &root.path().join("bootstrap"))
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(std::fs::read(&history).unwrap(), b"unchanged", "{case}");
+            assert_eq!(
+                std::fs::metadata(&history).unwrap().ino(),
+                before.ino(),
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::metadata(&real_home).unwrap().mode(),
+                mode,
+                "{case}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn provider_config_bootstrap_failure_preserves_prior_inode_and_siblings() {
         use std::os::unix::fs::MetadataExt;
         let root = tempfile::tempdir().unwrap();
@@ -5339,6 +5581,21 @@ mod tests {
             Ok(())
         }
 
+        async fn fork(
+            &self,
+            _request_id: &RequestId,
+            parent_session_id: &str,
+            _input: Option<serde_json::Value>,
+        ) -> Result<freshell_agent_runtime::host_actor::ForkTransition, DispatchFailure> {
+            self.operations.fetch_add(1, Ordering::SeqCst);
+            self.publish_child_observation();
+            Ok(freshell_agent_runtime::host_actor::ForkTransition {
+                parent_session_id: parent_session_id.into(),
+                child_session_id: "fixture-native-child".into(),
+                parent_retired_by_runtime: true,
+            })
+        }
+
         async fn interrupt(&self) -> Result<(), String> {
             Ok(())
         }
@@ -5353,12 +5610,23 @@ mod tests {
         async fn dispatch_operation(
             &self,
             request_id: &RequestId,
-            _operation: &FreshAgentOperation,
+            operation: &FreshAgentOperation,
         ) -> Result<OperationAck, OperationFailure> {
             self.operations.fetch_add(1, Ordering::SeqCst);
+            let changed = matches!(operation, FreshAgentOperation::Rollback { turn_id: Some(turn), .. } if turn == "reroot");
+            if changed {
+                self.publish_child_observation();
+            }
             Ok(OperationAck {
                 provider_ack_id: Some(request_id.to_string()),
-                native_session_id: Some("fixture-native-thread".into()),
+                native_session_id: Some(
+                    if changed {
+                        "fixture-native-child"
+                    } else {
+                        "fixture-native-thread"
+                    }
+                    .into(),
+                ),
             })
         }
 
@@ -5388,6 +5656,147 @@ mod tests {
 
         fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
             None
+        }
+    }
+
+    impl RpcFixtureTransport {
+        fn publish_child_observation(&self) {
+            let mut evidence = self.native_evidence.lock().unwrap();
+            let value = evidence.as_mut().unwrap();
+            value["nativeSessionId"] = serde_json::json!("fixture-native-child");
+            value["launch"]["evidenceRevision"] =
+                serde_json::json!(value["launch"]["evidenceRevision"].as_u64().unwrap() + 1);
+            value["launch"]["requestedNativeSessionId"] = serde_json::json!("fixture-native-child");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_root_transition_updates_host_status_and_input_binding() {
+        for exact_parent in [false, true] {
+            for fork in [false, true] {
+                let state = test_host_state();
+                let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                    incarnation_id: state.incarnation_id.clone(),
+                    launch_nonce: "root-transition-rpc".into(),
+                    evidence_revision: 7,
+                    execution_generation: 1,
+                    requested_native_session_id: exact_parent
+                        .then(|| "fixture-native-thread".into()),
+                };
+                state.persisted.lock().await.native_identity_launch = Some(binding.clone());
+                state.persisted.lock().await.max_execution_generation = 1;
+                let transport = Arc::new(RpcFixtureTransport {
+                    native_evidence: std::sync::Mutex::new(Some(
+                        serde_json::json!({"launch":binding,"nativeSessionId":"fixture-native-thread","queryGeneration":1}),
+                    )),
+                    dispatches: AtomicUsize::new(0),
+                    decisions: AtomicUsize::new(0),
+                    operations: AtomicUsize::new(0),
+                    captures: AtomicUsize::new(0),
+                    stops: AtomicUsize::new(0),
+                });
+                let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+                    state.state_dir.join("transition-agent"),
+                    FreshAgentProfile {
+                        provider: FreshProvider::Codex,
+                        runtime_variant: "fixture-sdk".into(),
+                        cwd: "/workspace".into(),
+                        model: None,
+                        effort: None,
+                        permission_mode: None,
+                        sandbox: None,
+                        provider_store_id: "fixture-store".into(),
+                        native_session_id: exact_parent.then(|| "fixture-native-thread".into()),
+                        plugins: None,
+                        model_selection: None,
+                        session_ref: None,
+                        provider_launch_context: None,
+                        provider_secret_references: Vec::new(),
+                    },
+                    transport.clone(),
+                )
+                .await
+                .unwrap();
+                *state.fresh_agent.lock().await = Some(actor.clone());
+                let command = if fork {
+                    HostCommand::FreshAgentFork {
+                        incarnation_id: state.incarnation_id.clone(),
+                        request_id: RequestId::new(),
+                        parent_session_id: "fixture-native-thread".into(),
+                        input: None,
+                    }
+                } else {
+                    HostCommand::FreshAgentRollback {
+                        incarnation_id: state.incarnation_id.clone(),
+                        request_id: RequestId::new(),
+                        direction: FreshAgentRollbackDirection::Undo,
+                        mode: FreshAgentRollbackMode::ToTurn,
+                        turn_id: Some("reroot".into()),
+                        cwd: None,
+                    }
+                };
+                dispatch(authenticated_host_envelope(&state, command), &state)
+                    .await
+                    .unwrap();
+                let status = dispatch(
+                    authenticated_host_envelope(
+                        &state,
+                        HostCommand::Status {
+                            incarnation_id: state.incarnation_id.clone(),
+                        },
+                    ),
+                    &state,
+                )
+                .await
+                .unwrap();
+                let HostResult::Status {
+                    native_session_id,
+                    native_identity_observation,
+                    ..
+                } = status
+                else {
+                    panic!("status")
+                };
+                assert_eq!(
+                    native_session_id.as_deref(),
+                    Some("fixture-native-child"),
+                    "fork={fork} exact={exact_parent}"
+                );
+                let observation = native_identity_observation.unwrap();
+                assert_eq!(observation.evidence_revision, 8);
+                assert!(observation.matches_launch(
+                    state
+                        .persisted
+                        .lock()
+                        .await
+                        .native_identity_launch
+                        .as_ref()
+                        .unwrap()
+                ));
+                dispatch(
+                    authenticated_host_envelope(
+                        &state,
+                        HostCommand::FreshAgentSend {
+                            incarnation_id: state.incarnation_id.clone(),
+                            request_id: RequestId::new(),
+                            text: "child input".into(),
+                            settings: None,
+                        },
+                    ),
+                    &state,
+                )
+                .await
+                .unwrap();
+                assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+                // A delayed parent producer must never reopen input for the child.
+                *transport.native_evidence.lock().unwrap() = Some(
+                    serde_json::json!({"launch":binding,"nativeSessionId":"fixture-native-thread","queryGeneration":1}),
+                );
+                assert!(ensure_current_fresh_native_observation(&state)
+                    .await
+                    .is_err());
+                actor.stop().await.unwrap();
+            }
         }
     }
 
@@ -5434,7 +5843,7 @@ mod tests {
         state.persisted.lock().await.native_identity_launch = Some(binding.clone());
         let transport = Arc::new(RpcFixtureTransport {
             native_evidence: std::sync::Mutex::new(Some(
-                serde_json::json!({"launch":binding,"queryGeneration":1}),
+                serde_json::json!({"launch":binding,"nativeSessionId":"fixture-native-thread","queryGeneration":1}),
             )),
             dispatches: AtomicUsize::new(0),
             decisions: AtomicUsize::new(0),
@@ -5522,7 +5931,7 @@ mod tests {
         state.persisted.lock().await.native_identity_launch = Some(binding.clone());
         let transport = Arc::new(RpcFixtureTransport {
             native_evidence: std::sync::Mutex::new(Some(
-                serde_json::json!({"launch":binding,"queryGeneration":1}),
+                serde_json::json!({"launch":binding,"nativeSessionId":"fixture-native-thread","queryGeneration":1}),
             )),
             dispatches: AtomicUsize::new(0),
             decisions: AtomicUsize::new(0),
@@ -5607,6 +6016,7 @@ mod tests {
             HostResult::FreshAgentCommand {
                 state: freshell_runtime_protocol::CommandState::ProviderAcked,
                 native_session_id: Some(ref native),
+                ..
             }
             if native == "fixture-native-thread"
         ));
@@ -6030,6 +6440,7 @@ mod tests {
             runtime_variant: launch.runtime_variant.clone(),
             fixture_transport: None,
             opencode_adoption_baseline: None,
+            claude_fork: None,
             program: "opencode".into(),
             resume_argv: Vec::new(),
             provider_home: home.to_string_lossy().into_owned(),
@@ -6282,6 +6693,571 @@ mod tests {
                 .frames
                 .iter()
                 .any(|frame| frame.data.contains(&format!("home={expected_home}"))));
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_codex_default_spawn_skips_native_update_gate_for_create_and_resume() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("owned-native-startup");
+        std::fs::write(&program, r#"#!/usr/bin/python3
+import sys
+args=sys.argv[1:]
+updates=[args[i+1] for i,arg in enumerate(args[:-1]) if arg=='-c' and args[i+1].startswith('check_for_update_on_startup=')]
+if len(updates)>1:
+ print('duplicate-update-setting');sys.exit(9)
+if updates!=['check_for_update_on_startup=false']:
+ print('native-update-input-gate');sys.exit(7)
+if '--model' not in args or args[args.index('--model')+1]!='gpt-5.6-luna':
+ print('selected-model-lost');sys.exit(8)
+if 'resume' in args and args[args.index('resume')+1]!='owned-native-root':
+ print('resume-root-lost');sys.exit(8)
+print('native-startup-without-update-input')
+"#).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root.path().join("selected-native-config");
+        std::fs::write(&config, b"ordinary selected profile remains untouched\n").unwrap();
+        for (mode, managed, resume, caller_setting, expected_exit) in [
+            ("codex", true, false, false, 0),
+            ("codex", true, true, false, 0),
+            ("codex", true, true, true, 0),
+            ("codex", false, false, false, 7),
+            ("codex", false, true, true, 0),
+            ("shell", true, false, false, 7),
+        ] {
+            let state = test_host_state();
+            let mut args = vec!["--model", "gpt-5.6-luna"];
+            if caller_setting {
+                args.extend(["-c", "check_for_update_on_startup=false"]);
+            }
+            if resume {
+                args.extend(["resume", "owned-native-root"]);
+            }
+            let launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                "terminalId":"owned-update", "streamId":"owned-update", "mode":mode, "program":program,
+                "args":args, "cwd":root.path(), "workspacePath":root.path(), "projectKey":"owned-update",
+                "cols":80, "rows":24, "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+                "env":{"HOME":root.path(),"PATH":"/usr/bin:/bin"}
+            })).unwrap();
+            let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: state.incarnation_id.clone(),
+                launch_nonce: "owned-update-launch".into(),
+                evidence_revision: 0,
+                execution_generation: 1,
+                requested_native_session_id: None,
+            };
+            let child_env = if managed {
+                std::collections::BTreeMap::from([(
+                    providers::native_identity::LAUNCH_ENV.into(),
+                    serde_json::to_string(&binding).unwrap(),
+                )])
+            } else {
+                Default::default()
+            };
+            let pty = HostedPty::spawn(
+                &state.state_dir,
+                state.incarnation_id.clone(),
+                &launch,
+                child_env,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            for _ in 0..100 {
+                if pty.exited() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(pty.exited(), "owned child must finish without user input");
+            let output = pty
+                .read_output(state.incarnation_id.clone(), 0, 65536, None)
+                .unwrap();
+            assert_eq!(
+                pty.exit_code(),
+                expected_exit,
+                "mode={mode} managed={managed} resume={resume} caller={caller_setting}: {output:?}"
+            );
+            assert!(output
+                .frames
+                .iter()
+                .any(|frame| frame.data.contains(if expected_exit == 0 {
+                    "native-startup-without-update-input"
+                } else {
+                    "native-update-input-gate"
+                })));
+            assert_eq!(
+                std::fs::read(&config).unwrap(),
+                b"ordinary selected profile remains untouched\n"
+            );
+            assert!(
+                pty.native_identity_observation().is_none(),
+                "controlled child is not provider identity evidence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_opencode_default_spawn_keeps_image_pin_before_native_startup() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("owned-opencode-startup");
+        std::fs::write(&program, r#"#!/usr/bin/python3
+import os,sys
+args=sys.argv[1:]
+if '--model' not in args or args[args.index('--model')+1]!='openai/gpt-5.6-luna':sys.exit(8)
+if '--session' in args and args[args.index('--session')+1]!='ses_ownedroot':sys.exit(9)
+print('native-startup-without-update-input' if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 'native-update-input-gate')
+sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
+"#).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root.path().join("ordinary-native-settings");
+        std::fs::write(&config, b"selected ordinary settings\n").unwrap();
+        for (mode, managed, resume, caller_setting, expected_exit) in [
+            ("opencode", true, false, None, 0),
+            ("opencode", true, true, None, 0),
+            ("opencode", true, true, Some("false"), 0),
+            ("opencode", true, false, Some("true"), 0),
+            ("opencode", false, false, None, 7),
+            ("opencode", false, true, Some("false"), 7),
+            ("opencode", false, true, Some("true"), 0),
+            ("shell", true, false, None, 7),
+        ] {
+            let state = test_host_state();
+            let mut args = vec!["--model", "openai/gpt-5.6-luna"];
+            if resume {
+                args.extend(["--session", "ses_ownedroot"]);
+            }
+            let mut launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                "terminalId":"owned-pinned-startup", "streamId":"owned-pinned-startup", "mode":mode, "program":program,
+                "args":args, "cwd":root.path(), "workspacePath":root.path(), "projectKey":"owned-pinned-startup",
+                "cols":80, "rows":24, "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+                "env":{"HOME":root.path(),"PATH":"/usr/bin:/bin"}, "resumeSessionId":resume.then_some("ses_ownedroot")
+            })).unwrap();
+            if let Some(setting) = caller_setting {
+                launch
+                    .env
+                    .insert("OPENCODE_DISABLE_AUTOUPDATE".into(), setting.into());
+            }
+            let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: state.incarnation_id.clone(),
+                launch_nonce: "owned-pinned-launch".into(),
+                evidence_revision: 0,
+                execution_generation: 1,
+                requested_native_session_id: resume.then(|| "ses_ownedroot".into()),
+            };
+            let child_env = if managed {
+                std::collections::BTreeMap::from([(
+                    providers::native_identity::LAUNCH_ENV.into(),
+                    serde_json::to_string(&binding).unwrap(),
+                )])
+            } else {
+                Default::default()
+            };
+            let pty = HostedPty::spawn(
+                &state.state_dir,
+                state.incarnation_id.clone(),
+                &launch,
+                child_env,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            for _ in 0..100 {
+                if pty.exited() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(pty.exited(), "owned child must finish before input");
+            let output = pty
+                .read_output(state.incarnation_id.clone(), 0, 65536, None)
+                .unwrap();
+            assert_eq!(pty.exit_code(), expected_exit, "mode={mode} managed={managed} resume={resume} caller={caller_setting:?}: {output:?}");
+            assert!(output
+                .frames
+                .iter()
+                .any(|frame| frame.data.contains(if expected_exit == 0 {
+                    "native-startup-without-update-input"
+                } else {
+                    "native-update-input-gate"
+                })));
+            assert_eq!(
+                std::fs::read(&config).unwrap(),
+                b"selected ordinary settings\n"
+            );
+            assert!(
+                pty.native_identity_observation().is_none(),
+                "controlled child supplies no native identity proof"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn controlled_claude_parity_uses_configured_current_native_channels_before_input() {
+        use std::os::unix::fs::PermissionsExt;
+        let node = std::process::Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+            .unwrap();
+        assert!(node.status.success());
+        let node = String::from_utf8(node.stdout).unwrap().trim().to_string();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for case in [
+            "startup",
+            "resume",
+            "missing-settings",
+            "disabled-hooks",
+            "wrong-root",
+            "stale-launch",
+        ] {
+            let owned = tempfile::tempdir().unwrap();
+            let root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            let actual = if case == "wrong-root" {
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            } else {
+                root
+            };
+            let provider = owned.path().join("parity-claude");
+            let source = owned.path().join("source");
+            std::fs::create_dir(&source).unwrap();
+            let producer = source.join("parity-claude");
+            std::fs::copy(
+                repo.join("test/fixtures/providers/parity-provider.mjs"),
+                &producer,
+            )
+            .unwrap();
+            std::fs::write(
+                &provider,
+                format!(
+                    "#!/bin/sh\nexec '{}' '{}' \"$@\"\n",
+                    node,
+                    producer.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let module = repo
+                .join("crates/freshell-claude-sidecar/native-session-channel.mjs")
+                .canonicalize()
+                .unwrap();
+            let binary = owned.path().join("bin");
+            std::fs::create_dir(&binary).unwrap();
+            let wrapper = binary.join("node");
+            let state = test_host_state();
+            let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: state.incarnation_id.clone(),
+                launch_nonce: format!("parity-{case}"),
+                evidence_revision: 2,
+                execution_generation: 1,
+                requested_native_session_id: Some(root.into()),
+            };
+            let stale = if case == "stale-launch" {
+                let mut previous = binding.clone();
+                previous.launch_nonce = "previous-launch".into();
+                format!(
+                    "export FRESHELL_NATIVE_IDENTITY_LAUNCH='{}'\n",
+                    serde_json::to_string(&previous).unwrap()
+                )
+            } else {
+                String::new()
+            };
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nshift\n{stale}exec '{}' '{}' \"$@\"\n",
+                    node,
+                    module.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if case == "disabled-hooks" {
+                std::fs::create_dir(owned.path().join(".claude")).unwrap();
+                std::fs::write(
+                    owned.path().join(".claude/settings.json"),
+                    r#"{"disableAllHooks":true}"#,
+                )
+                .unwrap();
+            }
+            let resume = case != "startup";
+            let mut args = vec![];
+            if case != "missing-settings" {
+                args.extend([
+                    "--settings".into(),
+                    freshell_platform::cli_launch::claude_settings_json(
+                        freshell_platform::cli_launch::ProviderTarget::Unix,
+                    ),
+                ]);
+            }
+            args.extend([
+                if resume { "--resume" } else { "--session-id" }.into(),
+                actual.into(),
+                "--model".into(),
+                "selected-fixture-model".into(),
+            ]);
+            let launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                "terminalId":"controlled-parity", "streamId":"controlled-parity", "mode":"claude",
+                "program":provider, "args":args, "resumeSessionId":if resume { Some(root) } else { None },
+                "cwd":owned.path(), "workspacePath":owned.path(), "projectKey":"owned-controlled-parity", "cols":80,"rows":24,
+                "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+                "env":{"HOME":owned.path(),"PATH":format!("{}:{}",binary.display(),std::env::var("PATH").unwrap())}
+            })).unwrap();
+            let pty = HostedPty::spawn(
+                &state.state_dir,
+                state.incarnation_id.clone(),
+                &launch,
+                std::collections::BTreeMap::from([(
+                    providers::native_identity::LAUNCH_ENV.into(),
+                    serde_json::to_string(&binding).unwrap(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            *state.pty.lock().await = Some(pty);
+            let signal = owned.path().join(format!(
+                ".freshell/native-identity/parity-{case}/statusline-loaded.json"
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !signal.exists() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // Observe the completed configured commands through the real host gate.
+            let status = dispatch(
+                authenticated_host_envelope(
+                    &state,
+                    HostCommand::Status {
+                        incarnation_id: state.incarnation_id.clone(),
+                    },
+                ),
+                &state,
+            )
+            .await
+            .unwrap();
+            let mut pty = state.pty.lock().await.take().unwrap();
+            pty.stop().await;
+            assert!(
+                !owned.path().join(".claude/projects").exists(),
+                "controlled startup must not invent a transcript or user turn"
+            );
+            if case == "disabled-hooks" {
+                assert!(signal.exists());
+                assert!(!signal.with_file_name("session-start.json").exists());
+            }
+            if case == "stale-launch" {
+                let published: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&signal).unwrap()).unwrap();
+                assert_eq!(published["launch"]["launchNonce"], "previous-launch");
+            }
+            match case {
+                "startup" | "resume" => assert!(
+                    matches!(status,HostResult::Status { native_session_id:Some(ref id), native_identity_observation:Some(ref observation),.. }
+                    if id==root && observation.native_session_id==root && observation.launch_nonce==binding.launch_nonce),
+                    "configured current producer did not reach host gate: {case}: {status:?}"
+                ),
+                _ => assert!(
+                    matches!(
+                        status,
+                        HostResult::Status {
+                            native_session_id: None,
+                            native_identity_observation: None,
+                            ..
+                        }
+                    ),
+                    "missing/wrong native response must stay unobserved: {case}: {status:?}"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_nonadoption_opencode_status_requires_current_native_loader() {
+        use std::os::unix::fs::PermissionsExt;
+        for resume in [false, true] {
+            let owned = tempfile::tempdir().unwrap();
+            let program = owned.path().join("controlled-native-provider");
+            std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let state = test_host_state();
+            let root = "ses_hostroot1";
+            let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: state.incarnation_id.clone(),
+                launch_nonce: "nonadoption-native-current".into(),
+                evidence_revision: 3,
+                execution_generation: 2,
+                requested_native_session_id: resume.then(|| root.into()),
+            };
+            let launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"nonadoption-opencode", "streamId":"nonadoption-opencode", "mode":"opencode",
+            "program":program, "args":if resume {vec!["--session",root]} else {vec![]}, "resumeSessionId":resume.then_some(root),
+            "cwd":owned.path(), "workspacePath":owned.path(), "projectKey":"controlled-native-loader",
+            "cols":80, "rows":24, "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+            "env":{"HOME":owned.path(),"PATH":"/usr/bin:/bin","XDG_DATA_HOME":owned.path().join(".local/share")}
+        })).unwrap();
+            let pty = HostedPty::spawn(
+                &state.state_dir,
+                state.incarnation_id.clone(),
+                &launch,
+                std::collections::BTreeMap::from([(
+                    providers::native_identity::LAUNCH_ENV.into(),
+                    serde_json::to_string(&binding).unwrap(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            *state.pty.lock().await = Some(pty);
+            let directory = owned
+                .path()
+                .join(".freshell/native-identity/nonadoption-native-current");
+            std::fs::create_dir_all(&directory).unwrap();
+            let file = directory.join("opencode-loaded.json");
+            let native = serde_json::json!({"source":"opencode-tui-native-loader","session_id":root,
+            "parent_id":null,"hydrated":true,"messages_read":"empty_confirmed","active_message_count":0,"tail_message_id":null});
+            let mut wrong = binding.clone();
+            wrong.launch_nonce = "previous-native-launch".into();
+            let mut variants = vec![
+                (
+                    "stale launch",
+                    serde_json::json!({"launch":wrong,"native":native}),
+                    false,
+                ),
+                (
+                    "wrong root",
+                    serde_json::json!({"launch":binding,"native":{"session_id":if resume {"ses_otherroot"} else {"local_placeholder"},"source":"opencode-tui-native-loader",
+                "parent_id":null,"hydrated":true,"messages_read":"empty_confirmed","active_message_count":0,"tail_message_id":null}}),
+                    false,
+                ),
+                (
+                    "current native loader",
+                    serde_json::json!({"launch":binding,"native":native}),
+                    true,
+                ),
+            ];
+            for (case, field, value) in [
+                ("wrong source", "source", serde_json::json!("route-only")),
+                ("parent root", "parent_id", serde_json::json!("ses_parent1")),
+                ("not hydrated", "hydrated", serde_json::json!(false)),
+                (
+                    "failed native read",
+                    "messages_read",
+                    serde_json::json!("failed"),
+                ),
+                (
+                    "wrong count type",
+                    "active_message_count",
+                    serde_json::json!("0"),
+                ),
+                (
+                    "nonempty claimed empty",
+                    "active_message_count",
+                    serde_json::json!(1),
+                ),
+                (
+                    "empty claimed message",
+                    "tail_message_id",
+                    serde_json::json!("msg_invented1"),
+                ),
+            ] {
+                let mut refused = native.clone();
+                refused[field] = value;
+                variants.push((
+                    case,
+                    serde_json::json!({"launch":binding,"native":refused}),
+                    false,
+                ));
+            }
+            for (case, field, value) in [
+                ("old revision", "evidenceRevision", serde_json::json!(2)),
+                (
+                    "old execution generation",
+                    "executionGeneration",
+                    serde_json::json!(1),
+                ),
+                (
+                    "old incarnation",
+                    "incarnationId",
+                    serde_json::json!("incarnation-previous"),
+                ),
+            ] {
+                let mut refused = serde_json::to_value(&binding).unwrap();
+                refused[field] = value;
+                variants.push((
+                    case,
+                    serde_json::json!({"launch":refused,"native":native}),
+                    false,
+                ));
+            }
+            let mut results = Vec::new();
+            for (case, value, accepted) in variants {
+                std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+                let status = dispatch(
+                    authenticated_host_envelope(
+                        &state,
+                        HostCommand::Status {
+                            incarnation_id: state.incarnation_id.clone(),
+                        },
+                    ),
+                    &state,
+                )
+                .await
+                .unwrap();
+                let input = dispatch(
+                    authenticated_host_envelope(
+                        &state,
+                        HostCommand::TerminalInput {
+                            incarnation_id: state.incarnation_id.clone(),
+                            request_id: RequestId::new(),
+                            data: "controlled input".into(),
+                        },
+                    ),
+                    &state,
+                )
+                .await;
+                results.push((case, status, input, accepted));
+            }
+            state.pty.lock().await.take().unwrap().stop().await;
+            for (case, status, input, accepted) in results {
+                let HostResult::Status {
+                    native_identity_observation,
+                    native_session_id,
+                    opencode_adoption,
+                    ..
+                } = status
+                else {
+                    panic!("actual host status required")
+                };
+                assert_eq!(native_identity_observation.is_some(), accepted, "{case}");
+                assert_eq!(
+                    native_session_id.as_deref(),
+                    accepted.then_some(root),
+                    "{case}"
+                );
+                assert_eq!(opencode_adoption, OpenCodeAdoptionStatus::NotRequired);
+                if accepted {
+                    assert!(
+                        matches!(
+                            input,
+                            Ok(HostResult::TerminalInput {
+                                state: freshell_runtime_protocol::CommandState::Completed
+                            })
+                        ),
+                        "{case}: {input:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        input.unwrap_err().code,
+                        RuntimeErrorCode::RecoveryBlocked,
+                        "{case}"
+                    );
+                }
+            }
         }
     }
 
@@ -6609,6 +7585,7 @@ mod tests {
             runtime_variant: "managed_terminal_pty".into(),
             fixture_transport: None,
             opencode_adoption_baseline: None,
+            claude_fork: None,
             program: launcher.to_string_lossy().into_owned(),
             resume_argv: vec!["--continue".into(), "--model".into(), "free-model".into()],
             provider_home: "/home/freshell/provider".into(),
@@ -6792,6 +7769,7 @@ mod tests {
             child: Mutex::new(None),
             pty: Mutex::new(None),
             fresh_agent: Mutex::new(None),
+            fresh_native_command: Mutex::new(()),
             provider_config_paths: ProviderConfigPaths::default(),
             opencode_transfer_mount: PathBuf::from(OPENCODE_TRANSFER_MOUNT),
             bootstrap_root: PathBuf::from("/run/freshell-bootstrap"),
@@ -7588,6 +8566,7 @@ mod tests {
             child: Mutex::new(None),
             pty: Mutex::new(None),
             fresh_agent: Mutex::new(None),
+            fresh_native_command: Mutex::new(()),
             provider_config_paths: ProviderConfigPaths {
                 private_mount: root.join("private"),
                 provider_home: home,
@@ -7798,6 +8777,7 @@ mod tests {
             child: Mutex::new(None),
             pty: Mutex::new(None),
             fresh_agent: Mutex::new(None),
+            fresh_native_command: Mutex::new(()),
             provider_config_paths: ProviderConfigPaths {
                 private_mount: root.path().join("private"),
                 provider_home: home.clone(),
@@ -8003,6 +8983,7 @@ mod tests {
             child: Mutex::new(None),
             pty: Mutex::new(None),
             fresh_agent: Mutex::new(None),
+            fresh_native_command: Mutex::new(()),
             provider_config_paths: ProviderConfigPaths {
                 private_mount: root.join("private"),
                 provider_home: home,
@@ -8023,6 +9004,7 @@ mod tests {
             runtime_variant: "managed_terminal_pty".into(),
             fixture_transport: None,
             opencode_adoption_baseline: None,
+            claude_fork: None,
             program: terminal.program.clone(),
             resume_argv: Vec::new(),
             provider_home: terminal.env["HOME"].clone(),

@@ -1,10 +1,12 @@
+// @vitest-environment node
 import { describe, expect, it } from 'vitest'
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createNativeSessionChannel, inspectNativeDeferredCheckpoint } from '../../../crates/freshell-claude-sidecar/native-session-channel.mjs'
+import { stageSdkInitFieldFault } from '../../../scripts/testing/runtime-native-feasibility.js'
 
 const root = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const launch = { incarnationId: 'current-incarnation', launchNonce: 'current-nonce', evidenceRevision: 3, executionGeneration: 4, requestedNativeSessionId: root }
@@ -14,10 +16,10 @@ async function withChannel(run: (channel: any) => Promise<void>) {
   try { await run(await createNativeSessionChannel({ launch, directory, timeoutMs: 100 })) }
   finally { await rm(directory, { recursive: true, force: true }) }
 }
-async function hook(channel: any) {
+async function hook(channel: any, input = native) {
   const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/native-session-channel.mjs')], { env: { ...process.env, ...channel.env }, stdio: ['pipe', 'pipe', 'pipe'] })
   const exited = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', resolve) })
-  child.stdin.end(JSON.stringify(native))
+  child.stdin.end(JSON.stringify(input))
   expect(await exited).toBe(0)
 }
 function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false, delayedNativeExit = false, providerHome = directory, eagerResume = false, eagerCallbackOnly = false, splitBatch: boolean | 'incomplete' = false) {
@@ -54,10 +56,164 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
       }
       throw new Error(`missing ${type}: ${JSON.stringify(frames)}`)
     },
-    close: async () => { send({ type: 'shutdown' }); await exited },
+    close: async (awaitNativeShutdown = false) => { if (child.exitCode === null) send({ type: 'shutdown', awaitNativeShutdown }); await exited },
   }
 }
 describe('managed native startup channel', () => {
+  it('joins the old native writer before acknowledging managed rollback shutdown', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'native-rollback-shutdown-'))
+    const worker = checkpointSidecar(directory, 'current', false, true)
+    try {
+      worker.send({ type: 'create', requestId: 'join-native-writer', cwd: directory })
+      await worker.wait('sdk.session.init')
+      await worker.wait('probe.native-child')
+      const before = Date.now()
+      await worker.close(true)
+      expect(Date.now() - before).toBeGreaterThanOrEqual(100)
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it('reopens the same acknowledged unmaterialized child from its guarded parent before accepting input', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'native-parent-backed-'))
+    const directory = join(home, '.claude/projects/work')
+    await mkdir(directory, { recursive: true })
+    const parent = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const cutoff = '11111111-1111-4111-8111-111111111111'
+    const dropped = '22222222-2222-4222-8222-222222222222'
+    const source = JSON.stringify({ type: 'user', sessionId: parent, uuid: cutoff, parentUuid: null,
+      message: { content: 'retained parent input' } }) + '\n' + JSON.stringify({ type: 'user', sessionId: parent,
+      uuid: dropped, parentUuid: cutoff, message: { content: 'undone input' } }) + '\n'
+    await writeFile(join(directory, parent + '.jsonl'), source)
+    const recipe = { childSessionId: root, parentSessionId: parent,
+      parentTranscript: '.claude/projects/work/' + parent + '.jsonl', childTranscript: '.claude/projects/work/' + root + '.jsonl',
+      parentSha256: createHash('sha256').update(source).digest('hex'), target: { kind: 'prefix', cutoffUuid: cutoff, dropTurnUuid: dropped } }
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const worker = checkpointSidecar(directory, 'native-current', false, false, home)
+        try {
+          worker.send({ type: 'create', requestId: 'reopen-parent-' + attempt, cwd: directory, resumeSessionId: root,
+            nativeForkRecipe: recipe, permissionMode: 'default' })
+          const observed = await worker.wait('sdk.session.init')
+          expect(observed.cliSessionId).toBe(root)
+          expect(observed.nativeIdentityEvidence.source).toBe('fork')
+          expect(worker.frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
+          await expect(readFile(join(directory, root + '.jsonl'))).rejects.toMatchObject({ code: 'ENOENT' })
+        } finally { await worker.close() }
+      }
+      expect(await readFile(join(directory, parent + '.jsonl'), 'utf8')).toBe(source)
+    } finally { await rm(home, { recursive: true, force: true }) }
+  })
+  it('observes an authorized first-turn Undo as a new empty native startup', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'native-reroot-empty-'))
+    const sidecar = checkpointSidecar(directory)
+    try {
+      sidecar.send({ type: 'create', requestId: 'empty-rollback', cwd: directory, model: 'empty-rollback-native',
+        nativeIdentityTransition: { parentNativeSessionId: root,
+          launch: { ...launch, evidenceRevision: launch.evidenceRevision + 1, requestedNativeSessionId: null } } })
+      const observed = await sidecar.wait('sdk.session.init')
+      expect(observed.cliSessionId).toBe('dddddddd-dddd-4ddd-8ddd-dddddddddddd')
+      expect(observed.nativeIdentityEvidence.source).toBe('startup')
+      expect(sidecar.frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
+    } finally { await sidecar.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it('admits an authorized native rollback child while preserving ordinary exact-resume refusal', async () => {
+    for (const authorized of [true, false]) {
+      const directory = await mkdtemp(join(tmpdir(), 'native-reroot-'))
+      const sidecar = checkpointSidecar(directory)
+      try {
+        sidecar.send({ type: 'create', requestId: 'rollback-owned', cwd: directory,
+          resumeSessionId: root, resumeSessionAt: 'retained-turn', forkSession: true,
+          ...(authorized ? { nativeIdentityTransition: { parentNativeSessionId: root,
+            launch: { ...launch, evidenceRevision: launch.evidenceRevision + 1, requestedNativeSessionId: null } } } : {}) })
+        if (authorized) {
+          const observed = await sidecar.wait('sdk.session.init')
+          expect(observed.cliSessionId).toBe('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
+          expect(observed.nativeIdentityEvidence.source).toBe('fork')
+          expect(observed.nativeIdentityEvidence.launch.evidenceRevision).toBe(launch.evidenceRevision + 1)
+          expect(sidecar.frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
+        } else {
+          await sidecar.wait('sdk.error')
+          expect(sidecar.frames.some(frame => frame.type === 'sdk.session.init')).toBe(false)
+        }
+      } finally {
+        await sidecar.close()
+        await rm(directory, { recursive: true, force: true })
+      }
+    }
+  })
+  it('refuses an unsolicited native fork even when it names the requested root', async () => withChannel(async (channel) => {
+    await hook(channel, { ...native, source: 'fork' })
+    await expect(channel.waitReady({ initializationResult: async () => ({}) })).rejects.toThrow('unexpected native fork')
+  }))
+  it.each([
+    ['fork-retained-parent', 'native rollback retained the retired root'],
+    ['fork-without-native-ack', 'native rollback did not acknowledge a fork'],
+  ])('refuses an authorized transition without actual child fork evidence (%s)', async (model, message) => {
+    const directory = await mkdtemp(join(tmpdir(), 'native-reroot-unobserved-'))
+    const sidecar = checkpointSidecar(directory)
+    try {
+      sidecar.send({ type: 'create', requestId: 'unobserved-rollback', cwd: directory, model,
+        resumeSessionId: root, resumeSessionAt: 'retained-turn', forkSession: true,
+        nativeIdentityTransition: { parentNativeSessionId: root,
+          launch: { ...launch, evidenceRevision: launch.evidenceRevision + 1, requestedNativeSessionId: null } } })
+      expect((await sidecar.wait('sdk.error')).message).toContain(message)
+      expect(sidecar.frames.some(frame => frame.type === 'sdk.session.init' || frame.type === 'probe.native-input')).toBe(false)
+    } finally { await sidecar.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it.each(['incarnationId', 'launchNonce', 'executionGeneration', 'evidenceRevision', 'requestedNativeSessionId'] as const)(
+    'rejects a rollback create with stale %s before opening a native query', async (field) => {
+      const directory = await mkdtemp(join(tmpdir(), 'native-reroot-stale-'))
+      const sidecar = checkpointSidecar(directory)
+      try {
+        const next: Record<string, unknown> = { ...launch, evidenceRevision: launch.evidenceRevision + 1, requestedNativeSessionId: null }
+        next[field] = field === 'executionGeneration' ? 0 : field === 'evidenceRevision' ? launch.evidenceRevision : 'stale'
+        sidecar.send({ type: 'create', requestId: 'stale-rollback', cwd: directory, resumeSessionId: root,
+          resumeSessionAt: 'retained-turn', forkSession: true, nativeIdentityTransition: { parentNativeSessionId: root, launch: next } })
+        await sidecar.wait('create.failed')
+        expect(sidecar.frames.some(frame => frame.type === 'sdk.session.init' || frame.type === 'created' || frame.type === 'probe.native-input')).toBe(false)
+      } finally { await sidecar.close(); await rm(directory, { recursive: true, force: true }) }
+    })
+  it.each(['freshclaude', 'kilroy'].flatMap(mode => ['missing-native-id', 'placeholder-id'].map(caseId => ({ mode, caseId }))))(
+    'executes the production sidecar native init field fault for $mode/$caseId without input', async ({ mode, caseId }) => {
+      const directory = await mkdtemp(join('/tmp', 'finite-native-init-'))
+      const ownedRoot = join('/tmp/frs', randomUUID().slice(0, 12))
+      const workspace = join(ownedRoot, `${mode}-${caseId}-workspace`)
+      await mkdir(workspace, { recursive: true })
+      const modules = ['index.mjs', 'native-session-channel.mjs', 'native-process.mjs', 'native-checkpoint-state.mjs',
+        'monotonic-clock.mjs', 'permission-channel.mjs', 'session-settings.mjs', 'turn-complete-gate.mjs']
+      const producer = await readFile(resolve('crates/freshell-claude-sidecar/index.mjs'), 'utf8')
+      for (const module of modules) await writeFile(join(directory, module), module === 'index.mjs'
+        ? stageSdkInitFieldFault(producer) : await readFile(resolve('crates/freshell-claude-sidecar', module), 'utf8'))
+      await writeFile(join(workspace, 'native-init-field-fault-control.json'), JSON.stringify({ mode, caseId }))
+      const selectedLaunch = { ...launch, requestedNativeSessionId: null }
+      const child = spawn(process.execPath, [join(directory, 'index.mjs')], {
+        env: { ...process.env, HOME: directory, FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(selectedLaunch),
+          FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      const frames: any[] = []; let buffered = ''
+      child.stdout.on('data', chunk => {
+        buffered += chunk
+        while (buffered.includes('\n')) { const end = buffered.indexOf('\n'); frames.push(JSON.parse(buffered.slice(0, end))); buffered = buffered.slice(end + 1) }
+      })
+      const closed = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('close', () => resolve()) })
+      try {
+        child.stdin.write(JSON.stringify({ type: 'create', requestId: 'owned-init-fault', cwd: workspace }) + '\n')
+        for (let attempt = 0; attempt < 300 && !frames.some(frame => frame.type === 'sdk.session.init'); attempt++) {
+          await new Promise(resolve => setTimeout(resolve, 10))
+        }
+        const init = frames.find(frame => frame.type === 'sdk.session.init')
+        expect(init).toBeDefined()
+        expect(init.cliSessionId).toBe(caseId === 'missing-native-id' ? undefined : init.sessionId)
+        const captured = JSON.parse(await readFile(join(workspace, 'native-init-field-fault-observation.json'), 'utf8'))
+        expect(captured.actualNativeSessionId).toBe(root)
+        expect(captured.frame).toEqual(init); expect(captured.frame.nativeIdentityEvidence.launch).toEqual(selectedLaunch)
+        expect(frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
+      } finally {
+        child.stdin.end(JSON.stringify({ type: 'shutdown' }) + '\n'); await closed
+        await rm(directory, { recursive: true, force: true }); await rm(ownedRoot, { recursive: true, force: true })
+      }
+    },
+  )
   it('writes current terminal post-load evidence and preserves the selected ordinary status output', async () => withChannel(async (channel) => {
     const home = await mkdtemp(join(tmpdir(), 'terminal-status-home-'))
     const cwd = join(home, 'workspace')
@@ -192,6 +348,26 @@ describe('native solo deferred checkpoint inspection', () => {
 })
 
 describe('production sidecar native checkpoint continuation', () => {
+  it('continues an authorized rollback child checkpoint without forking again', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-rollback-checkpoint-'))
+    const child = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: child }) + '\n')
+    const worker = checkpointSidecar(directory)
+    try {
+      worker.send({ type: 'create', requestId: 'rollback-child', cwd: directory, resumeSessionId: root,
+        resumeSessionAt: 'retained-turn', forkSession: true, permissionMode: 'default', nativeIdentityTransition: {
+          parentNativeSessionId: root, launch: { ...launch, evidenceRevision: launch.evidenceRevision + 1, requestedNativeSessionId: null } } })
+      const session = await worker.wait('created')
+      expect((await worker.wait('sdk.session.init')).cliSessionId).toBe(child)
+      worker.send({ type: 'send', sessionId: session.sessionId, text: 'owned child operation' })
+      const card = await worker.wait('sdk.permission.request')
+      expect(card.nativeCheckpoint.nativeSessionId).toBe(child)
+      expect(worker.frames.filter(frame => frame.type === 'sdk.session.init').map(frame => frame.cliSessionId)).toEqual([child, child])
+      worker.send({ type: 'permission.respond', sessionId: session.sessionId, requestId: card.requestId,
+        decision: { behavior: 'deny', message: 'owned denial' } })
+      expect((await worker.wait('sdk.tool.result')).content[0].is_error).toBe(true)
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
   it.each([true, 'incomplete'] as const)('keeps split-row native batch hooks on ordinary policy (completion: %s)', async (completion) => {
     const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-batch-'))
     await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')

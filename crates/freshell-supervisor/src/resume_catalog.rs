@@ -6,7 +6,8 @@
 
 use crate::registry::{NativeImportState, RecoveryContext};
 use freshell_agent_runtime::{
-    build_resume_spec, pinned_provider_version, ResumeSpecInput, PROVIDER_HOME,
+    build_resume_spec, pinned_fresh_provider_version, pinned_provider_version, ResumeSpecInput,
+    PROVIDER_HOME,
 };
 use freshell_runtime_protocol::{
     AllocationState, CheckpointReference, CredentialReference, DurablePosition, IdentityProvenance,
@@ -140,6 +141,7 @@ fn exact_resume_candidate_base(
     if let Some(stored) = context.resume_spec.clone() {
         let expected = context.native_session_id.as_deref();
         if stored.provider_session.provider != context.provider
+            || (stored.claude_fork.is_some() && stored.claude_fork != context.claude_fork)
             || stored.provider_session.provider_store_id != context.provider_store_id
             || expected != Some(stored.provider_session.native_session_id.as_str())
         {
@@ -163,6 +165,7 @@ fn exact_resume_candidate_base(
 
     if let Some(agent) = context.fresh_agent.as_ref() {
         let spec = ResumeSpec {
+            claude_fork: context.claude_fork.clone(),
             schema_version: RESUME_SPEC_SCHEMA_VERSION,
             provider_session: ProviderSessionRef {
                 provider: agent.provider.as_str().into(),
@@ -189,7 +192,7 @@ fn exact_resume_candidate_base(
             reasoning_effort: agent.effort.clone(),
             permission_mode: agent.permission_mode.clone(),
             image_ref: Some(context.prior_handle.image_ref().to_string()),
-            provider_version: pinned_provider_version(agent.provider.as_str()),
+            provider_version: pinned_fresh_provider_version(&agent.provider),
             credential_references: agent
                 .provider_bootstrap_files
                 .iter()
@@ -255,6 +258,7 @@ fn exact_resume_candidate_base(
 
     if context.fixture == Some(freshell_runtime_protocol::FixtureKind::NativeSession) {
         let spec = ResumeSpec {
+            claude_fork: None,
             schema_version: RESUME_SPEC_SCHEMA_VERSION,
             provider_session: ProviderSessionRef {
                 provider: context.provider.clone(),
@@ -407,6 +411,7 @@ mod tests {
         let soul = SoulId::parse("soul-resume-catalog").unwrap();
         let incarnation = IncarnationId::parse("incarnation-resume-catalog").unwrap();
         RecoveryContext {
+            claude_fork: None,
             native_identity_launch: None,
             soul_id: soul.clone(),
             prior_handle: OwnedRuntimeHandle::from_registry(
@@ -626,6 +631,134 @@ mod tests {
         assert_eq!(resume.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(resume.permission_mode.as_deref(), Some("ask"));
         assert_eq!(resume.fixture_transport, None);
+        assert_eq!(resume.provider_version.as_deref(), Some("0.147.0"));
+
+        context.provider = "opencode".into();
+        let agent = context.fresh_agent.as_mut().unwrap();
+        agent.provider = FreshProvider::Opencode;
+        agent.session_type = "freshopencode".into();
+        agent.runtime_variant = "opencode-sdk-ws".into();
+        let opencode = exact_resume_candidate(&context, Some("thread-native-42"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(opencode.provider_version.as_deref(), Some("1.18.21"));
+        assert_eq!(
+            opencode.provider_session.native_session_id,
+            "thread-native-42"
+        );
+        assert_eq!(opencode.provider_session.provider, "opencode");
+        assert_eq!(opencode.model, resume.model);
+        assert_eq!(opencode.permission_mode, resume.permission_mode);
+    }
+
+    fn claude_backed_fresh_context(provider: FreshProvider) -> RecoveryContext {
+        let mut context = fixture_context(Some("native-exact"));
+        context.provider = provider.as_str().into();
+        context.fixture = None;
+        context.profile = RuntimeProfile::DefaultAgent;
+        let session_type = if provider == FreshProvider::Kilroy {
+            "kilroy"
+        } else {
+            "freshclaude"
+        };
+        context.fresh_agent = Some(FreshAgentLaunchSpec {
+            session_id: "presentation-key".into(),
+            provider,
+            session_type: session_type.into(),
+            runtime_variant: "claude-sdk-sidecar".into(),
+            provider_store_id: context.provider_store_id.clone(),
+            cwd: "/workspace/project".into(),
+            workspace_path: "/workspace/project".into(),
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: Some("selected-model".into()),
+            effort: Some("low".into()),
+            permission_mode: Some("default".into()),
+            sandbox: None,
+            native_session_id: Some("native-exact".into()),
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            fixture_transport: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
+        });
+        context
+    }
+
+    fn assert_selected_sdk_child_resume_profile(provider: FreshProvider) {
+        let expected_provider = provider.as_str();
+        let context = claude_backed_fresh_context(provider);
+        let candidate = exact_resume_candidate(&context, Some("native-exact"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.provider_version.as_deref(), Some("2.1.237"));
+        assert_eq!(candidate.provider_session.provider, expected_provider);
+        assert_eq!(candidate.provider_session.native_session_id, "native-exact");
+        assert_eq!(
+            candidate.mode,
+            context.fresh_agent.as_ref().unwrap().session_type
+        );
+        assert_eq!(candidate.runtime_profile, Some(context.profile));
+        assert_eq!(candidate.model.as_deref(), Some("selected-model"));
+        assert_eq!(candidate.permission_mode.as_deref(), Some("default"));
+        assert_eq!(
+            candidate.identity_provenance,
+            IdentityProvenance::ProviderObserved
+        );
+        assert_eq!(candidate.fixture_transport, None);
+        let projected = serde_json::to_value(&candidate).unwrap();
+        assert_eq!(projected["providerVersion"], "2.1.237");
+        assert!(matches!(
+            exact_resume_candidate(&context, Some("wrong-root")),
+            Err(RecoveryProbe::Blocked {
+                reason: RecoveryBlockReason::WrongNativeIdentity,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fresh_claude_catalog_preserves_selected_sdk_child_recovery_profile() {
+        assert_selected_sdk_child_resume_profile(FreshProvider::Claude);
+    }
+
+    #[test]
+    fn logical_kilroy_catalog_preserves_selected_sdk_child_recovery_profile() {
+        assert_selected_sdk_child_resume_profile(FreshProvider::Kilroy);
+    }
+
+    #[test]
+    fn saved_fresh_versions_remain_immutable_and_terminal_claude_stays_separate() {
+        let mut fresh = claude_backed_fresh_context(FreshProvider::Claude);
+        let mut saved = exact_resume_candidate(&fresh, None).unwrap().unwrap();
+        saved.provider_version = Some("historical-native-version".into());
+        fresh.resume_spec = Some(saved.clone());
+        assert_eq!(
+            exact_resume_candidate(&fresh, None).unwrap().unwrap(),
+            saved
+        );
+        let mut terminal = completed_import_context();
+        terminal.provider = "claude".into();
+        terminal.native_import_state = NativeImportState::NotApplicable;
+        terminal.native_import_authority = "no_import_configured".into();
+        let launch = terminal.terminal.as_mut().unwrap();
+        launch.mode = "claude".into();
+        launch.program = "claude".into();
+        launch.opencode_transfer = None;
+        launch.args = vec![
+            "--resume".into(),
+            terminal.native_session_id.clone().unwrap(),
+        ];
+        let spec = exact_resume_candidate(&terminal, None).unwrap().unwrap();
+        assert_eq!(spec.provider_version.as_deref(), Some("2.1.263"));
+        assert_eq!(spec.mode, "claude");
+        assert_eq!(
+            spec.provider_session.native_session_id,
+            terminal.native_session_id.unwrap()
+        );
     }
 
     #[test]

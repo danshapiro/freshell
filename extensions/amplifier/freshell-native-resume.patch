@@ -71,7 +71,7 @@
          session=session,
 --- /dev/null
 +++ b/amplifier_app_cli/freshell_native_resume.py
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,164 @@
 +"""Pinned managed CLI load/context acknowledgement; ordinary launches are unchanged."""
 +
 +from __future__ import annotations
@@ -160,12 +160,14 @@
 +    return LoadedTranscript(transcript, witness), metadata
 +
 +
-+def _status(event, launch, reason=None):
++def _status(event, launch, reason=None, native_session_id=None):
 +    record = {"severity": "error" if reason else "info", "event": event,
 +              "incarnationId": launch["incarnationId"], "launchNonce": launch["launchNonce"],
 +              "evidenceRevision": launch["evidenceRevision"], "executionGeneration": launch["executionGeneration"]}
 +    if reason:
 +        record["reason"] = reason
++    if native_session_id is not None:
++        record["nativeSessionId"] = native_session_id
 +    sys.stderr.write(json.dumps(record) + "\n")
 +
 +
@@ -196,6 +198,7 @@
 +        raise ValueError("native selected session is not a root")
 +    requested = launch["requestedNativeSessionId"]
 +    if requested is not None and native_id != requested:
++        _status("amplifier.native_root.refused", launch, "native_root_mismatch", native_id)
 +        raise ValueError("native selected root disagrees with current launch")
 +    context = session.coordinator.get("context")
 +    if context is None or not callable(getattr(context, "set_messages", None)) or not callable(getattr(context, "get_messages", None)):
