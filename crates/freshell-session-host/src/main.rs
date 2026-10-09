@@ -8252,6 +8252,166 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         assert!(reject_symlink_components(&real.join(".local/share/opencode/opencode.db")).is_ok());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn baseline_only_resume_failure_retry_preserves_installed_history_and_current_tail() {
+        let imported = run_joined_synthetic_transfer(None).await.unwrap();
+        assert!(imported.result.is_ok());
+        let descriptor: OpenCodeTransferDescriptor = serde_json::from_slice(
+            &std::fs::read(
+                imported
+                    .root
+                    .path()
+                    .join("opencode-transfer-descriptor.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let terminal: TerminalLaunchSpec = serde_json::from_slice(
+            &std::fs::read(imported.root.path().join("opencode-terminal.json")).unwrap(),
+        )
+        .unwrap();
+        let baseline = OpenCodeAdoptionBaseline {
+            manifest_sha256: sha256_hex(descriptor.manifest_json.as_bytes()),
+            descriptor: descriptor.clone(),
+        };
+        let original_receipt = std::fs::read(
+            imported
+                .root
+                .path()
+                .join("host-state/opencode-synthetic-transfer-import.json"),
+        )
+        .unwrap();
+        let original_readable = std::fs::read(
+            imported
+                .root
+                .path()
+                .join("host-state/opencode-synthetic-transfer-readable.json"),
+        )
+        .unwrap();
+        for failure in [
+            SyntheticTransferFailure::CurrentEvidenceRead,
+            SyntheticTransferFailure::CurrentEvidenceMismatch,
+            SyntheticTransferFailure::CurrentEvidenceGenerationMismatch,
+            SyntheticTransferFailure::ReadinessIdentityMismatch,
+            SyntheticTransferFailure::SavedBaselineMismatch,
+        ] {
+            let blocked = run_synthetic_exact_resume(&imported, Some(failure), true)
+                .await
+                .unwrap();
+            assert!(blocked.result.is_err(), "{failure:?}");
+            assert!(blocked
+                .state
+                .persisted
+                .try_lock()
+                .unwrap()
+                .grant_id
+                .is_none());
+            assert!(!blocked
+                .pty_callback_invoked
+                .load(std::sync::atomic::Ordering::SeqCst));
+            assert!(blocked.adoption_expectation.lock().unwrap().is_none());
+            assert!(!blocked.events.lock().unwrap().contains(&"import"));
+            assert!(!blocked.events.lock().unwrap().contains(&"pty"));
+            let retry = run_synthetic_exact_resume(&imported, None, true)
+                .await
+                .unwrap();
+            assert!(
+                retry.result.is_ok(),
+                "retry after {failure:?}: {:?}",
+                retry.result
+            );
+            assert_eq!(*retry.events.lock().unwrap(), ["current", "pty"]);
+            let adoption = retry.adoption_expectation.lock().unwrap().clone().unwrap();
+            assert_eq!(adoption.baseline, baseline);
+            assert_eq!(adoption.root_session_id, descriptor.root_session_id);
+            assert_eq!(adoption.incarnation_id, retry.state.incarnation_id);
+            assert_eq!(
+                adoption.root_tail,
+                OpenCodeVerifiedRootTail::Message {
+                    message_id: "synthetic-message".into()
+                }
+            );
+            assert_eq!(
+                std::fs::read(
+                    imported
+                        .root
+                        .path()
+                        .join("host-state/opencode-synthetic-transfer-import.json")
+                )
+                .unwrap(),
+                original_receipt
+            );
+            assert_eq!(
+                std::fs::read(
+                    imported
+                        .root
+                        .path()
+                        .join("host-state/opencode-synthetic-transfer-readable.json")
+                )
+                .unwrap(),
+                original_readable
+            );
+        }
+        // Ordinary native progress changes the current tail while the saved
+        // import baseline continues to protect the original history.
+        let database = rusqlite::Connection::open(&terminal.env["OPENCODE_DB"]).unwrap();
+        let info = serde_json::json!({"id":"msg_current_tail","sessionID":descriptor.root_session_id,
+            "role":"user","time":{"created":2},"agent":"build","model":{"providerID":"synthetic","modelID":"synthetic"}});
+        let mut message_data = info.as_object().unwrap().clone();
+        message_data.remove("id");
+        message_data.remove("sessionID");
+        database.execute("INSERT INTO event_sequence(aggregate_id,seq,owner_id) VALUES (?1,0,'synthetic-current-owner')",[descriptor.root_session_id.as_str()]).unwrap();
+        database.execute("INSERT INTO event(id,aggregate_id,seq,type,data) VALUES ('evt_current_tail',?1,0,'message.updated.1',?2)",
+            rusqlite::params![descriptor.root_session_id,serde_json::json!({"sessionID":descriptor.root_session_id,"info":info}).to_string()]).unwrap();
+        database.execute("INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES ('msg_current_tail',?1,2,2,?2)",
+            rusqlite::params![descriptor.root_session_id, serde_json::Value::Object(message_data).to_string()]).unwrap();
+        drop(database);
+        let progressed = run_synthetic_exact_resume(&imported, None, true)
+            .await
+            .unwrap();
+        assert!(
+            progressed.result.is_ok(),
+            "current native tail: {:?}",
+            progressed.result
+        );
+        let adoption = progressed
+            .adoption_expectation
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(adoption.baseline, baseline);
+        assert_eq!(
+            adoption.root_tail,
+            OpenCodeVerifiedRootTail::Message {
+                message_id: "msg_current_tail".into()
+            }
+        );
+        assert_eq!(*progressed.events.lock().unwrap(), ["current", "pty"]);
+        let database = rusqlite::Connection::open(&terminal.env["OPENCODE_DB"]).unwrap();
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT data FROM message WHERE id='synthetic-message'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            r#"{"text":"synthetic message body is test-only"}"#
+        );
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT count(*) FROM message WHERE session_id=?1",
+                    [descriptor.root_session_id],
+                    |row| row.get::<_, u32>(0)
+                )
+                .unwrap(),
+            2
+        );
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum SyntheticTransferFailure {
         Mount,
