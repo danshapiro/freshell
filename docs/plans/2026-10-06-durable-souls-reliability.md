@@ -508,11 +508,11 @@ Also stage ONLY the ROOT-admitted controlled parity producer files when actually
 - Consumes: typed recovery blocker/error, existing per-soul lifecycle lock, intent revision/control epoch, recovery attempt ID and ownership handle.
 - Produces: internal `RecoveryRetry { soul_id: SoulId, intent_revision: u64, attempt_count: u8, next_due_at_ms: Option<i64>, reserved_attempt_id: Option<RecoveryAttemptId>, last_reason: String }`; registry APIs `reserve_due_recovery_retry(soul_id: SoulId, intent_revision: u64, now_ms: i64) -> Result<Option<RecoveryRetry>, RegistryError>` and `settle_recovery_retry(soul_id: SoulId, intent_revision: u64, attempt_id: RecoveryAttemptId, retryable: bool, recovered: bool, now_ms: i64) -> Result<(), RegistryError>`; initial + 2s + 10s automatic attempts, separate from five successful recoveries/hour flap budget.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Add `automatic_retry_survives_restart_without_budget_reset`: use the existing registry/supervisor fixture and injected clock, cause typed transient provider/backend unavailability, complete the initial attempt, reopen the registry/supervisor at 1s, verify no attempt, at 2s verify one retry, reopen at 3s, and verify the remaining retry is due 10s after second settlement. Three failures exhaust without resetting on another restart. A dependency becoming available on attempt two recovers the same root once. Cover crash before reservation, after reservation/before dispatch, after replacement created/before settlement, and after settlement; adopt/inspect any reserved attempt through existing recovery ownership before retrying. Add Stop/new intent/manual retry/lost cancellation, stale revision, concurrent observer/startup reservation, and nonretryable wrong-identity/unqualified-source blockers. No wall-clock sleep is necessary for policy tests. Define exactly four ignored destructive parent tests `automatic_retry_crash_before_reservation`, `automatic_retry_crash_after_reservation_before_dispatch`, `automatic_retry_crash_after_replacement_before_settlement`, and `automatic_retry_crash_after_settlement` in the existing supervisor recovery/service test module, each exercising its named production boundary through subprocess crash/reopen and exact owned handle/attempt/budget checks. Mark each ignored with the Docker-sandbox-only reason; ordinary cargo tests never launch them. Run the `automatic_retry_crash` prefix in both red and green phases exclusively through documented `scripts/sandbox-test.sh --runtime-suite`; require four selected/executed parents and positive boundary assertions.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `cargo test -p freshell-supervisor automatic_retry_survives_restart_without_budget_reset`
 
@@ -520,11 +520,11 @@ Run: `scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor
 
 Expected: FAIL because blocked souls are excluded from continuing observation and failed-attempt due state is not persisted; require exactly four destructive parents with intended behavior failures, never zero-selection/setup failures.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Add a compatible registry schema migration with a retry row keyed by soul and intent revision, durable attempted/reserved state, next deadline, typed last reason and active recovery-attempt reference. Use the migration framework's next schema version after Task 1, not a hardcoded stale version. Initial attempt reservation consumes attempt 1; failed retryable settlement schedules attempt 2 at now+2000ms and attempt 3 at now+10000ms; failed attempt 3 has no next deadline and exposes RetryExhausted. Reservation and existing recovery-attempt creation commit together before external work. SQL updates check current desired Running, exact intent revision, not Lost, no conflicting active attempt, and due deadline. Observer/startup enumerate due retries as well as LIVE health observation, acquire the existing lifecycle lock and bounded concurrency permit, recheck reservation, then invoke the ordinary recovery path. Startup inspects/adopts a reserved in-flight recovery using owned handles and existing recovery journal; never blindly replays provider creation. Clock rollback cannot mint attempts; persisted deadlines remain deadlines. Only explicitly typed transient host/backend/config dependency/preparation failures are retryable; identity mismatch, ownership mismatch, incomplete evidence and required user owner choice are blocked until deliberate correction/manual retry. Manual retry rearms once under a fresh current intent action. Successful recovery, Stop, Lost, and revised intent clear/cancel pending schedules transactionally. Log scheduled/reserved/settled/exhausted/cancelled with severity and exact IDs. Keep success flap budget separate.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `cargo test -p freshell-supervisor automatic_retry_survives_restart_without_budget_reset`
 
@@ -534,11 +534,11 @@ Run: `scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor
 
 Expected: PASS for bounded restart-safe failed attempts and unchanged successful-recovery flap policy, plus four actually executed crash parents and no host execution.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Share registry eligibility/reservation between startup and observer; keep retries out of the web controller. Factor a pure due/settlement policy in `recovery_retry.rs`, retaining SQL transactional authority and existing lock ownership.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `cargo test -p freshell-supervisor`
 
@@ -546,7 +546,7 @@ Run: `scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor
 
 Expected: PASS with nonzero crash selectors; schema reopen, existing flap-budget/manual retry, source/identity mismatch, Stop fences and startup readiness continue to pass.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 Run: `git add crates/freshell-supervisor/src/recovery_retry.rs crates/freshell-supervisor/src/lib.rs crates/freshell-supervisor/src/registry.rs crates/freshell-supervisor/src/inventory.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-supervisor/src/service.rs`
 
