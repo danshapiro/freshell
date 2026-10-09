@@ -311,6 +311,25 @@ impl Supervisor {
             ));
         }
         match envelope.body {
+            AdminCommand::Recover(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                // Recovery must not retain the general command switch's
+                // unrelated provider futures on the worker's polling stack.
+                Box::pin(self.recover(request))
+                    .await
+                    .map(AdminResult::Recovery)
+            }
+            _ => Box::pin(self.dispatch_non_recovery(envelope)).await,
+        }
+    }
+
+    async fn dispatch_non_recovery(
+        &self,
+        envelope: Envelope<AdminCommand>,
+    ) -> Result<AdminResult, RuntimeError> {
+        match envelope.body {
             AdminCommand::Health => Ok(AdminResult::Health {
                 control_epoch: self.registry.control_epoch(),
                 installation_id: self.registry.installation_id().clone(),
@@ -793,16 +812,8 @@ impl Supervisor {
                     .await
                     .map(AdminResult::RecoveryProbe)
             }
-            AdminCommand::Recover(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                // Recovery polls several bounded provider/store paths. Keep its
-                // state outside the command-dispatch future so debug builds
-                // do not stack both large async frames on a Tokio worker.
-                Box::pin(self.recover(request))
-                    .await
-                    .map(AdminResult::Recovery)
+            AdminCommand::Recover(_) => {
+                unreachable!("recovery is dispatched before the general command switch")
             }
         }
     }
@@ -4106,6 +4117,74 @@ mod opencode_transfer_restart_tests {
 
     const ATTEMPT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ATTEMPT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[tokio::test]
+    async fn recovery_dispatch_validates_controls_before_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry);
+        for (case, expected) in [
+            ("protocol", RuntimeErrorCode::ProtocolVersionMismatch),
+            ("role", RuntimeErrorCode::UnauthorizedRole),
+            ("credential", RuntimeErrorCode::UnauthorizedRole),
+            ("epoch", RuntimeErrorCode::StaleControlEpoch),
+            ("intent", RuntimeErrorCode::StaleIntentRevision),
+        ] {
+            let mut envelope = Envelope::new(
+                RequestId::new(),
+                if case == "role" {
+                    ControlRole::Runtime
+                } else {
+                    ControlRole::Web
+                },
+                AdminCommand::Recover(freshell_runtime_protocol::RecoverRequest {
+                    soul_id: soul.clone(),
+                    trigger: freshell_runtime_protocol::RecoveryTrigger::ManualRetry,
+                    expected_intent_revision: Some(
+                        context.intent_revision + u64::from(case == "intent"),
+                    ),
+                    // Earlier invalid controls must reject before the stale epoch.
+                    expected_control_epoch: Some(
+                        supervisor.registry.control_epoch() + u64::from(case != "intent"),
+                    ),
+                }),
+            );
+            envelope.auth = Some(
+                if case == "credential" {
+                    "invalid"
+                } else {
+                    "synthetic-secret"
+                }
+                .into(),
+            );
+            if case == "protocol" {
+                envelope.protocol_version += 1;
+            }
+            let request_id = envelope.request_id.clone();
+            let reply = supervisor.dispatch(envelope).await;
+            assert_eq!(reply.request_id, request_id);
+            assert_eq!(reply.result.unwrap_err().code, expected, "{case}");
+            let current = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(current.intent_revision, context.intent_revision, "{case}");
+            assert!(current.recovery_attempt_id.is_none(), "{case}");
+            assert!(
+                supervisor
+                    .registry
+                    .recovery_retry(soul.clone(), context.intent_revision)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{case}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn fresh_native_transition_must_commit_before_input_and_recovery_probe() {

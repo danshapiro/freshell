@@ -2272,10 +2272,29 @@ impl Supervisor {
                 .recovery_context(request.soul_id.clone())
                 .await
                 .map_err(map_registry)?;
+            let pending = self
+                .registry
+                .recovery_retry(request.soul_id.clone(), context.intent_revision)
+                .await
+                .map_err(map_registry)?;
+            let probe = pending.and_then(|retry| {
+                retry.next_due_at_ms.map(|due| {
+                    blocked(
+                        RecoveryPath::Reattach,
+                        if retry.last_reason == "preparation_unavailable" {
+                            RecoveryBlockReason::CapabilityPending
+                        } else {
+                            RecoveryBlockReason::ProviderUnavailable
+                        },
+                        "the supervisor has scheduled another recovery attempt",
+                        Some(due.saturating_sub(self.registry.recovery_now_ms()).max(0) as u64),
+                    )
+                })
+            });
             return Ok(RecoveryResult {
                 outcome: RecoveryOutcome::Blocked,
                 view: self.view_for(context.prior_handle.incarnation_id()).await?,
-                probe: None,
+                probe,
                 prior_incarnation_id: None,
                 attempt_id: None,
                 expected_native_session_id: context.native_session_id,
@@ -7294,13 +7313,13 @@ mod automatic_retry_tests {
         supervisor.reconcile_startup().await.unwrap();
         assert_eq!(attempts(dir.path()).len(), 1);
         clock.store(2_000, Ordering::SeqCst);
-        let report = supervisor.observe_once().await.unwrap();
+        supervisor.observe_once().await.unwrap();
         let current = supervisor
             .registry
             .recovery_context(soul.clone())
             .await
             .unwrap();
-        assert_eq!(current.recovery_state, RecoveryState::Live, "{report:?}");
+        assert_eq!(current.recovery_state, RecoveryState::Live);
         assert_eq!(current.intent_revision, context.intent_revision + 1);
         assert_eq!(backend.count("creates"), 1);
         assert_eq!(attempts(dir.path()).len(), 2);

@@ -206,7 +206,9 @@ impl Supervisor {
         });
     }
 
-    pub(crate) async fn observe_once(&self) -> Result<(), RuntimeError> {
+    /// Run one bounded observation pass through the same lifecycle locks and
+    /// persisted retry policy used by the background observer.
+    pub async fn observe_once(&self) -> Result<(), RuntimeError> {
         let due: BTreeMap<_, _> = self
             .registry
             .due_recovery_retries(self.registry.recovery_now_ms())
