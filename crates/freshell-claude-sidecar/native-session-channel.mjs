@@ -10,6 +10,7 @@ const signalKey = 'FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'
 const ownPath = fileURLToPath(import.meta.url)
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`
 const validRoot = (root) => typeof root === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(root)
+const sessionStartSources = new Set(['startup', 'resume', 'clear', 'compact', 'fork'])
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']'
@@ -133,7 +134,7 @@ async function writeNativeSignal(name, input, env) {
 
 export async function writeNativeSessionSignal(input, env = process.env) {
   if (!input || input.hook_event_name !== 'SessionStart' || typeof input.session_id !== 'string'
-    || !validRoot(input.session_id) || !['startup', 'resume', 'clear', 'compact'].includes(input.source)) {
+    || !validRoot(input.session_id) || !sessionStartSources.has(input.source)) {
     throw new Error('invalid native SessionStart')
   }
   await writeNativeSignal('session-start.json', input, env)
@@ -174,7 +175,7 @@ async function terminalStatusLine(input, bytes, env = process.env) {
   })
 }
 
-export async function createNativeSessionChannel({ launch, directory, timeoutMs = 50_000, signal } = {}) {
+export async function createNativeSessionChannel({ launch, directory, timeoutMs = 50_000, signal, allowFork = false } = {}) {
   if (!launch?.launchNonce || !launch.incarnationId) throw new Error('missing current native launch')
   const ownedDirectory = join(directory ?? tmpdir(), `freshell-native-${randomUUID()}`)
   await mkdir(ownedDirectory, { recursive: true, mode: 0o700 })
@@ -199,7 +200,8 @@ export async function createNativeSessionChannel({ launch, directory, timeoutMs 
           const value = JSON.parse(bytes)
           if (JSON.stringify(value.launch) !== JSON.stringify(launch)) throw new Error('stale native launch')
           if (value.native?.hook_event_name !== 'SessionStart' || !validRoot(value.native?.session_id)
-            || !['startup', 'resume', 'clear', 'compact'].includes(value.native.source)) throw new Error('invalid native SessionStart')
+            || !sessionStartSources.has(value.native.source)) throw new Error('invalid native SessionStart')
+          if (value.native.source === 'fork' && !allowFork) throw new Error('unexpected native fork')
           if (launch.requestedNativeSessionId && value.native.session_id !== launch.requestedNativeSessionId) throw new Error('wrong native root')
           if (initialized) return { nativeSessionId: value.native.session_id, native: value.native,
             evidenceDigest: createHash('sha256').update(bytes).digest('hex') }

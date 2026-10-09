@@ -16,10 +16,10 @@ async function withChannel(run: (channel: any) => Promise<void>) {
   try { await run(await createNativeSessionChannel({ launch, directory, timeoutMs: 100 })) }
   finally { await rm(directory, { recursive: true, force: true }) }
 }
-async function hook(channel: any) {
+async function hook(channel: any, input = native) {
   const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/native-session-channel.mjs')], { env: { ...process.env, ...channel.env }, stdio: ['pipe', 'pipe', 'pipe'] })
   const exited = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', resolve) })
-  child.stdin.end(JSON.stringify(native))
+  child.stdin.end(JSON.stringify(input))
   expect(await exited).toBe(0)
 }
 function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false, delayedNativeExit = false, providerHome = directory, eagerResume = false, eagerCallbackOnly = false, splitBatch: boolean | 'incomplete' = false) {
@@ -72,6 +72,7 @@ describe('managed native startup channel', () => {
         if (authorized) {
           const observed = await sidecar.wait('sdk.session.init')
           expect(observed.cliSessionId).toBe('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
+          expect(observed.nativeIdentityEvidence.source).toBe('fork')
           expect(observed.nativeIdentityEvidence.launch.evidenceRevision).toBe(launch.evidenceRevision + 1)
           expect(sidecar.frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
         } else {
@@ -83,6 +84,25 @@ describe('managed native startup channel', () => {
         await rm(directory, { recursive: true, force: true })
       }
     }
+  })
+  it('refuses an unsolicited native fork even when it names the requested root', async () => withChannel(async (channel) => {
+    await hook(channel, { ...native, source: 'fork' })
+    await expect(channel.waitReady({ initializationResult: async () => ({}) })).rejects.toThrow('unexpected native fork')
+  }))
+  it.each([
+    ['fork-retained-parent', 'native rollback retained the retired root'],
+    ['fork-without-native-ack', 'native rollback did not acknowledge a fork'],
+  ])('refuses an authorized transition without actual child fork evidence (%s)', async (model, message) => {
+    const directory = await mkdtemp(join(tmpdir(), 'native-reroot-unobserved-'))
+    const sidecar = checkpointSidecar(directory)
+    try {
+      sidecar.send({ type: 'create', requestId: 'unobserved-rollback', cwd: directory, model,
+        resumeSessionId: root, resumeSessionAt: 'retained-turn', forkSession: true,
+        nativeIdentityTransition: { parentNativeSessionId: root,
+          launch: { ...launch, evidenceRevision: launch.evidenceRevision + 1, requestedNativeSessionId: null } } })
+      expect((await sidecar.wait('sdk.error')).message).toContain(message)
+      expect(sidecar.frames.some(frame => frame.type === 'sdk.session.init' || frame.type === 'probe.native-input')).toBe(false)
+    } finally { await sidecar.close(); await rm(directory, { recursive: true, force: true }) }
   })
   it.each(['incarnationId', 'launchNonce', 'executionGeneration', 'evidenceRevision', 'requestedNativeSessionId'] as const)(
     'rejects a rollback create with stale %s before opening a native query', async (field) => {

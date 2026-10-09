@@ -9,7 +9,7 @@ export function query({ prompt, options }) {
     void options.canUseTool('Bash', { command: 'owned-preinit-effect' }, {}).then((decision) =>
       process.stdout.write(JSON.stringify({ type: 'probe.preinit-permission', decision }) + '\n'))
   }
-  const nativeRoot = options.forkSession
+  const nativeRoot = options.model === 'fork-retained-parent' ? options.resume : options.forkSession
     ? (++nativeForks === 1 ? 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' : 'cccccccc-cccc-4ccc-8ccc-cccccccccccc')
     : options.resume ?? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
   const checkpointScenario = process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT === '1'
@@ -29,7 +29,9 @@ export function query({ prompt, options }) {
       if (error) reject(error)
       else setTimeout(() => options.model === 'restore-failure' ? reject(new Error('native restoration failed')) : resolve({}), 100)
     })
-    child.stdin.end(JSON.stringify({ hook_event_name: 'SessionStart', session_id: nativeRoot, source: options.resume ? 'resume' : 'startup', cwd: options.cwd, transcript_path: transcriptPath }))
+    child.stdin.end(JSON.stringify({ hook_event_name: 'SessionStart', session_id: nativeRoot,
+      source: options.forkSession && options.model !== 'fork-without-native-ack' ? 'fork' : options.resume ? 'resume' : 'startup',
+      cwd: options.cwd, transcript_path: transcriptPath }))
   })
   if (!checkpointScenario) void (async () => { for await (const message of prompt) process.stdout.write(JSON.stringify({ type: 'probe.native-input', text: message.message.content }) + '\n') })()
   return {
