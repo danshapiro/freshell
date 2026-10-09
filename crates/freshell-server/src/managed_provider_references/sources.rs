@@ -1,5 +1,8 @@
 //! Ordered native source occurrences for managed OpenCode preparation.
 pub use freshell_platform::opencode_recipe::{DiscoveryRole, DiscoveryRoot};
+use freshell_platform::provider_input_profiles::{
+    MAX_SIMULTANEOUS_SOURCE_VIEW_BYTES, MAX_SOURCE_VIEW_BYTES,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -289,7 +292,7 @@ fn add_source(
         .map_err(|_| "selected configuration source is unavailable, dangling or cyclic")?;
     let metadata = std::fs::metadata(&canonical_source)
         .map_err(|_| "selected configuration source metadata failed")?;
-    if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
+    if !metadata.is_file() || metadata.len() > MAX_SOURCE_VIEW_BYTES {
         return Err("selected configuration source is not a bounded regular file");
     }
     sources.push(SourceOccurrence {
@@ -315,7 +318,7 @@ pub(crate) struct SourceViewBudget {
 }
 impl SourceViewBudget {
     pub fn charge(&mut self, view: &str) -> Result<(), &'static str> {
-        if view.len() > 16 * 1024 * 1024 {
+        if view.len() as u64 > MAX_SOURCE_VIEW_BYTES {
             return Err("source view exceeds 16 MiB");
         }
         let identity = (view.as_ptr() as usize, view.len());
@@ -326,7 +329,7 @@ impl SourceViewBudget {
             .bytes
             .checked_add(view.len())
             .ok_or("source-view byte count overflow")?;
-        if bytes > 64 * 1024 * 1024 {
+        if bytes as u64 > MAX_SIMULTANEOUS_SOURCE_VIEW_BYTES {
             return Err("simultaneous retained source views exceed 64 MiB");
         }
         self.views.insert(identity);
@@ -375,10 +378,15 @@ pub fn read_opencode_sources(
         let view = if let Some(view) = canonical.get(&source.canonical_source) {
             view.clone()
         } else {
-            let remaining = (64 * 1024 * 1024usize)
+            let remaining = (MAX_SIMULTANEOUS_SOURCE_VIEW_BYTES as usize)
                 .checked_sub(retained)
                 .ok_or_else(|| fail("source-view byte count overflow"))?;
-            let limit = remaining.min(16 * 1024 * 1024);
+            let limit = remaining.min(MAX_SOURCE_VIEW_BYTES as usize);
+            let metadata = std::fs::metadata(&source.canonical_source)
+                .map_err(|_| fail("selected source read failed"))?;
+            if !metadata.is_file() || metadata.len() > limit as u64 {
+                return Err(fail("selected source exceeds source-view limit"));
+            }
             let mut raw = String::new();
             std::fs::File::open(&source.canonical_source)
                 .map_err(|_| fail("selected source read failed"))?
@@ -618,6 +626,85 @@ pub fn plan_loaded_opencode_sources_relocated(
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn managed_provider_references_actual_source_file_growth_rejects_before_reading() {
+        let owned = tempfile::tempdir().unwrap();
+        let path = owned.path().join("opencode.json");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut sources = Vec::new();
+        add_source(
+            &mut sources,
+            path.clone(),
+            SourceLane::Main,
+            DiscoveryRole::Workspace,
+        )
+        .unwrap();
+        file.set_len(16 * 1024 * 1024 + 1).unwrap();
+        let unread = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        file.set_times(std::fs::FileTimes::new().set_accessed(unread))
+            .unwrap();
+        assert!(read_opencode_sources(sources).is_err());
+        assert_eq!(
+            file.metadata().unwrap().accessed().unwrap(),
+            unread,
+            "growth beyond the actual per-source limit must fail before reading source bytes"
+        );
+    }
+
+    #[test]
+    fn managed_provider_references_actual_aggregate_view_limit_rejects_before_extra_read() {
+        let owned = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for ordinal in 0..4 {
+            let path = owned.path().join(format!("source-{ordinal}.json"));
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(16 * 1024 * 1024)
+                .unwrap();
+            paths.push(path);
+        }
+        let occurrences = |paths: &[PathBuf]| {
+            paths
+                .iter()
+                .map(|path| SourceOccurrence {
+                    logical_path: path.clone(),
+                    canonical_source: path.clone(),
+                    lane: SourceLane::Main,
+                    role: DiscoveryRole::Workspace,
+                })
+                .collect()
+        };
+        let mut repeated = paths.clone();
+        repeated.push(paths[0].clone());
+        let loaded = read_opencode_sources(occurrences(&repeated)).unwrap();
+        assert_eq!(
+            retained_source_view_bytes(&loaded).unwrap(),
+            64 * 1024 * 1024
+        );
+        assert!(std::sync::Arc::ptr_eq(&loaded[0].view, &loaded[4].view));
+        assert!(loaded.iter().all(|source| {
+            source.view.len() == 16 * 1024 * 1024
+                && source.view.as_bytes().iter().all(|byte| *byte == 0)
+        }));
+        drop(loaded);
+        let extra = owned.path().join("extra.json");
+        let extra_file = std::fs::File::create(&extra).unwrap();
+        extra_file.set_len(1).unwrap();
+        let unread = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        extra_file
+            .set_times(std::fs::FileTimes::new().set_accessed(unread))
+            .unwrap();
+        paths.push(extra);
+        assert!(read_opencode_sources(occurrences(&paths)).is_err());
+        assert_eq!(
+            extra_file.metadata().unwrap().accessed().unwrap(),
+            unread,
+            "the extra view must be rejected before reading beyond 64 MiB"
+        );
+        assert_eq!(std::fs::read_dir(owned.path()).unwrap().count(), 5);
+    }
+
     fn digest(path: &Path) -> String {
         format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
     }
