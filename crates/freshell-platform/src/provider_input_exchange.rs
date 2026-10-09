@@ -369,4 +369,184 @@ mod tests {
         };
         assert_eq!(bytes.len(), MAX_CHUNK_BYTES);
     }
+
+    #[test]
+    fn provider_input_exchange_actual_capacity_and_overflow_preserve_prior_generation() {
+        use std::os::unix::fs::PermissionsExt;
+        let owned = tempfile::tempdir().unwrap();
+        let prior = owned.path().join("prior");
+        std::fs::create_dir(&prior).unwrap();
+        std::fs::write(prior.join("nonce"), b"prior-indexed-generation").unwrap();
+        for (case, ids, payloads, expected_success) in [
+            ("exact", 128u16, vec![MAX_FILE_BYTES, MAX_FILE_BYTES], true),
+            ("file-over", 1, vec![MAX_FILE_BYTES + 1], false),
+            (
+                "total-over",
+                3,
+                vec![MAX_FILE_BYTES, MAX_FILE_BYTES, 1],
+                false,
+            ),
+            ("source-over", 129, vec![], false),
+        ] {
+            let root = owned.path().join(case);
+            std::fs::create_dir(&root).unwrap();
+            let socket = owned.path().join(format!("{case}.sock"));
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let outcome = std::thread::scope(|scope| {
+                let worker = scope.spawn(|| serve(&root, &socket));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(pair) => break pair,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "private capacity publisher did not connect"
+                            );
+                            std::thread::yield_now();
+                        }
+                        Err(_) => panic!("private capacity accept failed"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(20)))
+                    .unwrap();
+                let acknowledged = |stream: &mut std::os::unix::net::UnixStream,
+                                    request: Request,
+                                    expected: Acknowledgement| {
+                    write_request(stream, &request).unwrap();
+                    let mut length = [0; 4];
+                    if stream.read_exact(&mut length).is_err() {
+                        return false;
+                    }
+                    let length = u32::from_be_bytes(length) as usize;
+                    assert!(length < MAX_FRAME_BYTES);
+                    let mut response = vec![0; length];
+                    stream.read_exact(&mut response).unwrap();
+                    serde_json::from_slice::<Acknowledgement>(&response).unwrap() == expected
+                };
+                let mut accepted = acknowledged(
+                    &mut stream,
+                    Request::Begin {
+                        source_ids: (0..ids).collect(),
+                    },
+                    Acknowledgement::Begun,
+                );
+                for id in 0..ids {
+                    if !accepted {
+                        break;
+                    }
+                    accepted = acknowledged(
+                        &mut stream,
+                        Request::Open { source_id: id },
+                        Acknowledgement::Opened,
+                    );
+                    let mut remaining = payloads.get(id as usize).copied().unwrap_or(0);
+                    while accepted && remaining != 0 {
+                        let length = remaining.min(MAX_CHUNK_BYTES as u64) as usize;
+                        accepted = acknowledged(
+                            &mut stream,
+                            Request::Chunk {
+                                bytes: vec![0x5a; length],
+                            },
+                            Acknowledgement::Written,
+                        );
+                        remaining -= length as u64;
+                    }
+                    if accepted {
+                        accepted =
+                            acknowledged(&mut stream, Request::Finish, Acknowledgement::Finished);
+                    }
+                }
+                if accepted {
+                    accepted = acknowledged(&mut stream, Request::Seal, Acknowledgement::Populated);
+                    assert!(
+                        !worker.is_finished(),
+                        "exact full generation must remain leased until release"
+                    );
+                    if accepted {
+                        accepted =
+                            acknowledged(&mut stream, Request::Release, Acknowledgement::Released);
+                    }
+                }
+                drop(stream);
+                let result = worker.join().unwrap();
+                (accepted, result)
+            });
+            assert_eq!(outcome.0, expected_success, "capacity case {case}");
+            assert_eq!(outcome.1.is_ok(), expected_success, "capacity case {case}");
+            if expected_success {
+                assert_eq!(std::fs::read_dir(root.join("files")).unwrap().count(), 128);
+                for id in 0..128 {
+                    let path = root.join(format!("files/source-{id}"));
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                    let mut input = std::fs::File::open(path).unwrap();
+                    let mut bytes = 0u64;
+                    let mut block = [0; MAX_CHUNK_BYTES];
+                    loop {
+                        let length = input.read(&mut block).unwrap();
+                        if length == 0 {
+                            break;
+                        }
+                        assert!(block[..length].iter().all(|byte| *byte == 0x5a));
+                        bytes += length as u64;
+                    }
+                    assert_eq!(bytes, payloads.get(id as usize).copied().unwrap_or(0));
+                }
+            } else {
+                assert!(
+                    outcome.1.unwrap_err().len() < 128,
+                    "failure remains a fixed diagnostic without payload"
+                );
+                match case {
+                    "file-over" => {
+                        assert_eq!(
+                            std::fs::metadata(root.join("files/source-0"))
+                                .unwrap()
+                                .len(),
+                            MAX_FILE_BYTES
+                        );
+                    }
+                    "total-over" => {
+                        for id in 0..2 {
+                            assert_eq!(
+                                std::fs::metadata(root.join(format!("files/source-{id}")))
+                                    .unwrap()
+                                    .len(),
+                                MAX_FILE_BYTES
+                            );
+                        }
+                        assert_eq!(
+                            std::fs::metadata(root.join("files/source-2"))
+                                .unwrap()
+                                .len(),
+                            0,
+                            "over-budget byte must not be written"
+                        );
+                    }
+                    "source-over" => assert!(
+                        !root.join("files").exists(),
+                        "source-count overflow must precede private-file allocation"
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(
+                std::fs::read(prior.join("nonce")).unwrap(),
+                b"prior-indexed-generation"
+            );
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(
+                !root.exists(),
+                "failed attempt's indexed files are removable without prior-generation mutation"
+            );
+        }
+    }
 }
