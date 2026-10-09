@@ -2017,14 +2017,7 @@ fn refresh_provider_context(
     let Some(context) = context else {
         return Ok(());
     };
-    let private_mount = &paths.private_mount;
-    let user_root = private_mount.join("user-provider");
-    if provider_config_references(context).iter().any(|reference| {
-        reference.root == freshell_runtime_protocol::ProviderConfigRoot::UserProvider
-    }) && !user_root.is_dir()
-    {
-        return Err("provider user config mount is unavailable".into());
-    }
+    let user_root = prepare_provider_input_mount(context, paths)?;
     refresh_provider_config_references(
         context,
         provider,
@@ -2544,17 +2537,10 @@ fn prepare_provider_context_for_fresh_launch(
         paths,
     )
 }
-fn prepare_provider_context_at(
-    context: Option<&freshell_runtime_protocol::ProviderLaunchContext>,
-    provider: &str,
-    workspace: &str,
-    run_as_uid: u32,
-    run_as_gid: u32,
+fn prepare_provider_input_mount(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
     paths: &ProviderConfigPaths,
-) -> Result<(), String> {
-    let Some(context) = context else {
-        return Ok(());
-    };
+) -> Result<PathBuf, String> {
     let user_root = paths.private_mount.join("user-provider");
     if provider_config_references(context).iter().any(|reference| {
         reference.root == freshell_runtime_protocol::ProviderConfigRoot::UserProvider
@@ -2589,6 +2575,21 @@ fn prepare_provider_context_at(
         })?;
         set_mode(&paths.private_mount, 0o710)?;
     }
+    Ok(user_root)
+}
+
+fn prepare_provider_context_at(
+    context: Option<&freshell_runtime_protocol::ProviderLaunchContext>,
+    provider: &str,
+    workspace: &str,
+    run_as_uid: u32,
+    run_as_gid: u32,
+    paths: &ProviderConfigPaths,
+) -> Result<(), String> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let user_root = prepare_provider_input_mount(context, paths)?;
     refresh_provider_config_references(
         context,
         provider,
@@ -4416,6 +4417,67 @@ mod tests {
             std::fs::read(home.join("skills/sibling")).unwrap(),
             b"sibling-nonce"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_resume_validates_private_input_parent_before_copy() {
+        use freshell_runtime_protocol::{
+            ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let real_private = root.path().join("real-private");
+        let private = root.path().join("private");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(real_private.join("user-provider")).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(
+            real_private.join("user-provider/settings.json"),
+            b"new-config",
+        )
+        .unwrap();
+        std::fs::create_dir(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/settings.json"), b"accepted-config").unwrap();
+        std::os::unix::fs::symlink(&real_private, &private).unwrap();
+        let context = ProviderLaunchContext {
+            prepared_inputs: None,
+            preparation: ProviderPreparation::Claude {
+                mcp_args: Vec::new(),
+            },
+            mcp_capability: None,
+            config: vec![ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "settings.json".into(),
+                provider_relative_path: ".claude/settings.json".into(),
+                format: "json".into(),
+            }],
+        };
+        let error = refresh_provider_context(
+            Some(&context),
+            "claude",
+            root.path().to_str().unwrap(),
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            &ProviderConfigPaths {
+                private_mount: private,
+                provider_home: home.clone(),
+            },
+        )
+        .expect_err("resume must validate the same physical private parent as initial preparation");
+        assert!(error.contains("trusted physical directory"));
+        assert_eq!(
+            std::fs::read(home.join(".claude/settings.json")).unwrap(),
+            b"accepted-config"
+        );
+        assert_eq!(
+            std::fs::read(real_private.join("user-provider/settings.json")).unwrap(),
+            b"new-config"
+        );
+        assert!(std::fs::read_dir(&home).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".freshell-provider-refresh-")));
     }
 
     #[test]
