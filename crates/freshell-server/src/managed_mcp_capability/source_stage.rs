@@ -1,7 +1,10 @@
 //! Stage source views in the grant's private filesystem before publication.
 use super::{private_directory, write_private_bytes};
 use crate::managed_provider_references::sources::{PlannedSourceOccurrence, SourceLane};
-use freshell_platform::opencode_recipe::{SelectedSourceFile, SourceManifest, SourceView};
+use freshell_platform::{
+    opencode_recipe::{SelectedSourceFile, SourceManifest, SourceView},
+    provider_input_profiles::MAX_SOURCE_VIEW_BYTES,
+};
 use std::{collections::BTreeMap, path::Path};
 
 /// Selected discovery roots are complete writable units, independent of the
@@ -99,19 +102,24 @@ pub(super) fn read_source_view(root: &Path, relative: &str) -> Result<String, St
         return Err("accepted source view has an invalid private path".into());
     }
     let path = root.join(relative);
-    if !std::fs::symlink_metadata(&path)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|_| "accepted source view must be a physical stage file")?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
         || std::fs::canonicalize(&path).map_err(|_| "accepted source view is unavailable")? != path
     {
         return Err("accepted source view must be a physical stage file".into());
     }
+    if metadata.len() > MAX_SOURCE_VIEW_BYTES {
+        return Err("accepted source view exceeds 16 MiB".into());
+    }
     let mut raw = String::new();
     std::fs::File::open(path)
         .map_err(|_| "accepted source view is unavailable")?
-        .take(16 * 1024 * 1024 + 1)
+        .take(MAX_SOURCE_VIEW_BYTES + 1)
         .read_to_string(&mut raw)
         .map_err(|_| "accepted source view read failed")?;
-    if raw.len() > 16 * 1024 * 1024 {
+    if raw.len() as u64 > MAX_SOURCE_VIEW_BYTES {
         return Err("accepted source view exceeds 16 MiB".into());
     }
     Ok(raw)
@@ -517,4 +525,41 @@ pub(super) fn describe(
     write_private_bytes(&root.join(".freshell/prepared-inputs.json"), &metadata)?;
     super::allow_controller_stage_read(&root.join(".freshell/prepared-inputs.json"))?;
     Ok(inputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepted_source_view_rejects_actual_oversize_before_reading_or_prior_mutation() {
+        let owned = tempfile::tempdir().unwrap();
+        let root = owned.path().join("stage");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("view");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(16 * 1024 * 1024 + 1).unwrap();
+        let before = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        file.set_times(std::fs::FileTimes::new().set_accessed(before))
+            .unwrap();
+        let prior = owned.path().join("prior");
+        std::fs::write(&prior, b"prior-accepted-source-view").unwrap();
+        let result = read_source_view(&root, "view");
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().accessed().unwrap(),
+            before,
+            "oversized stage view must be rejected from metadata before source bytes are read"
+        );
+        assert_eq!(
+            std::fs::read(&prior).unwrap(),
+            b"prior-accepted-source-view"
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        file.set_len(16 * 1024 * 1024).unwrap();
+        assert_eq!(
+            read_source_view(&root, "view").unwrap().len(),
+            16 * 1024 * 1024
+        );
+    }
 }
