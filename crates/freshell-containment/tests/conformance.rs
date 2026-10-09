@@ -27,14 +27,6 @@ fn tag_only() -> Containment {
     })
 }
 
-/// A plain `sleep 600` child of the test: no placement, no tag.
-fn plain_sleep() -> std::process::Child {
-    std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn force_stop_interrupts_main_first_then_kills_the_whole_unit() {
     for (name, c) in backends() {
@@ -383,11 +375,9 @@ async fn the_codex_daemon_family_is_never_signalled() {
 async fn a_pinned_root_is_stopped_even_when_the_backend_finds_no_members() {
     for (name, c) in backends() {
         let unit = c.create_unit(UnitId::mint(), label()).unwrap();
-        let mut sleep = tokio::process::Command::new("sleep")
-            .arg("600")
-            .spawn()
-            .unwrap();
-        let watch = ProcWatch::open(sleep.id().unwrap()).unwrap();
+        // A plain child of the test: no placement, no tag.
+        let mut sleep = OwnChild::sleep();
+        let watch = sleep.watch().clone();
         unit.add_root(watch.clone());
         unit.stop(StopRequest::new(
             StopMode::Force,
@@ -400,7 +390,7 @@ async fn a_pinned_root_is_stopped_even_when_the_backend_finds_no_members() {
             watch.has_exited(),
             "{name}: the pinned root was not stopped"
         );
-        let _ = sleep.wait().await;
+        sleep.wait();
     }
 }
 
@@ -421,14 +411,14 @@ async fn a_unit_refuses_members_once_its_stop_has_begun() {
             unit.tokio_command("true", &[], MemberRole::Agent).is_err(),
             "{name}"
         );
-        let mut late = plain_sleep();
-        let watch = ProcWatch::open(late.id()).unwrap();
+        let mut late = OwnChild::sleep();
+        let watch = late.watch().clone();
         unit.set_screen(watch.clone());
         tokio::time::timeout(Duration::from_secs(5), watch.exited())
             .await
             .unwrap_or_else(|_| panic!("{name}: a member pinned after the stop began survived"))
             .unwrap();
-        let _ = late.wait();
+        late.wait();
         handle.wait().await;
         assert!(unit.placement(MemberRole::Screen).is_err(), "{name}");
     }
@@ -444,11 +434,10 @@ async fn confirm_placement_accepts_members_and_rejects_strangers() {
         let main = unit.main().unwrap().pid();
         unit.confirm_placement(main).unwrap();
         unit.confirm_placement(p.main).unwrap();
-        let mut stranger = plain_sleep();
+        let mut stranger = OwnChild::sleep(); // no placement, no tag
         let refused = unit.confirm_placement(stranger.id()).unwrap_err();
         assert_ne!(refused.kind(), std::io::ErrorKind::NotFound, "{name}");
-        stranger.kill().unwrap();
-        stranger.wait().unwrap();
+        stranger.kill_and_wait();
         assert_eq!(
             unit.confirm_placement(stranger.id()).unwrap_err().kind(),
             std::io::ErrorKind::NotFound,
@@ -593,8 +582,8 @@ async fn a_stop_that_panics_is_rerun_once_in_force_and_never_poisons_waiters() {
     let (cap, _guard) = capture::install();
     let c = tag_only();
     let unit = c.create_unit(UnitId::mint(), label()).unwrap();
-    let mut sleep = plain_sleep();
-    let watch = ProcWatch::open(sleep.id()).unwrap();
+    let mut sleep = OwnChild::sleep();
+    let watch = sleep.watch().clone();
     unit.set_screen(watch.clone());
     let gone_calls = Arc::new(AtomicUsize::new(0));
     let calls = gone_calls.clone();
@@ -617,5 +606,5 @@ async fn a_stop_that_panics_is_rerun_once_in_force_and_never_poisons_waiters() {
         "on_gone ran exactly once"
     );
     assert!(watch.has_exited(), "the screen was stopped");
-    let _ = sleep.wait();
+    sleep.wait();
 }

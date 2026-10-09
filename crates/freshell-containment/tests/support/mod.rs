@@ -2,10 +2,12 @@
 pub mod capture;
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use freshell_containment::{
-    AgentUnit, BackendKind, Containment, MemberRole, ProcWatch, SelectOptions, ShimCommand,
+    process, AgentUnit, BackendKind, Containment, MemberRole, ProcWatch, SelectOptions,
+    ShimCommand, Sig,
 };
 
 /// The test build of the `__unit-exec` shim (the server passes its own exe).
@@ -107,17 +109,43 @@ pub struct AgentScript {
     pub script: PathBuf,
     pub pids: PathBuf,
     pub marker: PathBuf,
-    /// Every process this script's run started, pinned while it was alive:
-    /// a test that fails before its stop leaves nothing running.
-    pins: std::sync::Mutex<Vec<ProcWatch>>,
+    /// The unit main `spawn_main` started (the reaper shim on the tag
+    /// backend), pinned while it is the test's own unreaped child.
+    main: Mutex<Option<ProcWatch>>,
+    /// The script's own bash, pinned as soon as it reports its pid.
+    agent: Mutex<Option<ProcWatch>>,
+    /// Everything else the script reported starting, pinned while alive.
+    pins: Mutex<Vec<ProcWatch>>,
 }
 
+/// A test that fails at any point leaves nothing running. The agent is
+/// killed first: a reaper shim main then kills the whole tree it holds,
+/// including what the script started before it reported its pids, and exits
+/// (bounded wait); then every pin, the main included, is killed.
 impl Drop for AgentScript {
     fn drop(&mut self) {
-        for watch in self.pins.lock().unwrap().iter() {
-            let _ = watch.signal(freshell_containment::Sig::Kill);
+        let main = take(&mut self.main);
+        let agent = take(&mut self.agent);
+        if let Some(agent) = &agent {
+            let _ = agent.signal(Sig::Kill);
+            if let Some(main) = main.as_ref().filter(|m| m.pid() != agent.pid()) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !main.has_exited() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        let pins = self.pins.get_mut().unwrap_or_else(PoisonError::into_inner);
+        for watch in main.iter().chain(pins.iter()) {
+            let _ = watch.signal(Sig::Kill);
         }
     }
+}
+
+fn take(slot: &mut Mutex<Option<ProcWatch>>) -> Option<ProcWatch> {
+    slot.get_mut()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
 }
 
 impl AgentScript {
@@ -125,6 +153,34 @@ impl AgentScript {
         if let Ok(watch) = ProcWatch::open(pid) {
             self.pins.lock().unwrap().push(watch);
         }
+    }
+
+    /// Pins the script's bash as soon as it reports its pid. The pinned
+    /// process is the bash only while it is the main itself or the main's
+    /// child (under the reaper shim); that is checked after the pin, and the
+    /// pin has not exited since, so the check refers to the pinned process.
+    async fn pin_agent(&self, main: &ProcWatch) {
+        let reported = self.dir.path().join("agent.pid");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let pid = loop {
+            let read = std::fs::read_to_string(&reported).ok();
+            if let Some(pid) = read.and_then(|raw| raw.trim().parse::<u32>().ok()) {
+                break pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the agent script never reported its pid"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let agent =
+            ProcWatch::open(pid).unwrap_or_else(|e| panic!("agent {pid} is not running: {e}"));
+        let ours = pid == main.pid() || process::parent(pid) == Some(main.pid());
+        assert!(
+            ours && !agent.has_exited(),
+            "process {pid} is not the agent this test started"
+        );
+        *self.agent.lock().unwrap() = Some(agent);
     }
 
     /// The copy the INT trap made of `AgentOpts::on_int_copy`.
@@ -170,6 +226,7 @@ pub fn agent_script(opts: &AgentOpts) -> AgentScript {
         r#"#!/bin/bash
 trap '{copy}echo INT >> "{marker}"; [ "{ei}" = 1 ] && exit 0' INT
 trap 'echo TERM >> "{marker}"; [ "{et}" = 1 ] && exit 0' TERM
+echo $$ > "{dir}/agent.pid.tmp" && mv "{dir}/agent.pid.tmp" "{dir}/agent.pid"
 perl -e 'use POSIX; POSIX::setsid(); exec "sleep", "600"' & S=$!
 perl -e 'setpgrp(0,0); sleep 600' & P=$!
 nohup sh -c 'sleep 600 & echo $! > "{dir}/nohup.pid"' >/dev/null 2>&1 &
@@ -215,6 +272,8 @@ while true; do sleep 1 & wait $!; done
         script,
         pids,
         marker,
+        main: Default::default(),
+        agent: Default::default(),
         pins: Default::default(),
     }
 }
@@ -225,9 +284,11 @@ pub async fn spawn_main(unit: &AgentUnit, s: &AgentScript) -> tokio::process::Ch
         .unwrap();
     cmd.kill_on_drop(false).stdin(std::process::Stdio::null());
     let child = cmd.spawn().unwrap();
+    // The test's own unreaped child: its pid names it until it is reaped.
     let main = ProcWatch::open(child.id().unwrap()).unwrap();
-    s.pins.lock().unwrap().push(main.clone());
-    unit.set_main(main);
+    *s.main.lock().unwrap() = Some(main.clone());
+    unit.set_main(main.clone());
+    s.pin_agent(&main).await;
     child
 }
 
@@ -236,7 +297,15 @@ pub async fn read_pids(s: &AgentScript) -> Pids {
     loop {
         if let Ok(raw) = std::fs::read_to_string(&s.pids) {
             let v: Vec<u32> = raw.split_whitespace().map(|x| x.parse().unwrap()).collect();
-            for pid in v.iter().copied().filter(|p| *p != 0) {
+            // Index 0 is the agent (pinned by `spawn_main`); index 11, the
+            // envless job's intermediate, has exited by design, so its pid
+            // may name another process by now.
+            for (_, pid) in v
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(i, pid)| *pid != 0 && *i != 0 && *i != 11)
+            {
                 s.pin(pid);
             }
             return Pids {
@@ -259,6 +328,59 @@ pub async fn read_pids(s: &AgentScript) -> Pids {
             "agent script never wrote its pids"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A plain child of the test (no unit placement), pinned while it is the
+/// test's own unreaped child, killed through that pin and reaped when
+/// dropped, so a failed assertion leaves nothing running.
+pub struct OwnChild {
+    child: std::process::Child,
+    watch: ProcWatch,
+}
+
+impl OwnChild {
+    pub fn spawn(cmd: &mut std::process::Command) -> Self {
+        let mut child = cmd.spawn().unwrap();
+        match ProcWatch::open(child.id()) {
+            Ok(watch) => Self { child, watch },
+            Err(err) => {
+                // Unreaped, so its pid still names it.
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("cannot pin the test's own child: {err}");
+            }
+        }
+    }
+
+    /// `sleep 600`.
+    pub fn sleep() -> Self {
+        Self::spawn(std::process::Command::new("sleep").arg("600"))
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn watch(&self) -> &ProcWatch {
+        &self.watch
+    }
+
+    pub fn wait(&mut self) -> std::process::ExitStatus {
+        self.child.wait().unwrap()
+    }
+
+    /// Kills it through its pin and reaps it.
+    pub fn kill_and_wait(&mut self) -> std::process::ExitStatus {
+        self.watch.signal(Sig::Kill).unwrap();
+        self.wait()
+    }
+}
+
+impl Drop for OwnChild {
+    fn drop(&mut self) {
+        let _ = self.watch.signal(Sig::Kill);
+        let _ = self.child.wait();
     }
 }
 

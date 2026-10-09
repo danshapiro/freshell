@@ -251,10 +251,7 @@ async fn boot_never_signals_a_recorded_root_whose_start_time_differs() {
     let (cap, _guard) = capture::install();
     let root = tempfile::tempdir().unwrap();
     for (name, c) in backends_with_state(root.path()) {
-        let mut sleep = std::process::Command::new("sleep")
-            .arg("600")
-            .spawn()
-            .unwrap();
+        let mut sleep = OwnChild::sleep();
         let pid = sleep.id();
         let start = process::start_time(pid).unwrap();
         let record = |roots: Vec<(u32, u64)>| UnitRecord {
@@ -319,12 +316,53 @@ async fn boot_never_signals_a_recorded_root_whose_start_time_differs() {
         .wait()
         .await;
         use std::os::unix::process::ExitStatusExt;
-        let status = sleep.wait().unwrap();
+        let status = sleep.wait();
         assert_eq!(
             status.signal(),
             Some(libc::SIGKILL),
             "{name}: the matching root is stopped"
         );
+    }
+}
+
+/// A child of the test, forked without exec, that only waits in pause(2):
+/// pinned while it is the test's own unreaped child, killed through that pin
+/// and reaped when dropped.
+struct ForkedPause {
+    pid: libc::pid_t,
+    watch: ProcWatch,
+}
+
+impl ForkedPause {
+    fn start() -> Self {
+        // SAFETY: the child only calls pause(2) (async-signal-safe) until
+        // the test kills it; it never returns into the test.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        assert!(pid > 0, "fork failed");
+        match ProcWatch::open(pid as u32) {
+            Ok(watch) => Self { pid, watch },
+            Err(err) => {
+                // SAFETY: our own unreaped child, so its pid still names it.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, std::ptr::null_mut(), 0);
+                }
+                panic!("cannot pin the forked child: {err}");
+            }
+        }
+    }
+}
+
+impl Drop for ForkedPause {
+    fn drop(&mut self) {
+        let _ = self.watch.signal(Sig::Kill);
+        // SAFETY: reaping our own child.
+        unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
     }
 }
 
@@ -338,23 +376,12 @@ async fn a_dropped_containment_frees_its_records_even_while_a_forked_child_holds
     for (name, a) in backends_with_state(root.path()) {
         let unit = a.create_unit(UnitId::mint(), label()).unwrap();
         let record = read_record(&record_path(root.path(), name, &unit));
-        // SAFETY: the child only calls pause(2) (async-signal-safe) until
-        // the test kills it; it never returns into the test.
-        let child = unsafe { libc::fork() };
-        if child == 0 {
-            loop {
-                unsafe { libc::pause() };
-            }
-        }
-        assert!(child > 0, "fork failed");
-        let forked = ProcWatch::open(child as u32).unwrap();
+        let forked = ForkedPause::start();
         drop(unit);
         drop(a);
         let c = rebuild(name, root.path());
         let found = c.recorded_units().unwrap();
-        forked.signal(Sig::Kill).unwrap();
-        // SAFETY: reaping our own child.
-        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        drop(forked);
         assert_eq!(found, vec![record], "{name}");
     }
 }
