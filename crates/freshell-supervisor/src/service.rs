@@ -2037,74 +2037,65 @@ impl Supervisor {
 
     /// Retry only a durable acceptance proof for this immutable incarnation.
     /// Running alone never authorizes completion of a resumed generation.
-    pub(crate) async fn complete_pending_provider_preparation(
+    pub(crate) fn complete_pending_provider_preparation<'a>(
+        &'a self,
+        handle: &'a crate::registry::OwnedRuntimeHandle,
+    ) -> impl std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a {
+        // Recovery embeds this operation on several branches. Keep the large
+        // provider completion future off the ordinary control-worker stack.
+        Box::pin(async move {
+            if !self
+                .registry
+                .provider_preparation_is_pending(handle.incarnation_id().clone())
+                .await
+                .map_err(map_registry)?
+            {
+                return Ok(());
+            }
+            if let Err(error) = self.commit_provider_preparation(handle).await {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.provider_preparation.pending",
+                    serde_json::json!({
+                        "severity":"error", "soulId":handle.soul_id(), "incarnationId":handle.incarnation_id(),
+                        "operation":"complete_accepted_generation", "errorCode":error.code,
+                    }),
+                );
+                return Err(error);
+            }
+            self.registry
+                .mark_provider_preparation_complete(handle.incarnation_id().clone())
+                .await
+                .map_err(map_registry)?;
+            append_event(
+                &self.config.lifecycle_log,
+                "supervisor.provider_preparation.completed",
+                serde_json::json!({
+                    "severity":"info", "soulId":handle.soul_id(), "incarnationId":handle.incarnation_id(),
+                }),
+            );
+            Ok(())
+        })
+    }
+
+    async fn commit_provider_preparation(
         &self,
         handle: &crate::registry::OwnedRuntimeHandle,
     ) -> Result<(), RuntimeError> {
-        if !self
-            .registry
-            .provider_preparation_is_pending(handle.incarnation_id().clone())
-            .await
-            .map_err(map_registry)?
-        {
-            return Ok(());
-        }
-        let workload = LaunchWorkload {
-            soul_id: handle.soul_id().clone(),
-            fixture: handle.fixture(),
-            terminal: handle.terminal().cloned(),
-            fresh_agent: handle.fresh_agent().cloned(),
-            resume_spec: None,
-        };
-        if let Err(error) = self
-            .commit_provider_preparation(&workload, handle.incarnation_id())
-            .await
-        {
-            append_event(
-                &self.config.lifecycle_log,
-                "supervisor.provider_preparation.pending",
-                serde_json::json!({
-                    "severity":"error", "soulId":handle.soul_id(), "incarnationId":handle.incarnation_id(),
-                    "operation":"complete_accepted_generation", "errorCode":error.code,
-                }),
-            );
-            return Err(error);
-        }
-        self.registry
-            .mark_provider_preparation_complete(handle.incarnation_id().clone())
-            .await
-            .map_err(map_registry)?;
-        append_event(
-            &self.config.lifecycle_log,
-            "supervisor.provider_preparation.completed",
-            serde_json::json!({
-                "severity":"info", "soulId":handle.soul_id(), "incarnationId":handle.incarnation_id(),
-            }),
-        );
-        Ok(())
-    }
-
-    pub(crate) async fn commit_provider_preparation(
-        &self,
-        workload: &LaunchWorkload,
-        incarnation: &IncarnationId,
-    ) -> Result<(), RuntimeError> {
-        let context = workload
-            .terminal
-            .as_ref()
+        let context = handle
+            .terminal()
             .and_then(|terminal| terminal.provider_launch_context.as_ref())
             .or_else(|| {
-                workload
-                    .fresh_agent
-                    .as_ref()
+                handle
+                    .fresh_agent()
                     .and_then(|agent| agent.provider_launch_context.as_ref())
             });
         if let Some(capability) = context.and_then(|context| context.mcp_capability.as_ref()) {
             self.notify_mcp_capability(
                 "commit",
                 &capability.endpoint,
-                &workload.soul_id,
-                incarnation,
+                handle.soul_id(),
+                handle.incarnation_id(),
                 &capability.grant_id,
             )
             .await?;
@@ -2113,13 +2104,8 @@ impl Supervisor {
             .and_then(|context| context.prepared_inputs.as_ref())
             .is_some()
         {
-            let handle = self
-                .registry
-                .owned_handle(incarnation.clone())
-                .await
-                .map_err(map_registry)?;
             self.backend
-                .commit_prepared_inputs(&handle)
+                .commit_prepared_inputs(handle)
                 .await
                 .map_err(map_backend)?;
             // The pending flag is armed atomically with initial acceptance or
@@ -2127,18 +2113,18 @@ impl Supervisor {
             // gates while finishing interrupted release/retirement.
             if let Some(prior) = self
                 .registry
-                .prior_provider_owner(incarnation.clone())
+                .prior_provider_owner(handle.incarnation_id().clone())
                 .await
                 .map_err(map_registry)?
             {
                 self.backend
-                    .retire_prior_prepared_inputs(&handle, &prior)
+                    .retire_prior_prepared_inputs(handle, &prior)
                     .await
                     .map_err(map_backend)?;
             }
         }
         if let Some(inputs) = context.and_then(|context| context.prepared_inputs.as_ref()) {
-            self.commit_provider_path_inputs(&workload.soul_id, &inputs.generation_id);
+            self.commit_provider_path_inputs(handle.soul_id(), &inputs.generation_id);
         }
         Ok(())
     }

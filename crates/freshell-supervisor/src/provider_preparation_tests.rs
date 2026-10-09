@@ -280,7 +280,41 @@ impl RuntimeBackend for Backend {
     }
 }
 
-#[tokio::test]
+async fn control_recover(
+    socket: &std::path::Path,
+    request: RecoverRequest,
+) -> Result<RecoveryResult, RuntimeError> {
+    let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+    let mut envelope = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::Recover(request),
+    );
+    envelope.auth = Some("synthetic-control-secret".into());
+    write_frame(&mut stream, &envelope).await.unwrap();
+    let reply: AdminReply = read_frame(&mut stream).await.unwrap();
+    match reply.result? {
+        AdminResult::Recovery(result) => Ok(result),
+        _ => panic!("unexpected actual control recovery reply"),
+    }
+}
+
+async fn control_listener(supervisor: &Supervisor) -> tokio::task::JoinHandle<()> {
+    let owner = supervisor.clone();
+    let path = supervisor.config.control_socket_path.clone();
+    let socket = path.clone();
+    let task = tokio::spawn(async move { serve_control(owner, &socket).await.unwrap() });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_accepted_completion_retries_after_registry_success_on_fresh_healthy_startup() {
     for failure in ["controller", "publisher", "retire"] {
         let temp = tempfile::tempdir().unwrap();
@@ -429,7 +463,8 @@ async fn provider_accepted_completion_retries_after_registry_success_on_fresh_he
             expected_intent_revision: None,
             expected_control_epoch: None,
         };
-        let failed = supervisor.recover(request()).await;
+        let control = control_listener(&supervisor).await;
+        let failed = control_recover(&supervisor.config.control_socket_path, request()).await;
         assert!(
             failed.is_err(),
             "injected post-success completion failure must reach actual recovery owner"
@@ -447,6 +482,9 @@ async fn provider_accepted_completion_retries_after_registry_success_on_fresh_he
         assert_eq!(view.native_session_id.as_deref(), Some("ses_exact"));
         assert_eq!(daemon.lock().unwrap().generations.len(), 2);
         assert_eq!(daemon.lock().unwrap().grants, 2);
+        control.abort();
+        let _ = control.await;
+        std::fs::remove_file(&supervisor.config.control_socket_path).unwrap();
         drop(supervisor);
         drop(registry);
         let registry = Registry::open(&root, None).unwrap();
@@ -475,8 +513,12 @@ async fn provider_accepted_completion_retries_after_registry_success_on_fresh_he
             "accepted B publisher must be released"
         );
         let events_before = daemon.lock().unwrap().events.len();
+        let control = control_listener(&cold).await;
         assert_eq!(
-            cold.recover(request()).await.unwrap().outcome,
+            control_recover(&cold.config.control_socket_path, request())
+                .await
+                .unwrap()
+                .outcome,
             RecoveryOutcome::Reattached
         );
         assert_eq!(
@@ -489,7 +531,9 @@ async fn provider_accepted_completion_retries_after_registry_success_on_fresh_he
             .unwrap()
             .running
             .remove(after.incarnation_id());
-        let next = cold.recover(request()).await.unwrap();
+        let next = control_recover(&cold.config.control_socket_path, request())
+            .await
+            .unwrap();
         assert_eq!(
             next.outcome,
             RecoveryOutcome::Replaced,
@@ -500,6 +544,8 @@ async fn provider_accepted_completion_retries_after_registry_success_on_fresh_he
             BTreeSet::from(["grant-3".into()])
         );
         assert_eq!(daemon.lock().unwrap().grants, 3);
+        control.abort();
+        let _ = control.await;
         drop(cold);
         drop(registry);
         callback_task.abort();
