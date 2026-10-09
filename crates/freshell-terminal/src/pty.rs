@@ -239,6 +239,25 @@ impl PtyTerminal {
             }
             Err(err) => return Err(to_io(err)),
         };
+        // The child starts with the server's original open-file soft limit,
+        // not the raised one the server runs with (`child_nofile`):
+        // portable-pty has no pre-exec hook, so it is set right after the
+        // spawn. A child that already exited needs nothing.
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = child.process_id() {
+            match freshell_platform::child_nofile::restore_for_pid(pid) {
+                Ok(()) => {}
+                Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(err) => tracing::warn!(
+                    component = "terminal-pty",
+                    event = "terminal_child_nofile_restore_failed",
+                    terminal_id = %terminal_id,
+                    pid,
+                    error = %err,
+                    "terminal child keeps the server's raised open-file limit"
+                ),
+            }
+        }
         // Drop the parent's slave handle so the master EOFs once the child exits.
         drop(pair.slave);
 

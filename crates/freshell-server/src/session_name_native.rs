@@ -1088,6 +1088,7 @@ impl ClaudeNativeNameAdapter {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true); // leak-safety backstop; the explicit kill/wait below still owns cleanup
+        freshell_platform::child_nofile::restore_in_child(command.as_std_mut());
         let mut child = command.spawn().map_err(|e| {
             format!(
                 "claude session-names helper spawn failed ({} {}): {e}",

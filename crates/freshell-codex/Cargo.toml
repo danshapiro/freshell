@@ -42,6 +42,9 @@ default = []
 real-transport = ["dep:tokio-tungstenite", "dep:futures-util", "dep:libc", "tokio/net", "tokio/io-util", "tokio/process"]
 
 [dependencies]
+# `child_nofile`: the app-server sidecar starts with the server's original
+# open-file soft limit, not the raised one the server runs with.
+freshell-platform = { path = "../freshell-platform" }
 # Derive for the durable sidecar record rows (`sidecar_store`) — the versioned
 # camelCase JSON schema a restarted server reads back (BindingRow precedent,
 # pane_ledger.rs:93-130).

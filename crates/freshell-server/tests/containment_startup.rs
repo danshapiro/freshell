@@ -10,7 +10,9 @@
 //!    facilities every confirmed stop rests on (pidfd and
 //!    `/proc/<pid>/task/<tid>/children`), plus a stderr line cloud e2e logs carry;
 //! 3. it raises its open-file soft limit to the hard limit, so fd exhaustion
-//!    under the common 1024 default cannot surface as stop errors.
+//!    under the common 1024 default cannot surface as stop errors, while
+//!    every child it starts (a shell pane, an ordinary helper process) still
+//!    starts with the soft limit the server itself was started with.
 //!
 //! Harness conventions are intentionally duplicated from
 //! `diag01_lifecycle_logging.rs` (this repo's black-box test files each carry
@@ -318,6 +320,74 @@ async fn connect_ready(port: u16) -> WsStream {
     ws
 }
 
+/// Creates a plain shell terminal and returns its terminal id and the
+/// shell's pid (read from the server's `terminal.created` log line).
+async fn create_shell(ws: &mut WsStream, home: &Path) -> (String, u32) {
+    let request_id = format!("containment-startup-{}", uuid::Uuid::new_v4());
+    send_json(
+        ws,
+        &serde_json::json!({
+            "type": "terminal.create",
+            "requestId": request_id,
+            "mode": "shell",
+            "shell": "system",
+        }),
+    )
+    .await;
+    let created =
+        wait_for_any_message_type(ws, &["terminal.created", "error"], Duration::from_secs(15))
+            .await
+            .expect("expected terminal.created");
+    assert_eq!(
+        created.0, "terminal.created",
+        "create must succeed: {created:?}"
+    );
+    let terminal_id = created.1["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+
+    let created_line = wait_for_log_line(home, Duration::from_secs(5), |l| {
+        l["msg"].as_str() == Some("terminal.created")
+            && l["terminal_id"].as_str() == Some(terminal_id.as_str())
+    })
+    .await
+    .expect("terminal.created must be logged with the shell's pid");
+    let shell_pid = created_line["pid"].as_u64().expect("terminal.created pid") as u32;
+    (terminal_id, shell_pid)
+}
+
+async fn kill_terminal(ws: &mut WsStream, terminal_id: &str) {
+    send_json(
+        ws,
+        &serde_json::json!({ "type": "terminal.kill", "terminalId": terminal_id }),
+    )
+    .await;
+}
+
+/// Starts the server with its soft open-file limit lowered to `soft` (the
+/// hard limit is unchanged).
+fn start_with_soft_nofile(cmd: &mut Command, soft: u64) {
+    // SAFETY: the closure runs between fork and exec and makes only the
+    // getrlimit/setrlimit system calls on a stack value.
+    unsafe {
+        cmd.pre_exec(move || {
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            lim.rlim_cur = soft as libc::rlim_t;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// The NUL-separated `KEY=VALUE` entries of a process's environment.
 fn environ_entries(pid: u32) -> Vec<String> {
     let raw = std::fs::read(format!("/proc/{pid}/environ")).expect("read shell environ");
@@ -341,48 +411,11 @@ async fn the_server_never_passes_an_inherited_unit_tag_to_its_children() {
     let mut boot = boot(cmd, port).await;
 
     let mut ws = connect_ready(boot.port).await;
-    let request_id = format!("containment-startup-{}", uuid::Uuid::new_v4());
-    send_json(
-        &mut ws,
-        &serde_json::json!({
-            "type": "terminal.create",
-            "requestId": request_id,
-            "mode": "shell",
-            "shell": "system",
-        }),
-    )
-    .await;
-    let created = wait_for_any_message_type(
-        &mut ws,
-        &["terminal.created", "error"],
-        Duration::from_secs(15),
-    )
-    .await
-    .expect("expected terminal.created");
-    assert_eq!(
-        created.0, "terminal.created",
-        "create must succeed: {created:?}"
-    );
-    let terminal_id = created.1["terminalId"]
-        .as_str()
-        .expect("terminalId")
-        .to_string();
-
-    let created_line = wait_for_log_line(home.path(), Duration::from_secs(5), |l| {
-        l["msg"].as_str() == Some("terminal.created")
-            && l["terminal_id"].as_str() == Some(terminal_id.as_str())
-    })
-    .await
-    .expect("terminal.created must be logged with the shell's pid");
-    let shell_pid = created_line["pid"].as_u64().expect("terminal.created pid") as u32;
+    let (terminal_id, shell_pid) = create_shell(&mut ws, home.path()).await;
     let environ = environ_entries(shell_pid);
 
     // Stop the shell before asserting, so a failure leaves nothing running.
-    send_json(
-        &mut ws,
-        &serde_json::json!({ "type": "terminal.kill", "terminalId": terminal_id }),
-    )
-    .await;
+    kill_terminal(&mut ws, &terminal_id).await;
     ws.close(None).await.ok();
     sigterm_and_reap(&mut boot).await;
 
@@ -457,23 +490,7 @@ async fn the_server_raises_its_open_file_soft_limit() {
     let home = tempfile::tempdir().expect("create temp home");
     let port = allocate_ephemeral_port();
     let mut cmd = server_command(&server_binary, home.path(), port);
-    // Start the server with a low soft limit (the hard limit is unchanged).
-    unsafe {
-        cmd.pre_exec(|| {
-            let mut lim = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            lim.rlim_cur = LOWERED_SOFT as libc::rlim_t;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    start_with_soft_nofile(&mut cmd, LOWERED_SOFT);
     let mut boot = boot(cmd, port).await;
     let (soft, hard) = nofile_limits(boot.child.id());
     sigterm_and_reap(&mut boot).await;
@@ -491,4 +508,69 @@ async fn the_server_raises_its_open_file_soft_limit() {
     assert_eq!(checks[0]["nofile_soft_before"].as_u64(), Some(LOWERED_SOFT));
     assert_eq!(checks[0]["nofile_soft_after"].as_u64(), Some(hard));
     assert_eq!(checks[0]["nofile_error"].as_str(), Some(""));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_servers_children_start_with_its_original_open_file_soft_limit() {
+    const LOWERED_SOFT: u64 = 256;
+    let server_binary = discover_server_binary();
+    let home = tempfile::tempdir().expect("create temp home");
+    let port = allocate_ephemeral_port();
+    let mut cmd = server_command(&server_binary, home.path(), port);
+    start_with_soft_nofile(&mut cmd, LOWERED_SOFT);
+    let mut boot = boot(cmd, port).await;
+    let (server_soft, hard) = nofile_limits(boot.child.id());
+
+    // A PTY child: a plain shell pane.
+    let mut ws = connect_ready(boot.port).await;
+    let (terminal_id, shell_pid) = create_shell(&mut ws, home.path()).await;
+    let shell_limits = nofile_limits(shell_pid);
+
+    // An ordinary (tokio `Command`) child: the exec route runs `bash -lc`,
+    // which reads its own row of `/proc/<pid>/limits`.
+    let exec = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{}/api/fresh-agent/exec",
+            boot.port
+        ))
+        .header("x-auth-token", AUTH_TOKEN)
+        .json(&serde_json::json!({
+            "command": "grep 'Max open files' /proc/$$/limits",
+            "cwd": home.path(),
+        }))
+        .send()
+        .await
+        .expect("exec request");
+    let exec_status = exec.status();
+    let exec_body: serde_json::Value = exec.json().await.expect("exec answers JSON");
+
+    // Stop the shell and the server before asserting.
+    kill_terminal(&mut ws, &terminal_id).await;
+    ws.close(None).await.ok();
+    sigterm_and_reap(&mut boot).await;
+
+    assert!(
+        hard > LOWERED_SOFT,
+        "the test needs a hard limit above {LOWERED_SOFT} (got {hard})"
+    );
+    assert_eq!(server_soft, hard, "the server itself runs raised");
+    assert!(exec_status.is_success(), "exec: {exec_status} {exec_body}");
+    let output = exec_body["output"].as_str().expect("exec output");
+    let row = output
+        .lines()
+        .find(|l| l.starts_with("Max open files"))
+        .unwrap_or_else(|| panic!("the exec child printed its limits: {exec_body}"));
+    let cols: Vec<&str> = row.split_whitespace().collect();
+    let exec_limits: (u64, u64) = (
+        cols[3].parse().expect("numeric soft limit"),
+        cols[4].parse().expect("numeric hard limit"),
+    );
+    assert_eq!(
+        [("shell pane", shell_limits), ("exec child", exec_limits)],
+        [
+            ("shell pane", (LOWERED_SOFT, hard)),
+            ("exec child", (LOWERED_SOFT, hard))
+        ],
+        "every child must start with the server's original soft limit"
+    );
 }

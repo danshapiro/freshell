@@ -294,6 +294,7 @@ async fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    freshell_platform::child_nofile::restore_in_child(cmd.as_std_mut());
     let first_arg = args.first().copied().unwrap_or("");
     let output = cmd
         .output()

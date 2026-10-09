@@ -867,12 +867,10 @@ fn git_common_dir(workspace: &Path) -> Option<PathBuf> {
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(cwd).args(args);
+    freshell_platform::child_nofile::restore_in_child(&mut cmd);
+    let output = cmd.output().ok()?;
     output
         .status
         .success()

@@ -13,5 +13,10 @@ publish.workspace = true
 percent-encoding = "2"
 serde_json = { workspace = true }
 
+# `child_nofile`: the open-file soft limit children start with (setrlimit in
+# a pre-exec step, prlimit for a PTY child). Already in the workspace lock.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

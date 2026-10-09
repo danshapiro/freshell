@@ -87,16 +87,24 @@ fn spawn_grandchild_cmd(command: &str) -> u32 {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn exited_fires_for_a_non_child_when_it_exits() {
-    let pid = spawn_grandchild("0.4");
+    const LIFETIME: Duration = Duration::from_millis(400);
+    // Measured from before the spawn: the process cannot exit sooner than
+    // LIFETIME after this instant, however slowly the spawn and open run.
+    let t0 = Instant::now();
+    let pid = spawn_grandchild(&format!("{}", LIFETIME.as_secs_f64()));
     let watch = ProcWatch::open(pid).expect("open");
     assert!(!watch.has_exited());
-    let t0 = Instant::now();
     tokio::time::timeout(Duration::from_secs(5), watch.exited())
         .await
         .expect("exit event")
         .expect("watch registered");
     assert!(watch.has_exited());
-    assert!(t0.elapsed() >= Duration::from_millis(300));
+    // `exited` waited for the exit rather than resolving at once.
+    assert!(
+        t0.elapsed() >= LIFETIME,
+        "resolved after {:?}",
+        t0.elapsed()
+    );
 }
 
 #[cfg(unix)]

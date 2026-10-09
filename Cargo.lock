@@ -1306,6 +1306,7 @@ dependencies = [
 name = "freshell-codex"
 version = "0.1.0"
 dependencies = [
+ "freshell-platform",
  "futures-util",
  "libc",
  "serde",
@@ -1396,6 +1397,7 @@ dependencies = [
 name = "freshell-platform"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "percent-encoding",
  "serde_json",
  "tempfile",

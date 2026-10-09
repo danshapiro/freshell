@@ -310,7 +310,9 @@ struct ExecOutcome {
 ///   `Arc<Mutex<Vec<u8>>>` buffers survive the 30 s `tokio::time::timeout`
 ///   arm that takes the kill path, mirroring Node buffering up to the kill.
 async fn run_command(command: &str, cwd: &str) -> ExecOutcome {
-    let spawned = tokio::process::Command::new("bash")
+    let mut cmd = tokio::process::Command::new("bash");
+    freshell_platform::child_nofile::restore_in_child(cmd.as_std_mut());
+    let spawned = cmd
         .arg("-lc")
         .arg(command)
         .current_dir(cwd)
@@ -466,6 +468,7 @@ async fn run_git_diff(cwd: &str, file_path: Option<&str>) -> Result<String, Stri
         // null-vs-Node's-open-pipe is observationally equivalent here;
         // null avoids holding a dead write end for the child's lifetime.
         .stdin(std::process::Stdio::null());
+    freshell_platform::child_nofile::restore_in_child(cmd.as_std_mut());
     let mut child = cmd.spawn().map_err(|e| format!("git diff failed: {e}"))?;
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");

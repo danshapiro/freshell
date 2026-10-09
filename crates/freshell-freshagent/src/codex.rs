@@ -7163,6 +7163,7 @@ impl FreshCodexState {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd.kill_on_drop(true);
+        freshell_platform::child_nofile::restore_in_child(cmd.as_std_mut());
 
         let mut child = cmd
             .spawn()

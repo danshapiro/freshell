@@ -353,12 +353,13 @@ fn run_path_conversion(program: &str, args: &[&str]) -> Option<String> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    let child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    crate::child_nofile::restore_in_child(&mut cmd);
+    let child = cmd.spawn();
     let Ok(mut child) = child else {
         return None;
     };

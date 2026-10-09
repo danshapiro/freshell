@@ -1189,6 +1189,9 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            // Started with the server's original open-file soft limit, not
+            // the raised one the server runs with.
+            freshell_platform::child_nofile::restore_in_child(cmd.as_std_mut());
 
             // Detach CONDITIONALLY — only when the sidecar will actually be
             // TRACKED (kata ynfn: "surviving restarts is a feature"; Node

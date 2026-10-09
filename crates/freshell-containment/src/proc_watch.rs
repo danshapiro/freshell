@@ -117,11 +117,15 @@ impl ProcWatch {
     }
 
     /// Resolves when the process exits. Event-driven (pidfd readiness in the
-    /// tokio reactor); must be awaited inside a tokio runtime, and one watch
-    /// is awaited within one runtime (its registration belongs to the runtime
-    /// of its first await). An `Err` means the watch could not be registered
-    /// (for example fd exhaustion) and the caller treats it as a stop error;
-    /// this never panics.
+    /// tokio reactor).
+    ///
+    /// Precondition: awaited inside a tokio runtime with IO enabled, and one
+    /// watch is awaited within one runtime (its registration belongs to the
+    /// runtime of its first await). Awaited outside such a runtime, tokio
+    /// panics while registering. Within it, a watch that cannot be registered
+    /// (for example when no file descriptor is left) answers `Err` instead of
+    /// panicking, the caller treats it as a stop error, and a later await
+    /// tries the registration again.
     pub async fn exited(&self) -> io::Result<()> {
         use tokio::io::unix::AsyncFd;
         use tokio::io::Interest;

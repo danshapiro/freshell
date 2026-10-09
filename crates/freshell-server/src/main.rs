@@ -788,10 +788,16 @@ async fn main() -> ExitCode {
     // Containment prelude, before any task, thread or child is started: a
     // server started from inside an agent pane inherits that pane's unit tag
     // and would hand it to every terminal and sidecar it starts, so remove it;
-    // and raise the open-file soft limit (every exit watch holds a pidfd).
-    // Both results are logged by the self-check once logging is up.
+    // and raise the open-file soft limit (every exit watch holds a pidfd),
+    // recording the original so every child starts with it, as before the
+    // raise. Both results are logged by the self-check once logging is up.
     let removed_unit_tags = freshell_containment::startup::strip_inherited_unit_tags();
     let nofile_limit = freshell_containment::startup::raise_nofile_limit();
+    if let Ok((soft_before, soft_after)) = nofile_limit {
+        if soft_after > soft_before {
+            freshell_platform::child_nofile::record_original_soft_limit(soft_before);
+        }
+    }
 
     // AUTH_TOKEN is mandatory — refuse to start without it (matches the original).
     let auth_token = match std::env::var("AUTH_TOKEN") {

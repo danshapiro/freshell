@@ -51,6 +51,7 @@
 //! injected source ([`Env`], [`FileProbe`], [`path::WslPathResolver`]). Thin `*_live`
 //! wrappers at the edges perform the real reads and delegate to the pure core.
 
+pub mod child_nofile;
 pub mod cli_launch;
 pub mod clock;
 pub mod detect;
@@ -342,13 +343,13 @@ impl CommandRunner for StdCommandRunner {
         use std::io::Read;
         use std::process::{Command, Stdio};
 
-        let mut child = match Command::new(command)
-            .args(args)
+        let mut cmd = Command::new(command);
+        cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        crate::child_nofile::restore_in_child(&mut cmd);
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return CommandOutput::spawn_failure(e.to_string()),
         };

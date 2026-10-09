@@ -320,14 +320,14 @@ fn resolve_git_branch(checkout_root: &str) -> Option<String> {
 /// EVERY invocation sets GIT_OPTIONAL_LOCKS=0 (validator-A7) so the Task 18
 /// polling loop can never keep rewriting .git/index.
 fn run_git(dir: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
+        .stdin(std::process::Stdio::null());
+    crate::child_nofile::restore_in_child(&mut cmd);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
