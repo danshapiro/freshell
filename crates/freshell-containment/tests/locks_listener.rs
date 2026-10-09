@@ -1,0 +1,247 @@
+#![cfg(target_os = "linux")]
+//! Lock holders are the processes whose file descriptors carry the lock
+//! (fdinfo `lock:` lines), never the lock table's pid column and never the
+//! lock file's existence; the app-server main process is whoever owns the
+//! listening socket. Every process here is spawned and killed by the test.
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use freshell_containment::{
+    codex_thread_lock_path, listening_socket_owner, lock_holders, lock_holders_among, process,
+    LockHolder, ProcWatch, Sig,
+};
+
+/// Test-only bounded wait (product code never polls).
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The test's own child, killed and reaped when dropped, so a failed
+/// assertion leaves nothing running.
+struct OwnChild(Child);
+
+impl OwnChild {
+    fn spawn(cmd: &mut Command) -> Self {
+        Self(cmd.spawn().expect("spawn test child"))
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// The first line the child prints (empty at end of output).
+    fn read_line(&mut self) -> String {
+        let out = self.0.stdout.as_mut().expect("stdout is piped");
+        let mut line = String::new();
+        BufReader::new(out)
+            .read_line(&mut line)
+            .expect("read child stdout");
+        line.trim_end().to_string()
+    }
+
+    fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for OwnChild {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// A grandchild pinned by pidfd while its parent (the test's child) was
+/// alive; SIGKILLed when dropped. Never reaches a recycled pid.
+struct PinnedGrandchild(ProcWatch);
+
+impl PinnedGrandchild {
+    fn kill(&self) {
+        let _ = self.0.signal(Sig::Kill);
+    }
+}
+
+impl Drop for PinnedGrandchild {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+fn holder(pid: u32, name: &str, path: &Path) -> LockHolder {
+    LockHolder {
+        pid,
+        name: name.to_string(),
+        path: path.to_path_buf(),
+    }
+}
+
+fn sorted(mut holders: Vec<LockHolder>) -> Vec<LockHolder> {
+    holders.sort_by_key(|h| h.pid);
+    holders
+}
+
+#[test]
+fn codex_lock_path_layout() {
+    let p = codex_thread_lock_path(std::path::Path::new("/h/.codex"), "01a1");
+    assert_eq!(
+        p,
+        std::path::PathBuf::from("/h/.codex/thread-writer-locks/01a1.lock")
+    );
+}
+
+#[test]
+fn lock_holders_ignores_missing_paths() {
+    assert!(lock_holders(&[std::path::PathBuf::from("/nonexistent/x.lock")]).is_empty());
+}
+
+#[tokio::test]
+async fn lock_holders_attributes_a_lock_to_the_process_holding_its_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("t.lock");
+    std::fs::write(&lock, b"").unwrap();
+    assert!(
+        lock_holders(std::slice::from_ref(&lock)).is_empty(),
+        "an existing, unlocked file has no holders"
+    );
+
+    // One long-lived pid owns the only descriptor; the lock was taken by a
+    // `flock(1)` helper that has exited (the realistic fake's shape), so the
+    // lock table's pid column names a dead process.
+    let mut child = OwnChild::spawn(
+        Command::new("sh")
+            .args([
+                "-c",
+                r#"exec 3>>"$0"; flock -x -n 3 || exit 1; echo locked; exec sleep 600"#,
+            ])
+            .arg(&lock)
+            .stdout(Stdio::piped()),
+    );
+    assert_eq!(child.read_line(), "locked", "the holder took the lock");
+    let pid = child.pid();
+    eventually("the holder execs sleep", || {
+        process::name(pid).is_ok_and(|n| n == "sleep")
+    })
+    .await;
+
+    let expected = vec![holder(pid, "sleep", &lock)];
+    assert_eq!(lock_holders(std::slice::from_ref(&lock)), expected);
+    assert_eq!(
+        lock_holders_among(std::slice::from_ref(&lock), &[pid]),
+        expected
+    );
+    assert!(
+        lock_holders_among(std::slice::from_ref(&lock), &[std::process::id()]).is_empty(),
+        "a process without the descriptor is not a holder"
+    );
+
+    child.kill();
+    eventually("the lock is released with its holder", || {
+        lock_holders(std::slice::from_ref(&lock)).is_empty()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_lock_shared_by_two_processes_stays_held_until_both_are_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("t.lock");
+    std::fs::write(&lock, b"").unwrap();
+
+    // `flock FILE cmd` keeps its descriptor and its `cmd` child inherits it:
+    // both hold the same lock.
+    let mut flock = OwnChild::spawn(
+        Command::new("flock")
+            .arg("-x")
+            .arg(&lock)
+            .args(["sleep", "600"]),
+    );
+    let flock_pid = flock.pid();
+    eventually("flock starts its child", || {
+        !process::children(flock_pid).is_empty()
+    })
+    .await;
+    let sleep_pid = process::children(flock_pid)[0];
+    // Pinned while its parent (the test's child) is alive, before anything
+    // can fail, so a failed assertion never leaves it running.
+    let sleep = PinnedGrandchild(ProcWatch::open(sleep_pid).expect("pin the sleep child"));
+    eventually("the child execs sleep", || {
+        process::name(sleep_pid).is_ok_and(|n| n == "sleep")
+    })
+    .await;
+
+    eventually("the lock is taken", || {
+        !lock_holders(std::slice::from_ref(&lock)).is_empty()
+    })
+    .await;
+    assert_eq!(
+        sorted(lock_holders(std::slice::from_ref(&lock))),
+        sorted(vec![
+            holder(flock_pid, "flock", &lock),
+            holder(sleep_pid, "sleep", &lock),
+        ])
+    );
+
+    flock.kill();
+    assert_eq!(
+        lock_holders(std::slice::from_ref(&lock)),
+        vec![holder(sleep_pid, "sleep", &lock)],
+        "the lock stays held while the child keeps the descriptor"
+    );
+
+    sleep.kill();
+    tokio::time::timeout(Duration::from_secs(10), sleep.0.exited())
+        .await
+        .expect("the sleep child exits")
+        .expect("exit watch");
+    eventually("the lock is released when its last holder is gone", || {
+        lock_holders(std::slice::from_ref(&lock)).is_empty()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn listening_socket_owner_finds_only_a_listener_inside_the_candidates_trees() {
+    // A wrapper whose `node` child owns the listener (the launcher -> native
+    // shape). Node picks a free port and prints it, so no port is guessed.
+    let mut wrapper = OwnChild::spawn(
+        Command::new("sh")
+            .args([
+                "-c",
+                r#"node -e "const s = require('net').createServer().listen(0, '127.0.0.1', () => console.log(s.address().port))" & wait"#,
+            ])
+            .stdout(Stdio::piped()),
+    );
+    let port: u16 = wrapper
+        .read_line()
+        .parse()
+        .expect("node prints its listening port");
+    let wrapper_pid = wrapper.pid();
+    // Pinned while its parent (the test's child) is alive, before anything
+    // can fail, so a failed assertion never leaves it running.
+    let node_pid = *process::children(wrapper_pid)
+        .first()
+        .expect("node is the wrapper's child");
+    let node = PinnedGrandchild(ProcWatch::open(node_pid).expect("pin the node child"));
+    assert_eq!(process::name(node_pid).unwrap(), "node");
+
+    assert_eq!(
+        listening_socket_owner(port, &[wrapper_pid]),
+        Some(node_pid),
+        "the listener's owner is the wrapper's node child, not the wrapper"
+    );
+
+    // Another pane's unit: the listener answers, but not from its tree.
+    let other = OwnChild::spawn(Command::new("sleep").arg("600"));
+    std::net::TcpStream::connect(("127.0.0.1", port)).expect("the listener answers connections");
+    assert_eq!(listening_socket_owner(port, &[other.pid()]), None);
+
+    node.kill();
+    wrapper.kill();
+    drop(other);
+}
