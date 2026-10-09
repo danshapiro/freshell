@@ -311,8 +311,8 @@ impl DockerEngineBackend {
         }
         verify_inspect_config(handle, &value)?;
         let mounts = match (handle.terminal(), handle.fresh_agent()) {
-            (Some(terminal), None) => Some(docker::terminal_mounts(terminal)),
-            (None, Some(agent)) => Some(docker::fresh_agent_mounts(agent)),
+            (Some(terminal), None) => Some(docker::terminal_mounts_for_adoption(terminal)),
+            (None, Some(agent)) => Some(docker::fresh_agent_mounts_for_adoption(agent)),
             _ => None,
         }
         .transpose()
@@ -1434,13 +1434,13 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
         ));
     }
     if let Some(terminal) = handle.terminal() {
-        let expected =
-            docker::terminal_mounts(terminal).map_err(BackendError::OwnershipMismatch)?;
+        let expected = docker::terminal_mounts_for_adoption(terminal)
+            .map_err(BackendError::OwnershipMismatch)?;
         verify_workload_mounts(mounts, &expected)?;
     }
     if let Some(agent) = handle.fresh_agent() {
-        let expected =
-            docker::fresh_agent_mounts(agent).map_err(BackendError::OwnershipMismatch)?;
+        let expected = docker::fresh_agent_mounts_for_adoption(agent)
+            .map_err(BackendError::OwnershipMismatch)?;
         verify_workload_mounts(mounts, &expected)?;
     }
     Ok(())

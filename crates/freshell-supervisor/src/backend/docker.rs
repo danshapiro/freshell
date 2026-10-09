@@ -52,7 +52,26 @@ pub struct ResolvedProviderConfigBind {
     pub reference: freshell_runtime_protocol::ProviderConfigBind,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MountPurpose {
+    Create,
+    Adopt,
+}
+
 pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, String> {
+    terminal_mounts_for(spec, MountPurpose::Create)
+}
+
+pub(super) fn terminal_mounts_for_adoption(
+    spec: &TerminalLaunchSpec,
+) -> Result<TerminalMounts, String> {
+    terminal_mounts_for(spec, MountPurpose::Adopt)
+}
+
+fn terminal_mounts_for(
+    spec: &TerminalLaunchSpec,
+    purpose: MountPurpose,
+) -> Result<TerminalMounts, String> {
     workload_mounts(
         &spec.workspace_path,
         &spec.cwd,
@@ -61,10 +80,24 @@ pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, Stri
         &spec.provider_secret_references,
         spec.provider_launch_context.as_ref(),
         &spec.mode,
+        purpose,
     )
 }
 
 pub fn fresh_agent_mounts(spec: &FreshAgentLaunchSpec) -> Result<TerminalMounts, String> {
+    fresh_agent_mounts_for(spec, MountPurpose::Create)
+}
+
+pub(super) fn fresh_agent_mounts_for_adoption(
+    spec: &FreshAgentLaunchSpec,
+) -> Result<TerminalMounts, String> {
+    fresh_agent_mounts_for(spec, MountPurpose::Adopt)
+}
+
+fn fresh_agent_mounts_for(
+    spec: &FreshAgentLaunchSpec,
+    purpose: MountPurpose,
+) -> Result<TerminalMounts, String> {
     workload_mounts(
         &spec.workspace_path,
         &spec.cwd,
@@ -73,6 +106,7 @@ pub fn fresh_agent_mounts(spec: &FreshAgentLaunchSpec) -> Result<TerminalMounts,
         &spec.provider_secret_references,
         spec.provider_launch_context.as_ref(),
         spec.provider.native_provider(),
+        purpose,
     )
 }
 
@@ -84,6 +118,7 @@ fn workload_mounts(
     secret_references: &[ProviderSecretReference],
     context: Option<&ProviderLaunchContext>,
     provider: &str,
+    purpose: MountPurpose,
 ) -> Result<TerminalMounts, String> {
     if let Some(context) = context {
         context.validate(provider).map_err(|error| error.message)?;
@@ -121,6 +156,11 @@ fn workload_mounts(
     }
     let mut provider_bootstrap_files = Vec::with_capacity(bootstrap_files.len());
     for file in bootstrap_files {
+        if purpose == MountPurpose::Adopt {
+            let source = accepted_source_path(&file.source_path)?;
+            provider_bootstrap_files.push(source);
+            continue;
+        }
         let source = std::fs::canonicalize(&file.source_path)
             .map_err(|error| format!("provider bootstrap file: {error}"))?;
         if !source.is_file() || source != Path::new(&file.source_path) {
@@ -136,6 +176,14 @@ fn workload_mounts(
         .is_some_and(|inputs| inputs.indexed_files.is_some());
     let mut source_id = 0u16;
     for (index, secret) in secret_references.iter().enumerate() {
+        if purpose == MountPurpose::Adopt {
+            provider_secret_files.push(accepted_source_path(&secret.source_path)?);
+            if indexed && secret.profile.is_configuration_file() {
+                indexed_secret_sources.insert(index, source_id);
+                source_id += 1;
+            }
+            continue;
+        }
         let source = std::fs::canonicalize(&secret.source_path)
             .map_err(|error| format!("provider secret reference: {error}"))?;
         if !source.is_file() || source != Path::new(&secret.source_path) {
@@ -164,9 +212,10 @@ fn workload_mounts(
     }
     let provider_user_root =
         if let Some(capability) = context.and_then(|context| context.mcp_capability.as_ref()) {
-            Some(approved_staged_provider_root(
-                &capability_directory()?,
+            Some(staged_provider_root_for(
+                &capability_directory_for(purpose)?,
                 &capability.grant_id,
+                purpose,
             )?)
         } else if context.is_some() {
             let home = std::env::var_os("HOME");
@@ -186,7 +235,7 @@ fn workload_mounts(
     let mcp_capability_file = context
         .and_then(|context| context.mcp_capability.as_ref())
         .map(|capability| {
-            let directory = capability_directory()?;
+            let directory = capability_directory_for(purpose)?;
             if !capability.grant_id.starts_with("grant-")
                 || capability.grant_id.len() > 128
                 || !capability
@@ -197,6 +246,9 @@ fn workload_mounts(
                 return Err("invalid managed MCP grant id".to_string());
             }
             let source = directory.join(format!("{}.json", capability.grant_id));
+            if purpose == MountPurpose::Adopt {
+                return Ok(source);
+            }
             let canonical = std::fs::canonicalize(&source)
                 .map_err(|error| format!("managed MCP grant unavailable: {error}"))?;
             if canonical != source || !canonical.is_file() {
@@ -218,10 +270,12 @@ fn workload_mounts(
             Ok(canonical)
         })
         .transpose()?;
-    let prepared = prepared_input_mounts(
+    let prepared = prepared_input_mounts_for(
         &workspace,
         provider_user_root.as_deref(),
         context.and_then(|context| context.prepared_inputs.as_ref()),
+        purpose,
+        context.and_then(|context| context.mcp_capability.as_ref()),
     )?;
     Ok(TerminalMounts {
         workspace,
@@ -297,9 +351,39 @@ fn prepared_input_mounts(
     root: Option<&Path>,
     inputs: Option<&freshell_runtime_protocol::PreparedProviderInputs>,
 ) -> Result<PreparedInputMounts, String> {
+    prepared_input_mounts_for(workspace, root, inputs, MountPurpose::Create, None)
+}
+
+fn prepared_input_mounts_for(
+    workspace: &Path,
+    root: Option<&Path>,
+    inputs: Option<&freshell_runtime_protocol::PreparedProviderInputs>,
+    purpose: MountPurpose,
+    capability: Option<&freshell_runtime_protocol::McpCapabilityReference>,
+) -> Result<PreparedInputMounts, String> {
     let mut prepared = PreparedInputMounts::default();
     if let Some(inputs) = inputs {
         let root = root.ok_or("prepared provider stage is unavailable")?;
+        if purpose == MountPurpose::Adopt {
+            inputs.validate(capability).map_err(|error| error.message)?;
+            // Existing mounts are verified against these accepted descriptors
+            // and Docker's actual immutable configuration below. Missing or
+            // changed source bytes cannot authorize a new launch, but do not
+            // change the identity of an already mounted, healthy workload.
+            return Ok(PreparedInputMounts {
+                input_manifest: Some(root.join(&inputs.manifest.relative_path)),
+                config_binds: inputs
+                    .config_binds
+                    .iter()
+                    .map(|reference| ResolvedProviderConfigBind {
+                        source: root.join(&reference.source_relative_path),
+                        reference: reference.clone(),
+                    })
+                    .collect(),
+                resource_mounts: inputs.resource_mounts.clone(),
+                indexed_files: inputs.indexed_files.clone(),
+            });
+        }
         let manifest = canonical_stage_file(root, &inputs.manifest.relative_path)?;
         verify_input_manifest_digest(&manifest, &inputs.manifest.sha256)?;
         for reference in &inputs.config_binds {
@@ -554,14 +638,135 @@ mod prepared_stage_tests {
             b"{\"model\":\"original\"}"
         );
     }
+
+    #[test]
+    fn provider_prepared_adoption_keeps_accepted_routes_when_source_authority_is_lost() {
+        let (owned, stage, workspace, mut inputs) = fixture();
+        let capability = freshell_runtime_protocol::McpCapabilityReference {
+            grant_id: inputs.generation_id.clone(),
+            endpoint: "http://host.docker.internal:4000".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let expected = prepared_input_mounts(&workspace, Some(&stage), Some(&inputs)).unwrap();
+        std::fs::rename(&stage, owned.path().join("unavailable-stage")).unwrap();
+        let adopted = prepared_input_mounts_for(
+            &workspace,
+            Some(&stage),
+            Some(&inputs),
+            MountPurpose::Adopt,
+            Some(&capability),
+        )
+        .expect("accepted mounted descriptors do not require source republication");
+        assert_eq!(adopted.input_manifest, expected.input_manifest);
+        assert_eq!(adopted.config_binds, expected.config_binds);
+        assert_eq!(adopted.resource_mounts, expected.resource_mounts);
+        assert!(
+            prepared_input_mounts(&workspace, Some(&stage), Some(&inputs)).is_err(),
+            "missing authority must still block creating a new runtime"
+        );
+        inputs.config_binds[0].source_relative_path = "../unapproved".into();
+        assert!(prepared_input_mounts_for(
+            &workspace,
+            Some(&stage),
+            Some(&inputs),
+            MountPurpose::Adopt,
+            Some(&capability)
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(
+                owned
+                    .path()
+                    .join("unavailable-stage/.freshell/templates/source-0")
+            )
+            .unwrap(),
+            b"{\"model\":\"transported\"}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_prepared_adoption_terminal_and_fresh_use_the_same_accepted_mounts() {
+        const CHILD: &str = "FRESHELL_ADOPTION_MOUNT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new("/usr/bin/timeout")
+                .args(["--kill-after=1s", "20s"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "backend::docker::prepared_stage_tests::provider_prepared_adoption_terminal_and_fresh_use_the_same_accepted_mounts", "--nocapture"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success(), "isolated shared adoption behavior failed");
+            return;
+        }
+        let (owned, stage, workspace, inputs) = fixture();
+        let capabilities = owned.path().join("mcp-capabilities");
+        let selected = owned
+            .path()
+            .join("provider-roots")
+            .join(&inputs.generation_id);
+        std::fs::create_dir(&capabilities).unwrap();
+        std::fs::create_dir(selected.parent().unwrap()).unwrap();
+        std::fs::rename(stage, &selected).unwrap();
+        let capability = freshell_runtime_protocol::McpCapabilityReference {
+            grant_id: inputs.generation_id.clone(),
+            endpoint: "http://host.docker.internal:4000".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let grant = capabilities.join(format!("{}.json", capability.grant_id));
+        std::fs::write(&grant, b"{}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&grant, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::env::set_var("FRESHELL_RUNTIME_CAPABILITY_DIR", &capabilities);
+        let context = ProviderLaunchContext {
+            preparation: freshell_runtime_protocol::ProviderPreparation::Claude {
+                mcp_args: vec![],
+            },
+            config: vec![],
+            mcp_capability: Some(capability),
+            prepared_inputs: Some(inputs),
+        };
+        let mut terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"adoption-terminal", "streamId":"stream", "mode":"claude", "program":"claude", "args":[],
+            "cwd":workspace,"workspacePath":workspace,"projectKey":"project", "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24
+        })).unwrap();
+        terminal.provider_launch_context = Some(context.clone());
+        let mut fresh: FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
+            "sessionId":"adoption-fresh", "provider":"claude", "sessionType":"freshclaude", "runtimeVariant":"claude-sdk",
+            "providerStoreId":"store", "cwd":workspace,"workspacePath":workspace,"runAsUid":65534,"runAsGid":0
+        })).unwrap();
+        fresh.provider_launch_context = Some(context);
+        let expected = terminal_mounts(&terminal).unwrap();
+        assert_eq!(fresh_agent_mounts(&fresh).unwrap(), expected);
+        std::fs::rename(&selected, owned.path().join("unavailable-selected")).unwrap();
+        std::fs::rename(&grant, grant.with_extension("unavailable")).unwrap();
+        assert_eq!(terminal_mounts_for_adoption(&terminal).unwrap(), expected);
+        assert_eq!(fresh_agent_mounts_for_adoption(&fresh).unwrap(), expected);
+        assert!(terminal_mounts(&terminal).is_err());
+        assert!(fresh_agent_mounts(&fresh).is_err());
+    }
 }
 
 fn capability_directory() -> Result<PathBuf, String> {
+    capability_directory_for(MountPurpose::Create)
+}
+
+fn capability_directory_for(purpose: MountPurpose) -> Result<PathBuf, String> {
     let directory = CAPABILITY_DIR
         .get()
         .cloned()
         .or_else(|| std::env::var_os("FRESHELL_RUNTIME_CAPABILITY_DIR").map(PathBuf::from))
         .ok_or("managed MCP capability directory is unavailable")?;
+    if purpose == MountPurpose::Adopt {
+        return accepted_source_path(
+            directory
+                .to_str()
+                .ok_or("managed capability path is not UTF-8")?,
+        );
+    }
     std::fs::canonicalize(&directory)
         .map_err(|error| format!("managed MCP capability directory unavailable: {error}"))
 }
@@ -571,6 +776,14 @@ pub(crate) fn staged_provider_root_for_grant(grant_id: &str) -> Result<PathBuf, 
 }
 
 fn approved_staged_provider_root(directory: &Path, grant_id: &str) -> Result<PathBuf, String> {
+    staged_provider_root_for(directory, grant_id, MountPurpose::Create)
+}
+
+fn staged_provider_root_for(
+    directory: &Path,
+    grant_id: &str,
+    purpose: MountPurpose,
+) -> Result<PathBuf, String> {
     if !grant_id.starts_with("grant-")
         || grant_id.len() > 128
         || !grant_id
@@ -584,11 +797,30 @@ fn approved_staged_provider_root(directory: &Path, grant_id: &str) -> Result<Pat
         .ok_or("managed MCP capability directory has no parent")?
         .join("provider-roots")
         .join(grant_id);
+    if purpose == MountPurpose::Adopt {
+        return Ok(expected);
+    }
     let canonical = canonical_dir(&expected, "managed provider root")?;
     if canonical != expected {
         return Err("managed provider root must be canonical".into());
     }
     Ok(canonical)
+}
+
+fn accepted_source_path(raw: &str) -> Result<PathBuf, String> {
+    let path = Path::new(raw);
+    if !path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err("accepted mount source must be an absolute normal path".into());
+    }
+    reject_management_path(path)?;
+    Ok(path.into())
 }
 
 fn user_provider_config_referenced(context: &ProviderLaunchContext) -> bool {
