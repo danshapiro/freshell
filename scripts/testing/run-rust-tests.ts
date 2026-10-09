@@ -13,9 +13,10 @@ function log(severity: 'info' | 'error', event: string, fields: Record<string, u
   stream.write(`${JSON.stringify({ severity, event, timestamp: new Date().toISOString(), ...fields })}\n`)
 }
 
-function runChild(command: string, args: string[], env: NodeJS.ProcessEnv): Promise<number> {
+function runChild(command: string, args: string[], env: NodeJS.ProcessEnv, sandbox = false): Promise<number> {
   return new Promise((resolve) => {
-    log('info', 'rust_test_phase_started', { command, args })
+    const metadata = sandbox ? { command, mode: 'runtime-suite', argumentCount: args.length } : { command, args }
+    log('info', 'rust_test_phase_started', metadata)
     let settled = false
     let child: ChildProcess
     try {
@@ -27,8 +28,7 @@ function runChild(command: string, args: string[], env: NodeJS.ProcessEnv): Prom
       })
     } catch (error) {
       log('error', 'rust_test_phase_spawn_failed', {
-        command,
-        args,
+        ...metadata,
         error: error instanceof Error ? error.message : String(error),
       })
       resolve(1)
@@ -36,39 +36,82 @@ function runChild(command: string, args: string[], env: NodeJS.ProcessEnv): Prom
     }
 
     const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const
-    const forwardSignal = (signal: typeof signals[number]) => {
-      if (child.exitCode === null && !child.killed) child.kill(signal)
-    }
-    for (const signal of signals) process.once(signal, forwardSignal)
+    // Node signal listeners receive no argument. Capture each signal so the
+    // sandbox wrapper receives the actual request and can settle its workload.
+    const handlers = signals.map(signal => {
+      const handler = () => { if (child.exitCode === null) child.kill(signal) }
+      process.on(signal, handler)
+      return { signal, handler }
+    })
 
     const finish = (code: number, signal: NodeJS.Signals | null) => {
       if (settled) return
       settled = true
-      for (const forwardedSignal of signals) process.off(forwardedSignal, forwardSignal)
+      for (const { signal: forwardedSignal, handler } of handlers) process.off(forwardedSignal, handler)
       if (code !== 0 || signal) {
-        log('error', 'rust_test_phase_failed', { command, args, code, signal })
+        log('error', 'rust_test_phase_failed', { ...metadata, code, signal })
       } else {
-        log('info', 'rust_test_phase_finished', { command, args, code })
+        log('info', 'rust_test_phase_finished', { ...metadata, code })
       }
       resolve(code)
     }
 
     child.once('error', (error) => {
       log('error', 'rust_test_phase_spawn_failed', {
-        command,
-        args,
+        ...metadata,
         error: error.message,
       })
       finish(1, null)
     })
-    child.once('exit', (code, signal) => {
+    child.once('close', (code, signal) => {
       const exitCode = code ?? (signal ? 128 + (osConstants.signals[signal] ?? 1) : 1)
       finish(exitCode, signal)
     })
   })
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`
+}
+
+function sandboxCommand(argv: string[]): string {
+  // Fixed wrapper text owns only its newly allocated target subdirectory.
+  // Arguments remain separately quoted words; none becomes shell code.
+  return `set -e
+owned_tmp="$(mktemp -d /workspace/target/.freshell-rust-tests-XXXXXXXX)"
+runner_pid=
+cleanup() {
+  status=$?
+  trap - EXIT
+  rm -rf -- "$owned_tmp" || { [ "$status" -ne 0 ] || status=1; }
+  exit "$status"
+}
+interrupt() {
+  trap '' INT TERM HUP
+  if [ -n "$runner_pid" ]; then
+    kill -s "$1" "$runner_pid" 2>/dev/null || true
+    wait "$runner_pid" || true
+  fi
+  exit "$2"
+}
+trap cleanup EXIT
+trap 'interrupt INT 130' INT
+trap 'interrupt TERM 143' TERM
+trap 'interrupt HUP 129' HUP
+export TMPDIR="$owned_tmp" FRESHELL_TEST_EXECUTABLE_TMP_DIR="$owned_tmp" FRESHELL_RUST_TEST_SANDBOX=0 CARGO_BUILD_JOBS=3
+node --import tsx /workspace/scripts/testing/run-rust-tests.ts ${argv.map(shellQuote).join(' ')} &
+runner_pid=$!
+wait "$runner_pid"`
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+  if (process.env.FRESHELL_RUST_TEST_SANDBOX === '1') {
+    log('info', 'rust_test_sandbox_route_selected', { mode: 'runtime-suite', cargoBuildJobs: 3, forwardedArgumentCount: argv.length })
+    // Do not inherit a host binary selection. The unchanged inner runner
+    // selects its own freshly built /workspace/target/debug server.
+    const { FRESHELL_SERVER_BIN: _hostBinary, ...env } = process.env
+    return runChild(path.join(PROJECT_ROOT, 'scripts/sandbox-test.sh'), ['--runtime-suite', sandboxCommand(argv)], env, true)
+  }
   const binary = path.join(PROJECT_ROOT, 'target', 'debug', `freshell-server${process.platform === 'win32' ? '.exe' : ''}`)
   const cargo = process.platform === 'win32' ? 'cargo.exe' : 'cargo'
   const buildExitCode = await runChild(cargo, ['build', '-p', 'freshell-server', '--locked'], process.env)

@@ -42,6 +42,28 @@ to the unprivileged `sandbox` UID before test code and the self-test verifies th
 effective capabilities. The mode never mounts Docker/admin sockets or real provider homes. The runtime gate's separate trusted broker is the only component allowed to hold the real
 Docker socket; this wrapper never grants it to tests.
 
+For the Rust phase of the existing full suite, explicitly select this mode:
+
+```bash
+FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test
+# Or run the existing standalone Rust launcher with Cargo test arguments:
+FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:rust <filter> -- --exact
+```
+
+Only the exact value `1` enables routing; other test backend settings do not.
+The Rust launcher runs its unchanged locked server build and workspace tests
+inside the strict sandbox, selects the container's server binary, and gives
+both temporary-directory variables a newly owned executable directory under
+the sandbox Cargo target volume. Cargo uses three parallel build jobs within
+the existing container resource limits. The launcher removes its temporary
+directory on exit. Sandbox,
+dependency, and inner-runner failures return failure without host Cargo fallback.
+The other full-suite phases keep their configured backends and coordinator.
+The wrapper records its owned container and settles it before returning a
+signal failure; stopping the attached Docker client alone is insufficient.
+Warm dependency caches through the documented ordinary sandbox preparation
+before a strict run if needed; strict mode keeps its read-only home and no network.
+
 ## Safety guarantees
 
 | What | Guarantee |
