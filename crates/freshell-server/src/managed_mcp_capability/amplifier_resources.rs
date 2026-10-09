@@ -89,6 +89,26 @@ struct BundleSelection {
 }
 
 impl BundleSelection {
+    fn remember_namespace(
+        &mut self,
+        name: &str,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), String> {
+        if self.namespaces.contains_key(name) {
+            return Ok(());
+        }
+        if self.namespaces.len() >= 8192 {
+            return Err("Amplifier namespace event budget exceeded".into());
+        }
+        self.retain_metadata(name.len())?;
+        self.retain_metadata(source.as_os_str().len())?;
+        self.retain_metadata(destination.as_os_str().len())?;
+        self.namespaces
+            .insert(name.into(), (source.to_owned(), destination.to_owned()));
+        Ok(())
+    }
+
     fn remember_bundle_name(&mut self, root: &Path, name: &str) -> Result<(), String> {
         if !self.bundle_names.contains_key(root) {
             if self.bundle_names.len() >= 8192 {
@@ -159,13 +179,12 @@ fn select_namespace_contexts(
 // FileSourceHandler first finds the nearest native bundle entry starting at
 // base_path. An entry in base_path is the source boundary, so the registry's
 // ancestor search cannot select its parent. Otherwise the nearest ancestor is
-// the finite local ROOT whose different name activates namespace_root.
-fn has_different_native_root(
+// the finite local ROOT. Its registration and the child override are separate.
+fn native_ancestor_root(
     root: &Path,
-    name: &str,
     excluded: &[PathBuf],
     state: &mut BundleSelection,
-) -> Result<bool, String> {
+) -> Result<Option<(PathBuf, String)>, String> {
     for (depth, directory) in root.ancestors().enumerate() {
         if depth >= 64 {
             return Err("Amplifier local ancestor depth profile exceeded".into());
@@ -175,7 +194,7 @@ fn has_different_native_root(
             match std::fs::metadata(&path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => return Err("Amplifier ancestor bundle metadata unavailable".into()),
-                Ok(_) if directory == root => return Ok(false),
+                Ok(_) if directory == root => return Ok(None),
                 Ok(metadata) if !metadata.is_file() => {
                     return Err("Amplifier ancestor bundle is not a regular file".into())
                 }
@@ -184,7 +203,7 @@ fn has_different_native_root(
             let canonical = std::fs::canonicalize(&path)
                 .map_err(|_| "Amplifier ancestor bundle unavailable or cyclic")?;
             if let Some(ancestor_name) = state.bundle_names.get(&canonical) {
-                return Ok(!ancestor_name.is_empty() && ancestor_name != name);
+                return Ok(Some((directory.to_owned(), ancestor_name.clone())));
             }
             if excluded.iter().any(|path| canonical.starts_with(path)) {
                 return Err("Amplifier ancestor bundle aliases credentials or native state".into());
@@ -212,7 +231,7 @@ fn has_different_native_root(
                 Some(raw.as_str())
             };
             let Some(yaml) = yaml else {
-                return Ok(false);
+                return Ok(None);
             };
             bound_yaml_expansion(yaml)?;
             let documents = MarkedYamlOwned::load_from_str(yaml)
@@ -227,10 +246,10 @@ fn has_different_native_root(
                 .and_then(|node| node.data.as_str())
                 .unwrap_or("");
             state.remember_bundle_name(&canonical, ancestor_name)?;
-            return Ok(!ancestor_name.is_empty() && ancestor_name != name);
+            return Ok(Some((directory.to_owned(), ancestor_name.to_owned())));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn select_local_bundle(
@@ -396,15 +415,20 @@ fn select_local_bundle(
                     let namespace_root = native_mapping_value(meta, "namespace_root", 0)?
                         .filter(|node| !node.data.is_null());
                     state.remember_bundle_name(&document, name)?;
-                    // Native standalone self-name resolution uses base_path.
-                    // Only a different named ancestor enables namespace_root.
-                    let namespace_root = if namespace_root.is_some()
-                        && has_different_native_root(root, name, excluded, state)?
-                    {
-                        namespace_root
-                    } else {
-                        None
-                    };
+                    let ancestor = native_ancestor_root(root, excluded, state)?;
+                    // A named ROOT registers source_root even when its name
+                    // equals the selected child. An unnamed ROOT still permits
+                    // the different-named child's namespace_root override.
+                    if let Some((source_root, root_name)) = &ancestor {
+                        if !root_name.is_empty() {
+                            state.remember_namespace(root_name, source_root, &relative)?;
+                        }
+                    }
+                    let namespace_root = namespace_root.filter(|_| {
+                        ancestor
+                            .as_ref()
+                            .is_some_and(|(_, root_name)| root_name != name)
+                    });
                     let source_base = if let Some(node) = namespace_root {
                         let relative = node
                             .data
@@ -430,16 +454,7 @@ fn select_local_bundle(
                     } else {
                         root.to_owned()
                     };
-                    state.retain_metadata(name.len())?;
-                    state.retain_metadata(source_base.as_os_str().len())?;
-                    state.retain_metadata(relative.as_os_str().len())?;
-                    if state.namespaces.len() >= 8192 {
-                        return Err("Amplifier namespace event budget exceeded".into());
-                    }
-                    state
-                        .namespaces
-                        .entry(name.into())
-                        .or_insert((source_base, relative.clone()));
+                    state.remember_namespace(name, &source_base, &relative)?;
                 }
             }
             let module_origin = ModuleSourceOrigin {
@@ -915,6 +930,118 @@ mod module_source_tests {
                     .expect("missing standalone context must refuse despite parent decoy")
                     .contains("selected context is missing"));
             }
+        }
+    }
+
+    #[test]
+    fn managed_provider_amplifier_ancestor_names_consume_parent_context_after_both_copies() {
+        for (ancestor_name, namespace_root) in [("probe", true), ("probe", false), ("", true)] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let bundle = owned.path().join("external-bundle");
+            let cwd = owned.path().join("workspace");
+            for directory in [
+                &home.join(".amplifier"),
+                &cwd,
+                &bundle.join("context"),
+                &bundle.join("behaviors/context"),
+            ] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            let parent_raw = format!("bundle: {{name: {ancestor_name:?}}}\n");
+            let child_raw = format!(
+                "bundle: {{name: probe{}}}\ncontext: {{include: ['probe:context/selected.md']}}\n",
+                if namespace_root {
+                    ", namespace_root: .."
+                } else {
+                    ""
+                }
+            );
+            std::fs::write(bundle.join("bundle.yaml"), &parent_raw).unwrap();
+            let child = bundle.join("behaviors/probe.yaml");
+            std::fs::write(&child, &child_raw).unwrap();
+            std::fs::write(
+                bundle.join("context/selected.md"),
+                "correct-ancestor-context",
+            )
+            .unwrap();
+            std::fs::write(
+                bundle.join("behaviors/context/selected.md"),
+                "wrong-child-decoy",
+            )
+            .unwrap();
+            let settings_raw = format!(
+                "bundle: {{active: {}}}\n",
+                serde_json::to_string(&format!("file://{}", child.display())).unwrap()
+            );
+            let settings = home.join(".amplifier/settings.yaml");
+            std::fs::write(&settings, &settings_raw).unwrap();
+            let prepared = prepare(&home, &cwd, &[]).unwrap();
+            let stage = owned.path().join("stage");
+            let host = owned.path().join("host");
+            freshell_platform::provider_environment::copy_environment(
+                &prepared.selections,
+                &stage,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            for (relative, raw) in &prepared.rewritten_resources {
+                std::fs::write(stage.join(relative), raw).unwrap();
+            }
+            let second = prepared
+                .selections
+                .iter()
+                .map(|selection| CopySelection {
+                    source: stage.join(&selection.destination_relative),
+                    destination_relative: selection.destination_relative.clone(),
+                })
+                .collect::<Vec<_>>();
+            freshell_platform::provider_environment::copy_environment(
+                &second,
+                &host,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            let projected_child = &prepared
+                .rewritten_resources
+                .iter()
+                .find(|(_, raw)| raw.contains("name: probe"))
+                .unwrap()
+                .0;
+            let projected_resource = host
+                .join(projected_child.parent().unwrap())
+                .join("context/selected.md");
+            let hidden = owned.path().join("hidden-original");
+            std::fs::rename(&bundle, &hidden).unwrap();
+            let output = std::process::Command::new("node")
+                .args([
+                    "-e",
+                    "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))",
+                ])
+                .arg(projected_resource)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .output()
+                .unwrap();
+            std::fs::rename(&hidden, &bundle).unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout, b"correct-ancestor-context",
+                "ancestor={ancestor_name:?}, override={namespace_root}"
+            );
+            assert_eq!(std::fs::read_to_string(&settings).unwrap(), settings_raw);
+            assert_eq!(std::fs::read_to_string(&child).unwrap(), child_raw);
+            assert_eq!(
+                std::fs::read_to_string(bundle.join("bundle.yaml")).unwrap(),
+                parent_raw
+            );
+            std::fs::remove_file(bundle.join("context/selected.md")).unwrap();
+            assert!(prepare(&home, &cwd, &[])
+                .err()
+                .expect("missing ancestor target must refuse despite child decoy")
+                .contains("selected context is missing"));
         }
     }
 

@@ -743,7 +743,7 @@ async def mount(coordinator,config=None):
         selected=yaml.safe_load((Path.home()/'.amplifier/settings.yaml').read_text())['bundle']['active']
         loaded=await load_bundle(selected)
         loaded.resolve_pending_context()
-        contexts={name:hashlib.sha256(loaded.context[name].read_bytes()).hexdigest() for name in ['closed-native-bundle:context/self.md','probe:context/selected.md']}
+        contexts={name:hashlib.sha256(loaded.context[name].read_bytes()).hexdigest() for name in ['closed-native-bundle:context/self.md','probe:context/selected.md','same-root:context/selected.md','same-no-root:context/selected.md','unnamed-root:context/selected.md']}
         request=urllib.request.Request(os.environ['FRESHELL_URL']+'/api/mcp',data=b'{}',headers={'x-auth-token':os.environ['FRESHELL_TOKEN']})
         with urllib.request.urlopen(request,timeout=5) as response: authenticated=response.status==200
         seed_receipt=Path(config['receipt']).with_suffix('.seed.json')
@@ -807,7 +807,35 @@ async def on_session_ready(coordinator):
     let namespace_child = bundle.join("behaviors/probe.yaml");
     let namespace_child_raw="bundle: {name: probe, namespace_root: ..}\ncontext: {include: ['probe:context/selected.md']}\n";
     std::fs::write(&namespace_child, namespace_child_raw).unwrap();
-    let bundle_document=format!("bundle:\n  name: closed-native-bundle\n  namespace_root: ..\nincludes: [{}]\ncontext: {{include: ['closed-native-bundle:context/self.md']}}\nsession:\n  orchestrator:\n    module: loop-probe\n    source: ./modules/loop-probe\n  context:\n    module: context-probe\n    source: ./modules/context-probe\n    config:\n      conversation_receipt: {}\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\nhooks:\n  - module: hooks-probe\n    source: ./modules/hooks-probe\n    config:\n      receipt: {}\n      session_id: {}\n      key_digest: {}\n",serde_json::to_string(&format!("file://{}",namespace_child.display())).unwrap(),serde_json::to_string(conversation_receipt.to_str().unwrap()).unwrap(),serde_json::to_string(receipt.to_str().unwrap()).unwrap(),native_id,hash(b"synthetic-amplifier-onecli-value"));
+    let mut namespace_includes = vec![format!("file://{}", namespace_child.display())];
+    for (name, ancestor_name, override_root) in [
+        ("same-root", "same-root", true),
+        ("same-no-root", "same-no-root", false),
+        ("unnamed-root", "", true),
+    ] {
+        let root = fixture.join(format!("scenarios/{name}"));
+        std::fs::create_dir_all(root.join("context")).unwrap();
+        std::fs::create_dir_all(root.join("behaviors/context")).unwrap();
+        std::fs::write(
+            root.join("bundle.yaml"),
+            format!("bundle: {{name: {ancestor_name:?}}}\n"),
+        )
+        .unwrap();
+        let child = root.join("behaviors/probe.yaml");
+        std::fs::write(&child, format!("bundle: {{name: {name}{}}}\ncontext: {{include: ['{name}:context/selected.md']}}\n", if override_root {", namespace_root: .."} else {""})).unwrap();
+        std::fs::write(
+            root.join("context/selected.md"),
+            format!("native-{name}-ancestor-context"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("behaviors/context/selected.md"),
+            "wrong-child-context-decoy",
+        )
+        .unwrap();
+        namespace_includes.push(format!("file://{}", child.display()));
+    }
+    let bundle_document=format!("bundle:\n  name: closed-native-bundle\n  namespace_root: ..\nincludes: {}\ncontext: {{include: ['closed-native-bundle:context/self.md']}}\nsession:\n  orchestrator:\n    module: loop-probe\n    source: ./modules/loop-probe\n  context:\n    module: context-probe\n    source: ./modules/context-probe\n    config:\n      conversation_receipt: {}\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\nhooks:\n  - module: hooks-probe\n    source: ./modules/hooks-probe\n    config:\n      receipt: {}\n      session_id: {}\n      key_digest: {}\n",serde_json::to_string(&namespace_includes).unwrap(),serde_json::to_string(conversation_receipt.to_str().unwrap()).unwrap(),serde_json::to_string(receipt.to_str().unwrap()).unwrap(),native_id,hash(b"synthetic-amplifier-onecli-value"));
     std::fs::write(bundle.join("bundle.yaml"), &bundle_document).unwrap();
     let settings = "bundle:\n  active: ../scenarios/external-amplifier-bundle/bundle.yaml\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\n".to_owned();
     std::fs::write(home.join(".amplifier/settings.yaml"), &settings).unwrap();
@@ -1116,7 +1144,7 @@ async def on_session_ready(coordinator):
             json!({"provider":"amplifier","route":"terminal","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"classes":classes,"classifiedErrors":classified_errors})
         );
     }
-    let expected = json!({"finalExecProfile":native_exec_profile(),"nativeCallback":true,"exactIdentity":true,"physicalHome":"/home/freshell/provider","authenticated":true,"scopedAlias":true,"onecli":true,"nativeModuleInstaller":true,"resourceAndDependency":hash(b"closed-amplifier-resource:closed-amplifier-dependency"),"nativeNamespaceContexts":{"closed-native-bundle:context/self.md":hash(b"native-self-namespace-context"),"probe:context/selected.md":hash(b"native-nested-namespace-context")}});
+    let expected = json!({"finalExecProfile":native_exec_profile(),"nativeCallback":true,"exactIdentity":true,"physicalHome":"/home/freshell/provider","authenticated":true,"scopedAlias":true,"onecli":true,"nativeModuleInstaller":true,"resourceAndDependency":hash(b"closed-amplifier-resource:closed-amplifier-dependency"),"nativeNamespaceContexts":{"closed-native-bundle:context/self.md":hash(b"native-self-namespace-context"),"probe:context/selected.md":hash(b"native-nested-namespace-context"),"same-root:context/selected.md":hash(b"native-same-root-ancestor-context"),"same-no-root:context/selected.md":hash(b"native-same-no-root-ancestor-context"),"unnamed-root:context/selected.md":hash(b"native-unnamed-root-ancestor-context")}});
     assert_eq!(observed.expect("real Amplifier must activate selected local module and executable skill before a model turn"),expected);
     assert!(
         !output.exited,
