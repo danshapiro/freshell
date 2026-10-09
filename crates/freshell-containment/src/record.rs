@@ -254,13 +254,24 @@ fn write_atomically(dir: &Path, record: &UnitRecord) -> io::Result<()> {
 }
 
 /// Boot: takes ownership of every record whose lock no running server
-/// holds. A record held elsewhere is skipped unread; one that does not
-/// parse (a torn write after a machine crash, whose processes died with it)
-/// is logged and removed with its lock file.
+/// holds. A record held elsewhere is skipped unread and silently; one whose
+/// lock cannot be taken for any other reason, or that cannot be read, is
+/// skipped with a WARN; one that does not parse (a torn write after a
+/// machine crash, whose processes died with it) is logged and removed with
+/// its lock file. A directory that cannot be listed is logged once (ERROR):
+/// none of its records can be finished.
 fn load_all(dir: &Path) -> BTreeMap<UnitId, Owned> {
     let mut owned = BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return owned;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::error!(target: "freshell_unit",
+                event = "containment.unit_records_unlisted",
+                path = %dir.display(),
+                error = %err,
+                "unit records could not be listed: units recorded before this start are not finished");
+            return owned;
+        }
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -275,8 +286,17 @@ fn load_all(dir: &Path) -> BTreeMap<UnitId, Owned> {
         let lock_file = lock_path(dir, &id);
         let lock = match take_lock(&lock_file) {
             Ok(lock) => lock,
-            // Held by a running server (or unlockable): never read.
-            Err(_) => continue,
+            // Held by a running server: its record, never read.
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(err) => {
+                tracing::warn!(target: "freshell_unit",
+                    event = "containment.unit_record_unlockable",
+                    unit_id = %id,
+                    path = %lock_file.display(),
+                    error = %err,
+                    "unit record skipped: its lock could not be taken");
+                continue;
+            }
         };
         match std::fs::read(&path) {
             Ok(raw) => match serde_json::from_slice::<UnitRecord>(&raw) {
@@ -299,13 +319,24 @@ fn load_all(dir: &Path) -> BTreeMap<UnitId, Owned> {
                         unit_id = %id,
                         path = %path.display(),
                         error = %reason,
+                        removed = true,
                         "unreadable unit record removed");
                     let _ = std::fs::remove_file(&path);
                     release(lock, &lock_file);
                 }
             },
             // Deleted by its owner between the listing and the lock.
-            Err(_) => release(lock, &lock_file),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => release(lock, &lock_file),
+            Err(err) => {
+                tracing::warn!(target: "freshell_unit",
+                    event = "containment.unit_record_unreadable",
+                    unit_id = %id,
+                    path = %path.display(),
+                    error = %err,
+                    removed = false,
+                    "unit record skipped: it could not be read");
+                release(lock, &lock_file);
+            }
         }
     }
     owned
@@ -314,6 +345,7 @@ fn load_all(dir: &Path) -> BTreeMap<UnitId, Owned> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_capture::{capture, CapturedEvent, FieldValue};
 
     fn record(state: UnitRecordState) -> UnitRecord {
         UnitRecord {
@@ -344,6 +376,27 @@ mod tests {
         );
     }
 
+    /// `<root>/units` with one valid Running record in it.
+    fn units_with_one_record() -> (tempfile::TempDir, PathBuf, UnitRecord) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("units");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = record(UnitRecordState::Running);
+        std::fs::write(
+            record_path(&dir, &rec.unit_id),
+            serde_json::to_vec(&rec).unwrap(),
+        )
+        .unwrap();
+        (root, dir, rec)
+    }
+
+    /// Opens the store on `root`, returning it and every event it logged.
+    fn open_captured(root: &Path) -> (RecordStore, Vec<CapturedEvent>) {
+        let mut store = None;
+        let events = capture(|| store = Some(RecordStore::open(root)));
+        (store.unwrap(), events)
+    }
+
     #[test]
     fn an_unreadable_record_is_removed_with_its_lock_at_boot() {
         let root = tempfile::tempdir().unwrap();
@@ -352,10 +405,82 @@ mod tests {
         let id = UnitId::mint();
         std::fs::write(record_path(&dir, &id), b"{ torn").unwrap();
         std::fs::write(lock_path(&dir, &id), b"").unwrap();
-        let store = RecordStore::open(root.path());
+        let (store, events) = open_captured(root.path());
         assert!(store.owned_records().unwrap().is_empty());
         assert!(!record_path(&dir, &id).exists());
         assert!(!lock_path(&dir, &id).exists());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        assert_eq!(events[0].str("event"), "containment.unit_record_unreadable");
+        assert_eq!(events[0].fields["removed"], FieldValue::Bool(true));
+    }
+
+    #[test]
+    fn a_record_held_by_a_running_server_is_skipped_without_a_log_line() {
+        let (root, dir, rec) = units_with_one_record();
+        let _held = take_lock(&lock_path(&dir, &rec.unit_id)).unwrap();
+        let (store, events) = open_captured(root.path());
+        assert!(events.is_empty(), "{events:?}");
+        assert!(store.owned_records().unwrap().is_empty());
+        assert!(record_path(&dir, &rec.unit_id).exists());
+    }
+
+    #[test]
+    fn a_record_whose_lock_cannot_be_taken_is_skipped_with_a_warning() {
+        let (root, dir, rec) = units_with_one_record();
+        // Opening a directory for writing fails (EISDIR), even as root.
+        let lock = lock_path(&dir, &rec.unit_id);
+        std::fs::create_dir(&lock).unwrap();
+        let (store, events) = open_captured(root.path());
+        assert!(store.owned_records().unwrap().is_empty());
+        assert!(
+            record_path(&dir, &rec.unit_id).exists(),
+            "never read or removed"
+        );
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(event.target, "freshell_unit");
+        assert_eq!(event.str("event"), "containment.unit_record_unlockable");
+        assert_eq!(event.str("unit_id"), rec.unit_id.as_str());
+        assert_eq!(event.str("path"), lock.display().to_string());
+        assert!(!event.str("error").is_empty());
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_is_skipped_with_a_warning() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("units");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = UnitId::mint();
+        // Reading a directory fails (EISDIR), even as root.
+        std::fs::create_dir(record_path(&dir, &id)).unwrap();
+        let (store, events) = open_captured(root.path());
+        assert!(store.owned_records().unwrap().is_empty());
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(event.str("event"), "containment.unit_record_unreadable");
+        assert_eq!(event.str("unit_id"), id.as_str());
+        assert_eq!(event.fields["removed"], FieldValue::Bool(false));
+        assert!(record_path(&dir, &id).exists(), "not removed");
+    }
+
+    #[test]
+    fn a_units_directory_that_cannot_be_listed_is_logged_once() {
+        let root = tempfile::tempdir().unwrap();
+        let not_a_dir = root.path().join("units");
+        std::fs::write(&not_a_dir, b"a file").unwrap();
+        let events = capture(|| {
+            assert!(load_all(&not_a_dir).is_empty());
+        });
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event.level, tracing::Level::ERROR);
+        assert_eq!(event.target, "freshell_unit");
+        assert_eq!(event.str("event"), "containment.unit_records_unlisted");
+        assert_eq!(event.str("path"), not_a_dir.display().to_string());
+        assert!(!event.str("error").is_empty());
     }
 
     #[test]
