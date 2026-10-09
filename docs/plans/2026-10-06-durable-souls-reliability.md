@@ -599,7 +599,7 @@ Expected: PASS for Stop-vs-recovery CAS, tombstones, writer claim release, exact
 
 - [ ] **Step 7: Commit the task**
 
-Run: `git add crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/registry.rs crates/freshell-supervisor/src/inventory.rs crates/freshell-supervisor/src/recovery.rs test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts`
+Run: `git add crates/freshell-supervisor/src/backend.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/registry.rs crates/freshell-supervisor/src/inventory.rs crates/freshell-supervisor/src/recovery.rs test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts`
 
 Run: `git commit -m "fix(supervisor): finish durable Stop after interruption"`
 
