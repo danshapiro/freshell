@@ -3477,7 +3477,11 @@ describe('actual Cloud launcher browser image binding', () => {
       const command = `#!${process.execPath}\nconst fs=require('node:fs');const path=require('node:path');const args=process.argv.slice(2);const name=path.basename(process.argv[1]);
 fs.appendFileSync(process.env.TEST_CALLS,JSON.stringify({name,args})+'\\n');
 if(name==='git'){if(args.includes('status'))process.exit(0);console.log(args.includes('--short=12')?'aaaaaaaaaaaa':'${'a'.repeat(40)}');process.exit(0)}
-if(name==='pnpm'){if(args.some(x=>x.includes('externalCloudMetadata'))&&process.env.TEST_EXTERNAL==='1')console.log('FRESHELL_RUNTIME_EXTERNAL_RUN_ID: "${descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID}"');process.exit(0)}
+if(name==='pnpm'){
+  if(args.some(x=>x.includes('cleanupOwnedExternalCloudJob')))JSON.parse(fs.readFileSync(0,'utf8'));
+  if(args.some(x=>x.includes('externalCloudMetadata'))&&process.env.TEST_EXTERNAL==='1')console.log('FRESHELL_RUNTIME_EXTERNAL_RUN_ID: "${descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID}"');
+  process.exit(0);
+}
 if(args[0]==='info')process.exit(0);
 if(args[0]==='auth'){console.log('fixture-token');process.exit(0)}
 if(args[0]==='artifacts'){console.log(process.env.TEST_DIGEST);process.exit(0)}
