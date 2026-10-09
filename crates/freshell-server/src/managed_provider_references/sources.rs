@@ -500,6 +500,20 @@ pub fn plan_loaded_opencode_sources_relocated(
     let mut variables = std::collections::BTreeSet::new();
     let mut event_count = 0usize;
     let mut view_budget = SourceViewBudget::default();
+    // All unprocessed originals are still live while the first source is
+    // transformed. Include them, plus retained outputs from earlier sources.
+    for loaded in &sources {
+        view_budget
+            .charge(&loaded.view)
+            .map_err(|cause| super::ReferenceError {
+                operation: "read",
+                field: "OpenCode source",
+                source_ordinal: 0,
+                declaring_source: loaded.source.logical_path.clone(),
+                variables: vec![],
+                cause,
+            })?;
+    }
     for (ordinal, loaded) in sources.into_iter().enumerate() {
         let source = loaded.source;
         let original_form = source.lane != SourceLane::Inline
@@ -563,6 +577,8 @@ pub fn plan_loaded_opencode_sources_relocated(
             super::ReferenceProjection {
                 relocated_files,
                 original_form,
+                available_view_bytes: MAX_SIMULTANEOUS_SOURCE_VIEW_BYTES as usize
+                    - view_budget.bytes,
             },
         )?;
         if original_form {
@@ -588,6 +604,14 @@ pub fn plan_loaded_opencode_sources_relocated(
             .checked_add(references.recipes.len())
             .ok_or_else(|| fail("source recipe count overflow"))?;
         view_budget.charge(&references.template).map_err(fail)?;
+        if references.unexpanded_direct_source.is_none() {
+            // Generated recipes own a replacement raw view. Its original Arc
+            // cannot be shared by another occurrence (those use original form).
+            let identity = (loaded.view.as_ptr() as usize, loaded.view.len());
+            if view_budget.views.remove(&identity) {
+                view_budget.bytes -= loaded.view.len();
+            }
+        }
         view_budget
             .charge(references.unexpanded_source())
             .map_err(fail)?;
@@ -707,6 +731,60 @@ mod tests {
 
     fn digest(path: &Path) -> String {
         format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
+    }
+    #[test]
+    fn managed_provider_references_simultaneous_transform_views_preserve_inclusive_capacity() {
+        let owned = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        let limit = MAX_SOURCE_VIEW_BYTES as usize;
+        let suffix = "{env:VALUE}";
+        let document = |tail: &str| {
+            format!(
+                "{{\"description\":\"{}{tail}\"}}",
+                "x".repeat(limit - tail.len() - 18)
+            )
+        };
+        for ordinal in 0..4 {
+            let path = owned.path().join(format!("source-{ordinal}.json"));
+            let raw = document(if ordinal == 0 { suffix } else { "" });
+            assert_eq!(raw.len(), limit);
+            assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok());
+            std::fs::write(&path, raw).unwrap();
+            paths.push(path);
+        }
+        let sources = |count: usize| {
+            paths[..count]
+                .iter()
+                .map(|path| SourceOccurrence {
+                    logical_path: path.clone(),
+                    canonical_source: path.clone(),
+                    lane: SourceLane::Main,
+                    role: DiscoveryRole::Workspace,
+                })
+                .collect()
+        };
+        let lookup = |_: SourceLane, _: &Path, name: &str| {
+            (name == "VALUE").then(|| "x".repeat(suffix.len()))
+        };
+        let at_capacity = plan_opencode_sources(sources(3), owned.path(), owned.path(), &lookup)
+            .expect(
+                "48 MiB retained originals plus one complete 16 MiB expansion fits inclusively",
+            );
+        assert_eq!(at_capacity.len(), 3);
+        drop(at_capacity);
+        let exhausted = plan_opencode_sources(sources(4), owned.path(), owned.path(), &lookup);
+        assert!(
+            exhausted.is_err(),
+            "64 MiB retained originals cannot allocate another complete expanded source view"
+        );
+        std::fs::write(&paths[0], document("")).unwrap();
+        let no_op = plan_opencode_sources(sources(4), owned.path(), owned.path(), &|_, _, _| None)
+            .expect("four distinct no-op 16 MiB sources keep the full inclusive 64 MiB capacity");
+        assert_eq!(no_op.len(), 4);
+        assert!(no_op.iter().all(|source| std::ptr::eq(
+            source.references.template.as_str(),
+            source.references.unexpanded_source()
+        )));
     }
     #[test]
     fn managed_provider_references_shared_large_source_uses_unique_view_budget() {

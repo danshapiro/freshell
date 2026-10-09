@@ -563,11 +563,11 @@ struct SubstitutionSegment<'a> {
 const MAX_CONFIG_VIEW_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONFIG_EVENTS: usize = 8192;
 
-fn bounded_append(out: &mut String, piece: &str) -> Result<(), TransformError> {
+fn bounded_append(out: &mut String, piece: &str, available: usize) -> Result<(), TransformError> {
     if out
         .len()
         .checked_add(piece.len())
-        .is_none_or(|n| n > MAX_CONFIG_VIEW_BYTES)
+        .is_none_or(|n| n > MAX_CONFIG_VIEW_BYTES || n > available)
     {
         return Err(TransformError::ExpansionLimit);
     }
@@ -600,8 +600,31 @@ fn outer_file_end(raw: &str, start: usize) -> Option<usize> {
 pub fn transform_file_tokens<E>(
     raw: &str,
     env: &dyn Fn(&str) -> Option<String>,
-    mut file: impl FnMut(FileToken<'_>) -> Result<String, E>,
+    file: impl FnMut(FileToken<'_>) -> Result<String, E>,
 ) -> Result<String, TokenTransformError<E>> {
+    transform_file_tokens_inner(raw, env, file, 2 * MAX_CONFIG_VIEW_BYTES, true)
+        .map(|(text, _)| text.expect("rendered transform owns output"))
+}
+
+/// Inspect the same pinned substitution pass without retaining its private
+/// expanded output. `available` accounts for every source view the caller
+/// already holds; check each in-progress expansion before appending bytes.
+pub fn inspect_file_tokens<E>(
+    raw: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+    available: usize,
+    file: impl FnMut(FileToken<'_>) -> Result<String, E>,
+) -> Result<usize, TokenTransformError<E>> {
+    transform_file_tokens_inner(raw, env, file, available, false).map(|(_, bytes)| bytes)
+}
+
+fn transform_file_tokens_inner<E>(
+    raw: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+    mut file: impl FnMut(FileToken<'_>) -> Result<String, E>,
+    available: usize,
+    render: bool,
+) -> Result<(Option<String>, usize), TokenTransformError<E>> {
     use TokenTransformError::{Bound, Selection};
     if raw.len() > MAX_CONFIG_VIEW_BYTES {
         return Err(Bound(TransformError::SourceLimit));
@@ -630,7 +653,7 @@ pub fn transform_file_tokens<E>(
             .last()
             .map_or(0, |segment: &SubstitutionSegment<'_>| segment.original.end);
         let begin = expanded.len();
-        bounded_append(&mut expanded, &raw[literal_start..start]).map_err(Bound)?;
+        bounded_append(&mut expanded, &raw[literal_start..start], available).map_err(Bound)?;
         segments.push(SubstitutionSegment {
             expanded: begin..expanded.len(),
             original: literal_start..start,
@@ -638,7 +661,7 @@ pub fn transform_file_tokens<E>(
         });
         let begin = expanded.len();
         if let Some(value) = env(name) {
-            bounded_append(&mut expanded, &value).map_err(Bound)?;
+            bounded_append(&mut expanded, &value, available).map_err(Bound)?;
         }
         segments.push(SubstitutionSegment {
             expanded: begin..expanded.len(),
@@ -647,17 +670,45 @@ pub fn transform_file_tokens<E>(
         });
         cursor = close + 1;
     }
-    let literal_start = segments
-        .last()
-        .map_or(0, |segment: &SubstitutionSegment<'_>| segment.original.end);
-    let begin = expanded.len();
-    bounded_append(&mut expanded, &raw[literal_start..]).map_err(Bound)?;
-    segments.push(SubstitutionSegment {
-        expanded: begin..expanded.len(),
-        original: literal_start..raw.len(),
-        variable: None,
-    });
-    let mut out = String::new();
+    // A source without substitutions is already a complete accepted view.
+    // Borrow it instead of allocating an identical expansion at capacity.
+    let expanded = if segments.is_empty() {
+        segments.push(SubstitutionSegment {
+            expanded: 0..raw.len(),
+            original: 0..raw.len(),
+            variable: None,
+        });
+        std::borrow::Cow::Borrowed(raw)
+    } else {
+        let literal_start = segments.last().unwrap().original.end;
+        let begin = expanded.len();
+        bounded_append(&mut expanded, &raw[literal_start..], available).map_err(Bound)?;
+        segments.push(SubstitutionSegment {
+            expanded: begin..expanded.len(),
+            original: literal_start..raw.len(),
+            variable: None,
+        });
+        std::borrow::Cow::Owned(expanded)
+    };
+    let expanded_bytes = if matches!(expanded, std::borrow::Cow::Owned(_)) {
+        expanded.len()
+    } else {
+        0
+    };
+    let mut out = render.then(String::new);
+    let mut out_bytes = 0usize;
+    let mut append = |piece: &str| {
+        out_bytes = out_bytes
+            .checked_add(piece.len())
+            .ok_or(TransformError::ExpansionLimit)?;
+        if out_bytes > MAX_CONFIG_VIEW_BYTES {
+            return Err(TransformError::ExpansionLimit);
+        }
+        if let Some(out) = &mut out {
+            bounded_append(out, piece, available.saturating_sub(expanded_bytes))?;
+        }
+        Ok(())
+    };
     let mut cursor = 0;
     let mut scan = 0;
     let mut ordinal = 0;
@@ -709,13 +760,13 @@ pub fn transform_file_tokens<E>(
             ordinal,
         })
         .map_err(Selection)?;
-        bounded_append(&mut out, &expanded[cursor..start]).map_err(Bound)?;
-        bounded_append(&mut out, &replacement).map_err(Bound)?;
+        append(&expanded[cursor..start]).map_err(Bound)?;
+        append(&replacement).map_err(Bound)?;
         cursor = end;
         ordinal += 1;
     }
-    bounded_append(&mut out, &expanded[cursor..]).map_err(Bound)?;
-    Ok(out)
+    append(&expanded[cursor..]).map_err(Bound)?;
+    Ok((out, out_bytes))
 }
 
 #[derive(Debug)]

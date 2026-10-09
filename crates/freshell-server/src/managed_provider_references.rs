@@ -119,12 +119,14 @@ pub(super) fn resolve_file_references_from_view(
         ReferenceProjection {
             relocated_files: &std::collections::BTreeMap::new(),
             original_form: false,
+            available_view_bytes: (64 * 1024 * 1024usize).saturating_sub(raw.len()),
         },
     )
 }
 pub(super) struct ReferenceProjection<'a> {
     pub relocated_files: &'a std::collections::BTreeMap<PathBuf, PathBuf>,
     pub original_form: bool,
+    pub available_view_bytes: usize,
 }
 pub(super) fn resolve_file_references_from_view_relocated(
     raw: &str,
@@ -136,7 +138,7 @@ pub(super) fn resolve_file_references_from_view_relocated(
     projection: ReferenceProjection<'_>,
 ) -> Result<ResolvedFileReferencePlan, ReferenceError> {
     use freshell_platform::opencode_config::{
-        file_reference_path, transform_file_tokens, TokenTransformError,
+        file_reference_path, inspect_file_tokens, TokenTransformError,
     };
     let mut selections: Vec<FileReferenceSelection> = Vec::new();
     let mut rewritten = Vec::new();
@@ -167,59 +169,61 @@ pub(super) fn resolve_file_references_from_view_relocated(
         substitution_events.set(substitution_events.get() + 1);
         env(name)
     };
-    let transformed = transform_file_tokens(raw, &lookup, |token| {
-        let names: Vec<String> = token
-            .variables
-            .iter()
-            .map(|name| name.to_string())
-            .collect();
-        path_variables.extend(names.iter().cloned());
-        substitution_events.set(substitution_events.get() + 1);
-        if substitution_events.get() > 8192 {
-            return Err(fail(
-                token.ordinal,
-                names,
-                "source substitution event count exceeds 8192",
-            ));
-        }
-        generated |= !token.direct_expression;
-        let path = file_reference_path(
-            token.path,
-            origin.declaring_config,
-            origin.cwd,
-            origin.original_home,
-        );
-        let physical_source = projection.relocated_files.get(&path).unwrap_or(&path);
-        let canonical = std::fs::canonicalize(physical_source).map_err(|_| {
-            fail(
-                token.ordinal,
-                names.clone(),
-                "referenced file is missing, inaccessible or cyclic",
-            )
-        })?;
-        let metadata = std::fs::metadata(&canonical).map_err(|_| {
-            fail(
-                token.ordinal,
-                names.clone(),
-                "referenced file metadata unavailable",
-            )
-        })?;
-        if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
-            return Err(fail(
-                token.ordinal,
-                names,
-                "referenced target must be a regular file at most 16 MiB",
-            ));
-        }
-        std::fs::File::open(&canonical).map_err(|_| {
-            fail(
-                token.ordinal,
-                names.clone(),
-                "referenced file is unreadable",
-            )
-        })?;
-        let destination =
-            if let Some(selection) = selections.iter().find(|s| s.canonical_source == canonical) {
+    let transformed_length =
+        inspect_file_tokens(raw, &lookup, projection.available_view_bytes, |token| {
+            let names: Vec<String> = token
+                .variables
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+            path_variables.extend(names.iter().cloned());
+            substitution_events.set(substitution_events.get() + 1);
+            if substitution_events.get() > 8192 {
+                return Err(fail(
+                    token.ordinal,
+                    names,
+                    "source substitution event count exceeds 8192",
+                ));
+            }
+            generated |= !token.direct_expression;
+            let path = file_reference_path(
+                token.path,
+                origin.declaring_config,
+                origin.cwd,
+                origin.original_home,
+            );
+            let physical_source = projection.relocated_files.get(&path).unwrap_or(&path);
+            let canonical = std::fs::canonicalize(physical_source).map_err(|_| {
+                fail(
+                    token.ordinal,
+                    names.clone(),
+                    "referenced file is missing, inaccessible or cyclic",
+                )
+            })?;
+            let metadata = std::fs::metadata(&canonical).map_err(|_| {
+                fail(
+                    token.ordinal,
+                    names.clone(),
+                    "referenced file metadata unavailable",
+                )
+            })?;
+            if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
+                return Err(fail(
+                    token.ordinal,
+                    names,
+                    "referenced target must be a regular file at most 16 MiB",
+                ));
+            }
+            std::fs::File::open(&canonical).map_err(|_| {
+                fail(
+                    token.ordinal,
+                    names.clone(),
+                    "referenced file is unreadable",
+                )
+            })?;
+            let destination = if let Some(selection) =
+                selections.iter().find(|s| s.canonical_source == canonical)
+            {
                 selection.runtime_destination.clone()
             } else {
                 if selections.len() >= 128 {
@@ -252,52 +256,63 @@ pub(super) fn resolve_file_references_from_view_relocated(
                 });
                 destination
             };
-        if aliases.insert(path.clone()) && aliases.len() > 256 {
-            return Err(fail(
-                token.ordinal,
-                names,
-                "configuration alias count exceeds 256",
-            ));
-        }
-        occurrences.push(ApprovedFileOccurrence {
-            ordinal: token.ordinal,
-            approved_alias: path,
-            runtime_destination: destination.clone(),
-        });
-        let replacement = format!("{{file:{destination}}}");
-        let kind = if token.path.starts_with("~/") {
-            NativeAliasKind::Home
-        } else if Path::new(token.path).is_absolute() {
-            NativeAliasKind::Absolute
-        } else {
-            NativeAliasKind::Relative
-        };
-        // Only literal source-independent paths can receive an identical edit
-        // at a shared inode. Relative paths and loader-specific interpolation
-        // retain native evaluation and their approved occurrence aliases.
-        let selective = token.direct_expression
-            && token.variables.is_empty()
-            && !matches!(kind, NativeAliasKind::Relative);
-        if !projection.original_form || selective {
-            rewritten.push((token.original_span, replacement.clone()));
-        } else {
-            native_alias_kinds.insert(token.ordinal, kind);
-        }
-        Ok(replacement)
-    })
-    .map_err(|error| match error {
-        TokenTransformError::Selection(error) => error,
-        TokenTransformError::Bound(_) => fail(
-            0,
-            Vec::new(),
-            "configuration source, expansion or event profile limit exceeded",
-        ),
-    })?;
+            if aliases.insert(path.clone()) && aliases.len() > 256 {
+                return Err(fail(
+                    token.ordinal,
+                    names,
+                    "configuration alias count exceeds 256",
+                ));
+            }
+            occurrences.push(ApprovedFileOccurrence {
+                ordinal: token.ordinal,
+                approved_alias: path,
+                runtime_destination: destination.clone(),
+            });
+            let replacement = format!("{{file:{destination}}}");
+            let kind = if token.path.starts_with("~/") {
+                NativeAliasKind::Home
+            } else if Path::new(token.path).is_absolute() {
+                NativeAliasKind::Absolute
+            } else {
+                NativeAliasKind::Relative
+            };
+            // Only literal source-independent paths can receive an identical edit
+            // at a shared inode. Relative paths and loader-specific interpolation
+            // retain native evaluation and their approved occurrence aliases.
+            let selective = token.direct_expression
+                && token.variables.is_empty()
+                && !matches!(kind, NativeAliasKind::Relative);
+            if !projection.original_form || selective {
+                rewritten.push((token.original_span, replacement.clone()));
+            } else {
+                native_alias_kinds.insert(token.ordinal, kind);
+            }
+            Ok(replacement)
+        })
+        .map_err(|error| match error {
+            TokenTransformError::Selection(error) => error,
+            TokenTransformError::Bound(_) => fail(
+                0,
+                Vec::new(),
+                "configuration source, expansion or event profile limit exceeded",
+            ),
+        })?;
     if let Some(cause) = input_error.get() {
         return Err(fail(0, Vec::new(), cause));
     }
-    let transformed_length = transformed.len();
-    drop(transformed);
+    // The transient expanded inspection view is gone before retaining any
+    // template/recipe. Charge complete output views before allocating them.
+    let check_new_views = |bytes: usize| {
+        if bytes > projection.available_view_bytes {
+            Err(fail(
+                0,
+                Vec::new(),
+                "simultaneous retained source views exceed 64 MiB",
+            ))
+        } else {
+            Ok(())
+        }
+    };
     let (template, recipes) = if generated && !projection.original_form {
         let generated_name =
             freshell_platform::opencode_config::generated_config_reference_name(recipe_ordinal);
@@ -315,6 +330,11 @@ pub(super) fn resolve_file_references_from_view_relocated(
                 "generated configuration name collides with an original child input",
             ));
         }
+        check_new_views(
+            raw.len()
+                .checked_add(generated_name.len() + 6)
+                .ok_or_else(|| fail(0, Vec::new(), "source-view size overflow"))?,
+        )?;
         (
             format!("{{env:{generated_name}}}"),
             vec![GeneratedFileRecipe {
@@ -327,6 +347,31 @@ pub(super) fn resolve_file_references_from_view_relocated(
             }],
         )
     } else {
+        if rewritten.is_empty() {
+            let source = source_view.unwrap_or_else(|| std::sync::Arc::new(raw.to_owned()));
+            return Ok(ResolvedFileReferencePlan {
+                template: source.clone(),
+                unexpanded_direct_source: Some(source),
+                selections,
+                referenced_variables: variables.into_inner().into_iter().collect(),
+                path_variables: path_variables.into_iter().collect(),
+                recipes: Vec::new(),
+                occurrences,
+                substitution_events: substitution_events.get(),
+                native_alias_kinds,
+            });
+        }
+        let mut template_bytes = raw.len();
+        for (span, replacement) in &rewritten {
+            template_bytes = template_bytes
+                .checked_sub(span.len())
+                .and_then(|bytes| bytes.checked_add(replacement.len()))
+                .ok_or_else(|| fail(0, Vec::new(), "source-view size overflow"))?;
+        }
+        if template_bytes > 16 * 1024 * 1024 {
+            return Err(fail(0, Vec::new(), "source view exceeds 16 MiB"));
+        }
+        check_new_views(template_bytes)?;
         let mut template = String::new();
         let mut cursor = 0;
         for (span, replacement) in rewritten {
