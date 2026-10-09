@@ -731,6 +731,8 @@ import hashlib,json,os,resource,secrets,subprocess,urllib.request
 from pathlib import Path
 from amplifier_core import HookResult
 from amplifier_app_cli.session_store import SessionStore
+from amplifier_foundation import load_bundle
+import yaml
 _consumer=None
 async def mount(coordinator,config=None):
     global _consumer
@@ -738,6 +740,10 @@ async def mount(coordinator,config=None):
     async def consume(event,data):
         uv=subprocess.check_output(['uv','--version'],text=True).strip()
         output=subprocess.check_output([str(Path.home()/'.amplifier/skills/probe/run')])
+        selected=yaml.safe_load((Path.home()/'.amplifier/settings.yaml').read_text())['bundle']['active']
+        loaded=await load_bundle(selected)
+        loaded.resolve_pending_context()
+        contexts={name:hashlib.sha256(loaded.context[name].read_bytes()).hexdigest() for name in ['closed-native-bundle:context/self.md','probe:context/selected.md']}
         request=urllib.request.Request(os.environ['FRESHELL_URL']+'/api/mcp',data=b'{}',headers={'x-auth-token':os.environ['FRESHELL_TOKEN']})
         with urllib.request.urlopen(request,timeout=5) as response: authenticated=response.status==200
         seed_receipt=Path(config['receipt']).with_suffix('.seed.json')
@@ -755,7 +761,7 @@ async def mount(coordinator,config=None):
         stack=resource.getrlimit(resource.RLIMIT_STACK)[0]
         profile={'stackAtLeast8MiB':stack==resource.RLIM_INFINITY or stack>=8388608,'aggregateWithin1MiB':len(argv)+len(env)+8*(len(strings)+2)+len(os.readlink('/proc/self/exe').encode())+1<=1048576,'completeStringsWithin32Pages':all(len(value)+1<=131072 for value in strings)}
         if not all(profile.values()): raise RuntimeError('closed final native execution profile exceeded')
-        result={'finalExecProfile':profile,'nativeCallback':event=='on_session_ready','exactIdentity':data.get('session_id')==config['session_id'],'physicalHome':str(Path.home()),'authenticated':authenticated,'scopedAlias':os.environ.get('FRESHELL')=='1','onecli':hashlib.sha256(os.environ.get('OPENAI_API_KEY','').encode()).hexdigest()==config['key_digest'],'nativeModuleInstaller':uv.startswith('uv 0.8.22'),'resourceAndDependency':hashlib.sha256(output).hexdigest()}
+        result={'finalExecProfile':profile,'nativeCallback':event=='on_session_ready','exactIdentity':data.get('session_id')==config['session_id'],'physicalHome':str(Path.home()),'authenticated':authenticated,'scopedAlias':os.environ.get('FRESHELL')=='1','onecli':hashlib.sha256(os.environ.get('OPENAI_API_KEY','').encode()).hexdigest()==config['key_digest'],'nativeModuleInstaller':uv.startswith('uv 0.8.22'),'resourceAndDependency':hashlib.sha256(output).hexdigest(),'nativeNamespaceContexts':contexts}
         Path(config['receipt']).write_text(json.dumps(result))
         return HookResult(action='continue')
     _consumer=consume
@@ -780,7 +786,22 @@ async def on_session_ready(coordinator):
     let native_id = "41a04bb3-86f0-463d-97c5-f085e8a9ea4b";
     let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
     let conversation_receipt = workspace.join("amplifier-conversation.json");
-    let bundle_document=format!("bundle:\n  name: closed-native-bundle\nsession:\n  orchestrator:\n    module: loop-probe\n    source: ./modules/loop-probe\n  context:\n    module: context-probe\n    source: ./modules/context-probe\n    config:\n      conversation_receipt: {}\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\nhooks:\n  - module: hooks-probe\n    source: ./modules/hooks-probe\n    config:\n      receipt: {}\n      session_id: {}\n      key_digest: {}\n",serde_json::to_string(conversation_receipt.to_str().unwrap()).unwrap(),serde_json::to_string(receipt.to_str().unwrap()).unwrap(),native_id,hash(b"synthetic-amplifier-onecli-value"));
+    std::fs::create_dir_all(bundle.join("behaviors")).unwrap();
+    std::fs::create_dir_all(bundle.join("context")).unwrap();
+    std::fs::write(
+        bundle.join("context/self.md"),
+        "native-self-namespace-context",
+    )
+    .unwrap();
+    std::fs::write(
+        bundle.join("context/selected.md"),
+        "native-nested-namespace-context",
+    )
+    .unwrap();
+    let namespace_child = bundle.join("behaviors/probe.yaml");
+    let namespace_child_raw="bundle: {name: probe, namespace_root: ..}\ncontext: {include: ['probe:context/selected.md']}\n";
+    std::fs::write(&namespace_child, namespace_child_raw).unwrap();
+    let bundle_document=format!("bundle:\n  name: closed-native-bundle\nincludes: [{}]\ncontext: {{include: ['closed-native-bundle:context/self.md']}}\nsession:\n  orchestrator:\n    module: loop-probe\n    source: ./modules/loop-probe\n  context:\n    module: context-probe\n    source: ./modules/context-probe\n    config:\n      conversation_receipt: {}\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\nhooks:\n  - module: hooks-probe\n    source: ./modules/hooks-probe\n    config:\n      receipt: {}\n      session_id: {}\n      key_digest: {}\n",serde_json::to_string(&format!("file://{}",namespace_child.display())).unwrap(),serde_json::to_string(conversation_receipt.to_str().unwrap()).unwrap(),serde_json::to_string(receipt.to_str().unwrap()).unwrap(),native_id,hash(b"synthetic-amplifier-onecli-value"));
     std::fs::write(bundle.join("bundle.yaml"), &bundle_document).unwrap();
     let settings = "bundle:\n  active: ../scenarios/external-amplifier-bundle/bundle.yaml\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\n".to_owned();
     std::fs::write(home.join(".amplifier/settings.yaml"), &settings).unwrap();
@@ -1089,7 +1110,7 @@ async def on_session_ready(coordinator):
             json!({"provider":"amplifier","route":"terminal","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"classes":classes,"classifiedErrors":classified_errors})
         );
     }
-    let expected = json!({"finalExecProfile":native_exec_profile(),"nativeCallback":true,"exactIdentity":true,"physicalHome":"/home/freshell/provider","authenticated":true,"scopedAlias":true,"onecli":true,"nativeModuleInstaller":true,"resourceAndDependency":hash(b"closed-amplifier-resource:closed-amplifier-dependency")});
+    let expected = json!({"finalExecProfile":native_exec_profile(),"nativeCallback":true,"exactIdentity":true,"physicalHome":"/home/freshell/provider","authenticated":true,"scopedAlias":true,"onecli":true,"nativeModuleInstaller":true,"resourceAndDependency":hash(b"closed-amplifier-resource:closed-amplifier-dependency"),"nativeNamespaceContexts":{"closed-native-bundle:context/self.md":hash(b"native-self-namespace-context"),"probe:context/selected.md":hash(b"native-nested-namespace-context")}});
     assert_eq!(observed.expect("real Amplifier must activate selected local module and executable skill before a model turn"),expected);
     assert!(
         !output.exited,

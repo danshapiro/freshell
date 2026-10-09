@@ -62,6 +62,7 @@ pub(super) fn prepare(
     if let Some(runtime) = select_local_bundle(source, cwd, excluded, &mut result, &mut state)? {
         let replacement = serde_json::to_string(&runtime)
             .map_err(|_| "Amplifier projected source could not be encoded")?;
+        select_namespace_contexts(excluded, &mut result, &mut state)?;
         result.rewritten_settings = Some(rewrite_bundle_active(
             &raw,
             document,
@@ -81,6 +82,66 @@ struct BundleSelection {
     metadata_bytes: usize,
     completed: BTreeMap<PathBuf, String>,
     modules: BTreeMap<PathBuf, String>,
+    namespaces: BTreeMap<String, (PathBuf, PathBuf)>,
+    pending_contexts: Vec<(String, PathBuf)>,
+    native_includes: bool,
+}
+
+impl BundleSelection {
+    fn retain_metadata(&mut self, bytes: usize) -> Result<(), String> {
+        self.metadata_bytes = self
+            .metadata_bytes
+            .checked_add(bytes)
+            .ok_or("Amplifier selected source metadata overflow")?;
+        if self.metadata_bytes > 8 * 1024 * 1024 {
+            return Err("Amplifier selected source metadata budget exceeded".into());
+        }
+        Ok(())
+    }
+}
+
+fn select_namespace_contexts(
+    excluded: &[PathBuf],
+    result: &mut ResourcePreparation,
+    state: &mut BundleSelection,
+) -> Result<(), String> {
+    for (namespace, path) in &state.pending_contexts {
+        let Some((source_base, destination_base)) = state.namespaces.get(namespace) else {
+            if state.native_includes {
+                continue;
+            } // Remote/registered bundles retain native resolution.
+            return Err("Amplifier selected context namespace has no local source base".into());
+        };
+        let selected = source_base.join(path);
+        let canonical = std::fs::canonicalize(&selected)
+            .map_err(|_| "Amplifier selected context is missing, inaccessible or cyclic")?;
+        if excluded.iter().any(|path| canonical.starts_with(path)) {
+            return Err("Amplifier selected context aliases credentials or native state; use the approved private grant source".into());
+        }
+        if !canonical.is_file() {
+            return Err("Amplifier selected context is not a regular file".into());
+        }
+        std::fs::File::open(&canonical).map_err(|_| "Amplifier selected context is unreadable")?;
+        let destination = destination_base.join(path);
+        if let Some(existing) = result
+            .selections
+            .iter()
+            .find(|selection| selection.destination_relative == destination)
+        {
+            if std::fs::canonicalize(&existing.source).ok().as_ref() != Some(&canonical) {
+                return Err("Amplifier selected namespace context destination conflicts".into());
+            }
+            continue;
+        }
+        if result.selections.len() >= 8192 {
+            return Err("Amplifier source selection event budget exceeded".into());
+        }
+        result.selections.push(CopySelection {
+            source: selected,
+            destination_relative: destination,
+        });
+    }
+    Ok(())
 }
 fn select_local_bundle(
     source: &str,
@@ -140,13 +201,7 @@ fn select_local_bundle(
     if state.active.len() >= 64 || state.next_id >= 8192 {
         return Err("Amplifier local include depth or event budget exceeded".into());
     }
-    state.metadata_bytes = state
-        .metadata_bytes
-        .checked_add(canonical.as_os_str().len())
-        .ok_or("Amplifier selected source metadata overflow")?;
-    if state.metadata_bytes > 8 * 1024 * 1024 {
-        return Err("Amplifier selected source metadata budget exceeded".into());
-    }
+    state.retain_metadata(canonical.as_os_str().len())?;
     state.active.insert(canonical.clone());
     let id = state.next_id;
     state.next_id += 1;
@@ -243,6 +298,49 @@ fn select_local_bundle(
                 return Err("Amplifier selected bundle requires one YAML document".into());
             }
             let mut bundle_replacements = Vec::new();
+            if let Some(meta) = native_mapping_value(&bundle_documents[0], "bundle", 0)? {
+                if let Some(name) = native_mapping_value(meta, "name", 0)?
+                    .and_then(|node| node.data.as_str())
+                    .filter(|name| !name.is_empty())
+                {
+                    let namespace_root = native_mapping_value(meta, "namespace_root", 0)?;
+                    let source_base = if let Some(node) = namespace_root {
+                        let relative = node
+                            .data
+                            .as_str()
+                            .ok_or("Amplifier namespace_root must be a string")?;
+                        let selected = root.join(relative);
+                        let canonical = std::fs::canonicalize(&selected).map_err(|_| {
+                            "Amplifier namespace source base is unavailable or cyclic"
+                        })?;
+                        if !canonical.is_dir() {
+                            return Err("Amplifier namespace source base is not a directory".into());
+                        }
+                        let start = header_offset
+                            .checked_add(source_offset(yaml, node.span.start)?)
+                            .ok_or("Amplifier namespace source offset overflow")?;
+                        let end = header_offset
+                            .checked_add(source_offset(yaml, node.span.end)?)
+                            .ok_or("Amplifier namespace source offset overflow")?;
+                        // Each selected namespace is relocated into its bundle's
+                        // projected resource root; keep its native include names.
+                        bundle_replacements.push((start, end, "\".\"".into()));
+                        canonical
+                    } else {
+                        root.to_owned()
+                    };
+                    state.retain_metadata(name.len())?;
+                    state.retain_metadata(source_base.as_os_str().len())?;
+                    state.retain_metadata(relative.as_os_str().len())?;
+                    if state.namespaces.len() >= 8192 {
+                        return Err("Amplifier namespace event budget exceeded".into());
+                    }
+                    state
+                        .namespaces
+                        .entry(name.into())
+                        .or_insert((source_base, relative.clone()));
+                }
+            }
             let module_origin = ModuleSourceOrigin {
                 yaml,
                 header_offset,
@@ -310,6 +408,8 @@ fn select_local_bundle(
                             .checked_add(source_offset(yaml, node.span.end)?)
                             .ok_or("Amplifier include source offset overflow")?;
                         bundle_replacements.push((start, end, replacement));
+                    } else {
+                        state.native_includes = true;
                     }
                 }
             }
@@ -337,8 +437,33 @@ fn select_local_bundle(
                         } else {
                             value
                         };
-                        if include && value.contains(':') {
-                            return Err("Amplifier namespace context requires its retained source-base projection".into());
+                        if include {
+                            if let Some((namespace, path)) = value.split_once(':') {
+                                state.retain_metadata(value.len())?;
+                                let path = PathBuf::from(path.trim_start_matches('/'));
+                                if namespace.is_empty()
+                                    || path.as_os_str().is_empty()
+                                    || path.components().any(|component| {
+                                        !matches!(
+                                            component,
+                                            std::path::Component::Normal(_)
+                                                | std::path::Component::CurDir
+                                        )
+                                    })
+                                {
+                                    return Err(
+                                        "Amplifier selected namespace context path is unsupported"
+                                            .into(),
+                                    );
+                                }
+                                if state.pending_contexts.len() >= 8192 {
+                                    return Err(
+                                        "Amplifier namespace context event budget exceeded".into(),
+                                    );
+                                }
+                                state.pending_contexts.push((namespace.into(), path));
+                                continue;
+                            }
                         }
                         let path = Path::new(value);
                         let selected = if path.is_absolute() {
@@ -557,6 +682,150 @@ fn markdown_frontmatter(raw: &str) -> Option<(&str, usize)> {
 #[cfg(test)]
 mod module_source_tests {
     use super::*;
+
+    #[test]
+    fn managed_provider_amplifier_namespace_context_consumes_native_source_bases_after_both_copies()
+    {
+        for nested in [false, true] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let cwd = owned.path().join("workspace");
+            let bundle = owned.path().join("external-bundle");
+            for path in [
+                &home.join(".amplifier"),
+                &cwd,
+                &bundle.join("behaviors"),
+                &bundle.join("context"),
+            ] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            let child = bundle.join("behaviors/probe.yaml");
+            let raw_child="bundle: {name: probe, namespace_root: ..}\ncontext:\n  include: ['probe:context/selected.md']\n";
+            let raw = if nested {
+                format!("bundle: {{name: root}}\nincludes: [{}]\ncontext:\n  include: ['probe:context/selected.md']\n",serde_json::to_string(&format!("file://{}",child.display())).unwrap())
+            } else {
+                "bundle: {name: probe}\ncontext:\n  include: ['probe:context/selected.md']\n".into()
+            };
+            std::fs::write(bundle.join("bundle.yaml"), &raw).unwrap();
+            std::fs::write(&child, raw_child).unwrap();
+            std::fs::write(
+                bundle.join("context/selected.md"),
+                "selected-namespaced-context",
+            )
+            .unwrap();
+            let settings = home.join(".amplifier/settings.yaml");
+            let raw_settings = format!(
+                "bundle: {{active: {}}}\n",
+                serde_json::to_string(&format!("file://{}", bundle.join("bundle.yaml").display()))
+                    .unwrap()
+            );
+            std::fs::write(&settings, &raw_settings).unwrap();
+            let prepared =
+                prepare(&home, &cwd, &[]).expect("native local namespace context must prepare");
+            let stage = owned.path().join("stage");
+            let host = owned.path().join("host");
+            freshell_platform::provider_environment::copy_environment(
+                &prepared.selections,
+                &stage,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            for (relative, raw) in &prepared.rewritten_resources {
+                std::fs::write(stage.join(relative), raw).unwrap();
+            }
+            let selections = prepared
+                .selections
+                .iter()
+                .map(|selection| CopySelection {
+                    source: stage.join(&selection.destination_relative),
+                    destination_relative: selection.destination_relative.clone(),
+                })
+                .collect::<Vec<_>>();
+            freshell_platform::provider_environment::copy_environment(
+                &selections,
+                &host,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            let child_relative = prepared
+                .rewritten_resources
+                .iter()
+                .find(|(_, raw)| raw.contains("name: probe"))
+                .unwrap()
+                .0
+                .clone();
+            let child_document = MarkedYamlOwned::load_from_str(
+                &std::fs::read_to_string(host.join(&child_relative)).unwrap(),
+            )
+            .unwrap();
+            let namespace_root = child_document[0]
+                .data
+                .as_mapping_get("bundle")
+                .unwrap()
+                .data
+                .as_mapping_get("namespace_root")
+                .and_then(|node| node.data.as_str())
+                .unwrap_or(".");
+            let reference = child_document[0]
+                .data
+                .as_mapping_get("context")
+                .unwrap()
+                .data
+                .as_mapping_get("include")
+                .unwrap()
+                .data
+                .as_sequence()
+                .unwrap()[0]
+                .data
+                .as_str()
+                .unwrap();
+            let (namespace, path) = reference.split_once(':').unwrap();
+            assert_eq!(namespace, "probe");
+            let source_base = host
+                .join(child_relative.parent().unwrap())
+                .join(namespace_root);
+            let hidden = owned.path().join("hidden-original-bundle");
+            std::fs::rename(&bundle, &hidden).unwrap();
+            let output=std::process::Command::new("node").args(["-e","process.stdout.write(require('node:fs').readFileSync(require('node:path').join(process.argv[1],process.argv[2])))"]).arg(&source_base).arg(path.trim_start_matches('/')).env_clear().env("PATH",std::env::var_os("PATH").unwrap()).output().unwrap();
+            std::fs::rename(&hidden, &bundle).unwrap();
+            assert!(output.status.success(),"projected native namespace source base must be readable with original sources hidden: {:?}",output.stderr);
+            assert_eq!(output.stdout, b"selected-namespaced-context");
+            assert_eq!(std::fs::read_to_string(settings).unwrap(), raw_settings);
+            assert_eq!(
+                std::fs::read_to_string(bundle.join("bundle.yaml")).unwrap(),
+                raw
+            );
+            assert_eq!(std::fs::read_to_string(child).unwrap(), raw_child);
+        }
+    }
+
+    #[test]
+    fn managed_provider_amplifier_namespace_context_missing_selected_resource_is_refused() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        std::fs::create_dir_all(home.join(".amplifier")).unwrap();
+        let bundle = owned.path().join("bundle.yaml");
+        std::fs::write(
+            &bundle,
+            "bundle: {name: probe}\ncontext: {include: ['probe:context/missing.md']}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".amplifier/settings.yaml"),
+            format!(
+                "bundle: {{active: {}}}\n",
+                serde_json::to_string(&bundle).unwrap()
+            ),
+        )
+        .unwrap();
+        let error = prepare(&home, owned.path(), &[])
+            .err()
+            .expect("missing selected namespace context blocks preparation");
+        assert!(error.contains("selected context is missing"), "{error}");
+        assert!(!owned.path().join("stage").exists());
+    }
 
     #[test]
     fn managed_provider_amplifier_top_local_forms_consume_modules_context_and_dependencies_after_both_copies(
