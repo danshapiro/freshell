@@ -770,30 +770,13 @@ fn optional(path: &Path) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::super::execute_copied_script;
     use super::*;
     use freshell_platform::{
         claude_inputs::ClaudeSettingSource,
         provider_environment::{copy_environment, CopyLimits},
     };
-
-    #[cfg(unix)]
-    fn execute_copied_script(path: &Path) -> std::io::Result<std::process::Output> {
-        // A parallel fork can briefly inherit a writer before close-on-exec.
-        // ETXTBSY creates no child, so retry only that transient spawn error;
-        // still execute the actual copied script and fail every other error.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        loop {
-            match std::process::Command::new(path).output() {
-                Err(error)
-                    if error.raw_os_error() == Some(libc::ETXTBSY)
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                result => return result,
-            }
-        }
-    }
 
     #[cfg(unix)]
     #[test]

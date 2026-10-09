@@ -3243,6 +3243,25 @@ pub(crate) async fn scoped_auth_middleware(
     next.run(request).await
 }
 
+#[cfg(all(test, unix))]
+fn execute_copied_script(path: &Path) -> std::io::Result<std::process::Output> {
+    // A parallel fork can briefly inherit a writer before close-on-exec.
+    // ETXTBSY creates no child, so retry only that transient spawn error;
+    // still execute the actual copied script and fail every other error.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        match std::process::Command::new(path).output() {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4164,8 +4183,7 @@ except Exception as error:
             .unwrap();
         assert!(plugin.status.success(), "dependency lookup: {plugin:?}");
         assert_eq!(plugin.stdout, b"dependency-nonce\n");
-        let script = Command::new(home.join("scripts/run"))
-            .output()
+        let script = execute_copied_script(&home.join("scripts/run"))
             .expect("two-stage executable must retain execute permission");
         assert!(script.status.success(), "{script:?}");
         assert_eq!(script.stdout, b"resource-nonce\n");
@@ -4174,7 +4192,7 @@ except Exception as error:
     #[cfg(unix)]
     #[test]
     fn managed_provider_two_stage_script_retains_execute_permission() {
-        use std::{os::unix::fs::PermissionsExt, process::Command};
+        use std::os::unix::fs::PermissionsExt;
         let root = executable_fixture_directory();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -4185,11 +4203,19 @@ except Exception as error:
         let home = root.path().join("home");
         copy_provider_source(&source, &source, &stage, 0, &mut 0).unwrap();
         copy_provider_source(&stage, &stage, &home, 0, &mut 0).unwrap();
-        assert!(Command::new(home.join("run"))
-            .output()
-            .expect("two-stage script spawn")
-            .status
-            .success());
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(home.join("run"))
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(writer);
+        });
+        let result = execute_copied_script(&home.join("run"));
+        release.join().unwrap();
+        let script = result.expect("two-stage script spawn after exact transient writer closes");
+        assert!(script.status.success());
+        assert_eq!(script.stdout, b"resource-nonce");
     }
 
     #[cfg(unix)]
