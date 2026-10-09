@@ -304,7 +304,7 @@ function makeThreadTurnsPage(params = {}) {
   }
 }
 
-function successResult(method, params) {
+function successResult(method, params, ctx = {}) {
   if (method === 'initialize') {
     return {
       userAgent: 'freshell-fixture/1.0.0',
@@ -314,12 +314,18 @@ function successResult(method, params) {
     }
   }
   if (method === 'thread/start') {
-    const threadId = behavior.threadStartThreadId || 'thread-new-1'
+    // Native role: the id (and ephemeral flag) the role chose for THIS request.
+    const threadId = ctx.threadId || behavior.threadStartThreadId || 'thread-new-1'
     const rolloutPath = behavior.threadStartRolloutPath || behavior.rolloutPath
     const thread = makeThread(threadId, params)
     if (rolloutPath) thread.path = rolloutPath
     if (typeof behavior.threadStartEphemeral === 'boolean') {
       thread.ephemeral = behavior.threadStartEphemeral
+    }
+    if (ctx.ephemeral === true) {
+      // Codex: an ephemeral (title) thread has no rollout file.
+      thread.ephemeral = true
+      thread.path = null
     }
     return {
       thread,
@@ -365,7 +371,9 @@ function successResult(method, params) {
       return { turn }
     }
     return {
-      turn: makeTurn('turn-1'),
+      // Native role: every turn gets its own id (concurrent turns on different
+      // threads must never share one).
+      turn: makeTurn(nativeRole ? `turn-${++nativeTurnCounter}` : 'turn-1'),
     }
   }
   if (method === 'thread/fork') {
@@ -378,6 +386,12 @@ function successResult(method, params) {
     forkCounter += 1
     const childThreadId = `thread-fork-${process.pid}-${forkCounter}`
     const child = makeThread(childThreadId, params)
+    if (nativeRole) {
+      // The native holds both the original's and the fork's locks; the
+      // dispatcher awaits `ctx.pending` before answering.
+      ctx.pending = nativeRole.noteLoaded(childThreadId, ctx.socket)
+      child.forkedFromId = parentThreadId
+    }
     ensureDurableArtifact(childThreadId)
     let childTurns = []
     if (behavior.recordTurns) {
@@ -457,6 +471,8 @@ function successResult(method, params) {
     if (typeof scriptedStatus === 'string') {
       thread.status = { type: scriptedStatus }
     }
+    const live = nativeRole?.statusFor(thread.id)
+    if (live) thread.status = live
     return { thread }
   }
   if (method === 'thread/turns/list') {
@@ -488,6 +504,21 @@ function maybeWriteRolloutForMethod(method, params) {
 
 const listenUrl = parseListenUrl(process.argv.slice(2))
 const behavior = loadBehavior()
+// The realistic native role (FAKE_CODEX_ROLE=native, set only by
+// fake-codex-launcher.mjs). Every other consumer keeps the single-process fake,
+// which never loads native-role.mjs, so this file still runs when copied alone.
+let nativeTurnCounter = 0
+const nativeRole = process.env.FAKE_CODEX_ROLE === 'native'
+  ? (await import('./native-role.mjs')).createNativeRole({
+      behavior,
+      codexHome: getCodexHome(),
+      broadcast: (method, params) => broadcastNotification(method, params),
+      openConnections: () => [...(wss?.clients ?? [])].filter((client) => client.readyState === 1),
+      sendTo: (socket, method, params) => {
+        if (socket.readyState === 1) socket.send(JSON.stringify({ jsonrpc: '2.0', method, params }))
+      },
+    })
+  : null
 if (process.env.FAKE_CODEX_APP_SERVER_ARG_LOG) {
   fs.writeFileSync(process.env.FAKE_CODEX_APP_SERVER_ARG_LOG, JSON.stringify({
     argv: process.argv.slice(2),
@@ -563,15 +594,21 @@ if (behavior.spawnDurableWriter) {
   }
 }
 
-const wss = portFile
-  ? new WebSocketServer({ host, port: 0 }, () => {
-      const address = wss.address()
-      if (!address || typeof address === 'string') {
-        throw new Error('fake app-server did not receive a loopback port')
-      }
-      fs.writeFileSync(portFile, `${address.port}\n`, 'utf8')
-    })
-  : new WebSocketServer({ host, port })
+// Created by listen() at the end of the module (after the native role is ready
+// and any behavior.listenDelayMs has passed).
+let wss = null
+function listen() {
+  wss = portFile
+    ? new WebSocketServer({ host, port: 0 }, () => {
+        const address = wss.address()
+        if (!address || typeof address === 'string') {
+          throw new Error('fake app-server did not receive a loopback port')
+        }
+        fs.writeFileSync(portFile, `${address.port}\n`, 'utf8')
+      })
+    : new WebSocketServer({ host, port })
+  wss.on('connection', handleConnection)
+}
 const watches = new Map()
 const activeThreadIds = new Set()
 // kata 1wxv (LBC-1): thread/revert is paginated-only. Threads THIS process
@@ -586,7 +623,7 @@ function broadcastNotification(method, params) {
     method,
     params,
   })
-  for (const client of wss.clients) {
+  for (const client of wss?.clients ?? []) {
     if (client.readyState === 1) {
       client.send(payload)
     }
@@ -613,7 +650,7 @@ function socketSafeBroadcast(notification) {
     return
   }
   const payload = JSON.stringify(notification)
-  for (const client of wss.clients) {
+  for (const client of wss?.clients ?? []) {
     if (client.readyState === 1) {
       client.send(payload)
     }
@@ -708,11 +745,12 @@ function claimCrossProcessCloseSocketOnce(method) {
   return claimCrossProcessOnce(behavior.closeSocketAfterMethodsOnceMarkerPath, `close-socket:${method}`)
 }
 
-wss.on('connection', (socket) => {
+function handleConnection(socket) {
   let initialized = false
   let initializedNotification = false
   const pendingClientRequests = new Map()
-  socket.on('message', (raw) => {
+  socket.on('close', () => nativeRole?.connectionClosed(socket))
+  socket.on('message', async (raw) => {
     const message = JSON.parse(raw.toString())
     if (message.method === undefined && ('result' in message || 'error' in message)) {
       const pending = pendingClientRequests.get(message.id)
@@ -771,6 +809,19 @@ wss.on('connection', (socket) => {
 
     if (behavior.ignoreMethods?.includes(method)) {
       return
+    }
+
+    const requestContext = { socket }
+    if (nativeRole) {
+      const answer = await nativeRole.intercept(method, message.params, socket, requestContext)
+      if (answer?.error) {
+        socket.send(JSON.stringify({ id: message.id, error: answer.error }))
+        return
+      }
+      if (answer && 'result' in answer) {
+        socket.send(JSON.stringify({ id: message.id, result: answer.result }))
+        return
+      }
     }
 
     // This fixture writes realistic rollout files on turn/start. Require BOTH a test-owned
@@ -874,7 +925,8 @@ wss.on('connection', (socket) => {
     setTimeout(async () => {
       await writeBytes(process.stdout, floodStdoutBytes)
       await writeBytes(process.stderr, floodStderrBytes)
-      const result = override?.result ?? successResult(method, message.params)
+      const result = override?.result ?? successResult(method, message.params, requestContext)
+      if (requestContext.pending) await requestContext.pending
       // Durable witnesses land BEFORE the RPC response (kata rb5h). socket.send copies
       // the frame into the kernel synchronously, so on a loaded multi-core host a client
       // on another core can observe the response and assert the witness files while THIS
@@ -900,49 +952,58 @@ wss.on('connection', (socket) => {
           pending.resolve({ cancelled: true })
         }
       }
-      if (method === 'turn/start' && behavior.recordTurns && result?.turn?.id) {
-        // recordTurns opt-in: a recorded turn closes with the real turn
-        // lifecycle notifications (thread/status active → turn/started →
-        // thread/status idle → turn/completed{completed})
-        // so the consumer's active-turn tracking clears and the idle snapshot
-        // edge (which re-fetches the recorded transcript) actually fires. The
-        // gap MATTERS (never drop it): the server's send task records
-        // active_turn when the RPC result lands; a same-tick turn/completed
-        // could clear it BEFORE that record, leaving the session wedged busy —
-        // a real provider never completes a turn within the result's tick.
-        behavior.threadStatuses = { ...(behavior.threadStatuses ?? {}), [message.params?.threadId]: 'active' }
-        broadcastNotification('thread/status/changed', {
-          threadId: message.params?.threadId,
-          status: { type: 'active' },
-        })
-        broadcastNotification('turn/started', {
-          threadId: message.params?.threadId,
-          turn: { id: result.turn.id, status: 'inProgress' },
-        })
-        const prompt = (message.params?.input ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('\n')
-        const userRequest = behavior.serverRequestsByPrompt?.[prompt]
-        let interrupted = false
-        if (userRequest) {
-          const id = userRequest.id ?? `request-${result.turn.id}`
-          const response = await new Promise((resolve) => {
-            pendingClientRequests.set(id, { resolve, threadId: message.params.threadId })
-            socket.send(JSON.stringify({ id, method: userRequest.method, params: {
-              threadId: message.params.threadId, turnId: result.turn.id, itemId: `item-${result.turn.id}`,
-              ...userRequest.params,
-            } }))
+      if (method === 'turn/start' && (behavior.recordTurns || nativeRole) && result?.turn?.id) {
+        // A native turn runs detached (like a real app-server), so the rest of the
+        // post-response handling — the rollout write included — happens at turn
+        // start; the single-process fake keeps awaiting it as before.
+        const turnLifecycle = (async () => {
+          // recordTurns opt-in: a recorded turn closes with the real turn
+          // lifecycle notifications (thread/status active → turn/started →
+          // thread/status idle → turn/completed{completed})
+          // so the consumer's active-turn tracking clears and the idle snapshot
+          // edge (which re-fetches the recorded transcript) actually fires. The
+          // gap MATTERS (never drop it): the server's send task records
+          // active_turn when the RPC result lands; a same-tick turn/completed
+          // could clear it BEFORE that record, leaving the session wedged busy —
+          // a real provider never completes a turn within the result's tick.
+          behavior.threadStatuses = { ...(behavior.threadStatuses ?? {}), [message.params?.threadId]: 'active' }
+          broadcastNotification('thread/status/changed', {
+            threadId: message.params?.threadId,
+            status: { type: 'active' },
           })
-          interrupted = response.cancelled === true
-        }
-        await new Promise((resolve) => setTimeout(resolve, Number(behavior.turnCompleteDelayMs ?? 150)))
-        behavior.threadStatuses[message.params?.threadId] = 'idle'
-        broadcastNotification('thread/status/changed', {
-          threadId: message.params?.threadId,
-          status: { type: 'idle' },
-        })
-        broadcastNotification('turn/completed', {
-          threadId: message.params?.threadId,
-          turn: { id: result.turn.id, status: interrupted ? 'interrupted' : 'completed' },
-        })
+          broadcastNotification('turn/started', {
+            threadId: message.params?.threadId,
+            turn: { id: result.turn.id, status: 'inProgress' },
+          })
+          const prompt = (message.params?.input ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('\n')
+          const userRequest = behavior.serverRequestsByPrompt?.[prompt]
+          let interrupted = false
+          if (userRequest) {
+            const id = userRequest.id ?? `request-${result.turn.id}`
+            const response = await new Promise((resolve) => {
+              pendingClientRequests.set(id, { resolve, threadId: message.params.threadId })
+              socket.send(JSON.stringify({ id, method: userRequest.method, params: {
+                threadId: message.params.threadId, turnId: result.turn.id, itemId: `item-${result.turn.id}`,
+                ...userRequest.params,
+              } }))
+            })
+            interrupted = response.cancelled === true
+          }
+          const turnOutcome = nativeRole
+            ? await nativeRole.turnDelay(message.params?.threadId, result.turn.id, Number(behavior.turnCompleteDelayMs ?? 150))
+            : (await new Promise((resolve) => setTimeout(resolve, Number(behavior.turnCompleteDelayMs ?? 150))), 'completed')
+          behavior.threadStatuses[message.params?.threadId] = 'idle'
+          broadcastNotification('thread/status/changed', {
+            threadId: message.params?.threadId,
+            status: { type: 'idle' },
+          })
+          broadcastNotification('turn/completed', {
+            threadId: message.params?.threadId,
+            turn: { id: result.turn.id, status: interrupted ? 'interrupted' : turnOutcome },
+          })
+          nativeRole?.turnEnded(message.params?.threadId, result.turn.id)
+        })()
+        if (!nativeRole) await turnLifecycle
       }
       if (method === 'initialize') {
         initialized = true
@@ -970,9 +1031,17 @@ wss.on('connection', (socket) => {
       if (method === 'thread/resume') {
         const thread = result?.thread || getThreadHandle(message.params?.threadId || 'thread-new-1')
         activeThreadIds.add(thread.id)
-        broadcastNotification('thread/started', {
-          thread,
-        })
+        // Codex 0.162 never announces a resume with thread/started; the native
+        // role broadcasts the cold-resume status pair instead.
+        if (!nativeRole) {
+          broadcastNotification('thread/started', {
+            thread,
+          })
+        }
+      }
+      if (method === 'thread/fork' && nativeRole && result?.thread) {
+        // Codex 0.162 announces a fork child (it carries forkedFromId).
+        broadcastNotification('thread/started', { thread: result.thread })
       }
       if (method === 'fs/watch') {
         const watchId = message.params?.watchId
@@ -987,7 +1056,7 @@ wss.on('connection', (socket) => {
           watches.delete(watchId)
         }
       }
-      if (method === 'turn/start' && message.params?.threadId) {
+      if (method === 'turn/start' && message.params?.threadId && !nativeRole?.isEphemeral(message.params.threadId)) {
         const { thread } = ensureDurableArtifact(message.params.threadId)
         const rolloutPath = thread.path
         const rolloutParent = path.dirname(rolloutPath)
@@ -1030,9 +1099,10 @@ wss.on('connection', (socket) => {
       }
     }, delayMs)
   })
-})
+}
 
-process.on('SIGTERM', () => {
+// The native role installs its own signal handlers.
+if (!nativeRole) process.on('SIGTERM', () => {
   if (process.env.FAKE_CODEX_APP_SERVER_IGNORE_SIGTERM === '1') {
     return
   }
@@ -1045,7 +1115,7 @@ process.on('SIGTERM', () => {
   if (!behavior.wrapperLeavesDurableWriterOnSigterm) {
     durableWriterChild?.kill('SIGTERM')
   }
-  const exit = () => wss.close(() => process.exit(0))
+  const exit = () => (wss ? wss.close(() => process.exit(0)) : process.exit(0))
   const delayExitMs = Number(behavior.delayExitOnSigtermMs || 0)
   if (delayExitMs > 0) {
     setTimeout(exit, delayExitMs)
@@ -1053,3 +1123,11 @@ process.on('SIGTERM', () => {
   }
   exit()
 })
+
+if (nativeRole) await nativeRole.ready
+const listenDelayMs = Number(behavior.listenDelayMs || 0)
+if (listenDelayMs > 0) {
+  setTimeout(listen, listenDelayMs) // makes "kill during start" reproducible
+} else {
+  listen()
+}

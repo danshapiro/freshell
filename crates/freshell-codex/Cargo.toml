@@ -24,6 +24,14 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+# Test fixture: the realistic Codex fake's real writer lock off Linux
+# (`File::try_lock`, as Codex's writer_lock.rs). std only; never shipped.
+[[bin]]
+name = "fake-codex-lock-holder"
+path = "tests/support/fake_codex_lock_holder.rs"
+test = false
+doc = false
+
 [features]
 # The CORE (framing, handshake, completion gating, model/effort normalization, durability
 # id-shapes) is pure/fake-injected and needs NO heavy deps. The real tokio-tungstenite WS
@@ -66,3 +74,9 @@ libc = { version = "0.2", optional = true }
 # Tempdirs for the sidecar-store unit tests — no global state, nothing outside
 # each test's own temp dir (never `~/.freshell/`).
 tempfile = "3"
+# The realistic-fake test support (`tests/support/fake_codex.rs`): manifest
+# deserialization, a JSON-RPC WebSocket client, and signals to test-spawned pids.
+serde = { workspace = true }
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+libc = "0.2"
