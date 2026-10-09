@@ -104,6 +104,13 @@ impl Selection<'_> {
             return Err("Codex role configuration cycle detected");
         }
         let result = (|| {
+            if std::fs::metadata(&canonical)
+                .map_err(|_| "Codex selected configuration unreadable")?
+                .len()
+                > MAX_SOURCE_VIEW_BYTES
+            {
+                return Err("Codex selected configuration source view exceeded");
+            }
             let mut raw = String::new();
             std::fs::File::open(&canonical)
                 .map_err(|_| "Codex selected configuration unreadable")?
@@ -760,6 +767,9 @@ fn is_agent_plugin(active: &Path) -> Result<bool, &'static str> {
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err("Codex active root plugin manifest must be a physical regular file; repair installation and retry");
     }
+    if metadata.len() > MAX_SOURCE_VIEW_BYTES {
+        return Err("Codex active plugin manifest source view exceeded");
+    }
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .map_err(|_| "Codex active plugin manifest is unreadable; repair installation and retry")?
@@ -792,13 +802,21 @@ fn exists(path: &Path) -> Result<bool, &'static str> {
 }
 fn read_config(path: &Path) -> Result<toml::Value, &'static str> {
     use std::io::Read;
+    let metadata =
+        std::fs::metadata(path).map_err(|_| "Codex selected configuration is unavailable")?;
+    if !metadata.is_file() {
+        return Err("Codex selected configuration is unavailable");
+    }
+    if metadata.len() > MAX_SOURCE_VIEW_BYTES {
+        return Err("Codex selected configuration source view exceeded");
+    }
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .map_err(|_| "Codex selected configuration is unavailable")?
         .take(MAX_SOURCE_VIEW_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "Codex selected configuration is unreadable")?;
-    if bytes.len() > 16 * 1024 * 1024 {
+    if bytes.len() as u64 > MAX_SOURCE_VIEW_BYTES {
         return Err("Codex selected configuration source view exceeded");
     }
     let raw =
@@ -924,6 +942,157 @@ mod tests {
             enabled,
             kind: LayerKind::User,
         }
+    }
+
+    #[test]
+    fn managed_provider_codex_actual_source_read_limits_reject_before_reading() {
+        use std::io::Write;
+        let owned = tempfile::tempdir().unwrap();
+        let unread = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let mut read_oversized = Vec::new();
+        for kind in ["selection", "configuration", "plugin"] {
+            let root = owned.path().join(kind);
+            std::fs::create_dir(&root).unwrap();
+            let path = root.join(if kind == "plugin" {
+                "plugin.json"
+            } else {
+                "config.toml"
+            });
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_len(16 * 1024 * 1024 + 1).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_accessed(unread))
+                .unwrap();
+            let rejected = match kind {
+                "selection" => {
+                    select_inputs(&[layer(path.clone(), true)], owned.path(), None).is_err()
+                }
+                "configuration" => read_config(&path).is_err(),
+                "plugin" => is_agent_plugin(&root).is_err(),
+                _ => unreachable!(),
+            };
+            assert!(rejected);
+            if file.metadata().unwrap().accessed().unwrap() != unread {
+                read_oversized.push(kind);
+            }
+        }
+        assert!(
+            read_oversized.is_empty(),
+            "oversized readers accessed source bytes: {read_oversized:?}"
+        );
+        for kind in ["selection", "configuration", "plugin"] {
+            let root = owned.path().join(kind);
+            let path = root.join(if kind == "plugin" {
+                "plugin.json"
+            } else {
+                "config.toml"
+            });
+            let prefix: &[u8] = if kind == "plugin" {
+                br#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"}"#
+            } else {
+                b"# exact source profile\n"
+            };
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(prefix).unwrap();
+            let chunk = vec![b' '; 64 * 1024];
+            let mut remaining = 16 * 1024 * 1024 - prefix.len();
+            while remaining != 0 {
+                let size = remaining.min(chunk.len());
+                file.write_all(&chunk[..size]).unwrap();
+                remaining -= size;
+            }
+            match kind {
+                "selection" => assert_eq!(
+                    select_inputs(&[layer(path, true)], owned.path(), None)
+                        .unwrap()
+                        .len(),
+                    1
+                ),
+                "configuration" => {
+                    assert!(read_config(&path).unwrap().as_table().unwrap().is_empty())
+                }
+                "plugin" => assert!(is_agent_plugin(&root).unwrap()),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_codex_actual_event_count_and_metadata_capacity() {
+        let owned = tempfile::tempdir().unwrap();
+        let root = owned.path().join("a".repeat(200)).join("b".repeat(200));
+        std::fs::create_dir_all(&root).unwrap();
+        let length = 512 - root.as_os_str().len() - 1;
+        assert!((8..255).contains(&length));
+        let configuration = root.join("c".repeat(length));
+        let role = root.join("r".repeat(length));
+        let alias = root.join("s".repeat(length + 1));
+        std::fs::write(&role, "# actual selected role\n").unwrap();
+        std::os::unix::fs::symlink(role.file_name().unwrap(), &alias).unwrap();
+        assert_eq!(configuration.as_os_str().len(), 512);
+        assert_eq!(role.as_os_str().len(), 512);
+        assert_eq!(alias.as_os_str().len(), 513);
+        let document = |count: usize, extra_alias: bool| {
+            (0..count)
+                .map(|ordinal| {
+                    let path = if extra_alias && ordinal + 1 == count {
+                        &alias
+                    } else {
+                        &role
+                    };
+                    format!(
+                        "[agents.role_{ordinal:04}]\nconfig_file={}\n",
+                        serde_json::to_string(path.to_str().unwrap()).unwrap()
+                    )
+                })
+                .collect::<String>()
+        };
+        let raw = document(8191, false);
+        std::fs::write(&configuration, &raw).unwrap();
+        let selected =
+            select_inputs(&[layer(configuration.clone(), true)], owned.path(), None).unwrap();
+        assert_eq!(selected.len(), 8192);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|input| input.logical_path.as_os_str().len()
+                    + input.canonical_source.as_os_str().len())
+                .sum::<usize>(),
+            8 * 1024 * 1024
+        );
+        assert!(selected
+            .iter()
+            .all(|input| input.kind == InputKind::Configuration));
+        assert!(selected[1..]
+            .iter()
+            .all(|input| input.logical_path == role && input.canonical_source == role));
+        let metadata_overflow = root.join("m".repeat(length));
+        std::fs::write(&metadata_overflow, document(8191, true)).unwrap();
+        assert_eq!(
+            select_inputs(&[layer(metadata_overflow, true)], owned.path(), None).err(),
+            Some("Codex selected input metadata budget exceeded")
+        );
+        let event_overflow = root.join("e".repeat(length));
+        std::fs::write(&event_overflow, document(8192, false)).unwrap();
+        let unread = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        std::fs::File::open(&role)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_accessed(unread))
+            .unwrap();
+        assert_eq!(
+            select_inputs(&[layer(event_overflow, true)], owned.path(), None).err(),
+            Some("Codex selected role event budget exceeded")
+        );
+        assert_eq!(
+            std::fs::metadata(&role).unwrap().accessed().unwrap(),
+            unread
+        );
+        assert_eq!(std::fs::read(&configuration).unwrap(), raw.as_bytes());
+        assert_eq!(
+            selected.len(),
+            8192,
+            "failed selections leave the prior retained selection intact"
+        );
     }
 
     #[cfg(unix)]
