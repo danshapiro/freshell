@@ -80,7 +80,7 @@ pub(crate) enum NativeIdentityWait {
 }
 
 const NATIVE_IDENTITY_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-const OPENCODE_ADOPTION_READINESS_TIMEOUT: Duration = Duration::from_secs(180);
+const OPENCODE_TUI_READINESS_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn retained_runtime_probe(
     exited: bool,
@@ -159,9 +159,9 @@ pub(crate) fn current_native_observation<'a>(
     .then_some(observation)
 }
 
-pub(crate) fn native_identity_wait_timeout(opencode_adoption_required: bool) -> Duration {
-    if opencode_adoption_required {
-        OPENCODE_ADOPTION_READINESS_TIMEOUT
+pub(crate) fn native_identity_wait_timeout(opencode_tui_readiness_required: bool) -> Duration {
+    if opencode_tui_readiness_required {
+        OPENCODE_TUI_READINESS_TIMEOUT
     } else {
         NATIVE_IDENTITY_STARTUP_TIMEOUT
     }
@@ -2620,16 +2620,18 @@ impl Supervisor {
         };
 
         verdict_fence = verdict_fence.for_incarnation(prepared.prepared.incarnation_id.clone());
+        let workload = LaunchWorkload {
+            soul_id: soul_id.clone(),
+            fixture: prepared.fixture,
+            terminal: prepared.terminal.clone(),
+            fresh_agent: prepared.fresh_agent.clone(),
+            resume_spec: prepared.resume_spec.clone(),
+        };
+        let opencode_readiness = workload.opencode_tui_readiness_required(&start.context.provider);
         let launch = self
             .activate_prepared_observed(
                 prepared.prepared.clone(),
-                LaunchWorkload {
-                    soul_id: soul_id.clone(),
-                    fixture: prepared.fixture,
-                    terminal: prepared.terminal.clone(),
-                    fresh_agent: prepared.fresh_agent.clone(),
-                    resume_spec: prepared.resume_spec.clone(),
-                },
+                workload,
                 start.context.requested_limits,
                 verdict_fence.clone(),
             )
@@ -2696,15 +2698,12 @@ impl Supervisor {
             );
         let observed_native_session_id = if expected_native_session_id.is_some() || requires_native
         {
-            let adoption_required = resume_spec
-                .as_ref()
-                .is_some_and(|spec| spec.opencode_adoption_baseline.is_some());
             let wait = self
                 .wait_for_native_identity(
                     &soul_id,
                     &prepared.prepared.incarnation_id,
                     start.context.intent_revision,
-                    native_identity_wait_timeout(adoption_required),
+                    native_identity_wait_timeout(opencode_readiness),
                     true,
                 )
                 .await;

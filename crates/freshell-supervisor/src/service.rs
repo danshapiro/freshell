@@ -57,19 +57,15 @@ pub(crate) struct LaunchWorkload {
 }
 
 impl LaunchWorkload {
-    fn opencode_adoption_required(&self, provider: &str) -> bool {
+    // Ordinary and imported terminals share the native TUI loader. Choosing
+    // its readiness budget supplies no adoption or identity evidence.
+    pub(crate) fn opencode_tui_readiness_required(&self, provider: &str) -> bool {
         provider == "opencode"
-            && (self.resume_spec.as_ref().is_some_and(|spec| {
-                spec.provider_session.provider == "opencode"
-                    && spec
-                        .opencode_adoption_baseline
-                        .as_ref()
-                        .is_some_and(|baseline| baseline.validate().is_ok())
-            }) || self.terminal.as_ref().is_some_and(|terminal| {
-                terminal.mode == "opencode"
-                    && terminal.opencode_transfer.is_some()
-                    && terminal.validate().is_ok()
-            }))
+            && self.fresh_agent.is_none()
+            && self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.mode == "opencode" && terminal.validate().is_ok())
     }
 }
 
@@ -2688,13 +2684,13 @@ impl Supervisor {
         intent_revision: u64,
     ) -> crate::recovery::NativeIdentityWait {
         use crate::recovery::NativeIdentityWait;
-        let adoption_required = workload.opencode_adoption_required(&context.provider);
+        let opencode_readiness = workload.opencode_tui_readiness_required(&context.provider);
         let result = self
             .wait_for_native_identity(
                 &workload.soul_id,
                 incarnation_id,
                 intent_revision,
-                crate::recovery::native_identity_wait_timeout(adoption_required),
+                crate::recovery::native_identity_wait_timeout(opencode_readiness),
                 false,
             )
             .await;
@@ -2725,7 +2721,7 @@ impl Supervisor {
                 "executionGeneration": context.native_identity_launch.as_ref().map(|launch| launch.execution_generation),
                 "launchNonce": context.native_identity_launch.as_ref().map(|launch| &launch.launch_nonce),
                 "outcome": outcome, "reason": outcome, "adoptionPending": adoption_pending, "elapsedMs": elapsed_ms,
-                "waitClass": if adoption_required { "opencode_adoption" } else { "ordinary" },
+                "waitClass": if opencode_readiness { "opencode_tui" } else { "ordinary" },
             }),
         );
         result
@@ -4024,20 +4020,27 @@ mod opencode_transfer_restart_tests {
     }
 
     #[tokio::test]
-    async fn initial_import_waits_for_current_observation_under_existing_adoption_policy() {
+    async fn terminal_opencode_readiness_waits_for_current_observation() {
         use crate::recovery::NativeIdentityWait;
         use freshell_runtime_protocol::{
             NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource,
             OpenCodeAdoptionBaseline, OpenCodeAdoptionStatus,
         };
         for case in [
+            "ordinary",
+            "ordinary-create",
             "initial",
             "saved",
-            "ordinary",
+            "ordinary-exact",
+            "fresh-opencode",
+            "other-provider",
             "wrong-mode",
             "invalid",
             "stop",
             "stale-intent",
+            "provider-exit",
+            "host-failure",
+            "unobserved",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let registry = Registry::open(dir.path().join("registry"), None).unwrap();
@@ -4055,14 +4058,23 @@ mod opencode_transfer_restart_tests {
                 [soul.as_str()],
             )
             .unwrap();
-            registry
-                .record_native_session(
-                    soul.clone(),
-                    prepared.incarnation_id.clone(),
-                    "ses_exact".into(),
+            if case == "other-provider" {
+                conn.execute(
+                    "UPDATE souls SET provider='codex' WHERE soul_id=?1",
+                    [soul.as_str()],
                 )
-                .await
                 .unwrap();
+            }
+            if case != "ordinary-create" {
+                registry
+                    .record_native_session(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        "ses_exact".into(),
+                    )
+                    .await
+                    .unwrap();
+            }
             let context = registry.recovery_context(soul.clone()).await.unwrap();
             let binding = registry
                 .bind_native_identity_launch(NativeIdentityLaunch {
@@ -4070,7 +4082,8 @@ mod opencode_transfer_restart_tests {
                     launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
                     evidence_revision: context.evidence_revision,
                     execution_generation: 1,
-                    requested_native_session_id: Some("ses_exact".into()),
+                    requested_native_session_id: (case != "ordinary-create")
+                        .then(|| "ses_exact".into()),
                 })
                 .await
                 .unwrap();
@@ -4084,7 +4097,7 @@ mod opencode_transfer_restart_tests {
             })).unwrap();
             terminal.validate().unwrap();
             let mut saved = None;
-            if case == "saved" {
+            if matches!(case, "saved" | "ordinary-exact") {
                 let mut spec = freshell_agent_runtime::build_resume_spec(
                     freshell_agent_runtime::ResumeSpecInput {
                         provider: "opencode",
@@ -4099,11 +4112,13 @@ mod opencode_transfer_restart_tests {
                     },
                 )
                 .unwrap();
-                spec.opencode_adoption_baseline =
-                    Some(OpenCodeAdoptionBaseline::from_descriptor(descriptor()).unwrap());
+                if case == "saved" {
+                    spec.opencode_adoption_baseline =
+                        Some(OpenCodeAdoptionBaseline::from_descriptor(descriptor()).unwrap());
+                }
                 saved = Some(spec);
             }
-            if matches!(case, "ordinary" | "saved") {
+            if !matches!(case, "initial" | "wrong-mode" | "invalid") {
                 terminal.opencode_transfer = None;
                 terminal.opencode_transfer_attempt_id = None;
             } else if case == "wrong-mode" {
@@ -4113,11 +4128,18 @@ mod opencode_transfer_restart_tests {
                 terminal.opencode_transfer.as_mut().unwrap().bundle_sha256 = "invalid".into();
                 assert!(terminal.validate().is_err());
             }
+            let fresh_agent = (case == "fresh-opencode").then(|| {
+                serde_json::from_value(serde_json::json!({
+                "sessionId":"fresh-readiness", "provider":"opencode", "sessionType":"freshopencode",
+                "runtimeVariant":"opencode-mcp", "providerStoreId":context.provider_store_id,
+                "cwd":"/workspace", "workspacePath":"/workspace", "runAsUid":65534, "runAsGid":0
+            })).unwrap()
+            });
             let workload = LaunchWorkload {
                 soul_id: soul.clone(),
                 fixture: None,
-                terminal: Some(terminal),
-                fresh_agent: None,
+                terminal: (case != "fresh-opencode").then_some(terminal),
+                fresh_agent,
                 resume_spec: saved,
             };
             let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
@@ -4126,7 +4148,13 @@ mod opencode_transfer_restart_tests {
                 incarnation_id: binding.incarnation_id.clone(),
                 launch_nonce: binding.launch_nonce.clone(),
                 evidence_revision: binding.evidence_revision,
-                source: NativeIdentitySource::OpencodeTui,
+                source: if case == "fresh-opencode" {
+                    NativeIdentitySource::FreshProviderHandshake
+                } else if case == "other-provider" {
+                    NativeIdentitySource::CodexAppServer
+                } else {
+                    NativeIdentitySource::OpencodeTui
+                },
                 evidence_digest: "a".repeat(64),
             };
             let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
@@ -4137,8 +4165,23 @@ mod opencode_transfer_restart_tests {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
                     let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
-                    let observed =
-                        (started.elapsed() >= Duration::from_secs(9)).then(|| observation.clone());
+                    let elapsed = started.elapsed();
+                    let observed = if elapsed < Duration::from_millis(250) {
+                        None
+                    } else {
+                        let mut current = observation.clone();
+                        if case == "unobserved" || elapsed < Duration::from_secs(9) {
+                            match (elapsed.as_millis() / 250) % 3 {
+                                0 => current.launch_nonce = "previous-launch".into(),
+                                1 => current.evidence_revision += 1,
+                                _ if case != "ordinary-create" => {
+                                    current.native_session_id = "ses_wrong".into()
+                                }
+                                _ => current.incarnation_id = IncarnationId::new(),
+                            }
+                        }
+                        Some(current)
+                    };
                     let result = match request.body {
                         HostCommand::Hello {
                             incarnation_id,
@@ -4154,6 +4197,21 @@ mod opencode_transfer_restart_tests {
                             capabilities: vec!["native-identity-observation-v1".into()],
                             effective_limits: limits,
                         },
+                        HostCommand::Status { .. } if case == "host-failure" => {
+                            write_frame(
+                                &mut socket,
+                                &HostReply {
+                                    request_id: request.request_id,
+                                    result: Err(RuntimeError::new(
+                                        RuntimeErrorCode::HostUnreachable,
+                                        "owned host unavailable",
+                                    )),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            continue;
+                        }
                         HostCommand::Status { .. } => HostResult::Status {
                             native_identity_observation: observed,
                             host_boot_id: boot.clone(),
@@ -4162,10 +4220,15 @@ mod opencode_transfer_restart_tests {
                             max_control_epoch: 1,
                             max_execution_generation: 1,
                             fixture_evidence: serde_json::json!({}),
-                            exited: false,
+                            exited: case == "provider-exit"
+                                && elapsed >= Duration::from_millis(250),
                             native_session_id: Some("ses_exact".into()),
                             opencode_transfer_receipt: None,
-                            opencode_adoption: OpenCodeAdoptionStatus::AwaitingObservation,
+                            opencode_adoption: if matches!(case, "initial" | "saved") {
+                                OpenCodeAdoptionStatus::AwaitingObservation
+                            } else {
+                                OpenCodeAdoptionStatus::NotRequired
+                            },
                         },
                         _ => panic!("unexpected native wait command"),
                     };
@@ -4180,16 +4243,22 @@ mod opencode_transfer_restart_tests {
                     .unwrap();
                 }
             });
-            if case == "stop" {
-                registry.begin_stop(soul.clone()).await.unwrap();
-            }
-            if case == "stale-intent" {
-                conn.execute(
-                    "UPDATE souls SET intent_revision=intent_revision+1 WHERE soul_id=?1",
-                    [soul.as_str()],
-                )
-                .unwrap();
-            }
+            let cancellation = if matches!(case, "stop" | "stale-intent") {
+                let registry = registry.clone();
+                let soul = soul.clone();
+                let database = dir.path().join("registry/runtime.sqlite3");
+                Some(tokio::spawn(async move {
+                    sleep(Duration::from_millis(250)).await;
+                    if case == "stop" {
+                        registry.begin_stop(soul).await.unwrap();
+                    } else {
+                        Connection::open(database).unwrap().execute(
+                        "UPDATE souls SET intent_revision=intent_revision+1 WHERE soul_id=?1", [soul.as_str()]).unwrap();
+                    }
+                }))
+            } else {
+                None
+            };
             let result = supervisor
                 .wait_for_native_startup(
                     &workload,
@@ -4198,13 +4267,22 @@ mod opencode_transfer_restart_tests {
                     prepared.intent_revision,
                 )
                 .await;
+            if let Some(cancellation) = cancellation {
+                cancellation.await.unwrap();
+            }
             responder.abort();
             assert!(responder.await.unwrap_err().is_cancelled());
-            if matches!(case, "initial" | "saved") {
+            if matches!(
+                case,
+                "initial" | "saved" | "ordinary" | "ordinary-create" | "ordinary-exact"
+            ) {
                 assert!(
                     matches!(result, NativeIdentityWait::Observed { .. }),
                     "{case}: {result:?}"
                 );
+                if let NativeIdentityWait::Observed { elapsed_ms, .. } = &result {
+                    assert!(*elapsed_ms >= 9_000);
+                }
             } else if case == "stop" {
                 assert!(
                     matches!(result, NativeIdentityWait::StopIntent { .. }),
@@ -4215,6 +4293,26 @@ mod opencode_transfer_restart_tests {
                     matches!(result, NativeIdentityWait::IntentChanged { .. }),
                     "{result:?}"
                 );
+            } else if case == "provider-exit" {
+                assert!(
+                    matches!(result, NativeIdentityWait::ProviderExited { .. }),
+                    "{result:?}"
+                );
+            } else if case == "host-failure" {
+                assert!(
+                    matches!(result, NativeIdentityWait::HostUnavailable { .. }),
+                    "{result:?}"
+                );
+            } else if case == "unobserved" {
+                assert!(matches!(
+                    result,
+                    NativeIdentityWait::TimedOut {
+                        adoption_pending: false,
+                        ..
+                    }
+                ));
+                assert!(started.elapsed() >= Duration::from_secs(180));
+                assert!(started.elapsed() < Duration::from_secs(190));
             } else {
                 assert!(
                     matches!(result, NativeIdentityWait::TimedOut { .. }),
@@ -4223,6 +4321,15 @@ mod opencode_transfer_restart_tests {
                 assert!(
                     started.elapsed() < Duration::from_secs(9),
                     "ordinary wait must end before the delayed observation"
+                );
+            }
+            if matches!(
+                case,
+                "stop" | "stale-intent" | "provider-exit" | "host-failure"
+            ) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "prompt cancellation: {case}"
                 );
             }
             let persisted: Option<String> = conn
