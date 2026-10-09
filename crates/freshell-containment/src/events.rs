@@ -193,7 +193,8 @@ pub fn release_failed(k: &UnitLogKeys, error: &str) {
 }
 
 /// Same-uid processes whose environment could not be read while looking for
-/// the unit's tag (they can still be members as a root's descendants).
+/// the unit's tag (they can still be members as a root's descendants). The
+/// backend reports the count; the unit logs it with its keys.
 pub fn environ_withheld(k: &UnitLogKeys, count: u64) {
     keyed!(
         info,

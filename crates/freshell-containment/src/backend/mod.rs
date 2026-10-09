@@ -52,6 +52,19 @@ pub(crate) struct KillSummary {
     #[allow(dead_code)]
     pub killed: usize,
     pub spared: Vec<ProcIdentity>,
+    /// See [`MemberList::withheld`].
+    pub withheld: u64,
+}
+
+/// One one-shot reading of a unit's live, non-spared members.
+#[derive(Debug, Default)]
+pub(crate) struct MemberList {
+    pub members: Vec<ProcIdentity>,
+    /// Same-uid processes whose environment could not be read while looking
+    /// for the unit's tag (tag backends; 0 elsewhere). They can still be
+    /// members as a root's descendants. The unit logs the count with its keys
+    /// (`unit.members.environ_withheld`); backends never log it.
+    pub withheld: u64,
 }
 
 /// One containment mechanism (selected once per server).
@@ -81,7 +94,7 @@ pub(crate) trait UnitBackend: Send + Sync {
         roots: Vec<(u32, u64)>,
     ) -> BoxFuture<'static, io::Result<KillSummary>>;
     /// The live, non-spared members right now (one-shot reads).
-    fn members(&self, roots: &[(u32, u64)]) -> io::Result<Vec<ProcIdentity>>;
+    fn members(&self, roots: &[(u32, u64)]) -> io::Result<MemberList>;
     /// One-shot: `Ok` when `pid` is in the unit, `ErrorKind::NotFound` when
     /// it is gone, another error when it lives outside the unit.
     fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()>;
