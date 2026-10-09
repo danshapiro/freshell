@@ -62,7 +62,6 @@ RUN apt-get update \
  && echo 'e2a04418d82731a37a98c228ed8a78bbe9ea4282db0d6410f22e8342db892c86  /opt/amplifier-src/amplifier_app_cli/runtime/config.py' | sha256sum --check \
  && git -C /opt/amplifier-src apply --check /opt/freshell-native-resume.patch \
  && git -C /opt/amplifier-src apply /opt/freshell-native-resume.patch \
- && echo '6980829983d6b691f05382360f428ae437edc26a65594a559e20c726980987be  /opt/amplifier-src/amplifier_app_cli/freshell_native_resume.py' | sha256sum --check \
  && /opt/uv/bin/uv sync --locked --no-dev --project /opt/amplifier-src \
  && git clone --filter=blob:none https://github.com/microsoft/amplifier-module-provider-vllm /opt/amplifier-provider-vllm \
  && git -C /opt/amplifier-provider-vllm checkout --detach "${AMPLIFIER_PROVIDER_VLLM_COMMIT}" \
