@@ -1012,9 +1012,15 @@ impl RuntimeBackend for DockerEngineBackend {
     }
 
     async fn verify_empty(&self, handle: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+        // inspect first proves the daemon, full id and immutable ownership.
+        // A positively inspected Created enclosure has never run a workload;
+        // Docker stop/kill are no-ops and need not turn it into Exited.
         Ok(matches!(
             self.inspect(handle).await?.state,
-            BackendRuntimeState::Missing | BackendRuntimeState::Exited | BackendRuntimeState::Dead
+            BackendRuntimeState::Missing
+                | BackendRuntimeState::Created
+                | BackendRuntimeState::Exited
+                | BackendRuntimeState::Dead
         ))
     }
 
@@ -1738,10 +1744,176 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use freshell_runtime_protocol::{FreshProvider, LaunchNonce};
     use std::os::unix::fs::PermissionsExt;
+
+    /// A Docker HTTP peer, not a RuntimeBackend double: all ownership, state
+    /// interpretation and Stop requests still execute DockerEngineBackend.
+    pub(crate) struct StopDockerFixture {
+        pub(crate) backend: DockerEngineBackend,
+        pub(crate) digest: String,
+        pub(crate) state: std::sync::Arc<std::sync::Mutex<StopDockerState>>,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    pub(crate) struct StopDockerState {
+        pub(crate) inspection: Value,
+        pub(crate) daemon_id: String,
+        pub(crate) requests: Vec<String>,
+        pub(crate) silence: Option<&'static str>,
+        pub(crate) disconnected: usize,
+    }
+
+    impl StopDockerFixture {
+        pub(crate) async fn new(root: &Path, handle: &OwnedRuntimeHandle) -> Self {
+            let agent = handle.fresh_agent().unwrap();
+            let workspace = &agent.workspace_path;
+            let actor = host_actor_state_dir(
+                handle.runtime_dir().parent().unwrap(),
+                handle.installation_id(),
+                handle.soul_id(),
+            );
+            std::fs::create_dir_all(&actor).unwrap();
+            std::fs::set_permissions(&actor, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut inspection = json!({
+                "Id":handle.container_id(), "Image":handle.image_ref(),
+                "State":{"Status":"created", "Running":false,"Paused":false,"Restarting":false},
+                "Config":{"Labels":{
+                    "com.freshell.managed":"true",
+                    "com.freshell.installation-id":handle.installation_id(),
+                    "com.freshell.soul-id":handle.soul_id(),
+                    "com.freshell.incarnation-id":handle.incarnation_id()
+                },"Env":runtime_host_environment(None,Some(agent)).unwrap()},
+                "HostConfig":{"NetworkMode":"bridge","PidMode":"","Privileged":false,
+                    "CapAdd":["CHOWN","SETUID","SETGID"],"Tmpfs":runtime_tmpfs(Some(agent.provider.as_str()))},
+                "Mounts":[
+                    {"Source":handle.host_binary_path(),"Destination":"/runtime/freshell-session-host","RW":false},
+                    {"Source":handle.runtime_dir(),"Destination":"/run/freshell","RW":true},
+                    {"Name":handle.provider_volume_name(),"Destination":"/home/freshell/provider","RW":true},
+                    {"Source":workspace,"Destination":workspace,"RW":true},
+                    {"Source":actor,"Destination":HOST_ACTOR_STATE_MOUNT,"RW":true}
+                ]
+            });
+            let mounts = docker::fresh_agent_mounts(agent).unwrap();
+            for (source, destination) in [
+                (
+                    mounts.mcp_capability_file,
+                    "/run/freshell/mcp-capability.json",
+                ),
+                (
+                    mounts.provider_user_root,
+                    "/run/freshell-private/user-provider",
+                ),
+            ] {
+                if let Some(source) = source {
+                    inspection["Mounts"].as_array_mut().unwrap().push(json!({
+                        "Source":source,"Destination":destination,"RW":false
+                    }));
+                }
+            }
+            let state = std::sync::Arc::new(std::sync::Mutex::new(StopDockerState {
+                inspection,
+                daemon_id: handle.daemon_id().to_string(),
+                requests: vec![],
+                silence: None,
+                disconnected: 0,
+            }));
+            let socket = root.join("docker-stop.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+            let server_state = state.clone();
+            let container_id = handle.container_id().to_owned();
+            let task = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        completed = connections.join_next(), if !connections.is_empty() => {
+                            completed.unwrap().unwrap();
+                        }
+                        accepted = listener.accept() => {
+                            let (mut stream, _) = accepted.unwrap();
+                            let state = server_state.clone();
+                            let container = container_id.clone();
+                            connections.spawn(async move {
+                                let mut header = Vec::new();
+                                while !header.ends_with(b"\r\n\r\n") {
+                                    header.push(stream.read_u8().await.unwrap());
+                                }
+                                let header = String::from_utf8(header).unwrap();
+                                let request = header.lines().next().unwrap().to_owned();
+                                let (silent, status, response) = {
+                                    let mut state = state.lock().unwrap();
+                                    let inspect = request == format!("GET {DOCKER_API}/containers/{container}/json HTTP/1.1");
+                                    let stop = request == format!("POST {DOCKER_API}/containers/{container}/stop?t=2 HTTP/1.1");
+                                    let force = request == format!("POST {DOCKER_API}/containers/{container}/kill?signal=KILL HTTP/1.1");
+                                    let after_stop = state.requests.iter().any(|r| r.contains("/stop?"));
+                                    let after_force = state.requests.iter().any(|r| r.contains("/kill?"));
+                                    let observations = state.requests.iter().filter(|r| r.contains("/json ")).count();
+                                    let silent = match state.silence {
+                                        Some("initial_inspect") => inspect,
+                                        Some("graceful_request") => stop,
+                                        // Consume part of the polling budget before going silent.
+                                        Some("graceful_observation") => inspect && after_stop && observations >= 14,
+                                        Some("force_request") => force,
+                                        Some("force_observation") => inspect && after_force,
+                                        Some("error_observation") => inspect && after_stop,
+                                        _ => false,
+                                    };
+                                    state.requests.push(request.clone());
+                                    let (status, response) = if request == format!("GET {DOCKER_API}/info HTTP/1.1") {
+                                        (200, json!({"ID":state.daemon_id,"SecurityOptions":["name=rootless"]}))
+                                    } else if inspect {
+                                        (200, state.inspection.clone())
+                                    } else if stop || force {
+                                        // Docker never starts or changes a Created container for
+                                        // these no-op requests. Running fixtures survive signals.
+                                        let status = if state.silence == Some("error_observation") && stop {
+                                            500
+                                        } else if state.inspection["State"]["Status"] == "created" {
+                                            if force { 409 } else { 304 }
+                                        } else { 204 };
+                                        (status, json!({"message":"fixture response"}))
+                                    } else {
+                                        panic!("unexpected Docker Stop request: {request}");
+                                    };
+                                    (silent, status, response)
+                                };
+                                if silent {
+                                    // Accepted request, no response. Observe cancellation closing
+                                    // the real transport instead of completing a fake future.
+                                    let mut bytes = Vec::new();
+                                    stream.read_to_end(&mut bytes).await.unwrap();
+                                    state.lock().unwrap().disconnected += 1;
+                                } else {
+                                    let body = serde_json::to_vec(&response).unwrap();
+                                    stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+                                    stream.write_all(&body).await.unwrap();
+                                    stream.shutdown().await.unwrap();
+                                }
+                            });
+                        }
+                    }
+                }
+                connections.shutdown().await;
+            });
+            Self {
+                backend: DockerEngineBackend::new(socket),
+                digest: immutable_digest_from_handle(handle).unwrap(),
+                state,
+                shutdown,
+                task,
+            }
+        }
+
+        pub(crate) async fn close(self) {
+            let _ = self.shutdown.send(());
+            self.task.await.unwrap();
+        }
+    }
 
     fn retained_opencode_fixture() -> (tempfile::TempDir, OwnedRuntimeHandle, Value) {
         let root = tempfile::tempdir().unwrap();

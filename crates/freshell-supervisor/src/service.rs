@@ -2638,10 +2638,13 @@ impl Supervisor {
             .stop_progress(handle)
             .await
             .map_err(map_registry)?;
-        match self.backend.verify_empty(handle).await {
+        match self
+            .verify_empty_before(handle, Instant::now() + Duration::from_secs(3))
+            .await
+        {
             Ok(true) => return Ok(StopOutcome::VerifiedEmpty),
             Ok(false) => {}
-            Err(error) => return Ok(stop_backend_outcome(error)),
+            Err(error) => return Ok(stop_verification_outcome(error)),
         }
         if let Ok(authenticated) = self
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
@@ -2663,18 +2666,33 @@ impl Supervisor {
             .stop_progress(handle)
             .await
             .map_err(map_registry)?;
-        if let Err(error) = self.backend.request_stop(handle, 2).await {
+        // Docker's grace parameter bounds termination inside Docker, not its
+        // HTTP exchange. Bound the actual future so silence releases our lock.
+        if let Err(error) =
+            tokio::time::timeout(Duration::from_secs(2), self.backend.request_stop(handle, 2))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(BackendError::Unavailable("graceful Stop timed out".into()))
+                })
+        {
             // A concurrently removed exact enclosure can return 404 to Stop.
             // It still needs the backend's qualified empty observation.
             self.registry
                 .stop_progress(handle)
                 .await
                 .map_err(map_registry)?;
-            return Ok(match self.backend.verify_empty(handle).await {
-                Ok(true) => StopOutcome::VerifiedEmpty,
-                Err(BackendError::OwnershipMismatch(_)) => StopOutcome::BlockedOwnership,
-                _ => stop_backend_outcome(error),
-            });
+            return Ok(
+                match self
+                    .verify_empty_before(handle, Instant::now() + Duration::from_secs(3))
+                    .await
+                {
+                    Ok(true) => StopOutcome::VerifiedEmpty,
+                    Err(error) if error.code == RuntimeErrorCode::OwnershipMismatch => {
+                        StopOutcome::BlockedOwnership
+                    }
+                    _ => stop_backend_outcome(error),
+                },
+            );
         }
         stop_crash_boundary("ordinary_stop_after_graceful");
         match self
@@ -2689,7 +2707,11 @@ impl Supervisor {
             .stop_progress(handle)
             .await
             .map_err(map_registry)?;
-        if let Err(error) = self.backend.force_stop(handle).await {
+        if let Err(error) =
+            tokio::time::timeout(Duration::from_secs(3), self.backend.force_stop(handle))
+                .await
+                .unwrap_or_else(|_| Err(BackendError::Unavailable("force Stop timed out".into())))
+        {
             return Ok(stop_backend_outcome(error));
         }
         Ok(
@@ -2711,22 +2733,33 @@ impl Supervisor {
     ) -> Result<bool, RuntimeError> {
         let deadline = Instant::now() + budget;
         loop {
-            match self.backend.verify_empty(handle).await {
-                Ok(true) => return Ok(true),
-                Ok(false) => {}
-                Err(BackendError::OwnershipMismatch(message)) => {
-                    return Err(RuntimeError::new(
-                        RuntimeErrorCode::OwnershipMismatch,
-                        message,
-                    ))
-                }
-                Err(error) => return Err(map_backend(error)),
+            if self.verify_empty_before(handle, deadline).await? {
+                return Ok(true);
             }
+            tokio::time::sleep_until((Instant::now() + Duration::from_millis(100)).min(deadline))
+                .await;
             if Instant::now() >= deadline {
                 return Ok(false);
             }
-            sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    async fn verify_empty_before(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        deadline: Instant,
+    ) -> Result<bool, RuntimeError> {
+        // Every observation shares the remaining window. A hung read cannot
+        // outlive it, and repeated observations cannot renew the budget.
+        tokio::time::timeout_at(deadline, self.backend.verify_empty(handle))
+            .await
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::BackendUnavailable,
+                    "Stop empty inspection timed out",
+                )
+            })?
+            .map_err(map_backend)
     }
 
     pub(crate) fn ensure_incarnation_dir(
@@ -5616,6 +5649,356 @@ mod interrupted_transaction_tests {
         SoulId::parse(std::fs::read_to_string(root.join("soul")).unwrap()).unwrap()
     }
 
+    async fn docker_fixture(
+        supervisor: &mut Supervisor,
+        root: &Path,
+        created: bool,
+    ) -> crate::backend::tests::StopDockerFixture {
+        let view = supervisor.registry.inventory().await.unwrap().remove(0);
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        if created {
+            // The replacement owns its container and retained soul history,
+            // but has not received an execution grant or started its host.
+            conn.execute(
+                "UPDATE incarnations SET launch_state='created',execution_generation=0,grant_id=NULL WHERE incarnation_id=?1",
+                [view.incarnation_id.as_str()],
+            ).unwrap();
+        }
+        let handle = supervisor
+            .registry
+            .owned_handle(view.incarnation_id)
+            .await
+            .unwrap();
+        let fixture = crate::backend::tests::StopDockerFixture::new(root, &handle).await;
+        conn.execute(
+            "UPDATE incarnations SET immutable_config_digest=?1 WHERE incarnation_id=?2",
+            params![fixture.digest, handle.incarnation_id().as_str()],
+        )
+        .unwrap();
+        // Setup is finished. Keep all execution/write counters active during
+        // Stop, reopen and observer continuation.
+        conn.execute("DELETE FROM stop_test_effects", []).unwrap();
+        supervisor.backend = Arc::new(fixture.backend.clone());
+        if !created {
+            fixture.state.lock().unwrap().inspection["State"] = serde_json::json!({
+                "Status":"running","Running":true,"Paused":false,"Restarting":false
+            });
+        }
+        fixture
+    }
+
+    #[tokio::test]
+    async fn docker_created_is_qualified_empty_without_starting_or_weakening_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        seed(&supervisor, dir.path(), false).await;
+        let fixture = docker_fixture(&mut supervisor, dir.path(), true).await;
+        let view = supervisor.registry.inventory().await.unwrap().remove(0);
+        let handle = supervisor
+            .registry
+            .owned_handle(view.incarnation_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.backend.inspect(&handle).await.unwrap().state,
+            BackendRuntimeState::Created
+        );
+        fixture.backend.request_stop(&handle, 2).await.unwrap();
+        fixture.backend.force_stop(&handle).await.unwrap();
+        assert_eq!(
+            fixture.backend.inspect(&handle).await.unwrap().state,
+            BackendRuntimeState::Created
+        );
+        let created_empty = fixture.backend.verify_empty(&handle).await.unwrap();
+        let owned = fixture.state.lock().unwrap().inspection.clone();
+        for (state, expected) in [
+            (
+                serde_json::json!({"Status":"running","Running":true}),
+                BackendRuntimeState::Running,
+            ),
+            (
+                serde_json::json!({"Status":"created","Running":true}),
+                BackendRuntimeState::Running,
+            ),
+            (
+                serde_json::json!({"Status":"paused","Running":true,"Paused":true}),
+                BackendRuntimeState::Paused,
+            ),
+            (
+                serde_json::json!({"Status":"restarting","Restarting":true}),
+                BackendRuntimeState::Restarting,
+            ),
+        ] {
+            fixture.state.lock().unwrap().inspection["State"] = state;
+            assert_eq!(
+                fixture.backend.inspect(&handle).await.unwrap().state,
+                expected
+            );
+            assert!(!fixture.backend.verify_empty(&handle).await.unwrap());
+        }
+        fixture.state.lock().unwrap().inspection = owned.clone();
+        for pointer in [
+            "/Id",
+            "/Image",
+            "/Config/Labels/com.freshell.soul-id",
+            "/Mounts/0/Source",
+        ] {
+            *fixture
+                .state
+                .lock()
+                .unwrap()
+                .inspection
+                .pointer_mut(pointer)
+                .unwrap() = serde_json::json!("foreign");
+            assert!(matches!(
+                fixture.backend.verify_empty(&handle).await,
+                Err(BackendError::OwnershipMismatch(_))
+            ));
+            fixture.state.lock().unwrap().inspection = owned.clone();
+        }
+        fixture.state.lock().unwrap().daemon_id = "foreign-daemon".into();
+        assert!(matches!(
+            fixture.backend.verify_empty(&handle).await,
+            Err(BackendError::OwnershipMismatch(_))
+        ));
+        fixture.state.lock().unwrap().daemon_id = handle.daemon_id().to_string();
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET immutable_config_digest='tampered' WHERE incarnation_id=?1",
+            [view.incarnation_id.as_str()],
+        )
+        .unwrap();
+        let tampered = supervisor
+            .registry
+            .owned_handle(view.incarnation_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture.backend.verify_empty(&tampered).await,
+            Err(BackendError::OwnershipMismatch(_))
+        ));
+        assert!(!fixture
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| r.contains("/start") || r.contains("/create")));
+        fixture.close().await;
+        assert!(created_empty, "an exactly owned, never-started Created enclosure has no workload even after no-op stop/kill");
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_docker_created_reopen_preserves_history_and_settles_exact_revoke() {
+        // Capability configuration is process-wide. Keep this production
+        // ownership test independent of other tests' configured directories.
+        // The child runs this exact non-destructive test, with its own tempdir.
+        const CHILD: &str = "FRESHELL_DOCKER_CREATED_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "service::interrupted_transaction_tests::ordinary_stop_docker_created_reopen_preserves_history_and_settles_exact_revoke", "--nocapture"])
+                    .env(CHILD, "1")
+                    .env_remove("FRESHELL_RUNTIME_CAPABILITY_DIR")
+                    .output().unwrap()
+            }).await.unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        tokio::time::timeout(Duration::from_secs(30), complete_docker_created_stop())
+            .await
+            .unwrap();
+    }
+
+    async fn complete_docker_created_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), true).await;
+        let grants = dir.path().join("mcp-capabilities");
+        std::fs::create_dir(&grants).unwrap();
+        std::fs::create_dir_all(dir.path().join("provider-roots/grant-stop-docker")).unwrap();
+        let capability_file = grants.join("grant-stop-docker.json");
+        std::fs::write(&capability_file, b"synthetic exact capability").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&capability_file, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        crate::backend::docker::configure_capability_dir(&dir.path().join("control.sock")).unwrap();
+        Connection::open(supervisor.registry.database_path()).unwrap().execute(
+            "UPDATE incarnations SET fresh_agent_spec=replace(fresh_agent_spec,'stop-exact-grant','grant-stop-docker')",[]
+        ).unwrap();
+        let fixture = docker_fixture(&mut supervisor, dir.path(), true).await;
+        let stopped = supervisor.registry.begin_stop(id).await.unwrap();
+        let revision = stopped.stop_fence().unwrap().intent_revision;
+        drop(supervisor);
+        let mut supervisor = open(dir.path());
+        supervisor.backend = Arc::new(fixture.backend.clone());
+        let revoke = callback_with_grant(dir.path(), b"ok", "grant-stop-docker").await;
+        supervisor.reconcile_startup().await.unwrap();
+        let progress = supervisor.registry.stop_progress(&stopped).await.unwrap();
+        assert_eq!(progress.outcome, Some(StopOutcome::VerifiedEmpty));
+        assert!(progress.settled);
+        assert_eq!(count(dir.path(), "revokes"), 1);
+        assert_retained(&supervisor, dir.path(), revision).await;
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        let (generation, writers): (u64,u64) = conn.query_row(
+            "SELECT execution_generation,(SELECT count(*) FROM writer_claims WHERE soul_id=?1) FROM incarnations WHERE incarnation_id=?2",
+            params![stopped.soul_id().as_str(),stopped.incarnation_id().as_str()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((generation, writers), (0, 0));
+        assert_eq!(
+            fixture.backend.inspect(&stopped).await.unwrap().state,
+            BackendRuntimeState::Created
+        );
+        supervisor.observe_once().await.unwrap();
+        assert_eq!(count(dir.path(), "revokes"), 1);
+        assert!(supervisor
+            .registry
+            .pending_stop_handles()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(fixture
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|r| r.starts_with("GET ")));
+        close(revoke).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_docker_silence_releases_lock_and_retries_same_intent() {
+        let mut failures = Vec::new();
+        for point in [
+            "initial_inspect",
+            "graceful_request",
+            "graceful_observation",
+            "force_request",
+            "force_observation",
+            "error_observation",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut supervisor = open(dir.path());
+            let id = seed(&supervisor, dir.path(), false).await;
+            let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+            fixture.state.lock().unwrap().silence = Some(point);
+            let fixture_host = host(&supervisor, dir.path()).await;
+            let lock = supervisor.lifecycle_lock(&id).await;
+            let mut stopping = {
+                let supervisor = supervisor.clone();
+                tokio::spawn(async move { supervisor.stop(id, Some(1)).await })
+            };
+            // Measure the backend budget from an actual accepted inspection.
+            // Parallel suite setup can queue SQLite intent commits before any
+            // backend future exists; that is not time spent awaiting Docker.
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !fixture
+                    .state
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .iter()
+                    .any(|r| r.contains("/json "))
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let limit = Duration::from_secs(if point.starts_with("force_") { 7 } else { 4 });
+            let result = tokio::time::timeout(limit, &mut stopping).await;
+            if result.is_err() {
+                // The timeout does not own/cancel the foreground Stop. Prove
+                // that it is still the old lock holder, then reap our task.
+                assert!(lock.try_lock().is_err());
+                stopping.abort();
+                let _ = stopping.await;
+                close(fixture_host).await;
+                fixture.close().await;
+                failures.push(format!(
+                    "{point}: foreground Stop retained its lifecycle lock beyond {limit:?}"
+                ));
+                continue;
+            }
+            let (outcome, view) = result.unwrap().unwrap().unwrap();
+            let expected = if point == "error_observation" {
+                StopOutcome::TerminationUnconfirmed
+            } else {
+                StopOutcome::BackendUnavailable
+            };
+            assert_eq!(outcome, expected, "{point}");
+            assert_eq!(view.intent_revision, 2);
+            assert_eq!(view.cleanup_state, CleanupState::TerminationUnconfirmed);
+            assert!(
+                lock.try_lock().is_ok(),
+                "{point}: completed Stop must release the original lock"
+            );
+            let handle = supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .remove(0);
+            let progress = supervisor.registry.stop_progress(&handle).await.unwrap();
+            assert_eq!(progress.outcome, Some(expected));
+            assert!(!progress.settled);
+            assert_retained(&supervisor, dir.path(), 2).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while fixture.state.lock().unwrap().disconnected == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            {
+                let mut state = fixture.state.lock().unwrap();
+                state.silence = None;
+                state.inspection["State"] = serde_json::json!({"Status":"exited","Running":false});
+            }
+            tokio::time::timeout(Duration::from_secs(2), supervisor.observe_once())
+                .await
+                .unwrap()
+                .unwrap();
+            let progress = supervisor.registry.stop_progress(&handle).await.unwrap();
+            assert_eq!(progress.outcome, Some(StopOutcome::VerifiedEmpty));
+            assert!(progress.settled);
+            assert!(supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .is_empty());
+            assert_retained(&supervisor, dir.path(), 2).await;
+            let writers: u64 = Connection::open(supervisor.registry.database_path())
+                .unwrap()
+                .query_row("SELECT count(*) FROM writer_claims", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(writers, 0);
+            assert!(!fixture
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|r| r.contains("/start") || r.contains("/create")));
+            eprintln!("bounded silent Docker {point}; same-intent observer completion verified");
+            close(fixture_host).await;
+            fixture.close().await;
+        }
+        assert!(
+            failures.is_empty(),
+            "unbounded Stop backend futures: {failures:?}"
+        );
+    }
+
     async fn host(supervisor: &Supervisor, root: &Path) -> tokio::task::JoinHandle<()> {
         let view = supervisor.registry.inventory().await.unwrap().remove(0);
         let handle = supervisor
@@ -5691,6 +6074,14 @@ mod interrupted_transaction_tests {
     }
 
     async fn callback(root: &Path, response: &'static [u8]) -> tokio::task::JoinHandle<()> {
+        callback_with_grant(root, response, "stop-exact-grant").await
+    }
+
+    async fn callback_with_grant(
+        root: &Path,
+        response: &'static [u8],
+        grant: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
         let path = root.join("mcp.sock");
         if path.exists() {
             std::fs::remove_file(&path).unwrap();
@@ -5704,7 +6095,7 @@ mod interrupted_transaction_tests {
                 socket.read_to_end(&mut body).await.unwrap();
                 let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(request["action"], "revoke");
-                assert_eq!(request["grantId"], "stop-exact-grant");
+                assert_eq!(request["grantId"], grant);
                 assert_eq!(request["soulId"], soul(&root).as_str());
                 let incarnation: String = Connection::open(root.join("registry/runtime.sqlite3"))
                     .unwrap()

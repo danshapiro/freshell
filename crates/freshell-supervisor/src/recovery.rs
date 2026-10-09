@@ -6689,6 +6689,23 @@ mod automatic_retry_tests {
                 .lines()
                 .count()
         }
+        fn state(&self, handle: &OwnedRuntimeHandle) -> BackendRuntimeState {
+            let object = handle.runtime_dir().join("fixture-object");
+            if !object.exists() {
+                return BackendRuntimeState::Missing;
+            }
+            assert_eq!(
+                std::fs::read_to_string(object).unwrap(),
+                handle.container_id()
+            );
+            if handle.runtime_dir().join("fixture-stopped").exists() {
+                BackendRuntimeState::Exited
+            } else if handle.runtime_dir().join("fixture-started").exists() {
+                BackendRuntimeState::Running
+            } else {
+                BackendRuntimeState::Created
+            }
+        }
         fn unavailable(&self, unavailable: bool) {
             let path = self.root.join("backend-unavailable");
             if unavailable {
@@ -6874,21 +6891,10 @@ mod automatic_retry_tests {
                     .unwrap();
                 }
             }
-            let object = handle.runtime_dir().join("fixture-object");
-            let state = if object.exists() {
-                assert_eq!(
-                    std::fs::read_to_string(object).unwrap(),
-                    handle.container_id()
-                );
-                if handle.runtime_dir().join("fixture-stopped").exists() {
-                    BackendRuntimeState::Exited
-                } else {
-                    self.host(handle).await;
-                    BackendRuntimeState::Running
-                }
-            } else {
-                BackendRuntimeState::Missing
-            };
+            let state = self.state(handle);
+            if state == BackendRuntimeState::Running {
+                self.host(handle).await;
+            }
             Ok(BackendInspection {
                 state,
                 configured_limits: handle.requested_limits(),
@@ -6917,6 +6923,7 @@ mod automatic_retry_tests {
             })
         }
         async fn start_host(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            std::fs::write(handle.runtime_dir().join("fixture-started"), b"started").unwrap();
             self.host(handle).await;
             Ok(())
         }
@@ -6925,15 +6932,23 @@ mod automatic_retry_tests {
             handle: &OwnedRuntimeHandle,
             _: u64,
         ) -> Result<(), BackendError> {
-            std::fs::write(handle.runtime_dir().join("fixture-stopped"), b"stopped").unwrap();
+            // Like Docker, no-op Stop on a never-started enclosure leaves it
+            // Created. Inspection must not silently start its host either.
+            if handle.runtime_dir().join("fixture-started").exists() {
+                std::fs::write(handle.runtime_dir().join("fixture-stopped"), b"stopped").unwrap();
+            }
             Ok(())
         }
         async fn force_stop(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
             self.request_stop(handle, 0).await
         }
         async fn verify_empty(&self, handle: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
-            Ok(!handle.runtime_dir().join("fixture-object").exists()
-                || handle.runtime_dir().join("fixture-stopped").exists())
+            Ok(matches!(
+                self.state(handle),
+                BackendRuntimeState::Missing
+                    | BackendRuntimeState::Created
+                    | BackendRuntimeState::Exited
+            ))
         }
         async fn read_limits(
             &self,
@@ -7985,6 +8000,18 @@ mod automatic_retry_tests {
                 rusqlite::params![soul.as_str(), handle.incarnation_id().as_str()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
             assert_eq!(generation, u64::from(starting));
             assert_eq!(writers, 0);
+            assert_eq!(
+                backend.inspect(&handle).await.unwrap().state,
+                if starting {
+                    BackendRuntimeState::Exited
+                } else {
+                    BackendRuntimeState::Created
+                }
+            );
+            assert_eq!(
+                handle.runtime_dir().join("fixture-started").exists(),
+                starting
+            );
             close_retry_hosts(&backend).await;
         }
     }
