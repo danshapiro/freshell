@@ -3035,29 +3035,7 @@ fn run_opencode_stopped_repair_worker_inner(
             return Err("OpenCode repair stage is not a root-owned read-only directory".into());
         }
     }
-    let descriptor_path = stage_dir.join("descriptor.json");
-    let descriptor_metadata = std::fs::symlink_metadata(&descriptor_path).map_err(|error| {
-        failure.io(&error);
-        "OpenCode repair descriptor is unavailable"
-    })?;
-    if descriptor_metadata.file_type().is_symlink() || !descriptor_metadata.is_file() {
-        return Err("OpenCode repair descriptor is not a regular file".into());
-    }
-    let descriptor: OpenCodeTransferDescriptor =
-        serde_json::from_slice(&std::fs::read(&descriptor_path).map_err(|error| {
-            failure.io(&error);
-            "OpenCode repair descriptor cannot be read"
-        })?)
-        .map_err(|_| "OpenCode repair descriptor is invalid")?;
-    descriptor
-        .validate()
-        .map_err(|_| "OpenCode repair descriptor is invalid")?;
-    let payload_path =
-        freshell_agent_runtime::opencode_transfer::verify_staged_bundle(&descriptor, &stage_dir)
-            .map_err(|error| {
-                failure.import(&error);
-                "OpenCode repair stage does not match its descriptor"
-            })?;
+    let (descriptor, payload_path) = read_opencode_stopped_repair_stage(&stage_dir, failure)?;
     let provider_env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
     let paths = plan_opencode_reader_paths_at(
         &provider_env,
@@ -3122,6 +3100,42 @@ fn run_opencode_stopped_repair_worker_inner(
     }
     println!("{}", String::from_utf8(bytes).expect("JSON is UTF-8"));
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct OpencodeRepairStageMetadata {
+    descriptor: OpenCodeTransferDescriptor,
+}
+
+fn read_opencode_stopped_repair_stage(
+    stage_dir: &Path,
+    failure: &mut OpencodeRepairFailure,
+) -> Result<(OpenCodeTransferDescriptor, PathBuf), String> {
+    let descriptor_path = stage_dir.join("descriptor.json");
+    let descriptor_metadata = std::fs::symlink_metadata(&descriptor_path).map_err(|error| {
+        failure.io(&error);
+        "OpenCode repair descriptor is unavailable"
+    })?;
+    if descriptor_metadata.file_type().is_symlink() || !descriptor_metadata.is_file() {
+        return Err("OpenCode repair descriptor is not a regular file".into());
+    }
+    let metadata: OpencodeRepairStageMetadata =
+        serde_json::from_slice(&std::fs::read(&descriptor_path).map_err(|error| {
+            failure.io(&error);
+            "OpenCode repair descriptor cannot be read"
+        })?)
+        .map_err(|_| "OpenCode repair descriptor is invalid")?;
+    let descriptor = metadata.descriptor;
+    descriptor
+        .validate()
+        .map_err(|_| "OpenCode repair descriptor is invalid")?;
+    let payload_path =
+        freshell_agent_runtime::opencode_transfer::verify_staged_bundle(&descriptor, stage_dir)
+            .map_err(|error| {
+                failure.import(&error);
+                "OpenCode repair stage does not match its descriptor"
+            })?;
+    Ok((descriptor, payload_path))
 }
 
 fn validate_import_receipt_binding(
@@ -8789,7 +8803,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
     }
 
     struct SyntheticGateAttempt {
-        root: tempfile::TempDir,
+        root: SyntheticOpencodeStage,
         state: Arc<HostState>,
         result: Result<HostResult, RuntimeError>,
         events: Arc<std::sync::Mutex<Vec<&'static str>>>,
@@ -9132,9 +9146,30 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         Ok((result, events, pty_callback_invoked))
     }
 
-    async fn run_joined_synthetic_transfer(
-        failure: Option<SyntheticTransferFailure>,
-    ) -> Result<SyntheticGateAttempt, String> {
+    struct SyntheticOpencodeStage {
+        root: tempfile::TempDir,
+        workspace: PathBuf,
+        descriptor: OpenCodeTransferDescriptor,
+        ready: PathBuf,
+    }
+
+    impl SyntheticOpencodeStage {
+        fn path(&self) -> &Path {
+            self.root.path()
+        }
+    }
+
+    impl Drop for SyntheticOpencodeStage {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            // Finalization makes this owned fixture read-only. Restore directory
+            // write access so TempDir can remove it even on an assertion failure.
+            std::fs::set_permissions(&self.ready, std::fs::Permissions::from_mode(0o700))
+                .expect("make owned synthetic stage removable");
+        }
+    }
+
+    fn stage_synthetic_opencode_transfer() -> Result<SyntheticOpencodeStage, String> {
         use freshell_runtime_protocol::{
             opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferChunk,
             OpenCodeTransferFile, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
@@ -9145,7 +9180,10 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         use freshell_supervisor::opencode_transfer::{OpenCodeTransferStaging, StagingLimits};
         use sha2::{Digest, Sha256};
 
-        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = tempfile::Builder::new()
+            .prefix("task007-stage-envelope-")
+            .tempdir()
+            .map_err(|error| error.to_string())?;
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
         let source_database = root.path().join("source.sqlite");
@@ -9272,6 +9310,141 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             .finalize(&descriptor.transfer_id, attempt_id)
             .map_err(|error| error.to_string())?;
 
+        Ok(SyntheticOpencodeStage {
+            root,
+            workspace,
+            descriptor,
+            ready,
+        })
+    }
+
+    #[test]
+    fn stopped_repair_stage_reads_real_supervisor_envelope() {
+        let fixture = stage_synthetic_opencode_transfer().unwrap();
+        let root_path = fixture.root.path().to_path_buf();
+        let mut failure = super::OpencodeRepairFailure::at("stage_validation");
+        let (actual, payload) =
+            super::read_opencode_stopped_repair_stage(&fixture.ready, &mut failure)
+                .expect("real finalized supervisor stage must be accepted by the stopped host");
+        assert_eq!(actual, fixture.descriptor);
+        assert_eq!(payload, fixture.ready.join("entry-0000.bin"));
+        assert_eq!(
+            hex::encode(Sha256::digest(std::fs::read(payload).unwrap())),
+            fixture.descriptor.files[0].sha256
+        );
+        drop(fixture);
+        assert!(!root_path.exists(), "owned stage must be removed");
+    }
+
+    #[test]
+    fn stopped_repair_stage_rejects_invalid_envelopes_and_tampered_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        for case in [
+            "malformed_json",
+            "bare_descriptor",
+            "missing_descriptor",
+            "invalid_descriptor",
+            "descriptor_manifest_mismatch",
+            "wrong_ready",
+            "tampered_payload",
+            "descriptor_symlink",
+            "ready_symlink",
+            "payload_symlink",
+            "stage_symlink",
+            "unlisted_file",
+        ] {
+            let fixture = stage_synthetic_opencode_transfer().unwrap();
+            let root_path = fixture.root.path().to_path_buf();
+            let destination = root_path.join("provider-home/.local/share/opencode/opencode.db");
+            let unrelated = root_path.join("unrelated");
+            std::fs::write(&unrelated, b"preserve").unwrap();
+            let source_before = std::fs::read(root_path.join("source.sqlite")).unwrap();
+            let descriptor_path = fixture.ready.join("descriptor.json");
+            let mut stage_path = fixture.ready.clone();
+            // Mutate only this fictional owned stage, then restore its published modes.
+            std::fs::set_permissions(&fixture.ready, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let replace = |path: &Path, bytes: &[u8]| {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::write(path, bytes).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
+            };
+            match case {
+                "malformed_json" => replace(&descriptor_path, b"{"),
+                "bare_descriptor" => replace(
+                    &descriptor_path,
+                    &serde_json::to_vec(&fixture.descriptor).unwrap(),
+                ),
+                "missing_descriptor" => replace(&descriptor_path, b"{}"),
+                "invalid_descriptor" | "descriptor_manifest_mismatch" => {
+                    let mut descriptor = fixture.descriptor.clone();
+                    if case == "invalid_descriptor" {
+                        descriptor.provider = "codex".into();
+                    } else {
+                        descriptor.root_session_id = "ses_differentroot".into();
+                    }
+                    replace(
+                        &descriptor_path,
+                        &serde_json::to_vec(&serde_json::json!({"descriptor": descriptor}))
+                            .unwrap(),
+                    );
+                }
+                "wrong_ready" => replace(&fixture.ready.join("READY"), b"wrong-digest"),
+                "tampered_payload" => {
+                    let path = fixture.ready.join("entry-0000.bin");
+                    let mut payload = std::fs::read(&path).unwrap();
+                    payload[0] ^= 1;
+                    replace(&path, &payload);
+                }
+                "descriptor_symlink" | "ready_symlink" | "payload_symlink" => {
+                    let name = match case {
+                        "descriptor_symlink" => "descriptor.json",
+                        "ready_symlink" => "READY",
+                        _ => "entry-0000.bin",
+                    };
+                    let path = fixture.ready.join(name);
+                    let target = root_path.join("symlink-target");
+                    std::fs::rename(&path, &target).unwrap();
+                    symlink(target, path).unwrap();
+                }
+                "stage_symlink" => {
+                    stage_path = root_path.join("stage-link");
+                    symlink(&fixture.ready, &stage_path).unwrap();
+                }
+                "unlisted_file" => std::fs::write(fixture.ready.join("extra"), b"extra").unwrap(),
+                _ => unreachable!(),
+            }
+            std::fs::set_permissions(&fixture.ready, std::fs::Permissions::from_mode(0o500))
+                .unwrap();
+            let mut failure = super::OpencodeRepairFailure::at("stage_validation");
+            assert!(
+                super::read_opencode_stopped_repair_stage(&stage_path, &mut failure).is_err(),
+                "must refuse {case}"
+            );
+            assert!(
+                !destination.exists(),
+                "{case} must not install a provider database"
+            );
+            assert_eq!(
+                std::fs::read(root_path.join("source.sqlite")).unwrap(),
+                source_before,
+                "{case} must preserve the source"
+            );
+            assert_eq!(std::fs::read(unrelated).unwrap(), b"preserve");
+            drop(fixture);
+            assert!(!root_path.exists(), "{case} owned stage must be removed");
+        }
+    }
+
+    async fn run_joined_synthetic_transfer(
+        failure: Option<SyntheticTransferFailure>,
+    ) -> Result<SyntheticGateAttempt, String> {
+        let fixture = stage_synthetic_opencode_transfer()?;
+        let root = &fixture.root;
+        let workspace = fixture.workspace.clone();
+        let descriptor = fixture.descriptor.clone();
+        let ready = fixture.ready.clone();
         let home = root.path().join("provider-home");
         let xdg_data_home = home.join(".local/share");
         let xdg_config_home = home.join(".config");
@@ -9439,7 +9612,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         );
         let result = dispatch_with_effects(envelope, &state, &effects).await;
         Ok(SyntheticGateAttempt {
-            root,
+            root: fixture,
             state,
             result,
             events,
