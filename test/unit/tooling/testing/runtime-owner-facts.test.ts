@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as owner from '../../../../scripts/testing/runtime-sandbox.js'
 import * as external from '../../../../scripts/testing/runtime-external-browser.js'
 import { execFileSync } from 'node:child_process'
@@ -14,6 +14,28 @@ import type { NativeHistory } from '../../../../scripts/testing/provider-native-
 
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
+const sourceRoot = process.cwd()
+let fixtureRepoRoot: string
+
+beforeEach(async () => {
+  // Exercise the real Git provenance boundary even in source-only Cloud images.
+  fixtureRepoRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'runtime-owner-facts-repo-'))
+  const schema = 'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'
+  await fsp.mkdir(path.dirname(path.join(fixtureRepoRoot, schema)), { recursive: true })
+  await fsp.copyFile(path.join(sourceRoot, schema), path.join(fixtureRepoRoot, schema))
+  const git = (...args: string[]) => execFileSync('git', [
+    '-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com',
+    '-c', 'commit.gpgsign=false', ...args,
+  ], { cwd: fixtureRepoRoot, encoding: 'utf8', timeout: 10_000 })
+  git('init', '--quiet')
+  git('add', '.')
+  git('commit', '--quiet', '-m', 'Owned runtime facts unit fixture')
+})
+
+afterEach(async () => {
+  if (fixtureRepoRoot) await fsp.rm(fixtureRepoRoot, { recursive: true, force: true })
+})
+
 const handle = {
   runId: 'run-owned', candidateSha: 'a'.repeat(40), soulId: 'soul-owned',
   incarnationId: 'incarnation-owned', containerId: 'b'.repeat(64),
@@ -27,7 +49,7 @@ describe('fixed observations of an owned prior enclosure', () => {
     const calls = path.join(root, 'calls.jsonl')
     const docker = path.join(root, 'docker')
     await fsp.writeFile(docker, `#!${process.execPath}\nconst fs=require('node:fs');const mode=fs.readFileSync(${JSON.stringify(modeFile)},'utf8');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(mode==='failed')process.exit(9);if(args[0]==='ps'){if(mode!=='absent')process.stdout.write('${handle.containerId}\\n');if(mode==='ambiguous')process.stdout.write('other-container\\n')}else if(args[0]==='inspect')process.stdout.write(JSON.stringify([{Id:'${handle.containerId}',State:{Running:mode==='malformed'?'unknown':mode==='running'}}]));else process.exit(10)\n`, { mode: 0o700 })
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot)
     const address = rig.runtimeEnclosureHandle(handle)
     await fsp.writeFile(path.join(root, 'host-state.json'), JSON.stringify({ hostBootId: address.hostBootId }))
     rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(root, 'unused.sock'), proxySocketPath: path.join(root, 'proxy.sock'),
@@ -60,7 +82,7 @@ describe('fixed observations of an owned prior enclosure', () => {
 
 describe('fixed fresh-agent launch observations', () => {
   it('crashes the matching fresh provider child rather than its adapter PID', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 5, {}, {}, 'release', {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
       enabledProviders: [], freshAgentModes: ['freshclaude'],
     })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
@@ -84,7 +106,7 @@ describe('fixed fresh-agent launch observations', () => {
     { mode: 'freshopencode', provider: 'opencode', version: '1.18.21', command: 'opencode serve' },
   ])('observes $mode native-family version/PID without requiring a pre-turn native ID', async ({ mode, provider, registeredProvider = provider, version, command }) => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-fresh-launch-'))
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 5, {}, {}, 'release', {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
       enabledProviders: [], freshAgentModes: [mode],
     })
     const enclosure = rig.runtimeEnclosureHandle(handle)
@@ -117,7 +139,7 @@ describe('fixed fresh-agent launch observations', () => {
 describe('fixed owned fresh Codex saved history', () => {
   it('prepares the original large fixture in its owned provider and detects later changes', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-codex-saved-history-'))
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused saved-history web') }, process.cwd(), 3,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused saved-history web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
@@ -178,7 +200,7 @@ describe('fixed owned fresh Codex saved history', () => {
 
 describe('fixed fresh Codex controller snapshot facts', () => {
   it('observes the original retained-row predicates without returning history text', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused snapshot web') }, process.cwd(), 3,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused snapshot web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
@@ -222,7 +244,7 @@ describe('fixed fresh Codex controller snapshot facts', () => {
 describe('fixed fresh Codex controller startup facts', () => {
   it('reads actual owned lifecycle startup and ready events with the same controller health', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-controller-startup-'))
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused startup web') }, process.cwd(), 3,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused startup web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
@@ -265,7 +287,7 @@ describe('fixed fresh Codex controller startup facts', () => {
 
 describe('fixed owned session-host process state', () => {
   it('reads the exact tracked host PID and refuses absent or unobserved enclosures', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused host state web') }, process.cwd(), 3,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused host state web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     const enclosure = rig.runtimeEnclosureHandle(handle)
     const current = { ...handle, ...enclosure }
@@ -327,7 +349,7 @@ describe('fixed owned session-host process state', () => {
 describe('fixed fresh Codex saved-history ownership facts', () => {
   it('counts actual matching receipts, starts, launches and scheduled recoveries', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-history-ownership-'))
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused ownership web') }, process.cwd(), 3,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused ownership web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
@@ -373,7 +395,7 @@ describe('fixed fresh Codex saved-history ownership facts', () => {
 
 describe('fixed saved-history measurement lifecycle', () => {
   it('records the same browser timing metadata only for the registered fixture', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused measurement web') }, process.cwd(), 3,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused measurement web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
@@ -406,7 +428,7 @@ describe('fixed saved-history measurement lifecycle', () => {
 
 describe('fixed saved-history measurement completion', () => {
   it('records original completion timings after verifying the recorded enclosure', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused completion web') }, process.cwd(), 3,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused completion web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     const enclosure = rig.runtimeEnclosureHandle(handle)
     const tracked = vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: false, running: false })
@@ -435,7 +457,7 @@ describe('fixed saved-history measurement completion', () => {
     tracked.mockResolvedValue({ present: false, running: false })
     await expect(rig.finishFreshCodexSavedHistoryMeasurement(enclosure, { ...measurement, transcript: 'private text' })).rejects.toThrow()
     expect(record).toHaveBeenCalledTimes(2)
-    const unregistered = new owner.ManagedRuntimeOwner(() => { throw new Error('unused unregistered web') }, process.cwd(), 3)
+    const unregistered = new owner.ManagedRuntimeOwner(() => { throw new Error('unused unregistered web') }, fixtureRepoRoot, 3)
     await expect(unregistered.finishFreshCodexSavedHistoryMeasurement(enclosure, measurement)).rejects.toThrow(/fixture/)
   })
 })
@@ -443,7 +465,7 @@ describe('fixed saved-history measurement completion', () => {
 describe('fixed saved-history controller reattachment lifecycle', () => {
   it('records original reattachment metadata with its complete private startup events', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-controller-reattach-'))
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused reattachment web') }, process.cwd(), 3,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused reattachment web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
@@ -493,7 +515,7 @@ describe('fixed saved-history controller reattachment lifecycle', () => {
 describe('fixed saved-history render measurement publication', () => {
   it('publishes existing sanitized profiler and audit metadata privately before cleanup', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-history-measurement-'))
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused measurement artifact web') }, process.cwd(), 3,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused measurement artifact web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     Object.assign(rig.runtime, { browserDir: root })
     const enclosure = rig.runtimeEnclosureHandle(handle)
@@ -543,7 +565,7 @@ describe('fixed saved-history render measurement publication', () => {
 describe('fixed owned saved-history preservation artifact', () => {
   it('preserves captured private fixture profiles and lifecycle evidence without a body or path channel', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-history-preservation-'))
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused preservation web') }, process.cwd(), 3,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused preservation web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     Object.assign(rig.runtime, { browserDir: root })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
@@ -652,7 +674,7 @@ describe('fixed owned saved-history preservation artifact', () => {
 
 describe('private fixture-state capture boundary', () => {
   it('captures complete private values only after existing identity and counter decoding succeeds', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused fixture capture web') }, process.cwd(), 3)
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused fixture capture web') }, fixtureRepoRoot, 3)
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     Object.assign(rig.runtime, { broker: { receipts: () => [{ soulId: current.soulId, incarnationId: current.incarnationId, containerId: current.containerId }] } })
     vi.spyOn(rig.runtime, 'adminOk').mockResolvedValue({ kind: 'inventory', data: [{ ...current, launchState: 'running' }] })
@@ -672,7 +694,7 @@ describe('private fixture-state capture boundary', () => {
 describe('finite Phase 4 browser receipt publication', () => {
   it('writes the existing observation privately on its owner and refuses worker paths or transcript fields', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-phase4-receipt-'))
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused phase4 web') }, process.cwd(), 4)
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused phase4 web') }, fixtureRepoRoot, 4)
     const file = path.join(root, 'phase4.json')
     vi.stubEnv('FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT', file)
     vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
@@ -708,7 +730,7 @@ describe('finite Phase 4 browser receipt publication', () => {
         action: 'phase4-browser-receipt', phase4Browser: browser })).rejects.toThrow(/owned run/)
       await expect(rig.publishPhase4BrowserReceipt({ ...browser, transcript: 'private text' })).rejects.toThrow()
       await expect(rig.publishPhase4BrowserReceipt({ ...browser, outputPath: '/foreign/file' })).rejects.toThrow()
-      const other = new owner.ManagedRuntimeOwner(() => { throw new Error('unused phase3 web') }, process.cwd(), 3)
+      const other = new owner.ManagedRuntimeOwner(() => { throw new Error('unused phase3 web') }, fixtureRepoRoot, 3)
       await expect(other.publishPhase4BrowserReceipt(browser)).rejects.toThrow(/Phase 4/)
       expect(await fsp.readFile(file, 'utf8')).toBe(raw)
     } finally { vi.unstubAllEnvs(); await fsp.rm(root, { recursive: true, force: true }) }
@@ -718,7 +740,7 @@ describe('finite Phase 4 browser receipt publication', () => {
 describe('finite Phase 3 approval effect operations', () => {
   it('publishes the existing browser observation on the owner without returning a filesystem path', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-p3-receipt-'))
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 3)
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
     vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
@@ -739,7 +761,7 @@ describe('finite Phase 3 approval effect operations', () => {
   })
   it('resets and counts only the existing owned marker file before native identity materializes', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-p3-effect-'))
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 3)
     const enclosure = rig.runtimeEnclosureHandle(handle)
     const row = { ...enclosure, provider: 'opencode', nativeSessionId: undefined, launchState: 'running', intentRevision: 1 }
     const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([row])
@@ -770,7 +792,7 @@ describe('finite Phase 3 approval effect operations', () => {
 
 describe('owner-side synthetic OpenCode source preparation', () => {
   it('returns only a new matching no-tool follow-up ID from the existing private native history', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 3)
     vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
     vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
@@ -792,7 +814,7 @@ describe('owner-side synthetic OpenCode source preparation', () => {
   })
 
   it('binds the existing authenticated adoption result to the registered source and current native address', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 3)
     vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
     vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
@@ -814,7 +836,7 @@ describe('owner-side synthetic OpenCode source preparation', () => {
   })
 
   it.each(['history', 'excluded'] as const)('reads actual SQLite %s facts only for the registered source root', async mode => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 3)
     const lifecycle = vi.spyOn(rig.runtime, 'recordLifecycle')
     vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
@@ -845,7 +867,7 @@ describe('owner-side synthetic OpenCode source preparation', () => {
   })
 
   it('owns source setup and teardown while returning only IDs, digests and observed counts', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3)
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 3)
     const lifecycle = vi.spyOn(rig.runtime, 'recordLifecycle')
     vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
     vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
@@ -905,7 +927,7 @@ describe('owner-side synthetic OpenCode source preparation', () => {
 
 describe('retained fixture owner web injection', () => {
   it('uses the injected owner factory rather than launching its browser fixture dependency', async () => {
-    const h = new owner.RuntimeHarness(process.cwd(), undefined, 3)
+    const h = new owner.RuntimeHarness(fixtureRepoRoot, undefined, 3)
     const supervisor: owner.SupervisorInstance = { scenarioId: 'task2-config-jsonc', containerId: 'c'.repeat(64),
       controlSocket: path.join(h.testRoot, 'control.sock'), controlSecret: 'owned-unit-secret',
       controlSecretFile: path.join(h.testRoot, 'control-secret'), runtimeRoot: h.testRoot,
@@ -931,7 +953,7 @@ describe('retained fixture owner web injection', () => {
 
 describe('finite retained browser stage protocol (source coverage only)', () => {
   it('requires the exact observed stage before advancing and accepts only the actual soul retry response', async () => {
-    const h = new owner.RuntimeHarness(process.cwd(), undefined, 3)
+    const h = new owner.RuntimeHarness(fixtureRepoRoot, undefined, 3)
     const info: owner.RuntimeWebInfo = { baseUrl: 'https://owned.example.invalid', wsUrl: 'wss://owned.example.invalid/ws',
       token: 'synthetic-unit-token', port: 443, configDir: h.testRoot, homeDir: h.testRoot, logsDir: h.testRoot,
       debugLogPath: path.join(h.testRoot, 'log'), pid: 1, runtimeRoot: h.repoRoot }
@@ -1044,7 +1066,7 @@ describe('exact owned runtime facts', () => {
     const command = path.join(root, 'docker')
     const limits = { cpuMax: '50000 100000', memoryMax: '268435456', swapMax: '0', pidsMax: '64' }
     await fsp.writeFile(command, `#!${process.execPath}\nsetTimeout(()=>process.stdout.write('${JSON.stringify(limits)}'),150)\n`, { mode: 0o700 })
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot)
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     rig.supervisor = { scenarioId: 'owned-cgroup', containerId: 'd'.repeat(64), controlSocket: path.join(root, 'control.sock'),
       controlSecret: 'synthetic-secret', controlSecretFile: path.join(root, 'secret'), runtimeRoot: root,
@@ -1074,7 +1096,7 @@ describe('exact owned runtime facts', () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-adoption-child-'))
     const command = path.join(root, 'docker')
     await fsp.writeFile(command, `#!${process.execPath}\nsetTimeout(()=>process.stdout.write(JSON.stringify({state:'awaiting_observation'})),150)\n`, { mode: 0o700 })
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot)
     rig.supervisor = { scenarioId: 'owned-adoption', containerId: 'd'.repeat(64), controlSocket: path.join(root, 'control.sock'),
       controlSecret: 'synthetic-secret', controlSecretFile: path.join(root, 'secret'), runtimeRoot: root,
       volumeName: 'owned-adoption-volume', binaryKind: 'test' }
@@ -1096,7 +1118,7 @@ describe('exact owned runtime facts', () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-probe-child-'))
     const command = path.join(root, 'docker')
     await fsp.writeFile(command, `#!${process.execPath}\nsetTimeout(()=>process.stdout.write(JSON.stringify({requestIds:['actual-probe-result'],resultIds:['actual-probe-result'],replayCount:0})),150)\n`, { mode: 0o700 })
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') }, fixtureRepoRoot)
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(root, 'unused.sock'), proxySocketPath: path.join(root, 'unused-proxy.sock'),
       runtimeRootPrefix: root, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId, logPath: path.join(root, 'broker.jsonl') })
@@ -1122,7 +1144,7 @@ describe('exact owned runtime facts', () => {
     const pidFile = path.join(root, 'probe.pid')
     const command = path.join(root, 'docker')
     await fsp.writeFile(command, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setInterval(()=>{},1000)\n`, { mode: 0o700 })
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') }, fixtureRepoRoot)
     rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(root, 'unused.sock'), proxySocketPath: path.join(root, 'unused-proxy.sock'),
       runtimeRootPrefix: root, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId, logPath: path.join(root, 'broker.jsonl') })
     vi.spyOn(rig.runtime.broker, 'receiptIds').mockReturnValue(new Set([handle.containerId]))
@@ -1157,7 +1179,7 @@ describe('exact owned runtime facts', () => {
       insert.run('actual-text','native-owned','actual-message',1,JSON.stringify({type:'text',text:'P5_CHAOS_FOLLOWUP synthetic owner-only response'}));
       insert.run('actual-tool','native-owned','actual-message',2,JSON.stringify({type:'tool',tool:'bash',state:{status:'completed',input:'p5-chaos-approval-count'}}));db.close();`
     execFileSync(process.execPath, ['--no-warnings', '-e', seed, file])
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') }, fixtureRepoRoot)
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
     vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (containerId, args) => {
@@ -1242,7 +1264,7 @@ describe('registered fresh fixture state decoder', () => {
 
 describe('owned rig cleanup settlement', () => {
   it('attempts every held host release, web stop and runtime cleanup after a release failure', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') }, fixtureRepoRoot)
     const first = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     const second = { ...first, soulId: 'second-owned-soul', incarnationId: 'second-owned-incarnation', containerId: 'd'.repeat(64) }
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
@@ -1286,14 +1308,14 @@ describe('owned rig cleanup settlement', () => {
       .resolves.toEqual({ ok: false, errors: ['runtime cleanup: owner cleanup failed'] })
   })
   it('settles actual owner cleanup rejection even when runtime produced no cleanup artifact', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') }, fixtureRepoRoot)
     vi.spyOn(rig.runtime, 'cleanup').mockRejectedValue(new Error('owned cleanup rejected'))
     const write = vi.spyOn(rig.runtime, 'writeArtifact').mockReturnValue('/owned/cleanup.json')
     await expect(rig.stop()).resolves.toEqual({ ok: false, errors: ['runtime cleanup: owned cleanup rejected'] })
     expect(write).toHaveBeenCalledWith('cleanup.json', expect.objectContaining({ ok: false }))
   })
   it('settles repeated successful owner finish once', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web factory') }, fixtureRepoRoot)
     const cleanup = vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
     vi.spyOn(rig.runtime, 'writeArtifact').mockReturnValue('/owned/cleanup.json')
     await expect(rig.stop()).resolves.toEqual({ ok: true, errors: [] })
@@ -1356,7 +1378,7 @@ describe('current handle admission before owner mutation', () => {
     const helperId = 'c'.repeat(64)
     const docker = path.join(root, 'docker')
     await fsp.writeFile(docker, `#!${process.execPath}\nconst fs=require('node:fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(callsFile)},JSON.stringify({args:a,host:process.env.DOCKER_HOST,api:process.env.DOCKER_API_VERSION})+'\\n');if(a[0]==='create')process.stdout.write('${helperId}');else if(a[0]==='wait')process.stdout.write('0');else if(a[0]==='logs')process.stdout.write(fs.readFileSync(${JSON.stringify(historyFile)},'utf8'));else if(!['start','rm'].includes(a[0]))process.exit(10);\n`, { mode: 0o700 })
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused stopped-proof web') }, process.cwd(), 5,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused stopped-proof web') }, fixtureRepoRoot, 5,
       {}, {}, 'release', { enabledProviders: ['codex'], freshAgentModes: [] })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     const row = { ...current, provider: 'codex', launchState: 'stopped', desiredState: 'stopped', cleanupState: 'verified_empty', intentRevision: 1 }
@@ -1406,7 +1428,7 @@ describe('current handle admission before owner mutation', () => {
     { provider: 'opencode', version: '1.18.21', process: '42 /usr/bin/opencode --model openai/gpt-5.6-luna', identities: ['openai/gpt-5.6-luna'], effortAbsent: true },
     { provider: 'amplifier', version: '0.1.1', process: '42 /usr/bin/amplifier resume', identities: [], effortAbsent: true },
   ])('projects fixed terminal startup facts for $provider without exposing the process table', async ({ provider, version, process, identities, effortAbsent }) => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused startup web') }, path.resolve('.'), 5,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused startup web') }, fixtureRepoRoot, 5,
       {}, {}, 'release', { enabledProviders: [provider], freshAgentModes: [] })
     const current = rig.runtimeEnclosureHandle(handle)
     const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...current, provider, launchState: 'running', intentRevision: 1 }])
@@ -1431,7 +1453,7 @@ describe('current handle admission before owner mutation', () => {
     expect(probe).not.toHaveBeenCalled()
   })
   it('reads the registered terminal provider notice count with the current controller fence', async () => {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused terminal web') }, process.cwd(), 5,
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused terminal web') }, fixtureRepoRoot, 5,
       {}, {}, 'release', { enabledProviders: ['codex'], freshAgentModes: [] })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     const row = { ...current, provider: 'codex', launchState: 'running', intentRevision: 1 }
@@ -1459,7 +1481,7 @@ describe('current handle admission before owner mutation', () => {
     expect(admin).not.toHaveBeenCalled()
   })
   function rigFixture() {
-    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('web is not used by this unit') }, process.cwd(), 3, {}, {}, 'test', {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('web is not used by this unit') }, fixtureRepoRoot, 3, {}, {}, 'test', {
       enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'],
     })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }

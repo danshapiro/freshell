@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -6,7 +6,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { spawnSync, type execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
@@ -37,15 +37,52 @@ import type { FreshAgentQualificationRow } from '../../../../scripts/testing/fre
 import type { ManagedTerminalStartupFacts } from '../../../../scripts/testing/runtime-sandbox.js'
 import * as managedBrowser from '../../../e2e-browser/helpers/managed-runtime.js'
 import { TestHarness } from '../../../e2e-browser/helpers/test-harness.js'
+import { FRESH_AGENT_INGRESS_INVENTORY } from '../../../../scripts/testing/fresh-agent-ingress-inventory.js'
 
-beforeEach(() => execute.mockReset())
+const sourceRoot = process.cwd()
+let fixtureRepoRoot: string
+
+function fixtureGit(directory: string, ...args: string[]): string {
+  return execFileSync('git', [
+    '-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com',
+    '-c', 'commit.gpgsign=false', ...args,
+  ], { cwd: directory, encoding: 'utf8', timeout: 10_000 })
+}
+
+function initializeFixtureCheckout(directory: string, message: string): void {
+  fixtureGit(directory, 'init', '--quiet')
+  fixtureGit(directory, 'add', '.')
+  fixtureGit(directory, 'commit', '--quiet', '--allow-empty', '-m', message)
+}
+
+beforeEach(async () => {
+  execute.mockReset()
+  // Cloud images have source files but no .git. Keep real candidate evidence
+  // and every runtime artifact in this test's owned checkout.
+  fixtureRepoRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'runtime-external-browser-repo-'))
+  const sources = new Set([
+    'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql',
+    'docs/development/runtime-provider-capabilities.json',
+    ...FRESH_AGENT_INGRESS_INVENTORY.flatMap(row => [row.entry.source, row.durableGateway.source, row.sharedSupervisorOperation.source]),
+  ])
+  for (const relative of sources) {
+    const target = path.join(fixtureRepoRoot, relative)
+    await fsp.mkdir(path.dirname(target), { recursive: true })
+    await fsp.copyFile(path.join(sourceRoot, relative), target)
+  }
+  initializeFixtureCheckout(fixtureRepoRoot, 'Owned external browser unit fixture')
+})
+
+afterEach(async () => {
+  if (fixtureRepoRoot) await fsp.rm(fixtureRepoRoot, { recursive: true, force: true })
+})
 
 describe('managed browser producers', () => {
   it('retains existing sanitized saved-history audit after an early failure without a CPU session', async () => {
     await import('../../../e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.js')
     const callback = registeredManagedBrowserCases.get('managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth')
     if (!callback) throw new Error('actual saved-history callback was not registered')
-    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused diagnostic web') }, process.cwd(), 3, {}, {}, 'test',
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused diagnostic web') }, fixtureRepoRoot, 3, {}, {}, 'test',
       { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     const row = { soulId: 'diagnostic-soul', incarnationId: 'diagnostic-incarnation', hostBootId: 'diagnostic-boot',
       containerId: 'b'.repeat(64), nativeSessionId: 'diagnostic-root', freshAgentSessionType: 'freshcodex', provider: 'codex',
@@ -109,27 +146,27 @@ describe('managed browser producers', () => {
   it('refuses selected native Amplifier before owner creation when the unchanged bootstrap is missing or malformed', async () => {
     const web = vi.fn(() => { throw new Error('native web must not start') })
     const selection = { spec: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts', provider: 'amplifier' as const }
-    expect(() => runner.createExternalManagedRuntimeOwner(process.cwd(), selection, {}, web)).toThrow(/requires.*AMPLIFIER_ONECLI/)
+    expect(() => runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection, {}, web)).toThrow(/requires.*AMPLIFIER_ONECLI/)
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-amplifier-locality-'))
     const file = path.join(root, 'amplifier.env')
     await fsp.writeFile(file, 'FIXTURE_REFERENCE=owner-only\n', { mode: 0o644 })
     await fsp.chmod(file, 0o644)
     try {
-      expect(() => runner.createExternalManagedRuntimeOwner(process.cwd(), selection,
+      expect(() => runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection,
         { FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE: file }, web)).toThrow(/private/)
       expect(web).not.toHaveBeenCalled()
       await fsp.chmod(file, 0o600)
-      const owned = runner.createExternalManagedRuntimeOwner(process.cwd(), selection,
+      const owned = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection,
         { FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE: file }, web)
       expect(owned.fixtureRegistrationFacts()).toEqual({ phase: 5, enabledProviders: ['amplifier'], freshAgentModes: [], fixtureFreshAgentModes: [] })
       expect(web).not.toHaveBeenCalled()
-      const fixture = runner.createExternalManagedRuntimeOwner(process.cwd(), {
+      const fixture = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
         spec: 'test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts',
       }, {}, web)
       expect(fixture.fixtureRegistrationFacts().fixtureFreshAgentModes).toEqual(['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'])
-      const retained = runner.createExternalManagedRuntimeOwner(process.cwd(), selection, {}, web, true)
+      const retained = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection, {}, web, true)
       expect(retained.fixtureRegistrationFacts().enabledProviders).toEqual(['amplifier'])
-      const codex = runner.createExternalManagedRuntimeOwner(process.cwd(), { ...selection, provider: 'codex' }, {}, web)
+      const codex = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, { ...selection, provider: 'codex' }, {}, web)
       expect(codex.fixtureRegistrationFacts().enabledProviders).toEqual(['codex'])
     } finally { await fsp.rm(root, { recursive: true, force: true }) }
   })
@@ -232,7 +269,7 @@ describe('selected production owner registration', () => {
     }
   })
   it('preserves the saved-history registered fixture profile and observer preset', async () => {
-    const owned = runner.createExternalManagedRuntimeOwner(process.cwd(), {
+    const owned = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
       spec: 'test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts', grep: 'already-live attach',
     }, {}, () => { throw new Error('unused saved-history web') })
     expect(owned.fixtureRegistrationFacts()).toEqual({ phase: 3, enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
@@ -250,7 +287,7 @@ describe('selected production owner registration', () => {
     } }))
   })
   it('preserves the all-mode fixture observer interval on an actual supervisor replacement', async () => {
-    const owner = runner.createExternalManagedRuntimeOwner(process.cwd(), {
+    const owner = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
       spec: 'test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts',
     }, { FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST: '1' }, () => { throw new Error('web unused') })
     const previous: SupervisorInstance = { scenarioId: 'fixture-owner', containerId: 'b'.repeat(64),
@@ -346,7 +383,7 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     expect(owned.child).toHaveBeenCalledTimes(2)
     expect(owned.finish.mock.invocationCallOrder[0]).toBeLessThan(owned.start.mock.invocationCallOrder[1])
     expect(owned.child.mock.calls.every(call => call[1].includes('--grep'))).toBe(true)
-    const profiles = owned.start.mock.calls.map(([selection]) => runner.createExternalManagedRuntimeOwner(process.cwd(), selection, {}, () => { throw new Error('unused profile web') }).fixtureRegistrationFacts())
+    const profiles = owned.start.mock.calls.map(([selection]) => runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection, {}, () => { throw new Error('unused profile web') }).fixtureRegistrationFacts())
     expect(profiles).toEqual([{ phase: 3, enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] },
       { phase: 4, enabledProviders: ['opencode'], freshAgentModes: [], fixtureFreshAgentModes: [] }])
     owned.start.mockClear()
@@ -471,7 +508,7 @@ describe('actual runner child and nonvacuity lifecycle', () => {
 describe('owned Cloud launcher diagnostics', () => {
   it('retains a failed actual child output privately before cleanup without publishing its body', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-cloud-output-'))
-    const owner = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd())
+    const owner = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot)
     const artifactPath = path.join(owner.runtime.evidenceDir, 'cloud-launcher-output.json')
     const privateBody = 'private-cloud-command-body'
     await fsp.writeFile(path.join(directory, 'pnpm'), `#!${process.execPath}\nif(process.argv.includes('--version'))console.log('10.34.5');else{console.log('${privateBody}');console.error('exact execution image observation is unavailable');process.exitCode=73}`, { mode: 0o700 })
@@ -580,7 +617,7 @@ describe('candidate-bound Cloud execution events', () => {
 
 describe('owned stable relay admission and lifetime (transport unit coverage only)', () => {
   it('admits the existing bounded CPU diagnostic and then finishes the owner over actual HTTP', async () => {
-    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused relay diagnostic web') })
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused relay diagnostic web') }, fixtureRepoRoot)
     const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
     const enclosure = owned.runtimeEnclosureHandle({ soulId: 'diagnostic-soul', incarnationId: 'diagnostic-incarnation',
       containerId: 'b'.repeat(64), hostBootId: 'diagnostic-boot' })
@@ -807,7 +844,7 @@ describe('owned web process lifetime (Node process fixture only)', () => {
   })
   it('stops the actual factory-created web PID when retained producer readiness fails', async () => {
     const { fixture: directory, entry } = await fixture()
-    const h = new RuntimeHarness(process.cwd(), undefined, 3)
+    const h = new RuntimeHarness(fixtureRepoRoot, undefined, 3)
     const supervisor: SupervisorInstance = { scenarioId: 'task2-config-jsonc', containerId: 'c'.repeat(64),
       controlSocket: path.join(h.testRoot, 'control.sock'), controlSecret: 'owned-unit-secret',
       controlSecretFile: path.join(h.testRoot, 'control-secret'), runtimeRoot: h.testRoot,
@@ -841,7 +878,7 @@ describe('owned web process lifetime (Node process fixture only)', () => {
   })
   it('attempts retained registry cleanup after its actual owned web stop fails', async () => {
     const { fixture: directory, entry } = await fixture()
-    const owned = new ManagedRuntimeOwner(() => { throw new Error('base web unused') })
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('base web unused') }, fixtureRepoRoot)
     const info = { baseUrl: 'http://127.0.0.1:1', wsUrl: 'ws://127.0.0.1:1/ws', token: 'owned-stable-token',
       port: 1, configDir: directory, homeDir: directory, logsDir: directory, debugLogPath: path.join(directory, 'log'), pid: 1, runtimeRoot: process.cwd() }
     vi.spyOn(owned, 'info', 'get').mockReturnValue(info)
@@ -1047,7 +1084,7 @@ describe('interrupted ordinary Stop owner transport', () => {
 
   async function fixture() {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-interrupted-stop-'))
-    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused interrupted Stop web') }, process.cwd(), 3,
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused interrupted Stop web') }, fixtureRepoRoot, 3,
       {}, supervisorEnv, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
     const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'stop-soul',
@@ -1118,16 +1155,16 @@ describe('interrupted ordinary Stop owner transport', () => {
   }
 
   it('registers only the exact synthetic Stop case as a grant-free phase 3 freshcodex test fixture', () => {
-    const owned = runner.createExternalManagedRuntimeOwner(process.cwd(), selection,
+    const owned = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection,
       { FRESHELL_RUNTIME_SYNTHETIC_RESUME: '1' }, () => { throw new Error('unused registration web') })
     expect(owned.fixtureRegistrationFacts()).toEqual({ phase: 3, enabledProviders: [],
       freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
     vi.stubEnv('FRESHELL_MANAGED_CODEX_ONECLI_ENV_FILE', '/absent/ambient-native-grant')
     try {
       expect((owned.runtime as unknown as { phase2BootstrapFiles(): string[] }).phase2BootstrapFiles()).toEqual([])
-      expect(() => runner.createExternalManagedRuntimeOwner(process.cwd(), selection, {}, () => { throw new Error('unused') }))
+      expect(() => runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection, {}, () => { throw new Error('unused') }))
         .toThrow(/FRESHELL_RUNTIME_SYNTHETIC_RESUME/)
-      expect(() => runner.createExternalManagedRuntimeOwner(process.cwd(), { ...selection, grep: 'synthetic|P2-G01' },
+      expect(() => runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, { ...selection, grep: 'synthetic|P2-G01' },
         { FRESHELL_RUNTIME_SYNTHETIC_RESUME: '1' }, () => { throw new Error('unused') })).toThrow(/separate/)
     } finally { vi.unstubAllEnvs() }
   })
@@ -1263,7 +1300,7 @@ describe('interrupted ordinary Stop owner transport', () => {
 
 describe('closed external owner control', () => {
   function fixture() {
-    const owned = new ManagedRuntimeOwner(() => { throw new Error('web factory unused in controller unit') })
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('web factory unused in controller unit') }, fixtureRepoRoot)
     const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
     const inventory = vi.spyOn(owned, 'inventory').mockResolvedValue([])
     const stop = vi.spyOn(owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
@@ -1519,10 +1556,7 @@ describe('closed external owner control', () => {
   it('observes actual owner Git integrity without exposing its working diff or accepting another root', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-candidate-integrity-'))
     try {
-      const git = (...args: string[]) => {
-        const result = spawnSync('git', args, { cwd: directory, encoding: 'utf8' })
-        expect(result.status, result.stderr).toBe(0)
-      }
+      const git = (...args: string[]) => fixtureGit(directory, ...args)
       git('init', '--quiet')
       await fsp.writeFile(path.join(directory, 'owned.txt'), 'initial owned content\n')
       git('add', 'owned.txt')
@@ -1998,7 +2032,7 @@ describe('closed external owner control', () => {
     }
   })
   it('validates fresh-agent ingress sources on the owner checkout without a browser-selected root', async () => {
-    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused ingress web') }, process.cwd(), 5)
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused ingress web') }, fixtureRepoRoot, 5)
     const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
     const control = runner.createExternalRuntimeControl(owned, context)
     const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
@@ -2009,10 +2043,7 @@ describe('closed external owner control', () => {
       action: 'fresh-agent-ingresses', repoRoot: '/foreign/checkout' })).rejects.toThrow(/operation/)
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-empty-ingress-root-'))
     try {
-      for (const args of [['init'], ['commit', '--allow-empty', '-m', 'Private ingress validation fixture']]) {
-        const child = spawnSync('git', args, { cwd: directory, encoding: 'utf8' })
-        if (child.status !== 0) throw new Error('private ingress fixture Git setup failed')
-      }
+      initializeFixtureCheckout(directory, 'Private ingress validation fixture')
       const missing = new ManagedRuntimeOwner(() => { throw new Error('unused missing ingress web') }, directory, 5)
       await expect(missing.validateFreshAgentIngressInventory()).rejects.toThrow()
     } finally {
@@ -2022,10 +2053,7 @@ describe('closed external owner control', () => {
   it('refuses fresh-agent receipt publication for unregistered or custody-only observations after cleanup', async () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-fresh-receipt-'))
     try {
-      for (const args of [['init'], ['commit', '--allow-empty', '-m', 'Private fresh receipt refusal fixture']]) {
-        const child = spawnSync('git', args, { cwd: directory, encoding: 'utf8' })
-        if (child.status !== 0) throw new Error('private fresh receipt fixture Git setup failed')
-      }
+      initializeFixtureCheckout(directory, 'Private fresh receipt refusal fixture')
       const owned = new ManagedRuntimeOwner(() => { throw new Error('unused fresh receipt web') }, directory, 5,
         {}, {}, 'release', { enabledProviders: [], providerSettings: {}, freshAgentModes: ['freshcodex'] })
       vi.spyOn(owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
@@ -2072,7 +2100,7 @@ describe('closed external owner control', () => {
     }
   })
   it('routes provider publication after cleanup while refusing unregistered and custody-only rows', async () => {
-    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused provider receipt web') }, process.cwd(), 5)
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused provider receipt web') }, fixtureRepoRoot, 5)
     vi.spyOn(owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
     const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
     const control = runner.createExternalRuntimeControl(owned, context)
@@ -3259,7 +3287,7 @@ describe('closed external owner control', () => {
     }
   })
   it('refuses to finalize a chaos receipt from custody-only records after cleanup', async () => {
-    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused receipt web') }, process.cwd(), 5)
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused receipt web') }, fixtureRepoRoot, 5)
     const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
     const control = runner.createExternalRuntimeControl(owned, context)
     const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(
@@ -3288,7 +3316,7 @@ describe('closed external owner control', () => {
     }
   })
   it('creates synthetic history only for the registered OpenCode fixture and returns observed row identities', async () => {
-    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, process.cwd(), 3, {}, {}, 'test', {
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 3, {}, {}, 'test', {
       enabledProviders: [], freshAgentModes: ['freshopencode'], fixtureFreshAgentModes: ['freshopencode'],
     })
     const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
@@ -3314,7 +3342,7 @@ describe('closed external owner control', () => {
 
 describe('external finite fixture client', () => {
   it('awaits the owner terminal notice count and validates the body-free reply', async () => {
-    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused notice web') })
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused notice web') }, fixtureRepoRoot)
     const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
     const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-soul',
       incarnationId: 'owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'owned-boot', nativeSessionId: 'owned-root' }
@@ -3339,7 +3367,7 @@ describe('external finite fixture client', () => {
     expect(launch).toHaveBeenCalledExactlyOnceWith(rig.runtimeEnclosureHandle(handle))
   })
   it('retries a lost mutation reply with the same operation ID and settles owner cleanup once', async () => {
-    const owned = new ManagedRuntimeOwner(() => { throw new Error('web factory unused in RPC unit') })
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('web factory unused in RPC unit') }, fixtureRepoRoot)
     const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
     const stop = vi.spyOn(owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
     const control = runner.createExternalRuntimeControl(owned, context)
