@@ -211,7 +211,16 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
     let top = object_members(raw, 0)?;
     let mut result = Vec::new();
     if tui {
-        if let Some(attention) = member(raw, &top, "attention") {
+        // Native TUI normalization is shallow: any present top-level attention
+        // replaces the entire nested key, including non-object values.
+        let attention = if let Some(attention) = member(raw, &top, "attention") {
+            Some(attention)
+        } else if let Some(tui) = member(raw, &top, "tui") {
+            member(tui, &object_members(tui, 0)?, "attention")
+        } else {
+            None
+        };
+        if let Some(attention) = attention {
             let entries = object_members(attention, 0)?;
             if let Some(sounds) = member(attention, &entries, "sounds") {
                 let entries = object_members(sounds, 0)?;
@@ -403,10 +412,17 @@ pub fn select(
                 || spelling.starts_with(['/', '.'])
                 || spelling.starts_with("~/")
             {
-                home_path(&spelling, home)
+                if field == "OpenCode attention.sounds" {
+                    PathBuf::from(&spelling)
+                } else {
+                    home_path(&spelling, home)
+                }
             } else {
                 continue;
             } // Native package identity remains native.
+        } else if field == "OpenCode mcp.cwd" {
+            // Native path.resolve(instance cwd, raw): no HOME or URL expansion.
+            PathBuf::from(&spelling)
         } else {
             home_path(&spelling, home)
         };

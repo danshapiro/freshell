@@ -226,6 +226,144 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn managed_provider_nested_attention_and_literal_tilde_keep_native_origins_after_both_copies() {
+        for scenario in ["nested", "top-replacement", "tilde"] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let cwd = owned.path().join("external/instance");
+            let parent = owned.path().join("external/tui");
+            let sound = parent.join(if scenario == "tilde" {
+                "~/selected.wav"
+            } else {
+                "selected.wav"
+            });
+            let tool = cwd.join("~/tool");
+            for path in [
+                &home,
+                &cwd,
+                &parent,
+                sound.parent().unwrap(),
+                &tool.join("node_modules/dependency"),
+            ] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            std::fs::write(&sound, "native-sound").unwrap();
+            std::fs::write(home.join("selected.wav"), "wrong-home-sound").unwrap();
+            std::fs::create_dir_all(home.join("tool")).unwrap();
+            std::fs::write(home.join("tool/resource"), "wrong-home-tool").unwrap();
+            std::fs::write(tool.join("resource"), "native-resource").unwrap();
+            std::fs::write(
+                tool.join("node_modules/dependency/index.js"),
+                "module.exports='native-dependency';",
+            )
+            .unwrap();
+            std::fs::write(tool.join("server.cjs"), "const fs=require('node:fs');process.stdout.write(fs.readFileSync('resource','utf8')+':'+require('dependency')+':'+fs.readFileSync(process.argv[2],'utf8'));").unwrap();
+            let spelling = if scenario == "tilde" {
+                "~/selected.wav"
+            } else {
+                "./selected.wav"
+            };
+            let attention = serde_json::json!({"sounds":{"default":spelling}});
+            let mut document = serde_json::json!({"tui":{"attention":attention},"mcp":{"probe":{"type":"local","command":["node","server.cjs"],"cwd":"~/tool"}}});
+            if scenario == "top-replacement" {
+                document["tui"]["attention"] =
+                    serde_json::json!({"sounds":{"question":"./unselected-missing.wav"}});
+                document["attention"] = attention;
+            }
+            let raw = document.to_string();
+            let config = parent.join("tui.jsonc");
+            std::fs::write(&config, &raw).unwrap();
+            let make_plan = || {
+                plan_opencode_sources(
+                    vec![SourceOccurrence {
+                        logical_path: config.clone(),
+                        canonical_source: config.clone(),
+                        lane: SourceLane::Tui,
+                        role: DiscoveryRole::Workspace,
+                    }],
+                    &cwd,
+                    &home,
+                    &|_, _, _| None,
+                )
+            };
+            let plan =
+                make_plan().expect("effective nested attention and cwd select native origins");
+            let units = resource_units(
+                &home,
+                &home.join(".config/opencode"),
+                &owned.path().join("workspace"),
+                &plan,
+                None,
+            )
+            .unwrap();
+            let sound_unit = units
+                .iter()
+                .find(|(source, _)| source == &sound)
+                .expect("native-origin sound transported");
+            let tool_unit = units
+                .iter()
+                .find(|(source, _)| source == &tool)
+                .expect("literal tilde cwd transports complete directory");
+            let stage = owned.path().join("stage");
+            let host = owned.path().join("host");
+            let selections = units
+                .iter()
+                .map(|(source, unit)| CopySelection {
+                    source: source.clone(),
+                    destination_relative: unit.stage_relative_path.clone().into(),
+                })
+                .collect::<Vec<_>>();
+            copy_environment(&selections, &stage, &[], Default::default()).unwrap();
+            let selections = units
+                .iter()
+                .map(|(_, unit)| CopySelection {
+                    source: stage.join(&unit.stage_relative_path),
+                    destination_relative: unit.provider_relative_path.clone().into(),
+                })
+                .collect::<Vec<_>>();
+            copy_environment(&selections, &host, &[], Default::default()).unwrap();
+            let hidden = owned.path().join("hidden-external");
+            std::fs::rename(owned.path().join("external"), &hidden).unwrap();
+            let output = std::process::Command::new("node")
+                .arg("server.cjs")
+                .arg(host.join(&sound_unit.1.provider_relative_path))
+                .current_dir(host.join(&tool_unit.1.provider_relative_path))
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .output()
+                .unwrap();
+            std::fs::rename(&hidden, owned.path().join("external")).unwrap();
+            assert!(
+                output.status.success(),
+                "native-origin two-copy executable consumer failed: {:?}",
+                output.stderr
+            );
+            assert_eq!(
+                output.stdout,
+                b"native-resource:native-dependency:native-sound"
+            );
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+            std::fs::remove_file(&sound).unwrap();
+            assert_eq!(
+                make_plan()
+                    .err()
+                    .expect("missing native sound must refuse despite HOME decoy")
+                    .field,
+                "OpenCode attention.sounds"
+            );
+            std::fs::write(&sound, "native-sound").unwrap();
+            std::fs::rename(&tool, owned.path().join("hidden-tool")).unwrap();
+            assert_eq!(
+                make_plan()
+                    .err()
+                    .expect("missing native cwd must refuse despite HOME decoy")
+                    .field,
+                "OpenCode mcp.cwd"
+            );
+        }
+    }
+
+    #[test]
     fn managed_provider_sound_and_mcp_cwd_refuse_unavailable_selected_resources() {
         use std::os::unix::fs::PermissionsExt;
         let owned = tempfile::tempdir().unwrap();

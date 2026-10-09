@@ -3506,7 +3506,13 @@ export default {{id:'closed-shared-{label}',async tui(api,options){{
         std::fs::Permissions::from_mode(0o755),
     )
     .unwrap();
-    let mcp_cwd = external.join("mcp-cwd");
+    let mcp_cwd = nested.join("~/mcp-cwd");
+    std::fs::create_dir_all(fixture.join("source-home/mcp-cwd")).unwrap();
+    std::fs::write(
+        fixture.join("source-home/mcp-cwd/resource"),
+        "wrong-home-cwd-decoy",
+    )
+    .unwrap();
     std::fs::create_dir_all(mcp_cwd.join("node_modules/native-mcp-dependency")).unwrap();
     std::fs::write(mcp_cwd.join("resource"), "native-mcp-resource").unwrap();
     std::fs::write(
@@ -3542,7 +3548,7 @@ export default async (input,options)=>({config:async(config)=>{
         serde_json::from_slice(&std::fs::read(&original_config).unwrap()).unwrap();
     original["plugin"].as_array_mut().unwrap().push(json!([reqwest::Url::from_file_path(package.join("index.mjs")).unwrap().to_string(), {"receipt":external_receipt,"instruction":external_instruction,"mcpReceipt":mcp_cwd_receipt}]));
     original["mcp"]["closed-cwd-probe"] =
-        json!({"type":"local","command":["node","server.cjs"],"cwd":mcp_cwd});
+        json!({"type":"local","command":["node","server.cjs"],"cwd":"~/mcp-cwd"});
     original["instructions"] = json!([external_instruction]);
     original["skills"] = json!({"paths":[selected_skills,"../../scenarios/external-native-resources/selected-skills"]});
     std::fs::write(&original_config, serde_json::to_vec(&original).unwrap()).unwrap();
@@ -3567,9 +3573,20 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
     let project_tui = fixture.join("workspace/tui.jsonc");
     let tui_receipt = fixture.join("workspace/native-tui-consumed.json");
     let selected_sound = external.join("selected.wav");
+    let tilde_sound = fixture.join("workspace/~/selected.wav");
+    std::fs::create_dir_all(tilde_sound.parent().unwrap()).unwrap();
+    std::fs::write(&tilde_sound, b"RIFF-native-literal-tilde-wave").unwrap();
+    std::fs::write(
+        fixture.join("source-home/selected.wav"),
+        b"wrong-home-sound-decoy",
+    )
+    .unwrap();
     std::fs::write(&selected_sound, b"RIFF-native-selected-wave").unwrap();
-    let selected_tui_bytes = format!("{{ // selected origin\n\"attention\":{{\"sounds\":{{\"default\":{},\"question\":{},\"error\":\"../scenarios/external-native-resources/selected.wav\"}}}},\"theme\":\"{{file:./selected-theme}}\",\"plugin\":[[\"file:///home/freshell/provider/.config/opencode/plugins/probe-tui/index.mjs\",{{\"receipt\":{}}}]],}}", serde_json::to_string(&selected_sound).unwrap(),serde_json::to_string(&reqwest::Url::from_file_path(&selected_sound).unwrap().to_string()).unwrap(),serde_json::to_string(&tui_receipt).unwrap());
+    let selected_tui_bytes = format!("{{ // selected origin\n\"tui\":{{\"attention\":{{\"sounds\":{{\"default\":{},\"question\":{},\"error\":\"~/selected.wav\"}}}}}},\"theme\":\"{{file:./selected-theme}}\",\"plugin\":[[\"file:///home/freshell/provider/.config/opencode/plugins/probe-tui/index.mjs\",{{\"receipt\":{}}}]],}}", serde_json::to_string(&selected_sound).unwrap(),serde_json::to_string(&reqwest::Url::from_file_path(&selected_sound).unwrap().to_string()).unwrap(),serde_json::to_string(&tui_receipt).unwrap());
     std::fs::write(&project_tui, &selected_tui_bytes).unwrap();
+    std::fs::write(fixture.join("source-home/.config/opencode/tui.json"),
+        serde_json::to_vec(&json!({"tui":{"attention":{"sounds":{"subagent_done":"/missing-replaced-sound"}}},"attention":{"sounds":{"default":selected_sound}}})).unwrap()).unwrap();
+
     std::fs::write(fixture.join("workspace/selected-theme"), "  dark\n").unwrap();
     let inline_source = r#"{ // inline instance origin
 "agent":{"probe":{"description":"{env:INLINE_VALUE}"}}}"#;
@@ -3937,7 +3954,7 @@ export default {{id:'closed-directory-discovery',async server(){{
         read_receipt(&tui_receipt)
             .await
             .expect("actual TUI plugin must consume the selected effective TUI configuration"),
-        json!({"theme":format!("{:x}",Sha256::digest(b"dark")),"sounds":vec![format!("{:x}",Sha256::digest(b"RIFF-native-selected-wave"));3]})
+        json!({"theme":format!("{:x}",Sha256::digest(b"dark")),"sounds":[format!("{:x}",Sha256::digest(b"RIFF-native-selected-wave")),format!("{:x}",Sha256::digest(b"RIFF-native-selected-wave")),format!("{:x}",Sha256::digest(b"RIFF-native-literal-tilde-wave"))]})
     );
     let ca_digest = format!(
         "{:x}",
