@@ -501,7 +501,8 @@ Also stage ONLY the ROOT-admitted controlled parity producer files when actually
 **Files:**
 - Create: `crates/freshell-supervisor/src/recovery_retry.rs`.
 - Modify: `crates/freshell-supervisor/src/lib.rs`, `registry.rs:1413`, `inventory.rs:198`, `recovery.rs`, `service.rs`.
-- Test: new retry module and existing registry/recovery/inventory tests.
+- Modify: `crates/freshell-server/src/managed_runtime.rs` (recovery scheduling/output state and inline caller/supervisor integration tests only).
+- Test: new retry module and existing registry/recovery/inventory tests. Include actual server-controller/supervisor coverage with `cargo test -p freshell-server --features managed-runtime-v1 managed_runtime::tests`; supervisor alone must own retry delays/exhaustion, and pending automatic recovery must not leave a stale terminal block after success.
 
 **Interfaces:**
 - Consumes: typed recovery blocker/error, existing per-soul lifecycle lock, intent revision/control epoch, recovery attempt ID and ownership handle.
