@@ -143,10 +143,16 @@ mod configured_resource_tests {
             sound.display().to_string(),
             reqwest::Url::from_file_path(&sound).unwrap().to_string(),
             "./selected.wav".into(),
+            "../external/selected.wav".into(),
         ]
         .into_iter()
         .enumerate()
         {
+            let config = if ordinal == 3 {
+                cwd.parent().unwrap().join("tui.jsonc")
+            } else {
+                config.clone()
+            };
             let raw = format!("{{ // selected finite native fields\n\"attention\":{{\"sounds\":{{\"default\":{}}}}},\"mcp\":{{\"probe\":{{\"type\":\"local\",\"command\":[\"node\",\"server.cjs\"],\"cwd\":\"../../external/tool\"}},\"disabled\":{{\"type\":\"local\",\"enabled\":false,\"cwd\":\"/missing-disabled\"}},\"remote\":{{\"type\":\"remote\",\"cwd\":\"/missing-remote\"}}}}}}", serde_json::to_string(&spelling).unwrap());
             std::fs::write(&config, &raw).unwrap();
             let plan = plan_opencode_sources(

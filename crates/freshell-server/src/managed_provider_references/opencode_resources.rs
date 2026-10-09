@@ -484,9 +484,12 @@ pub fn select(
                     .unwrap_or_else(|| source.instance_cwd.join(path));
             }
         }
-        if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
-            // Native instance-cwd resolution normalizes .. before deciding
-            // whether the selected directory is supplied by the workspace.
+        if matches!(
+            field,
+            "OpenCode skills.paths" | "OpenCode mcp.cwd" | "OpenCode attention.sounds"
+        ) {
+            // Native resolution resolution normalizes .. before deciding
+            // whether the selected resource is supplied by the workspace.
             path = freshell_platform::opencode_config::lexical_path(&path);
         }
         let canonical = checked(&path, field, declaring)?;
