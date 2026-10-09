@@ -426,7 +426,23 @@ impl FreshAgentHostActor {
             // Its grant and resource generation may change while the durable
             // conversation and every other launch setting remain the same.
             let current_preparation = expected_profile.provider_launch_context.take();
+            let current_references = expected_profile.provider_secret_references.clone();
             if current_preparation.is_some() {
+                // Configuration-file references belong to the host-validated
+                // preparation. Legacy OneCLI grants remain durable settings.
+                if !current_references
+                    .iter()
+                    .filter(|reference| !reference.profile.is_configuration_file())
+                    .eq(loaded
+                        .profile
+                        .provider_secret_references
+                        .iter()
+                        .filter(|reference| !reference.profile.is_configuration_file()))
+                {
+                    return Err(ActorError::NativeIdentityMismatch);
+                }
+                expected_profile.provider_secret_references =
+                    loaded.profile.provider_secret_references.clone();
                 expected_profile.provider_launch_context =
                     loaded.profile.provider_launch_context.clone();
             }
@@ -434,6 +450,7 @@ impl FreshAgentHostActor {
                 return Err(ActorError::NativeIdentityMismatch);
             }
             loaded.profile.provider_launch_context = current_preparation;
+            loaded.profile.provider_secret_references = current_references;
             for command in loaded.commands.values_mut() {
                 if matches!(command.state, CommandState::Dispatching) {
                     command.state = CommandState::Ambiguous;

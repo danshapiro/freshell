@@ -894,7 +894,8 @@ async fn exact_native_identity_and_profile_are_reused_on_host_actor_recovery() {
 #[tokio::test]
 async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
     use freshell_runtime_protocol::{
-        McpCapabilityReference, ProviderLaunchContext, ProviderPreparation,
+        McpCapabilityReference, ProviderLaunchContext, ProviderPreparation, ProviderSecretProfile,
+        ProviderSecretReference,
     };
     for provider in [
         FreshProvider::Claude,
@@ -918,7 +919,7 @@ async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
             },
         };
         let dir = tempfile::tempdir().unwrap();
-        let mut initial = profile(provider, "same-store", None);
+        let mut initial = profile(provider.clone(), "same-store", None);
         initial.provider_launch_context = Some(ProviderLaunchContext {
             preparation,
             prepared_inputs: None,
@@ -930,6 +931,19 @@ async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
                 host_gateway_address: None,
             }),
         });
+        initial
+            .provider_secret_references
+            .push(ProviderSecretReference {
+                source_path: "/synthetic/old-config-target".into(),
+                profile: match provider {
+                    FreshProvider::Claude | FreshProvider::Kilroy => {
+                        ProviderSecretProfile::ClaudeConfigurationFile
+                    }
+                    FreshProvider::Codex => ProviderSecretProfile::CodexConfigurationFile,
+                    FreshProvider::Opencode => ProviderSecretProfile::OpencodeConfigurationFile,
+                },
+                provider_relative_path: Some(".freshell/references/config-0".into()),
+            });
         let actor =
             FreshAgentHostActor::open(dir.path(), initial, FakeTransport::new("same-native"))
                 .await
@@ -944,6 +958,7 @@ async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
             .as_mut()
             .unwrap()
             .grant_id = "grant-replacement".into();
+        refreshed.provider_secret_references[0].source_path = "/synthetic/new-config-target".into();
         let transport = FakeTransport::new("same-native");
         let actor = FreshAgentHostActor::open(dir.path(), refreshed.clone(), transport.clone())
             .await
@@ -974,6 +989,8 @@ async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
             .as_mut()
             .unwrap()
             .grant_id = "grant-unconfirmed".into();
+        next_preparation.provider_secret_references[0].source_path =
+            "/synthetic/unconfirmed-config-target".into();
         let wrong_native = FakeTransport::new("wrong-native-from-provider");
         let result =
             FreshAgentHostActor::open(dir.path(), next_preparation.clone(), wrong_native.clone())
