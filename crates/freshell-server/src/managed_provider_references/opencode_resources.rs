@@ -64,70 +64,29 @@ impl Cursor<'_> {
 // A finite field visitor rather than decoded/serialized document rewriting.
 // Plugin tuple options (and nested unrelated fields) are never path schemas.
 fn fields(raw: &str) -> Result<Vec<(&'static str, String)>, &'static str> {
-    let mut cursor = Cursor { raw, at: 0 };
-    let mut depth = 0usize;
+    // Native JSONC parsing assigns each member in order: only the final
+    // spelling owns a configured capability, including escaped duplicate keys.
+    // Reuse raw member spans so plugin tuple options and source origins survive.
+    let top = object_members(raw, 0)?;
     let mut result = Vec::new();
-    while let Some(token) = cursor.next() {
-        match token {
-            Token::Punctuation(b'{' | b'[') => depth += 1,
-            Token::Punctuation(b'}' | b']') => depth = depth.saturating_sub(1),
-            Token::String(start, end) if depth == 1 && end - start <= 64 => {
-                let key: String = serde_json::from_str(&raw[start..end])
-                    .map_err(|_| "invalid selected resource field")?;
-                let mut selected = Cursor { raw, at: cursor.at };
-                if !matches!(selected.next(), Some(Token::Punctuation(b':'))) {
-                    continue;
-                }
-                match key.as_str() {
-                    "plugin" | "instructions"
-                        if matches!(selected.next(), Some(Token::Punctuation(b'['))) =>
-                    {
-                        let field = if key == "plugin" {
-                            "OpenCode plugin"
-                        } else {
-                            "OpenCode instructions"
-                        };
-                        resource_array(&mut selected, field, &mut result)?;
-                        cursor = selected;
-                    }
-                    "skills" if matches!(selected.next(), Some(Token::Punctuation(b'{'))) => {
-                        let mut skills_depth = 1usize;
-                        while skills_depth != 0 {
-                            match selected.next().ok_or("incomplete selected skills field")? {
-                                Token::Punctuation(b'{' | b'[') => skills_depth += 1,
-                                Token::Punctuation(b'}' | b']') => skills_depth -= 1,
-                                Token::String(start, end)
-                                    if skills_depth == 1 && end - start <= 64 =>
-                                {
-                                    let key: String = serde_json::from_str(&raw[start..end])
-                                        .map_err(|_| "invalid selected skills field")?;
-                                    if key != "paths" {
-                                        continue;
-                                    }
-                                    let mut paths = Cursor {
-                                        raw,
-                                        at: selected.at,
-                                    };
-                                    if matches!(paths.next(), Some(Token::Punctuation(b':')))
-                                        && matches!(paths.next(), Some(Token::Punctuation(b'[')))
-                                    {
-                                        resource_array(
-                                            &mut paths,
-                                            "OpenCode skills.paths",
-                                            &mut result,
-                                        )?;
-                                        selected = paths;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        cursor = selected;
-                    }
-                    _ => {}
-                }
+    for (name, field) in [
+        ("plugin", "OpenCode plugin"),
+        ("instructions", "OpenCode instructions"),
+    ] {
+        if let Some(value) = member(raw, &top, name) {
+            let mut selected = Cursor { raw: value, at: 0 };
+            if matches!(selected.next(), Some(Token::Punctuation(b'['))) {
+                resource_array(&mut selected, field, &mut result)?;
             }
-            _ => {}
+        }
+    }
+    if let Some(skills) = member(raw, &top, "skills") {
+        let entries = object_members(skills, 0)?;
+        if let Some(paths) = member(skills, &entries, "paths") {
+            let mut selected = Cursor { raw: paths, at: 0 };
+            if matches!(selected.next(), Some(Token::Punctuation(b'['))) {
+                resource_array(&mut selected, "OpenCode skills.paths", &mut result)?;
+            }
         }
     }
     Ok(result)

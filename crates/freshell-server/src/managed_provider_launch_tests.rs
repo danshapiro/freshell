@@ -3593,7 +3593,18 @@ export default async (input,options)=>({config:async(config)=>{
         json!({"type":"local","command":["node","server.cjs"],"cwd":"~/mcp-cwd"});
     original["instructions"] = json!([external_instruction]);
     original["skills"] = json!({"paths":[selected_skills,"../../scenarios/external-native-resources/selected-skills"]});
-    std::fs::write(&original_config, serde_json::to_vec(&original).unwrap()).unwrap();
+    // Native ConfigParse/jsonc-parser keeps only the final resource member.
+    // Obsolete targets do not exist; the existing actual plugin/instruction/
+    // skill consumers below must still consume each final selected closure.
+    let ordinary = serde_json::to_string(&original).unwrap().replace(
+        "\"skills\":{",
+        "\"skills\":{\"paths\":[\"/missing-obsolete-nested-skills\"],",
+    );
+    let duplicate_resources = format!(
+        "{{\"plugin\":[\"file:///missing-obsolete-plugin.mjs\"],\"instructions\":[\"/missing-obsolete-instructions.md\"],\"skills\":{{\"paths\":[\"/missing-obsolete-skills\"]}},{}",
+        &ordinary[1..],
+    );
+    std::fs::write(&original_config, duplicate_resources.as_bytes()).unwrap();
     let original_bytes = std::fs::read(&original_config).unwrap();
     let expected_external = json!({"adjacent":format!("{:x}",Sha256::digest(b"native-adjacent-import")),"child":format!("{:x}",Sha256::digest(b"native-child-dependency")),"parent":format!("{:x}",Sha256::digest(b"native-parent-dependency")),"resource":format!("{:x}",Sha256::digest(b"native-adjacent-resource")),"instruction":format!("{:x}",Sha256::digest(b"native-external-instruction")),"selected":true,"nativeSkill":true,"skillContent":format!("{:x}",Sha256::digest(b"Execute the adjacent synthetic resources.\n")),"skillExecution":format!("{:x}",Sha256::digest(b"native-skill-resource:native-skill-dependency")),"nativeMcpCwd":format!("{:x}",Sha256::digest(b"native-mcp-resource:native-mcp-dependency"))});
     let explicit_config = fixture.join("workspace/selected-config.json");

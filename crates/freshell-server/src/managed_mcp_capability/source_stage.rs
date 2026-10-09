@@ -13,6 +13,179 @@ mod configured_resource_tests {
     use crate::managed_provider_references::sources::*;
     use freshell_platform::provider_environment::{copy_environment, CopySelection};
     #[test]
+    fn managed_provider_duplicate_resource_members_select_only_native_winners_after_both_copies() {
+        use std::os::unix::fs::PermissionsExt;
+        let owned = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+            Some(root) => tempfile::tempdir_in(root).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let selected = owned.path().join("external/selected");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(selected.join("node_modules/dependency")).unwrap();
+        std::fs::write(
+            selected.join("node_modules/dependency/index.js"),
+            "module.exports='winning-dependency';",
+        )
+        .unwrap();
+        std::fs::write(selected.join("resource"), "winning-resource").unwrap();
+        std::fs::write(
+            selected.join("SKILL.md"),
+            "---\nname: winning\ndescription: winning skill\n---\nExecute run.\n",
+        )
+        .unwrap();
+        std::fs::write(selected.join("run"), "#!/usr/bin/env node\nconst fs=require('node:fs'),path=require('node:path');process.stdout.write(fs.readFileSync(path.join(__dirname,'resource'),'utf8')+':'+require('dependency'));").unwrap();
+        std::fs::set_permissions(selected.join("run"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let instruction = owned.path().join("external/selected.md");
+        std::fs::write(&instruction, "winning-instruction").unwrap();
+        let config = home.join("opencode.jsonc");
+        let plugin =
+            serde_json::to_string(&format!("file://{}", selected.join("run").display())).unwrap();
+        let instruction_json = serde_json::to_string(&instruction).unwrap();
+        let skills_json = serde_json::to_string(&selected).unwrap();
+        let obsolete = owned.path().join("obsolete-missing");
+        let obsolete_json = serde_json::to_string(&obsolete).unwrap();
+        let cases = [
+            format!(
+                r#"{{"plugin":[{obsolete_json}],"plu\u0067in":[[{plugin},{{"instructions":["/unselected-options"]}}]]}}"#
+            ),
+            format!(
+                r#"{{"instructions":[{obsolete_json}],/* final wins */"instructions":[{instruction_json}]}}"#
+            ),
+            format!(
+                r#"{{"skills":{{"paths":[{obsolete_json}]}},"skills":{{"paths":[{skills_json}]}}}}"#
+            ),
+            format!(r#"{{"skills":{{"paths":[{obsolete_json}],"pa\u0074hs":[{skills_json}]}}}}"#),
+        ];
+        for (index, raw) in cases.iter().enumerate() {
+            std::fs::write(&config, raw).unwrap();
+            let plan = plan_opencode_sources(
+                vec![SourceOccurrence {
+                    logical_path: config.clone(),
+                    canonical_source: config.clone(),
+                    lane: SourceLane::Main,
+                    role: DiscoveryRole::Home,
+                }],
+                &cwd,
+                &home,
+                &|_, _, _| None,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "native winning member must discard obsolete target: {} {}",
+                    e.field, e.cause
+                )
+            });
+            assert_eq!(plan[0].configured_resources.len(), 1);
+            assert!(!plan[0].configured_resources.contains(&obsolete));
+            let units =
+                resource_units(&home, &home.join(".config/opencode"), &cwd, &plan, None).unwrap();
+            let stage = owned.path().join(format!("stage-{index}"));
+            let host = owned.path().join(format!("host-{index}"));
+            copy_environment(
+                &units
+                    .iter()
+                    .map(|(source, mount)| CopySelection {
+                        source: source.clone(),
+                        destination_relative: mount.stage_relative_path.clone().into(),
+                    })
+                    .collect::<Vec<_>>(),
+                &stage,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            copy_environment(
+                &units
+                    .iter()
+                    .map(|(_, mount)| CopySelection {
+                        source: stage.join(&mount.stage_relative_path),
+                        destination_relative: mount.provider_relative_path.clone().into(),
+                    })
+                    .collect::<Vec<_>>(),
+                &host,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            let unit = units
+                .iter()
+                .find(|(source, _)| source == if index == 1 { &instruction } else { &selected })
+                .unwrap();
+            let projected = host.join(&unit.1.provider_relative_path);
+            let hidden = owned.path().join("hidden-original");
+            std::fs::rename(owned.path().join("external"), &hidden).unwrap();
+            if index == 1 {
+                assert_eq!(std::fs::read(&projected).unwrap(), b"winning-instruction");
+            } else {
+                let output = std::process::Command::new(projected.join("run"))
+                    .env_clear()
+                    .env("PATH", std::env::var_os("PATH").unwrap())
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "winning resource/dependency executable failed: {output:?}"
+                );
+                assert_eq!(output.stdout, b"winning-resource:winning-dependency");
+                assert!(std::fs::read_to_string(projected.join("SKILL.md"))
+                    .unwrap()
+                    .contains("name: winning"));
+            }
+            std::fs::rename(&hidden, owned.path().join("external")).unwrap();
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), *raw);
+        }
+        for field in ["plugin", "instructions", "skills-object", "skills-paths"] {
+            for final_missing in [false, true] {
+                let final_value = if final_missing {
+                    format!("[{obsolete_json}]")
+                } else {
+                    "[]".into()
+                };
+                let raw = match field {
+                    "plugin" | "instructions" => {
+                        format!(r#"{{"{field}":[{instruction_json}],"{field}":{final_value}}}"#)
+                    }
+                    "skills-object" => format!(
+                        r#"{{"skills":{{"paths":[{skills_json}]}},"skills":{{"paths":{final_value}}}}}"#
+                    ),
+                    _ => {
+                        format!(r#"{{"skills":{{"paths":[{skills_json}],"paths":{final_value}}}}}"#)
+                    }
+                };
+                std::fs::write(&config, &raw).unwrap();
+                let result = plan_opencode_sources(
+                    vec![SourceOccurrence {
+                        logical_path: config.clone(),
+                        canonical_source: config.clone(),
+                        lane: SourceLane::Main,
+                        role: DiscoveryRole::Home,
+                    }],
+                    &cwd,
+                    &home,
+                    &|_, _, _| None,
+                );
+                if final_missing {
+                    let error = result
+                        .err()
+                        .expect("missing final member must prevent publication");
+                    assert!(error.cause.contains("missing"));
+                    assert_eq!(error.declaring_source, config);
+                } else {
+                    assert!(result
+                        .unwrap()
+                        .iter()
+                        .all(|source| source.configured_resources.is_empty()));
+                }
+                assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+            }
+        }
+    }
+
+    #[test]
     fn managed_provider_configured_external_resources_fail_before_publication_when_unavailable() {
         use std::os::unix::fs::PermissionsExt;
         let owned = tempfile::tempdir().unwrap();
