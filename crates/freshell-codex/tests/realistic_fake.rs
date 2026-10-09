@@ -99,9 +99,9 @@ async fn launcher_forwards_only_the_first_signal() {
     rpc.initialize().await;
     rpc.call("thread/start", json!({})).await.unwrap();
     start_turn(&mut rpc, "t-fwd").await;
-    signal_own_child(fake.launcher_pid(), SIGTERM);
+    assert!(fake.signal_launcher(SIGTERM));
     tokio::time::sleep(Duration::from_millis(200)).await;
-    signal_own_child(fake.launcher_pid(), SIGINT);
+    assert!(fake.signal_launcher(SIGINT));
     tokio::time::sleep(Duration::from_millis(200)).await;
     let native = fake.native().await;
     let sigs: Vec<_> = native.signals.iter().map(|s| s.sig.as_str()).collect();
@@ -114,7 +114,7 @@ async fn launcher_forwards_only_the_first_signal() {
         pid_alive(native.pid),
         "a draining native keeps running its turn"
     );
-    signal_own_child(native.pid, SIGKILL);
+    assert!(fake.signal_native(SIGKILL));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -132,7 +132,7 @@ async fn sigterm_drains_the_running_turn_before_exit() {
     start_turn(&mut rpc, "t-drain").await;
     let native = fake.native().await.pid;
     let t0 = Instant::now();
-    signal_own_child(native, SIGTERM);
+    assert!(fake.signal_native(SIGTERM));
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(pid_alive(native), "SIGTERM must not stop a running turn");
     let done = rpc
@@ -162,7 +162,7 @@ async fn sigint_stops_at_once() {
     start_turn(&mut rpc, "t-int").await;
     let native = fake.native().await.pid;
     let t0 = Instant::now();
-    signal_own_child(native, SIGINT);
+    assert!(fake.signal_native(SIGINT));
     wait_until("native exit after SIGINT", Duration::from_secs(2), || {
         !pid_alive(native)
     })
@@ -183,7 +183,7 @@ async fn sigint_reports_the_running_turn_completed() {
     rpc.call("thread/start", json!({})).await.unwrap();
     start_turn(&mut rpc, "t-sigint").await;
     let native = fake.native().await.pid;
-    signal_own_child(native, SIGINT);
+    assert!(fake.signal_native(SIGINT));
     let done = rpc
         .next_notification_for("turn/completed", "t-sigint", Duration::from_secs(1))
         .await
@@ -243,7 +243,7 @@ async fn descendants_have_the_realistic_topology() {
         );
     }
     for pid in [detached, shell, helper, m.pid] {
-        signal_own_child(pid, SIGKILL);
+        assert!(m.signal(pid, SIGKILL));
     }
 }
 
@@ -267,13 +267,13 @@ async fn flock_refuses_a_second_writer_and_releases_on_native_exit() {
         .as_str()
         .unwrap()
         .contains("thread t-lock already has an active writer"));
-    signal_own_child(a.native().await.pid, SIGKILL);
+    assert!(a.signal_native(SIGKILL));
     wait_until("lock release", Duration::from_secs(2), || !lock_held(&lock)).await;
     rpc_b
         .call("thread/resume", json!({"threadId": "t-lock"}))
         .await
         .expect("resume after release");
-    signal_own_child(b.native().await.pid, SIGKILL);
+    assert!(b.signal_native(SIGKILL));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -345,7 +345,7 @@ async fn queue_goal_and_helper_threads_are_reported() {
         .await
         .unwrap();
     assert_eq!(g["goal"]["status"], "active");
-    signal_own_child(fake.native().await.pid, SIGKILL);
+    assert!(fake.signal_native(SIGKILL));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -391,7 +391,7 @@ async fn thread_loads_are_announced_like_codex() {
     );
 
     // (2) A cold resume on a second native: status notLoaded then idle; no thread/started.
-    signal_own_child(first.native().await.pid, SIGKILL);
+    assert!(first.signal_native(SIGKILL));
     wait_until(
         "first native's locks released",
         Duration::from_secs(2),
@@ -671,7 +671,7 @@ async fn a_never_materialized_thread_cannot_be_resumed() {
         rollout_exists(home.path(), "t-old"),
         "a turn materializes t-old"
     );
-    signal_own_child(a.native().await.pid, SIGKILL);
+    assert!(a.signal_native(SIGKILL));
     let new_lock = thread_lock_path(home.path(), "t-new");
     wait_until("A's locks released", Duration::from_secs(2), || {
         !lock_held(&new_lock) && !lock_held(&thread_lock_path(home.path(), "t-old"))
@@ -728,7 +728,7 @@ async fn the_tui_survives_app_server_death_and_reconnects() {
         "{}",
         tui.output()
     );
-    signal_own_child(a.native().await.pid, SIGKILL);
+    assert!(a.signal_native(SIGKILL));
     assert!(
         tui.wait_output("FAKE_TUI_RECONNECTING", Duration::from_secs(2))
             .await,
@@ -761,7 +761,7 @@ async fn the_tui_survives_app_server_death_and_reconnects() {
         "{}",
         tui2.output()
     );
-    signal_own_child(c.native().await.pid, SIGKILL);
+    assert!(c.signal_native(SIGKILL));
     assert!(
         tui2.wait_output(
             "Server connection could not be restored",
@@ -895,12 +895,12 @@ async fn signals_carry_the_unit_record_state_and_wedge_knobs_hold() {
     )
     .await;
     let native = fake.native().await.pid;
-    signal_own_child(native, SIGINT);
+    assert!(fake.signal_native(SIGINT));
     wait_until("SIGINT recorded", Duration::from_secs(2), || {
         fake.try_native().is_some_and(|m| m.signals.len() == 1)
     })
     .await;
-    signal_own_child(native, SIGTERM);
+    assert!(fake.signal_native(SIGTERM));
     wait_until("SIGTERM recorded", Duration::from_secs(2), || {
         fake.try_native().is_some_and(|m| m.signals.len() == 2)
     })
@@ -918,12 +918,11 @@ async fn signals_carry_the_unit_record_state_and_wedge_knobs_hold() {
             Some(r#"{"kind":"stopping","mode":"force"}"#)
         );
     }
-    signal_own_child(native, SIGKILL);
+    assert!(fake.signal_native(SIGKILL));
 
     // Without a unit record the field is null.
     let plain = FakeAppServer::spawn(json!({}), home.path(), &[]).await;
-    let native = plain.native().await.pid;
-    signal_own_child(native, SIGHUP);
+    assert!(plain.signal_native(SIGHUP));
     wait_until("SIGHUP recorded", Duration::from_secs(2), || {
         plain.try_native().is_some_and(|m| m.signals.len() == 1)
     })
@@ -996,7 +995,7 @@ async fn a_draining_native_refuses_turns_and_a_second_sigterm_exits_at_once() {
     rpc.call("thread/start", json!({})).await.unwrap();
     start_turn(&mut rpc, "t-dr").await;
     let native = fake.native().await.pid;
-    signal_own_child(native, SIGTERM);
+    assert!(fake.signal_native(SIGTERM));
     wait_until("SIGTERM recorded", Duration::from_secs(2), || {
         fake.try_native().is_some_and(|m| m.signals.len() == 1)
     })
@@ -1012,7 +1011,7 @@ async fn a_draining_native_refuses_turns_and_a_second_sigterm_exits_at_once() {
     assert_eq!(refused["message"], "app-server is draining");
     assert!(pid_alive(native), "the running turn keeps the native alive");
     let t0 = Instant::now();
-    signal_own_child(native, SIGTERM);
+    assert!(fake.signal_native(SIGTERM));
     wait_until(
         "native exit after a second SIGTERM",
         Duration::from_secs(2),
@@ -1071,4 +1070,88 @@ async fn the_compiled_lock_holder_behaves_like_codexs_writer_lock() {
         .unwrap()
         .unwrap();
     assert_eq!(c_status.code(), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signal_own_child_signals_only_the_pinned_process() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id().expect("child pid");
+    let start = proc_starttime(pid).expect("our unreaped child's start time");
+    assert!(
+        !signal_own_child(pid, start + 1, SIGKILL),
+        "another start time names another process: nothing is sent"
+    );
+    assert!(
+        pid_alive(pid),
+        "the mismatched signal never reached the child"
+    );
+    assert!(signal_own_child(pid, start, SIGKILL));
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("the pinned child dies")
+        .expect("wait for the child");
+    assert_eq!(status.signal(), Some(SIGKILL));
+    assert!(
+        !signal_own_child(pid, start, SIGKILL),
+        "a reaped process is never signalled"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_reported_process_is_pinned_and_ends_with_the_fake() {
+    let home = tempfile::tempdir().unwrap();
+    let fake = FakeAppServer::spawn(
+        json!({"spawnHelperProcess": true, "mcpChild": true, "turnSpawnsShellCommand": true,
+               "detachedJobOnTurn": true, "turnCompleteDelayMs": 60000, "threadStartThreadId": "t-pin"}),
+        home.path(),
+        &[],
+    )
+    .await;
+    let mut rpc = connected(fake.port).await;
+    rpc.call("thread/start", json!({})).await.unwrap();
+    start_turn(&mut rpc, "t-pin").await;
+    wait_until("turn descendants", Duration::from_secs(5), || {
+        fake.try_native()
+            .is_some_and(|m| !m.children.shell.is_empty() && !m.children.detached.is_empty())
+    })
+    .await;
+    let m = fake.native().await;
+    let mut pinned = vec![
+        m.pid,
+        m.children.helper.expect("helper"),
+        m.children.mcp.expect("mcp child"),
+    ];
+    pinned.extend(&m.children.shell);
+    pinned.extend(&m.children.detached);
+    let identities: Vec<(u32, u64)> = pinned.iter().map(|&pid| (pid, m.start_time(pid))).collect();
+    for &(pid, start) in &identities {
+        assert_eq!(
+            Some(start),
+            proc_starttime(pid),
+            "the native pinned {pid} by its real start time"
+        );
+    }
+    assert_eq!(
+        Some(fake.launcher_start_time()),
+        proc_starttime(fake.launcher_pid()),
+        "the launcher is pinned too"
+    );
+
+    // A test that ends early (a failing assertion) must not leave any of them behind.
+    drop(fake);
+    wait_until(
+        "every pinned process ended with the fake",
+        Duration::from_secs(5),
+        || {
+            identities
+                .iter()
+                .all(|&(pid, start)| !(pid_alive(pid) && proc_starttime(pid) == Some(start)))
+        },
+    )
+    .await;
 }

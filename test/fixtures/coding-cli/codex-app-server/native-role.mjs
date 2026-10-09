@@ -20,6 +20,11 @@ export function createNativeRole({ behavior, codexHome, broadcast, openConnectio
 
   const manifestDir = process.env.FAKE_CODEX_MANIFEST_DIR
   const children = { helper: null, mcp: null, shell: [], detached: [] }
+  // pid -> start time for every process the manifest reports, read while the pid
+  // certainly names that process (this native, or a child it has just spawned), so
+  // tests signal only that exact process (pid AND start time).
+  const startTimes = {}
+  pin(process.pid)
   const shellProcesses = []
   const signals = []
   const activeTurns = new Map() // `${threadId}\0${turnId}` -> { threadId, settled, finish }
@@ -37,8 +42,19 @@ export function createNativeRole({ behavior, codexHome, broadcast, openConnectio
     if (!manifestDir) return
     fs.mkdirSync(manifestDir, { recursive: true })
     const file = path.join(manifestDir, `native-${process.pid}.json`)
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ role: 'native', pid: process.pid, threads: heldThreadIds(), children, signals }))
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ role: 'native', pid: process.pid, threads: heldThreadIds(), children, startTimes, signals }))
     fs.renameSync(`${file}.tmp`, file)
+  }
+  function pin(pid) {
+    // /proc/<pid>/stat field 22 (Linux only; off Linux nothing is pinned).
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const start = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19])
+      if (Number.isSafeInteger(start)) startTimes[pid] = start
+    } catch {
+      // no /proc
+    }
+    return pid
   }
   async function lockOrError(threadId) {
     const r = await acquireThreadLock(codexHome, threadId)
@@ -48,23 +64,24 @@ export function createNativeRole({ behavior, codexHome, broadcast, openConnectio
   function spawnOwnGroupHelper() {
     // code-mode-host analogue: own process group, same session.
     const p = spawn('perl', ['-e', 'setpgrp(0,0); sleep 600'], { stdio: 'ignore' })
-    children.helper = p.pid
+    children.helper = pin(p.pid)
   }
   function spawnMcpChild() {
     const p = spawn(process.execPath, ['-e', 'process.stdin.resume(); process.stdin.on("end", () => process.exit(0))'], { stdio: ['pipe', 'ignore', 'ignore'] })
-    children.mcp = p.pid
+    children.mcp = pin(p.pid)
   }
   function spawnShellCommand() {
     const p = spawn('sleep', ['600'], { detached: true, stdio: 'ignore' }) // setsid
     p.unref()
     shellProcesses.push(p)
-    children.shell.push(p.pid)
+    children.shell.push(pin(p.pid))
   }
   function spawnDetachedJob() {
     // A `nohup` job whose parent shell exits at once, so it is reparented away.
+    // Pinned right away, while its `sleep 600` certainly still runs.
     const out = spawnSync('sh', ['-c', 'nohup sleep 600 >/dev/null 2>&1 & echo $!'])
     const pid = Number(String(out.stdout).trim())
-    if (Number.isFinite(pid) && pid > 0) children.detached.push(pid)
+    if (Number.isFinite(pid) && pid > 0) children.detached.push(pin(pid))
   }
 
   // Unit record state at signal time (Stage 2: LB-32): the per-unit record is the

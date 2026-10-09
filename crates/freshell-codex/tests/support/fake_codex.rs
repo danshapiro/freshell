@@ -1,8 +1,9 @@
 //! Test-only support for the realistic Codex fake (launcher + separate native).
-//! Every process these helpers signal was spawned by the calling test.
+//! Every process these helpers signal was spawned by the calling test, and is
+//! identified by pid AND start time (see [`signal_own_child`]).
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -79,6 +80,45 @@ pub struct NativeManifest {
     pub children: ChildPids,
     #[serde(default)]
     pub signals: Vec<SignalEntry>,
+    /// pid -> start time of every process above (the native and each child it
+    /// reports), recorded by the native while the pid certainly named that process.
+    #[serde(default, rename = "startTimes")]
+    pub start_times: BTreeMap<u32, u64>,
+}
+
+impl NativeManifest {
+    /// The start time the native pinned for `pid` (itself or a child it reported).
+    pub fn start_time(&self, pid: u32) -> u64 {
+        *self
+            .start_times
+            .get(&pid)
+            .unwrap_or_else(|| panic!("the native manifest pins no process {pid}"))
+    }
+
+    /// Sends `sig` to `pid` (the native or a child it reported) only while `pid`
+    /// still names the process the native pinned. Returns whether it was sent.
+    pub fn signal(&self, pid: u32, sig: i32) -> bool {
+        signal_own_child(pid, self.start_time(pid), sig)
+    }
+
+    /// SIGKILLs every process this manifest pins that is still that process.
+    pub fn kill_all(&self) {
+        for (&pid, &start) in &self.start_times {
+            signal_own_child(pid, start, libc::SIGKILL);
+        }
+    }
+}
+
+/// The native manifest of the launcher `launcher_pid` started (launcher manifest ->
+/// native manifest), if both have been written.
+pub fn read_native_manifest(manifest_dir: &Path, launcher_pid: u32) -> Option<NativeManifest> {
+    let raw =
+        std::fs::read_to_string(manifest_dir.join(format!("launcher-{launcher_pid}.json"))).ok()?;
+    let launcher: LauncherManifest = serde_json::from_str(&raw).ok()?;
+    let raw =
+        std::fs::read_to_string(manifest_dir.join(format!("native-{}.json", launcher.native_pid)))
+            .ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,8 +132,10 @@ pub struct FakeAppServer {
     pub port: u16,
     pub codex_home: PathBuf,
     pub manifest_dir: PathBuf,
-    /// The native's (pid, start time), so `Drop` only ever kills that exact process.
-    native_identity: Option<(u32, u64)>,
+    /// The launcher's (pid, start time), pinned at spawn (an unreaped child of ours).
+    launcher: (u32, u64),
+    /// The native's (pid, start time), as the native pinned itself in its manifest.
+    native: (u32, u64),
 }
 
 impl FakeAppServer {
@@ -122,41 +164,47 @@ impl FakeAppServer {
             cmd.env(k, v);
         }
         let child = cmd.spawn().expect("spawn fake launcher");
-        let mut me = Self {
+        let launcher_pid = child.id().expect("launcher pid");
+        // Unreaped, so the pid cannot have been reused yet.
+        let launcher_start = proc_starttime(launcher_pid).expect("launcher start time");
+        wait_until("native manifest", Duration::from_secs(10), || {
+            read_native_manifest(&manifest_dir, launcher_pid).is_some()
+        })
+        .await;
+        let manifest = read_native_manifest(&manifest_dir, launcher_pid).expect("native manifest");
+        Self {
             child,
             port,
             codex_home: codex_home.to_path_buf(),
             manifest_dir,
-            native_identity: None,
-        };
-        wait_until("native manifest", Duration::from_secs(10), || {
-            me.try_native().is_some()
-        })
-        .await;
-        let pid = me.try_native().expect("native manifest").pid;
-        me.native_identity = proc_starttime(pid).map(|start| (pid, start));
-        me
+            launcher: (launcher_pid, launcher_start),
+            native: (manifest.pid, manifest.start_time(manifest.pid)),
+        }
     }
 
+    /// The launcher's pid (recorded at spawn, so still known after it is reaped).
     pub fn launcher_pid(&self) -> u32 {
-        self.child.id().expect("launcher pid")
+        self.launcher.0
+    }
+
+    pub fn launcher_start_time(&self) -> u64 {
+        self.launcher.1
+    }
+
+    /// Sends `sig` to the launcher while its pid still names it.
+    pub fn signal_launcher(&self, sig: i32) -> bool {
+        signal_own_child(self.launcher.0, self.launcher.1, sig)
+    }
+
+    /// Sends `sig` to the native while its pid still names it.
+    pub fn signal_native(&self, sig: i32) -> bool {
+        signal_own_child(self.native.0, self.native.1, sig)
     }
 
     /// Synchronous manifest read (launcher manifest -> native manifest); usable in
     /// `wait_until` predicates.
     pub fn try_native(&self) -> Option<NativeManifest> {
-        let raw = std::fs::read_to_string(
-            self.manifest_dir
-                .join(format!("launcher-{}.json", self.child.id()?)),
-        )
-        .ok()?;
-        let launcher: LauncherManifest = serde_json::from_str(&raw).ok()?;
-        let raw = std::fs::read_to_string(
-            self.manifest_dir
-                .join(format!("native-{}.json", launcher.native_pid)),
-        )
-        .ok()?;
-        serde_json::from_str(&raw).ok()
+        read_native_manifest(&self.manifest_dir, self.launcher.0)
     }
 
     pub async fn native(&self) -> NativeManifest {
@@ -165,13 +213,14 @@ impl FakeAppServer {
 }
 
 impl Drop for FakeAppServer {
-    /// `kill_on_drop` ends only the launcher; the native would otherwise outlive the
-    /// test. Kill it only while its pid still names the process this fake started.
+    /// `kill_on_drop` ends only the launcher. The native and every child it reported
+    /// (helper, MCP child, shell commands, detached jobs) would otherwise outlive the
+    /// test, a test that fails early included. Each is killed only while its pid still
+    /// names the process the native pinned.
     fn drop(&mut self) {
-        if let Some((pid, start)) = self.native_identity {
-            if proc_starttime(pid) == Some(start) {
-                signal_own_child(pid, libc::SIGKILL);
-            }
+        self.signal_native(libc::SIGKILL);
+        if let Some(manifest) = self.try_native() {
+            manifest.kill_all();
         }
     }
 }
@@ -276,11 +325,23 @@ pub fn holds_lock_fd(pid: u32, path: &Path) -> bool {
     })
 }
 
-/// Only for pids this test spawned (launcher, native, or their children).
-pub fn signal_own_child(pid: u32, sig: i32) {
-    unsafe {
-        libc::kill(pid as i32, sig);
+/// Sends `sig` to `pid` only while `pid` still names the process whose start time
+/// is `start_time` (`/proc/<pid>/stat` field 22), so a reused pid is never
+/// signalled. Returns whether the signal was sent.
+///
+/// Only for processes this test spawned (the launcher, the native, or children
+/// the native reported), with the start time pinned at a moment the pid certainly
+/// named that process: at spawn for a test's own child, or from the native
+/// manifest's `startTimes` (see [`NativeManifest::signal`]).
+pub fn signal_own_child(pid: u32, start_time: u64, sig: i32) -> bool {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if raw_pid <= 0 || !pid_alive(pid) || proc_starttime(pid) != Some(start_time) {
+        return false;
     }
+    // SAFETY: plain syscall on a pid just verified to be the pinned process.
+    unsafe { libc::kill(raw_pid, sig) == 0 }
 }
 
 /// The thread a notification is about: `params.threadId`, else `params.thread.id`.
