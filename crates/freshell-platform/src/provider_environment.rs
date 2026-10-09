@@ -1589,6 +1589,174 @@ mod tests {
         assert_eq!(fs::read_dir(&home).unwrap().count(), 1);
     }
 
+    #[test]
+    fn default_copy_actual_metadata_capacity_preserves_both_stages_on_one_byte_overflow() {
+        fn destination(length: usize) -> PathBuf {
+            assert!((402..=656).contains(&length));
+            PathBuf::from("a".repeat(200))
+                .join("b".repeat(199))
+                .join("c".repeat(length - 401))
+        }
+        fn name(index: usize, length: usize) -> String {
+            let prefix = format!("f{index:06}");
+            assert!((prefix.len()..=255).contains(&length));
+            format!("{prefix}{}", "x".repeat(length - prefix.len()))
+        }
+        fn verify(directory: &Path, names: &[String]) {
+            assert_eq!(fs::read_dir(directory).unwrap().count(), names.len());
+            for (index, name) in names.iter().enumerate() {
+                assert_eq!(
+                    fs::read(directory.join(name)).unwrap(),
+                    (index as u64).to_le_bytes()
+                );
+            }
+        }
+        fn verify_projection(root: &Path, relative: &Path, alias_length: usize, names: &[String]) {
+            let alias = root.join("z".repeat(alias_length));
+            assert!(fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                fs::canonicalize(&alias).unwrap(),
+                fs::canonicalize(root.join(relative)).unwrap()
+            );
+            verify(&root.join(relative), names);
+            verify(&alias, names);
+            assert_eq!(fs::read_dir(root).unwrap().count(), 2);
+        }
+        fn mark_unread(directory: &Path, names: &[String]) -> std::time::SystemTime {
+            let before = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+            for name in names {
+                File::options()
+                    .write(true)
+                    .open(directory.join(name))
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_accessed(before))
+                    .unwrap();
+            }
+            before
+        }
+        fn verify_unread(directory: &Path, names: &[String], before: std::time::SystemTime) {
+            for name in names {
+                assert_eq!(
+                    fs::metadata(directory.join(name))
+                        .unwrap()
+                        .accessed()
+                        .unwrap(),
+                    before
+                );
+            }
+        }
+        fn selections(source: &Path, relative: &Path, alias_length: usize) -> [CopySelection; 2] {
+            [
+                CopySelection {
+                    source: source.into(),
+                    destination_relative: relative.into(),
+                },
+                selection(source, &"z".repeat(alias_length)),
+            ]
+        }
+
+        let root = executable_fixture();
+        let mut source = root.path().join("s".repeat(200)).join("t".repeat(200));
+        let remaining = 500usize.checked_sub(source.as_os_str().len() + 1).unwrap();
+        assert!((1..=255).contains(&remaining));
+        source.push("u".repeat(remaining));
+        fs::create_dir_all(&source).unwrap();
+        assert_eq!(source.as_os_str().len(), 500);
+        assert_eq!(fs::canonicalize(&source).unwrap().as_os_str().len(), 500);
+        let first_relative = destination(500);
+        assert_eq!(first_relative.as_os_str().len(), 500);
+        // Both graphs retain a 1000-byte source/destination path pair, 600
+        // bytes of connecting parents, and a 508-byte selected directory alias
+        // (including the retained separator on its mapped directory target).
+        // Ten adjustable physical filenames calibrate the real graph at 64 MiB.
+        let limit = 64 * 1024 * 1024usize;
+        let base = 2 * 1000 + 600 + 508;
+        let full_count = (limit - base - 10 * 1002 - 2 * 160) / 1402;
+        let mut extra = (limit - base - full_count * 1402 - 10 * 1002) / 2;
+        let mut names: Vec<_> = (0..full_count).map(|index| name(index, 200)).collect();
+        for index in 0..10 {
+            let length = (extra - (9 - index) * 7).min(255);
+            names.push(name(full_count + index, length));
+            extra -= length;
+        }
+        assert_eq!(extra, 0);
+        assert_eq!(
+            base + names
+                .iter()
+                .map(|name| 1002 + 2 * name.len())
+                .sum::<usize>(),
+            limit
+        );
+        for (index, name) in names.iter().enumerate() {
+            fs::write(source.join(name), (index as u64).to_le_bytes()).unwrap();
+            assert_eq!(
+                fs::canonicalize(source.join(name))
+                    .unwrap()
+                    .as_os_str()
+                    .len(),
+                501 + name.len()
+            );
+        }
+        let stage = root.path().join("stage");
+        let first = copy_environment(
+            &selections(&source, &first_relative, 7),
+            &stage,
+            &[],
+            CopyLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (first.entries, first.bytes),
+            (names.len() + 4, (8 * names.len()) as u64)
+        );
+        let staged_source = stage.join(&first_relative);
+        verify_projection(&stage, &first_relative, 7, &names);
+        let second_relative = destination(500 - stage.as_os_str().len() - 1);
+        let second_alias_length = 507 - second_relative.as_os_str().len();
+        let home = root.path().join("home");
+        let second = copy_environment(
+            &selections(&staged_source, &second_relative, second_alias_length),
+            &home,
+            &[],
+            CopyLimits::default(),
+        )
+        .unwrap();
+        assert_eq!((first.entries, first.bytes), (second.entries, second.bytes));
+        verify_projection(&home, &second_relative, second_alias_length, &names);
+        // Only the logical alias grows by one byte. The underlying file names
+        // and contents remain unchanged; the two rejected attempts must not
+        // open any regular source file or alter either previous publication.
+        for (source, destination, relative, alias_length) in [
+            (&source, &stage, &first_relative, 7),
+            (&staged_source, &home, &second_relative, second_alias_length),
+        ] {
+            let before = mark_unread(source, &names);
+            let failure = copy_environment(
+                &selections(source, relative, alias_length + 1),
+                destination,
+                &[],
+                CopyLimits::default(),
+            )
+            .unwrap_err();
+            assert_eq!(failure.limit_kind, Some("metadata_bytes"));
+            assert_eq!(
+                (failure.observed, failure.permitted),
+                (Some(limit as u64 + 1), Some(limit as u64))
+            );
+            verify_unread(source, &names, before);
+            verify_projection(destination, relative, alias_length, &names);
+            assert!(!destination.join("z".repeat(alias_length + 1)).exists());
+        }
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 3);
+        println!(
+            "RESOURCE_METADATA_CAPACITY={}",
+            serde_json::json!({"bytes":limit,"entries":first.entries,"fileBytes":first.bytes,"copies":2,"oneByteOverRejected":2})
+        );
+    }
+
     fn copy_default_twice(source: &Path, root: &Path) -> (CopyReport, CopyReport, PathBuf) {
         let stage = root.join("stage");
         let first = copy_environment(
