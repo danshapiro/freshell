@@ -370,19 +370,31 @@ pub fn prepare(
             .map_err(|error| error.message)?;
         generated.insert(name.into(), flag.runtime_destination.clone());
     }
-    let mut views = 0usize;
     for source in manifest.sources {
-        let remaining = (64 * 1024 * 1024usize)
-            .checked_sub(views)
+        // Each occurrence owns only this iteration's raw/expanded/output views.
+        // Preserve native lane evaluation, but release those charges when the
+        // iteration ends. Only returned child strings and their validation map
+        // survive; the shared input profile bounds each map to 256 KiB.
+        let retained_view_bytes = budget
+            .iter()
+            .map(|(_, value)| value.len())
+            .chain(generated.values().map(String::len))
+            .try_fold(0usize, |bytes, length| bytes.checked_add(length))
             .ok_or("source view profile overflow")?;
+        let remaining =
+            (freshell_platform::provider_input_profiles::MAX_SIMULTANEOUS_SOURCE_VIEW_BYTES
+                as usize)
+                .checked_sub(retained_view_bytes)
+                .ok_or("source view profile overflow")?;
+        // Raw is at most 16 MiB. The shared transformer checks its two live
+        // effective views against 32 MiB before appending. Together with the
+        // bounded retained maps, these fit the 64 MiB simultaneous profile.
         let raw = read_private(
             stage,
             &source.unexpanded_relative_path,
-            remaining.min(16 * 1024 * 1024),
+            remaining
+                .min(freshell_platform::provider_input_profiles::MAX_SOURCE_VIEW_BYTES as usize),
         )?;
-        views = views
-            .checked_add(raw.len())
-            .ok_or("source view profile overflow")?;
         let raw = String::from_utf8(raw).map_err(|_| "prepared source is not UTF-8")?;
         let recipe = GeneratedFileRecipe {
             generated_name: source.generated_name.clone().unwrap_or_default(),
@@ -523,6 +535,147 @@ mod tests {
     use freshell_platform::opencode_recipe::*;
     use freshell_runtime_protocol::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn provider_secret_repeated_native_source_views_release_live_storage_between_occurrences() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let stage = owned.path().join("stage");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir_all(stage.join(".freshell/source-views")).unwrap();
+        let limit = 16 * 1024 * 1024;
+        // Native-valid source at the inclusive per-view limit. Padding remains
+        // raw JSON whitespace, rather than an invalid synthetic schema field.
+        let mut raw =
+            r#"{"agent":{"liveCapacity":{"description":"native-source-nonce"}}}"#.to_string();
+        raw.push_str(&" ".repeat(limit - raw.len()));
+        assert_eq!(raw.len(), limit);
+        let decoded: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            decoded["agent"]["liveCapacity"]["description"],
+            "native-source-nonce"
+        );
+        let relative = ".freshell/source-views/source";
+        std::fs::write(stage.join(relative), &raw).unwrap();
+        let original_digest = Sha256::digest(raw.as_bytes());
+        let sources = (0..8)
+            .map(|index| SourceView {
+                logical_path: home.join(format!("alias-{index}/opencode.jsonc")),
+                discovery_role: DiscoveryRole::Global,
+                native_destination: None,
+                lane: if index == 7 {
+                    SourceLane::Tui
+                } else {
+                    SourceLane::Main
+                },
+                unexpanded_relative_path: relative.into(),
+                template_relative_path: relative.into(),
+                template_sha256: Some(format!("{original_digest:x}")),
+                generated_name: None,
+                occurrences: vec![],
+                referenced_variables: vec![],
+                path_variables: vec![],
+                original_form: true,
+            })
+            .collect();
+        let mut manifest = SourceManifest {
+            version: 1,
+            cwd: home.clone(),
+            original_home: home.clone(),
+            global_config_root: None,
+            sources,
+            files: vec![],
+            frozen_inputs: vec![],
+            user_owns_freshell_mcp: false,
+            native_source_flags: vec![],
+            resource_roots: vec![],
+            rebind_enabled: true,
+            inline_edits: Default::default(),
+        };
+        let bytes = bounded_json_bytes(&manifest, 64 * 1024 * 1024).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+        let generation = format!("grant-{}", uuid::Uuid::new_v4());
+        let context: ProviderLaunchContext = serde_json::from_value(serde_json::json!({
+            "preparation":{"opencode":{"project_config":[],"tui_config":null,"tui_source":null,"inline_config":false}},
+            "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
+            "preparedInputs":{"generationId":generation,"manifest":{"relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(&bytes)),"sourceCount":0,"aliasCount":0,"recipeCount":0}}
+        })).unwrap();
+        let mut secrets = ResolvedProviderSecrets::default();
+        let generated = prepare(Some(&context), &mut secrets, &ProviderPathInputs::default(), &stage, &home)
+            .expect("128 MiB cumulative reads of eight 16 MiB occurrences fit the simultaneous view profile");
+        assert!(
+            generated.is_empty(),
+            "direct native sources must not become child environment values"
+        );
+        assert!(secrets.opencode_plan.is_some());
+        assert_eq!(
+            Sha256::digest(std::fs::read(stage.join(relative)).unwrap()),
+            original_digest
+        );
+        assert_eq!(
+            std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+            bytes
+        );
+        // Real over-limit view fails before dispatch, without publishing a plan
+        // or changing accepted native data and the generation manifest.
+        std::fs::write(stage.join(relative), format!("{raw} ")).unwrap();
+        let mut refused = ResolvedProviderSecrets::default();
+        let error = prepare(
+            Some(&context),
+            &mut refused,
+            &ProviderPathInputs::default(),
+            &stage,
+            &home,
+        )
+        .unwrap_err();
+        assert!(error.contains("byte profile"), "{error}");
+        assert!(refused.opencode_plan.is_none());
+        assert_eq!(
+            std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+            bytes
+        );
+        // A complete raw view can fit while its actual env expansion cannot.
+        // Refuse that expansion before a plan becomes a dispatch target.
+        let prefix = r#"{"agent":{"liveCapacity":{"description":"{env:VALUE}"#;
+        let suffix = "\"}}}";
+        let expansion_raw = format!(
+            "{prefix}{}{suffix}",
+            "x".repeat(limit - prefix.len() - suffix.len())
+        );
+        assert_eq!(expansion_raw.len(), limit);
+        assert!(serde_json::from_str::<serde_json::Value>(&expansion_raw).is_ok());
+        std::fs::write(stage.join(relative), &expansion_raw).unwrap();
+        for source in &mut manifest.sources {
+            source.referenced_variables = vec!["VALUE".into()];
+        }
+        let bytes = bounded_json_bytes(&manifest, 64 * 1024 * 1024).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+        let mut context = context;
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
+        let mut refused = ResolvedProviderSecrets::default();
+        refused
+            .environment
+            .insert("VALUE".into(), "v".repeat(64 * 1024));
+        let error = prepare(
+            Some(&context),
+            &mut refused,
+            &ProviderPathInputs::default(),
+            &stage,
+            &home,
+        )
+        .unwrap_err();
+        assert!(error.contains("recipe profile limit"), "{error}");
+        assert!(refused.opencode_plan.is_none());
+        assert_eq!(
+            std::fs::read_to_string(stage.join(relative)).unwrap(),
+            expansion_raw
+        );
+        assert_eq!(
+            std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+            bytes
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -3580,7 +3580,7 @@ export default async (input,options)=>({config:async(config)=>{
    const output=execFileSync(path.join(path.dirname(skill.location),'scripts/run'));
    await input.client._client.get({url:'/mcp'});
    const mcp=digest(fs.readFileSync(options.mcpReceipt));
-   fs.writeFileSync(options.receipt,JSON.stringify({adjacent:digest(adjacent),child:digest(child),parent:digest(parent),resource:digest(fs.readFileSync(new URL('./resource.txt',import.meta.url))),instruction:digest(fs.readFileSync(options.instruction)),selected:config.instructions.includes(options.instruction),nativeSkill:true,skillContent:digest(skill.content),skillExecution:digest(output),nativeMcpCwd:mcp}));
+   fs.writeFileSync(options.receipt,JSON.stringify({adjacent:digest(adjacent),child:digest(child),parent:digest(parent),resource:digest(fs.readFileSync(new URL('./resource.txt',import.meta.url))),instruction:digest(fs.readFileSync(options.instruction)),selected:config.instructions.includes(options.instruction),nativeLiveViews:config.agent.liveCapacity.description==='native-live-capacity-nonce',nativeSkill:true,skillContent:digest(skill.content),skillExecution:digest(output),nativeMcpCwd:mcp}));
   } catch(error) {fs.writeFileSync(options.receipt+'.failure',JSON.stringify({operation:'native_skill_consumer',type:error instanceof TypeError?'TypeError':error.code==='ENOENT'?'ENOENT':'native_skill_unavailable'}));}
  },0);
 }});
@@ -3600,13 +3600,41 @@ export default async (input,options)=>({config:async(config)=>{
         "\"skills\":{",
         "\"skills\":{\"paths\":[\"/missing-obsolete-nested-skills\"],",
     );
+    let ordinary = ordinary.replace(
+        "\"instructions\":",
+        "\"\\u0069\\u006e\\u0073\\u0074\\u0072\\u0075\\u0063\\u0074\\u0069\\u006f\\u006e\\u0073\":",
+    );
     let duplicate_resources = format!(
         "{{\"plugin\":[\"file:///missing-obsolete-plugin.mjs\"],\"instructions\":[\"/missing-obsolete-instructions.md\"],\"skills\":{{\"paths\":[\"/missing-obsolete-skills\"]}},{}",
         &ordinary[1..],
     );
     std::fs::write(&original_config, duplicate_resources.as_bytes()).unwrap();
     let original_bytes = std::fs::read(&original_config).unwrap();
-    let expected_external = json!({"adjacent":format!("{:x}",Sha256::digest(b"native-adjacent-import")),"child":format!("{:x}",Sha256::digest(b"native-child-dependency")),"parent":format!("{:x}",Sha256::digest(b"native-parent-dependency")),"resource":format!("{:x}",Sha256::digest(b"native-adjacent-resource")),"instruction":format!("{:x}",Sha256::digest(b"native-external-instruction")),"selected":true,"nativeSkill":true,"skillContent":format!("{:x}",Sha256::digest(b"Execute the adjacent synthetic resources.\n")),"skillExecution":format!("{:x}",Sha256::digest(b"native-skill-resource:native-skill-dependency")),"nativeMcpCwd":format!("{:x}",Sha256::digest(b"native-mcp-resource:native-mcp-dependency"))});
+    let expected_external = json!({"adjacent":format!("{:x}",Sha256::digest(b"native-adjacent-import")),"child":format!("{:x}",Sha256::digest(b"native-child-dependency")),"parent":format!("{:x}",Sha256::digest(b"native-parent-dependency")),"resource":format!("{:x}",Sha256::digest(b"native-adjacent-resource")),"instruction":format!("{:x}",Sha256::digest(b"native-external-instruction")),"selected":true,"nativeLiveViews":true,"nativeSkill":true,"skillContent":format!("{:x}",Sha256::digest(b"Execute the adjacent synthetic resources.\n")),"skillExecution":format!("{:x}",Sha256::digest(b"native-skill-resource:native-skill-dependency")),"nativeMcpCwd":format!("{:x}",Sha256::digest(b"native-mcp-resource:native-mcp-dependency"))});
+    // Five logical native aliases share one accepted immutable 16 MiB raw
+    // source. The actual controller stage and actual host must not turn the
+    // 80 MiB cumulative read volume into a simultaneous-source limit.
+    let repeated_static_source = fixture.join("source-home/.config/opencode/static-capacity.jsonc");
+    let mut static_capacity =
+        r#"{"agent":{"liveCapacity":{"description":"native-live-capacity-nonce"}}}"#.to_string();
+    // JSONC block padding keeps the same inclusive physical-source size while
+    // avoiding repeated large strict-JSON renderings in native discovery.
+    static_capacity.push_str("/*");
+    static_capacity.push_str(&"x".repeat(16 * 1024 * 1024 - static_capacity.len() - 2));
+    static_capacity.push_str("*/");
+    assert_eq!(static_capacity.len(), 16 * 1024 * 1024);
+    assert_eq!(
+        freshell_platform::opencode_config::parse_jsonc_object(&static_capacity).unwrap()["agent"]
+            ["liveCapacity"]["description"],
+        "native-live-capacity-nonce"
+    );
+    std::fs::write(&repeated_static_source, &static_capacity).unwrap();
+    let capacity_aliases = [
+        fixture.join("source-home/.config/opencode/config.json"),
+        fixture.join("source-home/.config/opencode/opencode.jsonc"),
+        fixture.join("workspace/opencode.jsonc"),
+        nested.join("opencode.jsonc"),
+    ];
     let explicit_config = fixture.join("workspace/selected-config.json");
     let explicit_bytes = br#"{"agent":{"probe":{"description":"{file:./selected-rule}"}}}"#;
     std::fs::write(&explicit_config, explicit_bytes).unwrap();
@@ -3847,6 +3875,15 @@ export default {{id:'closed-directory-discovery',async server(){{
             );
         }
     }
+    // Activate capacity aliases only after the unrelated unavailable-resource
+    // controls; each refusal still tests its selected field without rescanning
+    // the large static source. Actual launch preparation consumes all aliases.
+    for alias in capacity_aliases
+        .into_iter()
+        .chain([explicit_directory.join("opencode.jsonc")])
+    {
+        std::os::unix::fs::symlink(&repeated_static_source, alias).unwrap();
+    }
     let terminal = controller
         .launch(request)
         .await
@@ -4042,6 +4079,10 @@ export default {{id:'closed-directory-discovery',async server(){{
     );
     assert_eq!(std::fs::read(&original_config).unwrap(), original_bytes);
     assert_eq!(std::fs::read(&shared_source).unwrap(), shared_bytes);
+    assert_eq!(
+        std::fs::read_to_string(&repeated_static_source).unwrap(),
+        static_capacity
+    );
     assert!(
         std::fs::symlink_metadata(fixture.join("workspace/opencode.json"))
             .unwrap()
@@ -4167,6 +4208,10 @@ export default {{id:'closed-directory-discovery',async server(){{
     );
     assert_eq!(std::fs::read(&original_config).unwrap(), original_bytes);
     assert_eq!(std::fs::read(&shared_source).unwrap(), shared_bytes);
+    assert_eq!(
+        std::fs::read_to_string(&repeated_static_source).unwrap(),
+        static_capacity
+    );
     assert!(
         std::fs::symlink_metadata(fixture.join("workspace/opencode.json"))
             .unwrap()

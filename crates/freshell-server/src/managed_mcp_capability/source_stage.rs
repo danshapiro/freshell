@@ -53,7 +53,7 @@ mod configured_resource_tests {
                 r#"{{"plugin":[{obsolete_json}],"plu\u0067in":[[{plugin},{{"instructions":["/unselected-options"]}}]]}}"#
             ),
             format!(
-                r#"{{"instructions":[{obsolete_json}],/* final wins */"instructions":[{instruction_json}]}}"#
+                r#"{{"instructions":[{obsolete_json}],/* final wins */"\u0069\u006e\u0073\u0074\u0072\u0075\u0063\u0074\u0069\u006f\u006e\u0073":[{instruction_json}]}}"#
             ),
             format!(
                 r#"{{"skills":{{"paths":[{obsolete_json}]}},"skills":{{"paths":[{skills_json}]}}}}"#

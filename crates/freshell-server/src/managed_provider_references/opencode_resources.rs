@@ -143,7 +143,9 @@ fn member<'a>(
     name: &str,
 ) -> Option<&'a str> {
     members.iter().rev().find_map(|(key, value)| {
-        if key.len() <= 64
+        // Every ASCII name character can use a six-byte Unicode escape.
+        // Bound the finite name before decoding, without excluding valid keys.
+        if key.len() <= 2 + 6 * name.len()
             && serde_json::from_str::<String>(&raw[key.clone()])
                 .ok()
                 .as_deref()
