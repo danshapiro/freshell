@@ -1189,9 +1189,6 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            // Started with the server's original open-file soft limit, not
-            // the raised one the server runs with.
-            freshell_platform::child_nofile::restore_in_child(cmd.as_std_mut());
 
             // Detach CONDITIONALLY — only when the sidecar will actually be
             // TRACKED (kata ynfn: "surviving restarts is a feature"; Node
@@ -1218,6 +1215,8 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             let mut child = cmd
                 .spawn()
                 .map_err(|error| format!("codex app-server spawn failed ({command}): {error}"))?;
+            // The server's original open-file soft limit, not its raised one.
+            freshell_platform::child_nofile::restore_after_spawn(child.id(), &program);
             drain_child_io(&mut child);
 
             // Wait for the listener: probe-dial until accepted or the budget expires.

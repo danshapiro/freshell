@@ -273,9 +273,9 @@ impl ProcessSpawner for TokioProcessSpawner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd.kill_on_drop(true);
-        freshell_platform::child_nofile::restore_in_child(cmd.as_std_mut());
 
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        freshell_platform::child_nofile::restore_after_spawn(child.id(), &req.command);
 
         let stderr_buf = Arc::new(Mutex::new(String::new()));
         if let Some(stderr) = child.stderr.take() {

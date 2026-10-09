@@ -1401,6 +1401,7 @@ dependencies = [
  "percent-encoding",
  "serde_json",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

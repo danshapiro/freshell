@@ -9569,7 +9569,6 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.kill_on_drop(true);
-    freshell_platform::child_nofile::restore_in_child(cmd.as_std_mut());
 
     let mut child = cmd.spawn().map_err(|e| {
         format!(
@@ -9577,6 +9576,7 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
             entry.display()
         )
     })?;
+    freshell_platform::child_nofile::restore_after_spawn(child.id(), &node);
     let stdin = child.stdin.take().ok_or("sidecar stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("sidecar stdout unavailable")?;
     // Drain stderr so verbose SDK/CLI logs can never fill the pipe and stall the sidecar.

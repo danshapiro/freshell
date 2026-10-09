@@ -83,12 +83,11 @@ fn stop(mut child: Child) {
 }
 
 #[test]
-fn a_child_command_starts_with_the_recorded_soft_limit() {
+fn a_spawned_child_gets_the_recorded_soft_limit() {
     let hard = raised_like_the_server();
 
-    let mut restored = sleeper();
-    child_nofile::restore_in_child(&mut restored);
-    let restored = restored.spawn().expect("spawn the restored child");
+    let restored = sleeper().spawn().expect("spawn the restored child");
+    child_nofile::restore_after_spawn(restored.id(), "sleep");
     // Control: without the reset a child inherits the raised limit, so the
     // assertion below is about the reset, not about the test runner.
     let inherited = sleeper().spawn().expect("spawn the control child");

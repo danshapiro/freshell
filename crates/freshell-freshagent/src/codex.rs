@@ -7163,11 +7163,11 @@ impl FreshCodexState {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd.kill_on_drop(true);
-        freshell_platform::child_nofile::restore_in_child(cmd.as_std_mut());
 
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("codex app-server spawn failed ({codex_cmd}): {e}"))?;
+        freshell_platform::child_nofile::restore_after_spawn(child.id(), codex_program);
         // Drain child stdio so verbose app-server/MCP logs can never fill the pipe and stall it.
         drain_child_io(&mut child);
 

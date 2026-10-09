@@ -358,11 +358,11 @@ fn run_path_conversion(program: &str, args: &[&str]) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    crate::child_nofile::restore_in_child(&mut cmd);
     let child = cmd.spawn();
     let Ok(mut child) = child else {
         return None;
     };
+    crate::child_nofile::restore_after_spawn(child.id(), program);
 
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();

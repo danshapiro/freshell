@@ -294,10 +294,17 @@ async fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    freshell_platform::child_nofile::restore_in_child(cmd.as_std_mut());
+    // `output()`'s stdio, spelled out because the child is spawned first to
+    // get its original open-file limit back.
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     let first_arg = args.first().copied().unwrap_or("");
-    let output = cmd
-        .output()
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("git {first_arg} failed: {e}"))?;
+    freshell_platform::child_nofile::restore_after_spawn(child.id(), "git");
+    let output = child
+        .wait_with_output()
         .await
         .map_err(|e| format!("git {first_arg} failed: {e}"))?;
     if !output.status.success() {

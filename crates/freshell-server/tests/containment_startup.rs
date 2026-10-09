@@ -527,7 +527,14 @@ async fn the_servers_children_start_with_its_original_open_file_soft_limit() {
     let shell_limits = nofile_limits(shell_pid);
 
     // An ordinary (tokio `Command`) child: the exec route runs `bash -lc`,
-    // which reads its own row of `/proc/<pid>/limits`.
+    // which reads its own row of `/proc/<pid>/limits`. The server resets a
+    // child's limit right after its spawn returns, so the command first waits
+    // (up to 2 s) for its soft limit to drop; a child that is never reset
+    // prints the raised limit.
+    let command = format!(
+        "for _ in $(seq 40); do [ \"$(ulimit -Sn)\" = {LOWERED_SOFT} ] && break; \
+         sleep 0.05; done; grep 'Max open files' /proc/$$/limits"
+    );
     let exec = reqwest::Client::new()
         .post(format!(
             "http://127.0.0.1:{}/api/fresh-agent/exec",
@@ -535,7 +542,7 @@ async fn the_servers_children_start_with_its_original_open_file_soft_limit() {
         ))
         .header("x-auth-token", AUTH_TOKEN)
         .json(&serde_json::json!({
-            "command": "grep 'Max open files' /proc/$$/limits",
+            "command": command,
             "cwd": home.path(),
         }))
         .send()

@@ -325,9 +325,14 @@ fn run_git(dir: &str, args: &[&str]) -> Option<String> {
         .arg(dir)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null());
-    crate::child_nofile::restore_in_child(&mut cmd);
-    let output = cmd.output().ok()?;
+        // `output()`'s stdio, spelled out because the child is spawned first
+        // to get its original open-file limit back.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().ok()?;
+    crate::child_nofile::restore_after_spawn(child.id(), "git");
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
     }

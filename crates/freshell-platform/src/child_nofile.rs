@@ -11,17 +11,25 @@
 //! yourself and give children the original back.
 //!
 //! The server records its original soft limit once
-//! ([`record_original_soft_limit`]) and every spawn site gives it back:
-//! - a `std` or `tokio` `Command`: [`restore_in_child`] (one `setrlimit`
-//!   after fork, before exec; for tokio pass `cmd.as_std_mut()`);
-//! - a PTY child, which portable-pty spawns without a pre-exec hook:
-//!   [`restore_for_pid`] right after the spawn (Linux `prlimit`). The child
-//!   runs with the raised limit only for the moment between its exec and that
-//!   call. macOS has no way to set another process's limit, so a PTY child
-//!   there keeps the raised limit.
+//! ([`record_original_soft_limit`]) and every spawn site gives it back to the
+//! child right after the spawn returns, with Linux `prlimit` on the child's
+//! pid: [`restore_after_spawn`], or [`restore_for_pid`] where the caller logs
+//! a failure itself (the PTY spawn, which logs its terminal id).
 //!
-//! A process that never records a limit (the session host, tests) is left
-//! exactly as before: both calls do nothing.
+//! The reset never touches the `Command`. std starts a child with
+//! `posix_spawn`, whose cost does not depend on the size of this process,
+//! only when the `Command` has no pre-exec step; with one it falls back to a
+//! full `fork()`, which copies the whole server's page tables while holding
+//! its memory-map lock (about 120 ms per spawn at 2.5 GB resident, against
+//! well under 1 ms). The price of resetting after the spawn is a short
+//! window: the child runs with the raised limit from its exec until the
+//! parent's `prlimit`, which follows `spawn` returning. A child that starts
+//! its own child inside that window passes the raised limit on.
+//!
+//! Only Linux can set another process's limit. On macOS every child keeps
+//! the raised limit (a pre-exec step would bring back the fork), and Windows
+//! has no resource limits. A process that never records a limit (the session
+//! host, tests) is left exactly as before: the reset does nothing.
 //!
 //! This lives here rather than in `freshell-containment` because
 //! `freshell-terminal`, which owns the PTY spawn, stays tokio-free and does
@@ -43,10 +51,10 @@ pub fn original_soft_limit() -> Option<u64> {
     ORIGINAL_SOFT.get().copied()
 }
 
-/// The limit a child should get, when it differs from what it would inherit:
-/// the recorded soft limit (never above the current hard limit) with the hard
+/// The limit a child should get, when it differs from what it inherits: the
+/// recorded soft limit (never above the current hard limit) with the hard
 /// limit unchanged. `None` when nothing was recorded or nothing needs lowering.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn child_limit() -> Option<libc::rlimit> {
     let original = original_soft_limit()?;
     let mut current = libc::rlimit {
@@ -57,7 +65,7 @@ fn child_limit() -> Option<libc::rlimit> {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) } != 0 {
         return None;
     }
-    // `rlim_t` is u64 on every target Freshell ships, but not on all Unixes.
+    // `rlim_t` is u64 on every target Freshell ships, but not on all Linuxes.
     #[allow(clippy::unnecessary_cast)]
     let soft = (original as libc::rlim_t).min(current.rlim_max);
     (soft < current.rlim_cur).then_some(libc::rlimit {
@@ -66,38 +74,9 @@ fn child_limit() -> Option<libc::rlimit> {
     })
 }
 
-/// Makes `cmd`'s child start with the recorded soft open-file limit. Does
-/// nothing when no limit was recorded (and then `cmd` keeps its fast spawn
-/// path, since no pre-exec step is added).
-#[cfg(unix)]
-pub fn restore_in_child(cmd: &mut std::process::Command) -> &mut std::process::Command {
-    use std::os::unix::process::CommandExt;
-    let Some(limit) = child_limit() else {
-        return cmd;
-    };
-    // SAFETY: the closure runs between fork and exec, so it may only make
-    // async-signal-safe calls; it makes one setrlimit system call on a value
-    // computed before the fork. Lowering a soft limit to or below the hard
-    // limit cannot be refused; were it refused, the child would still start,
-    // with the inherited limit.
-    unsafe {
-        cmd.pre_exec(move || {
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-            Ok(())
-        });
-    }
-    cmd
-}
-
-/// Off Unix there are no resource limits to restore.
-#[cfg(not(unix))]
-pub fn restore_in_child(cmd: &mut std::process::Command) -> &mut std::process::Command {
-    cmd
-}
-
-/// Sets the running process `pid` (a child just spawned, typically a PTY
-/// child) to the recorded soft open-file limit. `Ok(())` when no limit was
-/// recorded.
+/// Sets the running process `pid` (a child just spawned) to the recorded
+/// soft open-file limit. `Ok(())` when no limit was recorded. Call it before
+/// the child is waited for, so `pid` still names that child.
 #[cfg(target_os = "linux")]
 pub fn restore_for_pid(pid: u32) -> std::io::Result<()> {
     let Some(limit) = child_limit() else {
@@ -116,4 +95,31 @@ pub fn restore_for_pid(pid: u32) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Gives a child this process just spawned the recorded soft open-file
+/// limit. Call it right after `spawn` returns and before the child is waited
+/// for, with the child's id (`std` `Child::id()` or tokio's `Option`) and
+/// its program for the log. A child that is already gone needs nothing; any
+/// other failure (for example a setuid program) is a WARN
+/// `child_nofile_restore_failed`, and that child keeps the raised limit.
+/// Does nothing when no limit was recorded, and off Linux.
+pub fn restore_after_spawn(pid: impl Into<Option<u32>>, program: &str) {
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = pid.into() {
+        match restore_for_pid(pid) {
+            Ok(()) => {}
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(err) => tracing::warn!(
+                component = "child_nofile",
+                event = "child_nofile_restore_failed",
+                pid,
+                program,
+                error = %err,
+                "child keeps the server's raised open-file limit"
+            ),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (pid.into(), program);
 }

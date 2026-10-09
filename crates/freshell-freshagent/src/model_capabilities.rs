@@ -175,10 +175,10 @@ impl ModelCatalogProbe for ClaudeCatalogProbe {
             // A hung SDK close cannot leave that grandchild behind on timeout.
             #[cfg(target_os = "linux")]
             command.process_group(0);
-            freshell_platform::child_nofile::restore_in_child(command.as_std_mut());
             let child = command.spawn().map_err(|error| {
                 claude_probe_error(format!("Cannot start Claude model catalog: {error}"))
             })?;
+            freshell_platform::child_nofile::restore_after_spawn(child.id(), "node");
             #[cfg(target_os = "linux")]
             let process_group = child.id();
             let output =

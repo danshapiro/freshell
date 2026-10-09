@@ -348,11 +348,11 @@ impl CommandRunner for StdCommandRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        crate::child_nofile::restore_in_child(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return CommandOutput::spawn_failure(e.to_string()),
         };
+        crate::child_nofile::restore_after_spawn(child.id(), command);
 
         // Drain both pipes on their own threads (prevents deadlock on large output).
         let mut stdout_pipe = child.stdout.take();

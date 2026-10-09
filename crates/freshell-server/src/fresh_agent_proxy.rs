@@ -1204,9 +1204,17 @@ fn git_common_dir(workspace: &Path) -> Option<PathBuf> {
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(cwd).args(args);
-    freshell_platform::child_nofile::restore_in_child(&mut cmd);
-    let output = cmd.output().ok()?;
+    // `output()`'s stdio, spelled out because the child is spawned first to
+    // get its original open-file limit back.
+    cmd.arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().ok()?;
+    freshell_platform::child_nofile::restore_after_spawn(child.id(), "git");
+    let output = child.wait_with_output().ok()?;
     output
         .status
         .success()

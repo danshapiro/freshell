@@ -3,8 +3,10 @@
 //!
 //! Node raises its own soft limit to the hard limit as it starts, so reading
 //! the fake app-server's `/proc/<pid>/limits` would prove nothing. The sidecar
-//! command is therefore a small `sh` script that writes the soft limit it was
-//! started with, then execs the committed fake app-server.
+//! command is therefore a small `sh` script that writes its soft limit, then
+//! execs the committed fake app-server. The limit is reset right after the
+//! spawn returns, so the script first waits (up to 2 s) for its soft limit to
+//! drop; a sidecar that is never reset records the raised limit.
 //!
 //! This is its own test binary because it changes this process's soft
 //! `RLIMIT_NOFILE` and records the process-wide original, which is set once.
@@ -60,7 +62,9 @@ async fn the_codex_sidecar_starts_with_the_recorded_soft_limit() {
     std::fs::write(
         &script,
         format!(
-            "ulimit -Sn > '{}'\nexec node '{}' \"$@\"\n",
+            "i=0\nwhile [ \"$(ulimit -Sn)\" != {ORIGINAL_SOFT} ] && [ $i -lt 40 ]; do \
+             sleep 0.05; i=$((i+1)); done\n\
+             ulimit -Sn > '{}'\nexec node '{}' \"$@\"\n",
             soft_file.display(),
             fixture.display()
         ),
