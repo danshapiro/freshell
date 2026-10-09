@@ -119,6 +119,161 @@ mod configured_resource_tests {
         assert_eq!(plan[0].references.unexpanded_source(), raw);
     }
     #[test]
+    fn managed_provider_sound_and_mcp_cwd_consume_external_closure_after_both_copies() {
+        use std::os::unix::fs::PermissionsExt;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace/nested");
+        let external = owned.path().join("external");
+        let tool = external.join("tool");
+        for path in [&home, &cwd, &tool.join("node_modules/dependency")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let sound = external.join("selected.wav");
+        std::fs::write(&sound, b"RIFF-selected-wave-bytes").unwrap();
+        std::fs::write(tool.join("resource"), "mcp-resource").unwrap();
+        std::fs::write(
+            tool.join("node_modules/dependency/index.js"),
+            "module.exports='mcp-dependency';",
+        )
+        .unwrap();
+        std::fs::write(tool.join("server.cjs"), "const fs=require('node:fs');process.stdout.write(fs.readFileSync('resource','utf8')+':'+require('dependency')+':'+fs.readFileSync(process.argv[2],'utf8'));").unwrap();
+        let config = external.join("tui.jsonc");
+        for (ordinal, spelling) in [
+            sound.display().to_string(),
+            reqwest::Url::from_file_path(&sound).unwrap().to_string(),
+            "./selected.wav".into(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let raw = format!("{{ // selected finite native fields\n\"attention\":{{\"sounds\":{{\"default\":{}}}}},\"mcp\":{{\"probe\":{{\"type\":\"local\",\"command\":[\"node\",\"server.cjs\"],\"cwd\":\"../../external/tool\"}},\"disabled\":{{\"type\":\"local\",\"enabled\":false,\"cwd\":\"/missing-disabled\"}},\"remote\":{{\"type\":\"remote\",\"cwd\":\"/missing-remote\"}}}}}}", serde_json::to_string(&spelling).unwrap());
+            std::fs::write(&config, &raw).unwrap();
+            let plan = plan_opencode_sources(
+                vec![SourceOccurrence {
+                    logical_path: config.clone(),
+                    canonical_source: config.clone(),
+                    lane: SourceLane::Tui,
+                    role: DiscoveryRole::Workspace,
+                }],
+                &cwd,
+                &home,
+                &|_, _, _| None,
+            )
+            .unwrap();
+            let units = resource_units(
+                &home,
+                &home.join(".config/opencode"),
+                &owned.path().join("workspace"),
+                &plan,
+                None,
+            )
+            .unwrap();
+            let sound_unit = units
+                .iter()
+                .find(|(source, _)| source == &sound)
+                .expect("selected attention sound must be transported");
+            let tool_unit = units
+                .iter()
+                .find(|(source, _)| source == &tool)
+                .expect("local MCP cwd must transport the whole directory");
+            let stage = owned.path().join(format!("stage-{ordinal}"));
+            let host = owned.path().join(format!("host-{ordinal}"));
+            let selections = units
+                .iter()
+                .map(|(source, unit)| CopySelection {
+                    source: source.clone(),
+                    destination_relative: unit.stage_relative_path.clone().into(),
+                })
+                .collect::<Vec<_>>();
+            copy_environment(&selections, &stage, &[], Default::default()).unwrap();
+            let selections = units
+                .iter()
+                .map(|(_, unit)| CopySelection {
+                    source: stage.join(&unit.stage_relative_path),
+                    destination_relative: unit.provider_relative_path.clone().into(),
+                })
+                .collect::<Vec<_>>();
+            copy_environment(&selections, &host, &[], Default::default()).unwrap();
+            let hidden = owned.path().join("hidden-external");
+            std::fs::rename(&external, &hidden).unwrap();
+            let output = std::process::Command::new("node")
+                .arg("server.cjs")
+                .arg(host.join(&sound_unit.1.provider_relative_path))
+                .current_dir(host.join(&tool_unit.1.provider_relative_path))
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .output()
+                .unwrap();
+            std::fs::rename(&hidden, &external).unwrap();
+            assert!(output.status.success(), "MCP cwd consumer must execute its dependencies/resources and read the sound after both copies: {:?}",output.stderr);
+            assert_eq!(
+                output.stdout,
+                b"mcp-resource:mcp-dependency:RIFF-selected-wave-bytes"
+            );
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+            assert_eq!(
+                std::fs::metadata(&sound).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+    }
+
+    #[test]
+    fn managed_provider_sound_and_mcp_cwd_refuse_unavailable_selected_resources() {
+        use std::os::unix::fs::PermissionsExt;
+        let owned = tempfile::tempdir().unwrap();
+        let config = owned.path().join("tui.jsonc");
+        for field in ["sound", "cwd"] {
+            for case in ["missing", "unreadable", "cyclic", "wrong-type"] {
+                let target = owned.path().join(format!("{field}-{case}"));
+                match case {
+                    "cyclic" => std::os::unix::fs::symlink(&target, &target).unwrap(),
+                    "missing" => {}
+                    _ if (field == "cwd") != (case == "wrong-type") => {
+                        std::fs::create_dir(&target).unwrap()
+                    }
+                    _ => std::fs::write(&target, "resource").unwrap(),
+                }
+                if case == "unreadable" {
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0)).unwrap();
+                }
+                let raw=if field=="sound" {serde_json::json!({"attention":{"sounds":{"question":target}}})} else {serde_json::json!({"mcp":{"probe":{"type":"local","command":["node","server.cjs"],"cwd":target}}})}.to_string();
+                std::fs::write(&config, &raw).unwrap();
+                let result = plan_opencode_sources(
+                    vec![SourceOccurrence {
+                        logical_path: config.clone(),
+                        canonical_source: config.clone(),
+                        lane: SourceLane::Tui,
+                        role: DiscoveryRole::Workspace,
+                    }],
+                    owned.path(),
+                    owned.path(),
+                    &|_, _, _| None,
+                );
+                if case == "unreadable" {
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let error = result
+                    .err()
+                    .expect("selected unavailable sound/cwd must block preparation");
+                assert_eq!(
+                    error.field,
+                    if field == "sound" {
+                        "OpenCode attention.sounds"
+                    } else {
+                        "OpenCode mcp.cwd"
+                    }
+                );
+                assert_eq!(error.declaring_source, config);
+                assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+                assert!(!owned.path().join("stage").exists());
+            }
+        }
+    }
+
+    #[test]
     fn managed_provider_configured_skill_paths_execute_whole_directory_after_both_copies() {
         use std::os::unix::fs::PermissionsExt;
         let owned = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {

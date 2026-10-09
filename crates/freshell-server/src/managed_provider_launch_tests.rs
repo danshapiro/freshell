@@ -3485,6 +3485,19 @@ export default {{id:'closed-shared-{label}',async tui(api,options){{
         std::fs::Permissions::from_mode(0o755),
     )
     .unwrap();
+    let mcp_cwd = external.join("mcp-cwd");
+    std::fs::create_dir_all(mcp_cwd.join("node_modules/native-mcp-dependency")).unwrap();
+    std::fs::write(mcp_cwd.join("resource"), "native-mcp-resource").unwrap();
+    std::fs::write(
+        mcp_cwd.join("node_modules/native-mcp-dependency/index.js"),
+        "module.exports='native-mcp-dependency';",
+    )
+    .unwrap();
+    let mcp_cwd_receipt = fixture.join("workspace/native-mcp-cwd-consumed.txt");
+    std::fs::write(mcp_cwd.join("server.cjs"), format!(r#"const fs=require('node:fs'),readline=require('node:readline');
+fs.writeFileSync({},fs.readFileSync('resource','utf8')+':'+require('native-mcp-dependency'));
+readline.createInterface({{input:process.stdin}}).on('line',line=>{{const q=JSON.parse(line);if(q.id===undefined)return;const result=q.method==='initialize'?{{protocolVersion:q.params.protocolVersion,capabilities:{{tools:{{}}}},serverInfo:{{name:'closed-cwd-probe',version:'1'}}}}:q.method==='tools/list'?{{tools:[]}}:{{}};process.stdout.write(JSON.stringify({{jsonrpc:'2.0',id:q.id,result}})+'\n');}});
+"#,serde_json::to_string(&mcp_cwd_receipt).unwrap())).unwrap();
     let external_receipt = fixture.join("workspace/native-external-consumed.json");
     let external_plugin = r#"import fs from 'node:fs';import crypto from 'node:crypto';import path from 'node:path';import {execFileSync} from 'node:child_process';
 import adjacent from './adjacent.mjs';import child from 'closed-child';import parent from 'closed-parent';
@@ -3496,7 +3509,9 @@ export default async (input,options)=>({config:async(config)=>{
    const skill=response.data.find(skill=>skill.name==='closed-external-skill');
    if(!skill)throw Error('selected native skill unavailable');
    const output=execFileSync(path.join(path.dirname(skill.location),'scripts/run'));
-   fs.writeFileSync(options.receipt,JSON.stringify({adjacent:digest(adjacent),child:digest(child),parent:digest(parent),resource:digest(fs.readFileSync(new URL('./resource.txt',import.meta.url))),instruction:digest(fs.readFileSync(options.instruction)),selected:config.instructions.includes(options.instruction),nativeSkill:true,skillContent:digest(skill.content),skillExecution:digest(output)}));
+   await input.client._client.get({url:'/mcp'});
+   const mcp=digest(fs.readFileSync(options.mcpReceipt));
+   fs.writeFileSync(options.receipt,JSON.stringify({adjacent:digest(adjacent),child:digest(child),parent:digest(parent),resource:digest(fs.readFileSync(new URL('./resource.txt',import.meta.url))),instruction:digest(fs.readFileSync(options.instruction)),selected:config.instructions.includes(options.instruction),nativeSkill:true,skillContent:digest(skill.content),skillExecution:digest(output),nativeMcpCwd:mcp}));
   } catch(error) {fs.writeFileSync(options.receipt+'.failure',JSON.stringify({operation:'native_skill_consumer',type:error instanceof TypeError?'TypeError':error.code==='ENOENT'?'ENOENT':'native_skill_unavailable'}));}
  },0);
 }});
@@ -3504,12 +3519,14 @@ export default async (input,options)=>({config:async(config)=>{
     std::fs::write(package.join("index.mjs"), external_plugin).unwrap();
     let mut original: Value =
         serde_json::from_slice(&std::fs::read(&original_config).unwrap()).unwrap();
-    original["plugin"].as_array_mut().unwrap().push(json!([reqwest::Url::from_file_path(package.join("index.mjs")).unwrap().to_string(), {"receipt":external_receipt,"instruction":external_instruction}]));
+    original["plugin"].as_array_mut().unwrap().push(json!([reqwest::Url::from_file_path(package.join("index.mjs")).unwrap().to_string(), {"receipt":external_receipt,"instruction":external_instruction,"mcpReceipt":mcp_cwd_receipt}]));
+    original["mcp"]["closed-cwd-probe"] =
+        json!({"type":"local","command":["node","server.cjs"],"cwd":mcp_cwd});
     original["instructions"] = json!([external_instruction]);
     original["skills"] = json!({"paths":[selected_skills,"../../scenarios/external-native-resources/selected-skills"]});
     std::fs::write(&original_config, serde_json::to_vec(&original).unwrap()).unwrap();
     let original_bytes = std::fs::read(&original_config).unwrap();
-    let expected_external = json!({"adjacent":format!("{:x}",Sha256::digest(b"native-adjacent-import")),"child":format!("{:x}",Sha256::digest(b"native-child-dependency")),"parent":format!("{:x}",Sha256::digest(b"native-parent-dependency")),"resource":format!("{:x}",Sha256::digest(b"native-adjacent-resource")),"instruction":format!("{:x}",Sha256::digest(b"native-external-instruction")),"selected":true,"nativeSkill":true,"skillContent":format!("{:x}",Sha256::digest(b"Execute the adjacent synthetic resources.\n")),"skillExecution":format!("{:x}",Sha256::digest(b"native-skill-resource:native-skill-dependency"))});
+    let expected_external = json!({"adjacent":format!("{:x}",Sha256::digest(b"native-adjacent-import")),"child":format!("{:x}",Sha256::digest(b"native-child-dependency")),"parent":format!("{:x}",Sha256::digest(b"native-parent-dependency")),"resource":format!("{:x}",Sha256::digest(b"native-adjacent-resource")),"instruction":format!("{:x}",Sha256::digest(b"native-external-instruction")),"selected":true,"nativeSkill":true,"skillContent":format!("{:x}",Sha256::digest(b"Execute the adjacent synthetic resources.\n")),"skillExecution":format!("{:x}",Sha256::digest(b"native-skill-resource:native-skill-dependency")),"nativeMcpCwd":format!("{:x}",Sha256::digest(b"native-mcp-resource:native-mcp-dependency"))});
     let explicit_config = fixture.join("workspace/selected-config.json");
     let explicit_bytes = br#"{"agent":{"probe":{"description":"{file:./selected-rule}"}}}"#;
     std::fs::write(&explicit_config, explicit_bytes).unwrap();
@@ -3520,14 +3537,17 @@ export default async (input,options)=>({config:async(config)=>{
     std::fs::create_dir_all(&tui_plugin).unwrap();
     std::fs::write(tui_plugin.join("index.mjs"), r#"import fs from 'node:fs';import crypto from 'node:crypto';
 export default {id:'closed-native-tui-fixture',async tui(api,options){
- fs.writeFileSync(options.receipt,JSON.stringify({theme:crypto.createHash('sha256').update(api.tuiConfig.theme).digest('hex')}));
+ const digest=value=>crypto.createHash('sha256').update(value).digest('hex');
+ fs.writeFileSync(options.receipt,JSON.stringify({theme:digest(api.tuiConfig.theme),sounds:['default','question','error'].map(name=>digest(fs.readFileSync(api.tuiConfig.attention.sounds[name])))}));
 }};
 "#).unwrap();
     let selected_tui = fixture.join("workspace/selected-tui.jsonc");
     std::os::unix::fs::symlink("shared.json", &selected_tui).unwrap();
     let project_tui = fixture.join("workspace/tui.jsonc");
     let tui_receipt = fixture.join("workspace/native-tui-consumed.json");
-    let selected_tui_bytes = format!("{{ // selected origin\n\"theme\":\"{{file:./selected-theme}}\",\"plugin\":[[\"file:///home/freshell/provider/.config/opencode/plugins/probe-tui/index.mjs\",{{\"receipt\":{}}}]],}}", serde_json::to_string(&tui_receipt).unwrap());
+    let selected_sound = external.join("selected.wav");
+    std::fs::write(&selected_sound, b"RIFF-native-selected-wave").unwrap();
+    let selected_tui_bytes = format!("{{ // selected origin\n\"attention\":{{\"sounds\":{{\"default\":{},\"question\":{},\"error\":\"../scenarios/external-native-resources/selected.wav\"}}}},\"theme\":\"{{file:./selected-theme}}\",\"plugin\":[[\"file:///home/freshell/provider/.config/opencode/plugins/probe-tui/index.mjs\",{{\"receipt\":{}}}]],}}", serde_json::to_string(&selected_sound).unwrap(),serde_json::to_string(&reqwest::Url::from_file_path(&selected_sound).unwrap().to_string()).unwrap(),serde_json::to_string(&tui_receipt).unwrap());
     std::fs::write(&project_tui, &selected_tui_bytes).unwrap();
     std::fs::write(fixture.join("workspace/selected-theme"), "  dark\n").unwrap();
     let inline_source = r#"{ // inline instance origin
@@ -3896,7 +3916,7 @@ export default {{id:'closed-directory-discovery',async server(){{
         read_receipt(&tui_receipt)
             .await
             .expect("actual TUI plugin must consume the selected effective TUI configuration"),
-        json!({"theme":format!("{:x}",Sha256::digest(b"dark"))})
+        json!({"theme":format!("{:x}",Sha256::digest(b"dark")),"sounds":vec![format!("{:x}",Sha256::digest(b"RIFF-native-selected-wave"));3]})
     );
     let ca_digest = format!(
         "{:x}",

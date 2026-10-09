@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 enum Token {
     String(usize, usize),
     Punctuation(u8),
-    Other,
+    Other(usize),
 }
 struct Cursor<'a> {
     raw: &'a str,
@@ -56,7 +56,7 @@ impl Cursor<'_> {
             {
                 self.at += 1;
             }
-            Some(Token::Other)
+            Some(Token::Other(start))
         }
     }
 }
@@ -128,6 +128,121 @@ fn fields(raw: &str) -> Result<Vec<(&'static str, String)>, &'static str> {
                 }
             }
             _ => {}
+        }
+    }
+    Ok(result)
+}
+
+// Read only member spans: selected nested schemas never deserialize or rewrite
+// an entire source document, nor interpret command arrays as file selections.
+fn object_members(
+    raw: &str,
+    start: usize,
+) -> Result<Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>, &'static str> {
+    let mut cursor = Cursor { raw, at: start };
+    if !matches!(cursor.next(), Some(Token::Punctuation(b'{'))) {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    loop {
+        let key = match cursor.next().ok_or("incomplete selected object")? {
+            Token::Punctuation(b'}') => return Ok(result),
+            Token::Punctuation(b',') => continue,
+            Token::String(start, end) => start..end,
+            _ => return Err("invalid selected object member"),
+        };
+        if !matches!(cursor.next(), Some(Token::Punctuation(b':'))) {
+            return Err("invalid selected object member");
+        }
+        let token = cursor.next().ok_or("incomplete selected object value")?;
+        let start = match token {
+            Token::String(start, _) | Token::Other(start) => start,
+            Token::Punctuation(_) => cursor.at - 1,
+        };
+        let mut depth = usize::from(matches!(token, Token::Punctuation(b'{' | b'[')));
+        while depth > 0 {
+            match cursor.next().ok_or("incomplete selected object value")? {
+                Token::Punctuation(b'{' | b'[') => {
+                    depth += 1;
+                    if depth > 64 {
+                        return Err("selected object exceeds shared depth profile");
+                    }
+                }
+                Token::Punctuation(b'}' | b']') => depth -= 1,
+                _ => {}
+            }
+        }
+        if result.len() >= 100_000 {
+            return Err("selected object exceeds shared entry profile");
+        }
+        result.push((key, start..cursor.at));
+    }
+}
+fn member<'a>(
+    raw: &'a str,
+    members: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
+    name: &str,
+) -> Option<&'a str> {
+    members.iter().rev().find_map(|(key, value)| {
+        if key.len() <= 64
+            && serde_json::from_str::<String>(&raw[key.clone()])
+                .ok()
+                .as_deref()
+                == Some(name)
+        {
+            Some(&raw[value.clone()])
+        } else {
+            None
+        }
+    })
+}
+fn selected_string(raw: &str) -> Result<Option<String>, &'static str> {
+    if !raw.trim_start().starts_with('"') {
+        return Ok(None);
+    }
+    if raw.len() > 64 * 1024 {
+        return Err("configured resource selection profile exceeded");
+    }
+    serde_json::from_str(raw)
+        .map(Some)
+        .map_err(|_| "invalid selected resource path")
+}
+fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'static str> {
+    let top = object_members(raw, 0)?;
+    let mut result = Vec::new();
+    if tui {
+        if let Some(attention) = member(raw, &top, "attention") {
+            let entries = object_members(attention, 0)?;
+            if let Some(sounds) = member(attention, &entries, "sounds") {
+                let entries = object_members(sounds, 0)?;
+                for name in ["default", "question", "error", "subagent_done"] {
+                    if let Some(value) = member(sounds, &entries, name) {
+                        if let Some(path) = selected_string(value)?.filter(|path| !path.is_empty())
+                        {
+                            result.push(("OpenCode attention.sounds", path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(mcp) = member(raw, &top, "mcp") {
+        for (_, range) in object_members(mcp, 0)? {
+            let entry = &mcp[range];
+            let entries = object_members(entry, 0)?;
+            if member(entry, &entries, "type")
+                .and_then(|value| serde_json::from_str::<String>(value).ok())
+                .as_deref()
+                != Some("local")
+                || member(entry, &entries, "enabled").is_some_and(|value| value.trim() == "false")
+            {
+                continue;
+            }
+            if let Some(value) = member(entry, &entries, "cwd") {
+                if let Some(path) = selected_string(value)? {
+                    result.push(("OpenCode mcp.cwd", path));
+                }
+            }
         }
     }
     Ok(result)
@@ -230,9 +345,13 @@ pub fn select(
         Ok(())
     };
     let mut variables = std::collections::BTreeSet::new();
-    for (field, spelling) in fields(source.references.unexpanded_source())
-        .map_err(|cause| fail("OpenCode resource", cause))?
-    {
+    let raw = source.references.unexpanded_source();
+    let mut selections = fields(raw).map_err(|cause| fail("OpenCode resource", cause))?;
+    selections.extend(
+        nested_fields(raw, source.source.lane == super::sources::SourceLane::Tui)
+            .map_err(|cause| fail("OpenCode resource", cause))?,
+    );
+    for (field, spelling) in selections {
         // Private file-token payloads already use the accepted grant plan.
         if spelling.contains("{file:") {
             continue;
@@ -268,16 +387,22 @@ pub fn select(
         if introduced_file.get() {
             continue;
         }
-        if spelling.starts_with("http://") || spelling.starts_with("https://") {
+        if field != "OpenCode attention.sounds"
+            && field != "OpenCode mcp.cwd"
+            && (spelling.starts_with("http://") || spelling.starts_with("https://"))
+        {
             continue;
         }
-        let mut path = if field == "OpenCode plugin" {
+        let mut path = if field == "OpenCode plugin" || field == "OpenCode attention.sounds" {
             if spelling.starts_with("file:") {
                 reqwest::Url::parse(&spelling)
                     .ok()
                     .and_then(|url| url.to_file_path().ok())
                     .ok_or_else(|| fail(field, "local file URL is invalid"))?
-            } else if spelling.starts_with(['/', '.']) || spelling.starts_with("~/") {
+            } else if field == "OpenCode attention.sounds"
+                || spelling.starts_with(['/', '.'])
+                || spelling.starts_with("~/")
+            {
                 home_path(&spelling, home)
             } else {
                 continue;
@@ -324,7 +449,7 @@ pub fn select(
                         selected.map_err(|_| fail(field, "instruction glob traversal failed"))?;
                     let canonical = checked(&selected, field, declaring)?;
                     if !canonical.is_file() {
-                        return Err(fail(field, "selected instruction is not a regular file"));
+                        return Err(fail(field, "selected file resource is not a regular file"));
                     }
                     insert(selected, field)?;
                     matched = true;
@@ -343,12 +468,12 @@ pub fn select(
             continue;
         }
         if !path.is_absolute() {
-            if field == "OpenCode plugin" {
+            if field == "OpenCode plugin" || field == "OpenCode attention.sounds" {
                 path = declaring
                     .parent()
                     .unwrap_or(&source.instance_cwd)
                     .join(path);
-            } else if field == "OpenCode skills.paths" {
+            } else if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
                 path = source.instance_cwd.join(path);
             } else {
                 path = source
@@ -359,23 +484,26 @@ pub fn select(
                     .unwrap_or_else(|| source.instance_cwd.join(path));
             }
         }
-        if field == "OpenCode skills.paths" {
+        if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
             // Native instance-cwd resolution normalizes .. before deciding
             // whether the selected directory is supplied by the workspace.
             path = freshell_platform::opencode_config::lexical_path(&path);
         }
         let canonical = checked(&path, field, declaring)?;
         variables.extend(names.into_inner());
-        if field == "OpenCode instructions" {
+        if field == "OpenCode instructions" || field == "OpenCode attention.sounds" {
             if !canonical.is_file() {
-                return Err(fail(field, "selected instruction is not a regular file"));
+                return Err(fail(field, "selected file resource is not a regular file"));
             }
             insert(path, field)?;
             continue;
         }
-        if field == "OpenCode skills.paths" {
+        if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
             if !canonical.is_dir() {
-                return Err(fail(field, "selected skill path is not a directory"));
+                return Err(fail(
+                    field,
+                    "selected directory resource is not a directory",
+                ));
             }
             insert(path, field)?;
             continue;
