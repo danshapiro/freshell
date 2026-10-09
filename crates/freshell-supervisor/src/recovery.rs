@@ -3146,7 +3146,8 @@ impl Supervisor {
         };
 
         if requires_native {
-            let (current_probe, current) = self.probe_recovery_observed(soul_id.clone()).await?;
+            let (current_probe, current, transient) =
+                self.probe_recovery_for_attempt(soul_id.clone()).await?;
             let ready = matches!(&current_probe,RecoveryProbe::ReattachReady {handle,..}
                 if handle.incarnation_id==prepared.prepared.incarnation_id);
             verdict_fence = current.write_fence_for_attempt(attempt_id.clone());
@@ -3163,12 +3164,13 @@ impl Supervisor {
                 self.cleanup_failed_replacement(&prepared.prepared.incarnation_id)
                     .await;
                 self.registry
-                    .mark_recovery_blocked(
+                    .mark_recovery_blocked_with_retry(
                         soul_id.clone(),
                         Some(attempt_id.clone()),
                         reason,
                         vec![message.clone()],
                         verdict_fence.clone(),
+                        transient,
                     )
                     .await
                     .map_err(map_registry)?;
@@ -6632,6 +6634,7 @@ mod automatic_retry_tests {
 
     struct RetryBackend {
         root: PathBuf,
+        clock: Arc<AtomicI64>,
         hosts: Mutex<Vec<(PathBuf, tokio::task::JoinHandle<()>)>>,
     }
     impl Drop for RetryBackend {
@@ -6642,9 +6645,10 @@ mod automatic_retry_tests {
         }
     }
     impl RetryBackend {
-        fn new(root: &Path) -> Self {
+        fn new(root: &Path, clock: Arc<AtomicI64>) -> Self {
             Self {
                 root: root.into(),
+                clock,
                 hosts: Mutex::new(vec![]),
             }
         }
@@ -6696,6 +6700,11 @@ mod automatic_retry_tests {
                 boot
             };
             let generation_path = runtime.join("fixture-generation");
+            let native_launch_path = runtime.join("native-launch.json");
+            let provider_home = self.root.join("provider");
+            let native_file = provider_home.join(".codex/sessions/rollout-retry-root.jsonl");
+            let native_required = native_file.exists();
+            let final_identity_path = runtime.join("final-wrong-identity");
             let task = tokio::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
@@ -6711,12 +6720,21 @@ mod automatic_retry_tests {
                         } => HostResult::Hello {
                             proof: host_proof(&secret, &challenge, &boot, &incarnation_id),
                             host_boot_id: boot.clone(),
-                            capabilities: vec![],
+                            capabilities: if native_required {
+                                vec![
+                                    "native-identity-observation-v1".into(),
+                                    "owned-provider-config-v1".into(),
+                                    "provider-store-probe-v1".into(),
+                                ]
+                            } else {
+                                vec![]
+                            },
                             effective_limits: limits,
                         },
                         HostCommand::GrantExecution {
                             execution_generation,
                             resume_spec,
+                            native_identity_launch,
                             ..
                         } => {
                             assert_eq!(
@@ -6725,6 +6743,13 @@ mod automatic_retry_tests {
                             );
                             std::fs::write(&generation_path, execution_generation.to_string())
                                 .unwrap();
+                            if native_required {
+                                std::fs::write(
+                                    &native_launch_path,
+                                    serde_json::to_vec(&native_identity_launch.unwrap()).unwrap(),
+                                )
+                                .unwrap();
+                            }
                             HostResult::GrantAccepted {
                                 host_boot_id: boot.clone(),
                                 worker_pid: 42,
@@ -6736,21 +6761,47 @@ mod automatic_retry_tests {
                                 opencode_adoption: Default::default(),
                             }
                         }
-                        HostCommand::Status { .. } => HostResult::Status {
-                            host_boot_id: boot.clone(),
-                            worker_pid: Some(42),
-                            worker_launch_count: 1,
-                            max_control_epoch: 1,
-                            max_execution_generation: generation,
-                            fixture_evidence: serde_json::json!({}),
-                            exited: false,
-                            native_session_id: Some("retry-root".into()),
-                            native_identity_observation: None,
-                            opencode_transfer_receipt: None,
-                            opencode_adoption: Default::default(),
-                        },
+                        HostCommand::Status { .. } => {
+                            let observation = native_required.then(|| {
+                                let launch: freshell_runtime_protocol::NativeIdentityLaunch = serde_json::from_slice(&std::fs::read(&native_launch_path).unwrap()).unwrap();
+                                let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&native_file).unwrap()).unwrap();
+                                freshell_runtime_protocol::NativeIdentityObservation {
+                                    native_session_id: if final_identity_path.exists() { "wrong-root".into() } else { record["payload"]["id"].as_str().unwrap().into() },
+                                    incarnation_id: launch.incarnation_id,
+                                    launch_nonce: launch.launch_nonce,
+                                    evidence_revision: launch.evidence_revision,
+                                    source: freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+                                    evidence_digest: format!("{:x}", Sha256::digest(std::fs::read(&native_file).unwrap())),
+                                }
+                            });
+                            HostResult::Status {
+                                host_boot_id: boot.clone(),
+                                worker_pid: Some(42),
+                                worker_launch_count: 1,
+                                max_control_epoch: 1,
+                                max_execution_generation: generation,
+                                fixture_evidence: serde_json::json!({}),
+                                exited: false,
+                                native_session_id: observation
+                                    .as_ref()
+                                    .map(|observation| observation.native_session_id.clone())
+                                    .or_else(|| Some("retry-root".into())),
+                                native_identity_observation: observation,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
                         HostCommand::ProbeRecovery { resume_spec, .. } => {
                             let spec = resume_spec.unwrap();
+                            if native_required {
+                                assert!(matches!(
+                                    freshell_agent_runtime::probe_provider_store(
+                                        &provider_home,
+                                        &spec
+                                    ),
+                                    freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
+                                ));
+                            }
                             HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
                                 evidence_revision: spec.evidence_revision,
                                 resume_spec: spec,
@@ -6782,6 +6833,27 @@ mod automatic_retry_tests {
             self.record("inspects", handle.incarnation_id().as_str());
             if self.root.join("backend-unavailable").exists() {
                 return Err(BackendError::Unavailable("test backend offline".into()));
+            }
+            if let Ok(failure) = std::fs::read_to_string(self.root.join("final-inspection-failure"))
+            {
+                let activated: bool = Connection::open(self.root.join("registry/runtime.sqlite3")).unwrap().query_row(
+                    "SELECT launch_state='running' AND native_identity_observation IS NOT NULL FROM incarnations WHERE incarnation_id=?1",
+                    [handle.incarnation_id().as_str()], |row| row.get(0),
+                ).unwrap();
+                if activated {
+                    self.record("final-inspection", handle.incarnation_id().as_str());
+                    self.clock.store(750, Ordering::SeqCst);
+                    if failure == "transient" {
+                        return Err(BackendError::Unavailable(
+                            "final native inspection temporarily unavailable".into(),
+                        ));
+                    }
+                    std::fs::write(
+                        handle.runtime_dir().join("final-wrong-identity"),
+                        b"wrong-root",
+                    )
+                    .unwrap();
+                }
             }
             let object = handle.runtime_dir().join("fixture-object");
             let state = if object.exists() {
@@ -6869,7 +6941,7 @@ mod automatic_retry_tests {
         let mut registry = Registry::open(root.join("registry"), None).unwrap();
         let clock = Arc::new(AtomicI64::new(now));
         registry.retry_clock = Some(clock.clone());
-        let backend = Arc::new(RetryBackend::new(root));
+        let backend = Arc::new(RetryBackend::new(root, clock.clone()));
         let supervisor = Supervisor::new(
             registry,
             backend.clone(),
@@ -6923,6 +6995,59 @@ mod automatic_retry_tests {
             .unwrap();
         soul
     }
+    async fn seed_native(supervisor: &Supervisor, root: &Path) -> SoulId {
+        let soul = seed(supervisor).await;
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let provider_home = root.join("provider");
+        std::fs::create_dir_all(provider_home.join(".codex/sessions")).unwrap();
+        std::fs::write(
+            provider_home.join(".codex/sessions/rollout-retry-root.jsonl"),
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"retry-root\"}}\n",
+        )
+        .unwrap();
+        let agent: freshell_runtime_protocol::FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
+            "sessionId":"retry-fresh-codex", "provider":"codex", "sessionType":"freshcodex", "runtimeVariant":"codex-app-server-v1",
+            "providerStoreId":context.provider_store_id, "cwd":root, "workspacePath":root,
+            "runAsUid":65534, "runAsGid":0
+        })).unwrap();
+        agent.validate().unwrap();
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='codex',resume_spec=NULL WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fixture_kind=NULL,fresh_agent_spec=?1 WHERE incarnation_id=?2",
+            rusqlite::params![
+                serde_json::to_string(&agent).unwrap(),
+                context.prior_handle.incarnation_id().as_str()
+            ],
+        )
+        .unwrap();
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let spec = resume_catalog::exact_resume_candidate(&context, None)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            freshell_agent_runtime::probe_provider_store(&provider_home, &spec),
+            freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
+        ));
+        supervisor
+            .registry
+            .store_verified_resume_spec(soul.clone(), spec)
+            .await
+            .unwrap();
+        soul
+    }
     fn attempts(root: &Path) -> Vec<(String, String)> {
         let conn = Connection::open(root.join("registry/runtime.sqlite3")).unwrap();
         let mut stmt = conn
@@ -6958,6 +7083,55 @@ mod automatic_retry_tests {
             .unwrap();
         assert_eq!(context.native_session_id.as_deref(), Some("retry-root"));
         assert_eq!(context.successful_recoveries_in_window, successes);
+    }
+
+    #[tokio::test]
+    async fn retry_final_native_inspection_keeps_typed_transient() {
+        for failure in ["transient", "identity"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, _) = open(dir.path(), 0);
+            let soul = seed_native(&supervisor, dir.path()).await;
+            std::fs::write(dir.path().join("final-inspection-failure"), failure).unwrap();
+            supervisor.reconcile_startup().await.unwrap();
+            assert_eq!(
+                backend.count("final-inspection"),
+                1,
+                "must reach the activated native replacement's final inspection"
+            );
+            assert_eq!(backend.count("creates"), 1);
+            assert_eq!(attempts(dir.path()).len(), 1);
+            assert_eq!(
+                due(dir.path()),
+                (failure == "transient").then_some(2_750),
+                "{failure}: delay starts at final failure settlement"
+            );
+            assert_root_and_successes(&supervisor, &soul, 0).await;
+            std::fs::remove_file(dir.path().join("final-inspection-failure")).unwrap();
+            drop(supervisor);
+            drop(backend);
+            let (supervisor, backend, clock) = open(dir.path(), 2_000);
+            supervisor.reconcile_startup().await.unwrap();
+            assert_eq!(attempts(dir.path()).len(), 1);
+            clock.store(2_750, Ordering::SeqCst);
+            supervisor.observe_once().await.unwrap();
+            let current = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            if failure == "transient" {
+                assert_eq!(current.recovery_state, RecoveryState::Live);
+                assert_eq!(backend.count("creates"), 2);
+                assert_eq!(attempts(dir.path()).len(), 2);
+                assert_root_and_successes(&supervisor, &soul, 1).await;
+            } else {
+                assert_eq!(current.recovery_state, RecoveryState::Blocked);
+                assert_eq!(backend.count("creates"), 1);
+                assert_eq!(attempts(dir.path()).len(), 1);
+                assert_root_and_successes(&supervisor, &soul, 0).await;
+            }
+            assert_eq!(due(dir.path()), None);
+        }
     }
 
     #[tokio::test]
