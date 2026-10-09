@@ -18,7 +18,8 @@
 //!    sparing the Codex daemon family, without waiting for the killed
 //!    processes (whoever adopts them reaps them);
 //! 6. exits with the command's status: its exit code, or the same signal
-//!    raised on itself.
+//!    raised on itself (non-dumpable first, so a core-dumping signal never
+//!    makes the shim dump core in the command's place).
 //!
 //! It never reads or writes the terminal and holds no state beyond the
 //! child's pid.
@@ -243,10 +244,16 @@ fn sweep_own_tree() {
 }
 
 /// Dies by `sig` like the command did, so the PTY reader and the stop
-/// sequence see the status it produced.
+/// sequence see the status it produced. The shim makes itself non-dumpable
+/// first: for a core-dumping signal (SIGABRT, SIGSEGV, SIGQUIT) the dump, if
+/// any, was the command's, and the shim (the server binary in production)
+/// must not add a second one under its own name. The wait status still shows
+/// the same terminating signal.
 fn reraise(sig: libc::c_int) {
-    // SAFETY: restoring the default action, unblocking and raising on self.
+    // SAFETY: prctl with integer arguments; restoring the default action,
+    // unblocking and raising on self.
     unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
         libc::signal(sig, libc::SIG_DFL);
         let mut set = empty_sigset();
         libc::sigaddset(&mut set, sig);

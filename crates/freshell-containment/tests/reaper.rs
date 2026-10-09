@@ -315,3 +315,24 @@ fn the_shim_starts_the_agent_with_the_open_file_soft_limit_its_spawner_passes() 
     assert!(status.success());
     assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "256");
 }
+
+#[test]
+fn a_command_ended_by_a_core_dumping_signal_ends_the_shim_with_that_signal_without_a_core_dump() {
+    use std::os::unix::process::ExitStatusExt;
+    // The command makes itself non-dumpable before it aborts, so this test
+    // never produces a core dump of its own.
+    let status = std::process::Command::new(test_shim().exe)
+        .args(["--reaper", "--", "perl", "-e"])
+        .arg(r#"require "syscall.ph"; syscall(&SYS_prctl, 4, 0, 0, 0, 0) == 0 or die "prctl: $!"; kill "ABRT", $$; sleep 5"#)
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGABRT),
+        "the shim ends with the command's signal: {status:?}"
+    );
+    assert!(
+        !status.core_dumped(),
+        "the shim dumped core in the command's place: {status:?}"
+    );
+}
