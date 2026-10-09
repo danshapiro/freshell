@@ -524,6 +524,213 @@ mod tests {
     use freshell_runtime_protocol::*;
     use sha2::{Digest, Sha256};
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_secret_actual_merged_profile_reaches_guarded_child() {
+        const GENERATED: &str = "FRESHELL_CONFIG_REFERENCE_0";
+        const RECEIPT: &str = "HOST_MERGED_PROFILE=";
+        if std::env::var_os(GENERATED).is_some() {
+            let received: BTreeMap<String, String> = std::env::vars().collect();
+            ProviderPathInputs::new(received.clone()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&received[GENERATED]).unwrap();
+            assert!(parsed["value"]
+                .as_str()
+                .unwrap()
+                .contains("{file:/home/freshell/provider/.freshell/references/0}"));
+            let total: usize = received
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum();
+            println!(
+                "{RECEIPT}{}",
+                serde_json::json!({"names":received.len(),"total":total,"maxValue":received.values().map(String::len).max().unwrap()})
+            );
+            return;
+        }
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let destination = "/home/freshell/provider/.freshell/references/0";
+        let total_value_limit = 256 * 1024 - 127 * (128 + 1920) - GENERATED.len();
+        let mut prior = Vec::new();
+        for (ordinal, frozen_count, input_bytes, generated_bytes, accepted) in [
+            (0, 127, 1920, total_value_limit, true),
+            (1, 127, 1920, total_value_limit + 1, false),
+            (2, 128, 16, 128, false),
+            (3, 1, 16, 64 * 1024, true),
+            (4, 1, 16, 64 * 1024 + 1, false),
+        ] {
+            let stage = owned.path().join(format!("attempt-{ordinal}"));
+            std::fs::create_dir_all(stage.join(".freshell/source-views")).unwrap();
+            let controller = owned.path().join(format!("original-{ordinal}"));
+            std::fs::create_dir(&controller).unwrap();
+            std::fs::write(controller.join("rules"), b"PRIVATE_MERGED_PROFILE_PAYLOAD").unwrap();
+            let input = format!(
+                "{}{{file:rules}}",
+                "x".repeat(input_bytes - "{file:rules}".len())
+            );
+            let frozen = ProviderPathInputs::new(
+                (0..frozen_count)
+                    .map(|index| (format!("N{index:0127}"), input.clone()))
+                    .collect(),
+            )
+            .unwrap();
+            let names = frozen
+                .iter()
+                .map(|(name, _)| name.to_owned())
+                .collect::<Vec<_>>();
+            let expanded = input.replace("{file:rules}", &format!("{{file:{destination}}}"));
+            let minimum = serde_json::json!({"value":expanded}).to_string().len();
+            let generated_raw = serde_json::json!({"value":format!("{{env:{}}}{}",names[0],"p".repeat(generated_bytes - minimum))}).to_string();
+            let shared_raw = serde_json::Value::Object(
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        (
+                            format!("field-{index:03}"),
+                            serde_json::Value::String(format!("{{env:{name}}}")),
+                        )
+                    })
+                    .collect(),
+            )
+            .to_string();
+            let approved = controller.join("rules");
+            let occurrence = |index| ApprovedFileOccurrence {
+                ordinal: index,
+                approved_alias: approved.clone(),
+                runtime_destination: destination.into(),
+            };
+            let sources = (0..3)
+                .map(|index| {
+                    let raw = if index == 0 {
+                        &generated_raw
+                    } else {
+                        &shared_raw
+                    };
+                    let relative = format!(".freshell/source-views/source-{index}");
+                    std::fs::write(stage.join(&relative), raw).unwrap();
+                    SourceView {
+                        logical_path: controller.join(if index == 0 {
+                            "generated.json"
+                        } else {
+                            "shared.json"
+                        }),
+                        discovery_role: DiscoveryRole::Workspace,
+                        native_destination: None,
+                        lane: if index == 2 {
+                            SourceLane::Tui
+                        } else {
+                            SourceLane::Main
+                        },
+                        unexpanded_relative_path: relative,
+                        template_relative_path: format!(".freshell/templates/source-{index}"),
+                        template_sha256: None,
+                        generated_name: (index == 0).then(|| GENERATED.into()),
+                        occurrences: if index == 0 {
+                            vec![occurrence(0)]
+                        } else {
+                            (0..frozen_count).map(occurrence).collect()
+                        },
+                        referenced_variables: if index == 0 {
+                            vec![names[0].clone()]
+                        } else {
+                            names.clone()
+                        },
+                        path_variables: if index == 0 {
+                            vec![names[0].clone()]
+                        } else {
+                            names.clone()
+                        },
+                        original_form: index != 0,
+                    }
+                })
+                .collect();
+            let manifest = SourceManifest {
+                version: 1,
+                cwd: controller,
+                original_home: home.clone(),
+                global_config_root: None,
+                sources,
+                files: vec![SelectedSourceFile {
+                    source_id: 0,
+                    canonical_source: approved.clone(),
+                }],
+                frozen_inputs: names,
+                user_owns_freshell_mcp: true,
+                native_source_flags: vec![],
+                resource_roots: vec![],
+                rebind_enabled: true,
+                inline_edits: Default::default(),
+            };
+            let bytes = bounded_json_bytes(&manifest, 64 * 1024 * 1024).unwrap();
+            std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+            let generation = format!("grant-{}", uuid::Uuid::new_v4());
+            let context:ProviderLaunchContext = serde_json::from_value(serde_json::json!({
+                "preparation":{"opencode":{"project_config":[],"tui_config":null,"tui_source":null,"inline_config":false}},
+                "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
+                "preparedInputs":{"generationId":generation,"manifest":{"relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(&bytes)),"sourceCount":1,"aliasCount":0,"recipeCount":1},
+                    "indexedFiles":{"volumeName":indexed_provider_volume_name(&SoulId::new(),&generation),"aliases":[]}}
+            })).unwrap();
+            let mut secrets = ResolvedProviderSecrets::default();
+            let result = prepare(Some(&context), &mut secrets, &frozen, &stage, &home);
+            if accepted {
+                let environment = result.unwrap();
+                assert_eq!(environment.len(), frozen_count + 1);
+                assert_eq!(environment[GENERATED].len(), generated_bytes);
+                assert!(frozen
+                    .iter()
+                    .all(|(name, value)| environment.get(name).map(String::as_str) == Some(value)));
+                let binary = std::env::current_exe().unwrap();
+                let args: Vec<String> = vec!["--exact".into(),"provider_input_preparation::tests::provider_secret_actual_merged_profile_reaches_guarded_child".into(),"--nocapture".into()];
+                let mut command = std::process::Command::new(binary);
+                command.args(&args).env_clear().envs(&environment);
+                freshell_platform::provider_exec::check_command(&command, false, &[]).unwrap();
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "guarded merged-profile child failed"
+                );
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let receipt: serde_json::Value = serde_json::from_str(
+                    stdout
+                        .lines()
+                        .find_map(|line| line.split_once(RECEIPT).map(|(_, value)| value))
+                        .unwrap(),
+                )
+                .unwrap();
+                let total = environment
+                    .iter()
+                    .map(|(name, value)| name.len() + value.len())
+                    .sum::<usize>();
+                assert_eq!(
+                    receipt,
+                    serde_json::json!({"names":environment.len(),"total":total,"maxValue":environment.values().map(String::len).max().unwrap()})
+                );
+                println!("HOST_MERGED_PROFILE_QUALIFIED={receipt}");
+                if ordinal == 0 {
+                    assert_eq!(total, 256 * 1024);
+                    prior = (0..3)
+                        .map(|index| stage.join(format!(".freshell/source-views/source-{index}")))
+                        .chain([stage.join(".freshell/input-manifest.json"), approved])
+                        .map(|path| {
+                            let bytes = std::fs::read(&path).unwrap();
+                            (path, bytes)
+                        })
+                        .collect();
+                }
+            } else {
+                let error = result.err().unwrap();
+                assert!(error.contains("profile") || error.contains("64 KiB"));
+                assert!(!error.contains("PRIVATE_MERGED_PROFILE_PAYLOAD"));
+                assert!(secrets.opencode_plan.is_none());
+                for (path, bytes) in &prior {
+                    assert_eq!(std::fs::read(path).unwrap(), *bytes);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn provider_secret_claude_final_source_gate_blocks_unrecorded_generation_and_keeps_private_inputs(
     ) {
