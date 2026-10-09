@@ -3611,9 +3611,9 @@ export default async (input,options)=>({config:async(config)=>{
     std::fs::write(&original_config, duplicate_resources.as_bytes()).unwrap();
     let original_bytes = std::fs::read(&original_config).unwrap();
     let expected_external = json!({"adjacent":format!("{:x}",Sha256::digest(b"native-adjacent-import")),"child":format!("{:x}",Sha256::digest(b"native-child-dependency")),"parent":format!("{:x}",Sha256::digest(b"native-parent-dependency")),"resource":format!("{:x}",Sha256::digest(b"native-adjacent-resource")),"instruction":format!("{:x}",Sha256::digest(b"native-external-instruction")),"selected":true,"nativeLiveViews":true,"nativeSkill":true,"skillContent":format!("{:x}",Sha256::digest(b"Execute the adjacent synthetic resources.\n")),"skillExecution":format!("{:x}",Sha256::digest(b"native-skill-resource:native-skill-dependency")),"nativeMcpCwd":format!("{:x}",Sha256::digest(b"native-mcp-resource:native-mcp-dependency"))});
-    // Five logical native aliases share one accepted immutable 16 MiB raw
-    // source. The actual controller stage and actual host must not turn the
-    // 80 MiB cumulative read volume into a simultaneous-source limit.
+    // Five logical native sources share three immutable 16 MiB raw views.
+    // Their 48 MiB retained controller views fit its simultaneous profile;
+    // the host must not turn 80 MiB of sequential reads into a live limit.
     // Keep the shared backing file in the workspace mounted for the provider.
     // Workspace aliases must remain resolvable during the provider-owned
     // refresh, after the controller's original HOME is outside its mounts.
@@ -3633,11 +3633,10 @@ export default async (input,options)=>({config:async(config)=>{
     );
     std::fs::write(&repeated_static_source, &static_capacity).unwrap();
     let capacity_aliases = [
-        fixture.join("source-home/.config/opencode/config.json"),
-        fixture.join("source-home/.config/opencode/opencode.jsonc"),
         fixture.join("workspace/opencode.jsonc"),
         nested.join("opencode.jsonc"),
     ];
+    let global_capacity_source = fixture.join("source-home/.config/opencode/config.json");
     let explicit_config = fixture.join("workspace/selected-config.json");
     let explicit_bytes = br#"{"agent":{"probe":{"description":"{file:./selected-rule}"}}}"#;
     std::fs::write(&explicit_config, explicit_bytes).unwrap();
@@ -3881,10 +3880,15 @@ export default {{id:'closed-directory-discovery',async server(){{
     // Activate capacity aliases only after the unrelated unavailable-resource
     // controls; each refusal still tests its selected field without rescanning
     // the large static source. Actual launch preparation consumes all aliases.
-    for alias in capacity_aliases
-        .into_iter()
-        .chain([explicit_directory.join("opencode.jsonc")])
-    {
+    std::fs::write(&global_capacity_source, &static_capacity).unwrap();
+    std::os::unix::fs::symlink(
+        "config.json",
+        fixture.join("source-home/.config/opencode/opencode.jsonc"),
+    )
+    .unwrap();
+    let directory_capacity_source = explicit_directory.join("opencode.jsonc");
+    std::fs::write(&directory_capacity_source, &static_capacity).unwrap();
+    for alias in capacity_aliases {
         std::os::unix::fs::symlink(&repeated_static_source, alias).unwrap();
     }
     let terminal = controller
@@ -4086,6 +4090,9 @@ export default {{id:'closed-directory-discovery',async server(){{
         std::fs::read_to_string(&repeated_static_source).unwrap(),
         static_capacity
     );
+    for source in [&global_capacity_source, &directory_capacity_source] {
+        assert_eq!(std::fs::read_to_string(source).unwrap(), static_capacity);
+    }
     assert!(
         std::fs::symlink_metadata(fixture.join("workspace/opencode.json"))
             .unwrap()
@@ -4215,6 +4222,9 @@ export default {{id:'closed-directory-discovery',async server(){{
         std::fs::read_to_string(&repeated_static_source).unwrap(),
         static_capacity
     );
+    for source in [&global_capacity_source, &directory_capacity_source] {
+        assert_eq!(std::fs::read_to_string(source).unwrap(), static_capacity);
+    }
     assert!(
         std::fs::symlink_metadata(fixture.join("workspace/opencode.json"))
             .unwrap()
