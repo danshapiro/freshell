@@ -45,6 +45,112 @@ const handle = {
   hostBootId: 'boot-owned', nativeSessionId: 'native-owned',
 }
 
+describe('Task7 standalone owner cancellation', () => {
+  it.each((['SIGINT', 'SIGTERM'] as const).flatMap(signal =>
+    (['wait', 'create', 'export'] as const).map(stage => ({ signal, stage }))))(
+    'settles exact children and resources on $signal during $stage', async ({ signal, stage }) => {
+      const directory = path.join(fixtureRepoRoot, `cancel-${signal}-${stage}`)
+      await fsp.mkdir(directory, { mode: 0o700 })
+      const stateFile = path.join(directory, 'daemon.json')
+      const eventsFile = path.join(directory, 'events.jsonl')
+      const readyFile = path.join(directory, 'ready.json')
+      const resultFile = path.join(directory, 'owner.json')
+      const id = 'a'.repeat(64), foreignId = 'f'.repeat(64)
+      const volume = `freshell-provider-${'c'.repeat(24)}`
+      const state = { containers: { [foreignId]: { Id: foreignId, Name: 'unrelated-sentinel' } }, volumes: ['unrelated-volume', volume] }
+      await fsp.writeFile(stateFile, JSON.stringify(state))
+      const docker = path.join(directory, 'docker')
+      const common = `const fs=require('node:fs'),http=require('node:http');const stateFile=${JSON.stringify(stateFile)},eventsFile=${JSON.stringify(eventsFile)},readyFile=${JSON.stringify(readyFile)};const event=(kind,data={})=>fs.appendFileSync(eventsFile,JSON.stringify({kind,...data})+'\\n');`
+      await fsp.writeFile(docker, `#!${process.execPath}\n${common}
+const args=process.argv.slice(2),state=JSON.parse(fs.readFileSync(stateFile));event('docker',{args});
+if(args[0]==='create'){
+ const name=args[args.indexOf('--name')+1],labels={};for(let i=0;i<args.length;i++)if(args[i]==='--label'){const [key,value]=args[++i].split('=');labels[key]=value}
+ const mounts=[];for(let i=0;i<args.length;i++)if(args[i]==='--mount'){const items=args[++i].split(','),values=Object.fromEntries(items.map(item=>item.split('=')));mounts.push({Type:values.type,Source:values.source,Destination:values.target,RW:!items.includes('readonly')})}
+ state.containers['${id}']={Id:'${id}',Name:name,Image:args[args.indexOf('--entrypoint')+2],Config:{Labels:labels},Mounts:mounts};fs.writeFileSync(stateFile,JSON.stringify(state));
+ const acknowledge=()=>{event('create.settled');process.stdout.write('${id}')};if(${JSON.stringify(stage)}==='create'){fs.writeFileSync(readyFile,JSON.stringify({pid:process.pid}));setTimeout(acknowledge,250)}else acknowledge();
+}else if(args[0]==='wait'){
+ fs.writeFileSync(readyFile,JSON.stringify({pid:process.pid}));event('wait.started');setInterval(()=>{},1000);
+ process.on('SIGTERM',()=>{const socket=JSON.parse(fs.readFileSync(${JSON.stringify(resultFile)})).socket;const request=http.get({socketPath:socket,path:'/_ping'},response=>{response.resume();response.on('end',()=>setTimeout(()=>{event('wait.settled');process.stderr.write('cancelled wait');process.exit(9)},75))});request.on('error',()=>process.exit(8))});
+}else if(args[0]==='logs')process.stdout.write('partial owned parent output');
+else if(args[0]==='inspect'){const item=Object.values(state.containers).find(item=>item.Id===args[1]||item.Name===args[1]);if(!item)process.exit(1);process.stdout.write(JSON.stringify([item]))}
+else if(args[0]==='rm'){if(args.at(-1)==='${foreignId}')process.exit(7);delete state.containers[args.at(-1)];fs.writeFileSync(stateFile,JSON.stringify(state));event('container.removed',{id:args.at(-1)})}
+else if(args[0]==='ps')process.stdout.write(Object.values(state.containers).map(item=>args.includes('--format')?item.Name:item.Id).join('\\n'));
+else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')process.exit(7);state.volumes=state.volumes.filter(name=>name!==args[2]);fs.writeFileSync(stateFile,JSON.stringify(state));event('volume.removed')}else process.stdout.write(state.volumes.join('\\n'))}
+else if(args[0]!=='start')process.exit(4);
+`, { mode: 0o700 })
+      const exporter = path.join(directory, 'exporter.cjs')
+      await fsp.writeFile(exporter, `${common}
+const control=JSON.parse(fs.readFileSync(${JSON.stringify(resultFile)}));event('export.started',{pid:process.pid});
+const request=http.request({socketPath:control.socket,path:'/v1.47/containers/create?name=controlled-provider',method:'POST'},response=>{let body='';response.on('data',chunk=>body+=chunk);response.on('end',()=>event('export.response',{status:response.statusCode,body}))});request.on('error',error=>event('export.request_error',{message:error.message}));request.end(JSON.stringify(control.create));setInterval(()=>{},1000);
+process.on('SIGTERM',()=>{event('export.settled');process.stderr.write('partial owned export');process.exit(9)});
+`)
+      const launcher = path.join(directory, 'owner.mjs')
+      await fsp.writeFile(launcher, `import fs from 'node:fs';import path from 'node:path';import http from 'node:http';
+import {RuntimeHarness} from ${JSON.stringify(path.join(sourceRoot, 'scripts/testing/runtime-sandbox.ts'))};
+import {RestrictedDockerBroker} from ${JSON.stringify(path.join(sourceRoot, 'scripts/testing/runtime-test-broker.ts'))};
+import {runTask007DestructiveSandbox} from ${JSON.stringify(path.join(sourceRoot, 'scripts/testing/task007-destructive-sandbox.ts'))};
+const event=(kind,data={})=>fs.appendFileSync(${JSON.stringify(eventsFile)},JSON.stringify({kind,...data})+'\\n');let upstream;
+RuntimeHarness.prototype.prepareTask007StoppedFixture=async function(){
+ if(!this.broker){
+  fs.mkdirSync(this.testRoot,{recursive:true,mode:0o700});fs.mkdirSync(this.evidenceDir,{recursive:true,mode:0o700});fs.mkdirSync(this.buildDir,{recursive:true,mode:0o700});this.imageRef='sha256:${'b'.repeat(64)}';
+  const realSocket=path.join(this.testRoot,'upstream.sock'),socket=path.join(this.testRoot,'proxy.sock'),host=path.join(this.testRoot,'host'),runtimeDir=path.join(this.testRoot,'r/scenario/x/incarnation');
+  upstream=http.createServer((request,response)=>{request.resume();request.on('end',()=>{if(request.method==='POST'){event('upstream.create.started');fs.writeFileSync(${JSON.stringify(readyFile)},JSON.stringify({pid:process.pid}));setTimeout(()=>{const state=JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)}));state.containers['${id}']={Id:'${id}',Name:'late-provider'};fs.writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(state));event('upstream.create.settled');response.writeHead(201);response.end(JSON.stringify({Id:'${id}'}))},250)}else response.end('OK')})});await new Promise(resolve=>upstream.listen(realSocket,resolve));
+  this.broker=new RestrictedDockerBroker({realSocketPath:realSocket,proxySocketPath:socket,runtimeRootPrefix:path.join(this.testRoot,'r'),allowedHostBinaryPaths:new Set([host]),allowedImageRefs:new Set([this.imageRef]),testRunId:this.runId,logPath:path.join(this.evidenceDir,'broker.jsonl')});await this.broker.start();this.brokerStarted=true;this.trackedVolumes.add('${volume}');this.task007Artifact=Promise.resolve({path:'/controlled-lib-test'});
+  const close=this.broker.close.bind(this.broker);this.broker.close=async()=>{await close();event('broker.closed')};
+  const create={Image:this.imageRef,Labels:{project:'freshell','com.freshell.managed':'true','com.freshell.installation-id':'installation-unit','com.freshell.incarnation-id':'incarnation-unit','com.freshell.soul-id':'soul-unit','com.freshell.runtime-test-run-id':this.runId},HostConfig:{NetworkMode:'none',ReadonlyRootfs:true,Privileged:false,CapDrop:['ALL'],CapAdd:[],SecurityOpt:['no-new-privileges:true'],RestartPolicy:{Name:'no'},NanoCpus:500000000,Memory:134217728,PidsLimit:64,Tmpfs:{'/tmp':'rw,noexec,nosuid,nodev,size=128m'},Binds:[host+':/runtime/freshell-session-host:ro',runtimeDir+':/run/freshell:rw','${volume}:/home/freshell/provider:rw']}};
+  fs.writeFileSync(${JSON.stringify(resultFile)},JSON.stringify({testRoot:this.testRoot,evidenceDir:this.evidenceDir,buildDir:this.buildDir,socket,create}));
+ }
+ if(${JSON.stringify(stage)}==='export')await this.executeTask007Child(process.execPath,[${JSON.stringify(exporter)}],{cwd:this.repoRoot,env:{},timeout:15000,maxBuffer:1048576,encoding:'utf8'});
+ return {inputFile:'/controlled-input',registryRoot:'/controlled-registry',sourceDatabaseFile:'/controlled-source',metadataFile:'/controlled-metadata'};
+};
+try{await runTask007DestructiveSandbox(${JSON.stringify(fixtureRepoRoot)})}catch(error){event('owner.failed',{message:error.message});process.exitCode=1}finally{if(upstream)await new Promise(resolve=>upstream.close(resolve))}
+`)
+      const child = execFile(process.execPath, ['--import', path.join(sourceRoot, 'node_modules/tsx/dist/loader.mjs'), launcher], {
+        cwd: sourceRoot, env: { PATH: `${directory}${path.delimiter}${process.env.PATH}` }, timeout: 20_000,
+      })
+      const completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => child.once('close', (code, exitSignal) => resolve({ code, signal: exitSignal })))
+      let activePid: number | undefined
+      let control: { testRoot: string; evidenceDir: string; buildDir: string } | undefined
+      try {
+        await vi.waitFor(async () => {
+          if (!fs.existsSync(readyFile)) throw new Error(fs.existsSync(eventsFile) ? await fsp.readFile(eventsFile, 'utf8') : 'Owner has not allocated')
+          activePid = JSON.parse(await fsp.readFile(readyFile, 'utf8')).pid
+        }, { timeout: 10_000 })
+        control = JSON.parse(await fsp.readFile(resultFile, 'utf8'))
+        expect(child.kill(signal)).toBe(true)
+        const completed = await completion
+        expect(completed.signal).toBeNull()
+        expect(completed.code).not.toBe(0)
+        const closure = JSON.parse(await fsp.readFile(path.join(control!.evidenceDir, 'cleanup.json'), 'utf8'))
+        expect(closure, `${stage}: ${JSON.stringify(closure)}`).toMatchObject({ ok: true, verifiedResourcesAbsent: true })
+        expect(JSON.parse(await fsp.readFile(path.join(control!.evidenceDir, 'task007-destructive-owner-result.json'), 'utf8')))
+          .toMatchObject({ status: 'cancelled', signal, cleanup: { ok: true } })
+        const daemon = JSON.parse(await fsp.readFile(stateFile, 'utf8'))
+        expect(daemon).toEqual({ containers: { [foreignId]: { Id: foreignId, Name: 'unrelated-sentinel' } }, volumes: ['unrelated-volume'] })
+        const events = (await fsp.readFile(eventsFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { kind: string; args?: string[] })
+        const settled = events.findIndex(row => row.kind === `${stage === 'export' ? 'upstream.create' : stage}.settled`)
+        expect(settled).toBeGreaterThan(-1)
+        expect(events.findIndex(row => row.kind === 'volume.removed')).toBeGreaterThan(settled)
+        expect(events.findIndex(row => row.kind === 'broker.closed')).toBeGreaterThan(events.findIndex(row => row.kind === 'volume.removed'))
+        if (stage === 'create') expect(events.some(row => row.args?.[0] === 'start')).toBe(false)
+        if (stage === 'wait') expect(await fsp.readFile(path.join(control!.evidenceDir, 'task007-destructive-parents.stdout'), 'utf8')).toBe('partial owned parent output')
+        if (stage === 'export') expect(events.some(row => row.kind === 'export.settled')).toBe(true)
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
+        await completion
+        if (!control && fs.existsSync(resultFile)) control = JSON.parse(await fsp.readFile(resultFile, 'utf8'))
+        if (!activePid && fs.existsSync(eventsFile)) {
+          const started = (await fsp.readFile(eventsFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { kind: string; pid?: number }).find(row => row.kind === 'export.started')
+          activePid = started?.pid
+        }
+        if (activePid && activePid !== child.pid) {
+          try { process.kill(activePid, 'SIGKILL') } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error }
+        }
+        if (control) await fsp.rm(control.testRoot, { recursive: true, force: true })
+      }
+  }, 90_000)
+})
+
 describe('Task7 exact library test artifact packaging', () => {
   it('packages the actual Cargo-selected library harness through an asynchronous process and refuses decoys', async () => {
     const crate = path.join(fixtureRepoRoot, 'crates/freshell-supervisor')

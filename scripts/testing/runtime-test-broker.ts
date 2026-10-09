@@ -64,6 +64,7 @@ export class RestrictedDockerBroker {
   private readonly historyHelpers = new Map<string, { owner: BrokerReceipt; containerId?: string }>()
   private readonly events: BrokerEvent[] = []
   private server?: http.Server
+  private readonly pendingRequests = new Set<Promise<void>>()
   private stopFailuresRemaining = 0
 
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
@@ -133,7 +134,7 @@ export class RestrictedDockerBroker {
     fs.chmodSync(path.dirname(this.policy.logPath), 0o700)
     fs.rmSync(this.policy.proxySocketPath, { force: true })
     this.server = http.createServer((request, response) => {
-      this.handle(request, response).catch(() => {
+      const settlement = this.handle(request, response).catch(() => {
         try {
           this.record({
             method: request.method ?? 'GET', url: request.url ?? '/',
@@ -147,6 +148,8 @@ export class RestrictedDockerBroker {
           response.destroy()
         }
       })
+      this.pendingRequests.add(settlement)
+      settlement.then(() => this.pendingRequests.delete(settlement), () => this.pendingRequests.delete(settlement))
     })
     await new Promise<void>((resolve, reject) => {
       this.server!.once('error', reject)
@@ -160,6 +163,12 @@ export class RestrictedDockerBroker {
     await new Promise<void>((resolve) => this.server!.close(() => resolve()))
     this.server = undefined
     fs.rmSync(this.policy.proxySocketPath, { force: true })
+  }
+
+  /** The owner first stops its exact producers/enclosures, keeping this broker
+   * available until their already-forwarded operations publish their receipts. */
+  async awaitPendingRequests(): Promise<void> {
+    while (this.pendingRequests.size) await Promise.all([...this.pendingRequests])
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {

@@ -1622,13 +1622,33 @@ type Task2FixtureArtifacts = {
 
 export type Task007RunChild = (file: string, args: string[], options: {
   cwd: string; env: NodeJS.ProcessEnv; timeout: number; maxBuffer: number; encoding: 'utf8'
+  signal?: AbortSignal
 }) => Promise<{ stdout: string; stderr: string }>
 
 const runTask007Child: Task007RunChild = (file, args, options) => new Promise((resolve, reject) => {
-  execFile(file, args, options, (error, stdout, stderr) => {
-    if (error) reject(new Task007ChildFailure(error.code ?? undefined, stdout, stderr))
+  const { signal, ...childOptions } = options
+  if (signal?.aborted) { reject(new Error('Task7 owner cancelled')); return }
+  let forceStop: NodeJS.Timeout | undefined
+  // Let an already-issued allocation/start acknowledge before cleanup. Killing
+  // its transport can otherwise hide a daemon-side allocation still in progress.
+  const settleAllocation = file === 'docker' && (['create', 'start'].includes(args[0])
+    || (args[0] === 'volume' && args[1] === 'create'))
+  const cancel = () => {
+    if (settleAllocation) return
+    child.kill('SIGTERM')
+    forceStop = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    }, 2_000)
+  }
+  const child = execFile(file, args, childOptions, (error, stdout, stderr) => {
+    signal?.removeEventListener('abort', cancel)
+    clearTimeout(forceStop)
+    // execFile's callback runs after close, so a cancelled child has actually
+    // settled before its owner captures receipts or closes the broker.
+    if (error || signal?.aborted) reject(new Task007ChildFailure(signal?.aborted ? 'cancelled' : error?.code ?? undefined, stdout, stderr))
     else resolve({ stdout, stderr })
   })
+  signal?.addEventListener('abort', cancel, { once: true })
 })
 
 class Task007ChildFailure extends Error {
@@ -2115,6 +2135,7 @@ export class RuntimeHarness {
   private readonly task007Brokers: RestrictedDockerBroker[] = []
   private readonly task007HelperNames = new Set<string>()
   private readonly task007Children = new Set<Promise<unknown>>()
+  private readonly task007Cancellation = new AbortController()
   private readonly task007Fixtures = new Map<Task007StoppedFixtureKind, Task007PreparedStoppedFixture>()
   private readonly task007HostPaths = new Set<string>()
   private readonly task007WorkspaceRoots = new Set<string>()
@@ -2213,23 +2234,39 @@ export class RuntimeHarness {
     this.recordLifecycle('gate.prepare.completed', { imageRef: this.imageRef, brokerSocket: proxySocketPath })
   }
 
+  cancelTask007(signal: 'SIGINT' | 'SIGTERM'): void {
+    if (this.task007Cancellation.signal.aborted) return
+    this.recordLifecycle('task007.owner.cancelled', { severity: 'warn', signal, runId: this.runId,
+      candidateSha: this.candidateSha })
+    this.task007Cancellation.abort(signal)
+  }
+
+  private assertTask007Active(): void {
+    if (this.task007Cancellation.signal.aborted) throw new Error('Task7 owner cancelled')
+  }
+
   private readonly executeTask007Child: Task007RunChild = (file, args, options) => {
+    const cleanup = file === 'docker' && (['logs', 'rm', 'ps', 'inspect'].includes(args[0])
+      || (args[0] === 'volume' && ['ls', 'rm'].includes(args[1])))
+    if (!cleanup) this.assertTask007Active()
     const reference = `task007-child-${randomUUID()}`
-    const retain = (stdout: string, stderr: string) => {
+    const retain = (stdout: string, stderr: string, failed: boolean) => {
       ensurePrivateDirectory(this.evidenceDir)
       fs.writeFileSync(path.join(this.evidenceDir, `${reference}.stdout`), stdout, { mode: 0o600, flag: 'wx' })
       fs.writeFileSync(path.join(this.evidenceDir, `${reference}.stderr`), stderr, { mode: 0o600, flag: 'wx' })
-      this.recordLifecycle('task007.child.settled', { reference, file, args })
+      this.recordLifecycle('task007.child.settled', { severity: failed ? 'warn' : 'info', reference, file, args })
     }
-    const settlement = runTask007Child(file, args, options).then(result => {
-      retain(result.stdout, result.stderr)
+    const settlement = runTask007Child(file, args, { ...options,
+      ...(!cleanup ? { signal: this.task007Cancellation.signal } : {}) }).then(result => {
+      retain(result.stdout, result.stderr, false)
       return result
     }, error => {
-      if (error instanceof Task007ChildFailure) retain(error.stdout, error.stderr)
+      if (error instanceof Task007ChildFailure) retain(error.stdout, error.stderr, true)
       throw error
     })
     this.task007Children.add(settlement)
-    void settlement.finally(() => this.task007Children.delete(settlement)).catch(() => undefined)
+    const forget = () => this.task007Children.delete(settlement)
+    settlement.then(forget, forget)
     return settlement
   }
 
@@ -2251,6 +2288,7 @@ export class RuntimeHarness {
 
   /** Private grant-free setup; generated historical identities are not current runtime evidence. */
   async prepareTask007StoppedFixture(kind: Task007StoppedFixtureKind): Promise<Task007PreparedStoppedFixture> {
+    this.assertTask007Active()
     if (this.phase !== 3 || !this.ownerIsolation || this.ownerIsolation.bootstrapProviders.length !== 0
       || !['browser', 'after_import_publication', 'after_repair_cas_before_withdrawal', 'during_withdrawal_before_ack'].includes(kind)) {
       throw new Error('Task7 batch requires an explicitly isolated phase-three owner')
@@ -2380,14 +2418,17 @@ export class RuntimeHarness {
   }
 
   async runTask007StoppedRepairParents(): Promise<{ executedParents: 3; passedParents: 3 }> {
+    this.assertTask007Active()
     const kinds = ['after_import_publication', 'after_repair_cas_before_withdrawal', 'during_withdrawal_before_ack'] as const
     const fixtures: Record<string, { inputFile: string; registryRoot: string; sourceDatabaseFile: string; metadataFile: string }> = {}
     for (const kind of kinds) {
+      this.assertTask007Active()
       const prepared = await this.prepareTask007StoppedFixture(kind)
       fixtures[`stopped_repair_${kind}`] = { inputFile: prepared.inputFile, registryRoot: prepared.registryRoot,
         sourceDatabaseFile: prepared.sourceDatabaseFile, metadataFile: prepared.metadataFile }
     }
     const artifact = await this.task007Artifact
+    this.assertTask007Active()
     if (!artifact) throw new Error('Task7 parent harness artifact is absent')
     const manifest = path.join(this.testRoot, 'task007-crash-fixtures.json')
     writePrivateJson(manifest, fixtures)
@@ -2679,10 +2720,46 @@ export class RuntimeHarness {
     }
   }
 
+  private async removeTask007Helper(name: string): Promise<void> {
+    if (!this.task007HelperNames.has(name)) { this.removeContainerExact(name); return }
+    const names = (await this.task007Docker(['ps', '-a', '--format', '{{.Names}}'])).trim().split('\n')
+    if (!names.includes(name)) return
+    const observed = z.array(z.object({ Id: Task007Hex, Image: z.string(), Config: z.object({ Labels: z.record(z.string(), z.string()) }),
+      Mounts: z.array(z.object({ Type: z.string(), Name: z.string().optional(), Source: z.string().optional(), Destination: z.string(), RW: z.boolean() })) })).length(1)
+      .parse(JSON.parse(await this.task007Docker(['inspect', name])))[0]
+    const labels = observed.Config.Labels
+    const volumes = observed.Mounts.filter(mount => mount.Type === 'volume')
+    const binds = observed.Mounts.filter(mount => mount.Type === 'bind')
+    const kind = labels['com.freshell.task007-setup']
+    const parentMounts = kind === 'destructive-parents' && observed.Mounts.length === 2 && binds.length === 2
+      && binds.some(mount => mount.Source === this.testRoot && mount.Destination === this.testRoot && mount.RW)
+      && binds.some(mount => mount.Source === this.buildDir && mount.Destination === this.buildDir && !mount.RW)
+    const setupMounts = ['provider-home', 'registry-copy'].includes(kind) && volumes.length === 1
+      && !!volumes[0].Name && this.trackedVolumes.has(volumes[0].Name) && volumes[0].RW
+      && (kind === 'provider-home' ? observed.Mounts.length === 1 && volumes[0].Destination === '/home/freshell/provider'
+        : observed.Mounts.length === 2 && volumes[0].Destination === '/registry' && binds.length === 1
+          && !!binds[0].Source?.startsWith(`${this.testRoot}${path.sep}`) && binds[0].Destination === '/fixture' && !binds[0].RW)
+    if (observed.Image !== this.imageRef || labels['com.freshell.runtime-test-run-id'] !== this.runId
+      || labels['com.freshell.runtime-test-candidate'] !== this.candidateSha
+      || (!parentMounts && !setupMounts)) throw new Error('Task7 partial setup helper ownership is unknown')
+    await this.task007Docker(['rm', '--force', observed.Id])
+  }
+
   async cleanup(): Promise<{ ok: boolean; errors: string[] }> {
     const errors: string[] = []
     await Promise.allSettled([...this.task007Children])
     const brokers = [this.broker, ...this.task007Brokers].filter((broker): broker is RestrictedDockerBroker => !!broker)
+    if (this.task007Cancellation.signal.aborted) {
+      // A detached parent/helper can hold a broker wait open. Settle those exact
+      // enclosures before joining the already-forwarded broker operations.
+      const names = new Set([...this.task007HelperNames, ...brokers.flatMap(broker => broker.historyHelperNames())])
+      for (const name of names) {
+        try { await this.removeTask007Helper(name) } catch (error) { errors.push(`cancelled helper ${name}: ${String(error)}`) }
+      }
+    }
+    for (const broker of brokers) {
+      try { await broker.awaitPendingRequests() } catch (error) { errors.push(`broker settlement: ${String(error)}`) }
+    }
     const receipts = brokers.flatMap(broker => broker.receipts())
     const exactContainerIds = [...new Set([
       ...this.trackedSupervisorContainers, ...this.trackedForeignContainers,
@@ -2699,29 +2776,7 @@ export class RuntimeHarness {
     }
     for (const name of historyHelperNames) {
       try {
-        if (this.task007HelperNames.has(name)) {
-          const names = (await this.task007Docker(['ps', '-a', '--format', '{{.Names}}'])).trim().split('\n')
-          if (!names.includes(name)) continue
-          const observed = z.array(z.object({ Id: Task007Hex, Image: z.string(), Config: z.object({ Labels: z.record(z.string(), z.string()) }),
-            Mounts: z.array(z.object({ Type: z.string(), Name: z.string().optional(), Source: z.string().optional(), Destination: z.string(), RW: z.boolean() })) })).length(1)
-            .parse(JSON.parse(await this.task007Docker(['inspect', name])))[0]
-          const labels = observed.Config.Labels
-          const volumes = observed.Mounts.filter(mount => mount.Type === 'volume')
-          const binds = observed.Mounts.filter(mount => mount.Type === 'bind')
-          const kind = labels['com.freshell.task007-setup']
-          const parentMounts = kind === 'destructive-parents' && observed.Mounts.length === 2 && binds.length === 2
-            && binds.some(mount => mount.Source === this.testRoot && mount.Destination === this.testRoot && mount.RW)
-            && binds.some(mount => mount.Source === this.buildDir && mount.Destination === this.buildDir && !mount.RW)
-          const setupMounts = ['provider-home', 'registry-copy'].includes(kind) && volumes.length === 1
-            && !!volumes[0].Name && this.trackedVolumes.has(volumes[0].Name) && volumes[0].RW
-            && (kind === 'provider-home' ? observed.Mounts.length === 1 && volumes[0].Destination === '/home/freshell/provider'
-              : observed.Mounts.length === 2 && volumes[0].Destination === '/registry' && binds.length === 1
-                && !!binds[0].Source?.startsWith(`${this.testRoot}${path.sep}`) && binds[0].Destination === '/fixture' && !binds[0].RW)
-          if (observed.Image !== this.imageRef || labels['com.freshell.runtime-test-run-id'] !== this.runId
-            || labels['com.freshell.runtime-test-candidate'] !== this.candidateSha
-            || (!parentMounts && !setupMounts)) throw new Error('Task7 partial setup helper ownership is unknown')
-          await this.task007Docker(['rm', '--force', observed.Id])
-        } else this.removeContainerExact(name)
+        await this.removeTask007Helper(name)
       } catch (error) { errors.push(`history helper ${name}: ${String(error)}`) }
     }
     for (const id of [...this.trackedForeignContainers]) {
