@@ -10,7 +10,7 @@ use std::{
 };
 
 pub(super) struct Preparation {
-    manifest_bytes: Vec<u8>,
+    pub(super) manifest_bytes: Vec<u8>,
     pub selections: Vec<CopySelection>,
     pub binds: Vec<ProviderConfigBind>,
     pub mounts: Vec<ProviderResourceMount>,

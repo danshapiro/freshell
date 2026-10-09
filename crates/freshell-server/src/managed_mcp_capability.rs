@@ -1535,19 +1535,37 @@ fn stage_provider_root(
             .map_err(|_| "prepared resource descriptor exceeds control profile")?;
             write_private_bytes(&temporary.join(".freshell/resource-mounts.json"), &metadata)?;
         }
+        let retained_amplifier =
+            provider == "amplifier" && canonical_root.is_none() && prior_stage.is_some();
         let ordinary_resources = if opencode_input.launch_context.is_some()
             && matches!(provider, "codex" | "claude" | "amplifier")
         {
             Some(if provider == "amplifier" {
-                amplifier_stage::prepare(
-                    home,
-                    opencode_input.cwd.unwrap_or(home),
-                    opencode_input
-                        .workspace
-                        .or(opencode_input.cwd)
-                        .unwrap_or(home),
-                    opencode_input.amplifier_manifest,
-                )?
+                if retained_amplifier {
+                    tracing::info!(
+                        event = "provider.inputs.preparation.retained",
+                        stage = "controller",
+                        provider,
+                        reason = "original_root_unavailable",
+                        "Reusing the accepted Amplifier ordinary resource generation"
+                    );
+                    amplifier_stage::prepare_retained(
+                        opencode_input
+                            .amplifier_manifest
+                            .ok_or("Amplifier retained original origins unavailable")?,
+                        prior_stage.ok_or("Amplifier retained ordinary stage unavailable")?,
+                    )?
+                } else {
+                    amplifier_stage::prepare(
+                        home,
+                        opencode_input.cwd.unwrap_or(home),
+                        opencode_input
+                            .workspace
+                            .or(opencode_input.cwd)
+                            .unwrap_or(home),
+                        opencode_input.amplifier_manifest,
+                    )?
+                }
             } else if provider == "claude" {
                 if let Some(prior_stage) = prior_stage {
                     claude_stage::prepare_retained(
@@ -1603,7 +1621,7 @@ fn stage_provider_root(
         if let Some(resources) = &ordinary_resources {
             selections.extend(resources.selections.iter().cloned());
         }
-        let amplifier_resources = if provider == "amplifier" {
+        let amplifier_resources = if provider == "amplifier" && !retained_amplifier {
             Some(amplifier_resources::prepare(
                 home,
                 opencode_input.cwd.unwrap_or(home),
@@ -8815,9 +8833,13 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         ] {
             std::fs::create_dir_all(path).unwrap();
         }
+        let bundle = home.join(".amplifier/bundles/selected");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle:\n  name: retained\n").unwrap();
+        std::fs::write(bundle.join("resource"), b"retained-bundle-resource").unwrap();
         std::fs::write(
             home.join(".amplifier/settings.yaml"),
-            r#"{"env":{"CLAUDE_SELECTED":"original"}}"#,
+            format!("bundle:\n  active: file://{}\n", bundle.display()),
         )
         .unwrap();
         std::fs::write(
@@ -8860,6 +8882,8 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             .unwrap();
         let context = read_prepared_context(&directory, &prior).unwrap();
         assert!(context.prepared_inputs.is_some());
+        let prior_inputs = context.prepared_inputs.clone().unwrap();
+        std::fs::rename(&home, owned.path().join("unavailable-home")).unwrap();
         let callback=serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,"provider":"amplifier","workspace":workspace,"cwd":workspace,"priorContext":context,"providerSecretReferences":[]})).unwrap();
         let client = freshell_runtime_client::RuntimeClient::new(
             owned.path().join("unused.sock"),
@@ -8876,7 +8900,12 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         )
         .await
         .expect("replacement must select recorded original Amplifier sources");
-        std::fs::remove_file(home.join(".amplifier/settings.yaml")).unwrap();
+        std::fs::remove_file(
+            owned
+                .path()
+                .join("unavailable-home/.amplifier/settings.yaml"),
+        )
+        .unwrap();
         let repeated = apply_prepared_callback(
             &callback,
             "fixture-control",
@@ -8922,6 +8951,50 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             )
             .unwrap(),
             b"retained-original-resource"
+        );
+        assert_eq!(inputs.config_binds, prior_inputs.config_binds);
+        assert_eq!(inputs.resource_mounts, prior_inputs.resource_mounts);
+        assert_ne!(inputs.generation_id, prior_inputs.generation_id);
+        let projected = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| {
+                mount.logical_destination == "/home/freshell/provider/.freshell/resources"
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read(
+                stage
+                    .join(&projected.stage_relative_path)
+                    .join("amplifier-local-0/resource")
+            )
+            .unwrap(),
+            b"retained-bundle-resource"
+        );
+        assert!(!home.exists());
+        let prior_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+        let manifest = prior_stage.join(&prior_inputs.manifest.relative_path);
+        std::fs::write(&manifest, b"{}").unwrap();
+        assert!(amplifier_stage::prepare_retained(
+            &freshell_platform::amplifier_inputs::AmplifierInputManifest {
+                version: 1,
+                original_home: home.clone(),
+                cwd: workspace.clone(),
+                workspace,
+            },
+            &prior_stage,
+        )
+        .err()
+        .expect("changed retained manifest must block preparation")
+        .contains("manifest changed"));
+        assert_eq!(
+            std::fs::read(
+                stage
+                    .join(&projected.stage_relative_path)
+                    .join("amplifier-local-0/resource")
+            )
+            .unwrap(),
+            b"retained-bundle-resource"
         );
     }
 
