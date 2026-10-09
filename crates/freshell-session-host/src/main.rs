@@ -8275,20 +8275,16 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             manifest_sha256: sha256_hex(descriptor.manifest_json.as_bytes()),
             descriptor: descriptor.clone(),
         };
-        let original_receipt = std::fs::read(
-            imported
-                .root
-                .path()
-                .join("host-state/opencode-synthetic-transfer-import.json"),
-        )
-        .unwrap();
-        let original_readable = std::fs::read(
-            imported
-                .root
-                .path()
-                .join("host-state/opencode-synthetic-transfer-readable.json"),
-        )
-        .unwrap();
+        let import_receipt_file = imported
+            .root
+            .path()
+            .join("host-state/opencode-synthetic-transfer-import.json");
+        let readable_receipt_file = imported
+            .root
+            .path()
+            .join("host-state/opencode-synthetic-transfer-readable.json");
+        let original_receipt = std::fs::read(&import_receipt_file).unwrap();
+        let original_readable = std::fs::read(&readable_receipt_file).unwrap();
         for failure in [
             SyntheticTransferFailure::CurrentEvidenceRead,
             SyntheticTransferFailure::CurrentEvidenceMismatch,
@@ -8333,23 +8329,11 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                 }
             );
             assert_eq!(
-                std::fs::read(
-                    imported
-                        .root
-                        .path()
-                        .join("host-state/opencode-synthetic-transfer-import.json")
-                )
-                .unwrap(),
+                std::fs::read(&import_receipt_file).unwrap(),
                 original_receipt
             );
             assert_eq!(
-                std::fs::read(
-                    imported
-                        .root
-                        .path()
-                        .join("host-state/opencode-synthetic-transfer-readable.json")
-                )
-                .unwrap(),
+                std::fs::read(&readable_receipt_file).unwrap(),
                 original_readable
             );
         }
