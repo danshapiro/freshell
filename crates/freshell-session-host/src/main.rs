@@ -1510,25 +1510,17 @@ async fn grant_execution(
                 launch.cwd = resume.cwd.clone();
             }
             if !exact_resume {
-                prepare_provider_bootstrap_files(
-                    launch.provider.as_str(),
-                    &launch.provider_bootstrap_files,
-                    launch.run_as_uid,
-                    launch.run_as_gid,
+                prepare_fresh_provider_state_at(
+                    &launch,
+                    &state.provider_config_paths,
+                    Path::new("/run/freshell-bootstrap"),
                 )
                 .map_err(|error| {
                     RuntimeError::new(
                         RuntimeErrorCode::HostUnreachable,
-                        format!("prepare hosted provider bootstrap: {error}"),
+                        format!("prepare hosted provider state: {error}"),
                     )
                 })?;
-                prepare_fresh_provider_context_at(&launch, &ProviderConfigPaths::default())
-                    .map_err(|error| {
-                        RuntimeError::new(
-                            RuntimeErrorCode::HostUnreachable,
-                            format!("prepare hosted provider config: {error}"),
-                        )
-                    })?;
             } else {
                 refresh_provider_context(
                     launch.provider_launch_context.as_ref(),
@@ -3318,20 +3310,63 @@ fn transfer_created_paths(
     Ok(())
 }
 
-fn prepare_provider_bootstrap_files(
-    provider: &str,
-    files: &[ProviderBootstrapFile],
-    run_as_uid: u32,
-    run_as_gid: u32,
+fn prepare_fresh_provider_state_at(
+    launch: &FreshAgentLaunchSpec,
+    paths: &ProviderConfigPaths,
+    bootstrap_root: &Path,
 ) -> Result<(), String> {
-    let home = Path::new("/home/freshell/provider");
+    let home = &paths.provider_home;
+    let metadata = std::fs::symlink_metadata(home).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("managed provider HOME must be a physical directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if launch.native_session_id.is_some() && metadata.uid() == launch.run_as_uid {
+            if metadata.gid() != launch.run_as_gid || metadata.permissions().mode() & 0o777 != 0o700
+            {
+                return Err("selected provider HOME ownership handoff is incomplete".into());
+            }
+            // Initial preparation assigns HOME ownership last. An explicitly
+            // selected native session can reuse that completed handoff, but
+            // still needs actual native observation before it earns evidence.
+            emit_environment_event(serde_json::json!({
+                "severity": "info", "event": "provider.environment.ownership.reused",
+                "stage": "session_host", "provider": launch.provider.as_str(),
+                "provider_uid": launch.run_as_uid, "provider_gid": launch.run_as_gid
+            }));
+            return refresh_provider_context(
+                launch.provider_launch_context.as_ref(),
+                launch.provider.native_family(),
+                &launch.workspace_path,
+                launch.run_as_uid,
+                launch.run_as_gid,
+                paths,
+            );
+        }
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.gid() != unsafe { libc::getegid() }
+        {
+            return Err(
+                "provider HOME is not owned by the selected provider or initial host".into(),
+            );
+        }
+    }
     let created = write_provider_bootstrap_files(
-        provider,
-        files,
+        launch.provider.as_str(),
+        &launch.provider_bootstrap_files,
         home,
-        Path::new("/run/freshell-bootstrap"),
+        bootstrap_root,
     )?;
-    transfer_created_paths(provider, home, &created, run_as_uid, run_as_gid)
+    transfer_created_paths(
+        launch.provider.as_str(),
+        home,
+        &created,
+        launch.run_as_uid,
+        launch.run_as_gid,
+    )?;
+    prepare_fresh_provider_context_at(launch, paths)
 }
 
 fn rollback_created_provider_paths(paths: &[PathBuf]) {
@@ -5033,6 +5068,123 @@ mod tests {
             std::fs::read(home.join(".claude/settings.json")).unwrap(),
             refreshed
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_selected_native_home_refreshes_completed_handoff_without_bootstrap() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let history = home.join(".claude/projects/work/native.jsonl");
+        std::fs::create_dir_all(history.parent().unwrap()).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&history, b"retained native history\n").unwrap();
+        let before = std::fs::metadata(&history).unwrap();
+        let selected = br#"{"permissions":{"deny":["Bash"]}}"#;
+        std::fs::write(root.path().join("settings.json"), selected).unwrap();
+        let mut launch = kilroy_typed_launch(root.path());
+        launch.native_session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+        launch.provider_bootstrap_files = vec![ProviderBootstrapFile {
+            source_path: "already-consumed-bootstrap".into(),
+            provider_relative_path: ".claude/settings.json".into(),
+        }];
+        launch.provider_launch_context.as_mut().unwrap().config =
+            vec![freshell_runtime_protocol::ProviderConfigReference {
+                root: freshell_runtime_protocol::ProviderConfigRoot::Workspace,
+                relative_path: "settings.json".into(),
+                provider_relative_path: ".claude/settings.json".into(),
+                format: "json".into(),
+            }];
+        let paths = ProviderConfigPaths {
+            private_mount: root.path().join("private"),
+            provider_home: home.clone(),
+        };
+        prepare_fresh_provider_state_at(&launch, &paths, &root.path().join("absent-bootstrap"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(home.join(".claude/settings.json")).unwrap(),
+            selected
+        );
+        assert_eq!(
+            std::fs::read(&history).unwrap(),
+            b"retained native history\n"
+        );
+        assert_eq!(std::fs::metadata(&history).unwrap().ino(), before.ino());
+        assert_eq!(std::fs::metadata(&home).unwrap().mode() & 0o777, 0o700);
+
+        launch.provider_launch_context.as_mut().unwrap().preparation =
+            freshell_runtime_protocol::ProviderPreparation::Codex {
+                tui_args: Vec::new(),
+                sidecar_args: Vec::new(),
+            };
+        assert!(prepare_fresh_provider_state_at(
+            &launch,
+            &paths,
+            &root.path().join("absent-bootstrap")
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(home.join(".claude/settings.json")).unwrap(),
+            selected
+        );
+        assert_eq!(std::fs::metadata(&history).unwrap().ino(), before.ino());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_selected_native_home_refuses_incomplete_or_indirect_handoff() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        for case in ["mode", "group", "symlink", "file"] {
+            let root = tempfile::tempdir().unwrap();
+            let real_home = root.path().join("home");
+            std::fs::create_dir(&real_home).unwrap();
+            std::fs::set_permissions(&real_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let history = real_home.join("history");
+            std::fs::write(&history, b"unchanged").unwrap();
+            let before = std::fs::metadata(&history).unwrap();
+            let mut launch = kilroy_typed_launch(root.path());
+            launch.native_session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+            let home = match case {
+                "mode" => {
+                    std::fs::set_permissions(&real_home, std::fs::Permissions::from_mode(0o750))
+                        .unwrap();
+                    real_home.clone()
+                }
+                "group" => {
+                    launch.run_as_gid = launch.run_as_gid.wrapping_add(1);
+                    real_home.clone()
+                }
+                "symlink" => {
+                    let link = root.path().join("linked-home");
+                    symlink(&real_home, &link).unwrap();
+                    link
+                }
+                "file" => history.clone(),
+                _ => unreachable!(),
+            };
+            let mode = std::fs::metadata(&real_home).unwrap().mode();
+            let paths = ProviderConfigPaths {
+                private_mount: root.path().join("private"),
+                provider_home: home,
+            };
+            assert!(
+                prepare_fresh_provider_state_at(&launch, &paths, &root.path().join("bootstrap"))
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(std::fs::read(&history).unwrap(), b"unchanged", "{case}");
+            assert_eq!(
+                std::fs::metadata(&history).unwrap().ino(),
+                before.ino(),
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::metadata(&real_home).unwrap().mode(),
+                mode,
+                "{case}"
+            );
+        }
     }
 
     #[cfg(unix)]
