@@ -2641,23 +2641,69 @@ impl CapabilityStore {
         soul_id: &SoulId,
         directory: &Path,
     ) -> Result<(), String> {
-        if let Some(grant) = self.grants.lock().unwrap().get(grant_id) {
-            if &grant.soul_id != soul_id {
-                return Err("provider input preparation belongs to another soul".into());
+        let result = (|| {
+            let mut grants = self.grants.lock().unwrap();
+            let pending = |owner: &SoulId,
+                           incarnation: Option<&IncarnationId>,
+                           preparation: Option<&InputPreparation>| {
+                if owner != soul_id {
+                    return Err("provider input preparation belongs to another soul".into());
+                }
+                if incarnation.is_some()
+                    || preparation.is_none_or(|p| p.phase != InputPreparationPhase::Pending)
+                {
+                    return Err("provider input preparation is bound or unconfirmed; retain inputs and reconcile before cleanup".into());
+                }
+                Ok::<(), String>(())
+            };
+            if let Some(grant) = grants.get(grant_id) {
+                pending(
+                    &grant.soul_id,
+                    grant.incarnation_id.as_ref(),
+                    grant.preparation.as_ref(),
+                )?;
             }
-            if grant
-                .preparation
-                .as_ref()
-                .is_some_and(|p| p.phase == InputPreparationPhase::Committed)
-            {
-                return Err(
-                    "provider input preparation is committed; reconcile before cleanup".into(),
-                );
+            let path = grant_path(directory, grant_id)?;
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    let stored = read_stored_capability(directory, grant_id)?;
+                    pending(
+                        &stored.soul_id,
+                        stored.incarnation_id.as_ref(),
+                        stored.preparation.as_ref(),
+                    )?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let stage = staged_provider_root_path(directory, grant_id)?;
+                    if !grants.contains_key(grant_id)
+                        && std::fs::symlink_metadata(stage)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        return Ok(());
+                    }
+                    return Err(
+                        "provider input preparation ownership journal is missing; retain inputs and reconcile before cleanup".into(),
+                    );
+                }
+                Err(_) => {
+                    return Err(
+                        "provider input preparation ownership journal unavailable; retain inputs and reconcile before cleanup".into(),
+                    );
+                }
             }
-        }
-        self.revoke(grant_id, directory)?;
-        tracing::info!(event="provider.inputs.preparation.aborted",grant_id,soul_id=%soul_id);
-        Ok(())
+            // No activation may bind this pending generation between the ownership
+            // check and its removal. These private filesystem operations await no IPC.
+            Self::remove_preparation_files(grant_id, directory)?;
+            grants.remove(grant_id);
+            tracing::info!(event="provider.inputs.preparation.aborted",grant_id,soul_id=%soul_id);
+            Ok(())
+        })();
+        result.map_err(|reason: String| {
+            tracing::warn!(event="provider.inputs.preparation.abort_blocked",stage="controller",
+                operation="abort",grant_id,soul_id=%soul_id,cause=%reason,
+                "Provider preparation abort unconfirmed; retain inputs and reconcile");
+            reason
+        })
     }
 
     fn activate(
@@ -2701,6 +2747,12 @@ impl CapabilityStore {
     }
 
     fn revoke(&self, grant_id: &str, directory: &Path) -> Result<(), String> {
+        Self::remove_preparation_files(grant_id, directory)?;
+        self.grants.lock().unwrap().remove(grant_id);
+        Ok(())
+    }
+
+    fn remove_preparation_files(grant_id: &str, directory: &Path) -> Result<(), String> {
         let path = grant_path(directory, grant_id)?;
         let staged = staged_provider_root_path(directory, grant_id)?;
         match std::fs::remove_file(path) {
@@ -2713,7 +2765,6 @@ impl CapabilityStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.to_string()),
         }?;
-        self.grants.lock().unwrap().remove(grant_id);
         Ok(())
     }
 
@@ -5678,6 +5729,273 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         assert!(store
             .abort_preparation(&replacement.grant_id, &soul, &dir)
             .is_err());
+    }
+
+    #[test]
+    fn managed_mcp_generation_abort_preserves_bound_inputs_after_warm_and_cold_delivery() {
+        let control = tempfile::tempdir().unwrap();
+        let directory = control.path().join("mcp-capabilities");
+        std::fs::create_dir(&directory).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let endpoint = "http://host.docker.internal:4000";
+        let prior = store
+            .issue(
+                soul.clone(),
+                &directory,
+                endpoint.into(),
+                Some(("codex", home.path(), &[])),
+                Default::default(),
+                None,
+            )
+            .unwrap();
+        let prior_incarnation = IncarnationId::new();
+        store
+            .activate(
+                &prior.grant_id,
+                soul.clone(),
+                prior_incarnation.clone(),
+                &directory,
+                endpoint,
+            )
+            .unwrap();
+        store
+            .commit_preparation(&prior.grant_id, &soul, &prior_incarnation, &directory)
+            .unwrap();
+        let prior_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+        std::fs::write(prior_stage.join("usable-resource"), b"prior-input-nonce").unwrap();
+        let replacement = store
+            .issue_replacement(
+                soul.clone(),
+                &directory,
+                endpoint.into(),
+                Some(("codex", home.path(), &[])),
+                None,
+                Some(home.path()),
+            )
+            .unwrap();
+        let incarnation = IncarnationId::new();
+        store
+            .activate(
+                &replacement.grant_id,
+                soul.clone(),
+                incarnation.clone(),
+                &directory,
+                endpoint,
+            )
+            .unwrap();
+        let stage = staged_provider_root_path(&directory, &replacement.grant_id).unwrap();
+        std::fs::write(stage.join("usable-resource"), b"bound-input-nonce").unwrap();
+        let path = grant_path(&directory, &replacement.grant_id).unwrap();
+        let journal = std::fs::read(&path).unwrap();
+        let (prior_scope, current_scope) = {
+            let grants = store.grants.lock().unwrap();
+            (
+                grants[&prior.grant_id].token.clone(),
+                grants[&replacement.grant_id].token.clone(),
+            )
+        };
+        // Empty controller memory is not evidence that this preparation was
+        // never delivered. Its bounded durable record still belongs to a host.
+        let cold =
+            CapabilityStore::default().abort_preparation(&replacement.grant_id, &soul, &directory);
+        let warm = store.abort_preparation(&replacement.grant_id, &soul, &directory);
+        eprintln!(
+            "bound_preparation_abort {}",
+            serde_json::json!({
+                "coldAbortSucceeded":cold.is_ok(), "warmAbortSucceeded":warm.is_ok(),
+                "currentInputsRetained":stage.is_dir(),
+                "priorInputsRetained":prior_stage.is_dir()
+            })
+        );
+        assert!(
+            cold.is_err(),
+            "cold abort erased bound preparation ownership"
+        );
+        assert!(
+            warm.is_err(),
+            "warm abort erased bound preparation ownership"
+        );
+        assert!(std::fs::read(&path).unwrap() == journal);
+        assert_eq!(
+            std::fs::read(stage.join("usable-resource")).unwrap(),
+            b"bound-input-nonce"
+        );
+        assert_eq!(
+            std::fs::read(prior_stage.join("usable-resource")).unwrap(),
+            b"prior-input-nonce"
+        );
+        assert!(store.authenticates(&prior_scope));
+        assert!(store.authenticates(&current_scope));
+        let repeated = store
+            .issue_replacement(
+                soul.clone(),
+                &directory,
+                endpoint.into(),
+                Some(("codex", home.path(), &[])),
+                None,
+                Some(home.path()),
+            )
+            .unwrap();
+        assert_eq!(
+            repeated.grant_id, replacement.grant_id,
+            "uncertain bound delivery cannot authorize another generation"
+        );
+        let restored = read_stored_capability(&directory, &replacement.grant_id).unwrap();
+        assert_eq!(restored.incarnation_id.as_ref(), Some(&incarnation));
+        assert!(matches!(
+            restored.preparation.unwrap().phase,
+            InputPreparationPhase::Bound
+        ));
+    }
+
+    #[test]
+    fn managed_mcp_generation_abort_cold_pending_requires_complete_matching_ownership() {
+        use std::io::Read;
+        let mut failed = Vec::new();
+        for case in [
+            "pending",
+            "missing",
+            "malformed",
+            "oversize",
+            "other_soul",
+            "assigned_pending",
+            "unrecorded",
+        ] {
+            let control = tempfile::tempdir().unwrap();
+            let directory = control.path().join("mcp-capabilities");
+            std::fs::create_dir(&directory).unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let store = CapabilityStore::default();
+            let soul = SoulId::new();
+            let endpoint = "http://host.docker.internal:4000";
+            let prior = store
+                .issue(
+                    soul.clone(),
+                    &directory,
+                    endpoint.into(),
+                    Some(("codex", home.path(), &[])),
+                    Default::default(),
+                    None,
+                )
+                .unwrap();
+            let incarnation = IncarnationId::new();
+            store
+                .activate(
+                    &prior.grant_id,
+                    soul.clone(),
+                    incarnation.clone(),
+                    &directory,
+                    endpoint,
+                )
+                .unwrap();
+            store
+                .commit_preparation(&prior.grant_id, &soul, &incarnation, &directory)
+                .unwrap();
+            let prior_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+            std::fs::write(prior_stage.join("usable-resource"), b"prior-input-nonce").unwrap();
+            let pending = store
+                .issue_replacement(
+                    soul.clone(),
+                    &directory,
+                    endpoint.into(),
+                    Some(("codex", home.path(), &[])),
+                    None,
+                    Some(home.path()),
+                )
+                .unwrap();
+            let stage = staged_provider_root_path(&directory, &pending.grant_id).unwrap();
+            std::fs::write(stage.join("usable-resource"), b"pending-input-nonce").unwrap();
+            let path = grant_path(&directory, &pending.grant_id).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+            match case {
+                "missing" => std::fs::remove_file(&path).unwrap(),
+                "malformed" => std::fs::write(&path, b"{\"preparation\":").unwrap(),
+                "oversize" => {
+                    let mut file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&path)
+                        .unwrap();
+                    file.set_len(128 * 1024 + 1).unwrap();
+                    file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
+                        .unwrap();
+                    file.read_exact(&mut [0]).unwrap();
+                    assert_ne!(
+                        file.metadata().unwrap().accessed().unwrap(),
+                        old_access,
+                        "fixture filesystem must observe ownership payload reads"
+                    );
+                    file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
+                        .unwrap();
+                }
+                "assigned_pending" | "unrecorded" => {
+                    let mut stored: serde_json::Value = serde_json::from_slice(&before).unwrap();
+                    if case == "assigned_pending" {
+                        stored["incarnationId"] =
+                            serde_json::to_value(IncarnationId::new()).unwrap();
+                    } else {
+                        stored.as_object_mut().unwrap().remove("preparation");
+                    }
+                    std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+                }
+                _ => {}
+            }
+            let requested_soul = if case == "other_soul" {
+                SoulId::new()
+            } else {
+                soul
+            };
+            let modified = if matches!(case, "assigned_pending" | "unrecorded") {
+                Some(std::fs::read(&path).unwrap())
+            } else {
+                None
+            };
+            let cold = CapabilityStore::default();
+            let result = cold.abort_preparation(&pending.grant_id, &requested_soul, &directory);
+            let prior_retained = std::fs::read(prior_stage.join("usable-resource"))
+                .is_ok_and(|bytes| bytes == b"prior-input-nonce");
+            let current_retained = std::fs::read(stage.join("usable-resource"))
+                .is_ok_and(|bytes| bytes == b"pending-input-nonce");
+            eprintln!(
+                "cold_preparation_abort {}",
+                serde_json::json!({
+                    "case":case,"abortSucceeded":result.is_ok(),
+                    "currentInputsRetained":current_retained,"priorInputsRetained":prior_retained
+                })
+            );
+            let journal_retained = match case {
+                "pending" | "missing" => !path.exists(),
+                "malformed" => {
+                    std::fs::read(&path).is_ok_and(|bytes| bytes == b"{\"preparation\":")
+                }
+                "oversize" => std::fs::metadata(&path).is_ok_and(|metadata| {
+                    metadata.len() == 128 * 1024 + 1 && metadata.accessed().unwrap() == old_access
+                }),
+                "assigned_pending" | "unrecorded" => {
+                    std::fs::read(&path).is_ok_and(|bytes| Some(bytes) == modified)
+                }
+                _ => std::fs::read(&path).is_ok_and(|bytes| bytes == before),
+            };
+            let expected_success = case == "pending";
+            if result.is_ok() != expected_success
+                || !prior_retained
+                || !journal_retained
+                || current_retained == expected_success
+            {
+                failed.push(case);
+            }
+            if case == "pending" {
+                assert!(
+                    cold.abort_preparation(&pending.grant_id, &requested_soul, &directory)
+                        .is_ok(),
+                    "completed undispatched abort must be idempotent"
+                );
+            }
+        }
+        assert!(failed.is_empty(), "cold pending abort changed unconfirmed ownership or rejected an undispatched preparation: {failed:?}");
     }
 
     #[test]
