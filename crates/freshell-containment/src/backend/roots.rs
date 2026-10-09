@@ -47,15 +47,18 @@ impl UnitBackend for RootsUnit {
         })
     }
 
-    fn kill_all(self: Arc<Self>, _roots: Vec<u32>) -> BoxFuture<'static, io::Result<KillSummary>> {
+    fn kill_all(
+        self: Arc<Self>,
+        _roots: Vec<(u32, u64)>,
+    ) -> BoxFuture<'static, io::Result<KillSummary>> {
         Box::pin(async { Ok(KillSummary::default()) })
     }
 
-    fn members(&self, _roots: &[u32]) -> io::Result<Vec<ProcIdentity>> {
+    fn members(&self, _roots: &[(u32, u64)]) -> io::Result<Vec<ProcIdentity>> {
         Ok(Vec::new())
     }
 
-    fn confirm_placement(&self, _pid: u32, _roots: &[u32]) -> io::Result<()> {
+    fn confirm_placement(&self, _pid: u32, _roots: &[(u32, u64)]) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "placement confirmation arrives with job objects (Task 6)",

@@ -235,8 +235,9 @@ fn sweep_own_tree() {
             let spared = daemon_family_within(&candidates);
             (candidates, spared)
         },
-        |pid, candidates| {
-            process::parent(pid).is_some_and(|parent| parent == me || candidates.contains(&parent))
+        |watch, candidates| {
+            process::parent(watch.pid())
+                .is_some_and(|parent| parent == me || candidates.contains(&parent))
         },
     );
 }

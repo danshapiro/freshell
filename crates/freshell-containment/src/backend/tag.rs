@@ -1,7 +1,9 @@
 //! Tag backend (Linux without a user systemd manager; macOS until Task 7
 //! fills in its facts). A unit's members are the processes carrying its
-//! environment tag, the live pinned roots, and every descendant of those,
-//! computed fresh at each call from one-shot `/proc` reads, never by polling.
+//! environment tag, the live pinned roots (each admitted only while its pid
+//! still names the incarnation that started at its recorded start time), and
+//! every descendant of those, computed fresh at each call from one-shot
+//! `/proc` reads, never by polling.
 //!
 //! On Linux every member the unit spawns starts under the `__unit-exec
 //! --reaper` shim (`crate::reaper`), a child subreaper: the kernel reparents
@@ -142,7 +144,7 @@ impl TagUnit {
     /// One reading of the unit. `count_withheld` also counts the same-uid
     /// processes whose environment is unreadable (one extra read each), which
     /// each call does once.
-    fn scan(&self, roots: &[u32], count_withheld: bool) -> Scan {
+    fn scan(&self, roots: &[(u32, u64)], count_withheld: bool) -> Scan {
         let me = std::process::id();
         // SAFETY: getuid has no preconditions and cannot fail.
         let my_uid = unsafe { libc::getuid() };
@@ -167,8 +169,8 @@ impl TagUnit {
         candidates.extend(
             roots
                 .iter()
-                .copied()
-                .filter(|p| *p != me && process::is_running(*p)),
+                .filter(|(pid, start)| *pid != me && is_live_root(*pid, *start))
+                .map(|(pid, _)| *pid),
         );
         let mut candidates = with_descendants(candidates, me);
         // A zombie can be neither signalled nor a parent any more.
@@ -191,7 +193,7 @@ impl TagUnit {
         }
     }
 
-    fn kill_all_now(&self, roots: &[u32]) -> io::Result<KillSummary> {
+    fn kill_all_now(&self, roots: &[(u32, u64)]) -> io::Result<KillSummary> {
         let mut withheld = None;
         let summary = stop_the_world(
             || {
@@ -199,9 +201,10 @@ impl TagUnit {
                 withheld.get_or_insert(scan.withheld);
                 (scan.candidates, scan.spared)
             },
-            |pid, candidates| {
+            |watch, candidates| {
+                let pid = watch.pid();
                 self.carries_tag(pid)
-                    || roots.contains(&pid)
+                    || roots.contains(&(pid, watch.identity().start))
                     || process::parent(pid).is_some_and(|pp| candidates.contains(&pp))
             },
         );
@@ -218,7 +221,10 @@ impl UnitBackend for TagUnit {
         })
     }
 
-    fn kill_all(self: Arc<Self>, roots: Vec<u32>) -> BoxFuture<'static, io::Result<KillSummary>> {
+    fn kill_all(
+        self: Arc<Self>,
+        roots: Vec<(u32, u64)>,
+    ) -> BoxFuture<'static, io::Result<KillSummary>> {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || self.kill_all_now(&roots))
                 .await
@@ -226,7 +232,7 @@ impl UnitBackend for TagUnit {
         })
     }
 
-    fn members(&self, roots: &[u32]) -> io::Result<Vec<ProcIdentity>> {
+    fn members(&self, roots: &[(u32, u64)]) -> io::Result<Vec<ProcIdentity>> {
         let scan = self.scan(roots, true);
         self.log_withheld(scan.withheld);
         Ok(scan
@@ -236,21 +242,26 @@ impl UnitBackend for TagUnit {
             .collect())
     }
 
-    fn confirm_placement(&self, pid: u32, roots: &[u32]) -> io::Result<()> {
+    fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {
         if !process::is_running(pid) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("process {pid} is gone"),
             ));
         }
-        if self.carries_tag(pid) || roots.contains(&pid) {
+        let is_root = |pid: u32| {
+            roots
+                .iter()
+                .any(|(root, start)| *root == pid && is_live_root(pid, *start))
+        };
+        if self.carries_tag(pid) || is_root(pid) {
             return Ok(());
         }
         let mut at = pid;
         for _ in 0..MAX_ANCESTRY {
             match process::parent(at) {
                 Some(up) if up > 1 => {
-                    if roots.contains(&up) {
+                    if is_root(up) {
                         return Ok(());
                     }
                     at = up;
@@ -271,6 +282,12 @@ impl UnitBackend for TagUnit {
     fn remove(&self, _emptied: bool) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Whether `pid` is running and is still the incarnation that started at
+/// `start` (a root that exited and whose pid was reused is not).
+fn is_live_root(pid: u32, start: u64) -> bool {
+    process::is_running(pid) && process::start_time(pid).is_ok_and(|now| now == start)
 }
 
 /// `set` plus every descendant of its processes (one-shot child reads),
@@ -302,8 +319,9 @@ pub(crate) fn daemon_family_within(set: &BTreeSet<u32>) -> BTreeSet<u32> {
 /// The stop-the-world sweep shared by the tag backend and the reaper shim.
 ///
 /// `find` is one one-shot reading: (candidates, spared). `belongs` re-checks
-/// a pinned candidate against the round's candidates, so a pid recycled
-/// between the reading and the pin is never stopped. In rounds (at most
+/// a pinned candidate (given its watch, whose identity names the pinned
+/// incarnation) against the round's candidates, so a pid recycled between the
+/// reading and the pin is never stopped. In rounds (at most
 /// [`MAX_ROUNDS`], ending when a round finds nothing new) every new
 /// non-spared candidate is pinned, re-verified, confirmed not yet exited and
 /// stopped with SIGSTOP through its watch. Then each stopped process's argv
@@ -313,7 +331,7 @@ pub(crate) fn daemon_family_within(set: &BTreeSet<u32>) -> BTreeSet<u32> {
 /// the killed processes to exit.
 pub(crate) fn stop_the_world(
     mut find: impl FnMut() -> (BTreeSet<u32>, BTreeSet<u32>),
-    belongs: impl Fn(u32, &BTreeSet<u32>) -> bool,
+    belongs: impl Fn(&ProcWatch, &BTreeSet<u32>) -> bool,
 ) -> io::Result<KillSummary> {
     let mut stopped: BTreeMap<u32, ProcWatch> = BTreeMap::new();
     // Every pid already handled: stopped, gone, or refused as not a member.
@@ -343,7 +361,7 @@ pub(crate) fn stop_the_world(
             };
             // The membership read must refer to the pinned incarnation: it
             // still has not exited after the read.
-            if !belongs(pid, &candidates) || watch.has_exited() {
+            if !belongs(&watch, &candidates) || watch.has_exited() {
                 continue;
             }
             if watch.send(libc::SIGSTOP).is_ok() {
@@ -376,4 +394,72 @@ pub(crate) fn stop_the_world(
             .filter_map(|pid| process::identity(*pid).ok())
             .collect(),
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::proc_watch::Sig;
+    use std::time::Duration;
+
+    /// A plain `sleep 600` child of the test (no tag), pinned while it is
+    /// our own unreaped child, killed through that pin and reaped on drop.
+    struct Sleep {
+        child: std::process::Child,
+        watch: ProcWatch,
+    }
+
+    impl Sleep {
+        fn start() -> Self {
+            let child = std::process::Command::new("sleep")
+                .arg("600")
+                .spawn()
+                .unwrap();
+            let watch = ProcWatch::open(child.id()).unwrap();
+            Self { child, watch }
+        }
+    }
+
+    impl Drop for Sleep {
+        fn drop(&mut self) {
+            let _ = self.watch.signal(Sig::Kill);
+            let _ = self.child.wait();
+        }
+    }
+
+    fn fresh_unit() -> TagUnit {
+        let id = UnitId::mint();
+        TagUnit::new(UNIT_ENV, id.as_str(), &id, None)
+    }
+
+    /// A root whose pid now names another process (the root exited and its
+    /// pid was reused) must never be treated as a member: not listed, not
+    /// confirmed, not signalled.
+    #[test]
+    fn a_root_whose_start_time_no_longer_matches_is_not_a_member() {
+        let mut sleep = Sleep::start();
+        let (pid, start) = (sleep.watch.pid(), sleep.watch.identity().start);
+        let unit = fresh_unit();
+        let stale = [(pid, start + 1)];
+        assert!(
+            unit.members(&stale).unwrap().iter().all(|m| m.pid != pid),
+            "a root with another start time was listed as a member"
+        );
+        let refused = unit.confirm_placement(pid, &stale).unwrap_err();
+        assert_ne!(refused.kind(), io::ErrorKind::NotFound, "{refused}");
+        unit.kill_all_now(&stale).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !sleep.watch.has_exited(),
+            "a root with another start time was killed"
+        );
+
+        // The same process recorded with its own start time is a root.
+        let current = [(pid, start)];
+        assert!(unit.members(&current).unwrap().iter().any(|m| m.pid == pid));
+        unit.confirm_placement(pid, &current).unwrap();
+        unit.kill_all_now(&current).unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(sleep.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
 }

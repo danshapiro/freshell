@@ -480,7 +480,9 @@ impl AgentUnit {
     /// LB-27). Callers run it once at the start's settle point; an error is
     /// a typed start failure (`events::placement_failed`).
     pub fn confirm_placement(&self, pid: u32) -> io::Result<()> {
-        self.inner.backend.confirm_placement(pid, &self.root_pids())
+        self.inner
+            .backend
+            .confirm_placement(pid, &self.live_roots())
     }
 
     /// Adds one conversation key to the record (nothing is written when it
@@ -503,7 +505,7 @@ impl AgentUnit {
     /// backend a scan of every process), so async callers run it on a
     /// blocking task.
     pub fn members(&self) -> io::Result<Vec<ProcIdentity>> {
-        self.inner.backend.members(&self.root_pids())
+        self.inner.backend.members(&self.live_roots())
     }
 
     pub fn stop_in_flight(&self) -> Option<StopHandle> {
@@ -861,13 +863,7 @@ impl AgentUnit {
     ) -> Option<Vec<ProcIdentity>> {
         let mut pinned = self.pinned_watches();
         pinned.extend(extra.iter().cloned());
-        let mut roots: Vec<u32> = pinned
-            .iter()
-            .filter(|w| !w.has_exited())
-            .map(ProcWatch::pid)
-            .collect();
-        roots.sort_unstable();
-        roots.dedup();
+        let roots = live_identities(&pinned);
         let spared = match self.inner.backend.clone().kill_all(roots).await {
             Ok(summary) => Some(summary.spared),
             Err(err) => {
@@ -1098,16 +1094,10 @@ impl AgentUnit {
             .collect()
     }
 
-    fn root_pids(&self) -> Vec<u32> {
-        let mut pids: Vec<u32> = self
-            .pinned_watches()
-            .iter()
-            .filter(|w| !w.has_exited())
-            .map(ProcWatch::pid)
-            .collect();
-        pids.sort_unstable();
-        pids.dedup();
-        pids
+    /// The live pinned processes as `(pid, start time)`: the roots a
+    /// backend admits only while each pid still names that incarnation.
+    fn live_roots(&self) -> Vec<(u32, u64)> {
+        live_identities(&self.pinned_watches())
     }
 
     /// Applies `change` to the record and writes it. A failed write is
@@ -1135,6 +1125,18 @@ impl AgentUnit {
             operation_id,
         }
     }
+}
+
+/// The not-yet-exited `watches` as sorted, distinct `(pid, start time)`.
+fn live_identities(watches: &[ProcWatch]) -> Vec<(u32, u64)> {
+    let mut roots: Vec<(u32, u64)> = watches
+        .iter()
+        .filter(|w| !w.has_exited())
+        .map(identity_of)
+        .collect();
+    roots.sort_unstable();
+    roots.dedup();
+    roots
 }
 
 fn is_spared(watch: &ProcWatch, spared: &[ProcIdentity]) -> bool {

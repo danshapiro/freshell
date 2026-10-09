@@ -68,15 +68,23 @@ pub(crate) trait Backend: Send + Sync {
 pub(crate) trait UnitBackend: Send + Sync {
     /// How a member is started (`seq` numbers the unit's member spawns).
     fn placement(&self, role: MemberRole, seq: u32) -> io::Result<Placement>;
-    /// Kill every member (and every live process among `roots` and their
-    /// descendants), sparing the Codex daemon family. Never signals a bare
-    /// pid: every signal goes through a pinned `ProcWatch`.
-    fn kill_all(self: Arc<Self>, roots: Vec<u32>) -> BoxFuture<'static, io::Result<KillSummary>>;
+    /// Kill every member (and every live root plus their descendants),
+    /// sparing the Codex daemon family. Never signals a bare pid: every
+    /// signal goes through a pinned `ProcWatch`.
+    ///
+    /// `roots` (here and below) are the unit's pinned processes as
+    /// `(pid, start time)`. A root counts only while its pid still names the
+    /// process that started at that time, so a root that exited and whose
+    /// pid was reused is never treated as a member.
+    fn kill_all(
+        self: Arc<Self>,
+        roots: Vec<(u32, u64)>,
+    ) -> BoxFuture<'static, io::Result<KillSummary>>;
     /// The live, non-spared members right now (one-shot reads).
-    fn members(&self, roots: &[u32]) -> io::Result<Vec<ProcIdentity>>;
+    fn members(&self, roots: &[(u32, u64)]) -> io::Result<Vec<ProcIdentity>>;
     /// One-shot: `Ok` when `pid` is in the unit, `ErrorKind::NotFound` when
     /// it is gone, another error when it lives outside the unit.
-    fn confirm_placement(&self, pid: u32, roots: &[u32]) -> io::Result<()>;
+    fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()>;
     /// The kernel's "unit is empty" event, when the backend has one.
     fn wait_empty(&self) -> Option<BoxFuture<'static, ()>>;
     /// Release the unit's OS container after the post-Gone sweep;
