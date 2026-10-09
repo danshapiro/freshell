@@ -2841,6 +2841,10 @@ impl Registry {
             if changed != 1 {
                 return Err(RegistryError::RecoveryBlocked { soul_id, reason: "STOP_INTENT_OR_STALE_ATTEMPT".into() });
             }
+            // Rearm the exhausted success window with the deliberate intent,
+            // before a transient probe can defer replacement until a later
+            // automatic attempt (including after a supervisor restart).
+            rearm_exhausted_success_window(&tx, &soul_id, now_millis())?;
             // Writer ownership follows the explicit action without changing
             // the provider root or any identity/evidence revision.
             tx.execute("UPDATE writer_claims SET intent_revision=?1 WHERE soul_id=?2", params![next,soul_id.as_str()])?;
@@ -2943,10 +2947,7 @@ impl Registry {
                 // A deliberate user retry is the explicit rearm operation. It
                 // clears the persisted flap window but keeps identity/history
                 // intact and still runs through the same fenced transaction.
-                tx.execute(
-                    "UPDATE souls SET recovery_window_started_at=?1,successful_recoveries_in_window=0,updated_at=?1 WHERE soul_id=?2",
-                    params![now, context.soul_id.as_str()],
-                )?;
+                rearm_exhausted_success_window(&tx, &context.soul_id, now)?;
             }
             let attempt_id = reserved.clone().unwrap_or_default();
             let trigger_name = recovery_trigger_name(trigger);
@@ -3606,6 +3607,26 @@ fn parse_runtime_profile(value: &str) -> Result<RuntimeProfile, RegistryError> {
 pub fn stable_provider_volume_name(installation: &InstallationId, soul: &SoulId) -> String {
     let digest = Sha256::digest(format!("{}\0{}", installation.as_str(), soul.as_str()).as_bytes());
     format!("freshell-provider-{digest:x}")[..42].to_string()
+}
+
+fn rearm_exhausted_success_window(
+    tx: &Connection,
+    soul_id: &SoulId,
+    now: i64,
+) -> Result<(), RegistryError> {
+    let (window_started, successes) = tx.query_row(
+        "SELECT recovery_window_started_at,successful_recoveries_in_window FROM souls WHERE soul_id=?1",
+        [soul_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if !freshell_agent_runtime::successful_recovery_budget_available(window_started, successes, now)
+    {
+        tx.execute(
+            "UPDATE souls SET recovery_window_started_at=?1,successful_recoveries_in_window=0 WHERE soul_id=?2",
+            params![now, soul_id.as_str()],
+        )?;
+    }
+    Ok(())
 }
 
 fn charge_successful_recovery(
