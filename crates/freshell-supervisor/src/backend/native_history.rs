@@ -6,6 +6,152 @@ const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REPAIR_RECEIPT_BYTES: usize = 64 * 1024;
 const OPENCODE_PROVIDER_HOME: &str = "/home/freshell/provider";
 
+/// Body-free diagnostics for this helper only. Strings are selected from fixed
+/// categories, never copied from Docker bodies, stderr, or error Display text.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoppedRepairFailure {
+    pub category: &'static str,
+    pub wait_http_status: Option<u16>,
+    pub helper_exit: Option<i64>,
+    pub diagnostic_status: &'static str,
+    pub log_bytes: Option<usize>,
+    pub stderr_bytes: Option<usize>,
+    pub stage: Option<&'static str>,
+    pub error_class: Option<&'static str>,
+    pub io_kind: Option<&'static str>,
+    pub errno: Option<i32>,
+    pub sqlite_code: Option<i32>,
+    pub child_exit: Option<i32>,
+    pub child_signal: Option<i32>,
+}
+
+impl StoppedRepairFailure {
+    pub(crate) fn new(category: &'static str) -> Self {
+        Self {
+            category,
+            wait_http_status: None,
+            helper_exit: None,
+            diagnostic_status: "unavailable",
+            log_bytes: None,
+            stderr_bytes: None,
+            stage: None,
+            error_class: None,
+            io_kind: None,
+            errno: None,
+            sqlite_code: None,
+            child_exit: None,
+            child_signal: None,
+        }
+    }
+
+    fn read_logs(&mut self, bytes: &[u8]) {
+        self.log_bytes = Some(bytes.len());
+        // stdout never participates in failure classification or receipt parsing.
+        let mut cursor = 0;
+        let mut stderr = Vec::new();
+        while cursor < bytes.len() {
+            let Some(header) = bytes.get(cursor..cursor.saturating_add(8)) else {
+                self.diagnostic_status = "truncated";
+                return;
+            };
+            if !matches!(header[0], 1 | 2) || header[1..4] != [0, 0, 0] {
+                self.diagnostic_status = "malformed";
+                return;
+            }
+            let length = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+            let Some(end) = cursor.checked_add(8).and_then(|n| n.checked_add(length)) else {
+                self.diagnostic_status = "truncated";
+                return;
+            };
+            let Some(payload) = bytes.get(cursor + 8..end) else {
+                self.diagnostic_status = "truncated";
+                return;
+            };
+            if header[0] == 2 {
+                if stderr.len().saturating_add(length) > MAX_REPAIR_RECEIPT_BYTES {
+                    self.diagnostic_status = "truncated";
+                    return;
+                }
+                stderr.extend_from_slice(payload);
+            }
+            cursor = end;
+        }
+        self.stderr_bytes = Some(stderr.len());
+        self.diagnostic_status = if stderr.is_empty() {
+            "absent"
+        } else {
+            "unrecognized"
+        };
+        for record in String::from_utf8_lossy(&stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        {
+            if record["event"] != "session_host.opencode_repair.failed"
+                || record["severity"] != "error"
+            {
+                continue;
+            }
+            self.stage = match record["stage"].as_str() {
+                Some("stage_validation") => Some("stage_validation"),
+                Some("identity_spawn") => Some("identity_spawn"),
+                Some("input_stream") => Some("input_stream"),
+                Some("import") => Some("import"),
+                Some("reader") => Some("reader"),
+                Some("receipt_validation") => Some("receipt_validation"),
+                _ => continue,
+            };
+            self.error_class = match record["errorClass"].as_str() {
+                Some("io") => Some("io"),
+                Some("sqlite") => Some("sqlite"),
+                Some("blocked") => Some("blocked"),
+                Some("metadata") => Some("metadata"),
+                Some("validation") => Some("validation"),
+                Some("process") => Some("process"),
+                _ => {
+                    self.stage = None;
+                    continue;
+                }
+            };
+            self.io_kind = match record["ioKind"].as_str() {
+                Some("PermissionDenied") => Some("PermissionDenied"),
+                Some("NotFound") => Some("NotFound"),
+                Some("AlreadyExists") => Some("AlreadyExists"),
+                Some("InvalidData") => Some("InvalidData"),
+                Some("InvalidInput") => Some("InvalidInput"),
+                Some("StorageFull") => Some("StorageFull"),
+                Some("BrokenPipe") => Some("BrokenPipe"),
+                Some("UnexpectedEof") => Some("UnexpectedEof"),
+                Some(_) => Some("Other"),
+                None => None,
+            };
+            let number = |key: &str| record[key].as_i64().and_then(|n| i32::try_from(n).ok());
+            self.errno = number("errno");
+            self.sqlite_code = number("sqliteCode");
+            self.child_exit = number("childExit");
+            self.child_signal = number("childSignal");
+            self.diagnostic_status = "available";
+            break;
+        }
+    }
+}
+
+impl std::fmt::Display for StoppedRepairFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "category={} helper_exit={} stage={} class={} diagnostic={}",
+            self.category,
+            self.helper_exit
+                .map(|exit| exit.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            self.stage.unwrap_or("unknown"),
+            self.error_class.unwrap_or("unknown"),
+            self.diagnostic_status
+        )
+    }
+}
+
 struct ReadonlyNativeReader {
     image_ref: String,
     uid: u32,
@@ -188,6 +334,11 @@ impl DockerEngineBackend {
         let binary = canonical_regular_file(handle.host_binary_path())?;
         let name = format!("freshell-opencode-repair-{}", uuid::Uuid::new_v4());
         let mut create_attempted = false;
+        let mut helper_id = None;
+        let mut failure = StoppedRepairFailure::new("helper_operation_failed");
+        // Keep the original successful-operation deadline. Failure diagnostics
+        // use only its remaining time; cleanup retains its separate five-second cap.
+        let deadline = tokio::time::Instant::now() + budget;
         let operation = async {
             if self.daemon_id().await? != *handle.daemon_id() {
                 return Err(BackendError::OwnershipMismatch(
@@ -270,12 +421,14 @@ impl DockerEngineBackend {
             let id = created["Id"].as_str().ok_or_else(|| {
                 BackendError::Malformed("stopped OpenCode repair helper has no id".into())
             })?;
+            helper_id = Some(id.to_owned());
             let started = self
                 .request("POST", &format!("{DOCKER_API}/containers/{id}/start"), None)
                 .await?;
             if started.status != 204 {
                 return Err(started.as_error());
             }
+            failure.category = "wait_transport_failed";
             let waited = self
                 .request_bounded(
                     "POST",
@@ -284,16 +437,31 @@ impl DockerEngineBackend {
                     64 * 1024,
                 )
                 .await?;
+            failure.wait_http_status = Some(waited.status);
+            failure.category = "wait_http_failed";
             if waited.status != 200 {
-                return Err(waited.as_error());
-            }
-            let waited: Value = serde_json::from_slice(&waited.body)
-                .map_err(|error| BackendError::Malformed(error.to_string()))?;
-            if waited["StatusCode"].as_i64() != Some(0) {
                 return Err(BackendError::Unavailable(
-                    "stopped OpenCode import or provider-reader check failed".into(),
+                    "stopped helper wait HTTP failed".into(),
                 ));
             }
+            failure.category = "wait_malformed";
+            let waited: Value = serde_json::from_slice(&waited.body).map_err(|_| {
+                BackendError::Malformed("stopped helper wait JSON is invalid".into())
+            })?;
+            failure.helper_exit = waited["StatusCode"].as_i64();
+            failure.category = if waited.get("Error").is_some_and(|error| !error.is_null()) {
+                "wait_engine_error"
+            } else if failure.helper_exit.is_none() {
+                "wait_exit_unknown"
+            } else {
+                "helper_nonzero_exit"
+            };
+            if failure.helper_exit != Some(0) || failure.category == "wait_engine_error" {
+                return Err(BackendError::Unavailable(
+                    "stopped helper did not succeed".into(),
+                ));
+            }
+            failure.category = "receipt_failed";
             let logs = self
                 .request_bounded(
                     "GET",
@@ -315,13 +483,46 @@ impl DockerEngineBackend {
             serde_json::from_slice::<StoppedOpenCodeRepairReceipts>(&output)
                 .map_err(|error| BackendError::Malformed(error.to_string()))
         };
-        let result = tokio::time::timeout(budget, operation)
-            .await
-            .unwrap_or_else(|_| {
+        let mut result = match tokio::time::timeout_at(deadline, operation).await {
+            Ok(result) => result,
+            Err(_) => {
+                failure.category = "helper_timeout";
                 Err(BackendError::Unavailable(
                     "stopped OpenCode repair helper timed out".into(),
                 ))
-            });
+            }
+        };
+        if result.is_err() && create_attempted {
+            let diagnostic_budget = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_secs(5));
+            if diagnostic_budget.is_zero() {
+                failure.diagnostic_status = "budget_exhausted";
+            } else if let Some(id) = helper_id {
+                match tokio::time::timeout(
+                    diagnostic_budget,
+                    self.request_bounded(
+                        "GET",
+                        &format!("{DOCKER_API}/containers/{id}/logs?stdout=1&stderr=1"),
+                        None,
+                        MAX_REPAIR_RECEIPT_BYTES as u64,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(logs)) if logs.status == 200 => failure.read_logs(&logs.body),
+                    Ok(Ok(_)) => failure.diagnostic_status = "http_failed",
+                    Ok(Err(_)) => failure.diagnostic_status = "transport_or_bound_failed",
+                    Err(_) => failure.diagnostic_status = "timeout",
+                }
+            }
+            tracing::error!(soul_id=%handle.soul_id(), incarnation_id=%handle.incarnation_id(), helper=%name,
+                source_store_id=%descriptor.source_store_id, destination_store_id=%descriptor.destination_store_id,
+                root_session_id=%descriptor.root_session_id, source_generation=%descriptor.source_generation,
+                transfer_id=%descriptor.transfer_id, diagnostic=%serde_json::to_string(&failure).expect("safe diagnostic JSON"),
+                "runtime.stopped_opencode_repair_failed");
+            result = Err(BackendError::StoppedRepair(Box::new(failure)));
+        }
         if !create_attempted {
             return result;
         }
@@ -336,11 +537,19 @@ impl DockerEngineBackend {
         .await;
         match cleanup {
             Ok(Ok(response)) if response.status == 204 || response.status == 404 => {}
-            _ => {
-                tracing::warn!(soul_id=%handle.soul_id(), helper=%name, "runtime.stopped_opencode_repair_cleanup_failed");
-                return Err(BackendError::Unavailable(
-                    "stopped OpenCode repair helper cleanup failed".into(),
-                ));
+            failed => {
+                let (category, http_status) = match failed {
+                    Ok(Ok(response)) => ("http_failed", Some(response.status)),
+                    Ok(Err(_)) => ("transport_failed", None),
+                    Err(_) => ("timeout", None),
+                };
+                tracing::warn!(soul_id=%handle.soul_id(), helper=%name, category, http_status,
+                    "runtime.stopped_opencode_repair_cleanup_failed");
+                if result.is_ok() {
+                    return Err(BackendError::Unavailable(
+                        "stopped OpenCode repair helper cleanup failed".into(),
+                    ));
+                }
             }
         }
         result
@@ -1012,6 +1221,32 @@ mod tests {
 
     #[tokio::test]
     async fn stopped_repair_uses_a_no_tty_identity_helper_with_only_uid_gid_capabilities() {
+        check_stopped_repair_helper(None).await;
+    }
+
+    #[tokio::test]
+    async fn stopped_repair_failed_helper_retains_diagnostics_before_cleanup() {
+        for failure in [
+            "exit",
+            "malformed_wait",
+            "unknown_exit",
+            "wait_http",
+            "engine_error",
+            "logs_http",
+            "oversize",
+            "truncated",
+            "unknown_output",
+            "cleanup",
+            "wait_timeout",
+            "logs_timeout",
+            "stdout_diagnostic",
+            "malformed_logs",
+        ] {
+            check_stopped_repair_helper(Some(failure)).await;
+        }
+    }
+
+    async fn check_stopped_repair_helper(failure: Option<&'static str>) {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
@@ -1127,16 +1362,44 @@ mod tests {
         };
         let expected_receipts = serde_json::to_vec(&receipts).unwrap();
         let expected_receipt_len = expected_receipts.len();
-        let expected_receipts_frame = docker_stdout_frame(&expected_receipts);
+        let expected_receipts_frame = if failure.is_some() {
+            let mut stderr = docker_stdout_frame(br#"{"severity":"error","event":"session_host.opencode_repair.failed","stage":"import","errorClass":"io","ioKind":"PermissionDenied","errno":13}
+private-body-secret-sentinel
+"#);
+            stderr[0] = 2;
+            match failure {
+                Some("stdout_diagnostic") => {
+                    stderr[0] = 1;
+                    stderr
+                }
+                Some("malformed_logs") => vec![3, 0, 0, 0, 0, 0, 0, 0],
+                Some("oversize") => vec![0; MAX_REPAIR_RECEIPT_BYTES + 1],
+                Some("truncated") => {
+                    stderr.pop();
+                    stderr
+                }
+                Some("unknown_output") => {
+                    let mut output = docker_stdout_frame(br#"{"severity":"error","event":"session_host.fatal","error":"private-body-secret-sentinel"}
+{"severity":"error","event":"session_host.opencode_repair.failed","stage":"private-body-secret-sentinel","errorClass":"io"}
+"#);
+                    output[0] = 2;
+                    output
+                }
+                _ => stderr,
+            }
+        } else {
+            docker_stdout_frame(&expected_receipts)
+        };
         let seen = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
         let captured = Arc::clone(&seen);
         let server = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let seen = Arc::clone(&captured);
                 let daemon = expected_daemon.clone();
                 let body = expected_receipts_frame.clone();
-                tokio::spawn(async move {
+                handlers.spawn(async move {
                     let mut raw = Vec::new();
                     let mut byte = [0];
                     while !raw.ends_with(b"\r\n\r\n") {
@@ -1182,15 +1445,19 @@ mod tests {
                     } else if request.contains("/start ") {
                         (204, Vec::new(), "application/json")
                     } else if request.contains("/wait?") {
-                        (
-                            200,
-                            json!({"StatusCode":0}).to_string().into_bytes(),
-                            "application/json",
-                        )
+                        if failure == Some("wait_timeout") { tokio::time::sleep(Duration::from_secs(1)).await; }
+                        let body = match failure {
+                            Some("malformed_wait") => b"invalid private-body-secret-sentinel".to_vec(),
+                            Some("unknown_exit") => json!({"StatusCode":"private-body-secret-sentinel"}).to_string().into_bytes(),
+                            Some("engine_error") => json!({"StatusCode":0,"Error":{"Message":"private-body-secret-sentinel"}}).to_string().into_bytes(),
+                            _ => json!({"StatusCode":if failure.is_some() { 1 } else { 0 }}).to_string().into_bytes(),
+                        };
+                        (if failure == Some("wait_http") { 500 } else { 200 }, body, "application/json")
                     } else if request.contains("/logs?") {
-                        (200, body, "application/vnd.docker.raw-stream")
+                        if failure == Some("logs_timeout") { tokio::time::sleep(Duration::from_secs(1)).await; }
+                        (if failure == Some("logs_http") { 500 } else { 200 }, body, "application/vnd.docker.raw-stream")
                     } else if request.starts_with("DELETE ") {
-                        (204, Vec::new(), "application/json")
+                        (if failure == Some("cleanup") { 500 } else { 204 }, Vec::new(), "application/json")
                     } else {
                         panic!("unexpected request {request}")
                     };
@@ -1204,11 +1471,82 @@ mod tests {
             }
         });
         let backend = DockerEngineBackend::new(&socket);
+        let began = std::time::Instant::now();
         let result = backend
-            .repair_stopped_opencode_helper(&handle, &descriptor, &stage, Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert_eq!(result, receipts);
+            .repair_stopped_opencode_helper(
+                &handle,
+                &descriptor,
+                &stage,
+                if matches!(failure, Some("wait_timeout" | "logs_timeout")) {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_secs(5)
+                },
+            )
+            .await;
+        if matches!(failure, Some("wait_timeout" | "logs_timeout")) {
+            assert!(
+                began.elapsed() < Duration::from_secs(1),
+                "failure diagnostics must stay bounded"
+            );
+        }
+        if let Some(failure) = failure {
+            let error = result.unwrap_err();
+            let BackendError::StoppedRepair(detail) = &error else {
+                panic!("expected typed stopped error: {error}");
+            };
+            let expected_category = match failure {
+                "malformed_wait" => "wait_malformed",
+                "unknown_exit" => "wait_exit_unknown",
+                "wait_http" => "wait_http_failed",
+                "engine_error" => "wait_engine_error",
+                "wait_timeout" => "helper_timeout",
+                _ => "helper_nonzero_exit",
+            };
+            assert_eq!(detail.category, expected_category, "{failure}");
+            assert_eq!(
+                detail.wait_http_status,
+                if failure == "wait_timeout" {
+                    None
+                } else {
+                    Some(if failure == "wait_http" { 500 } else { 200 })
+                },
+                "{failure}"
+            );
+            assert_eq!(
+                detail.helper_exit,
+                match failure {
+                    "malformed_wait" | "unknown_exit" | "wait_http" | "wait_timeout" => None,
+                    "engine_error" => Some(0),
+                    _ => Some(1),
+                },
+                "{failure}"
+            );
+            let expected_diagnostic = match failure {
+                "logs_http" => "http_failed",
+                "oversize" => "transport_or_bound_failed",
+                "truncated" => "truncated",
+                "unknown_output" => "unrecognized",
+                "logs_timeout" => "timeout",
+                "wait_timeout" => "budget_exhausted",
+                "stdout_diagnostic" => "absent",
+                "malformed_logs" => "malformed",
+                _ => "available",
+            };
+            assert_eq!(detail.diagnostic_status, expected_diagnostic, "{failure}");
+            if expected_diagnostic == "available" {
+                assert_eq!(detail.stage, Some("import"));
+                assert_eq!(detail.error_class, Some("io"));
+                assert_eq!(detail.errno, Some(13));
+            } else {
+                assert_eq!(detail.error_class, None);
+            }
+            let safe = serde_json::to_string(detail).unwrap();
+            assert!(!safe.contains("private-body-secret-sentinel"));
+            assert!(!error.to_string().contains("private-body-secret-sentinel"));
+        } else {
+            assert_eq!(result.unwrap(), receipts);
+        }
         assert!(expected_receipt_len < MAX_REPAIR_RECEIPT_BYTES);
         {
             let seen = seen.lock().unwrap();
@@ -1245,6 +1583,22 @@ mod tests {
                 .find(|(request, _)| request.starts_with("DELETE "))
                 .unwrap();
             assert!(delete.0.contains("/containers/freshell-opencode-repair-"));
+            if failure == Some("wait_timeout") {
+                assert!(
+                    seen.iter().all(|(request, _)| !request.contains("/logs?")),
+                    "an exhausted operation budget cannot admit another wait"
+                );
+            } else if failure.is_some() {
+                let logs = seen
+                    .iter()
+                    .position(|(request, _)| request.contains("/logs?stdout=1&stderr=1"))
+                    .expect("failed helper stderr must be read before cleanup");
+                let delete = seen
+                    .iter()
+                    .position(|(request, _)| request.starts_with("DELETE "))
+                    .unwrap();
+                assert!(logs < delete);
+            }
         }
         server.abort();
         let _ = server.await;

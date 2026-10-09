@@ -4560,7 +4560,10 @@ async fn check_persisted_repair_source_failure(failure: &str) {
     drop(source);
     let target = stopped_legacy_fixture_target(&registry, dir.path(), root).await;
     let conn = Connection::open(registry.database_path()).unwrap();
-    let terminal = serde_json::json!({"terminalId":"terminal-source-failure","streamId":"stream-source-failure","mode":"opencode","program":"opencode","env":{},"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"test-project","workspacePath":workspace,"cwd":workspace});
+    let mut terminal = serde_json::json!({"terminalId":"terminal-source-failure","streamId":"stream-source-failure","mode":"opencode","program":"opencode","env":{},"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"test-project","workspacePath":workspace,"cwd":workspace});
+    if failure == "import" {
+        terminal["env"]["FRESHELL_TEST_STOPPED_DIAGNOSTIC"] = "1".into();
+    }
     conn.execute(
         "UPDATE incarnations SET terminal_spec=?1 WHERE soul_id=?2",
         params![terminal.to_string(), target.soul_id.as_str()],
@@ -4613,6 +4616,7 @@ async fn check_persisted_repair_source_failure(failure: &str) {
         "inventory" => "source_inventory_unreadable",
         "worker" => "source_inventory_worker_failed",
         "capture" => "source_not_exactly_resolvable",
+        "import" => "provider_reader_or_import_failed",
         _ => "source_scope_changed_before_import",
     };
     let injected = match failure {
@@ -4630,6 +4634,7 @@ async fn check_persisted_repair_source_failure(failure: &str) {
             RuntimeErrorCode::RecoveryBlocked,
             format!("stopped OpenCode repair is pending ({reason})"),
         )),
+        "import" => Ok(inventory.clone()),
         "capture" => Ok(HostOpenCodeInventory::new(
             dir.path().join("missing.sqlite"),
         )),
@@ -4645,6 +4650,14 @@ async fn check_persisted_repair_source_failure(failure: &str) {
         }
     };
     let source_before = std::fs::read(&database).unwrap();
+    let incident_before: String = Connection::open(registry.database_path())
+        .unwrap()
+        .query_row(
+            "SELECT certificate_json FROM loss_incidents WHERE incident_id=?1",
+            [target.incident_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
     let result = supervisor
         .restore_lost_souls_with_inventory(operation.clone(), request, async { injected })
         .await
@@ -4675,48 +4688,87 @@ async fn check_persisted_repair_source_failure(failure: &str) {
         .unwrap()
         .is_empty());
     assert_eq!(std::fs::read(&database).unwrap(), source_before);
+    let incident_after: String = Connection::open(registry.database_path())
+        .unwrap()
+        .query_row(
+            "SELECT certificate_json FROM loss_incidents WHERE incident_id=?1",
+            [target.incident_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(incident_after, incident_before);
     let log = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
     let events = log
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .filter(|event| event["event"] == "supervisor.stopped_repair.source_failed")
+        .filter(|event| {
+            event["event"]
+                == if failure == "import" {
+                    "supervisor.stopped_repair.import_failed"
+                } else {
+                    "supervisor.stopped_repair.source_failed"
+                }
+        })
         .collect::<Vec<_>>();
     assert_eq!(events.len(), 1, "{failure}");
     let event = &events[0]["data"];
     assert_eq!(event["severity"], "error");
     assert_eq!(event["reasonCode"], reason);
     assert_eq!(event["operationId"], operation.as_str());
-    assert_eq!(event["scopeId"], scope.scope_id);
-    assert_eq!(event["sourceStoreId"], scope.source_store_id);
-    assert_eq!(event["sourceFingerprint"], scope.source_fingerprint);
-    assert_eq!(event["soulId"], target.soul_id.as_str());
-    assert_eq!(
-        event["incarnationId"],
-        before.prior_handle.incarnation_id().as_str()
-    );
-    assert_eq!(event["intentRevision"], target.expected_intent_revision);
-    assert_eq!(event["incidentId"], target.incident_id.as_str());
-    assert_eq!(
-        event["incidentRevision"],
-        scope.targets[0].incident_revision
-    );
-    assert_eq!(
-        event["identityRevision"],
-        scope.targets[0].identity_revision
-    );
-    assert_eq!(
-        event["nativeImportRevision"],
-        scope.targets[0].native_import_revision
-    );
-    assert_eq!(
-        event["evidenceRevision"],
-        scope.targets[0].evidence_revision
-    );
-    assert_eq!(event["rootSessionId"], root);
-    assert_eq!(event["sourceGeneration"], scope.roots[0].graph_digest);
+    if failure != "import" {
+        assert_eq!(event["scopeId"], scope.scope_id);
+        assert_eq!(event["sourceStoreId"], scope.source_store_id);
+        assert_eq!(event["sourceFingerprint"], scope.source_fingerprint);
+        assert_eq!(event["soulId"], target.soul_id.as_str());
+        assert_eq!(
+            event["incarnationId"],
+            before.prior_handle.incarnation_id().as_str()
+        );
+        assert_eq!(event["intentRevision"], target.expected_intent_revision);
+        assert_eq!(event["incidentId"], target.incident_id.as_str());
+        assert_eq!(
+            event["incidentRevision"],
+            scope.targets[0].incident_revision
+        );
+        assert_eq!(
+            event["identityRevision"],
+            scope.targets[0].identity_revision
+        );
+        assert_eq!(
+            event["nativeImportRevision"],
+            scope.targets[0].native_import_revision
+        );
+        assert_eq!(
+            event["evidenceRevision"],
+            scope.targets[0].evidence_revision
+        );
+        assert_eq!(event["rootSessionId"], root);
+        assert_eq!(event["sourceGeneration"], scope.roots[0].graph_digest);
+    } else {
+        assert_eq!(event["rootSessionId"], root);
+        assert_eq!(event["soulId"], target.soul_id.as_str());
+        assert_eq!(event["intentRevision"], target.expected_intent_revision);
+        assert_eq!(
+            event["incarnationId"],
+            before.prior_handle.incarnation_id().as_str()
+        );
+        assert!(event["executionGeneration"].as_u64().is_some());
+        assert!(event["transferId"].as_str().is_some());
+        assert_eq!(event["backendCategory"], "helper_nonzero_exit");
+        assert_eq!(event["backendDiagnostic"]["helperExit"], 23);
+        assert_eq!(event["backendDiagnostic"]["stage"], "reader");
+        assert_eq!(event["backendDiagnostic"]["errno"], 13);
+        assert_eq!(event["identityRevision"], before.identity_revision);
+        assert_eq!(event["nativeImportRevision"], before.native_import_revision);
+    }
     assert!(!log.contains("private changed transcript marker"));
     assert!(!log.contains("private diagnostic fixture"));
     assert!(!log.contains("synthetic-secret"));
+}
+
+#[tokio::test]
+async fn durable_souls_persisted_repair_import_failure() {
+    check_persisted_repair_source_failure("import").await;
 }
 
 #[tokio::test]

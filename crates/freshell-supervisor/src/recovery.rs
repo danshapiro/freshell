@@ -47,6 +47,53 @@ use std::{
 };
 use tokio::time::{sleep, Duration, Instant};
 
+fn log_stopped_repair_import_failure(
+    path: &Path,
+    mut context: serde_json::Value,
+    error: &BackendError,
+    aborted: Result<(), crate::opencode_transfer::StagingError>,
+) {
+    context["backendCategory"] = match error {
+        BackendError::StoppedRepair(detail) => {
+            context["backendDiagnostic"] =
+                serde_json::to_value(detail).expect("safe stopped diagnostic");
+            detail.category
+        }
+        BackendError::Unavailable(_) => "unavailable",
+        BackendError::OwnershipMismatch(_) => "ownership_mismatch",
+        BackendError::PolicyMismatch(_) => "policy_mismatch",
+        BackendError::DockerHttp { status, .. } => {
+            context["backendHttpStatus"] = (*status).into();
+            "docker_http"
+        }
+        BackendError::Malformed(_) => "malformed",
+        BackendError::InvalidConfig(_) => "invalid_config",
+    }
+    .into();
+    crate::service::append_event(
+        path,
+        "supervisor.stopped_repair.import_failed",
+        context.clone(),
+    );
+    if let Err(error) = aborted {
+        use crate::opencode_transfer::StagingError;
+        let category = match error {
+            StagingError::InvalidDescriptor(_) => "invalid_descriptor",
+            StagingError::InvalidState(_) => "invalid_state",
+            StagingError::Capacity(_) => "capacity",
+            StagingError::Io(_) => "io",
+            StagingError::Metadata(_) => "metadata",
+        };
+        context["severity"] = "warn".into();
+        context["abortCategory"] = category.into();
+        crate::service::append_event(
+            path,
+            "supervisor.stopped_repair.staging_abort_failed",
+            context,
+        );
+    }
+}
+
 type StoppedRepairGroups = BTreeMap<
     String,
     Vec<(
@@ -1503,8 +1550,23 @@ impl Supervisor {
             .await
         {
             Ok(receipts) => receipts,
-            Err(_) => {
-                let _ = staging.abort(&transfer_id, &attempt_id);
+            Err(error) => {
+                let aborted = staging.abort(&transfer_id, &attempt_id);
+                log_stopped_repair_import_failure(
+                    &self.config.lifecycle_log,
+                    serde_json::json!({
+                        "severity":"error", "reasonCode":"provider_reader_or_import_failed",
+                        "operationId":operation_id, "rootSessionId":root_session_id,
+                        "soulId":target.soul_id, "incarnationId":captured.prior_handle.incarnation_id(),
+                        "intentRevision":target.expected_intent_revision, "incidentId":target.incident_id,
+                        "identityRevision":captured.identity_revision, "evidenceRevision":captured.evidence_revision,
+                        "nativeImportRevision":captured.native_import_revision,
+                        "executionGeneration":execution_generation, "sourceStoreId":descriptor.source_store_id,
+                        "sourceGeneration":descriptor.source_generation, "transferId":transfer_id,
+                    }),
+                    &error,
+                    aborted,
+                );
                 return Err(stopped_repair_blocked("provider_reader_or_import_failed"));
             }
         };
@@ -6417,10 +6479,72 @@ pub(crate) mod tests {
         ));
     }
 
+    #[test]
+    fn stopped_import_failure_preserves_first_diagnostic_when_abort_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = crate::opencode_transfer::OpenCodeTransferStaging::new(
+            dir.path().join("stage"),
+            crate::opencode_transfer::StagingLimits::for_test(1024, 2048),
+        )
+        .unwrap();
+        let aborted = staging.abort("transfer", "invalid attempt");
+        assert!(aborted.is_err());
+        let mut detail = crate::backend::StoppedRepairFailure::new("helper_nonzero_exit");
+        detail.helper_exit = Some(17);
+        let path = dir.path().join("lifecycle.jsonl");
+        super::log_stopped_repair_import_failure(
+            &path,
+            serde_json::json!({"operationId":"synthetic-operation"}),
+            &BackendError::StoppedRepair(Box::new(detail)),
+            aborted,
+        );
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]["event"],
+            "supervisor.stopped_repair.import_failed"
+        );
+        assert_eq!(events[0]["data"]["backendDiagnostic"]["helperExit"], 17);
+        assert_eq!(
+            events[1]["event"],
+            "supervisor.stopped_repair.staging_abort_failed"
+        );
+        assert_eq!(events[1]["data"]["backendDiagnostic"]["helperExit"], 17);
+        assert_eq!(events[1]["data"]["abortCategory"], "invalid_state");
+    }
+
     struct ObservedRuntime(BackendRuntimeState);
 
     #[async_trait::async_trait]
     impl crate::backend::RuntimeBackend for ObservedRuntime {
+        async fn repair_stopped_opencode(
+            &self,
+            handle: &OwnedRuntimeHandle,
+            _: &OpenCodeTransferDescriptor,
+            _: &Path,
+        ) -> Result<StoppedOpenCodeRepairReceipts, BackendError> {
+            if handle.terminal().is_some_and(|terminal| {
+                terminal
+                    .env
+                    .contains_key("FRESHELL_TEST_STOPPED_DIAGNOSTIC")
+            }) {
+                let mut detail = crate::backend::StoppedRepairFailure::new("helper_nonzero_exit");
+                detail.helper_exit = Some(23);
+                detail.wait_http_status = Some(200);
+                detail.stage = Some("reader");
+                detail.error_class = Some("io");
+                detail.errno = Some(13);
+                return Err(BackendError::StoppedRepair(Box::new(detail)));
+            }
+            Err(BackendError::Unavailable(
+                "stopped OpenCode repair helper is unavailable".into(),
+            ))
+        }
+
         async fn inspect(
             &self,
             handle: &OwnedRuntimeHandle,

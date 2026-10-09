@@ -1952,20 +1952,99 @@ fn validate_opencode_helper_identity(uid: u32, gid: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Only fixed categories and numeric system codes leave the private worker stderr.
+#[derive(Default)]
+struct OpencodeRepairFailure {
+    stage: &'static str,
+    class: &'static str,
+    io_kind: Option<String>,
+    errno: Option<i32>,
+    sqlite_code: Option<i32>,
+    child_exit: Option<i32>,
+    child_signal: Option<i32>,
+}
+
+impl OpencodeRepairFailure {
+    fn at(stage: &'static str) -> Self {
+        Self {
+            stage,
+            class: "validation",
+            ..Self::default()
+        }
+    }
+
+    fn io(&mut self, error: &io::Error) {
+        self.class = "io";
+        self.io_kind = Some(format!("{:?}", error.kind()));
+        self.errno = error.raw_os_error();
+    }
+
+    fn import(&mut self, error: &freshell_agent_runtime::opencode_transfer::OpenCodeImportError) {
+        use freshell_agent_runtime::opencode_transfer::OpenCodeImportError;
+        match error {
+            OpenCodeImportError::Io(error) => self.io(error),
+            OpenCodeImportError::Sqlite(error) => {
+                self.class = "sqlite";
+                if let Some(code) = error.sqlite_error() {
+                    self.sqlite_code = Some(code.extended_code);
+                }
+            }
+            OpenCodeImportError::Blocked(_) => self.class = "blocked",
+            OpenCodeImportError::Metadata(_) => self.class = "metadata",
+        }
+    }
+
+    fn emit(&self) {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "severity":"error", "event":"session_host.opencode_repair.failed",
+                "stage":self.stage, "errorClass":self.class, "ioKind":self.io_kind,
+                "errno":self.errno, "sqliteCode":self.sqlite_code,
+                "childExit":self.child_exit, "childSignal":self.child_signal,
+            })
+        );
+    }
+}
+
+fn with_opencode_repair_diagnostics(
+    operation: impl FnOnce(&mut OpencodeRepairFailure) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut failure = OpencodeRepairFailure::at("stage_validation");
+    let result = operation(&mut failure);
+    if result.is_err() {
+        failure.emit();
+    }
+    result
+}
+
 fn run_opencode_import_worker(args: &[String]) -> Result<(), String> {
+    with_opencode_repair_diagnostics(|failure| run_opencode_import_worker_inner(args, failure))
+}
+
+fn run_opencode_import_worker_inner(
+    args: &[String],
+    failure: &mut OpencodeRepairFailure,
+) -> Result<(), String> {
     let (workspace_root, expected_cwd, uid, gid) = opencode_helper_args(args)?;
     validate_opencode_helper_identity(uid, gid)?;
     let env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
     let paths = validate_opencode_reader_paths(&env, &workspace_root, &expected_cwd)?;
-    if std::env::current_dir().map_err(|error| error.to_string())? != paths.cwd {
+    if std::env::current_dir().map_err(|error| {
+        failure.io(&error);
+        error.to_string()
+    })? != paths.cwd
+    {
         return Err("OpenCode importer cwd differs from the requested provider cwd".into());
     }
 
+    failure.stage = "input_stream";
     let mut stdin = io::stdin().lock();
-    let descriptor = read_opencode_descriptor_frame(&mut stdin)?;
+    let descriptor = read_opencode_descriptor_frame(&mut stdin, Some(failure))?;
     if descriptor.destination_database_path != ".local/share/opencode/opencode.db" {
         return Err("OpenCode import destination path is unsupported".into());
     }
+    failure.stage = "import";
     let receipt = {
         let mut payload = (&mut stdin).take(descriptor.files[0].size_bytes);
         freshell_agent_runtime::opencode_transfer::import_bundle_payload(
@@ -1974,47 +2053,67 @@ fn run_opencode_import_worker(args: &[String]) -> Result<(), String> {
             &paths.database,
             &paths.workspace,
         )
-        .map_err(|_| "provider-identity OpenCode import failed".to_string())?
+        .map_err(|error| {
+            failure.import(&error);
+            "provider-identity OpenCode import failed".to_string()
+        })?
     };
+    failure.stage = "input_stream";
     let mut trailing = [0_u8; 1];
-    if stdin
-        .read(&mut trailing)
-        .map_err(|error| error.to_string())?
-        != 0
+    if stdin.read(&mut trailing).map_err(|error| {
+        failure.io(&error);
+        error.to_string()
+    })? != 0
     {
         return Err("OpenCode import stream contains trailing bytes".into());
     }
-    write_opencode_helper_result(&receipt)
+    failure.stage = "receipt_validation";
+    write_opencode_helper_result(&receipt, Some(failure))
 }
 
 fn run_opencode_reader_probe(args: &[String]) -> Result<(), String> {
+    with_opencode_repair_diagnostics(|failure| run_opencode_reader_probe_inner(args, failure))
+}
+
+fn run_opencode_reader_probe_inner(
+    args: &[String],
+    failure: &mut OpencodeRepairFailure,
+) -> Result<(), String> {
     let (workspace_root, expected_cwd, uid, gid) = opencode_helper_args(args)?;
     validate_opencode_helper_identity(uid, gid)?;
     let env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
     let paths = validate_opencode_reader_paths(&env, &workspace_root, &expected_cwd)?;
-    if std::env::current_dir().map_err(|error| error.to_string())? != paths.cwd {
+    if std::env::current_dir().map_err(|error| {
+        failure.io(&error);
+        error.to_string()
+    })? != paths.cwd
+    {
         return Err("OpenCode reader cwd differs from the requested provider cwd".into());
     }
 
+    failure.stage = "input_stream";
     let mut stdin = io::stdin().lock();
-    let descriptor = read_opencode_descriptor_frame(&mut stdin)?;
+    let descriptor = read_opencode_descriptor_frame(&mut stdin, Some(failure))?;
     let mut trailing = [0_u8; 1];
-    if stdin
-        .read(&mut trailing)
-        .map_err(|error| error.to_string())?
-        != 0
+    if stdin.read(&mut trailing).map_err(|error| {
+        failure.io(&error);
+        error.to_string()
+    })? != 0
     {
         return Err("OpenCode reader probe received trailing bytes".into());
     }
+    failure.stage = "reader";
     let reader_context = installed_store_reader_context(&paths, uid, gid);
     let receipt = freshell_agent_runtime::opencode_transfer::verify_installed_store(
         &descriptor,
         &reader_context,
     )
-    .map_err(|_| {
+    .map_err(|error| {
+        failure.import(&error);
         "provider-identity OpenCode reader could not read the installed history".to_string()
     })?;
-    write_opencode_helper_result(&receipt)
+    failure.stage = "receipt_validation";
+    write_opencode_helper_result(&receipt, Some(failure))
 }
 
 /// Revalidate an already-imported OpenCode store from the provider identity.
@@ -2030,7 +2129,7 @@ fn run_opencode_current_evidence_worker(args: &[String]) -> Result<(), String> {
     }
 
     let mut stdin = io::stdin().lock();
-    let descriptor = read_opencode_descriptor_frame(&mut stdin)?;
+    let descriptor = read_opencode_descriptor_frame(&mut stdin, None)?;
     if descriptor.destination_database_path != ".local/share/opencode/opencode.db" {
         return Err("OpenCode evidence database path is unsupported".into());
     }
@@ -2048,7 +2147,7 @@ fn run_opencode_current_evidence_worker(args: &[String]) -> Result<(), String> {
         &paths.workspace,
     )
     .map_err(|error| format!("provider-identity OpenCode evidence verification failed: {error}"))?;
-    write_opencode_helper_result(&evidence)
+    write_opencode_helper_result(&evidence, None)
 }
 
 fn opencode_helper_args(args: &[String]) -> Result<(PathBuf, PathBuf, u32, u32), String> {
@@ -2078,20 +2177,27 @@ fn opencode_helper_args(args: &[String]) -> Result<(PathBuf, PathBuf, u32, u32),
 
 fn read_opencode_descriptor_frame(
     reader: &mut impl Read,
+    mut failure: Option<&mut OpencodeRepairFailure>,
 ) -> Result<OpenCodeTransferDescriptor, String> {
     let mut length = [0; 4];
-    reader
-        .read_exact(&mut length)
-        .map_err(|_| "OpenCode transfer descriptor frame is truncated".to_string())?;
+    reader.read_exact(&mut length).map_err(|error| {
+        if let Some(failure) = failure.as_deref_mut() {
+            failure.io(&error);
+        }
+        "OpenCode transfer descriptor frame is truncated".to_string()
+    })?;
     let length = u32::from_be_bytes(length) as usize;
     let max_length = MAX_OPENCODE_TRANSFER_MANIFEST_BYTES + 16 * 1024;
     if length == 0 || length > max_length {
         return Err("OpenCode transfer descriptor frame exceeds its bound".into());
     }
     let mut bytes = vec![0; length];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|_| "OpenCode transfer descriptor frame is truncated".to_string())?;
+    reader.read_exact(&mut bytes).map_err(|error| {
+        if let Some(failure) = failure {
+            failure.io(&error);
+        }
+        "OpenCode transfer descriptor frame is truncated".to_string()
+    })?;
     let descriptor: OpenCodeTransferDescriptor =
         serde_json::from_slice(&bytes).map_err(|_| "OpenCode transfer descriptor is invalid")?;
     descriptor
@@ -2103,6 +2209,7 @@ fn read_opencode_descriptor_frame(
 fn write_opencode_descriptor_frame(
     writer: &mut impl Write,
     descriptor: &OpenCodeTransferDescriptor,
+    failure: Option<&mut OpencodeRepairFailure>,
 ) -> Result<(), String> {
     let bytes = serde_json::to_vec(descriptor).map_err(|_| "encode OpenCode transfer metadata")?;
     let max_length = MAX_OPENCODE_TRANSFER_MANIFEST_BYTES + 16 * 1024;
@@ -2114,10 +2221,18 @@ fn write_opencode_descriptor_frame(
     writer
         .write_all(&length.to_be_bytes())
         .and_then(|_| writer.write_all(&bytes))
-        .map_err(|_| "write OpenCode transfer metadata to provider helper".to_string())
+        .map_err(|error| {
+            if let Some(failure) = failure {
+                failure.io(&error);
+            }
+            "write OpenCode transfer metadata to provider helper".to_string()
+        })
 }
 
-fn write_opencode_helper_result(value: &impl Serialize) -> Result<(), String> {
+fn write_opencode_helper_result(
+    value: &impl Serialize,
+    failure: Option<&mut OpencodeRepairFailure>,
+) -> Result<(), String> {
     let bytes = serde_json::to_vec(value).map_err(|_| "encode OpenCode helper receipt")?;
     if bytes.len() > MAX_OPENCODE_RECEIPT_BYTES {
         return Err("OpenCode helper receipt exceeds its bound".into());
@@ -2127,7 +2242,12 @@ fn write_opencode_helper_result(value: &impl Serialize) -> Result<(), String> {
         .write_all(&bytes)
         .and_then(|_| stdout.write_all(b"\n"))
         .and_then(|_| stdout.flush())
-        .map_err(|_| "write OpenCode helper receipt".to_string())
+        .map_err(|error| {
+            if let Some(failure) = failure {
+                failure.io(&error);
+            }
+            "write OpenCode helper receipt".to_string()
+        })
 }
 
 #[derive(Default)]
@@ -2693,6 +2813,7 @@ fn run_opencode_provider_helper(
         cwd,
         worker,
         payload_path,
+        None,
     )
 }
 
@@ -2709,6 +2830,7 @@ fn run_opencode_provider_helper_with_env(
     cwd: &Path,
     worker: &str,
     payload_path: Option<&Path>,
+    mut failure: Option<&mut OpencodeRepairFailure>,
 ) -> Result<Vec<u8>, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut command = std::process::Command::new("/usr/bin/setpriv");
@@ -2733,34 +2855,115 @@ fn run_opencode_provider_helper_with_env(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|_| "could not start the provider-identity OpenCode helper".to_string())?;
+    let mut child = command.spawn().map_err(|error| {
+        if let Some(failure) = failure.as_deref_mut() {
+            failure.stage = "identity_spawn";
+            failure.io(&error);
+        }
+        "could not start the provider-identity OpenCode helper".to_string()
+    })?;
+    let worker_stage = if worker == "opencode-reader-probe" {
+        "reader"
+    } else {
+        "import"
+    };
+    if let Some(failure) = failure.as_deref_mut() {
+        failure.stage = "input_stream";
+    }
     let write_result = (|| -> Result<(), String> {
         let mut stdin = child
             .stdin
             .take()
             .ok_or("provider helper stdin is unavailable")?;
-        write_opencode_descriptor_frame(&mut stdin, descriptor)?;
+        write_opencode_descriptor_frame(&mut stdin, descriptor, failure.as_deref_mut())?;
         if let Some(payload_path) = payload_path {
-            let mut payload = std::fs::File::open(payload_path)
-                .map_err(|_| "verified OpenCode stage payload could not be opened")?;
-            let copied = io::copy(&mut payload, &mut stdin)
-                .map_err(|_| "OpenCode payload could not be streamed to the provider helper")?;
+            let mut payload = std::fs::File::open(payload_path).map_err(|error| {
+                if let Some(failure) = failure.as_deref_mut() {
+                    failure.io(&error);
+                }
+                "verified OpenCode stage payload could not be opened"
+            })?;
+            let copied = io::copy(&mut payload, &mut stdin).map_err(|error| {
+                if let Some(failure) = failure.as_deref_mut() {
+                    failure.io(&error);
+                }
+                "OpenCode payload could not be streamed to the provider helper"
+            })?;
             if copied != descriptor.files[0].size_bytes {
                 return Err("OpenCode staged payload size changed during handoff".into());
             }
         }
-        stdin
-            .flush()
-            .map_err(|_| "OpenCode provider helper input could not be flushed")?;
+        stdin.flush().map_err(|error| {
+            if let Some(failure) = failure.as_deref_mut() {
+                failure.io(&error);
+            }
+            "OpenCode provider helper input could not be flushed"
+        })?;
         Ok(())
     })();
-    let output = child
-        .wait_with_output()
-        .map_err(|_| "OpenCode provider helper did not settle")?;
+    let output = child.wait_with_output();
+    // Only the stopped diagnostic caller changes failure precedence. The
+    // ordinary live helper keeps its existing wait-then-write error contract.
+    if failure.is_some() {
+        write_result.as_ref().map_err(Clone::clone)?;
+    }
+    let output = output.map_err(|error| {
+        if let Some(failure) = failure.as_deref_mut() {
+            failure.stage = worker_stage;
+            failure.io(&error);
+        }
+        "OpenCode provider helper did not settle"
+    })?;
     write_result?;
     if !output.status.success() {
+        if let Some(failure) = failure.as_deref_mut() {
+            failure.stage = worker_stage;
+            failure.class = "process";
+            failure.child_exit = output.status.code();
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                failure.child_signal = output.status.signal();
+            }
+            // The child is this binary; admit only its typed numeric/category record.
+            for record in String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            {
+                if record["event"] == "session_host.opencode_repair.failed" {
+                    match record["errorClass"].as_str() {
+                        Some("io") => failure.class = "io",
+                        Some("sqlite") => failure.class = "sqlite",
+                        Some("blocked") => failure.class = "blocked",
+                        Some("metadata") => failure.class = "metadata",
+                        Some("validation") => failure.class = "validation",
+                        _ => continue,
+                    }
+                    failure.stage = match record["stage"].as_str() {
+                        Some("stage_validation") => "stage_validation",
+                        Some("identity_spawn") => "identity_spawn",
+                        Some("input_stream") => "input_stream",
+                        Some("import") => "import",
+                        Some("reader") => "reader",
+                        Some("receipt_validation") => "receipt_validation",
+                        _ => worker_stage,
+                    };
+                    failure.io_kind = match record["ioKind"].as_str() {
+                        Some("PermissionDenied") => Some("PermissionDenied".into()),
+                        Some("NotFound") => Some("NotFound".into()),
+                        Some("BrokenPipe") => Some("BrokenPipe".into()),
+                        Some("StorageFull") => Some("StorageFull".into()),
+                        Some(_) => Some("Other".into()),
+                        None => None,
+                    };
+                    failure.errno = record["errno"].as_i64().and_then(|n| i32::try_from(n).ok());
+                    failure.sqlite_code = record["sqliteCode"]
+                        .as_i64()
+                        .and_then(|n| i32::try_from(n).ok());
+                    break;
+                }
+            }
+        }
         let detail = String::from_utf8_lossy(&output.stderr)
             .trim()
             .chars()
@@ -2777,12 +2980,25 @@ fn run_opencode_provider_helper_with_env(
         ));
     }
     if output.stdout.len() > MAX_OPENCODE_RECEIPT_BYTES {
+        if let Some(failure) = failure {
+            failure.stage = "receipt_validation";
+            failure.class = "validation";
+        }
         return Err("provider-identity OpenCode helper receipt exceeds its bound".into());
     }
     Ok(output.stdout)
 }
 
 fn run_opencode_stopped_repair_worker(args: &[String]) -> Result<(), String> {
+    with_opencode_repair_diagnostics(|failure| {
+        run_opencode_stopped_repair_worker_inner(args, failure)
+    })
+}
+
+fn run_opencode_stopped_repair_worker_inner(
+    args: &[String],
+    failure: &mut OpencodeRepairFailure,
+) -> Result<(), String> {
     if args.len() != 10
         || args[0] != "--stage-dir"
         || args[2] != "--workspace-root"
@@ -2804,8 +3020,10 @@ fn run_opencode_stopped_repair_worker(args: &[String]) -> Result<(), String> {
     if uid == 0 {
         return Err("OpenCode provider uid cannot be root".into());
     }
-    let stage_metadata = std::fs::symlink_metadata(&stage_dir)
-        .map_err(|_| "OpenCode repair stage is unavailable")?;
+    let stage_metadata = std::fs::symlink_metadata(&stage_dir).map_err(|error| {
+        failure.io(&error);
+        "OpenCode repair stage is unavailable"
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -2818,22 +3036,28 @@ fn run_opencode_stopped_repair_worker(args: &[String]) -> Result<(), String> {
         }
     }
     let descriptor_path = stage_dir.join("descriptor.json");
-    let descriptor_metadata = std::fs::symlink_metadata(&descriptor_path)
-        .map_err(|_| "OpenCode repair descriptor is unavailable")?;
+    let descriptor_metadata = std::fs::symlink_metadata(&descriptor_path).map_err(|error| {
+        failure.io(&error);
+        "OpenCode repair descriptor is unavailable"
+    })?;
     if descriptor_metadata.file_type().is_symlink() || !descriptor_metadata.is_file() {
         return Err("OpenCode repair descriptor is not a regular file".into());
     }
-    let descriptor: OpenCodeTransferDescriptor = serde_json::from_slice(
-        &std::fs::read(&descriptor_path)
-            .map_err(|_| "OpenCode repair descriptor cannot be read")?,
-    )
-    .map_err(|_| "OpenCode repair descriptor is invalid")?;
+    let descriptor: OpenCodeTransferDescriptor =
+        serde_json::from_slice(&std::fs::read(&descriptor_path).map_err(|error| {
+            failure.io(&error);
+            "OpenCode repair descriptor cannot be read"
+        })?)
+        .map_err(|_| "OpenCode repair descriptor is invalid")?;
     descriptor
         .validate()
         .map_err(|_| "OpenCode repair descriptor is invalid")?;
     let payload_path =
         freshell_agent_runtime::opencode_transfer::verify_staged_bundle(&descriptor, &stage_dir)
-            .map_err(|_| "OpenCode repair stage does not match its descriptor")?;
+            .map_err(|error| {
+                failure.import(&error);
+                "OpenCode repair stage does not match its descriptor"
+            })?;
     let provider_env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
     let paths = plan_opencode_reader_paths_at(
         &provider_env,
@@ -2847,6 +3071,7 @@ fn run_opencode_stopped_repair_worker(args: &[String]) -> Result<(), String> {
         return Err("OpenCode repair helper cwd differs from the requested provider cwd".into());
     }
 
+    failure.stage = "import";
     let import_output = run_opencode_provider_helper_with_env(
         &ProviderProcessContext {
             environment: &provider_env,
@@ -2858,12 +3083,15 @@ fn run_opencode_stopped_repair_worker(args: &[String]) -> Result<(), String> {
         &paths.cwd,
         "opencode-import-worker",
         Some(&payload_path),
+        Some(failure),
     )?;
+    failure.stage = "receipt_validation";
     let imported: freshell_agent_runtime::opencode_transfer::ImportReceipt =
         serde_json::from_slice(&import_output)
             .map_err(|_| "provider importer returned an invalid repair receipt")?;
     validate_import_receipt_binding(&imported, &descriptor, &paths)?;
 
+    failure.stage = "reader";
     let reader_output = run_opencode_provider_helper_with_env(
         &ProviderProcessContext {
             environment: &provider_env,
@@ -2875,7 +3103,9 @@ fn run_opencode_stopped_repair_worker(args: &[String]) -> Result<(), String> {
         &paths.cwd,
         "opencode-reader-probe",
         None,
+        Some(failure),
     )?;
+    failure.stage = "receipt_validation";
     let readable: freshell_agent_runtime::opencode_transfer::InstalledStoreReadable =
         serde_json::from_slice(&reader_output)
             .map_err(|_| "provider reader returned an invalid repair receipt")?;
@@ -4867,6 +5097,156 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn stopped_repair_descriptor_io_keeps_system_category() {
+        let mut failure = super::OpencodeRepairFailure::at("input_stream");
+        assert!(
+            super::read_opencode_descriptor_frame(&mut std::io::empty(), Some(&mut failure))
+                .is_err()
+        );
+        assert_eq!(failure.class, "io");
+        assert_eq!(failure.io_kind.as_deref(), Some("UnexpectedEof"));
+        struct FailedWriter;
+        impl std::io::Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(32))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let descriptor: super::OpenCodeTransferDescriptor = serde_json::from_value(serde_json::json!({
+            "transferId":"synthetic", "provider":"opencode", "sourceStoreId":"source", "rootSessionId":"root",
+            "sourceGeneration":"generation", "providerSchema":"schema", "sourceSchemaFingerprint":"fingerprint",
+            "migrationJournalFingerprint":"migration", "destinationStoreId":"destination", "destinationDatabasePath":"database",
+            "targetImageRef":"image", "targetBuildReceipt":"receipt", "incarnationId":"incarnation", "manifestJson":"{}",
+            "files":[], "totalBytes":0, "bundleSha256":"digest"
+        })).unwrap();
+        assert!(super::write_opencode_descriptor_frame(
+            &mut FailedWriter,
+            &descriptor,
+            Some(&mut failure)
+        )
+        .is_err());
+        assert_eq!(failure.io_kind.as_deref(), Some("BrokenPipe"));
+        assert_eq!(failure.errno, Some(32));
+    }
+
+    #[test]
+    fn stopped_repair_import_reader_error_classes_emit_without_bodies() {
+        use freshell_agent_runtime::opencode_transfer::OpenCodeImportError;
+        if std::env::var_os("FRESHELL_TEST_STOPPED_DIAGNOSTIC_CHILD").is_some() {
+            let missing = tempfile::tempdir().unwrap();
+            let io = std::fs::File::open(missing.path().join("private-body-secret-sentinel"))
+                .unwrap_err();
+            let database = rusqlite::Connection::open_in_memory().unwrap();
+            let sqlite = database
+                .execute("SELECT private_body_secret_sentinel FROM absent_table", [])
+                .unwrap_err();
+            for (stage, error) in [
+                ("import", OpenCodeImportError::Io(io)),
+                ("reader", OpenCodeImportError::Sqlite(sqlite)),
+                (
+                    "import",
+                    OpenCodeImportError::Blocked("private-body-secret-sentinel".into()),
+                ),
+                (
+                    "reader",
+                    OpenCodeImportError::Metadata("private-body-secret-sentinel".into()),
+                ),
+            ] {
+                let mut failure = super::OpencodeRepairFailure::at(stage);
+                failure.import(&error);
+                failure.emit();
+            }
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::stopped_repair_import_reader_error_classes_emit_without_bodies",
+                "--nocapture",
+            ])
+            .env("FRESHELL_TEST_STOPPED_DIAGNOSTIC_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains("private-body-secret-sentinel"));
+        let events: Vec<serde_json::Value> = stderr
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 4);
+        for (event, class) in events.iter().zip(["io", "sqlite", "blocked", "metadata"]) {
+            assert_eq!(event["event"], "session_host.opencode_repair.failed");
+            assert_eq!(event["errorClass"], class);
+        }
+        assert_eq!(events[0]["stage"], "import");
+        assert_eq!(events[0]["ioKind"], "NotFound");
+        assert_eq!(events[0]["errno"], 2);
+        assert_eq!(events[1]["stage"], "reader");
+        assert_eq!(events[1]["sqliteCode"], 1);
+    }
+
+    #[test]
+    fn stopped_repair_invalid_stage_emits_body_free_failure() {
+        if std::env::var_os("FRESHELL_TEST_STOPPED_DIAGNOSTIC_CHILD").is_some() {
+            assert!(super::run_opencode_stopped_repair_worker(&[
+                "private-body-secret-sentinel".into()
+            ])
+            .is_err());
+            let temp = tempfile::tempdir().unwrap();
+            let args = vec![
+                "--stage-dir".into(),
+                temp.path()
+                    .join("private-body-secret-sentinel")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--workspace-root".into(),
+                temp.path().to_string_lossy().into_owned(),
+                "--expected-cwd".into(),
+                temp.path().to_string_lossy().into_owned(),
+                "--provider-uid".into(),
+                "65534".into(),
+                "--provider-gid".into(),
+                "0".into(),
+            ];
+            assert!(super::run_opencode_stopped_repair_worker(&args).is_err());
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::stopped_repair_invalid_stage_emits_body_free_failure",
+                "--nocapture",
+            ])
+            .env("FRESHELL_TEST_STOPPED_DIAGNOSTIC_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let events: Vec<serde_json::Value> = stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["stage"], "stage_validation");
+        assert_eq!(events[1]["errorClass"], "io");
+        assert_eq!(events[1]["ioKind"], "NotFound");
+        assert_eq!(events[1]["errno"], 2);
+        let event = stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["event"] == "session_host.opencode_repair.failed")
+            .expect("actual stopped-worker validation failure must emit its safe stage");
+        assert_eq!(event["severity"], "error");
+        assert_eq!(event["stage"], "stage_validation");
+        assert_eq!(event["errorClass"], "validation");
+        assert!(!stderr.contains("private-body-secret-sentinel"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn provider_config_failed_secret_source_attempt_cleans_only_its_inputs_and_retries() {

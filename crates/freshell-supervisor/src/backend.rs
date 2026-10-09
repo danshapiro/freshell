@@ -1,5 +1,6 @@
 pub mod docker;
 mod native_history;
+pub use native_history::StoppedRepairFailure;
 
 use crate::registry::OwnedRuntimeHandle;
 use async_trait::async_trait;
@@ -24,6 +25,8 @@ const DOCKER_API: &str = "/v1.47";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
+    #[error("stopped OpenCode repair failed: {0}")]
+    StoppedRepair(Box<StoppedRepairFailure>),
     #[error("docker backend unavailable: {0}")]
     Unavailable(String),
     #[error("runtime ownership proof no longer matches the backend object: {0}")]
