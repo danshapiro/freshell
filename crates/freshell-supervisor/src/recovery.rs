@@ -5100,7 +5100,7 @@ fn install_replacement_provider_context(
     let context = preparation.context;
     if context.preparation.provider() != terminal.mode || context.mcp_capability.is_none() {
         return Err(RuntimeError::new(
-            RuntimeErrorCode::HostUnreachable,
+            RuntimeErrorCode::RecoveryBlocked,
             "capability_pending: exact provider preparation does not match the selected provider",
         ));
     }
@@ -7356,6 +7356,118 @@ mod automatic_retry_tests {
                     "{kind} must require deliberate correction"
                 );
             }
+            assert_root_and_successes(&supervisor, &soul, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_valid_wrong_provider_preparation_is_not_transient() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let grants = tempfile::tempdir().unwrap();
+        std::fs::create_dir(grants.path().join("mcp-capabilities")).unwrap();
+        std::fs::create_dir_all(grants.path().join("provider-roots/grant-retry-test")).unwrap();
+        crate::backend::docker::configure_capability_dir(&grants.path().join("control.sock"))
+            .unwrap();
+        assert_eq!(
+            crate::backend::docker::staged_provider_root_for_grant("grant-retry-test").unwrap(),
+            grants.path().join("provider-roots/grant-retry-test")
+        );
+        for case in ["wrong_provider", "missing_capability", "unavailable"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, clock) = open(dir.path(), 0);
+            let soul = seed(&supervisor).await;
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let launch_context = serde_json::json!({
+                "preparation":{"codex":{"tui_args":[],"sidecar_args":[]}},
+                "mcpCapability":{"grantId":"grant-retry-test", "endpoint":"http://host.docker.internal:9", "providerRelativePath":".freshell/mcp-capability.json"},
+                "config":[]
+            });
+            let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                "terminalId":"preparation-retry", "streamId":"preparation-stream", "mode":"codex", "program":"codex",
+                "cwd":dir.path(), "workspacePath":dir.path(), "projectKey":"preparation-retry",
+                "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24, "providerLaunchContext":launch_context,
+            })).unwrap();
+            terminal.validate().unwrap();
+            Connection::open(supervisor.registry.database_path())
+                .unwrap()
+                .execute(
+                    "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                    rusqlite::params![
+                        serde_json::to_string(&terminal).unwrap(),
+                        context.prior_handle.incarnation_id().as_str()
+                    ],
+                )
+                .unwrap();
+            let server = if case == "unavailable" {
+                None
+            } else {
+                let listener = tokio::net::UnixListener::bind(dir.path().join("mcp.sock")).unwrap();
+                let mut response = terminal.provider_launch_context.unwrap();
+                if case == "wrong_provider" {
+                    response.preparation =
+                        freshell_runtime_protocol::ProviderPreparation::Opencode {
+                            project_config: vec![],
+                            tui_config: None,
+                            tui_source: None,
+                            inline_config: false,
+                        };
+                } else {
+                    response.mcp_capability = None;
+                }
+                let response = serde_json::to_vec(
+                    &freshell_runtime_protocol::ProviderReplacementPreparation {
+                        context: response,
+                        secret_references: vec![],
+                    },
+                )
+                .unwrap();
+                Some(tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = vec![];
+                    stream.read_to_end(&mut request).await.unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                    assert_eq!(request["action"], "issue");
+                    assert_eq!(request["provider"], "codex");
+                    stream.write_all(&response).await.unwrap();
+                }))
+            };
+            let report = supervisor.reconcile_startup().await.unwrap();
+            if let Some(server) = server {
+                server.await.unwrap();
+            }
+            assert_eq!(
+                due(dir.path()),
+                (case == "unavailable").then_some(2_000),
+                "{case}: {report:?}"
+            );
+            let journals = attempts(dir.path());
+            assert_eq!(journals.len(), 1);
+            assert_eq!(journals[0].1, "blocked");
+            let unfinished: u64 = Connection::open(supervisor.registry.database_path())
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_attempts WHERE finished_at IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unfinished, 0);
+            assert_eq!(
+                backend.count("creates"),
+                0,
+                "a mismatched preparation cannot dispatch a provider"
+            );
+            clock.store(2_000, Ordering::SeqCst);
+            supervisor.observe_once().await.unwrap();
+            assert_eq!(
+                attempts(dir.path()).len(),
+                if case == "unavailable" { 2 } else { 1 }
+            );
+            assert_eq!(backend.count("creates"), 0);
             assert_root_and_successes(&supervisor, &soul, 0).await;
         }
     }
