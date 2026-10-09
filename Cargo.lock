@@ -1323,11 +1323,13 @@ name = "freshell-containment"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "portable-pty",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "windows-sys 0.59.0",
 ]

@@ -151,12 +151,17 @@ impl ProcWatch {
 
     /// Send a signal to THIS incarnation. An already-exited process is Ok(()).
     pub fn signal(&self, sig: Sig) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
-        let signum = match sig {
+        self.send(match sig {
             Sig::Interrupt => libc::SIGINT,
             Sig::Terminate => libc::SIGTERM,
             Sig::Kill => libc::SIGKILL,
-        };
+        })
+    }
+
+    /// Any signal number, to THIS incarnation (the stop-the-world sweep's
+    /// SIGSTOP and SIGCONT). An already-exited process is Ok(()).
+    pub(crate) fn send(&self, signum: i32) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
         // SAFETY: a valid pidfd, a valid signal number, no siginfo, no flags.
         let rc = unsafe {
             libc::syscall(
@@ -214,6 +219,14 @@ impl ProcWatch {
     }
 
     pub fn signal(&self, _sig: Sig) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ProcWatch is not implemented on this OS yet",
+        ))
+    }
+
+    #[allow(dead_code)] // the Unix tag backend's sweep; macOS fills it in (Task 7)
+    pub(crate) fn send(&self, _signum: i32) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "ProcWatch is not implemented on this OS yet",

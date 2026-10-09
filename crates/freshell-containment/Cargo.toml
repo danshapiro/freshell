@@ -35,6 +35,11 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+# The reaper shim's tests run it under a real PTY, set up as Freshell's screens are.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+portable-pty = "0.8"
 
 [[bin]]
 name = "freshell-unit-exec"

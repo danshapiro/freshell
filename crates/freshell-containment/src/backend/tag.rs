@@ -1,0 +1,379 @@
+//! Tag backend (Linux without a user systemd manager; macOS until Task 7
+//! fills in its facts). A unit's members are the processes carrying its
+//! environment tag, the live pinned roots, and every descendant of those,
+//! computed fresh at each call from one-shot `/proc` reads, never by polling.
+//!
+//! On Linux every member the unit spawns starts under the `__unit-exec
+//! --reaper` shim (`crate::reaper`), a child subreaper: the kernel reparents
+//! every orphaned descendant (a `setsid` or double-forked job, whatever it
+//! does to its environment) to it, so the shim's tree holds everything the
+//! pane started and the tag only matters for a shim killed from outside.
+//!
+//! Kill is a stop-the-world sweep that never signals a bare pid: each new
+//! candidate is pinned with a `ProcWatch`, re-verified as a member, and
+//! stopped (a stopped process cannot fork, exit or exec, so the set
+//! converges); then every stopped process is killed through its watch. The
+//! Codex daemon family (each process judged by its own argv, plus its
+//! descendants) is spared and reported, never signalled.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::sync::Arc;
+
+use super::{Backend, BackendKind, Capability, KillSummary, UnitBackend};
+use crate::events::{self, UnitLogKeys};
+use crate::proc_watch::ProcWatch;
+use crate::process::{self, is_codex_daemon_family, ProcIdentity};
+use crate::unit::{MemberRole, Placement};
+use crate::{BoxFuture, UnitId, UNIT_ENV};
+
+/// The sweep's bound: rounds end as soon as one finds no new candidate.
+const MAX_ROUNDS: usize = 64;
+/// How far up the parent chain `confirm_placement` looks for a root.
+const MAX_ANCESTRY: usize = 4096;
+
+pub(crate) struct TagBackend {
+    kind: BackendKind,
+    reason: String,
+    /// `[<shim exe>, <shim leading args...>, "--reaper", "--"]` on Linux
+    /// when the backend has a shim; `None` otherwise.
+    wrapper: Option<Vec<String>>,
+}
+
+impl TagBackend {
+    pub(crate) fn new(
+        kind: BackendKind,
+        reason: &str,
+        shim: Option<&crate::containment::ShimCommand>,
+    ) -> Self {
+        let wrapper = reaper_wrapper(shim);
+        let mut reason = reason.to_string();
+        if cfg!(target_os = "linux") && wrapper.is_none() {
+            reason.push_str("; no reaper shim");
+        }
+        Self {
+            kind,
+            reason,
+            wrapper,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reaper_wrapper(shim: Option<&crate::containment::ShimCommand>) -> Option<Vec<String>> {
+    let shim = shim?;
+    let mut wrapper = vec![shim.exe.to_string_lossy().into_owned()];
+    wrapper.extend(shim.leading_args.iter().cloned());
+    wrapper.extend(["--reaper".to_string(), "--".to_string()]);
+    Some(wrapper)
+}
+
+/// macOS placement is Task 7's.
+#[cfg(not(target_os = "linux"))]
+fn reaper_wrapper(_shim: Option<&crate::containment::ShimCommand>) -> Option<Vec<String>> {
+    None
+}
+
+impl Backend for TagBackend {
+    fn capability(&self) -> Capability {
+        Capability {
+            kind: self.kind,
+            full: false,
+            reason: Some(self.reason.clone()),
+        }
+    }
+
+    fn create(&self, id: &UnitId) -> io::Result<Arc<dyn UnitBackend>> {
+        Ok(Arc::new(TagUnit::new(
+            UNIT_ENV,
+            id.as_str(),
+            id,
+            self.wrapper.clone(),
+        )))
+    }
+
+    fn reopen(&self, id: &UnitId) -> io::Result<Arc<dyn UnitBackend>> {
+        // The caller holds this server's own record for `id`: nothing is
+        // looked up first, and tags carry no per-server namespace because
+        // every lookup is by a recorded, unique unit id.
+        self.create(id)
+    }
+}
+
+/// One unit found by `key=value` in the environment (the unit tag, or the
+/// legacy Codex sidecar tag for v1 records).
+pub(crate) struct TagUnit {
+    key: String,
+    value: String,
+    /// The unit id its log lines carry (a legacy unit's minted id).
+    unit_id: String,
+    wrapper: Option<Vec<String>>,
+}
+
+/// One one-shot reading of a unit's processes.
+struct Scan {
+    /// Tag carriers, live roots and every descendant of those.
+    candidates: BTreeSet<u32>,
+    /// Daemon-family candidates and every descendant of them.
+    spared: BTreeSet<u32>,
+    /// Same-uid processes whose environment could not be read.
+    withheld: u64,
+}
+
+impl TagUnit {
+    pub(crate) fn new(
+        key: &str,
+        value: &str,
+        unit_id: &UnitId,
+        wrapper: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            key: key.to_string(),
+            value: value.to_string(),
+            unit_id: unit_id.as_str().to_string(),
+            wrapper,
+        }
+    }
+
+    fn carries_tag(&self, pid: u32) -> bool {
+        matches!(process::environ_entry(pid, &self.key), Ok(Some(v)) if v == self.value)
+    }
+
+    /// One reading of the unit. `count_withheld` also counts the same-uid
+    /// processes whose environment is unreadable (one extra read each), which
+    /// each call does once.
+    fn scan(&self, roots: &[u32], count_withheld: bool) -> Scan {
+        let me = std::process::id();
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let my_uid = unsafe { libc::getuid() };
+        let mut candidates = BTreeSet::new();
+        let mut withheld = 0;
+        for pid in process::all_pids() {
+            if pid == me {
+                continue;
+            }
+            match process::environ_entry(pid, &self.key) {
+                Ok(Some(v)) if v == self.value => {
+                    candidates.insert(pid);
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    if count_withheld && process::real_uid(pid) == Some(my_uid) {
+                        withheld += 1;
+                    }
+                }
+            }
+        }
+        candidates.extend(
+            roots
+                .iter()
+                .copied()
+                .filter(|p| *p != me && process::is_running(*p)),
+        );
+        let mut candidates = with_descendants(candidates, me);
+        // A zombie can be neither signalled nor a parent any more.
+        candidates.retain(|pid| process::is_running(*pid));
+        let spared = daemon_family_within(&candidates);
+        Scan {
+            candidates,
+            spared,
+            withheld,
+        }
+    }
+
+    fn log_withheld(&self, withheld: u64) {
+        if withheld > 0 {
+            let keys = UnitLogKeys {
+                unit_id: self.unit_id.clone(),
+                ..Default::default()
+            };
+            events::environ_withheld(&keys, withheld);
+        }
+    }
+
+    fn kill_all_now(&self, roots: &[u32]) -> io::Result<KillSummary> {
+        let mut withheld = None;
+        let summary = stop_the_world(
+            || {
+                let scan = self.scan(roots, withheld.is_none());
+                withheld.get_or_insert(scan.withheld);
+                (scan.candidates, scan.spared)
+            },
+            |pid, candidates| {
+                self.carries_tag(pid)
+                    || roots.contains(&pid)
+                    || process::parent(pid).is_some_and(|pp| candidates.contains(&pp))
+            },
+        );
+        self.log_withheld(withheld.unwrap_or(0));
+        summary
+    }
+}
+
+impl UnitBackend for TagUnit {
+    fn placement(&self, _role: MemberRole, _seq: u32) -> io::Result<Placement> {
+        Ok(Placement {
+            wrapper: self.wrapper.clone(),
+            env: vec![(self.key.clone(), self.value.clone())],
+        })
+    }
+
+    fn kill_all(self: Arc<Self>, roots: Vec<u32>) -> BoxFuture<'static, io::Result<KillSummary>> {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || self.kill_all_now(&roots))
+                .await
+                .map_err(io::Error::other)?
+        })
+    }
+
+    fn members(&self, roots: &[u32]) -> io::Result<Vec<ProcIdentity>> {
+        let scan = self.scan(roots, true);
+        self.log_withheld(scan.withheld);
+        Ok(scan
+            .candidates
+            .difference(&scan.spared)
+            .filter_map(|pid| process::identity(*pid).ok())
+            .collect())
+    }
+
+    fn confirm_placement(&self, pid: u32, roots: &[u32]) -> io::Result<()> {
+        if !process::is_running(pid) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("process {pid} is gone"),
+            ));
+        }
+        if self.carries_tag(pid) || roots.contains(&pid) {
+            return Ok(());
+        }
+        let mut at = pid;
+        for _ in 0..MAX_ANCESTRY {
+            match process::parent(at) {
+                Some(up) if up > 1 => {
+                    if roots.contains(&up) {
+                        return Ok(());
+                    }
+                    at = up;
+                }
+                _ => break,
+            }
+        }
+        Err(io::Error::other(format!(
+            "process {pid} is not in unit {}",
+            self.unit_id
+        )))
+    }
+
+    fn wait_empty(&self) -> Option<BoxFuture<'static, ()>> {
+        None
+    }
+
+    fn remove(&self, _emptied: bool) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `set` plus every descendant of its processes (one-shot child reads),
+/// never including `exclude` (the caller itself).
+pub(crate) fn with_descendants(mut set: BTreeSet<u32>, exclude: u32) -> BTreeSet<u32> {
+    let mut frontier: Vec<u32> = set.iter().copied().collect();
+    while let Some(pid) = frontier.pop() {
+        for child in process::children(pid) {
+            if child != exclude && set.insert(child) {
+                frontier.push(child);
+            }
+        }
+    }
+    set
+}
+
+/// The processes in `set` whose OWN argv is Codex's daemon family, plus every
+/// descendant of each (the only argv inspection in the kill path; it can only
+/// spare a process, never select one).
+pub(crate) fn daemon_family_within(set: &BTreeSet<u32>) -> BTreeSet<u32> {
+    let family = set
+        .iter()
+        .copied()
+        .filter(|pid| process::argv(*pid).is_ok_and(|argv| is_codex_daemon_family(&argv)))
+        .collect();
+    with_descendants(family, std::process::id())
+}
+
+/// The stop-the-world sweep shared by the tag backend and the reaper shim.
+///
+/// `find` is one one-shot reading: (candidates, spared). `belongs` re-checks
+/// a pinned candidate against the round's candidates, so a pid recycled
+/// between the reading and the pin is never stopped. In rounds (at most
+/// [`MAX_ROUNDS`], ending when a round finds nothing new) every new
+/// non-spared candidate is pinned, re-verified, confirmed not yet exited and
+/// stopped with SIGSTOP through its watch. Then each stopped process's argv
+/// is read again: one that exec'd into the daemon family between the check
+/// and the stop (and its stopped descendants) is resumed with SIGCONT and
+/// spared; every other one gets SIGKILL through its watch. Nothing waits for
+/// the killed processes to exit.
+pub(crate) fn stop_the_world(
+    mut find: impl FnMut() -> (BTreeSet<u32>, BTreeSet<u32>),
+    belongs: impl Fn(u32, &BTreeSet<u32>) -> bool,
+) -> io::Result<KillSummary> {
+    let mut stopped: BTreeMap<u32, ProcWatch> = BTreeMap::new();
+    // Every pid already handled: stopped, gone, or refused as not a member.
+    let mut handled: BTreeSet<u32> = BTreeSet::new();
+    let mut spared: BTreeSet<u32> = BTreeSet::new();
+    let mut pin_error: Option<io::Error> = None;
+    for _ in 0..MAX_ROUNDS {
+        let (candidates, round_spared) = find();
+        spared.extend(&round_spared);
+        let fresh: Vec<u32> = candidates
+            .iter()
+            .copied()
+            .filter(|pid| !round_spared.contains(pid) && !handled.contains(pid))
+            .collect();
+        if fresh.is_empty() {
+            break;
+        }
+        for pid in fresh {
+            handled.insert(pid);
+            let watch = match ProcWatch::open(pid) {
+                Ok(watch) => watch,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    pin_error.get_or_insert(err);
+                    continue;
+                }
+            };
+            // The membership read must refer to the pinned incarnation: it
+            // still has not exited after the read.
+            if !belongs(pid, &candidates) || watch.has_exited() {
+                continue;
+            }
+            if watch.send(libc::SIGSTOP).is_ok() {
+                stopped.insert(pid, watch);
+            }
+        }
+    }
+    let stopped_set: BTreeSet<u32> = stopped.keys().copied().collect();
+    let resumed: BTreeSet<u32> = daemon_family_within(&stopped_set)
+        .intersection(&stopped_set)
+        .copied()
+        .collect();
+    let mut killed = 0;
+    for (pid, watch) in &stopped {
+        if !resumed.contains(pid) && watch.send(libc::SIGKILL).is_ok() {
+            killed += 1;
+        }
+    }
+    for pid in &resumed {
+        let _ = stopped[pid].send(libc::SIGCONT);
+    }
+    spared.extend(&resumed);
+    if let Some(err) = pin_error {
+        return Err(err);
+    }
+    Ok(KillSummary {
+        killed,
+        spared: spared
+            .iter()
+            .filter_map(|pid| process::identity(*pid).ok())
+            .collect(),
+    })
+}

@@ -9,6 +9,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
+mod backend;
+pub mod containment;
 pub mod events;
 pub mod exec_shim;
 pub mod listener;
@@ -17,14 +19,28 @@ pub mod locks;
 mod log_capture;
 pub mod proc_watch;
 pub mod process;
+#[cfg(target_os = "linux")]
+mod reaper;
+pub mod record;
 pub mod startup;
 pub mod testing;
+pub mod unit;
 pub mod unit_id;
 
+pub use backend::{BackendKind, Capability};
+pub use containment::{
+    global_containment, set_global_containment, Containment, SelectOptions, ShimCommand,
+};
 pub use listener::listening_socket_owner;
 pub use locks::{codex_thread_lock_path, lock_holders, lock_holders_among, LockHolder};
 pub use proc_watch::{ProcWatch, Sig};
 pub use process::{identity, is_codex_daemon_family, ProcIdentity};
+pub use record::{UnitRecord, UnitRecordState};
+pub use unit::{
+    AgentUnit, GoneCallback, MemberRole, Placement, StopHandle, StopMode, StopReason, StopReport,
+    StopRequest, UnitLabel, FORCE_GRACE, PLACEMENT_DEADLINE, POST_GONE_EMPTY_WAIT,
+    UNCONFIRMED_AFTER,
+};
 pub use unit_id::{UnitId, LEGACY_CODEX_TAG_ENV, UNIT_ENV};
 
 /// A boxed, sendable future (no `futures` dependency).

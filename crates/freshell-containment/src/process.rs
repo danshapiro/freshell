@@ -156,12 +156,79 @@ pub fn all_pids() -> Vec<u32> {
 /// non-dumpable) — callers log unreadable candidates, never guess.
 #[cfg(target_os = "linux")]
 pub fn environ_value(pid: u32, key: &str) -> Option<String> {
-    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    environ_entry(pid, key).ok().flatten()
+}
+
+/// Linux: one environment value of `pid`: `Ok(Some)` when set, `Ok(None)`
+/// when absent, `Err` when the environment cannot be read (another uid, a
+/// non-dumpable process). The tag backend counts unreadable same-uid
+/// processes instead of silently treating them as untagged.
+#[cfg(target_os = "linux")]
+pub(crate) fn environ_entry(pid: u32, key: &str) -> io::Result<Option<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ"))?;
     let prefix = format!("{key}=");
-    raw.split(|b| *b == 0).find_map(|kv| {
+    Ok(raw.split(|b| *b == 0).find_map(|kv| {
         let s = String::from_utf8_lossy(kv);
         s.strip_prefix(&prefix).map(str::to_string)
-    })
+    }))
+}
+
+/// Linux: the real uid of `pid` (`/proc/<pid>/status`), readable even for
+/// processes whose environment is withheld.
+#[cfg(target_os = "linux")]
+pub(crate) fn real_uid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+// Off Linux the process facts below answer "nothing" until the per-OS
+// bodies land (Windows: Task 6, macOS: Task 7). No backend there finds
+// members through them yet.
+
+#[cfg(not(target_os = "linux"))]
+pub fn argv(_pid: u32) -> io::Result<Vec<String>> {
+    Err(unsupported())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_running(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn parent(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn children(_pid: u32) -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn all_pids() -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn environ_value(_pid: u32, _key: &str) -> Option<String> {
+    None
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn environ_entry(_pid: u32, _key: &str) -> io::Result<Option<String>> {
+    Err(unsupported())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn real_uid(_pid: u32) -> Option<u32> {
+    None
 }
 
 #[cfg(not(target_os = "linux"))]
