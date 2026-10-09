@@ -123,36 +123,43 @@ impl ServerManagedRuntimeController {
             .iter()
             .find(|view| view.soul_id.as_str() == soul_id)
             .ok_or_else(|| "managed soul is no longer in supervisor inventory".to_string())?;
-        if current.intent_revision == blocked.intent_revision
-            && matches!(
-                current.recovery_state,
-                RecoveryState::Blocked | RecoveryState::Lost | RecoveryState::Stopped
-            )
-        {
-            return Ok(Some(
-                current.recovery_reason.clone().unwrap_or(blocked.message),
-            ));
-        }
         // An observer can recover this soul without a web request, and a
         // delayed reply can belong to an older deliberate intent. The current
-        // supervisor state always wins over this presentation cache.
-        let mut cache = self.recovery.blocked.lock().await;
-        if cache
-            .get(soul_id)
-            .is_some_and(|entry| entry.intent_revision == blocked.intent_revision)
-        {
-            cache.remove(soul_id);
-        }
-        Ok(matches!(
+        // supervisor state wins over this presentation cache. Retain a newer
+        // policy block so later input can still request deliberate recovery.
+        let same_intent = current.intent_revision == blocked.intent_revision;
+        let current_block = (matches!(
             current.recovery_state,
             RecoveryState::Blocked | RecoveryState::Lost
-        )
-        .then(|| {
-            current
-                .recovery_reason
-                .clone()
-                .unwrap_or_else(|| "managed soul recovery is blocked".into())
-        }))
+        ) || (same_intent
+            && current.recovery_state == RecoveryState::Stopped))
+            .then(|| {
+                current.recovery_reason.clone().unwrap_or_else(|| {
+                    if same_intent {
+                        blocked.message.clone()
+                    } else {
+                        "managed soul recovery is blocked".into()
+                    }
+                })
+            });
+        let mut cache = self.recovery.blocked.lock().await;
+        if cache.get(soul_id).is_some_and(|entry| {
+            entry.intent_revision == blocked.intent_revision
+                && entry.intent_revision <= current.intent_revision
+        }) {
+            if let Some(message) = &current_block {
+                cache.insert(
+                    soul_id.to_owned(),
+                    ManagedRecoveryBlock {
+                        intent_revision: current.intent_revision,
+                        message: message.clone(),
+                    },
+                );
+            } else {
+                cache.remove(soul_id);
+            }
+        }
+        Ok(current_block)
     }
 
     async fn schedule_recovery(&self, soul: SoulId, trigger: RecoveryTrigger) {
@@ -1220,8 +1227,9 @@ mod tests {
     mod recovery_integration {
         use super::*;
         use freshell_runtime_protocol::{
-            host_proof, AdminCommand, DockerDaemonId, FixtureKind, HostBootId, HostCommand,
-            HostReply, HostResult, RecoveryState, RuntimeOutputBatch, RuntimeOutputFrame,
+            host_proof, AdminCommand, CommandState, DockerDaemonId, FixtureKind, HostBootId,
+            HostCommand, HostReply, HostResult, RecoveryState, RuntimeOutputBatch,
+            RuntimeOutputFrame,
         };
         use freshell_supervisor::{
             backend::{
@@ -1247,7 +1255,18 @@ mod tests {
             ready: Notify,
             release: Notify,
             recover_calls: AtomicUsize,
+            manual_calls: AtomicUsize,
             exhausted_calls: AtomicUsize,
+        }
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct InputObservation {
+            incarnation_id: IncarnationId,
+            native_session_id: String,
+            data: String,
+            intent_revision: u64,
+            recovery_state: String,
+            command_state: String,
         }
 
         struct RecoveryBackend {
@@ -1255,6 +1274,7 @@ mod tests {
             failure: AtomicUsize,
             creates: AtomicUsize,
             reads: Arc<AtomicUsize>,
+            inputs: Arc<StdMutex<Vec<InputObservation>>>,
             hosts: StdMutex<Vec<JoinHandle<()>>>,
         }
         impl Drop for RecoveryBackend {
@@ -1315,6 +1335,7 @@ mod tests {
                 let limits = handle.requested_limits();
                 let provider_home = self.provider_home.clone();
                 let reads = self.reads.clone();
+                let inputs = self.inputs.clone();
                 let task = tokio::spawn(async move {
                     let boot = HostBootId::new();
                     let mut generation = u64::from(original);
@@ -1422,6 +1443,37 @@ mod tests {
                                         data: "recovered output".into(),
                                     }],
                                 })
+                            }
+                            HostCommand::TerminalInput {
+                                incarnation_id,
+                                request_id,
+                                data,
+                            } => {
+                                let connection = rusqlite::Connection::open(
+                                    provider_home
+                                        .parent()
+                                        .unwrap()
+                                        .join("registry/runtime.sqlite3"),
+                                )
+                                .unwrap();
+                                let (intent_revision, recovery_state, command_state) = connection
+                                    .query_row(
+                                        "SELECT s.intent_revision,s.recovery_state,c.state FROM souls s JOIN input_commands c ON c.soul_id=s.soul_id WHERE c.request_id=?1",
+                                        [request_id.as_str()],
+                                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                                    )
+                                    .unwrap();
+                                inputs.lock().unwrap().push(InputObservation {
+                                    incarnation_id,
+                                    native_session_id: native,
+                                    data,
+                                    intent_revision,
+                                    recovery_state,
+                                    command_state,
+                                });
+                                HostResult::TerminalInput {
+                                    state: CommandState::Completed,
+                                }
                             }
                             HostCommand::Stop { .. } => HostResult::Stopped,
                             other => panic!("unexpected recovery integration command: {other:?}"),
@@ -1587,6 +1639,7 @@ mod tests {
                     failure: AtomicUsize::new(0),
                     creates: AtomicUsize::new(0),
                     reads: Arc::new(AtomicUsize::new(0)),
+                    inputs: Arc::new(StdMutex::new(vec![])),
                     hosts: StdMutex::new(vec![]),
                 });
                 backend
@@ -1631,6 +1684,7 @@ mod tests {
                                     let recovery = matches!(&request.body, AdminCommand::Recover(_));
                                     if let AdminCommand::Recover(request) = &request.body {
                                         gate.recover_calls.fetch_add(1, Ordering::SeqCst);
+                                        if request.trigger == RecoveryTrigger::ManualRetry { gate.manual_calls.fetch_add(1, Ordering::SeqCst); }
                                         if request.trigger == RecoveryTrigger::RetryExhausted { gate.exhausted_calls.fetch_add(1, Ordering::SeqCst); }
                                     }
                                     let reply = service.dispatch(request).await;
@@ -1831,6 +1885,132 @@ mod tests {
                 .expect("late old-intent reply cannot hide the current live output");
             assert_eq!(output.chunks[0].data, "recovered output");
             fixture.close().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn newer_policy_block_survives_output_poll_until_deliberate_input_recovers() {
+            let mut fixture = Box::pin(RecoveryFixture::new()).await;
+            fixture.backend.failure.store(2, Ordering::SeqCst);
+            Box::pin(fixture.supervisor.observe_once()).await.unwrap();
+            fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .unwrap();
+            fixture.wait_for_request().await;
+            assert!(fixture
+                .controller
+                .blocked_recovery(fixture.soul.as_str())
+                .await
+                .unwrap()
+                .is_some());
+            let revision = fixture
+                .supervisor
+                .registry()
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap()
+                .intent_revision;
+            // The public retry route delegates directly to RuntimeClient, so
+            // its newer result does not enter the controller's local cache.
+            let newer = fixture
+                .controller
+                .runtime_client()
+                .recover_expected_with_request_id(
+                    RequestId::new(),
+                    fixture.soul.clone(),
+                    RecoveryTrigger::ManualRetry,
+                    Some(revision),
+                )
+                .await
+                .unwrap();
+            assert_eq!(newer.outcome, RecoveryOutcome::Blocked);
+            assert_eq!(newer.view.intent_revision, revision + 1);
+            assert!(!recovery_pending(&newer));
+            assert_eq!(fixture.attempts(), 2);
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 0);
+            let newer_message = newer.view.recovery_reason.unwrap();
+            assert_eq!(
+                fixture
+                    .controller
+                    .read_output(fixture.terminal.clone(), 0, 4096)
+                    .await
+                    .unwrap_err(),
+                newer_message
+            );
+            let retained_block = fixture
+                .controller
+                .blocked_recovery(fixture.soul.as_str())
+                .await
+                .unwrap();
+            assert_eq!(fixture.gate.recover_calls.load(Ordering::SeqCst), 2);
+            assert!(fixture.backend.inputs.lock().unwrap().is_empty());
+
+            fixture.backend.failure.store(0, Ordering::SeqCst);
+            let input = fixture
+                .controller
+                .input(fixture.terminal.clone(), "deliberate input".into())
+                .await;
+            let current = fixture
+                .supervisor
+                .registry()
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap();
+            let connection =
+                rusqlite::Connection::open(fixture.dir.path().join("registry/runtime.sqlite3"))
+                    .unwrap();
+            let attempts: Vec<(u64, String, bool)> = connection
+                .prepare("SELECT intent_revision,verdict,finished_at IS NOT NULL FROM recovery_attempts ORDER BY intent_revision")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let completed_inputs: u64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM input_commands WHERE state='completed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(connection);
+            fixture.close().await;
+
+            assert_eq!(
+                retained_block,
+                Some(newer_message),
+                "output polling must retain the newer block for deliberate retry; input result: {input:?}"
+            );
+            input.expect("deliberate input must recover the blocked soul before dispatch");
+            assert_eq!(current.intent_revision, revision + 2);
+            assert_eq!(current.recovery_state, RecoveryState::Live);
+            assert_eq!(current.native_session_id.as_deref(), Some("web-retry-root"));
+            assert_eq!(current.successful_recoveries_in_window, 1);
+            assert_eq!(
+                attempts,
+                vec![
+                    (revision, "blocked".into(), true),
+                    (revision + 1, "blocked".into(), true),
+                    (revision + 2, "succeeded".into(), true),
+                ]
+            );
+            assert_eq!(fixture.gate.recover_calls.load(Ordering::SeqCst), 3);
+            assert_eq!(fixture.gate.manual_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(fixture.gate.exhausted_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 1);
+            assert_eq!(completed_inputs, 1);
+            assert_eq!(
+                *fixture.backend.inputs.lock().unwrap(),
+                vec![InputObservation {
+                    incarnation_id: current.prior_handle.incarnation_id().clone(),
+                    native_session_id: "web-retry-root".into(),
+                    data: "deliberate input".into(),
+                    intent_revision: revision + 2,
+                    recovery_state: "live".into(),
+                    command_state: "dispatching".into(),
+                }]
+            );
         }
     }
 
