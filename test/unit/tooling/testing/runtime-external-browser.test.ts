@@ -1321,7 +1321,7 @@ describe('closed external owner control', () => {
   }
   it('forwards only registered batch IDs and fixed faults while keeping repair IDs distinct from transport retries', async () => {
     const { owned, context, request } = fixture()
-    const facts = { fixtureId: 'fixture-batch', families: Array.from({ length: 7 }, (_, index) => ({ rootId: `ses_root_${index}`,
+    const facts = { fixtureId: 'fixture-batch', sourceStoreId: 'a'.repeat(64), families: Array.from({ length: 7 }, (_, index) => ({ rootId: `ses_root_${index}`,
       childId: `ses_child_${index}`, grandchildId: `ses_grand_${index}`, baselineMessages: {}, baselineParts: {} })),
       targets: Array.from({ length: 9 }, (_, index) => ({ soulId: `soul-${index}`, providerStoreId: `store-${index}`,
         rootSessionId: `ses_root_${index % 7}`, terminalId: `terminal-${index}`, streamId: `stream-${index}`,
@@ -1356,6 +1356,28 @@ describe('closed external owner control', () => {
     await expect(control({ ...request, operationId: 'generic-fault', action: 'synthetic-stopped-repair-fault',
       fixtureId: 'fixture-batch', stoppedRepairFault: 'source_generation_change' })).rejects.toThrow(/operation/)
     await expect(control({ ...request, operationId: 'missing-id', action: 'synthetic-stopped-repair-observation' })).rejects.toThrow(/fixture|operation/)
+    const measured: import('../../../../scripts/testing/runtime-sandbox.js').SyntheticStoppedRepairBatchObservation = {
+      fixtureId: facts.fixtureId, operationId: 'repair-current', controlEpoch: 27,
+      scope: { scopeId: 'd'.repeat(64), sourceStoreId: facts.sourceStoreId, sourceFingerprint: 'e'.repeat(64),
+        targets: facts.targets.map(target => ({ target: { soulId: target.soulId, incidentId: target.incidentId, expectedIntentRevision: 1 },
+          providerStoreId: target.providerStoreId, rootSessionId: target.rootSessionId, incidentRevision: 1, identityRevision: 1,
+          nativeImportRevision: 1, evidenceRevision: 1 })), roots: facts.families.map(family => ({ rootSessionId: family.rootId,
+          graphDigest: 'f'.repeat(64), eligibleOwners: facts.targets.filter(target => target.rootSessionId === family.rootId).map(target => target.soulId), canonicalSoulId: null })) },
+      canonicalChoices: facts.canonicalChoices.map(choice => ({ ...choice, expectedIntentRevision: 1 })),
+      status: 'complete', withdrawalStatus: 'files_complete', roots: [], installedStores: [], nativeObservations: [],
+      souls: facts.targets.map(target => ({ soulId: target.soulId, providerStoreId: target.providerStoreId,
+        nativeSessionId: target.rootSessionId, desiredState: 'stopped', recoveryState: 'data_repair_complete', identityRevision: 2,
+        intentRevision: 1, nativeImportRevision: 2, activeWriters: 0, writerClaims: [], incidentPresent: false, exportPresent: [false, false] })),
+      unrelated: { incidentPresent: true, viewPresent: true, noticeIds: [], outboxEventIds: [], exportSha256: [] },
+    }
+    observation.mockResolvedValue(measured)
+    await expect(remote.syntheticStoppedRepairBatchObservation(facts.fixtureId, 'repair-current')).resolves.toEqual(measured)
+    observation.mockResolvedValue({ ...measured, operationId: 'foreign-repair' })
+    await expect(remote.syntheticStoppedRepairBatchObservation(facts.fixtureId, 'repair-current')).rejects.toThrow(/operation/)
+    observation.mockResolvedValue({ ...measured, fixtureId: 'foreign-fixture' })
+    await expect(remote.syntheticStoppedRepairBatchObservation(facts.fixtureId, 'repair-current')).rejects.toThrow(/fixture/)
+    observation.mockImplementation(async () => ({ ...measured, roots: [], launchNonce: 'private-forbidden' }))
+    await expect(remote.syntheticStoppedRepairBatchObservation(facts.fixtureId, 'repair-current')).rejects.toThrow(/invalid/)
     expect(read).toHaveBeenCalledOnce()
     } finally { await new Promise<void>(resolve => server.close(() => resolve())) }
   })

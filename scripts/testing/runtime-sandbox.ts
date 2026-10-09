@@ -8,6 +8,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
 import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchema, ManagedRuntimeSoulSchema,
+  ManagedRuntimeRepairBatchScopeSchema,
+  ManagedRuntimeNativeIdentityObservationSchema,
   type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
 
 
@@ -606,6 +608,28 @@ try {
   db.exec('COMMIT;');
   process.stdout.write(JSON.stringify([...matches].sort()));
 } finally { db.close(); }
+`
+
+// The batch reader adds only the selected closure's parent edges. Existing
+// history and exclusion readers retain their implementations and semantics.
+export const TASK007_BATCH_STORE_PROBE = `
+const { DatabaseSync } = require('node:sqlite');
+const { execFileSync } = require('node:child_process');
+const database = process.argv[1], root = process.argv[2];
+const history = () => JSON.parse(execFileSync(process.execPath, ['--no-warnings', '-e', ${JSON.stringify(PROVIDER_HISTORY_DIGESTS)}, database, root], { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
+const parents = () => {
+  const db = new DatabaseSync(database, { readOnly: true });
+  try {
+    db.exec('PRAGMA query_only = ON; BEGIN;');
+    const rows = db.prepare('WITH RECURSIVE ids(id) AS (SELECT id FROM session WHERE id = ? UNION SELECT child.id FROM session child JOIN ids ON child.parent_id = ids.id) SELECT session.id, session.parent_id FROM session JOIN ids ON session.id = ids.id ORDER BY session.id LIMIT 1025').all(root);
+    if (rows.length > 1024 || rows.filter(row => row.id === root && row.parent_id === null).length !== 1) throw new Error('registered batch root is absent, non-root or oversized');
+    return Object.fromEntries(rows.map(row => [row.id, row.parent_id]));
+  } finally { db.close(); }
+};
+const before = parents(), digests = history();
+const exclusions = JSON.parse(execFileSync(process.execPath, ['--no-warnings', '-e', ${JSON.stringify(PROVIDER_SENTINEL_SCAN)}, database, ${JSON.stringify(JSON.stringify(EXCLUDED_SOURCE_SENTINELS))}], { encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 }));
+if (JSON.stringify(before) !== JSON.stringify(parents()) || JSON.stringify(digests) !== JSON.stringify(history()) || JSON.stringify(Object.keys(before).sort()) !== JSON.stringify([...digests.sessions].sort())) throw new Error('installed graph changed during batch read');
+process.stdout.write(JSON.stringify({ parents: before, history: digests, excludedSourceSentinels: exclusions }));
 `
 
 export type RuntimeHostFacts = {
@@ -1706,7 +1730,7 @@ export type Task007PreparedStoppedFixture = {
 
 const Task007FamilyFactsSchema = z.object({ rootId: Task007Id, childId: Task007Id, grandchildId: Task007Id,
   baselineMessages: z.record(z.string(), Task007Hex), baselineParts: z.record(z.string(), Task007Hex) }).strict()
-export const SyntheticStoppedRepairBatchFactsSchema = z.object({ fixtureId: Task007Id,
+export const SyntheticStoppedRepairBatchFactsSchema = z.object({ fixtureId: Task007Id, sourceStoreId: Task007Hex,
   families: z.array(Task007FamilyFactsSchema).length(7),
   targets: z.array(z.object({ soulId: Task007Id, providerStoreId: Task007Id, rootSessionId: Task007Id,
     terminalId: Task007Id, streamId: Task007Id, incidentId: Task007Id, viewIds: z.array(Task007Id) }).strict()).length(9),
@@ -1719,8 +1743,48 @@ const Task007RepairSoulSchema = z.object({ soulId: Task007Id, providerStoreId: T
   nativeSessionId: Task007Id.nullable(), desiredState: z.string(), recoveryState: z.string(),
   identityRevision: z.number().int().nonnegative(), intentRevision: z.number().int().nonnegative(),
   nativeImportRevision: z.number().int().nonnegative(), activeWriters: z.number().int().nonnegative(),
+  writerClaims: z.array(z.object({ soulId: Task007Id, incarnationId: Task007Id,
+    intentRevision: z.number().int().nonnegative(), provider: Task007Id, providerStoreId: Task007Id,
+    nativeSessionId: Task007Id }).strict()),
   incidentPresent: z.boolean(), exportPresent: z.array(z.boolean()).length(2) }).strict()
+const Task007InstalledGraphSchema = z.object({ parents: z.record(Task007Id, Task007Id.nullable())
+  .refine(parents => Object.keys(parents).length <= 1024), history: SyntheticOpenCodeHistoryFactsSchema,
+  excludedSourceSentinels: z.array(z.enum(EXCLUDED_SOURCE_SENTINELS)) }).strict()
+const Task007SafeAdoptionSchema = z.discriminatedUnion('state', [
+  z.object({ state: z.enum(['not_required', 'awaiting_observation']) }).strict(),
+  z.object({ state: z.literal('observed'), terminalId: Task007Id, rootSessionId: Task007Id,
+    tailMessageId: Task007Id.nullable(), evidenceGeneration: Task007Hex, incarnationId: Task007Id,
+    launchNonceSha256: Task007Hex, hydrated: z.boolean(), messagesRead: z.enum(['success', 'empty_confirmed', 'failed']) }).strict(),
+])
+export const TASK007_HOST_ADOPTION_PROBE = `
+const { readHostAdoptionStatus } = require(process.argv[1]);
+readHostAdoptionStatus(process.argv[2], process.argv[3], process.argv[4]).then(
+  status => process.stdout.write(JSON.stringify(status)),
+  error => {
+    if (['ENOENT', 'ECONNREFUSED'].includes(error.code)) process.stdout.write(JSON.stringify({ state: 'unavailable' }));
+    else { process.stderr.write(String(error)); process.exitCode = 1; }
+  }
+);
+`
+const Task007NativeObservationSchema = z.discriminatedUnion('state', [
+  z.object({ rootSessionId: Task007Id, canonicalSoulId: Task007Id, state: z.literal('unavailable'),
+    reason: z.enum(['stopped', 'host_unavailable']) }).strict(),
+  z.object({ rootSessionId: Task007Id, canonicalSoulId: Task007Id, state: z.literal('current'),
+    incarnationId: Task007Id, containerId: Task007Hex, hostBootId: Task007Id, terminalId: Task007Id,
+    intentRevision: z.number().int().nonnegative(), nativeImportRevision: z.number().int().nonnegative(),
+    executionGeneration: z.number().int().nonnegative(), evidenceRevision: z.number().int().nonnegative(),
+    launchState: Task007Id, recoveryState: Task007Id, hostStatus: Task007SafeAdoptionSchema,
+    registryNativeObservation: ManagedRuntimeNativeIdentityObservationSchema.omit({ launchNonce: true })
+      .extend({ launchNonceSha256: Task007Hex }).strict().nullable() }).strict(),
+])
+const Task007CurrentIncarnationSchema = z.object({ soulId: Task007Id, incarnationId: Task007Id,
+  launchNonce: Task007Id, containerId: Task007Hex.nullable(), hostBootId: Task007Id.nullable(),
+  launchState: Task007Id, executionGeneration: z.number().int().nonnegative() }).strict()
+type Task007CurrentIncarnation = z.infer<typeof Task007CurrentIncarnationSchema>
 export const SyntheticStoppedRepairBatchObservationSchema = z.object({ fixtureId: Task007Id, operationId: Task007Id,
+  controlEpoch: z.number().int().nonnegative(), scope: ManagedRuntimeRepairBatchScopeSchema,
+  canonicalChoices: z.array(z.object({ rootSessionId: Task007Id, soulId: Task007Id,
+    expectedIntentRevision: z.number().int().positive() }).strict()).length(2),
   status: z.enum(['importing', 'withdraw_pending', 'complete']), withdrawalStatus: z.enum(['files_pending', 'files_complete']).nullable(),
   souls: z.array(Task007RepairSoulSchema).length(9),
   roots: z.array(z.object({ rootSessionId: Task007Id, canonicalSoulId: Task007Id, destinationStoreId: Task007Id,
@@ -1733,43 +1797,72 @@ export const SyntheticStoppedRepairBatchObservationSchema = z.object({ fixtureId
   installedStores: z.array(z.object({ rootSessionId: Task007Id, providerStoreId: Task007Id,
     providerUid: z.literal(65534), providerGid: z.literal(0), providerVersion: Task007Id,
     generation: Task007Id, sourceSchemaFingerprint: Task007Id, migrationJournalFingerprint: Task007Id,
-    rowCount: z.number().int().nonnegative() }).strict()).max(7),
+    rowCount: z.number().int().nonnegative() }).extend(Task007InstalledGraphSchema.shape).strict()).max(7),
+  nativeObservations: z.array(Task007NativeObservationSchema).max(7),
 }).strict()
-const Task007RepairRecordsSchema = SyntheticStoppedRepairBatchObservationSchema.omit({ installedStores: true })
+const Task007RepairRecordsSchema = SyntheticStoppedRepairBatchObservationSchema.omit({ installedStores: true, nativeObservations: true })
+  .extend({ currentIncarnations: z.array(Task007CurrentIncarnationSchema).max(9) }).strict()
 export type SyntheticStoppedRepairBatchObservation = z.infer<typeof SyntheticStoppedRepairBatchObservationSchema>
 
 // Fixed owner-only read of current production records; browser supplies IDs,
 // never a query, database path, command, or historical evidence object.
 export const TASK007_STOPPED_REPAIR_OBSERVATION = String.raw`
 import hashlib,json,os,sqlite3,sys
-database,metadata,operation,export_root=sys.argv[1:5]
+database,metadata,operation,export_root,source_store=sys.argv[1:6]
 fixture=json.load(open(metadata))
 c=sqlite3.connect('file:'+database+'?mode=ro',uri=True)
 c.row_factory=sqlite3.Row
 c.execute('BEGIN')
-op=c.execute('SELECT status,targets_json FROM stopped_repair_operations WHERE operation_id=?',(operation,)).fetchone()
+op=c.execute('SELECT status,targets_json,scope_json,owner_choices_json FROM stopped_repair_operations WHERE operation_id=?',(operation,)).fetchone()
 if op is None: raise RuntimeError('registered repair operation is absent')
-expected={t['soulId'] for t in fixture['targets']}
-if {t['soulId'] for t in json.loads(op['targets_json'])}!=expected: raise RuntimeError('repair operation targets differ from registered fixture')
+expected={t['soulId']:t for t in fixture['targets']}
+targets=json.loads(op['targets_json']);scope=json.loads(op['scope_json']);choices=json.loads(op['owner_choices_json'])
+def exact_targets(items):
+    if len(items)!=9 or len({t['soulId'] for t in items})!=9: return False
+    return all(t['soulId'] in expected and t['incidentId']==expected[t['soulId']]['incidentId'] and t['expectedIntentRevision']==expected[t['soulId']]['expectedIntentRevision'] for t in items)
+if not exact_targets(targets): raise RuntimeError('repair operation targets or incidents differ from registered fixture')
+if scope['sourceStoreId']!=source_store or not exact_targets([t['target'] for t in scope['targets']]): raise RuntimeError('repair source or captured targets differ from registered fixture')
+if any(t['providerStoreId']!=expected[t['target']['soulId']]['providerStoreId'] or t['rootSessionId']!=expected[t['target']['soulId']]['rootSessionId'] for t in scope['targets']): raise RuntimeError('captured repair store/root differs from registered fixture')
+roots_by_id={r['rootSessionId']:r for r in scope['roots']}
+if len(scope['roots'])!=7 or set(roots_by_id)!={t['rootSessionId'] for t in fixture['targets']}: raise RuntimeError('captured repair roots differ from registered fixture')
+for r in scope['roots']:
+    eligible={t['soulId'] for t in fixture['targets'] if t['rootSessionId']==r['rootSessionId']}
+    if len(r['eligibleOwners'])!=len(eligible) or set(r['eligibleOwners'])!=eligible: raise RuntimeError('repair eligible owners differ from registered fixture')
+ambiguous={r['rootSessionId'] for r in scope['roots'] if r['canonicalSoulId'] is None}
+if len(choices)!=2 or {choice['rootSessionId'] for choice in choices}!=ambiguous: raise RuntimeError('repair canonical choices differ from captured scope')
+canonicals={r['rootSessionId']:r['canonicalSoulId'] for r in scope['roots']}
+for choice in choices:
+    r=roots_by_id[choice['rootSessionId']];t=expected.get(choice['soulId'])
+    if choice['soulId'] not in r['eligibleOwners'] or t is None or choice['expectedIntentRevision']!=t['expectedIntentRevision']: raise RuntimeError('selected canonical owner is not eligible')
+    canonicals[choice['rootSessionId']]=choice['soulId']
+if any(canonicals[r['rootSessionId']] not in r['eligibleOwners'] for r in scope['roots']): raise RuntimeError('captured canonical owner is not eligible')
 def present(table,key,value): return c.execute('SELECT EXISTS(SELECT 1 FROM '+table+' WHERE '+key+'=?)',(value,)).fetchone()[0]==1
 def digest(value): return hashlib.sha256(value).hexdigest()
 def file_hash(relative):
     file=os.path.realpath(os.path.join(export_root,relative))
     if not file.startswith(os.path.realpath(export_root)+os.sep): raise RuntimeError('export is outside registered fixture')
     return digest(open(file,'rb').read()) if os.path.isfile(file) else None
-souls=[]
+souls=[];current_incarnations=[]
 for target in fixture['targets']:
     row=c.execute('SELECT soul_id,provider_store_id,native_session_id,desired_state,recovery_state,identity_revision,intent_revision,native_import_revision FROM souls WHERE soul_id=?',(target['soulId'],)).fetchone()
     if row is None: raise RuntimeError('registered repair soul is absent')
-    writers=c.execute("SELECT count(*) FROM writer_claims WHERE soul_id=? OR (provider='opencode' AND provider_store_id=? AND native_session_id=?)",(target['soulId'],row['provider_store_id'],row['native_session_id'])).fetchone()[0]
-    souls.append(dict(soulId=row['soul_id'],providerStoreId=row['provider_store_id'],nativeSessionId=row['native_session_id'],desiredState=row['desired_state'],recoveryState=row['recovery_state'],identityRevision=row['identity_revision'],intentRevision=row['intent_revision'],nativeImportRevision=row['native_import_revision'],activeWriters=writers,incidentPresent=present('loss_incidents','incident_id',target['incidentId']),exportPresent=[os.path.isfile(os.path.join(export_root,'incidents',target['incidentId']+'.'+suffix+'.json')) for suffix in ['open','closed']]))
+    writers=[dict(soulId=w['soul_id'],incarnationId=w['incarnation_id'],intentRevision=w['intent_revision'],provider=w['provider'],providerStoreId=w['provider_store_id'],nativeSessionId=w['native_session_id']) for w in c.execute("SELECT * FROM writer_claims WHERE soul_id=? OR (provider='opencode' AND provider_store_id=? AND native_session_id=?) ORDER BY soul_id,incarnation_id",(target['soulId'],row['provider_store_id'],row['native_session_id']))]
+    souls.append(dict(soulId=row['soul_id'],providerStoreId=row['provider_store_id'],nativeSessionId=row['native_session_id'],desiredState=row['desired_state'],recoveryState=row['recovery_state'],identityRevision=row['identity_revision'],intentRevision=row['intent_revision'],nativeImportRevision=row['native_import_revision'],activeWriters=len(writers),writerClaims=writers,incidentPresent=present('loss_incidents','incident_id',target['incidentId']),exportPresent=[os.path.isfile(os.path.join(export_root,'incidents',target['incidentId']+'.'+suffix+'.json')) for suffix in ['open','closed']]))
+    current=c.execute("SELECT * FROM incarnations WHERE soul_id=? ORDER BY CASE WHEN launch_state IN ('prepared','created','starting','running','stopping') THEN 0 ELSE 1 END,created_at DESC,rowid DESC LIMIT 1",(row['soul_id'],)).fetchone()
+    if current: current_incarnations.append(dict(soulId=row['soul_id'],incarnationId=current['incarnation_id'],launchNonce=current['launch_nonce'],containerId=current['container_id'],hostBootId=current['host_boot_id'],launchState=current['launch_state'],executionGeneration=current['execution_generation']))
 roots=[]
-for row in c.execute('SELECT root_session_id,canonical_soul_id,source_generation,transfer_id,import_receipt_json,readable_receipt_json FROM stopped_repair_root_receipts WHERE operation_id=? ORDER BY root_session_id',(operation,)):
+for row in c.execute('SELECT root_session_id,canonical_soul_id,source_store_id,source_generation,identity_revision,intent_revision,native_import_revision,transfer_id,import_receipt_json,readable_receipt_json FROM stopped_repair_root_receipts WHERE operation_id=? ORDER BY root_session_id',(operation,)):
     imported=json.loads(row['import_receipt_json']);readable=json.loads(row['readable_receipt_json'])
+    if row['root_session_id'] not in canonicals or row['canonical_soul_id']!=canonicals[row['root_session_id']]: raise RuntimeError('installed canonical differs from selected operation')
+    if row['source_generation']!=roots_by_id[row['root_session_id']]['graphDigest']: raise RuntimeError('installed source generation differs from captured scope')
+    captured=next(t for t in scope['targets'] if t['target']['soulId']==row['canonical_soul_id'])
+    if row['source_store_id']!=source_store or row['identity_revision']!=captured['identityRevision'] or row['intent_revision']!=captured['target']['expectedIntentRevision'] or row['native_import_revision']!=captured['nativeImportRevision']: raise RuntimeError('installed source or captured revisions differ from operation scope')
+    if readable['destinationStoreId']!=expected[row['canonical_soul_id']]['providerStoreId']: raise RuntimeError('installed destination differs from selected owner')
     roots.append(dict(rootSessionId=row['root_session_id'],canonicalSoulId=row['canonical_soul_id'],destinationStoreId=readable['destinationStoreId'],sourceGeneration=row['source_generation'],transferId=row['transfer_id'],rowCount=readable['rowCount'],assetCount=readable['assetCount'],structuralSha256=readable['structuralSha256'],providerUid=readable['providerUid'],providerGid=readable['providerGid'],readerEnvironmentSha256=readable['readerEnvironmentSha256'],adoptionBaselineSha256=digest(json.dumps(imported['adoption_baseline'],sort_keys=True,separators=(',',':')).encode())))
 withdrawal=c.execute('SELECT status FROM stopped_repair_withdrawals WHERE operation_id=?',(operation,)).fetchone()
 unrelated=fixture['unrelated']
-result=dict(fixtureId=fixture['fixtureId'],operationId=operation,status=op['status'],withdrawalStatus=withdrawal['status'] if withdrawal else None,souls=souls,roots=roots,unrelated=dict(incidentPresent=present('loss_incidents','incident_id',unrelated['incidentId']),viewPresent=present('view_intents','view_id',unrelated['viewId']),noticeIds=[id for id in unrelated['noticeIds'] if present('runtime_notices','notice_id',id)],outboxEventIds=[id for id in unrelated['outboxEventIds'] if present('outbox','event_id',id)],exportSha256=[file_hash(artifact['file']) for artifact in unrelated['exports']]))
+epoch=c.execute('SELECT control_epoch FROM installation WHERE singleton=1').fetchone()[0]
+result=dict(fixtureId=fixture['fixtureId'],operationId=operation,controlEpoch=epoch,scope=scope,canonicalChoices=choices,status=op['status'],withdrawalStatus=withdrawal['status'] if withdrawal else None,souls=souls,roots=roots,currentIncarnations=current_incarnations,unrelated=dict(incidentPresent=present('loss_incidents','incident_id',unrelated['incidentId']),viewPresent=present('view_intents','view_id',unrelated['viewId']),noticeIds=[id for id in unrelated['noticeIds'] if present('runtime_notices','notice_id',id)],outboxEventIds=[id for id in unrelated['outboxEventIds'] if present('outbox','event_id',id)],exportSha256=[file_hash(artifact['file']) for artifact in unrelated['exports']]))
 c.close()
 print(json.dumps(result))
 `
@@ -4095,6 +4188,7 @@ export type ManagedRuntimeView = {
   profile?: string
   provider?: string
   nativeSessionId?: string
+  nativeIdentityObservation?: z.infer<typeof ManagedRuntimeNativeIdentityObservationSchema>
   recoveryReason?: string
   priorIncarnationId?: string
   recoveryAttemptId?: string
@@ -4269,6 +4363,7 @@ export class ManagedRuntimeOwner {
   async syntheticStoppedRepairBatchFacts(): Promise<SyntheticStoppedRepairBatchFacts> {
     const batch = this.registeredStoppedRepairBatch()
     return SyntheticStoppedRepairBatchFactsSchema.parse({ fixtureId: batch.input.fixtureId,
+      sourceStoreId: createHash('sha256').update(await fsp.realpath(batch.sourceDatabaseFile)).digest('hex'),
       families: batch.source.families.map(family => ({ rootId: family.rootId, childId: family.childId,
         grandchildId: family.grandchildId, baselineMessages: Object.fromEntries(family.baselineMessages),
         baselineParts: Object.fromEntries(family.baselineParts) })),
@@ -4287,43 +4382,133 @@ export class ManagedRuntimeOwner {
     const batch = this.registeredStoppedRepairBatch(fixtureId)
     Task007Id.parse(operationId)
     if (!this.supervisor || this.supervisor.volumeName !== batch.volumeName) throw new Error('registered batch supervisor required')
+    const sourceStoreId = (await this.syntheticStoppedRepairBatchFacts()).sourceStoreId
     const records = async () => Task007RepairRecordsSchema.parse(JSON.parse(await this.ownedDockerProbe(
       this.supervisor.containerId, ['python3', '-I', '-c', TASK007_STOPPED_REPAIR_OBSERVATION,
-        '/var/lib/freshell-supervisor/runtime.sqlite3', batch.metadataFile, operationId, '/var/lib/freshell-supervisor'], false)))
-    const observed = await records()
+        '/var/lib/freshell-supervisor/runtime.sqlite3', batch.metadataFile, operationId, '/var/lib/freshell-supervisor', sourceStoreId], false)))
+    const initial = await records()
+    const { currentIncarnations, ...observed } = initial
     if (observed.fixtureId !== fixtureId || observed.operationId !== operationId
       || observed.souls.some(soul => !batch.output.targets.some(target => target.soulId === soul.soulId))
       || observed.roots.some(root => !batch.source.families.some(family => family.rootId === root.rootSessionId))) {
       throw new Error('current repair observation differs from registered fixture and operation')
     }
-    if (observed.souls.some(soul => soul.activeWriters !== 0)) throw new Error('stopped store observation requires zero current writers')
+    const resumedSouls = new Set(observed.roots.filter(root => observed.souls.some(soul =>
+      soul.soulId === root.canonicalSoulId && soul.desiredState === 'running')).map(root => root.canonicalSoulId))
+    if (observed.souls.some(soul => soul.activeWriters !== 0 && !resumedSouls.has(soul.soulId))) {
+      throw new Error('stopped store observation requires zero current writers')
+    }
+    const currentViews = resumedSouls.size ? await this.inventory() : []
+    const selectCurrentView = (views: ManagedRuntimeView[], current?: Task007CurrentIncarnation): ManagedRuntimeView | undefined => {
+      if (!current) return undefined
+      const rows = views.filter(row => row.soulId === current.soulId)
+      const matches = rows.filter(row => row.incarnationId === current.incarnationId)
+      // Registry selects current authority; failed/stopped history is retained.
+      // Another active incarnation remains a conflict on either side of the read.
+      if (matches.length !== 1 || rows.some(row => row.incarnationId !== current.incarnationId
+        && ['prepared', 'created', 'starting', 'running', 'stopping'].includes(row.launchState))) return undefined
+      return matches[0]
+    }
     const installedStores: SyntheticStoppedRepairBatchObservation['installedStores'] = []
+    const nativeObservations: SyntheticStoppedRepairBatchObservation['nativeObservations'] = []
+    const resumedReads: Array<{ root: SyntheticStoppedRepairBatchObservation['roots'][number]; view: ManagedRuntimeView;
+      soul: z.infer<typeof Task007RepairSoulSchema>; current: Task007CurrentIncarnation; native: z.infer<typeof Task007NativeObservationSchema> }> = []
     for (const root of observed.roots) {
       const soul = observed.souls.find(soul => soul.soulId === root.canonicalSoulId)
-      if (!soul || soul.desiredState !== 'stopped' || soul.nativeSessionId !== root.rootSessionId
-        || soul.providerStoreId !== root.destinationStoreId) throw new Error('current stopped store/root differs from repair receipt')
-      installedStores.push(await this.readTask007StoppedStore(batch, root))
+      if (!soul || !['running', 'stopped'].includes(soul.desiredState) || soul.nativeSessionId !== root.rootSessionId
+        || soul.providerStoreId !== root.destinationStoreId) throw new Error('current store/root differs from repair receipt')
+      let view: ManagedRuntimeView | undefined
+      if (soul.desiredState === 'running') {
+        const current = currentIncarnations.find(current => current.soulId === soul.soulId)
+        view = selectCurrentView(currentViews, current)
+        if (!view || !current || view.incarnationId !== current.incarnationId
+          || view.containerId !== current.containerId || (view.hostBootId ?? null) !== current.hostBootId
+          || view.launchState !== current.launchState || view.executionGeneration !== current.executionGeneration
+          || view.provider !== 'opencode' || view.nativeSessionId !== root.rootSessionId
+          || view.intentRevision !== soul.intentRevision || view.desiredState !== soul.desiredState
+          || view.recoveryState !== soul.recoveryState || soul.activeWriters > 1
+          || (view.launchState === 'stopped' && soul.activeWriters !== 0)
+          || soul.writerClaims.some(writer => writer.soulId !== soul.soulId || writer.incarnationId !== current.incarnationId
+            || writer.intentRevision !== soul.intentRevision || writer.provider !== 'opencode'
+            || writer.providerStoreId !== soul.providerStoreId || writer.nativeSessionId !== root.rootSessionId)) {
+          throw new Error('current canonical address or writer ownership differs from registered repair')
+        }
+        const native = await this.readTask007NativeObservation(root, soul, view, current)
+        nativeObservations.push(native)
+        resumedReads.push({ root, soul, view, current, native })
+      } else nativeObservations.push({ rootSessionId: root.rootSessionId, canonicalSoulId: root.canonicalSoulId,
+        state: 'unavailable', reason: 'stopped' })
+      installedStores.push(await this.readTask007InstalledStore(batch, root, view))
     }
-    if (JSON.stringify(await records()) !== JSON.stringify(observed)) throw new Error('current stopped repair records changed during independent store observation')
-    return SyntheticStoppedRepairBatchObservationSchema.parse({ ...observed, installedStores })
+    for (const { root, soul, view, current, native } of resumedReads) {
+      const after = selectCurrentView(await this.inventory(), current)
+      if (!after || JSON.stringify(after) !== JSON.stringify(view)
+        || JSON.stringify(await this.readTask007NativeObservation(root, soul, after, current)) !== JSON.stringify(native)) {
+        throw new Error('current native Resume observation changed during installed store read')
+      }
+    }
+    if (JSON.stringify(await records()) !== JSON.stringify(initial)) throw new Error('current stopped repair records changed during independent store observation')
+    return SyntheticStoppedRepairBatchObservationSchema.parse({ ...observed, installedStores, nativeObservations })
   }
 
-  private async readTask007StoppedStore(batch: Task007PreparedStoppedFixture,
-    root: SyntheticStoppedRepairBatchObservation['roots'][number]): Promise<SyntheticStoppedRepairBatchObservation['installedStores'][number]> {
+  private async readTask007NativeObservation(root: SyntheticStoppedRepairBatchObservation['roots'][number],
+    soul: z.infer<typeof Task007RepairSoulSchema>, view: ManagedRuntimeView,
+    current: Task007CurrentIncarnation): Promise<z.infer<typeof Task007NativeObservationSchema>> {
+    if (view.launchState !== 'running' || !view.containerId || !view.hostBootId || !view.terminalId) {
+      return { rootSessionId: root.rootSessionId, canonicalSoulId: soul.soulId, state: 'unavailable', reason: 'host_unavailable' }
+    }
+    const host = z.union([ManagedOpenCodeAdoptionStatusSchema, z.object({ state: z.literal('unavailable') }).strict()])
+      .parse(JSON.parse(await this.ownedDockerProbe(this.supervisor.containerId,
+      ['node', '--no-warnings', '-e', TASK007_HOST_ADOPTION_PROBE,
+        path.join(this.repoRoot, 'test/e2e-browser/fixtures/managed-opencode-host-status.cjs'),
+        this.runtime.runtimeDir(this.supervisor, current.incarnationId), current.incarnationId, view.hostBootId], false)))
+    if (host.state === 'unavailable') return { rootSessionId: root.rootSessionId,
+      canonicalSoulId: soul.soulId, state: 'unavailable', reason: 'host_unavailable' }
+    let hostStatus: z.infer<typeof Task007SafeAdoptionSchema>
+    if (host.state === 'observed') {
+      const { launchNonce, ...observation } = host.data.observation
+      // Adoption has its own attempt nonce; the authenticated host applies
+      // its production expectation gate, independently of Registry launch identity.
+      if (!/^[a-f0-9]{32}$/.test(launchNonce) || !/^[a-f0-9]{64}$/.test(observation.evidenceGeneration)
+        || observation.incarnationId !== current.incarnationId
+        || observation.rootSessionId !== root.rootSessionId || observation.terminalId !== view.terminalId) {
+        throw new Error('current native host observation nonce, generation, incarnation, terminal or root differs')
+      }
+      hostStatus = { state: 'observed', ...observation, launchNonceSha256: sha256(launchNonce) }
+    } else hostStatus = host
+    let registryNativeObservation: z.infer<typeof ManagedRuntimeNativeIdentityObservationSchema> | null = null
+    if (view.nativeIdentityObservation) {
+      const registry = ManagedRuntimeNativeIdentityObservationSchema.parse(view.nativeIdentityObservation)
+      if (registry.launchNonce !== current.launchNonce || registry.incarnationId !== current.incarnationId
+        || registry.nativeSessionId !== root.rootSessionId || registry.evidenceRevision !== view.evidenceRevision
+        || registry.source !== 'opencode_tui') throw new Error('current persisted native identity address or evidence revision differs')
+      registryNativeObservation = registry
+    }
+    const { launchNonce: registryNonce, ...safeRegistry } = registryNativeObservation ?? { launchNonce: '' }
+    return Task007NativeObservationSchema.parse({ rootSessionId: root.rootSessionId, canonicalSoulId: soul.soulId,
+      state: 'current', incarnationId: current.incarnationId, containerId: view.containerId,
+      hostBootId: view.hostBootId, terminalId: view.terminalId, intentRevision: soul.intentRevision,
+      nativeImportRevision: soul.nativeImportRevision, executionGeneration: current.executionGeneration,
+      evidenceRevision: view.evidenceRevision, launchState: view.launchState, recoveryState: soul.recoveryState,
+      hostStatus, registryNativeObservation: registryNativeObservation ? { ...safeRegistry, launchNonceSha256: sha256(registryNonce) } : null })
+  }
+
+  private async readTask007InstalledStore(batch: Task007PreparedStoppedFixture,
+    root: SyntheticStoppedRepairBatchObservation['roots'][number], view?: ManagedRuntimeView): Promise<SyntheticStoppedRepairBatchObservation['installedStores'][number]> {
     const target = batch.output.targets.find(target => target.soulId === root.canonicalSoulId
       && target.providerStoreId === root.destinationStoreId && target.rootSessionId === root.rootSessionId)
-    const receipt = target && this.runtime.broker.receipts().find(receipt => receipt.containerId === target.containerId
-      && receipt.soulId === target.soulId && receipt.incarnationId === target.incarnationId)
+    const receipt = target && this.runtime.broker.receipts().find(receipt => receipt.containerId === (view?.containerId ?? target.containerId)
+      && receipt.soulId === target.soulId && receipt.incarnationId === (view?.incarnationId ?? target.incarnationId))
     if (!target || !receipt || receipt.providerVolumeName !== target.providerVolumeName
       || receipt.imageRef !== this.runtime.imageRef || receipt.workspacePath !== batch.input.workspacePath
       || receipt.hostBinaryPath !== batch.input.hostBinaryPath) throw new Error('registered stopped store has no exact current-image receipt')
-    const state = z.array(z.object({ Id: z.literal(target.containerId), State: z.object({ Running: z.literal(false) }) })).length(1)
-    state.parse(JSON.parse(await this.trackedDockerProbe(target.containerId, ['inspect', target.containerId])))
+    const state = z.array(z.object({ Id: z.literal(receipt.containerId), State: z.object({ Running: z.literal(view?.launchState === 'running') }) })).length(1)
+    state.parse(JSON.parse(await this.trackedDockerProbe(receipt.containerId, ['inspect', receipt.containerId])))
     const selected = { providerStoreId: root.destinationStoreId, nativeSessionId: root.rootSessionId,
       imageRef: this.runtime.imageRef, providerHome: '/home/freshell/provider', workspacePath: batch.input.workspacePath,
       cwd: batch.input.cwd, providerUid: 65534, providerGid: 0 }
     const name = `freshell-history-${randomUUID()}`
-    const probe = (args: string[]) => this.trackedDockerProbe(target.containerId, args, true)
+    const probe = (args: string[]) => this.trackedDockerProbe(receipt.containerId, args, true)
     let failure: unknown
     try {
       const id = (await probe(['create', '--name', name, '--user', '65534:0', '--network', 'none', '--read-only',
@@ -4347,15 +4532,53 @@ export class ManagedRuntimeOwner {
         cwd: z.literal(selected.cwd), providerUid: z.literal(65534), providerGid: z.literal(0) }).strict(),
         providerVersion: Task007Id, sourceSchemaFingerprint: Task007Id, migrationJournalFingerprint: Task007Id,
         generation: Task007Id, rowCount: z.number().int().nonnegative() }).strict().parse(JSON.parse(output))
+      const graph = await this.readTask007InstalledGraph(batch, target, receipt)
       return { rootSessionId: root.rootSessionId, providerStoreId: root.destinationStoreId,
         providerUid: measured.request.providerUid, providerGid: measured.request.providerGid, providerVersion: measured.providerVersion,
         sourceSchemaFingerprint: measured.sourceSchemaFingerprint, migrationJournalFingerprint: measured.migrationJournalFingerprint,
-        generation: measured.generation, rowCount: measured.rowCount }
+        generation: measured.generation, rowCount: measured.rowCount, ...graph }
     } catch (error) { failure = error; throw error }
     finally {
       try { await probe(['rm', '--force', name]) }
       catch (cleanupError) {
         if (failure) throw new AggregateError([failure, cleanupError], 'stopped store reader and cleanup failed')
+        throw cleanupError
+      }
+    }
+  }
+
+  private async readTask007InstalledGraph(batch: Task007PreparedStoppedFixture,
+    target: Task007FixtureOutput['targets'][number], receipt: BrokerReceipt): Promise<z.infer<typeof Task007InstalledGraphSchema>> {
+    const name = `freshell-history-${randomUUID()}`
+    const probe = (args: string[]) => this.trackedDockerProbe(receipt.containerId, args, true)
+    let failure: unknown
+    try {
+      const id = (await probe(['create', '--name', name, '--user', '65534:0', '--network', 'none', '--read-only',
+        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--memory', '256m', '--memory-swap', '256m',
+        '--cpus', '0.5', '--pids-limit', '32', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m',
+        '--env', 'HOME=/home/freshell/provider',
+        '--mount', `type=volume,source=${receipt.providerVolumeName},target=/home/freshell/provider,readonly`,
+        '--mount', `type=bind,source=${batch.input.workspacePath},target=${batch.input.workspacePath},readonly`,
+        '--workdir', batch.input.workspacePath, '--entrypoint', 'node', this.runtime.imageRef,
+        '--no-warnings', '-e', TASK007_BATCH_STORE_PROBE,
+        '/home/freshell/provider/.local/share/opencode/opencode.db', target.rootSessionId])).trim()
+      if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('batch graph reader returned no exact helper ID')
+      await probe(['start', id])
+      const exit = (await probe(['wait', id])).trim()
+      const output = await probe(['logs', id])
+      this.runtime.writeArtifact(`task007-installed-graph-${target.soulId}.json`, { fixtureId: batch.input.fixtureId, helperId: id, exit, output })
+      if (exit !== '0') throw new Error('batch installed graph reader refused registered root')
+      const graph = Task007InstalledGraphSchema.parse(JSON.parse(output))
+      if (graph.parents[target.rootSessionId] !== null || new Set(graph.history.sessions).size !== graph.history.sessions.length
+        || JSON.stringify([...graph.history.sessions].sort()) !== JSON.stringify(Object.keys(graph.parents).sort())) {
+        throw new Error('batch graph/history closure differs from registered root')
+      }
+      return graph
+    } catch (error) { failure = error; throw error }
+    finally {
+      try { await probe(['rm', '--force', name]) }
+      catch (cleanupError) {
+        if (failure) throw new AggregateError([failure, cleanupError], 'batch graph reader and cleanup failed')
         throw cleanupError
       }
     }

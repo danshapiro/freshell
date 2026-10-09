@@ -3,9 +3,28 @@ import os from 'node:os'
 import fs from 'node:fs/promises'
 import http from 'node:http'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { execFile } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
 
 import { RestrictedDockerBroker } from '../../../../scripts/testing/runtime-test-broker.js'
+import { TASK007_BATCH_STORE_PROBE } from '../../../../scripts/testing/runtime-sandbox.js'
+
+it.each(['owner-first', 'broker-first'])('initializes the actual ESM owner/broker cycle with %s', async order => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'task008-batch-esm-'))
+  const ownerUrl = pathToFileURL(path.join(process.cwd(), 'scripts/testing/runtime-sandbox.ts')).href
+  const brokerUrl = pathToFileURL(path.join(process.cwd(), 'scripts/testing/runtime-test-broker.ts')).href
+  const imports = order === 'owner-first' ? [ownerUrl, brokerUrl] : [brokerUrl, ownerUrl]
+  try {
+    const output = await new Promise<string>((resolve, reject) => execFile(process.execPath,
+      ['--import', path.join(process.cwd(), 'node_modules/tsx/dist/loader.mjs'), '--input-type=module', '-e',
+        `await import(${JSON.stringify(imports[0])});await import(${JSON.stringify(imports[1])});const {RestrictedDockerBroker}=await import(${JSON.stringify(brokerUrl)});const broker=new RestrictedDockerBroker(${JSON.stringify({ realSocketPath: path.join(directory, 'unused.sock'), proxySocketPath: path.join(directory, 'proxy.sock'),
+          runtimeRootPrefix: directory, allowedHostBinaryPaths: [], allowedImageRefs: [], testRunId: 'esm-owned', logPath: path.join(directory, 'broker.jsonl') })});await broker.start();await broker.close();process.stdout.write(String(broker.historyHelperNames().length));`],
+      { encoding: 'utf8', timeout: 15_000 }, (error, stdout) => error ? reject(error) : resolve(stdout)))
+    expect(output).toBe('0')
+    await expect(fs.stat(path.join(directory, 'proxy.sock'))).rejects.toHaveProperty('code', 'ENOENT')
+  } finally { await fs.rm(directory, { recursive: true, force: true }) }
+})
 
 it('settles an owner request failure with a structured refusal and closes the exact socket', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'task008-broker-rejection-'))
@@ -215,6 +234,53 @@ const ownedId = 'a'.repeat(64)
 const helperId = 'b'.repeat(64)
 const providerVolume = 'freshell-provider-aaaaaaaaaaaaaaaaaaaaaaaa'
 const helperName = 'freshell-history-11111111-1111-4111-8111-111111111111'
+function batchStoreHelperBody() {
+  const body = historyHelperBody()
+  return { ...body, Image: `sha256:${'b'.repeat(64)}`, Tty: false, Entrypoint: ['node'], WorkingDir: '/workspace',
+    Cmd: ['--no-warnings', '-e', TASK007_BATCH_STORE_PROBE, '/home/freshell/provider/.local/share/opencode/opencode.db', 'ses_batch'],
+    HostConfig: { ...body.HostConfig, Mounts: [body.HostConfig.Mounts[1],
+      { Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true }] } }
+}
+
+it('tracks the fixed batch Node reader and refuses every altered capability before forwarding', async () => {
+  await withHttpBroker(async ({ request, forwarded, broker }) => {
+    const original = { ...JSON.parse(createBody([...ordinaryBinds, actorBind]).toString()), Image: `sha256:${'b'.repeat(64)}` }
+    expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', original)).status).toBe(201)
+    const mutations = [
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Cmd[2] += '\nprocess.exit(0)' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Cmd[3] = '/foreign.db' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Cmd[4] = '../foreign' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Cmd.push('foreign') },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.User = '0:0' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Tty = true },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Image = 'sha256:fixture-image' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Image = `sha256:${'f'.repeat(64)}` },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Env.push('TOKEN=foreign') },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.Mounts[0].Source = 'foreign-volume' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.Mounts[0].ReadOnly = false },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.Mounts[1].Source = '/foreign' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.WorkingDir = '/foreign' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.CapDrop = [] },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { Object.assign(body.HostConfig, { CapAdd: ['SYS_ADMIN'] }) },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.SecurityOpt = [] },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.Tmpfs['/tmp'] = 'rw,exec,size=16m' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.NetworkMode = 'bridge' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.ReadonlyRootfs = false },
+    ]
+    for (const mutate of mutations) {
+      const body = batchStoreHelperBody(); mutate(body)
+      const before = forwarded.length
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, body)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+    }
+    expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, batchStoreHelperBody())).status).toBe(201)
+    expect(broker.receiptIds()).toContain(helperId)
+    expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+    expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+    expect((await request('GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=1`)).status).toBe(200)
+    expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+  })
+})
 function historyHelperBody() {
   return {
     Image: 'sha256:fixture-image',

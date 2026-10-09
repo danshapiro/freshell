@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as owner from '../../../../scripts/testing/runtime-sandbox.js'
 import * as external from '../../../../scripts/testing/runtime-external-browser.js'
 import { execFile, execFileSync } from 'node:child_process'
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomUUID } from 'node:crypto'
+import net from 'node:net'
 import http from 'node:http'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -382,6 +383,43 @@ describe('Task7 closed historical snapshot installation', () => {
 })
 
 describe('Task7 registered physical stopped fixture preparation', () => {
+  it('admits only the fixed batch SQLite graph reader through the owned helper boundary', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-batch-broker-'))
+    const upstreamSocket = path.join(directory, 'upstream.sock'), proxySocket = path.join(directory, 'proxy.sock')
+    const helperId = 'e'.repeat(64), image = `sha256:${'a'.repeat(64)}`, volume = `freshell-provider-${'b'.repeat(24)}`
+    const upstream = http.createServer((_request, response) => { response.writeHead(201).end(JSON.stringify({ Id: helperId })) })
+    const broker = new RestrictedDockerBroker({ realSocketPath: upstreamSocket, proxySocketPath: proxySocket,
+      runtimeRootPrefix: directory, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set([image]),
+      allowedWorkspaceRoots: new Set([directory]), testRunId: 'owned-batch', logPath: path.join(directory, 'broker.jsonl') })
+    vi.spyOn(broker, 'receipts').mockReturnValue([{ soulId: 'soul-batch', incarnationId: 'inc-batch', containerId: 'c'.repeat(64),
+      imageRef: image, providerVolumeName: volume, workspacePath: directory, hostBinaryPath: '/owned/host',
+      runtimeDir: directory, createdAt: 'controlled', requestDigest: 'controlled' }])
+    const body = { Image: image, User: '65534:0', Tty: false, WorkingDir: directory, Entrypoint: ['node'],
+      Cmd: ['--no-warnings', '-e', owner.TASK007_BATCH_STORE_PROBE, '/home/freshell/provider/.local/share/opencode/opencode.db', 'ses_owned_batch'],
+      Env: ['HOME=/home/freshell/provider'], HostConfig: { NetworkMode: 'none', ReadonlyRootfs: true,
+        CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges'], Memory: 256 * 1024 * 1024, MemorySwap: 256 * 1024 * 1024,
+        NanoCpus: 500_000_000, PidsLimit: 32, Tmpfs: { '/tmp': 'rw,noexec,nosuid,nodev,size=16m' },
+        Mounts: [{ Type: 'volume', Source: volume, Target: '/home/freshell/provider', ReadOnly: true },
+          { Type: 'bind', Source: directory, Target: directory, ReadOnly: true }] } }
+    try {
+      await new Promise<void>(resolve => upstream.listen(upstreamSocket, resolve))
+      await broker.start()
+      const status = await new Promise<number>((resolve, reject) => {
+        const request = http.request({ socketPath: proxySocket, method: 'POST',
+          path: `/v1.47/containers/create?name=freshell-history-${randomUUID()}` }, response => {
+          response.resume(); response.on('end', () => resolve(response.statusCode!))
+        })
+        request.on('error', reject); request.end(JSON.stringify(body))
+      })
+      expect(status).toBe(201)
+      expect(broker.receiptIds()).toContain(helperId)
+    } finally {
+      await broker.close(); upstream.closeAllConnections()
+      await new Promise<void>(resolve => upstream.close(() => resolve()))
+      await fsp.rm(directory, { recursive: true, force: true }); vi.restoreAllMocks()
+    }
+  })
+
   async function browserFixture(rig: owner.ManagedRuntimeOwner): Promise<owner.Task007PreparedStoppedFixture> {
     const root = rig.runtime.testRoot
     await fsp.mkdir(root, { recursive: true, mode: 0o700 })
@@ -470,6 +508,12 @@ describe('Task7 registered physical stopped fixture preparation', () => {
     vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
     try {
       const original = await rig.prepareSyntheticStoppedRepairBatch()
+      expect(original).toMatchObject({ sourceStoreId: createHash('sha256')
+        .update(await fsp.realpath(batch.sourceDatabaseFile)).digest('hex') })
+      const sourceDb = new DatabaseSync(batch.sourceDatabaseFile)
+      sourceDb.prepare('UPDATE session SET title = ? WHERE id = ?').run('changed source content', batch.source.families[0].rootId)
+      sourceDb.close()
+      expect(await rig.syntheticStoppedRepairBatchFacts()).toEqual(original)
       expect(original.families[0].baselineMessages).toEqual(Object.fromEntries(batch.source.families[0].baselineMessages))
       expect(JSON.stringify(original)).not.toContain(batch.sourceDatabaseFile)
       await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'after_import_publication')).resolves.toEqual({ controlEpoch: null })
@@ -487,25 +531,43 @@ describe('Task7 registered physical stopped fixture preparation', () => {
     } finally { vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
   })
 
-  it('projects actual current repair SQLite records through the fixed reader and refuses absent or foreign operations', async () => {
+  it.each(['running', 'blocked stopped', 'retained failed Retry'] as const)(
+    'projects actual current repair SQLite records for %s and refuses absent or foreign operations', async (attempt) => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused batch reader web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
     const batch = await browserFixture(rig)
     vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
     vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const hostRuntimeDir = path.join(batch.outputDir, 'current-host')
+    let hostServer: net.Server | undefined
+    let hostStatus: owner.ManagedOpenCodeAdoptionStatus
     try {
-      await rig.prepareSyntheticStoppedRepairBatch()
+      const facts = await rig.prepareSyntheticStoppedRepairBatch()
       await fsp.mkdir(batch.registryRoot)
       const database = path.join(batch.registryRoot, 'runtime.sqlite3')
       const db = new DatabaseSync(database)
-      db.exec(`CREATE TABLE stopped_repair_operations(operation_id TEXT,status TEXT,targets_json TEXT);
+      db.exec(`CREATE TABLE installation(singleton INTEGER,control_epoch INTEGER); INSERT INTO installation VALUES(1,12);
+        CREATE TABLE stopped_repair_operations(operation_id TEXT,status TEXT,targets_json TEXT,scope_json TEXT,owner_choices_json TEXT);
         CREATE TABLE stopped_repair_withdrawals(operation_id TEXT,status TEXT);
-        CREATE TABLE stopped_repair_root_receipts(operation_id TEXT,root_session_id TEXT,canonical_soul_id TEXT,source_generation TEXT,transfer_id TEXT,import_receipt_json TEXT,readable_receipt_json TEXT);
+        CREATE TABLE stopped_repair_root_receipts(operation_id TEXT,root_session_id TEXT,canonical_soul_id TEXT,source_generation TEXT,transfer_id TEXT,import_receipt_json TEXT,readable_receipt_json TEXT,source_store_id TEXT,identity_revision INTEGER,intent_revision INTEGER,native_import_revision INTEGER);
         CREATE TABLE souls(soul_id TEXT,provider_store_id TEXT,native_session_id TEXT,desired_state TEXT,recovery_state TEXT,identity_revision INTEGER,intent_revision INTEGER,native_import_revision INTEGER);
-        CREATE TABLE writer_claims(soul_id TEXT,provider TEXT,provider_store_id TEXT,native_session_id TEXT);CREATE TABLE loss_incidents(incident_id TEXT);
+        CREATE TABLE writer_claims(soul_id TEXT,provider TEXT,provider_store_id TEXT,native_session_id TEXT,incarnation_id TEXT,intent_revision INTEGER);
+        CREATE TABLE incarnations(soul_id TEXT,incarnation_id TEXT,launch_nonce TEXT,container_id TEXT,host_boot_id TEXT,launch_state TEXT,execution_generation INTEGER,created_at INTEGER);
+        CREATE TABLE loss_incidents(incident_id TEXT);
         CREATE TABLE view_intents(view_id TEXT);CREATE TABLE runtime_notices(notice_id TEXT);CREATE TABLE outbox(event_id TEXT);`)
-      db.prepare('INSERT INTO stopped_repair_operations VALUES(?,?,?)').run('repair-current', 'complete', JSON.stringify(batch.output.targets.map(target => ({ soulId: target.soulId }))))
-      db.prepare('INSERT INTO stopped_repair_operations VALUES(?,?,?)').run('repair-foreign', 'complete', '[]')
+      const targets = batch.output.targets.map(target => ({ soulId: target.soulId, incidentId: target.incidentId,
+        expectedIntentRevision: target.expectedIntentRevision }))
+      const scope = { scopeId: 'd'.repeat(64), sourceStoreId: facts.sourceStoreId, sourceFingerprint: 'e'.repeat(64),
+        targets: batch.output.targets.map((target, index) => ({ target: targets[index], providerStoreId: target.providerStoreId,
+          rootSessionId: target.rootSessionId, incidentRevision: 1, identityRevision: 1, nativeImportRevision: 1, evidenceRevision: 1 })),
+        roots: batch.source.families.map(family => { const eligibleOwners = batch.output.targets.filter(target => target.rootSessionId === family.rootId).map(target => target.soulId)
+          return { rootSessionId: family.rootId, graphDigest: 'generation-current', eligibleOwners,
+            canonicalSoulId: eligibleOwners.length === 1 ? eligibleOwners[0] : null } }) }
+      // Production scopes use a SHA256 generation, independently of the selection ID.
+      scope.roots.forEach(root => { root.graphDigest = 'f'.repeat(64) })
+      const insertOperation = db.prepare('INSERT INTO stopped_repair_operations VALUES(?,?,?,?,?)')
+      insertOperation.run('repair-current', 'complete', JSON.stringify(targets), JSON.stringify(scope), JSON.stringify(batch.output.canonicalChoices))
+      insertOperation.run('repair-foreign', 'complete', '[]', JSON.stringify(scope), JSON.stringify(batch.output.canonicalChoices))
       db.prepare('INSERT INTO stopped_repair_withdrawals VALUES(?,?)').run('repair-current', 'files_complete')
       for (const target of batch.output.targets) db.prepare('INSERT INTO souls VALUES(?,?,?,?,?,?,?,?)').run(target.soulId, target.providerStoreId, target.rootSessionId, 'stopped', 'data_repair_complete', 2, 1, 2)
       db.prepare('INSERT INTO loss_incidents VALUES(?)').run('incident-9')
@@ -513,10 +575,10 @@ describe('Task7 registered physical stopped fixture preparation', () => {
       db.prepare('INSERT INTO runtime_notices VALUES(?)').run('notice-unrelated')
       db.prepare('INSERT INTO outbox VALUES(?)').run('event-unrelated')
       const root = batch.output.targets[0]
-      db.prepare('INSERT INTO stopped_repair_root_receipts VALUES(?,?,?,?,?,?,?)').run('repair-current', root.rootSessionId, root.soulId,
-        'generation-current', 'transfer-current', JSON.stringify({ adoption_baseline: { manifestSha256: 'f'.repeat(64) } }),
+      db.prepare('INSERT INTO stopped_repair_root_receipts VALUES(?,?,?,?,?,?,?,?,?,?,?)').run('repair-current', root.rootSessionId, root.soulId,
+        'f'.repeat(64), 'transfer-current', JSON.stringify({ adoption_baseline: { manifestSha256: 'f'.repeat(64) } }),
         JSON.stringify({ destinationStoreId: root.providerStoreId, rowCount: 318, assetCount: 0, structuralSha256: 'a'.repeat(64),
-          providerUid: 65534, providerGid: 0, readerEnvironmentSha256: 'b'.repeat(64) }))
+          providerUid: 65534, providerGid: 0, readerEnvironmentSha256: 'b'.repeat(64) }), facts.sourceStoreId, 1, 1, 1)
       db.close()
       await fsp.mkdir(path.join(batch.registryRoot, 'incidents'))
       await fsp.writeFile(path.join(batch.registryRoot, 'incidents/incident-9.closed.json'), 'unchanged unrelated artifact')
@@ -525,9 +587,15 @@ describe('Task7 registered physical stopped fixture preparation', () => {
       rig.supervisor = { scenarioId: batch.scenarioId, volumeName: batch.volumeName!, containerId: 'c'.repeat(64),
         runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled', controlSecretFile: '/controlled/secret', binaryKind: 'test' }
       vi.spyOn(Object.getPrototypeOf(rig), 'ownedDockerProbe').mockImplementation(async (_container: string, args: string[]) => new Promise<string>((resolve, reject) => {
+        if (args[0] === 'node') {
+          execFile(process.execPath, ['--no-warnings', '-e', args[3],
+            path.join(sourceRoot, 'test/e2e-browser/fixtures/managed-opencode-host-status.cjs'), hostRuntimeDir, args[6], args[7]],
+          { encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout))
+          return
+        }
         expect(args.slice(0, 3)).toEqual(['python3', '-I', '-c'])
         const exports = args[7] === '/var/lib/freshell-supervisor' ? batch.registryRoot : args[7]
-        execFile('python3', [args[1], args[2], args[3], database, args[5], args[6], exports], { encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout))
+        execFile('python3', [args[1], args[2], args[3], database, args[5], args[6], exports, args[8]], { encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout))
       }))
       rig.runtime.imageRef = batch.input.imageRef
       rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: '/controlled-unused', proxySocketPath: batch.input.brokerSocketPath,
@@ -540,7 +608,11 @@ describe('Task7 registered physical stopped fixture preparation', () => {
       const probeScript = path.join(batch.outputDir, 'readonly-control.cjs')
       const calls = path.join(batch.outputDir, 'readonly-calls.jsonl')
       const selected = path.join(batch.outputDir, 'readonly-request.json')
-      await fsp.writeFile(probeScript, `const fs=require('node:fs'),args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='inspect')process.stdout.write(JSON.stringify([{Id:${JSON.stringify(root.containerId)},State:{Running:false}}]));else if(args[0]==='create'){fs.writeFileSync(${JSON.stringify(selected)},args.at(-1));process.stdout.write('${'d'.repeat(64)}')}else if(args[0]==='wait')process.stdout.write('0');else if(args[0]==='logs')process.stdout.write(JSON.stringify({request:JSON.parse(fs.readFileSync(${JSON.stringify(selected)})),providerVersion:'1.18.21',sourceSchemaFingerprint:'schema-current',migrationJournalFingerprint:'migration-current',generation:'generation-current',rowCount:318}));else if(!['start','rm'].includes(args[0]))process.exit(4);\n`)
+      const inspection = path.join(batch.outputDir, 'inspection.json')
+      await fsp.writeFile(inspection, JSON.stringify([{ Id: root.containerId, State: { Running: false } }]))
+      const installedDatabase = path.join(batch.outputDir, 'installed.db')
+      await fsp.copyFile(batch.sourceDatabaseFile, installedDatabase)
+      await fsp.writeFile(probeScript, `const fs=require('node:fs'),args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='inspect')process.stdout.write(fs.readFileSync(${JSON.stringify(inspection)}));else if(args[0]==='create'){fs.writeFileSync(${JSON.stringify(selected)},JSON.stringify(args));process.stdout.write('${'d'.repeat(64)}')}else if(args[0]==='wait')process.stdout.write('0');else if(args[0]==='logs'){const saved=JSON.parse(fs.readFileSync(${JSON.stringify(selected)}));if(saved[saved.indexOf('--entrypoint')+1]==='node')process.stdout.write(require('node:child_process').execFileSync(process.execPath,['--no-warnings','-e',saved.at(-3),${JSON.stringify(installedDatabase)},saved.at(-1)],{encoding:'utf8'}));else process.stdout.write(JSON.stringify({request:JSON.parse(saved.at(-1)),providerVersion:'1.18.21',sourceSchemaFingerprint:'schema-current',migrationJournalFingerprint:'migration-current',generation:'generation-current',rowCount:318}));}else if(!['start','rm'].includes(args[0]))process.exit(4);\n`)
       const read = vi.spyOn(Object.getPrototypeOf(rig), 'trackedDockerProbe').mockImplementation(async (_container: string, args: string[]) => new Promise<string>((resolve, reject) => {
         execFile(process.execPath, [probeScript, ...args], { encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout))
       }))
@@ -549,32 +621,267 @@ describe('Task7 registered physical stopped fixture preparation', () => {
       expect(observed.souls).toHaveLength(9)
       expect(observed.souls.every(soul => soul.activeWriters === 0 && !soul.incidentPresent)).toBe(true)
       expect(observed.roots[0]).toMatchObject({ rootSessionId: root.rootSessionId, providerUid: 65534, rowCount: 318 })
-      expect(observed.installedStores).toEqual([{ rootSessionId: root.rootSessionId, providerStoreId: root.providerStoreId,
+      expect(observed.installedStores.map(({ parents, history, excludedSourceSentinels, ...measured }) => measured)).toEqual([{ rootSessionId: root.rootSessionId, providerStoreId: root.providerStoreId,
         providerUid: 65534, providerGid: 0, providerVersion: '1.18.21', sourceSchemaFingerprint: 'schema-current',
         migrationJournalFingerprint: 'migration-current', generation: 'generation-current', rowCount: 318 }])
+      expect(observed.installedStores[0]).toHaveProperty('parents', {
+        [batch.source.families[0].rootId]: null,
+        [batch.source.families[0].childId]: batch.source.families[0].rootId,
+        [batch.source.families[0].grandchildId]: batch.source.families[0].childId,
+      })
+      expect(observed.installedStores[0].history.messages).toEqual(Object.fromEntries(batch.source.families[0].baselineMessages))
+      expect(observed.installedStores[0].history.parts).toEqual(Object.fromEntries(batch.source.families[0].baselineParts))
+      expect(observed.installedStores[0].excludedSourceSentinels).toEqual([...owner.EXCLUDED_SOURCE_SENTINELS].sort())
+      expect(JSON.stringify(observed)).not.toContain('must-not-import')
       const actual = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
-      expect(actual.map(args => args[0])).toEqual(['inspect', 'create', 'start', 'wait', 'logs', 'rm'])
+      expect(actual.map(args => args[0])).toEqual(['inspect', 'create', 'start', 'wait', 'logs', 'create', 'start', 'wait', 'logs', 'rm', 'rm'])
       expect(actual[1]).toContain('retained-opencode-store-worker')
       expect(actual[1]).toContain(`type=volume,source=${root.providerVolumeName},target=/home/freshell/provider,readonly`)
       expect(actual.at(-1)?.slice(0, 2)).toEqual(['rm', '--force'])
       expect(observed.unrelated).toEqual({ incidentPresent: true, viewPresent: true, noticeIds: ['notice-unrelated'],
         outboxEventIds: ['event-unrelated'], exportSha256: [createHash('sha256').update('unchanged unrelated artifact').digest('hex')] })
+      const alteredGraph = new DatabaseSync(installedDatabase)
+      alteredGraph.prepare('UPDATE session SET parent_id = ? WHERE id = ?').run(root.rootSessionId, batch.source.families[0].grandchildId)
+      alteredGraph.close()
+      const changedEdges = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
+      expect(changedEdges.installedStores[0].history.sessions).toEqual(observed.installedStores[0].history.sessions)
+      expect(changedEdges.installedStores[0].parents).not.toEqual(observed.installedStores[0].parents)
+      expect(changedEdges.installedStores[0].parents[batch.source.families[0].grandchildId]).toBe(root.rootSessionId)
+      const resumed = { soulId: root.soulId, incarnationId: 'incarnation-resumed', containerId: 'a'.repeat(64),
+        hostBootId: 'resumed-boot', terminalId: 'terminal-0', nativeSessionId: root.rootSessionId,
+        provider: 'opencode', launchState: 'running', desiredState: 'running', recoveryState: 'live', intentRevision: 2,
+        executionGeneration: 2, evidenceRevision: 3,
+        nativeIdentityObservation: { nativeSessionId: root.rootSessionId, incarnationId: 'incarnation-resumed',
+          launchNonce: 'private-current-nonce', evidenceRevision: 3, source: 'opencode_tui' as const, evidenceDigest: 'c'.repeat(64) } }
+      const liveDb = new DatabaseSync(database)
+      liveDb.prepare('UPDATE souls SET desired_state=?,recovery_state=?,intent_revision=? WHERE soul_id=?').run('running', 'live', 2, root.soulId)
+      liveDb.prepare('INSERT INTO incarnations VALUES(?,?,?,?,?,?,?,?)').run(root.soulId, resumed.incarnationId,
+        'private-current-nonce', resumed.containerId, resumed.hostBootId, 'running', 2, 100)
+      liveDb.prepare('INSERT INTO writer_claims VALUES(?,?,?,?,?,?)').run(root.soulId, 'opencode', root.providerStoreId, root.rootSessionId, resumed.incarnationId, 2)
+      liveDb.close()
+      const originalReceipts = rig.runtime.broker.receipts()
+      vi.spyOn(rig.runtime.broker, 'receipts').mockReturnValue([...originalReceipts,
+        { ...originalReceipts[0], containerId: resumed.containerId, incarnationId: resumed.incarnationId }])
+      const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([resumed])
+      const persistedInventory = () => {
+        const registry = new DatabaseSync(database, { readOnly: true })
+        try {
+          return registry.prepare(`SELECT i.incarnation_id,i.container_id,i.host_boot_id,i.launch_state,i.execution_generation,
+            s.desired_state,s.recovery_state,s.intent_revision FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id
+            ORDER BY i.created_at,i.incarnation_id`).all().map(row => ({ ...resumed,
+              incarnationId: String(row.incarnation_id), containerId: row.container_id === null ? undefined : String(row.container_id),
+              hostBootId: row.host_boot_id === null ? undefined : String(row.host_boot_id), launchState: String(row.launch_state),
+              executionGeneration: Number(row.execution_generation), desiredState: String(row.desired_state),
+              recoveryState: String(row.recovery_state), intentRevision: Number(row.intent_revision),
+              nativeIdentityObservation: row.incarnation_id === resumed.incarnationId ? resumed.nativeIdentityObservation : undefined }))
+        } finally { registry.close() }
+      }
+      if (attempt === 'blocked stopped') {
+        const blocked = { ...resumed, launchState: 'stopped', recoveryState: 'blocked' }
+        const failedResume = new DatabaseSync(database)
+        failedResume.exec("UPDATE souls SET recovery_state='blocked' WHERE soul_id='soul-0'; UPDATE incarnations SET launch_state='stopped'; DELETE FROM writer_claims")
+        failedResume.close()
+        inventory.mockImplementation(async () => persistedInventory())
+        await fsp.writeFile(inspection, JSON.stringify([{ Id: resumed.containerId, State: { Running: false } }]))
+        const blockedObservation = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
+        expect(blockedObservation.souls[0]).toMatchObject({ desiredState: 'running', recoveryState: 'blocked', activeWriters: 0 })
+        expect(blockedObservation.nativeObservations[0]).toEqual({ rootSessionId: root.rootSessionId,
+          canonicalSoulId: root.soulId, state: 'unavailable', reason: 'host_unavailable' })
+        expect(blockedObservation.installedStores[0]).toEqual(changedEdges.installedStores[0])
+        inventory.mockResolvedValueOnce([blocked]).mockResolvedValueOnce([{ ...blocked, intentRevision: 3 }])
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/changed/)
+        const stoppedWriter = new DatabaseSync(database)
+        stoppedWriter.prepare('INSERT INTO writer_claims VALUES(?,?,?,?,?,?)').run(root.soulId, 'opencode', root.providerStoreId,
+          root.rootSessionId, resumed.incarnationId, 2)
+        stoppedWriter.close()
+        read.mockClear()
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/writer/)
+        expect(read).not.toHaveBeenCalled()
+        const retry = new DatabaseSync(database)
+        retry.exec("UPDATE souls SET recovery_state='live' WHERE soul_id='soul-0'; UPDATE incarnations SET launch_state='running'")
+        retry.close()
+        inventory.mockResolvedValue([resumed])
+      }
+      if (attempt === 'retained failed Retry') {
+        const predecessor = { ...resumed, incarnationId: 'incarnation-retired', containerId: undefined,
+          hostBootId: undefined, launchState: 'failed', executionGeneration: 1, nativeIdentityObservation: undefined }
+        const retired = new DatabaseSync(database)
+        retired.prepare('INSERT INTO incarnations VALUES(?,?,?,?,?,?,?,?)').run(root.soulId, predecessor.incarnationId,
+          'private-retired-nonce', null, null, 'failed', 1, 90)
+        retired.close()
+        inventory.mockImplementation(async () => persistedInventory())
+      }
+      const adoptionNonce = '1234567890abcdef'.repeat(2), adoptionGeneration = '9'.repeat(64)
+      hostStatus = { state: 'observed', data: { observation: {
+        terminalId: resumed.terminalId, rootSessionId: root.rootSessionId, tailMessageId: null,
+        evidenceGeneration: adoptionGeneration, incarnationId: resumed.incarnationId,
+        launchNonce: adoptionNonce, hydrated: true, messagesRead: 'success' } } }
+      await fsp.mkdir(hostRuntimeDir, { mode: 0o700 })
+      const secret = Buffer.from('private-unit-host-secret')
+      await fsp.writeFile(path.join(hostRuntimeDir, 'secret'), secret, { mode: 0o600 })
+      const proof = (challenge: string) => createHmac('sha256', secret)
+        .update(`${challenge}\0${resumed.hostBootId}\0${resumed.incarnationId}`).digest('hex')
+      hostServer = net.createServer(socket => {
+        let buffered = Buffer.alloc(0)
+        socket.on('error', () => socket.destroy())
+        socket.on('data', chunk => {
+          buffered = Buffer.concat([buffered, chunk])
+          if (buffered.length < 4 || buffered.length < buffered.readUInt32BE(0) + 4) return
+          const request = JSON.parse(buffered.subarray(4).toString())
+          const hello = request.body.method === 'hello'
+          const admitted = request.body.params.incarnation_id === resumed.incarnationId
+            && (hello || request.auth === proof('command-auth'))
+          const response = { requestId: request.requestId, result: admitted ? { Ok: hello
+            ? { kind: 'hello', data: { host_boot_id: resumed.hostBootId, proof: proof(request.body.params.challenge) } }
+            : { kind: 'status', data: { host_boot_id: resumed.hostBootId, opencode_adoption: hostStatus } } }
+            : { Err: { code: 'UNAUTHORIZED' } } }
+          const payload = Buffer.from(JSON.stringify(response)), frame = Buffer.alloc(payload.length + 4)
+          frame.writeUInt32BE(payload.length, 0); payload.copy(frame, 4); socket.end(frame)
+        })
+      })
+      await new Promise<void>(resolve => hostServer!.listen(path.join(hostRuntimeDir, 'host.sock'), resolve))
+      await fsp.writeFile(inspection, JSON.stringify([{ Id: resumed.containerId, State: { Running: true } }]))
+      const live = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
+      expect(live).toHaveProperty('nativeObservations.0.state', 'current')
+      expect(JSON.stringify(live)).not.toContain('private-current-nonce')
+      expect(JSON.stringify(live)).not.toContain(adoptionNonce)
+      expect(live).toHaveProperty('nativeObservations.0.hostStatus.launchNonceSha256', createHash('sha256').update(adoptionNonce).digest('hex'))
+      expect(live).toHaveProperty('nativeObservations.0.registryNativeObservation.launchNonceSha256', createHash('sha256').update('private-current-nonce').digest('hex'))
+      expect(live).toHaveProperty('nativeObservations.0.hostStatus.evidenceGeneration', adoptionGeneration)
+      for (const changedView of [
+        { ...resumed, incarnationId: 'incarnation-foreign' },
+        { ...resumed, hostBootId: 'foreign-boot' },
+        { ...resumed, nativeSessionId: 'ses_foreign' },
+        { ...resumed, executionGeneration: 3 },
+        { ...resumed, intentRevision: 3 },
+        { ...resumed, nativeIdentityObservation: { ...resumed.nativeIdentityObservation, launchNonce: 'foreign-nonce' } },
+        { ...resumed, nativeIdentityObservation: { ...resumed.nativeIdentityObservation, evidenceRevision: 2 } },
+      ]) {
+        inventory.mockResolvedValue([changedView])
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/current/)
+      }
+      for (const conflictingViews of [
+        [resumed, resumed],
+        ...['prepared', 'created', 'starting', 'running', 'stopping'].map(launchState =>
+          [resumed, { ...resumed, incarnationId: 'incarnation-conflicting', launchState }]),
+      ]) {
+        inventory.mockResolvedValue(conflictingViews)
+        read.mockClear()
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/current/)
+        expect(read).not.toHaveBeenCalled()
+        inventory.mockResolvedValueOnce([resumed]).mockResolvedValueOnce(conflictingViews)
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/changed/)
+      }
+      inventory.mockResolvedValue([resumed])
+      const duplicateWriter = new DatabaseSync(database)
+      duplicateWriter.prepare('INSERT INTO writer_claims VALUES(?,?,?,?,?,?)').run(root.soulId, 'opencode', root.providerStoreId,
+        root.rootSessionId, resumed.incarnationId, 2)
+      duplicateWriter.close()
+      read.mockClear()
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/writer/)
+      expect(read).not.toHaveBeenCalled()
+      const removeDuplicate = new DatabaseSync(database)
+      removeDuplicate.exec('DELETE FROM writer_claims WHERE rowid=(SELECT MAX(rowid) FROM writer_claims)')
+      removeDuplicate.close()
+      const foreignLiveWriter = new DatabaseSync(database)
+      foreignLiveWriter.prepare('UPDATE writer_claims SET soul_id = ?, incarnation_id = ?').run('foreign-soul', 'incarnation-foreign')
+      foreignLiveWriter.close()
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/writer/)
+      const restoreWriter = new DatabaseSync(database)
+      restoreWriter.prepare('UPDATE writer_claims SET soul_id = ?, incarnation_id = ?').run(root.soulId, resumed.incarnationId)
+      restoreWriter.close()
+      inventory.mockResolvedValueOnce([resumed]).mockResolvedValueOnce([{ ...resumed, evidenceRevision: 4 }])
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/changed/)
+      inventory.mockResolvedValue([resumed])
+      hostStatus = { state: 'awaiting_observation' }
+      const awaiting = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
+      expect(awaiting).toHaveProperty('nativeObservations.0.hostStatus.state', 'awaiting_observation')
+      inventory.mockResolvedValue([{ ...resumed, nativeIdentityObservation: undefined }])
+      const awaitingRegistry = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
+      expect(awaitingRegistry).toHaveProperty('nativeObservations.0.registryNativeObservation', null)
+      inventory.mockResolvedValue([resumed])
+      hostStatus = { state: 'observed', data: { observation: { terminalId: resumed.terminalId, rootSessionId: root.rootSessionId,
+        tailMessageId: null, evidenceGeneration: adoptionGeneration, incarnationId: resumed.incarnationId,
+        launchNonce: adoptionNonce, hydrated: true, messagesRead: 'success' } } }
+      hostStatus.data.observation.launchNonce = 'foreign-native-nonce'
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/nonce/)
+      hostStatus.data.observation.launchNonce = adoptionNonce
+      hostStatus.data.observation.evidenceGeneration = 'malformed-generation'
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/generation/)
+      hostStatus.data.observation.evidenceGeneration = adoptionGeneration
+      for (const key of ['incarnationId', 'rootSessionId', 'terminalId'] as const) {
+        const currentValue = hostStatus.data.observation[key]
+        hostStatus.data.observation[key] = 'foreign-current-binding'
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/differs/)
+        hostStatus.data.observation[key] = currentValue
+      }
+      await new Promise<void>(resolve => hostServer!.close(() => resolve()))
+      hostServer = undefined
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).resolves.toHaveProperty('nativeObservations.0.reason', 'host_unavailable')
+      inventory.mockRestore()
+      vi.spyOn(rig.runtime.broker, 'receipts').mockReturnValue(originalReceipts)
+      const stoppedAgain = new DatabaseSync(database)
+      stoppedAgain.prepare('UPDATE souls SET desired_state=?,recovery_state=?,intent_revision=? WHERE soul_id=?').run('stopped', 'data_repair_complete', 1, root.soulId)
+      stoppedAgain.exec('DELETE FROM writer_claims; DELETE FROM incarnations')
+      stoppedAgain.close()
+      await fsp.writeFile(inspection, JSON.stringify([{ Id: root.containerId, State: { Running: false } }]))
       const changed = new DatabaseSync(database)
-      changed.prepare('INSERT INTO writer_claims VALUES(?,?,?,?)').run(root.soulId, 'opencode', root.providerStoreId, root.rootSessionId)
+      changed.prepare('INSERT INTO writer_claims VALUES(?,?,?,?,?,?)').run(root.soulId, 'opencode', root.providerStoreId, root.rootSessionId, root.incarnationId, 1)
       changed.close()
       read.mockClear()
       await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/writer/)
       expect(read).not.toHaveBeenCalled()
       const foreignWriter = new DatabaseSync(database)
       foreignWriter.exec('DELETE FROM writer_claims')
-      foreignWriter.prepare('INSERT INTO writer_claims VALUES(?,?,?,?)').run('foreign-soul', 'opencode', root.providerStoreId, root.rootSessionId)
+      foreignWriter.prepare('INSERT INTO writer_claims VALUES(?,?,?,?,?,?)').run('foreign-soul', 'opencode', root.providerStoreId, root.rootSessionId, 'foreign-incarnation', 1)
       foreignWriter.close()
       await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/writer/)
       expect(read).not.toHaveBeenCalled()
       await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'absent')).rejects.toThrow(/absent/)
       await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-foreign')).rejects.toThrow(/differ/)
       await expect(rig.syntheticStoppedRepairBatchObservation('foreign-fixture', 'repair-current')).rejects.toThrow(/registered/)
-    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+      const mismatched = new DatabaseSync(database)
+      mismatched.prepare('UPDATE stopped_repair_operations SET targets_json = ? WHERE operation_id = ?')
+        .run(JSON.stringify(batch.output.targets.map(target => ({ soulId: target.soulId,
+          incidentId: 'foreign-incident', expectedIntentRevision: target.expectedIntentRevision }))), 'repair-current')
+      mismatched.exec('DELETE FROM writer_claims')
+      mismatched.close()
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/targets|incident/)
+      const receiptDrift = new DatabaseSync(database)
+      receiptDrift.prepare('UPDATE stopped_repair_operations SET targets_json = ? WHERE operation_id = ?').run(JSON.stringify(targets), 'repair-current')
+      receiptDrift.prepare('UPDATE stopped_repair_root_receipts SET source_store_id = ?').run('a'.repeat(64))
+      receiptDrift.close()
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/source|capture/)
+      const restoreReceipt = new DatabaseSync(database)
+      restoreReceipt.prepare('UPDATE stopped_repair_root_receipts SET source_store_id = ?, native_import_revision = ?').run(facts.sourceStoreId, 9)
+      restoreReceipt.close()
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/capture/)
+      const restoreCapture = new DatabaseSync(database)
+      restoreCapture.exec('UPDATE stopped_repair_root_receipts SET native_import_revision = 1')
+      restoreCapture.close()
+      for (const wrongScope of [
+        { ...scope, sourceStoreId: '0'.repeat(64) },
+        { ...scope, targets: scope.targets.map((target, index) => index === 0
+          ? { ...target, target: { ...target.target, expectedIntentRevision: 2 } } : target) },
+        { ...scope, roots: scope.roots.map((root, index) => index === 0 ? { ...root, eligibleOwners: ['foreign-soul'] } : root) },
+        { ...scope, roots: scope.roots.slice(1) },
+      ]) {
+        const wrong = new DatabaseSync(database)
+        wrong.prepare('UPDATE stopped_repair_operations SET scope_json = ? WHERE operation_id = ?').run(JSON.stringify(wrongScope), 'repair-current')
+        wrong.close()
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/source|capture|eligible/)
+      }
+      const wrongChoice = new DatabaseSync(database)
+      wrongChoice.prepare('UPDATE stopped_repair_operations SET scope_json = ?, owner_choices_json = ? WHERE operation_id = ?')
+        .run(JSON.stringify(scope), JSON.stringify(batch.output.canonicalChoices.map((choice, index) => index === 0 ? { ...choice, soulId: 'soul-7' } : choice)), 'repair-current')
+      wrongChoice.close()
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/canonical/)
+    } finally {
+      if (hostServer) await new Promise<void>(resolve => hostServer!.close(() => resolve()))
+      vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true })
+      expect(fs.existsSync(path.join(hostRuntimeDir, 'host.sock'))).toBe(false)
+      expect(fs.existsSync(rig.runtime.testRoot)).toBe(false)
+    }
   })
 
   it('refuses browser batch setup before any preparation unless the owner is isolated, grant-free and explicitly opted in', async () => {

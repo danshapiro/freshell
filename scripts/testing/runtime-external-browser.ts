@@ -788,8 +788,12 @@ export class ExternalManagedRuntimeRig {
     return this.rpc('synthetic-stopped-repair-facts', SyntheticStoppedRepairBatchFactsSchema)
   }
   async syntheticStoppedRepairBatchObservation(fixtureId: string, operationId: string): Promise<SyntheticStoppedRepairBatchObservation> {
-    return this.rpc('synthetic-stopped-repair-observation', SyntheticStoppedRepairBatchObservationSchema,
+    const observed = await this.rpc('synthetic-stopped-repair-observation', SyntheticStoppedRepairBatchObservationSchema,
       { fixtureId, repairOperationId: operationId })
+    if (observed.fixtureId !== fixtureId || observed.operationId !== operationId) {
+      throw new Error('batch observation belongs to another fixture or repair operation')
+    }
+    return observed
   }
   async setSyntheticStoppedRepairFault(fixtureId: string, preset: SyntheticStoppedRepairFault): Promise<{ controlEpoch: number | null }> {
     return this.rpc('synthetic-stopped-repair-fault', z.object({ controlEpoch: z.number().int().nonnegative().nullable() }).strict(),
