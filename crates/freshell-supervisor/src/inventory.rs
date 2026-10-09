@@ -62,6 +62,13 @@ impl Supervisor {
             }),
         );
 
+        let due: BTreeMap<_, _> = self
+            .registry
+            .due_recovery_retries(self.registry.recovery_now_ms())
+            .await
+            .map_err(map_registry)?
+            .into_iter()
+            .collect();
         let mut latest = BTreeMap::<SoulId, u64>::new();
         for view in self.registry.inventory().await.map_err(map_registry)? {
             if view.desired_state == DesiredState::Running {
@@ -77,6 +84,7 @@ impl Supervisor {
         let mut tasks = JoinSet::new();
 
         for (soul_id, intent_revision) in latest {
+            let only_due_retry = due.contains_key(&soul_id);
             let supervisor = self.clone();
             let semaphore = Arc::clone(&semaphore);
             let active = Arc::clone(&active);
@@ -90,12 +98,15 @@ impl Supervisor {
                 peak.fetch_max(observed, Ordering::SeqCst);
                 let result = tokio::time::timeout(
                     timeout,
-                    supervisor.recover(RecoverRequest {
-                        soul_id: soul_id.clone(),
-                        trigger: RecoveryTrigger::StartupReconcile,
-                        expected_intent_revision: Some(intent_revision),
-                        expected_control_epoch: Some(supervisor.registry.control_epoch()),
-                    }),
+                    supervisor.recover_scheduled(
+                        RecoverRequest {
+                            soul_id: soul_id.clone(),
+                            trigger: RecoveryTrigger::StartupReconcile,
+                            expected_intent_revision: Some(intent_revision),
+                            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                        },
+                        only_due_retry,
+                    ),
                 )
                 .await;
                 active.fetch_sub(1, Ordering::SeqCst);
@@ -195,7 +206,14 @@ impl Supervisor {
         });
     }
 
-    async fn observe_once(&self) -> Result<(), RuntimeError> {
+    pub(crate) async fn observe_once(&self) -> Result<(), RuntimeError> {
+        let due: BTreeMap<_, _> = self
+            .registry
+            .due_recovery_retries(self.registry.recovery_now_ms())
+            .await
+            .map_err(map_registry)?
+            .into_iter()
+            .collect();
         let mut latest = BTreeMap::new();
         for view in self.registry.inventory().await.map_err(map_registry)? {
             latest.insert(view.soul_id.clone(), view);
@@ -204,17 +222,33 @@ impl Supervisor {
         let semaphore = Arc::new(Semaphore::new(startup_concurrency_limit()));
         for (_, view) in latest {
             if view.desired_state != DesiredState::Running
-                || view.recovery_state != RecoveryState::Live
-                || view.launch_state != LaunchState::Running
+                || (!due.contains_key(&view.soul_id)
+                    && (view.recovery_state != RecoveryState::Live
+                        || view.launch_state != LaunchState::Running))
             {
                 continue;
             }
+            let retry_due = due.contains_key(&view.soul_id);
             let supervisor = self.clone();
             let semaphore = Arc::clone(&semaphore);
             tasks.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.map_err(|error| {
                     RuntimeError::new(RuntimeErrorCode::RegistryFailure, error.to_string())
                 })?;
+                if retry_due {
+                    supervisor
+                        .recover_scheduled(
+                            RecoverRequest {
+                                soul_id: view.soul_id,
+                                trigger: RecoveryTrigger::StartupReconcile,
+                                expected_intent_revision: Some(view.intent_revision),
+                                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                            },
+                            true,
+                        )
+                        .await?;
+                    return Ok(());
+                }
                 let handle = supervisor
                     .registry
                     .active_handle_for_soul(view.soul_id.clone())

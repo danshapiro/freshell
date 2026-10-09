@@ -1229,6 +1229,19 @@ impl Supervisor {
                 crate::recovery::NativeIdentityWait::Observed {
                     native_session_id, ..
                 } => native_session_id,
+                crate::recovery::NativeIdentityWait::HostUnavailable {
+                    transient: Some(_), ..
+                } => {
+                    return Err(self.activation_failure(
+                        &prepared,
+                        state,
+                        "verify_native_startup",
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "native startup host transport unavailable",
+                        ),
+                    ));
+                }
                 crate::recovery::NativeIdentityWait::StopIntent { .. }
                 | crate::recovery::NativeIdentityWait::IntentChanged { .. } => {
                     return Err(self.activation_failure(
@@ -2357,7 +2370,7 @@ impl Supervisor {
             .await?;
         if response != b"ok" {
             return Err(RuntimeError::new(
-                RuntimeErrorCode::HostUnreachable,
+                RuntimeErrorCode::RecoveryBlocked,
                 "capability_pending: server rejected scoped grant",
             ));
         }
@@ -2386,7 +2399,7 @@ impl Supervisor {
             .await?;
         serde_json::from_slice(&response).map_err(|_| {
             RuntimeError::new(
-                RuntimeErrorCode::HostUnreachable,
+                RuntimeErrorCode::RecoveryBlocked,
                 "capability_pending: server returned an invalid exact provider preparation",
             )
         })
@@ -2441,7 +2454,16 @@ impl Supervisor {
             })?
             .map_err(|error| {
                 RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Other
+                            | std::io::ErrorKind::InvalidInput
+                            | std::io::ErrorKind::InvalidData
+                    ) {
+                        RuntimeErrorCode::RecoveryBlocked
+                    } else {
+                        RuntimeErrorCode::HostUnreachable
+                    },
                     format!("capability_pending: server callback unavailable: {error}"),
                 )
             })?;
@@ -2459,6 +2481,17 @@ impl Supervisor {
             .begin_stop_expected(soul_id.clone(), expected_intent_revision)
             .await
             .map_err(map_registry)?;
+        let stopped = self.registry.recovery_context(soul_id.clone()).await.ok();
+        let stopped_view = self.registry.inventory().await.ok().and_then(|views| {
+            views
+                .into_iter()
+                .find(|view| &view.incarnation_id == handle.incarnation_id())
+        });
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery_retry.cancelled",
+            serde_json::json!({"severity":"info","soulId":soul_id,"incarnationId":handle.incarnation_id(),"intentRevision":stopped.as_ref().map(|context| context.intent_revision),"executionGeneration":stopped_view.map(|view| view.execution_generation),"controlEpoch":self.registry.control_epoch(),"reason":"stop_intent"}),
+        );
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         self.registry
@@ -3222,6 +3255,14 @@ pub(crate) fn fresh_agent_command_budget(configured: Option<&str>) -> Duration {
         ))
 }
 
+fn map_host_frame_error(error: freshell_runtime_protocol::FrameError) -> RuntimeError {
+    let code = match error {
+        freshell_runtime_protocol::FrameError::Io(_) => RuntimeErrorCode::HostUnreachable,
+        _ => RuntimeErrorCode::HostAuthenticationFailed,
+    };
+    RuntimeError::new(code, error.to_string())
+}
+
 /// One bounded framed request/reply against a session host's control socket.
 /// Connect, write, and read all share the single budget so a host that accepts
 /// the connection and then goes silent cannot extend the wait.
@@ -3239,7 +3280,7 @@ pub(crate) async fn request_host_reply(
             .map_err(|error| unreachable(error.to_string()))?;
         write_frame(&mut stream, envelope)
             .await
-            .map_err(|error| unreachable(error.to_string()))?;
+            .map_err(map_host_frame_error)?;
         let reply_limit = if matches!(envelope.body, HostCommand::FreshAgentReadSnapshot { .. }) {
             freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
         } else {
@@ -3248,7 +3289,7 @@ pub(crate) async fn request_host_reply(
         let reply: HostReply =
             freshell_runtime_protocol::read_frame_with_limit(&mut stream, reply_limit)
                 .await
-                .map_err(|error| unreachable(error.to_string()))?;
+                .map_err(map_host_frame_error)?;
         Ok(reply)
     })
     .await
@@ -3275,10 +3316,8 @@ pub(crate) async fn exchange_host_frame(
     tokio::time::timeout(budget, async {
         write_frame(stream, envelope)
             .await
-            .map_err(|error| unreachable(error.to_string()))?;
-        let reply: HostReply = read_frame(stream)
-            .await
-            .map_err(|error| unreachable(error.to_string()))?;
+            .map_err(map_host_frame_error)?;
+        let reply: HostReply = read_frame(stream).await.map_err(map_host_frame_error)?;
         Ok(reply)
     })
     .await
@@ -3581,7 +3620,10 @@ mod host_ipc_timeout_tests {
                     matches!(reply.unwrap().result.unwrap(), freshell_runtime_protocol::HostResult::FreshAgentSnapshot(value) if value == expected)
                 );
             } else {
-                assert_eq!(reply.unwrap_err().code, RuntimeErrorCode::HostUnreachable);
+                assert_eq!(
+                    reply.unwrap_err().code,
+                    RuntimeErrorCode::HostAuthenticationFailed
+                );
             }
         }
     }
@@ -4924,13 +4966,13 @@ fn map_registry(error: RegistryError) -> RuntimeError {
     RuntimeError::new(code, error.to_string())
 }
 
-fn map_backend(error: BackendError) -> RuntimeError {
+pub(crate) fn map_backend(error: BackendError) -> RuntimeError {
     let code = match &error {
         BackendError::OwnershipMismatch(_) => RuntimeErrorCode::OwnershipMismatch,
-        BackendError::Unavailable(_) | BackendError::DockerHttp { .. } => {
+        error if crate::recovery_retry::TransientRecoveryFailure::from_backend(error).is_some() => {
             RuntimeErrorCode::BackendUnavailable
         }
-        _ => RuntimeErrorCode::BackendUnavailable,
+        _ => RuntimeErrorCode::RecoveryBlocked,
     };
     RuntimeError::new(code, error.to_string())
 }

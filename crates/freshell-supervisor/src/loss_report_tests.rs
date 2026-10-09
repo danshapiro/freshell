@@ -629,14 +629,34 @@ async fn dispatched_missing_identity_cannot_certify_loss() {
             launch_state, "running",
             "no loss tombstone or process cleanup"
         );
-        for table in ["loss_incidents", "recovery_attempts"] {
-            let count: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(count, 0, "{mode}: {table}");
-        }
+        let loss_incidents: i64 = conn
+            .query_row("SELECT COUNT(*) FROM loss_incidents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(loss_incidents, 0, "{mode}: no certified loss");
+        let attempts: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),COUNT(CASE WHEN soul_id=?1 AND intent_revision=?2 AND verdict='blocked' AND finished_at IS NOT NULL THEN 1 END) FROM recovery_attempts",
+                rusqlite::params![context.soul_id.as_str(), context.intent_revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts,
+            (1, 1),
+            "{mode}: initial probe reservation settled"
+        );
+        let replacements: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM incarnations WHERE prior_incarnation_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(replacements, 0, "{mode}: missing identity cannot replace");
+        let pending_retries: i64 = conn
+            .query_row("SELECT COUNT(*) FROM recovery_retries WHERE reserved_attempt_id IS NOT NULL OR next_due_at_ms IS NOT NULL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pending_retries, 0, "{mode}: missing identity cannot retry");
         let loss_exports: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM outbox WHERE event_kind LIKE 'loss_incident.%'",

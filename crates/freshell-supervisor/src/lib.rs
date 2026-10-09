@@ -9,6 +9,7 @@ pub mod notice_outbox;
 pub mod opencode_transfer;
 pub mod qualification_evidence;
 pub mod recovery;
+mod recovery_retry;
 pub mod registry;
 pub mod repair;
 pub mod resume_catalog;
