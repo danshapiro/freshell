@@ -58,7 +58,12 @@ fn native_exec_profile() -> Value {
 fn assert_private_sentinels_absent(root: &Path, certificate_sentinel: &[u8]) {
     for entry in std::fs::read_dir(root).unwrap() {
         let entry = entry.unwrap();
-        let metadata = entry.file_type().unwrap();
+        let metadata = entry.file_type().unwrap_or_else(|error| {
+            panic!(
+                "owned privacy scan metadata {}: {error}",
+                entry.path().display()
+            )
+        });
         if metadata.is_dir() {
             assert_private_sentinels_absent(&entry.path(), certificate_sentinel);
         } else if metadata.is_file() {
@@ -94,11 +99,15 @@ fn assert_private_sentinels_absent(root: &Path, certificate_sentinel: &[u8]) {
 /// added operation delivers metadata to the closed fixture's trusted broker.
 struct BrokerAuthorizedBackend {
     real: DockerEngineBackend,
+    cold_backend: std::sync::OnceLock<DockerEngineBackend>,
     control: PathBuf,
     handoff: PathBuf,
     certificate_sentinel: Vec<u8>,
 }
 impl BrokerAuthorizedBackend {
+    fn real(&self) -> &DockerEngineBackend {
+        self.cold_backend.get().unwrap_or(&self.real)
+    }
     async fn authorize_claude_candidate(
         &self,
         owner: &freshell_supervisor::backend::ClaudeSourceOwner,
@@ -339,7 +348,7 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
     ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
         self.authorize_claude_candidate(owner, request).await?;
         let reply = match self
-            .real
+            .real()
             .observe_claude_sources(owner, request, test_run_id)
             .await
         {
@@ -404,13 +413,32 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
         &self,
         reservation: &OwnedInputReservation,
     ) -> Result<InitialAuthVolumeObservation, BackendError> {
-        self.real.observe_initial_auth_volume(reservation).await
+        self.real().observe_initial_auth_volume(reservation).await
     }
     async fn commit_prepared_inputs(
         &self,
         handle: &OwnedRuntimeHandle,
     ) -> Result<(), BackendError> {
-        self.real.commit_prepared_inputs(handle).await
+        if handle.terminal().is_some_and(|v| v.mode == "opencode") {
+            // The accepted workload now holds the tmpfs. A second fresh
+            // constructor releases the exact old publisher without its map.
+            let cold = DockerEngineBackend::new(self.handoff.parent().unwrap().join("broker.sock"));
+            cold.commit_prepared_inputs(handle).await?;
+            println!(
+                "provider_indexed_cold_lifecycle {}",
+                json!({"phase":"accepted-release","freshConstructor":true,"workloadVolumePreserved":true})
+            );
+        }
+        self.real().commit_prepared_inputs(handle).await
+    }
+    async fn retire_prior_prepared_inputs(
+        &self,
+        current: &OwnedRuntimeHandle,
+        prior: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        self.real()
+            .retire_prior_prepared_inputs(current, prior)
+            .await
     }
     async fn read_native_auth(
         &self,
@@ -418,7 +446,7 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
         keys: &[String],
         binary: &Path,
     ) -> Result<BTreeMap<String, String>, BackendError> {
-        self.real.read_native_auth(handle, keys, binary).await
+        self.real().read_native_auth(handle, keys, binary).await
     }
     async fn read_native_history(
         &self,
@@ -427,7 +455,7 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
         id: &str,
         binary: &Path,
     ) -> Result<Value, BackendError> {
-        self.real
+        self.real()
             .read_native_history(handle, provider, id, binary)
             .await
     }
@@ -436,7 +464,28 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
         spec: &CreateRuntimeSpec,
     ) -> Result<BackendCreated, BackendError> {
         self.authorize(spec).await?;
-        let created = self.real.create_stopped(spec).await?;
+        if spec.terminal.as_ref().is_some_and(|v| v.mode == "opencode")
+            && self.cold_backend.get().is_none()
+        {
+            // The finite broker fails BEFORE forwarding main create, after the
+            // real publisher seals its tmpfs. Drop every old backend reference
+            // then construct a fresh production backend, not a cloned map.
+            let old = DockerEngineBackend::new(self.handoff.parent().unwrap().join("broker.sock"));
+            let failed = old.create_stopped(spec).await;
+            assert!(matches!(failed,Err(BackendError::DockerHttp{status:503,..})),"closed cold-boundary failure must occur after actual publication and before workload create");
+            drop(old);
+            assert!(self
+                .cold_backend
+                .set(DockerEngineBackend::new(
+                    self.handoff.parent().unwrap().join("broker.sock")
+                ))
+                .is_ok());
+            println!(
+                "provider_indexed_cold_lifecycle {}",
+                json!({"phase":"population-before-create","freshConstructor":true,"oldBackendDropped":true,"noWorkloadDispatch":true})
+            );
+        }
+        let created = self.real().create_stopped(spec).await?;
         if std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_SOURCE_GUARD").as_deref()
             == Ok("changed-git")
         {
@@ -459,41 +508,41 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
         Ok(created)
     }
     async fn start_host(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
-        self.real.start_host(handle).await
+        self.real().start_host(handle).await
     }
     async fn inspect(
         &self,
         handle: &OwnedRuntimeHandle,
     ) -> Result<BackendInspection, BackendError> {
-        self.real.inspect(handle).await
+        self.real().inspect(handle).await
     }
     async fn request_stop(
         &self,
         handle: &OwnedRuntimeHandle,
         grace: u64,
     ) -> Result<(), BackendError> {
-        self.real.request_stop(handle, grace).await
+        self.real().request_stop(handle, grace).await
     }
     async fn force_stop(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
-        self.real.force_stop(handle).await
+        self.real().force_stop(handle).await
     }
     async fn verify_empty(&self, handle: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
-        self.real.verify_empty(handle).await
+        self.real().verify_empty(handle).await
     }
     async fn list_known(
         &self,
         handles: &[OwnedRuntimeHandle],
     ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
-        self.real.list_known(handles).await
+        self.real().list_known(handles).await
     }
     async fn read_limits(
         &self,
         handle: &OwnedRuntimeHandle,
     ) -> Result<RuntimeLimits, BackendError> {
-        self.real.read_limits(handle).await
+        self.real().read_limits(handle).await
     }
     async fn enable_long_lived(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
-        self.real.enable_long_lived(handle).await
+        self.real().enable_long_lived(handle).await
     }
 }
 
@@ -758,6 +807,7 @@ async def on_session_ready(coordinator):
     freshell_supervisor::backend::docker::configure_capability_dir(&socket).unwrap();
     let backend = Arc::new(BrokerAuthorizedBackend {
         real: DockerEngineBackend::new(fixture.join("broker.sock")),
+        cold_backend: Default::default(),
         control: control.clone(),
         handoff: fixture.join("handoff"),
         certificate_sentinel: b"synthetic-amplifier-onecli-value".to_vec(),
@@ -1752,6 +1802,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         registry.clone(),
         Arc::new(BrokerAuthorizedBackend {
             real: DockerEngineBackend::new(fixture.join("broker.sock")),
+            cold_backend: Default::default(),
             control: control.clone(),
             handoff: fixture.join("handoff"),
             certificate_sentinel: b"synthetic-claude-onecli-value".to_vec(),
@@ -2948,6 +2999,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
         registry.clone(),
         Arc::new(BrokerAuthorizedBackend {
             real: DockerEngineBackend::new(fixture.join("broker.sock")),
+            cold_backend: Default::default(),
             control: control.clone(),
             handoff: fixture.join("handoff"),
             certificate_sentinel: b"unselected-private-sentinel".to_vec(),
@@ -3220,6 +3272,7 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
     assert!(certificate_sentinel.len() >= 32);
     let backend = Arc::new(BrokerAuthorizedBackend {
         real: DockerEngineBackend::new(fixture.join("broker.sock")),
+        cold_backend: Default::default(),
         control: control.clone(),
         handoff: fixture.join("handoff"),
         certificate_sentinel: certificate_sentinel.clone(),
@@ -3279,12 +3332,12 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
             let Ok((mut stream, _)) = web.accept().await else {
                 break;
             };
-            tokio::spawn(async move {
+            {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut bytes = [0; 4096];
                 let _ = stream.read(&mut bytes).await;
                 let _=stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"config\":{}}").await;
-            });
+            }
         }
     });
     crate::managed_mcp_capability::configure("0.0.0.0", port, &socket, &secret_file).unwrap();
@@ -3987,15 +4040,18 @@ export default {{id:'closed-directory-discovery',async server(){{
         "provider_launch_consumer {}",
         json!({"provider":"opencode","route":"fresh","finalExecProfile":native_exec_profile(),"workspaceScope":"workspace-under-home","digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&fresh_expected).unwrap()))})
     );
-    // Scan only run-owned durable/staged surfaces; referenced payloads belong
-    // in private indexed files, not ordinary resource/configuration trees.
-    assert_private_sentinels_absent(&fixture.join("registry"), &certificate_sentinel);
-    assert_private_sentinels_absent(&fixture.join("handoff"), &certificate_sentinel);
     for view in client.inventory().await.unwrap() {
         if view.desired_state == DesiredState::Running {
             client.stop(view.soul_id).await.unwrap();
         }
     }
     web_task.abort();
+    let _ = web_task.await;
     control_task.abort();
+    let _ = control_task.await;
+    // Each prepared root is also scanned before publication. Join owned
+    // writers before this final complete scan so retiring SQLite/temp entries
+    // cannot disappear between enumeration and reading. No entry is omitted.
+    assert_private_sentinels_absent(&fixture.join("registry"), &certificate_sentinel);
+    assert_private_sentinels_absent(&fixture.join("handoff"), &certificate_sentinel);
 }

@@ -3,7 +3,7 @@ import os from 'node:os'
 import fs from 'node:fs/promises'
 import http from 'node:http'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
 
@@ -223,12 +223,13 @@ describe('managed provider host gateway', () => {
     const validate = (body: Buffer): { ok: boolean } => (
       broker() as unknown as { validateCreate(body: Buffer): { ok: boolean } }
     ).validateCreate(body)
-    const address = Object.values(os.networkInterfaces()).flatMap((interfaces) => interfaces ?? [])
-      .find((network) => network.family === 'IPv4' && !network.internal)?.address
-    expect(address).toBeDefined()
+    const address = '192.0.2.10'
+    const interfaces = vi.spyOn(os,'networkInterfaces').mockReturnValue({fixture:[{address,netmask:'255.255.255.0',family:'IPv4',mac:'00:00:00:00:00:00',internal:false,cidr:address+'/24'}]})
+    try {
 
     expect(validate(createBody([...ordinaryBinds, actorBind], undefined, [`host.docker.internal:${address}`])).ok).toBe(true)
     expect(validate(createBody([...ordinaryBinds, actorBind], undefined, ['host.docker.internal:203.0.113.7'])).ok).toBe(false)
+    } finally { interfaces.mockRestore() }
   })
 })
 
@@ -664,6 +665,7 @@ describe('receipt-owned auth exchange HTTP routes', () => {
 
 type ForwardedRequest = { method: string; url: string; body: any }
 type BrokerHttpFixture = {
+  setRuntimeRunning:(running:boolean)=>void
   request(method: string, url: string, body?: unknown): Promise<{ status: number; body: string }>
   forwarded: ForwardedRequest[]
   broker: RestrictedDockerBroker
@@ -768,6 +770,51 @@ describe('fixed indexed publisher broker',()=>{
       expect(forwarded.filter((request)=>request.method==='DELETE')).toEqual([]);
     });
   });
+  it('retires only the exact stopped receipt and never forces a live or foreign workload',async()=>{
+    await withHttpBroker(async({request,forwarded,setRuntimeRunning})=>{
+      expect((await request('POST','/v1.47/containers/create?name=owned-runtime',createBody([...ordinaryBinds,actorBind]))).status).toBe(201);
+      const before=forwarded.length;
+      expect((await request('DELETE',`/v1.47/containers/${ownedId}?force=1`)).status).toBe(403);
+      expect((await request('DELETE',`/v1.47/containers/${'f'.repeat(64)}?force=0`)).status).toBe(403);
+      expect(forwarded).toHaveLength(before);
+      setRuntimeRunning(true);
+      expect((await request('DELETE',`/v1.47/containers/${ownedId}?force=0`)).status).toBe(403);
+      expect(forwarded.filter(value=>value.method==='DELETE')).toEqual([]);
+      setRuntimeRunning(false);
+      expect((await request('DELETE',`/v1.47/containers/${ownedId}?force=0`)).status).toBe(204);
+      expect(forwarded.filter(value=>value.method==='DELETE').map(value=>value.url)).toEqual([`/v1.47/containers/${ownedId}?force=0`]);
+    });
+  });
+  it('fails once at the indexed population boundary before forwarding any workload creation',async()=>{
+    await withHttpBroker(async({request,forwarded,broker:instance})=>{
+      const input=publisherAuthorization();instance.authorizePreparedInputs(input);
+      expect((await request('POST','/v1.47/volumes/create',{Name:input.indexedFiles!.volumeName,Driver:'local',DriverOpts:indexedOptions,Labels:publisherLabels(input)})).status).toBe(201);
+      expect((await request('POST',`/v1.47/containers/create?name=${input.indexedFiles!.volumeName}-publisher`,publisherBody(input))).status).toBe(201);
+      const body=JSON.parse(createBody([...ordinaryBinds,actorBind]).toString());
+      body.HostConfig.Mounts=[{Type:'volume',Source:input.indexedFiles!.volumeName,Target:'/workspace/input',ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:'files/source-0'}},{Type:'volume',Source:input.indexedFiles!.volumeName,Target:'/run/freshell-secrets/provider-0',ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:'files/source-0'}}];
+      instance.failNextInputPublicationBeforeCreate();const before=forwarded.length;
+      expect((await request('POST','/v1.47/containers/create?name=owned-runtime',body)).status).toBe(503);expect(forwarded).toHaveLength(before);
+      expect((await request('POST','/v1.47/containers/create?name=owned-runtime-retry',body)).status).toBe(201);
+      expect((await request('DELETE',`/v1.47/containers/${helperId}?force=1`)).status).toBe(204);
+      expect((await request('GET',`/v1.47/containers/${helperId}/json`)).status).toBe(404);
+      expect((await request('POST',`/v1.47/containers/create?name=${input.indexedFiles!.volumeName}-publisher`,publisherBody(input))).status).toBe(201);
+      expect(instance.eventsSnapshot().filter(value=>value.decision==='inject_failure')).toHaveLength(1);
+    });
+  });
+  it('allows only exact generation users and soul-scoped indexed inventories for cold reconciliation',async()=>{
+    await withHttpBroker(async({request,forwarded,broker:instance})=>{
+      const input=publisherAuthorization();instance.authorizePreparedInputs(input);
+      const users=(volume:string)=>`/v1.47/containers/json?all=1&filters=${encodeURIComponent(JSON.stringify({volume:[volume]}))}`;
+      const inventory=(soul:string)=>`/v1.47/volumes?filters=${encodeURIComponent(JSON.stringify({label:['com.freshell.managed-inputs=true',`com.freshell.installation-id=${input.installationId}`,`com.freshell.soul-id=${soul}`]}))}`;
+      const before=forwarded.length;
+      for(const url of ['/v1.47/containers/json?all=1','/v1.47/volumes',users('freshell-inputs-ffffffffffffffffffffffff'),inventory('foreign'),users(input.indexedFiles!.volumeName)+'&limit=100',inventory(input.soulId)+'&filters=%7B%7D']) {
+        expect((await request('GET',url)).status).toBe(403);expect(forwarded).toHaveLength(before);
+      }
+      expect((await request('GET',users(input.indexedFiles!.volumeName))).status).toBe(200);
+      expect((await request('GET',inventory(input.soulId))).status).toBe(200);
+      expect(forwarded.slice(before).map(value=>value.url)).toEqual([users(input.indexedFiles!.volumeName),inventory(input.soulId)]);
+    });
+  });
   it('limits tmpfs and publisher operations to the exact preparation and refuses extra host access',async()=>{
     await withHttpBroker(async({request,forwarded,broker:instance})=>{
       const input=publisherAuthorization();
@@ -814,6 +861,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
   const proxy = path.join(dir, 'broker.sock')
   const forwarded: ForwardedRequest[] = []
   let loseAck = false
+  let runtimeRunning=false
   let helperAckId = helperId
   let indexedVolumeMetadata:unknown
   let foreignHelper=false
@@ -842,6 +890,10 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     if (req.method==='GET' && req.url?.startsWith('/v1.47/volumes/freshell-inputs-') && indexedVolumeMetadata) {
       res.statusCode=200;res.end(JSON.stringify(indexedVolumeMetadata));return;
     }
+    if (req.method==='GET' && req.url===`/v1.47/containers/${ownedId}/json`) {
+      const creation=forwarded.findLast(value=>value.url.includes('/containers/create?') && !value.body?.Entrypoint)!;
+      res.statusCode=200;res.end(JSON.stringify({Id:ownedId,Config:creation.body,HostConfig:creation.body.HostConfig,State:{Running:runtimeRunning,Status:runtimeRunning?'running':'exited',Paused:false,Restarting:false}}));return;
+    }
     const candidateCreation = forwarded.findLast((operation) => operation.url.includes('/containers/create?') && operation.body?.Labels?.['com.freshell.claude-candidate']==='ordinary')
     if (req.method==='GET' && candidateCreation && (req.url===`/v1.47/containers/${helperId}/json`
       || req.url===`${candidateCreation.url.replace('/containers/create?name=', '/containers/')}/json`)) {
@@ -852,9 +904,9 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       res.statusCode=200;res.end(JSON.stringify({Id:helperId,Config:foreignHelper?{...inspected,User:'foreign'}:inspected,HostConfig:inspected.HostConfig}));return
     }
     if (req.method==='GET' && (req.url?.includes('-publisher/json') || req.url?.includes('/freshell-claude-source-')
-      || (req.url===`/v1.47/containers/${helperId}/json` && forwarded.some((operation)=>operation.body?.Cmd?.[0]==='observe-claude-sources-private')))) {
+      || (req.url===`/v1.47/containers/${helperId}/json` && forwarded.some((operation)=>['observe-claude-sources-private','publish-provider-inputs'].includes(operation.body?.Cmd?.[0]))))) {
       if (sourceHelperDeleted) { res.statusCode=404;res.end('{}');return }
-      const command=req.url?.includes('/freshell-claude-source-') || req.url===`/v1.47/containers/${helperId}/json`?'observe-claude-sources-private':'publish-provider-inputs';
+      const command=req.url?.includes('-publisher/json') || (req.url===`/v1.47/containers/${helperId}/json` && forwarded.some(operation=>operation.body?.Cmd?.[0]==='publish-provider-inputs'))?'publish-provider-inputs':'observe-claude-sources-private';
       const config=forwarded.findLast((request)=>request.url.includes('/containers/create?') && request.body?.Cmd?.[0]===command)!.body;
       const inspected=structuredClone(config);
       inspected.Labels['org.opencontainers.image.version']='24.04';
@@ -864,6 +916,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       res.statusCode=200;res.end(JSON.stringify({Id:helperId,Config:foreignHelper?{...inspected,User:'0:0'}:inspected,HostConfig:inspected.HostConfig}));return;
     }
     if (req.url?.startsWith('/v1.47/containers/create?')) {
+      if(body.Cmd?.[0]==='publish-provider-inputs') sourceHelperDeleted=false
       if (body.Entrypoint?.[0] === '/runtime/freshell-session-host' && loseAck) {
         req.socket.destroy()
         return
@@ -907,7 +960,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
   try {
     await new Promise<void>((resolve) => upstream.listen(socket, resolve))
     await instance.start()
-    await run({ request, forwarded, broker: instance, loseHelperAck: () => { loseAck = true }, returnHelperId: (id) => { helperAckId = id },replaceHelperInspection:()=>{foreignHelper=true},
+    await run({ request, forwarded, broker: instance, setRuntimeRunning:(running)=>{runtimeRunning=running}, loseHelperAck: () => { loseAck = true }, returnHelperId: (id) => { helperAckId = id },replaceHelperInspection:()=>{foreignHelper=true},
       loseCandidateVolumeAck:()=>{candidateVolumeAckUnavailable=true},replaceCandidateVolumeInspection:()=>{candidateVolumeMetadata.Labels['com.freshell.soul-id']='foreign'} })
   } finally {
     await instance.close()

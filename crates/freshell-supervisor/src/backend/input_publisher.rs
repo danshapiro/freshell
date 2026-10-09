@@ -77,6 +77,35 @@ fn labels(spec: &CreateRuntimeSpec, generation: &str) -> Value {
         "com.freshell.input-generation":generation})
 }
 
+fn filter_query(value: Value) -> String {
+    serde_json::to_vec(&value)
+        .expect("finite Docker filter")
+        .into_iter()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect()
+}
+fn helper_body(
+    image: &str,
+    ownership: &Value,
+    binary: &Path,
+    volume: &str,
+    directory: &Path,
+) -> Value {
+    json!({
+        "Image":image,"User":"65534:0","Tty":false,"Labels":ownership,
+        "Entrypoint":["/runtime/freshell-session-host"],"Cmd":["publish-provider-inputs"],"Env":[],
+        "HostConfig":{"NetworkMode":"none","ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"],
+            "Memory":128*1024*1024,"MemorySwap":128*1024*1024,"NanoCpus":500_000_000,"PidsLimit":32,
+            "LogConfig":{"Type":"none","Config":{}},
+            "Mounts":[{"Type":"bind","Source":binary,"Target":"/runtime/freshell-session-host","ReadOnly":true},
+                {"Type":"volume","Source":volume,"Target":"/run/freshell-input-files","ReadOnly":false,"VolumeOptions":{"NoCopy":true}},
+                {"Type":"bind","Source":directory,"Target":"/run/freshell-input-exchange","ReadOnly":true}]}
+    })
+}
+fn volume_options() -> Value {
+    json!({"type":"tmpfs","device":"tmpfs","o":prepared_inputs::INDEXED_VOLUME_OPTIONS})
+}
+
 fn environment(value: &Value) -> Option<BTreeMap<&str, &str>> {
     let mut result = BTreeMap::new();
     for entry in value.as_array()? {
@@ -228,6 +257,237 @@ impl DockerEngineBackend {
             .map(|(key, value)| format!("{key}={value}"))
             .collect())
     }
+    async fn input_ownership_request(&self, path: &str) -> Result<DockerResponse, BackendError> {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.request_bounded("GET", path, None, 1024 * 1024),
+        )
+        .await
+        .map_err(|_| fail("input ownership inspection timed out; preserve preparation"))?
+    }
+    async fn verify_no_input_workloads(
+        &self,
+        volume: &str,
+        helper: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let filters = filter_query(json!({"volume":[volume]}));
+        let response = self
+            .input_ownership_request(&format!(
+                "{DOCKER_API}/containers/json?all=1&filters={filters}"
+            ))
+            .await
+            .map_err(|_| fail("input generation users unavailable; preserve preparation"))?;
+        if response.status != 200 {
+            return Err(fail(
+                "input generation users unavailable; preserve preparation",
+            ));
+        }
+        let values: Value = serde_json::from_slice(&response.body)
+            .map_err(|_| fail("input generation users invalid; preserve preparation"))?;
+        let values = values
+            .as_array()
+            .ok_or_else(|| fail("input generation users invalid; preserve preparation"))?;
+        for value in values {
+            let id = value["Id"]
+                .as_str()
+                .filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| {
+                    fail("input generation user identity invalid; preserve preparation")
+                })?;
+            if Some(id) != helper {
+                return Err(fail("input generation has an uncertain workload reference; preserve dispatched ownership"));
+            }
+        }
+        Ok(())
+    }
+    async fn check_input_generation_capacity(
+        &self,
+        spec: &CreateRuntimeSpec,
+        current: &str,
+    ) -> Result<(), BackendError> {
+        let filters = filter_query(
+            json!({"label":["com.freshell.managed-inputs=true",format!("com.freshell.installation-id={}",spec.installation_id),format!("com.freshell.soul-id={}",spec.soul_id)]}),
+        );
+        let response = self
+            .input_ownership_request(&format!("{DOCKER_API}/volumes?filters={filters}"))
+            .await
+            .map_err(|_| fail("input generation ownership inventory unavailable"))?;
+        if response.status != 200 {
+            return Err(fail("input generation ownership inventory unavailable"));
+        }
+        let value: Value = serde_json::from_slice(&response.body)
+            .map_err(|_| fail("input generation ownership inventory invalid"))?;
+        let empty = Vec::new();
+        let volumes = if value["Volumes"].is_null() {
+            &empty
+        } else {
+            value["Volumes"]
+                .as_array()
+                .ok_or_else(|| fail("input generation ownership inventory invalid"))?
+        };
+        let mut names = std::collections::BTreeSet::new();
+        for volume in volumes {
+            let generation = volume["Labels"]["com.freshell.input-generation"]
+                .as_str()
+                .filter(|v| {
+                    v.len() <= 128
+                        && v.starts_with("grant-")
+                        && v.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                })
+                .ok_or_else(|| fail("input generation inventory ownership changed"))?;
+            let incarnation = volume["Labels"]["com.freshell.incarnation-id"]
+                .as_str()
+                .ok_or_else(|| fail("input generation inventory ownership changed"))?;
+            IncarnationId::parse(incarnation.to_owned())
+                .map_err(|_| fail("input generation inventory owner invalid"))?;
+            let expected =
+                freshell_runtime_protocol::indexed_provider_volume_name(&spec.soul_id, generation);
+            let mut ownership = labels(spec, generation);
+            ownership["com.freshell.incarnation-id"] = json!(incarnation);
+            if volume["Name"] != expected
+                || volume["Labels"] != ownership
+                || volume["Driver"] != "local"
+                || volume["Options"] != volume_options()
+                || !names.insert(expected)
+            {
+                return Err(fail(
+                    "input generation inventory ownership changed; preserve volumes",
+                ));
+            }
+            if names.len() > 2 {
+                return Err(fail("input generations exceed one active and one pending; reconcile exact ownership"));
+            }
+        }
+        if names.len() == 2 && !names.contains(current) {
+            return Err(fail(
+                "one active and one pending input generation already exist; preserve and reconcile",
+            ));
+        }
+        Ok(())
+    }
+    async fn inspect_cold_publisher(
+        &self,
+        volume: &str,
+        ownership: &Value,
+        image: &str,
+        binary: &Path,
+    ) -> Result<Option<(Value, String)>, BackendError> {
+        let name = format!("{volume}-publisher");
+        let response = self
+            .input_ownership_request(&format!("{DOCKER_API}/containers/{name}/json"))
+            .await
+            .map_err(|_| fail("cold input publisher inspection unavailable"))?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        if response.status != 200 {
+            return Err(fail("cold input publisher inspection unavailable"));
+        }
+        let actual: Value = serde_json::from_slice(&response.body)
+            .map_err(|_| fail("cold input publisher metadata invalid"))?;
+        let mounts = actual["HostConfig"]["Mounts"]
+            .as_array()
+            .ok_or_else(|| fail("cold input publisher mounts invalid"))?;
+        let directory = mounts
+            .iter()
+            .find(|m| m["Target"] == "/run/freshell-input-exchange")
+            .and_then(|m| m["Source"].as_str())
+            .map(PathBuf::from)
+            .ok_or_else(|| fail("cold input publisher exchange invalid"))?;
+        let suffix = directory
+            .file_name()
+            .and_then(|v| v.to_str())
+            .and_then(|v| v.strip_prefix("freshell-inputs-"))
+            .ok_or_else(|| fail("cold input publisher exchange ownership changed"))?;
+        if directory.parent() != Some(std::env::temp_dir().as_path())
+            || uuid::Uuid::parse_str(suffix)
+                .ok()
+                .is_none_or(|id| id.get_version_num() != 4 || id.to_string() != suffix)
+        {
+            return Err(fail("cold input publisher exchange ownership changed"));
+        }
+        let mut expected = helper_body(image, ownership, binary, volume, &directory);
+        expected["Env"] = serde_json::to_value(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                self.private_helper_environment(image, &[]),
+            )
+            .await
+            .map_err(|_| fail("cold input publisher image inspection timed out"))??,
+        )
+        .map_err(|_| fail("cold input publisher environment invalid"))?;
+        let host = &actual["HostConfig"];
+        let id = actual["Id"]
+            .as_str()
+            .filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| fail("cold input publisher identity invalid"))?;
+        if actual["Name"] != format!("/{name}")
+            || !owned_helper(&actual, &expected)
+            || [
+                "NetworkMode",
+                "ReadonlyRootfs",
+                "CapDrop",
+                "SecurityOpt",
+                "Memory",
+                "MemorySwap",
+                "NanoCpus",
+                "PidsLimit",
+            ]
+            .iter()
+            .any(|key| host[key] != expected["HostConfig"][key])
+            || host["Privileged"].as_bool().unwrap_or(false)
+            || !host["PidMode"].as_str().unwrap_or("").is_empty()
+            || ["CapAdd", "Devices", "Binds", "VolumesFrom"]
+                .iter()
+                .any(|key| host[key].as_array().is_some_and(|v| !v.is_empty()))
+        {
+            return Err(fail(
+                "cold input publisher fixed ownership changed; preserve helper",
+            ));
+        }
+        Ok(Some((expected, id.to_owned())))
+    }
+    async fn cleanup_cold_publisher(
+        &self,
+        volume: &str,
+        expected: &Value,
+    ) -> Result<(), BackendError> {
+        self.cleanup_input_helper(&format!("{volume}-publisher"), expected)
+            .await?;
+        // Only the exact private socket and its empty directory are retired.
+        // Never recurse or remove a changed path inferred from Docker metadata.
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = PathBuf::from(
+            expected["HostConfig"]["Mounts"][2]["Source"]
+                .as_str()
+                .ok_or_else(|| fail("cold input publisher exchange unavailable"))?,
+        );
+        if let Ok(meta) = std::fs::symlink_metadata(&directory) {
+            let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            if meta.is_dir()
+                && !meta.file_type().is_symlink()
+                && meta.uid() == uid
+                && meta.gid() == gid
+                && meta.permissions().mode() & 0o777 == 0o710
+            {
+                let socket = directory.join("reply.sock");
+                if std::fs::symlink_metadata(&socket).is_ok_and(|m| {
+                    m.uid() == uid
+                        && m.gid() == gid
+                        && m.permissions().mode() & 0o777 == 0o660
+                        && std::os::unix::fs::FileTypeExt::is_socket(&m.file_type())
+                }) {
+                    let _ = std::fs::remove_file(socket);
+                }
+                let _ = std::fs::remove_dir(directory);
+            } else {
+                tracing::warn!("runtime.input_publication_cold_exchange_preserved");
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn abort_indexed_publication(
         &self,
         spec: &CreateRuntimeSpec,
@@ -252,20 +512,36 @@ impl DockerEngineBackend {
                 .input_publishers
                 .lock()
                 .map_err(|_| fail("input publisher ownership unavailable"))?;
-            let Some(publisher) = held.get(&files.volume_name) else {
-                return Ok(());
-            };
-            if publisher.soul != spec.soul_id.as_str()
-                || publisher.incarnation != spec.incarnation_id.as_str()
-                || publisher.context != *context.unwrap()
-            {
-                return Err(fail("input publisher abort belongs to another preparation"));
+            if let Some(publisher) = held.get(&files.volume_name) {
+                if publisher.soul != spec.soul_id.as_str()
+                    || publisher.incarnation != spec.incarnation_id.as_str()
+                    || publisher.context != *context.unwrap()
+                {
+                    return Err(fail("input publisher abort belongs to another preparation"));
+                }
             }
         }
+        let ownership = labels(spec, &inputs.generation_id);
+        let cold = self
+            .inspect_cold_publisher(
+                &files.volume_name,
+                &ownership,
+                &spec.image_ref,
+                &spec.host_binary_path,
+            )
+            .await?;
+        self.verify_no_input_workloads(
+            &files.volume_name,
+            cold.as_ref().map(|(_, id)| id.as_str()),
+        )
+        .await?;
         self.release_indexed_publication(
             &spec.soul_id,
             &spec.incarnation_id,
             &inputs.generation_id,
+            &ownership,
+            &spec.image_ref,
+            &spec.host_binary_path,
         )
         .await?;
         self.cleanup_input_volume(
@@ -374,18 +650,14 @@ impl DockerEngineBackend {
         directory.mode(&socket, 0o660)?;
         let name = format!("{}-publisher", files.volume_name);
         let ownership = labels(spec, &inputs.generation_id);
-        let mut body = json!({
-            "Image":spec.image_ref,"User":"65534:0","Tty":false,"Labels":ownership,
-            "Entrypoint":["/runtime/freshell-session-host"],"Cmd":["publish-provider-inputs"],"Env":[],
-            "HostConfig":{"NetworkMode":"none","ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"],
-                "Memory":128*1024*1024,"MemorySwap":128*1024*1024,"NanoCpus":500_000_000,"PidsLimit":32,
-                "LogConfig":{"Type":"none","Config":{}},
-                "Mounts":[{"Type":"bind","Source":binary,"Target":"/runtime/freshell-session-host","ReadOnly":true},
-                    {"Type":"volume","Source":files.volume_name,"Target":"/run/freshell-input-files","ReadOnly":false,"VolumeOptions":{"NoCopy":true}},
-                    {"Type":"bind","Source":directory.0,"Target":"/run/freshell-input-exchange","ReadOnly":true}]}
-        });
-        let options =
-            json!({"type":"tmpfs","device":"tmpfs","o":prepared_inputs::INDEXED_VOLUME_OPTIONS});
+        let mut body = helper_body(
+            &spec.image_ref,
+            &ownership,
+            binary,
+            &files.volume_name,
+            &directory.0,
+        );
+        let options = volume_options();
         let mut volume_attempted = false;
         let mut helper_attempted = false;
         let operation = async {
@@ -403,9 +675,38 @@ impl DockerEngineBackend {
                 )
                 .await
                 .map_err(|_| fail("input publisher expected-volume query failed"))?;
-            if prior.status != 404 {
+            self.check_input_generation_capacity(spec, &files.volume_name)
+                .await?;
+            if prior.status == 200 {
+                let metadata: Value = serde_json::from_slice(&prior.body)
+                    .map_err(|_| fail("input volume cold metadata invalid"))?;
+                if metadata["Name"] != files.volume_name
+                    || metadata["Driver"] != "local"
+                    || metadata["Labels"] != ownership
+                    || metadata["Options"] != options
+                {
+                    return Err(fail(
+                        "input volume cold ownership changed; preserve preparation",
+                    ));
+                }
+                let cold = self
+                    .inspect_cold_publisher(&files.volume_name, &ownership, &spec.image_ref, binary)
+                    .await?;
+                self.verify_no_input_workloads(
+                    &files.volume_name,
+                    cold.as_ref().map(|(_, id)| id.as_str()),
+                )
+                .await?;
+                if let Some((expected, _)) = cold {
+                    self.cleanup_cold_publisher(&files.volume_name, &expected)
+                        .await?;
+                }
+                self.cleanup_input_volume(&files.volume_name, &ownership, &options)
+                    .await?;
+                tracing::info!(soul_id=%spec.soul_id,generation_id=%inputs.generation_id,"runtime.input_publication_cold_repopulation");
+            } else if prior.status != 404 {
                 return Err(fail(
-                    "input publisher volume already exists; reconcile before preparation",
+                    "input volume cold ownership unavailable; preserve preparation",
                 ));
             }
             volume_attempted = true;
@@ -657,11 +958,110 @@ impl DockerEngineBackend {
             .map_err(|_| fail("input volume cleanup timed out"))?
     }
 
+    pub(super) async fn retire_prior_indexed_inputs(
+        &self,
+        current: &OwnedRuntimeHandle,
+        prior: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        fn context(
+            handle: &OwnedRuntimeHandle,
+        ) -> Option<&freshell_runtime_protocol::ProviderLaunchContext> {
+            handle
+                .terminal()
+                .and_then(|v| v.provider_launch_context.as_ref())
+                .or_else(|| {
+                    handle
+                        .fresh_agent()
+                        .and_then(|v| v.provider_launch_context.as_ref())
+                })
+        }
+        let Some(inputs) = context(prior).and_then(|v| v.prepared_inputs.as_ref()) else {
+            return Ok(());
+        };
+        let Some(files) = inputs.indexed_files.as_ref() else {
+            return Ok(());
+        };
+        let next = context(current)
+            .and_then(|v| v.prepared_inputs.as_ref())
+            .ok_or_else(|| fail("accepted current input generation unavailable; preserve prior"))?;
+        if current.installation_id() != prior.installation_id()
+            || current.soul_id() != prior.soul_id()
+            || current.incarnation_id() == prior.incarnation_id()
+        {
+            return Err(fail(
+                "prior input retirement owner changed; preserve generation",
+            ));
+        }
+        if next.generation_id == inputs.generation_id {
+            return Ok(());
+        }
+        if files.volume_name
+            != freshell_runtime_protocol::indexed_provider_volume_name(
+                prior.soul_id(),
+                &inputs.generation_id,
+            )
+        {
+            return Err(fail("prior input generation identity changed"));
+        }
+        let ownership = json!({"com.freshell.managed-inputs":"true","com.freshell.installation-id":prior.installation_id(),"com.freshell.soul-id":prior.soul_id(),"com.freshell.incarnation-id":prior.incarnation_id(),"com.freshell.input-generation":inputs.generation_id});
+        let operation = async {
+            let state = self.inspect(prior).await?.state;
+            match state {
+                BackendRuntimeState::Missing => {}
+                BackendRuntimeState::Created
+                | BackendRuntimeState::Exited
+                | BackendRuntimeState::Dead => {
+                    // Docker refuses removal if this exact proved object becomes
+                    // running again. Retirement never forces a workload stop.
+                    let removed = self
+                        .request_bounded(
+                            "DELETE",
+                            &format!("{DOCKER_API}/containers/{}?force=0", prior.container_id()),
+                            None,
+                            64 * 1024,
+                        )
+                        .await?;
+                    if !matches!(removed.status, 204 | 404) {
+                        return Err(fail(
+                            "prior input workload removal uncertain; preserve generation",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(fail(
+                        "prior input workload remains live or uncertain; preserve generation",
+                    ))
+                }
+            }
+            self.release_indexed_publication(
+                prior.soul_id(),
+                prior.incarnation_id(),
+                &inputs.generation_id,
+                &ownership,
+                prior.image_ref(),
+                prior.host_binary_path(),
+            )
+            .await?;
+            self.verify_no_input_workloads(&files.volume_name, None)
+                .await?;
+            self.cleanup_input_volume(&files.volume_name, &ownership, &volume_options())
+                .await?;
+            tracing::info!(soul_id=%prior.soul_id(),prior_incarnation_id=%prior.incarnation_id(),generation_id=%inputs.generation_id,"runtime.input_publication_prior_retired");
+            Ok(())
+        };
+        tokio::time::timeout(Duration::from_secs(20), operation)
+            .await
+            .map_err(|_| fail("prior input retirement timed out; preserve uncertain generation"))?
+    }
+
     pub(super) async fn release_indexed_publication(
         &self,
         soul: &SoulId,
         incarnation: &IncarnationId,
         generation: &str,
+        ownership: &Value,
+        image: &str,
+        binary: &Path,
     ) -> Result<(), BackendError> {
         let volume = freshell_runtime_protocol::indexed_provider_volume_name(soul, generation);
         let held = self
@@ -670,6 +1070,13 @@ impl DockerEngineBackend {
             .map_err(|_| fail("input publisher ownership unavailable"))?
             .remove(&volume);
         let Some(mut held) = held else {
+            if let Some((expected, _)) = self
+                .inspect_cold_publisher(&volume, ownership, image, binary)
+                .await?
+            {
+                self.cleanup_cold_publisher(&volume, &expected).await?;
+                tracing::info!(soul_id=%soul,generation_id=generation,"runtime.input_publication_cold_release");
+            }
             return Ok(());
         };
         if held.soul != soul.as_str() || held.incarnation != incarnation.as_str() {
@@ -815,15 +1222,64 @@ mod tests {
     #[tokio::test]
     async fn provider_input_publisher_streams_only_private_ipc_and_pins_tmpfs_before_workload_creation(
     ) {
-        publication_fixture(false).await;
+        publication_fixture(PublicationCase::WarmCommit).await;
     }
 
     #[tokio::test]
     async fn provider_input_publisher_abort_removes_only_the_pending_owned_generation() {
-        publication_fixture(true).await;
+        publication_fixture(PublicationCase::WarmAbort).await;
     }
 
-    async fn publication_fixture(abort: bool) {
+    #[tokio::test]
+    async fn provider_input_publisher_cold_backend_repopulates_confirmed_undispatched_generation() {
+        publication_fixture(PublicationCase::ColdRetry).await;
+    }
+    #[tokio::test]
+    async fn provider_input_publisher_cold_abort_removes_exact_helper_and_volume() {
+        publication_fixture(PublicationCase::ColdAbort).await;
+    }
+    #[tokio::test]
+    async fn provider_input_publisher_cold_backend_preserves_uncertain_workload_reference() {
+        publication_fixture(PublicationCase::ColdUncertain).await;
+    }
+    #[derive(Clone, Copy)]
+    enum PublicationCase {
+        WarmCommit,
+        WarmAbort,
+        ColdRetry,
+        ColdAbort,
+        ColdUncertain,
+        ColdAcceptedRelease,
+        ColdCapacity,
+        ColdRetirement,
+    }
+    #[tokio::test]
+    async fn provider_input_publisher_cold_accepted_release_preserves_workload_volume() {
+        publication_fixture(PublicationCase::ColdAcceptedRelease).await;
+    }
+    #[tokio::test]
+    async fn provider_input_publisher_cold_inventory_bounds_one_active_and_one_pending() {
+        publication_fixture(PublicationCase::ColdCapacity).await;
+    }
+    #[tokio::test]
+    async fn provider_input_publisher_cold_retirement_removes_only_the_prior_accepted_generation() {
+        publication_fixture(PublicationCase::ColdRetirement).await;
+    }
+    async fn publication_fixture(case: PublicationCase) {
+        let abort = matches!(
+            case,
+            PublicationCase::WarmAbort
+                | PublicationCase::ColdAbort
+                | PublicationCase::ColdUncertain
+        );
+        let cold = !matches!(
+            case,
+            PublicationCase::WarmCommit | PublicationCase::WarmAbort
+        );
+        let uncertain = matches!(case, PublicationCase::ColdUncertain);
+        let accepted = matches!(case, PublicationCase::ColdAcceptedRelease);
+        let capacity = matches!(case, PublicationCase::ColdCapacity);
+        let retirement = matches!(case, PublicationCase::ColdRetirement);
         let owned = tempfile::tempdir().unwrap();
         let source = owned.path().join("approved-source");
         std::fs::write(&source, b"PRIVATE_PUBLISHER_SENTINEL").unwrap();
@@ -901,17 +1357,23 @@ mod tests {
             None::<std::thread::JoinHandle<Result<(), &'static str>>>,
         ));
         let active_helper = helper.clone();
+        let workload = Arc::new(Mutex::new(false));
+        let workload_for_server = workload.clone();
+        let over_capacity = Arc::new(Mutex::new(false));
+        let over_capacity_for_server = over_capacity.clone();
         let private_root = volume_root.clone();
         let created_for_server = created.clone();
         let server = tokio::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let (seen, created, volume, helper, private_root) = (
+                let (seen, created, volume, helper, private_root, workload, over_capacity) = (
                     seen.clone(),
                     created_for_server.clone(),
                     volume.clone(),
                     active_helper.clone(),
                     private_root.clone(),
+                    workload_for_server.clone(),
+                    over_capacity_for_server.clone(),
                 );
                 tokio::spawn(async move {
                     let mut header = Vec::new();
@@ -932,9 +1394,44 @@ mod tests {
                     stream.read_exact(&mut body).await.unwrap();
                     let request = header.lines().next().unwrap().to_string();
                     seen.lock().unwrap().push((request.clone(), body.clone()));
-                    let (status, reply) = if request.contains("/images/") {
+                    let (status, reply) = if request.contains("/info ") {
+                        (200,json!({"ID":"input-publisher-daemon","SecurityOptions":["name=rootless"]}).to_string())
+                    } else if request.contains(&format!("/containers/{}/json ", "c".repeat(64))) {
+                        (404, String::new())
+                    } else if request.contains("/images/") {
                         (200,json!({"Config":{"Env":["PATH=/image/path","INHERITED_TOKEN=PRIVATE_IMAGE_SENTINEL"]}}).to_string())
+                    } else if request.contains("/volumes?filters=") {
+                        let mut values = volume.lock().unwrap().iter().cloned().collect::<Vec<_>>();
+                        if *over_capacity.lock().unwrap() {
+                            for generation in ["grant-extra-one", "grant-extra-two"] {
+                                let mut extra = values[0].clone();
+                                let soul = SoulId::parse(
+                                    extra["Labels"]["com.freshell.soul-id"].as_str().unwrap(),
+                                )
+                                .unwrap();
+                                extra["Name"] =
+                                    json!(freshell_runtime_protocol::indexed_provider_volume_name(
+                                        &soul, generation
+                                    ));
+                                extra["Labels"]["com.freshell.input-generation"] =
+                                    json!(generation);
+                                values.push(extra);
+                            }
+                        }
+                        (200, json!({"Volumes":values}).to_string())
+                    } else if request.contains("/containers/json?") {
+                        let mut users = Vec::new();
+                        if created.lock().unwrap().is_some() {
+                            users.push(json!({"Id":"b".repeat(64)}));
+                        }
+                        if *workload.lock().unwrap() {
+                            users.push(json!({"Id":"c".repeat(64)}));
+                        }
+                        (200, serde_json::to_string(&users).unwrap())
                     } else if request.contains("/volumes/create ") {
+                        if private_root.join("files").exists() {
+                            std::fs::remove_dir_all(private_root.join("files")).unwrap();
+                        }
                         let mut value: Value = serde_json::from_slice(&body).unwrap();
                         value["Mountpoint"] = json!("/owned/daemon/volume");
                         value["Options"] = value["DriverOpts"].clone();
@@ -970,11 +1467,15 @@ mod tests {
                         }));
                         (204, String::new())
                     } else if request.contains("/json ") {
-                        let mut config = created.lock().unwrap().clone().unwrap();
-                        // Docker inspection includes normalized default fields.
-                        config["HostConfig"]["Mounts"][0]["Consistency"] = json!("default");
-                        (200,json!({"Config":config,"HostConfig":config["HostConfig"],"State":{"Status":"running"}}).to_string())
+                        match created.lock().unwrap().clone() {
+                            Some(mut config) => {
+                                config["HostConfig"]["Mounts"][0]["Consistency"] = json!("default");
+                                (200,json!({"Id":"b".repeat(64),"Name":format!("/{}-publisher",config["HostConfig"]["Mounts"][1]["Source"].as_str().unwrap()),"Config":config,"HostConfig":config["HostConfig"],"State":{"Status":"running"}}).to_string())
+                            }
+                            None => (404, String::new()),
+                        }
                     } else if request.starts_with("DELETE ") {
+                        *created.lock().unwrap() = None;
                         (204, String::new())
                     } else {
                         panic!("unexpected owned Docker request {request}");
@@ -997,6 +1498,134 @@ mod tests {
             !helper.lock().unwrap().as_ref().unwrap().is_finished(),
             "publisher must pin completed tmpfs before workload creation"
         );
+        if cold {
+            let expected_helper = created.lock().unwrap().clone().unwrap();
+            drop(backend);
+            // The original controller disappears. Its helper sees EOF and is
+            // joined before any fresh constructor attempts reconciliation.
+            assert!(helper
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .join()
+                .unwrap()
+                .is_err());
+            let fresh = DockerEngineBackend::new(&socket);
+            *workload.lock().unwrap() = uncertain || accepted;
+            *over_capacity.lock().unwrap() = capacity;
+            std::fs::write(&source, b"FRESH_APPROVED_PUBLISHER_BYTES").unwrap();
+            let result = if retirement {
+                let make_handle = |candidate: &CreateRuntimeSpec| {
+                    crate::registry::OwnedRuntimeHandle::from_registry(
+                        candidate.installation_id.clone(),
+                        candidate.soul_id.clone(),
+                        candidate.incarnation_id.clone(),
+                        freshell_runtime_protocol::LaunchNonce::new(),
+                        DockerDaemonId::parse("input-publisher-daemon").unwrap(),
+                        "c".repeat(64),
+                        candidate.image_ref.clone(),
+                        candidate.runtime_dir.clone(),
+                        binary.clone(),
+                        digest_expected(&ExpectedConfig::new(
+                            candidate,
+                            &binary,
+                            &candidate.runtime_dir,
+                        ))
+                        .unwrap(),
+                        candidate.limits,
+                        None,
+                        candidate.terminal.clone(),
+                        None,
+                        candidate.provider_volume_name.clone(),
+                    )
+                };
+                let prior = make_handle(&spec);
+                let mut next = spec.clone();
+                next.incarnation_id = IncarnationId::parse("incarnation-current").unwrap();
+                let context = next
+                    .terminal
+                    .as_mut()
+                    .unwrap()
+                    .provider_launch_context
+                    .as_mut()
+                    .unwrap();
+                context.prepared_inputs.as_mut().unwrap().generation_id = "grant-current".into();
+                context
+                    .prepared_inputs
+                    .as_mut()
+                    .unwrap()
+                    .indexed_files
+                    .as_mut()
+                    .unwrap()
+                    .volume_name = freshell_runtime_protocol::indexed_provider_volume_name(
+                    &spec.soul_id,
+                    "grant-current",
+                );
+                fresh
+                    .retire_prior_prepared_inputs(&make_handle(&next), &prior)
+                    .await
+            } else if accepted {
+                fresh
+                    .release_indexed_publication(
+                        &spec.soul_id,
+                        &spec.incarnation_id,
+                        generation,
+                        &labels(&spec, generation),
+                        &spec.image_ref,
+                        &binary,
+                    )
+                    .await
+            } else if abort {
+                fresh.abort_indexed_publication(&spec).await
+            } else {
+                fresh
+                    .begin_indexed_publication(&spec, &mounts, &binary)
+                    .await
+            };
+            let observed_deletes = captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(request, _)| request.starts_with("DELETE "))
+                .count();
+            let progressed = result.is_ok()
+                && if accepted {
+                    observed_deletes == 1
+                        && std::fs::read(volume_root.join("files/source-0")).unwrap()
+                            == b"PRIVATE_PUBLISHER_SENTINEL"
+                } else if abort || retirement {
+                    observed_deletes == 2
+                } else {
+                    std::fs::read(volume_root.join("files/source-0"))
+                        .is_ok_and(|bytes| bytes == b"FRESH_APPROVED_PUBLISHER_BYTES")
+                };
+            let preserved = (uncertain || capacity)
+                && result.is_err()
+                && observed_deletes == 0
+                && std::fs::read(volume_root.join("files/source-0")).unwrap()
+                    == b"PRIVATE_PUBLISHER_SENTINEL";
+            *workload.lock().unwrap() = false;
+            *over_capacity.lock().unwrap() = false;
+            // Always settle exact fixture ownership before asserting RED.
+            if !abort && progressed && !accepted {
+                fresh.abort_indexed_publication(&spec).await.unwrap();
+            } else {
+                fresh
+                    .cleanup_input_helper(&format!("{volume_name}-publisher"), &expected_helper)
+                    .await
+                    .unwrap();
+                fresh.cleanup_input_volume(&volume_name,&labels(&spec,generation),&json!({"type":"tmpfs","device":"tmpfs","o":prepared_inputs::INDEXED_VOLUME_OPTIONS})).await.unwrap();
+            }
+            if let Some(thread) = helper.lock().unwrap().take() {
+                assert!(thread.join().unwrap().is_ok());
+            }
+            drop(fresh);
+            server.abort();
+            let _ = server.await;
+            assert!(if uncertain || capacity {preserved} else {progressed},"fresh backend must reconcile only exact undispatched ownership; result={result:?}, deletes={observed_deletes}");
+            return;
+        }
         // A lost workload-create acknowledgement retries the same frozen
         // preparation. It must reuse the pinned bytes, even after the source
         // disappears, rather than publish a second generation.
@@ -1037,7 +1666,14 @@ mod tests {
             backend.abort_indexed_publication(&spec).await.unwrap();
         } else {
             backend
-                .release_indexed_publication(&spec.soul_id, &spec.incarnation_id, generation)
+                .release_indexed_publication(
+                    &spec.soul_id,
+                    &spec.incarnation_id,
+                    generation,
+                    &labels(&spec, generation),
+                    &spec.image_ref,
+                    &spec.host_binary_path,
+                )
                 .await
                 .unwrap();
         }

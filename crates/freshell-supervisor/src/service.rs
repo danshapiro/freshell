@@ -2066,6 +2066,21 @@ impl Supervisor {
                 .commit_prepared_inputs(&handle)
                 .await
                 .map_err(map_backend)?;
+            // Both callers are after HostGrantAccepted and registry commit.
+            // Initial/pristine activation calls here only without resume_spec;
+            // exact resumes reach here from recovery only AFTER native identity
+            // verification, queued-input replay, and recovery-success commit.
+            if let Some(prior) = self
+                .registry
+                .prior_provider_owner(incarnation.clone())
+                .await
+                .map_err(map_registry)?
+            {
+                self.backend
+                    .retire_prior_prepared_inputs(&handle, &prior)
+                    .await
+                    .map_err(map_backend)?;
+            }
         }
         if let Some(inputs) = context.and_then(|context| context.prepared_inputs.as_ref()) {
             self.commit_provider_path_inputs(&workload.soul_id, &inputs.generation_id);

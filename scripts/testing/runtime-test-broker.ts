@@ -85,6 +85,7 @@ function preparedMountsMatch(actual: unknown[], input: PreparedInputAuthorizatio
 
 export type BrokerReceipt = {
   containerId: string
+  installationId?: string
   createdAt: string
   requestDigest: string
   incarnationId: string
@@ -200,6 +201,7 @@ export class RestrictedDockerBroker {
   private readonly events: BrokerEvent[] = []
   private server?: http.Server
   private stopFailuresRemaining = 0
+  private inputPublicationBeforeCreateFailure = false
 
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
 
@@ -344,6 +346,8 @@ export class RestrictedDockerBroker {
     return this.events.filter((event) => event.destructive && event.containerId === containerId)
   }
 
+  failNextInputPublicationBeforeCreate(): void { this.inputPublicationBeforeCreateFailure = true }
+
   failNextStop(count = 1): void {
     this.stopFailuresRemaining = Math.max(0, count)
   }
@@ -395,6 +399,40 @@ export class RestrictedDockerBroker {
     if (method==='GET' && [...this.policy.allowedImageRefs].some((image)=>url===`${DOCKER_API_PREFIX}/images/${image}/json`)) {
       await this.forwardAndReply(request,response,body,{destructive:false})
       return
+    }
+
+    // Cold publisher inspection is confined to one accepted generation or
+    // one installation/soul's indexed labels. Never expose an unfiltered list.
+    if (method === 'GET' && body.length === 0) {
+      const parsed = new URL(url, 'http://docker')
+      let filters: Record<string, unknown> = {}
+      try { const value = JSON.parse(parsed.searchParams.get('filters') ?? '{}'); if (value && typeof value === 'object' && !Array.isArray(value)) filters = value } catch {}
+      const keys = [...parsed.searchParams.keys()]
+      const users = parsed.pathname === `${DOCKER_API_PREFIX}/containers/json`
+        && keys.length === 2 && parsed.searchParams.getAll('filters').length === 1 && parsed.searchParams.getAll('all').length === 1 && parsed.searchParams.get('all') === '1'
+        && Object.keys(filters).length === 1 && Array.isArray(filters.volume) && filters.volume.length === 1
+        && [...this.preparedInputs.values()].some(input => input.indexedFiles?.volumeName === (filters.volume as unknown[])[0])
+      const inventory = parsed.pathname === `${DOCKER_API_PREFIX}/volumes`
+        && keys.length === 1 && parsed.searchParams.getAll('filters').length === 1 && Object.keys(filters).length === 1
+        && Array.isArray(filters.label) && filters.label.length === 3 && filters.label.every(value => typeof value === 'string')
+        && [...this.preparedInputs.values()].some(input => JSON.stringify([...filters.label as string[]].sort()) === JSON.stringify([
+          'com.freshell.managed-inputs=true', `com.freshell.installation-id=${input.installationId}`, `com.freshell.soul-id=${input.soulId}`,
+        ].sort()))
+      if (users || inventory) { await this.forwardAndReply(request,response,body,{destructive:false}); return }
+    }
+    const retiring = url.match(/^\/v1\.47\/containers\/([a-f0-9]{64})\?force=0$/)?.[1]
+    const prior = retiring && this.receiptsById.get(retiring)
+    if (method === 'DELETE' && prior && body.length === 0) {
+      const inspected = await this.forward({ method:'GET',url:`${DOCKER_API_PREFIX}/containers/${retiring}/json`,headers:{} } as IncomingMessage,Buffer.alloc(0))
+      let actual: Record<string,any> = {};try {actual=JSON.parse(inspected.body.toString())} catch {}
+      const labels = {project:'freshell','com.freshell.managed':'true','com.freshell.installation-id':prior.installationId,
+        'com.freshell.soul-id':prior.soulId,'com.freshell.incarnation-id':prior.incarnationId,'com.freshell.runtime-test-run-id':this.policy.testRunId}
+      if (inspected.statusCode !== 404 && (inspected.statusCode !== 200 || actual.Id !== retiring || actual.Config?.Image !== prior.imageRef
+        || !ownedHelperLabels(actual.Config?.Labels,labels) || actual.State?.Running !== false || actual.State?.Paused === true
+        || actual.State?.Restarting === true || !['created','exited','dead'].includes(actual.State?.Status))) {
+        this.block(response,method,url,403,'prior indexed generation workload is live or ownership changed',true);return
+      }
+      await this.forwardAndReply(request,response,body,{destructive:true,containerId:retiring});return
     }
 
     const volume = url.match(/^\/v1\.47\/volumes\/(freshell-provider-[a-f0-9]{24})$/)?.[1]
@@ -555,7 +593,9 @@ export class RestrictedDockerBroker {
         || (method==='POST' && exactId && owned.expected.Cmd?.[0]==='prepare-provider-mountpoints'
           && url===`${DOCKER_API_PREFIX}/containers/${owned.containerId}/wait?condition=not-running`)
         || (method==='DELETE' && url===`${DOCKER_API_PREFIX}/containers/${helperTarget![1]}?force=1`)) {
-        await this.forwardAndReply(request,response,body,{destructive:method!=='GET',containerId:owned.containerId,helperName:name})
+        const forwarded=await this.forward(request,body)
+        this.record({method,url,decision:'forward',destructive:method!=='GET',unsafeAttempt:false,containerId:owned.containerId,helperName:name})
+        replyDocker(response,forwarded)
         return
       }
     }
@@ -615,7 +655,13 @@ export class RestrictedDockerBroker {
       }
       if (/^freshell-inputs-[a-f0-9]{24}-publisher$/.test(name) || mountpointHelper) {
         const input=mountpointHelper ? this.validateMountpointHelper(body) : this.validateInputPublisher(name,body)
-        if (!input || this.inputPublishers.has(name)) {
+        let previousAbsent=true
+        if (input && this.inputPublishers.has(name)) {
+          const previous=await this.forward({method:'GET',url:`${DOCKER_API_PREFIX}/containers/${name}/json`,headers:{}} as IncomingMessage,Buffer.alloc(0))
+          previousAbsent=previous.statusCode===404
+          this.record({method:'GET',url:`${DOCKER_API_PREFIX}/containers/${name}/json`,decision:'forward',destructive:false,unsafeAttempt:false,helperName:name})
+        }
+        if (!input || !previousAbsent) {
           this.block(response,method,url,403,'indexed publisher must match an owned fixed preparation',false)
           return
         }
@@ -672,6 +718,11 @@ export class RestrictedDockerBroker {
         this.block(response, method, url, 403, validation.reason, true, undefined)
         return
       }
+      if (this.inputPublicationBeforeCreateFailure && [...this.inputPublishers.values()].some(publisher => publisher.input.incarnationId === validation.incarnationId && publisher.expected.Cmd?.[0] === 'publish-provider-inputs')) {
+        this.inputPublicationBeforeCreateFailure = false
+        this.record({method,url,decision:'inject_failure',reason:'indexed population before main create',destructive:false,unsafeAttempt:false})
+        response.statusCode=503;response.end(JSON.stringify({message:'closed indexed publication before main create'}));return
+      }
       const forwarded = await this.forward(request, body)
       if (forwarded.statusCode === 201) {
         const parsed = JSON.parse(forwarded.body.toString('utf8')) as { Id?: unknown }
@@ -683,6 +734,7 @@ export class RestrictedDockerBroker {
         this.knownContainerIds.add(containerId)
         this.receiptsById.set(containerId, {
           containerId,
+          installationId: validation.installationId,
           createdAt: new Date().toISOString(),
           requestDigest: sha256(body),
           incarnationId: validation.incarnationId,
@@ -731,7 +783,7 @@ export class RestrictedDockerBroker {
   }
 
   private validateCreate(body: Buffer):
-    | { ok: true; incarnationId: string; soulId: string; imageRef: string; runtimeDir: string; hostBinaryPath: string; providerVolumeName?: string; workspacePath?: string }
+    | { ok: true; installationId: string; incarnationId: string; soulId: string; imageRef: string; runtimeDir: string; hostBinaryPath: string; providerVolumeName?: string; workspacePath?: string }
     | { ok: false; reason: string } {
     let parsed: Record<string, any>
     try {
@@ -870,7 +922,7 @@ export class RestrictedDockerBroker {
       && input.soulId === soulId && input.incarnationId === incarnationId && input.imageRef === imageRef
       && input.hostBinaryPath === hostBinaryPath && input.providerVolumeName === providerVolumeName);
     if ((host.Mounts?.length || prepared.length) && !prepared.some((input)=>preparedMountsMatch(host.Mounts ?? [],input))) return { ok: false, reason: 'typed mounts differ from this attempt owned prepared input set' }
-    return { ok: true, incarnationId, soulId, imageRef, runtimeDir, hostBinaryPath, ...(providerVolumeName ? { providerVolumeName } : {}), ...(workspacePath ? { workspacePath } : {}) }
+    return { ok: true, installationId, incarnationId, soulId, imageRef, runtimeDir, hostBinaryPath, ...(providerVolumeName ? { providerVolumeName } : {}), ...(workspacePath ? { workspacePath } : {}) }
   }
 
   private validateClaudeCandidateHelper(body: Buffer, role: 'reader' | 'mountpoints'): boolean {

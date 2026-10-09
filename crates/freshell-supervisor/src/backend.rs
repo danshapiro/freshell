@@ -160,6 +160,15 @@ pub trait RuntimeBackend: Send + Sync {
     ) -> Result<(), BackendError> {
         Ok(())
     }
+    /// Called only after accepted grant/registry commit and exact native
+    /// verification when a resume requires it. No pre-dispatch retirement.
+    async fn retire_prior_prepared_inputs(
+        &self,
+        _current: &OwnedRuntimeHandle,
+        _prior: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
     async fn read_native_auth(
         &self,
         _handle: &OwnedRuntimeHandle,
@@ -632,10 +641,19 @@ impl RuntimeBackend for DockerEngineBackend {
                 handle.soul_id(),
                 handle.incarnation_id(),
                 &inputs.generation_id,
+                &json!({"com.freshell.managed-inputs":"true","com.freshell.installation-id":handle.installation_id(),"com.freshell.soul-id":handle.soul_id(),"com.freshell.incarnation-id":handle.incarnation_id(),"com.freshell.input-generation":inputs.generation_id}),
+                handle.image_ref(),handle.host_binary_path(),
             )
             .await?;
         }
         Ok(())
+    }
+    async fn retire_prior_prepared_inputs(
+        &self,
+        current: &OwnedRuntimeHandle,
+        prior: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        self.retire_prior_indexed_inputs(current, prior).await
     }
     async fn read_native_auth(
         &self,

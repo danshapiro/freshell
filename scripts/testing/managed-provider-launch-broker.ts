@@ -36,6 +36,7 @@ const broker=new RestrictedDockerBroker({
   allowedHostGatewayAddresses:gateways,
   testRunId:configuration.runId,logPath:path.join(root,'broker.jsonl'),
 })
+if (configuration.provider==='opencode') broker.failNextInputPublicationBeforeCreate()
 for (const authorization of configuration.initialVolumes) broker.authorizeInitialProviderVolume(authorization)
 await broker.start()
 const accepted=new Set<string>()
