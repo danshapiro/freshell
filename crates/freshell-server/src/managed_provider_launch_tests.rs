@@ -3492,7 +3492,7 @@ export default async (input,options)=>({config:async(config)=>{
  const digest=value=>crypto.createHash('sha256').update(value).digest('hex');
  setTimeout(async()=>{
   try {
-   const response=await input.client.app.skills();
+   const response=await input.client._client.get({url:'/skill'});
    const skill=response.data.find(skill=>skill.name==='closed-external-skill');
    if(!skill)throw Error('selected native skill unavailable');
    const output=execFileSync(path.join(path.dirname(skill.location),'scripts/run'));
@@ -3747,6 +3747,16 @@ export default {{id:'closed-directory-discovery',async server(){{
                 if let Ok(bytes) = std::fs::read(path) {
                     if let Ok(value) = serde_json::from_slice(&bytes) {
                         return value;
+                    }
+                }
+                let failure = path.with_file_name(format!(
+                    "{}.failure",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+                if let Ok(bytes) = std::fs::read(&failure) {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                        println!("provider_skill_consumer_failure {}", value);
+                        panic!("native skill consumer failed; see classified fixture receipt");
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
