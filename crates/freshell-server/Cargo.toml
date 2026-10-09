@@ -27,6 +27,7 @@ managed-runtime-v1 = [
   "dep:saphyr-parser",
   "dep:semver",
   "dep:tempfile",
+  "dep:glob",
 ]
 managed-provider-qualification = [
   "managed-runtime-v1",
@@ -84,6 +85,7 @@ saphyr-parser = { version = "=0.0.11", optional = true }
 semver = { version = "=1.0.28", optional = true }
 # Managed preparation journals use private temporary files before atomic publication.
 tempfile = { version = "3", optional = true }
+glob = { version = "0.3.3", optional = true }
 # Boot-scoped identifiers: `srv-<uuidv4>` / `boot-<uuidv4>`.
 uuid = { version = "1", features = ["v4"] }
 # The browser-pane HTTP reverse proxy (`/api/proxy/http/{port}/*`) forwards to a

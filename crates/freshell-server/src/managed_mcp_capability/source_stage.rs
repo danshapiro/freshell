@@ -7,6 +7,214 @@ use freshell_platform::{
 };
 use std::{collections::BTreeMap, path::Path};
 
+#[cfg(test)]
+mod configured_resource_tests {
+    use super::*;
+    use crate::managed_provider_references::sources::*;
+    use freshell_platform::provider_environment::{copy_environment, CopySelection};
+    #[test]
+    fn managed_provider_configured_external_resources_fail_before_publication_when_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        let owned = tempfile::tempdir().unwrap();
+        let config = owned.path().join("opencode.json");
+        let resource = owned.path().join("unavailable-resource.mjs");
+        for field in ["plugin", "instructions"] {
+            for unreadable in [false, true] {
+                if unreadable {
+                    std::fs::write(&resource, "resource").unwrap();
+                    std::fs::set_permissions(&resource, std::fs::Permissions::from_mode(0))
+                        .unwrap();
+                }
+                let raw = serde_json::to_string(&serde_json::json!({field:[resource]})).unwrap();
+                std::fs::write(&config, &raw).unwrap();
+                let plan = plan_opencode_sources(
+                    vec![SourceOccurrence {
+                        logical_path: config.clone(),
+                        canonical_source: config.clone(),
+                        lane: SourceLane::Main,
+                        role: DiscoveryRole::Workspace,
+                    }],
+                    owned.path(),
+                    owned.path(),
+                    &|_, _, _| None,
+                );
+                if unreadable {
+                    std::fs::set_permissions(&resource, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    std::fs::remove_file(&resource).unwrap();
+                }
+                let error = plan
+                    .err()
+                    .expect("selected unavailable ordinary resource must prevent preparation");
+                assert_eq!(
+                    error.field,
+                    if field == "plugin" {
+                        "OpenCode plugin"
+                    } else {
+                        "OpenCode instructions"
+                    }
+                );
+                assert_eq!(error.declaring_source, config);
+                assert!(error
+                    .cause
+                    .contains(if unreadable { "unreadable" } else { "missing" }));
+                assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+                assert!(!owned.path().join("stage").exists());
+            }
+        }
+    }
+    #[test]
+    fn managed_provider_configured_resources_keep_field_and_relative_instruction_origins() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace/nested");
+        let global = owned.path().join("xdg/opencode");
+        let plugin = global.join("plugins/selected");
+        for directory in [
+            &home,
+            &cwd,
+            &plugin,
+            &cwd.join("rules"),
+            &cwd.parent().unwrap().join("rules"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(plugin.join("index.mjs"), "export default ()=>({});").unwrap();
+        std::fs::write(
+            cwd.join("rules/selected.md"),
+            "nearest selected instruction",
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.parent().unwrap().join("rules/unselected.md"),
+            "ancestor must not be selected",
+        )
+        .unwrap();
+        let config = global.join("opencode.jsonc");
+        let raw = r#"{ // retain raw native spellings and unrelated options
+"plugin":[["file:///home/freshell/provider/.config/opencode/plugins/selected/index.mjs",{"instructions":["/unselected/missing"],"path":"{env:UNRELATED}"}]],
+"instructions":["{env:RULE_PATTERN}"],}"#;
+        std::fs::write(&config, raw).unwrap();
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Global,
+            }],
+            &cwd,
+            &home,
+            &|_, _, name| match name {
+                "RULE_PATTERN" => Some("rules/*.md".into()),
+                "UNRELATED" => Some("ordinary option value".into()),
+                _ => None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plan[0].configured_resources,
+            vec![cwd.join("rules/selected.md")]
+        );
+        assert_eq!(plan[0].references.path_variables, vec!["RULE_PATTERN"]);
+        assert_eq!(plan[0].references.unexpanded_source(), raw);
+    }
+    #[test]
+    fn managed_provider_configured_external_resources_execute_complete_transport() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let package = owned.path().join("external/package");
+        for path in [&home, &workspace, &package.join("node_modules/dependency")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(package.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        std::fs::write(package.join("helper.mjs"), "export default 'adjacent';").unwrap();
+        std::fs::write(package.join("resource"), "resource").unwrap();
+        std::fs::write(
+            package.join("node_modules/dependency/package.json"),
+            r#"{"type":"module","exports":"./index.mjs"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("node_modules/dependency/index.mjs"),
+            "export default 'dependency';",
+        )
+        .unwrap();
+        std::fs::write(package.join("index.mjs"), "import fs from 'node:fs';import helper from './helper.mjs';import dependency from 'dependency';console.log(helper+':'+dependency+':'+fs.readFileSync(new URL('./resource',import.meta.url),'utf8'));").unwrap();
+        let instructions = owned.path().join("external/instructions.md");
+        std::fs::write(&instructions, "instruction-resource").unwrap();
+        let config = home.join("opencode.jsonc");
+        let raw = format!("{{ // preserve comments\n\"plugin\":[[{},{{\"unrelated\":\"/unselected/path\"}}]],\"instructions\":[{}],}}", serde_json::to_string(&format!("file://{}",package.join("index.mjs").display())).unwrap(), serde_json::to_string(&instructions).unwrap());
+        std::fs::write(&config, &raw).unwrap();
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config.clone(),
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Home,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        assert!(
+            units.iter().any(|(source, _)| source == &package),
+            "ordinary file-URL plugin must select its complete package"
+        );
+        assert!(
+            units.iter().any(|(source, _)| source == &instructions),
+            "ordinary instruction file must be transported"
+        );
+        let stage = owned.path().join("stage");
+        copy_environment(
+            &units
+                .iter()
+                .map(|(source, mount)| CopySelection {
+                    source: source.clone(),
+                    destination_relative: mount.stage_relative_path.clone().into(),
+                })
+                .collect::<Vec<_>>(),
+            &stage,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        let plugin = units.iter().find(|(source, _)| source == &package).unwrap();
+        let hidden = owned.path().join("hidden-original-resources");
+        std::fs::rename(owned.path().join("external"), &hidden).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(stage.join(&plugin.1.stage_relative_path).join("index.mjs"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .output()
+            .unwrap();
+        std::fs::rename(&hidden, owned.path().join("external")).unwrap();
+        assert!(
+            output.status.success(),
+            "transported dependency and adjacent imports must execute"
+        );
+        assert_eq!(output.stdout, b"adjacent:dependency:resource\n");
+        let instruction = units
+            .iter()
+            .find(|(source, _)| source == &instructions)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(stage.join(&instruction.1.stage_relative_path)).unwrap(),
+            b"instruction-resource"
+        );
+        assert_eq!(std::fs::read_to_string(config).unwrap(), raw);
+    }
+}
+
 /// Selected discovery roots are complete writable units, independent of the
 /// private rewritten configuration leaves mounted inside them.
 pub(super) fn resource_units(
@@ -52,15 +260,53 @@ pub(super) fn resource_units(
         }
         roots.insert((parent.to_path_buf(), source.source.role), canonical);
     }
+    for source in plan {
+        for logical in &source.configured_resources {
+            // The mounted workspace already supplies its native paths. External
+            // paths and relocated HOME inputs need complete owned projections.
+            if logical.starts_with(workspace) {
+                continue;
+            }
+            let mut roles =
+                vec![crate::managed_provider_references::sources::DiscoveryRole::Workspace];
+            if logical.starts_with(global) {
+                roles.push(crate::managed_provider_references::sources::DiscoveryRole::Global);
+            } else if logical.starts_with(home) {
+                roles.push(crate::managed_provider_references::sources::DiscoveryRole::Home);
+            }
+            for role in roles {
+                if roots
+                    .keys()
+                    .any(|(root, root_role)| *root_role == role && logical.starts_with(root))
+                {
+                    continue;
+                }
+                let canonical = std::fs::canonicalize(&logical)
+                    .map_err(|_| "selected OpenCode configured resource is unavailable")?;
+                roots.insert((logical.clone(), role), canonical);
+            }
+        }
+    }
     let mut units = Vec::new();
     let mut identities = BTreeMap::new();
     for ((logical, role), canonical) in roots {
         let next = identities.len();
         let ordinal = *identities.entry(canonical.clone()).or_insert(next);
-        let destination =
-            crate::managed_provider_references::sources::runtime_directory_destination(
+        let kind = if canonical.is_file() {
+            ProviderResourceKind::File
+        } else {
+            ProviderResourceKind::Directory
+        };
+        let name = if kind == ProviderResourceKind::File {
+            format!("root-{ordinal}/source")
+        } else {
+            format!("root-{ordinal}")
+        };
+        let destination = freshell_platform::opencode_config::lexical_path(
+            &crate::managed_provider_references::sources::runtime_directory_destination(
                 home, global, &logical, role,
-            );
+            ),
+        );
         let effective = if destination.starts_with("/home/freshell/provider")
             || !logical.starts_with(workspace)
         {
@@ -76,8 +322,8 @@ pub(super) fn resource_units(
         units.push((
             canonical,
             ProviderResourceMount {
-                stage_relative_path: format!(".freshell/resource-units/root-{ordinal}"),
-                provider_relative_path: format!(".freshell/provider-roots/root-{ordinal}"),
+                stage_relative_path: format!(".freshell/resource-units/{name}"),
+                provider_relative_path: format!(".freshell/provider-roots/{name}"),
                 logical_destination: destination
                     .to_str()
                     .ok_or("resource destination is not UTF-8")?
@@ -86,7 +332,7 @@ pub(super) fn resource_units(
                     .to_str()
                     .ok_or("resource destination is not UTF-8")?
                     .into(),
-                kind: ProviderResourceKind::Directory,
+                kind,
             },
         ));
     }

@@ -1462,6 +1462,7 @@ dependencies = [
  "freshell-terminal",
  "freshell-ws",
  "futures-util",
+ "glob",
  "hyper",
  "hyper-util",
  "libc",

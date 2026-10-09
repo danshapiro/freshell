@@ -3375,7 +3375,58 @@ export default {{id:'closed-shared-{label}',async tui(api,options){{
     }
     let cwd = nested.to_string_lossy().into_owned();
     let original_config = fixture.join("source-home/.config/opencode/opencode.json");
+    // These ordinary native fields select resources outside every implicit
+    // HOME, workspace and control root. The plugin needs its adjacent scope
+    // and installed parent lookup, and reads the selected instruction itself.
+    let external = fixture.join("scenarios/external-native-resources");
+    let package = external.join("plugin-package");
+    std::fs::create_dir_all(package.join("node_modules/closed-child")).unwrap();
+    std::fs::create_dir_all(external.join("node_modules/closed-parent")).unwrap();
+    for (base, name, value) in [
+        (&package, "closed-child", "native-child-dependency"),
+        (&external, "closed-parent", "native-parent-dependency"),
+    ] {
+        let dependency = base.join("node_modules").join(name);
+        std::fs::write(
+            dependency.join("package.json"),
+            br#"{"type":"module","exports":"./index.mjs"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("index.mjs"),
+            format!("export default {};", serde_json::to_string(value).unwrap()),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        package.join("package.json"),
+        br#"{"type":"module","exports":"./index.mjs"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("adjacent.mjs"),
+        "export default 'native-adjacent-import';",
+    )
+    .unwrap();
+    std::fs::write(package.join("resource.txt"), "native-adjacent-resource").unwrap();
+    let external_instruction = external.join("ordinary-instructions.md");
+    std::fs::write(&external_instruction, "native-external-instruction").unwrap();
+    let external_receipt = fixture.join("workspace/native-external-consumed.json");
+    let external_plugin = r#"import fs from 'node:fs';import crypto from 'node:crypto';
+import adjacent from './adjacent.mjs';import child from 'closed-child';import parent from 'closed-parent';
+export default async (_input,options)=>({config:async(config)=>{
+ const digest=value=>crypto.createHash('sha256').update(value).digest('hex');
+ fs.writeFileSync(options.receipt,JSON.stringify({adjacent:digest(adjacent),child:digest(child),parent:digest(parent),resource:digest(fs.readFileSync(new URL('./resource.txt',import.meta.url))),instruction:digest(fs.readFileSync(options.instruction)),selected:config.instructions.includes(options.instruction)}));
+}});
+"#;
+    std::fs::write(package.join("index.mjs"), external_plugin).unwrap();
+    let mut original: Value =
+        serde_json::from_slice(&std::fs::read(&original_config).unwrap()).unwrap();
+    original["plugin"].as_array_mut().unwrap().push(json!([reqwest::Url::from_file_path(package.join("index.mjs")).unwrap().to_string(), {"receipt":external_receipt,"instruction":external_instruction}]));
+    original["instructions"] = json!([external_instruction]);
+    std::fs::write(&original_config, serde_json::to_vec(&original).unwrap()).unwrap();
     let original_bytes = std::fs::read(&original_config).unwrap();
+    let expected_external = json!({"adjacent":format!("{:x}",Sha256::digest(b"native-adjacent-import")),"child":format!("{:x}",Sha256::digest(b"native-child-dependency")),"parent":format!("{:x}",Sha256::digest(b"native-parent-dependency")),"resource":format!("{:x}",Sha256::digest(b"native-adjacent-resource")),"instruction":format!("{:x}",Sha256::digest(b"native-external-instruction")),"selected":true});
     let explicit_config = fixture.join("workspace/selected-config.json");
     let explicit_bytes = br#"{"agent":{"probe":{"description":"{file:./selected-rule}"}}}"#;
     std::fs::write(&explicit_config, explicit_bytes).unwrap();
@@ -3560,6 +3611,44 @@ export default {{id:'closed-directory-discovery',async server(){{
         view_pane_id: None,
         create_request_id: Some("closed-native-terminal-create".into()),
     };
+    // Fail through the actual terminal controller before any Docker handoff.
+    // Restore every owned fixture before checking the result, including RED.
+    for (field, selected) in [
+        ("OpenCode plugin", package.join("index.mjs")),
+        ("OpenCode instructions", external_instruction.clone()),
+    ] {
+        for unreadable in [false, true] {
+            let hidden = selected.with_extension("closed-unavailable");
+            if unreadable {
+                std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0)).unwrap();
+            } else {
+                std::fs::rename(&selected, &hidden).unwrap();
+            }
+            let failed = controller.launch(request.clone()).await;
+            if unreadable {
+                std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            } else {
+                std::fs::rename(&hidden, &selected).unwrap();
+            }
+            let error = failed
+                .err()
+                .expect("selected unavailable resource must block the actual launch");
+            assert!(
+                error.contains(field)
+                    && error.contains(if unreadable { "unreadable" } else { "missing" })
+            );
+            assert_eq!(
+                std::fs::read_dir(fixture.join("handoff")).unwrap().count(),
+                0
+            );
+            assert_eq!(std::fs::read(&original_config).unwrap(), original_bytes);
+            println!(
+                "provider_resource_selection_failure {}",
+                json!({"field":field,"cause":if unreadable {"unreadable"} else {"missing"},"beforeDockerHandoff":true,"originalsRestored":true})
+            );
+        }
+    }
     let terminal = controller
         .launch(request)
         .await
@@ -3630,6 +3719,18 @@ export default {{id:'closed-directory-discovery',async server(){{
         }
     };
     assert_eq!(terminal_receipt, expected);
+    assert_eq!(
+        read_receipt(&external_receipt).await.unwrap(),
+        expected_external
+    );
+    assert_eq!(
+        std::fs::read_to_string(package.join("index.mjs")).unwrap(),
+        external_plugin
+    );
+    assert_eq!(
+        std::fs::read(&external_instruction).unwrap(),
+        b"native-external-instruction"
+    );
     let expected_root = json!({"finalExecProfile":native_exec_profile(),"physicalHome":"/home/freshell/provider","privateRule":format!("{:x}",Sha256::digest(b"shared-home-private-rule")),"dependency":format!("{:x}",Sha256::digest(b"selected-root-dependency")),"resource":format!("{:x}",Sha256::digest(b"selected-root-resource")),"write":format!("{:x}",Sha256::digest(b"selected-root-write"))});
     assert_eq!(read_receipt(&root_receipt).await.unwrap(), expected_root);
     assert_eq!(
@@ -3755,6 +3856,7 @@ export default {{id:'closed-directory-discovery',async server(){{
     std::fs::remove_file(&receipt).unwrap();
     std::fs::remove_file(&shared_receipt).unwrap();
     std::fs::remove_file(&root_receipt).unwrap();
+    std::fs::remove_file(&external_receipt).unwrap();
     std::fs::remove_file(&home_root_receipt).unwrap();
     std::fs::remove_file(&directory_receipt).unwrap();
     std::fs::remove_file(shared_lane_receipt.with_extension("root.main")).unwrap();
@@ -3816,6 +3918,18 @@ export default {{id:'closed-directory-discovery',async server(){{
         .dispatch(HostedFreshAgentCommand::Send(send))
         .await;
     assert_eq!(read_receipt(&receipt).await.unwrap(), fresh_expected);
+    assert_eq!(
+        read_receipt(&external_receipt).await.unwrap(),
+        expected_external
+    );
+    assert_eq!(
+        std::fs::read_to_string(package.join("index.mjs")).unwrap(),
+        external_plugin
+    );
+    assert_eq!(
+        std::fs::read(&external_instruction).unwrap(),
+        b"native-external-instruction"
+    );
     assert_eq!(
         read_receipt(&shared_lane_receipt.with_extension("root.main"))
             .await

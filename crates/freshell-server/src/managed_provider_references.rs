@@ -6,6 +6,7 @@ pub(crate) mod amplifier;
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod environment;
+pub(crate) mod opencode_resources;
 pub(crate) mod sources;
 
 pub struct FileSourceOrigin<'a> {

@@ -1510,6 +1510,15 @@ fn stage_provider_root(
                 .map(|reference| PathBuf::from(&reference.source_path)),
         );
         if let Some(plan) = opencode_input.source_plan {
+            // Indexed payloads remain exclusively in the private input volume,
+            // even when an ordinary package scope also contains their files.
+            excluded.extend(plan.iter().flat_map(|source| {
+                source
+                    .references
+                    .selections
+                    .iter()
+                    .map(|selection| selection.canonical_source.clone())
+            }));
             let units = source_stage::resource_units(
                 home,
                 &source,

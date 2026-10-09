@@ -309,6 +309,8 @@ pub struct PlannedSourceOccurrence {
     pub references: super::ResolvedFileReferencePlan,
     pub original_form: bool,
     pub requires_config_bind: bool,
+    pub instance_cwd: PathBuf,
+    pub configured_resources: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -485,6 +487,11 @@ pub fn plan_loaded_opencode_sources_relocated(
     lookup: &dyn Fn(SourceLane, &Path, &str) -> Option<String>,
     relocated_files: &std::collections::BTreeMap<PathBuf, PathBuf>,
 ) -> Result<Vec<PlannedSourceOccurrence>, super::ReferenceError> {
+    let global = sources
+        .iter()
+        .find(|source| source.source.role == DiscoveryRole::Global)
+        .and_then(|source| source.source.logical_path.parent())
+        .map(Path::to_owned);
     let original_names = source_environment_names(&sources)?;
     let mut canonical_occurrences = std::collections::BTreeMap::new();
     for source in &sources {
@@ -636,12 +643,31 @@ pub fn plan_loaded_opencode_sources_relocated(
                 "combined source recipe, alias, variable or event limit exceeded",
             ));
         }
-        result.push(PlannedSourceOccurrence {
+        let mut planned = PlannedSourceOccurrence {
             source,
             references,
             original_form,
             requires_config_bind: loaded.requires_config_bind,
-        });
+            instance_cwd: cwd.into(),
+            configured_resources: Vec::new(),
+        };
+        let (resources, names) =
+            super::opencode_resources::select(&planned, home, global.as_deref(), &|name| {
+                lookup(planned.source.lane, &planned.source.logical_path, name)
+            })
+            .map_err(|error| super::ReferenceError {
+                operation: "select",
+                field: error.field,
+                source_ordinal: ordinal,
+                declaring_source: planned.source.logical_path.clone(),
+                variables: vec![],
+                cause: error.cause,
+            })?;
+        planned.configured_resources = resources;
+        planned.references.path_variables.extend(names);
+        planned.references.path_variables.sort();
+        planned.references.path_variables.dedup();
+        result.push(planned);
     }
     Ok(result)
 }
