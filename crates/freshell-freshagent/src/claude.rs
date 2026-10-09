@@ -97,6 +97,254 @@ const SIDECAR_CREATE_BUDGET: Duration = Duration::from_secs(45);
 /// clears when the handler ends, on EVERY terminal path).
 const MID_ROLLBACK_PARK_TICK: Duration = Duration::from_millis(10);
 
+const MANAGED_HISTORY_BYTES: u64 = 32 * 1024 * 1024;
+const MANAGED_HISTORY_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClaudeRollbackTranscript {
+    path: PathBuf,
+    content: String,
+    cwd: Option<String>,
+    modified_ms: Option<i64>,
+}
+
+fn managed_transcript_identity() -> Result<Option<(u32, u32)>, String> {
+    match (
+        std::env::var("FRESHELL_PROVIDER_RUN_AS_UID").ok(),
+        std::env::var("FRESHELL_PROVIDER_RUN_AS_GID").ok(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(uid), Some(gid)) => {
+            let identity = (
+                uid.parse().map_err(|_| "invalid managed provider uid")?,
+                gid.parse().map_err(|_| "invalid managed provider gid")?,
+            );
+            #[cfg(unix)]
+            if identity == (unsafe { libc::geteuid() }, unsafe { libc::getegid() }) {
+                return Ok(None);
+            }
+            Ok(Some(identity))
+        }
+        _ => Err("incomplete managed provider identity".into()),
+    }
+}
+
+fn read_claude_transcript_local(
+    session_id: &str,
+    allow_removed: bool,
+    bounded: bool,
+) -> Result<Option<ClaudeRollbackTranscript>, String> {
+    use std::io::Read;
+    let Some(path) = crate::claude_snapshot::locate_transcript(session_id) else {
+        return Ok(None);
+    };
+    let content = if bounded {
+        match std::fs::File::open(&path) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(MANAGED_HISTORY_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| error.to_string())?;
+                if bytes.len() as u64 > MANAGED_HISTORY_BYTES {
+                    return Err("managed Claude transcript exceeds read budget".into());
+                }
+                String::from_utf8(bytes).map_err(|_| "Claude transcript is not UTF-8")?
+            }
+            Err(error) if allow_removed && error.kind() == std::io::ErrorKind::NotFound => {
+                String::new()
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    } else {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if allow_removed && error.kind() == std::io::ErrorKind::NotFound => {
+                String::new()
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    let cwd = crate::claude_snapshot::transcript_cwd(&path)
+        .filter(|cwd| std::path::Path::new(cwd).is_dir());
+    let modified_ms = std::fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_millis() as i64);
+    Ok(Some(ClaudeRollbackTranscript {
+        path,
+        content,
+        cwd,
+        modified_ms,
+    }))
+}
+
+async fn read_claude_rollback_transcript(
+    session_id: &str,
+    allow_removed: bool,
+) -> Result<Option<ClaudeRollbackTranscript>, String> {
+    if managed_transcript_identity()?.is_some() {
+        let value = managed_claude_history_read(json!({
+            "kind":"transcript", "sessionId":session_id, "allowRemoved":allow_removed,
+        }))
+        .await?;
+        serde_json::from_value(value)
+            .map_err(|_| "invalid managed Claude transcript response".into())
+    } else {
+        read_claude_transcript_local(session_id, allow_removed, false)
+    }
+}
+
+async fn managed_claude_history_read(request: Value) -> Result<Value, String> {
+    use tokio::io::AsyncReadExt;
+    let (uid, gid) = managed_transcript_identity()?.ok_or("managed provider identity is absent")?;
+    let mut command = tokio::process::Command::new("/usr/bin/setpriv");
+    command
+        .args([
+            "--reuid",
+            &uid.to_string(),
+            "--regid",
+            &gid.to_string(),
+            "--clear-groups",
+            "--no-new-privs",
+            "--",
+        ])
+        .arg(std::env::current_exe().map_err(|error| error.to_string())?)
+        .arg("claude-history-read-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|_| "managed Claude history worker did not start")?;
+    let result = tokio::time::timeout(MANAGED_HISTORY_TIMEOUT, async {
+        let payload = serde_json::to_vec(&request).map_err(|_| "invalid Claude history request")?;
+        if payload.len() as u64 > MANAGED_HISTORY_BYTES {
+            return Err("Claude history request exceeds read budget");
+        }
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("Claude history worker has no stdin")?;
+        stdin
+            .write_all(&payload)
+            .await
+            .map_err(|_| "Claude history request write failed")?;
+        drop(stdin);
+        let mut bytes = Vec::new();
+        child
+            .stdout
+            .take()
+            .ok_or("Claude history worker has no stdout")?
+            .take(MANAGED_HISTORY_BYTES * 2 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| "Claude history response read failed")?;
+        if bytes.len() as u64 > MANAGED_HISTORY_BYTES * 2 {
+            return Err("Claude history response exceeds read budget");
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|_| "Claude history worker wait failed")?;
+        if !status.success() {
+            return Err("Claude history worker could not read the native store");
+        }
+        serde_json::from_slice(&bytes).map_err(|_| "invalid Claude history response")
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        failure => {
+            let _ = child.kill().await;
+            let reason: String = match failure {
+                Ok(Err(reason)) => reason.into(),
+                Err(_) => "managed Claude history read timed out".into(),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            tracing::warn!(event = "freshagent.claude.managed_history_read_failed",
+                operation = request["kind"].as_str().unwrap_or("unknown"),
+                provider_uid = uid, provider_gid = gid, reason = %reason);
+            Err(reason)
+        }
+    }
+}
+
+fn claude_history_read(request: &Value) -> Result<Value, String> {
+    let session_id = request["sessionId"]
+        .as_str()
+        .filter(|id| {
+            !id.is_empty() && !id.contains(['/', '\\']) && !id.chars().any(char::is_control)
+        })
+        .ok_or("invalid Claude history identity")?;
+    let transcript =
+        read_claude_transcript_local(session_id, request["allowRemoved"] == true, true)?;
+    match request["kind"].as_str() {
+        Some("transcript") => serde_json::to_value(transcript).map_err(|error| error.to_string()),
+        Some("snapshot") => {
+            let transcript = transcript.ok_or("claude session not found")?;
+            let rollback: Option<crate::rollback_record::RollbackRecord> =
+                serde_json::from_value(request["rollback"].clone())
+                    .map_err(|_| "invalid Claude rollback record")?;
+            if let Some(original) = rollback
+                .as_ref()
+                .and_then(|record| record.original_session_id.as_deref())
+            {
+                let _ = read_claude_transcript_local(original, false, true)?;
+            }
+            let session_type = request["sessionType"]
+                .as_str()
+                .filter(|kind| matches!(*kind, "freshclaude" | "kilroy"))
+                .ok_or("invalid Claude history session type")?;
+            let mut snapshot = crate::claude_snapshot::build_claude_snapshot_json(
+                session_type,
+                session_id,
+                &transcript.content,
+                0,
+                rollback.as_ref(),
+            );
+            let basis = transcript
+                .modified_ms
+                .unwrap_or_else(|| {
+                    snapshot["turns"]
+                        .as_array()
+                        .map_or(0, |turns| turns.len() as i64)
+                })
+                .max(0);
+            snapshot["revision"] = json!(rollback
+                .as_ref()
+                .map_or(basis, |record| basis.max(record.last_op_at_ms)));
+            Ok(snapshot)
+        }
+        _ => Err("unknown Claude history read".into()),
+    }
+}
+
+/// Internal session-host worker. Runs with the existing provider UID/GID drop;
+/// native history remains provider-owned and is returned only over private stdio.
+pub fn run_claude_history_read_worker() -> Result<(), String> {
+    use std::io::Read;
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take(MANAGED_HISTORY_BYTES + 1)
+        .read_to_end(&mut input)
+        .map_err(|_| "Claude history request read failed")?;
+    if input.len() as u64 > MANAGED_HISTORY_BYTES {
+        return Err("Claude history request exceeds read budget".into());
+    }
+    let request: Value =
+        serde_json::from_slice(&input).map_err(|_| "invalid Claude history request")?;
+    let result = claude_history_read(&request)?;
+    let bytes =
+        serde_json::to_vec(&result).map_err(|_| "Claude history response encoding failed")?;
+    if bytes.len() as u64 > MANAGED_HISTORY_BYTES * 2 {
+        return Err("Claude history response exceeds read budget".into());
+    }
+    std::io::Write::write_all(&mut std::io::stdout(), &bytes)
+        .map_err(|_| "Claude history response write failed".into())
+}
+
 /// Shared, cheaply-cloneable freshclaude WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
 pub struct FreshClaudeState {
@@ -5204,20 +5452,28 @@ impl FreshClaudeState {
         thread_id: &str,
     ) -> Result<Value, String> {
         let rollback = self.load_rollback_record(thread_id).await;
-        let mut snapshot = crate::claude_snapshot::get_claude_snapshot(
-            session_type_str(session_type),
-            thread_id,
-            rollback.as_ref(),
-        )
-        .await
-        .map_err(|error| match error {
-            crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
-                "claude session not found".to_string()
-            }
-            crate::claude_snapshot::ClaudeSnapshotError::Io(_) => {
-                "claude snapshot unavailable".to_string()
-            }
-        })?;
+        let mut snapshot = if managed_transcript_identity()?.is_some() {
+            managed_claude_history_read(json!({
+                "kind":"snapshot", "sessionType":session_type_str(session_type),
+                "sessionId":thread_id, "rollback":rollback,
+            }))
+            .await?
+        } else {
+            crate::claude_snapshot::get_claude_snapshot(
+                session_type_str(session_type),
+                thread_id,
+                rollback.as_ref(),
+            )
+            .await
+            .map_err(|error| match error {
+                crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
+                    "claude session not found".to_string()
+                }
+                crate::claude_snapshot::ClaudeSnapshotError::Io(_) => {
+                    "claude snapshot unavailable".to_string()
+                }
+            })?
+        };
         let (approvals, questions) = self.snapshot_pending_overlay(thread_id).await;
         crate::claude_snapshot::apply_pending_overlay(&mut snapshot, approvals, questions);
         self.apply_snapshot_metadata(thread_id, &mut snapshot).await;
@@ -5870,18 +6126,18 @@ impl FreshClaudeState {
             guard_uuid,
         ) = match op.direction {
             RollbackDirection::Undo => {
-                let Some(path) = snap::locate_transcript(&durable_id) else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "NOTHING_TO_UNDO",
-                        UNDO_EMPTY_MESSAGE,
-                    ));
-                    return;
-                };
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(t) => t,
+                let text = match read_claude_rollback_transcript(&durable_id, false).await {
+                    Ok(Some(transcript)) => transcript.content,
+                    Ok(None) => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "NOTHING_TO_UNDO",
+                            UNDO_EMPTY_MESSAGE,
+                        ));
+                        return;
+                    }
                     Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
+                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e));
                         return;
                     }
                 };
@@ -5924,11 +6180,9 @@ impl FreshClaudeState {
                 let root_text = if chain_root == durable_id {
                     text.clone()
                 } else {
-                    match snap::locate_transcript(&chain_root)
-                        .and_then(|p| std::fs::read_to_string(p).ok())
-                    {
-                        Some(t) => t,
-                        None => {
+                    match read_claude_rollback_transcript(&chain_root, false).await {
+                        Ok(Some(transcript)) => transcript.content,
+                        _ => {
                             reply_sink(rollback_error_frame(
                                 &op,
                                 "INTERNAL_ERROR",
@@ -5984,28 +6238,20 @@ impl FreshClaudeState {
                     ));
                     return;
                 };
-                let Some(original_path) = snap::locate_transcript(&original) else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_REMOVED_HISTORY_COPY,
-                    ));
-                    return;
-                };
-                let original_text = match std::fs::read_to_string(&original_path) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
+                let original_text = match read_claude_rollback_transcript(&original, false).await {
+                    Ok(Some(transcript)) => transcript.content,
+                    Ok(None) => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "REDO_UNAVAILABLE",
+                            REDO_REMOVED_HISTORY_COPY,
+                        ));
                         return;
                     }
-                };
-                let Some(current_path) = snap::locate_transcript(&durable_id) else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "INTERNAL_ERROR",
-                        "current transcript missing",
-                    ));
-                    return;
+                    Err(e) => {
+                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e));
+                        return;
+                    }
                 };
                 // Task 4 review (Minor-2): classify the read OUTCOME — a missing
                 // file (or a raced deletion) is the DELIBERATE vacuous-empty leg
@@ -6014,11 +6260,18 @@ impl FreshClaudeState {
                 // existing-expected path is a loud INTERNAL_ERROR, exactly like
                 // the original's read leg above — never a silent empty-chain
                 // degradation yielding a false `redone` ack plus a pointless fork.
-                let current_text = match std::fs::read_to_string(&current_path) {
-                    Ok(t) => t,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                let current_text = match read_claude_rollback_transcript(&durable_id, true).await {
+                    Ok(Some(transcript)) => transcript.content,
+                    Ok(None) => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "INTERNAL_ERROR",
+                            "current transcript missing",
+                        ));
+                        return;
+                    }
                     Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
+                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e));
                         return;
                     }
                 };
@@ -6349,11 +6602,14 @@ impl FreshClaudeState {
         let recovered = self
             .identity_sink()
             .and_then(|s| s.load_settings(PROVIDER, &durable_id));
-        let source_path = snap::locate_transcript(&resume_from);
-        let original_cwd = source_path
-            .as_deref()
-            .and_then(snap::transcript_cwd)
-            .filter(|c| std::path::Path::new(c).is_dir());
+        let source_transcript = read_claude_rollback_transcript(&resume_from, false)
+            .await
+            .ok()
+            .flatten();
+        let source_path = source_transcript.as_ref().map(|source| &source.path);
+        let original_cwd = source_transcript
+            .as_ref()
+            .and_then(|source| source.cwd.clone());
         // resume value (the fork leg): the durable id under its ORIGINAL cwd's
         // slug scope when that cwd survives; else the transcript PATH (the
         // verified cli.js escape hatch bypassing slug scoping).
@@ -20512,6 +20768,65 @@ rl.on('line', (line) => {
             }
         }
         std::fs::write(dir.join(format!("{durable}.jsonl")), out.join("\n")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_claude_history_worker_reads_native_snapshot_and_rollback_anchors_without_writes(
+    ) {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), "managed-read", &two_turn_transcript());
+        let path = home.path().join("projects/-t/managed-read.jsonl");
+        let before = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let transcript: ClaudeRollbackTranscript = serde_json::from_value(
+            claude_history_read(&json!({
+                "kind":"transcript", "sessionId":"managed-read",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(transcript.path, path);
+        assert_eq!(transcript.cwd.as_deref(), Some("/tmp"));
+        let point = crate::claude_snapshot::resolve_resume_point(
+            &transcript.content,
+            "managed-read",
+            crate::claude_snapshot::ResumeTarget::Step,
+        )
+        .unwrap();
+        assert_eq!(point.resume_at_uuid.as_deref(), Some("a1"));
+        assert_eq!(point.guard_uuid.as_deref(), Some("u2"));
+        let snapshot = claude_history_read(&json!({"kind":"snapshot", "sessionId":"managed-read", "sessionType":"freshclaude", "rollback":null})).unwrap();
+        let expected =
+            crate::claude_snapshot::get_claude_snapshot("freshclaude", "managed-read", None)
+                .await
+                .unwrap();
+        assert_eq!(snapshot, expected);
+        assert!(
+            claude_history_read(&json!({"kind":"transcript", "sessionId":"absent"}))
+                .unwrap()
+                .is_null()
+        );
+        assert!(claude_history_read(&json!({"kind":"snapshot", "sessionId":"absent", "sessionType":"freshclaude", "rollback":null})).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        let oversized = home.path().join("projects/-t/oversized.jsonl");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MANAGED_HISTORY_BYTES + 1)
+            .unwrap();
+        assert!(
+            claude_history_read(&json!({"kind":"transcript", "sessionId":"oversized"})).is_err()
+        );
+        match previous {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
     }
 
     /// A rollback-fixture live session: a `tee <stdin_log>` child stands in for the

@@ -418,6 +418,7 @@ async fn run() -> Result<(), String> {
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
         Some("native-identity-read") => providers::native_identity::run_signal_read_worker(&args[2..]),
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
+        Some("claude-history-read-worker") => freshell_freshagent::claude::run_claude_history_read_worker(),
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
         Some("publish-provider-files") => {
             if args.len()!=4 { return Err("publish-provider-files requires stage and provider HOME".into()); }
