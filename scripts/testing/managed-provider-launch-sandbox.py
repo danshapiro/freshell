@@ -17,6 +17,7 @@ AMPLIFIER_TEST="managed_provider_launch_tests::managed_provider_amplifier_termin
 CLAUDE_TEST="managed_provider_launch_tests::managed_provider_claude_terminal_and_fresh_native_startup_consumes_prepared_inputs"
 CLAUDE_IMAGE="sha256:b09595b8f02dae505e6719d7617305ab8f5ad53a7138b3b1580ac553c0f2663a"
 LABEL="com.freshell.provider-launch-probe"
+INDEXED_OPTIONS={"type":"tmpfs","device":"tmpfs","o":"size=64m,mode=0700,uid=65534,gid=0,nr_inodes=1024,nosuid,nodev,noexec"}
 
 def docker(*args,check=True,timeout=180):
     return subprocess.run(["docker",*args],text=True,capture_output=True,timeout=timeout,check=check)
@@ -271,6 +272,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                 value=json.loads(inspected.stdout)[0]
                 preparations=[json.loads(candidate.read_text()) for candidate in (root/"handoff").glob("*.json")]
                 labels=None
+                options=None
                 for prepared in preparations:
                     if volume==prepared["providerVolumeName"]:
                         if not prepared.get("initialAuthReservation"):continue
@@ -283,6 +285,7 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                         labels={"com.freshell.managed-inputs":"true","com.freshell.installation-id":installation,
                                 "com.freshell.soul-id":prepared["soulId"],"com.freshell.incarnation-id":prepared["incarnationId"],
                                 "com.freshell.input-generation":prepared["generationId"]}
+                        options=INDEXED_OPTIONS
                 for candidate in candidates:
                     if volume=="freshell-claude-candidate-"+candidate["requestId"]:
                         source=next(item for item in initial if item["soulId"]==candidate["soulId"])
@@ -292,7 +295,8 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                                 "com.freshell.claude-candidate":"ordinary"}
                         if candidate.get("retained"):labels["com.freshell.source-recovery-attempt-id"]=candidate["retained"]["attemptId"]
                         else:labels["com.freshell.source-reservation-id"]=candidate["reservationId"]
-                if labels is None or value.get("Driver")!="local" or value.get("Options") not in (None,{}) or value.get("Labels")!=labels:
+                valid_options=value.get("Options")==options if options is not None else value.get("Options") in (None,{})
+                if labels is None or value.get("Driver")!="local" or not valid_options or value.get("Labels")!=labels:
                     raise RuntimeError("closed startup volume cleanup ownership changed")
                 docker("volume","rm",volume)
             receipt["ownedCleanup"]=all(docker("container","inspect",name,check=False).returncode!=0 for name in owned) and all(docker("volume","inspect",volume,check=False).returncode!=0 for volume in volumes)
