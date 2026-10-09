@@ -1039,6 +1039,228 @@ describe('owned web process lifetime (Node process fixture only)', () => {
   })
 })
 
+describe('interrupted ordinary Stop owner transport', () => {
+  const selection = { spec: 'test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts',
+    grep: 'synthetic interrupted ordinary Stop preserves history$' }
+  const supervisorEnv = { FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS: '5000',
+    FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS: '10000', FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000' }
+
+  async function fixture() {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-interrupted-stop-'))
+    const owned = new ManagedRuntimeOwner(() => { throw new Error('unused interrupted Stop web') }, process.cwd(), 3,
+      {}, supervisorEnv, 'test', { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
+    const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'stop-soul',
+      incarnationId: 'stop-incarnation', containerId: 'b'.repeat(64), hostBootId: 'stop-boot', nativeSessionId: 'stop-root' }
+    const runtimeRoot = path.join(directory, 'runtimes')
+    const runtimeDir = path.join(runtimeRoot, handle.incarnationId)
+    await fsp.mkdir(runtimeDir, { recursive: true })
+    await fsp.mkdir(path.join(directory, 'evidence'))
+    const hostState = path.join(runtimeDir, 'host-state.json')
+    const lifecycle = path.join(directory, 'evidence', 'lifecycle.jsonl')
+    await fsp.writeFile(hostState, JSON.stringify({ hostBootId: handle.hostBootId, workerLaunchCount: 1 }))
+    await fsp.writeFile(lifecycle, '')
+    owned.supervisor = { scenarioId: 'browser-managed-runtime', containerId: 'c'.repeat(64), runtimeRoot,
+      controlSocket: path.join(directory, 'control.sock'), controlSecret: 'owner-private-only',
+      controlSecretFile: path.join(directory, 'secret'), volumeName: 'stop-registry-volume', binaryKind: 'test' }
+    const row = { ...handle, provider: 'codex', freshAgentSessionType: 'freshcodex', launchState: 'running', intentRevision: 4 }
+    const inventory = vi.spyOn(owned, 'inventory').mockImplementation(async () => [row])
+    owned.runtime.broker = { receipts: () => [{ ...handle, runtimeDir }], unsafeAttempts: () => [] } as unknown as typeof owned.runtime.broker
+    vi.spyOn(owned.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    Object.assign(owned.runtime, { evidenceDir: directory })
+    const databasePath = path.join(directory, 'runtime.sqlite3')
+    const db = new DatabaseSync(databasePath)
+    db.exec(`CREATE TABLE souls(soul_id TEXT, provider_store_id TEXT, provider_volume_name TEXT, native_session_id TEXT, intent_revision INTEGER, desired_state TEXT);
+      CREATE TABLE incarnations(soul_id TEXT, incarnation_id TEXT, container_id TEXT, execution_generation INTEGER, grant_id TEXT, launch_state TEXT, cleanup_state TEXT, created_at INTEGER);
+      CREATE TABLE writer_claims(soul_id TEXT);
+      CREATE TABLE recovery_attempts(soul_id TEXT);
+      CREATE TABLE ordinary_stops(soul_id TEXT, intent_revision INTEGER, outcome TEXT, revoke_pending INTEGER, settled INTEGER);
+      CREATE TABLE stop_tombstones(soul_id TEXT);`)
+    db.prepare('INSERT INTO souls VALUES(?,?,?,?,?,?)').run(handle.soulId, 'stop-store', 'stop-provider-volume', handle.nativeSessionId, 4, 'running')
+    db.prepare('INSERT INTO incarnations VALUES(?,?,?,?,?,?,?,?)').run(handle.soulId, handle.incarnationId, handle.containerId, 3, 'stop-grant', 'running', 'active', 1)
+    db.prepare('INSERT INTO writer_claims VALUES(?)').run(handle.soulId)
+    const registry = vi.spyOn(owned.runtime, 'execOwnedContainerExact').mockImplementation((containerId, args) => {
+      expect(containerId).toBe(owned.supervisor.containerId)
+      const result = spawnSync(args[0], [args[1], args[2].replace('/var/lib/freshell-supervisor/runtime.sqlite3', databasePath), ...args.slice(3)], { encoding: 'utf8' })
+      if (result.status !== 0) throw new Error(result.stderr)
+      return result.stdout
+    })
+    const transcriptPath = path.join(directory, 'rollout.jsonl')
+    const provider = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (containerId, args) => {
+      expect(containerId).toBe(handle.containerId)
+      const result = spawnSync(args[0], [...args.slice(1, 4), transcriptPath, ...args.slice(5)], { encoding: 'utf8' })
+      if (result.status !== 0) throw new Error(result.stderr)
+      return result.stdout
+    })
+    const stop = vi.spyOn(owned.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+    const remove = vi.spyOn(owned.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    const start = vi.spyOn(owned.runtime, 'startSupervisor').mockImplementation(async () => ({ ...owned.supervisor,
+      containerId: (owned.supervisor.containerId === 'c'.repeat(64) ? 'd' : 'e').repeat(64) }))
+    const running = vi.spyOn(owned.runtime, 'isContainerRunning').mockReturnValue(true)
+    const logs = vi.spyOn(owned.runtime, 'containerLogs').mockReturnValue('')
+    const inspect = vi.spyOn(owned.runtime, 'inspectContainer').mockImplementation(containerId => ({
+      Id: containerId, State: { Running: running(containerId), ExitCode: running(containerId) ? 0 : 134 },
+    }))
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const wire: unknown[] = []
+    const rig = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => {
+      try {
+        const reply = await control(JSON.parse(String(init.body)))
+        wire.push(reply)
+        return new Response(JSON.stringify(reply), { status: 200 })
+      } catch { return new Response(JSON.stringify({ error: 'runtime_owner_refused' }), { status: 409 }) }
+    })
+    const request = { runId: context.runId, candidateSha: context.candidateSha, scenarioId: 'browser-managed-runtime',
+      operationId: 'stop-operation', action: 'interrupted-stop-facts', handle }
+    return { owned, rig, handle, row, inventory, directory, db, registry, provider, transcriptPath, hostState, lifecycle,
+      stop, remove, start, running, logs, inspect, control, request, wire,
+      close: async () => { db.close(); vi.restoreAllMocks(); await fsp.rm(directory, { recursive: true, force: true }) } }
+  }
+
+  it('registers only the exact synthetic Stop case as a grant-free phase 3 freshcodex test fixture', () => {
+    const owned = runner.createExternalManagedRuntimeOwner(process.cwd(), selection,
+      { FRESHELL_RUNTIME_SYNTHETIC_RESUME: '1' }, () => { throw new Error('unused registration web') })
+    expect(owned.fixtureRegistrationFacts()).toEqual({ phase: 3, enabledProviders: [],
+      freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'] })
+    vi.stubEnv('FRESHELL_MANAGED_CODEX_ONECLI_ENV_FILE', '/absent/ambient-native-grant')
+    try {
+      expect((owned.runtime as unknown as { phase2BootstrapFiles(): string[] }).phase2BootstrapFiles()).toEqual([])
+      expect(() => runner.createExternalManagedRuntimeOwner(process.cwd(), selection, {}, () => { throw new Error('unused') }))
+        .toThrow(/FRESHELL_RUNTIME_SYNTHETIC_RESUME/)
+      expect(() => runner.createExternalManagedRuntimeOwner(process.cwd(), { ...selection, grep: 'synthetic|P2-G01' },
+        { FRESHELL_RUNTIME_SYNTHETIC_RESUME: '1' }, () => { throw new Error('unused') })).toThrow(/separate/)
+    } finally { vi.unstubAllEnvs() }
+  })
+
+  it('seeds real retained turns, awaits exact fault replacement, and derives SQL/worker/lifecycle facts after Stop', async () => {
+    const f = await fixture()
+    try {
+      await f.rig.prepareInterruptedOrdinaryStopHistory(f.handle)
+      const transcript = (await fsp.readFile(f.transcriptPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+      expect(transcript[0].payload.id).toBe(f.handle.nativeSessionId)
+      expect(transcript.filter(row => row.payload.type === 'user_message').map(row => row.payload.message))
+        .toEqual([0, 1, 2].map(index => `Synthetic saved prompt ${index}`))
+      expect(transcript.filter(row => row.payload.type === 'task_complete').map(row => row.payload.last_agent_message))
+        .toEqual([0, 1, 2].map(index => `Synthetic saved answer ${index}`))
+      const previous = f.owned.supervisor
+      let release!: () => void
+      const pending = new Promise<void>(resolve => { release = resolve })
+      f.start.mockImplementationOnce(async () => { await pending; return { ...previous, containerId: 'd'.repeat(64) } })
+      let armed = false
+      const arm = f.rig.armInterruptedOrdinaryStop(f.handle).then(() => { armed = true })
+      try {
+        await vi.waitFor(() => expect(f.start).toHaveBeenCalledOnce())
+        expect(armed).toBe(false)
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(previous)
+        expect(f.remove).toHaveBeenCalledExactlyOnceWith(previous.containerId)
+        expect(f.start).toHaveBeenCalledWith(expect.objectContaining({ scenarioId: previous.scenarioId,
+          volumeName: previous.volumeName, binaryKind: 'test', reuseSecret: true,
+          env: supervisorEnv, crashPoint: 'ordinary_stop_after_intent' }))
+      } finally { release(); await arm }
+      const before = await f.rig.installInterruptedOrdinaryStopCounters(f.handle)
+      expect(before.durable).toMatchObject({ soul: { native_session_id: 'stop-root', intent_revision: 4 }, writers: 1, effects: [] })
+      expect(before.workerLaunchCount).toBe(1)
+      expect(before.lifecycle).toEqual([])
+      f.running.mockReturnValue(false)
+      f.logs.mockReturnValue('not JSON\n' + JSON.stringify({ event: 'supervisor.test_crash', point: 'different_point' }))
+      await expect(f.rig.interruptedOrdinaryStopCrashFacts(f.handle)).resolves.toMatchObject({ running: false, crashPoint: null, exitCode: 134 })
+      f.logs.mockReturnValue(JSON.stringify({ event: 'supervisor.test_crash', point: 'ordinary_stop_after_intent' }))
+      await expect(f.rig.interruptedOrdinaryStopCrashFacts(f.handle)).resolves.toEqual({ running: false, crashPoint: 'ordinary_stop_after_intent', exitCode: 134 })
+      await f.rig.restartSupervisor()
+      expect(f.owned.supervisor.containerId).toBe('e'.repeat(64))
+      expect(f.start.mock.calls[1][0].crashPoint).toBeUndefined()
+      f.db.exec(`UPDATE souls SET desired_state='stopped',intent_revision=5;
+        UPDATE incarnations SET launch_state='stopped',cleanup_state='verified_empty';
+        DELETE FROM writer_claims;
+        INSERT INTO ordinary_stops VALUES('stop-soul',5,'verified_empty',0,1);
+        INSERT INTO stop_tombstones VALUES('stop-soul');`)
+      f.row.launchState = 'stopped'
+      f.row.intentRevision = 5
+      await fsp.writeFile(f.lifecycle, [
+        { event: 'supervisor.stop_committed', data: { soulId: f.handle.soulId, intentRevision: 5, privatePayload: 'omitted' } },
+        { event: 'supervisor.stop_continuation', data: { soulId: f.handle.soulId, intentRevision: 5 } },
+        { event: 'supervisor.stop_committed', data: { soulId: 'other-soul', intentRevision: 9 } },
+      ].map(row => JSON.stringify(row)).join('\n'))
+      const after = await f.rig.interruptedOrdinaryStopFacts(f.handle)
+      expect(after.durable.soul).toEqual({ ...before.durable.soul, desired_state: 'stopped', intent_revision: 5 })
+      expect(after.durable.incarnations).toEqual(before.durable.incarnations.map(row => ({ ...row,
+        launch_state: 'stopped', cleanup_state: 'verified_empty' })))
+      expect(after.durable).toMatchObject({ writers: 0, effects: [], tombstones: 1,
+        stops: [{ intent_revision: 5, outcome: 'verified_empty', revoke_pending: 0, settled: 1 }] })
+      expect(after.workerLaunchCount).toBe(before.workerLaunchCount)
+      expect(after.lifecycle.map(row => row.event)).toEqual(['supervisor.stop_committed', 'supervisor.stop_continuation'])
+      const artifact = await f.rig.publishInterruptedOrdinaryStopResult(f.handle, 6)
+      expect(artifact.artifactRef).toMatch(/^interrupted-ordinary-stop:[a-f0-9]{64}$/)
+      expect(JSON.parse(await fsp.readFile(path.join(f.directory, 'task006-interrupted-stop.json'), 'utf8')))
+        .toMatchObject({ soulId: 'stop-soul', nativeSessionId: 'stop-root', intentRevision: 5, retainedTurns: 6,
+          workerLaunchCount: 1, effects: [], crashExitCode: 134 })
+      expect(JSON.stringify(f.wire)).not.toMatch(/owner-private-only|Synthetic saved answer|privatePayload|omitted/)
+    } finally { await f.close() }
+  })
+
+  it('reports every real post-setup SQL effect and refuses foreign or changed owner identities before reads', async () => {
+    const f = await fixture()
+    try {
+      await f.rig.prepareInterruptedOrdinaryStopHistory(f.handle)
+      await f.rig.armInterruptedOrdinaryStop(f.handle)
+      await f.rig.installInterruptedOrdinaryStopCounters(f.handle)
+      f.db.exec(`INSERT INTO incarnations SELECT soul_id,'replacement',container_id,execution_generation,grant_id,launch_state,cleanup_state,2 FROM incarnations;
+        INSERT INTO writer_claims VALUES('stop-soul');
+        INSERT INTO recovery_attempts VALUES('stop-soul');
+        UPDATE incarnations SET execution_generation=4 WHERE incarnation_id='stop-incarnation';`)
+      await fsp.writeFile(f.hostState, JSON.stringify({ hostBootId: f.handle.hostBootId, workerLaunchCount: 2 }))
+      const facts = await f.rig.interruptedOrdinaryStopFacts(f.handle)
+      expect(facts.durable.effects).toEqual(['replacement', 'writer', 'recovery', 'grant'])
+      expect(facts.workerLaunchCount).toBe(2)
+      f.db.exec("UPDATE souls SET native_session_id='changed-root'")
+      await expect(f.control({ ...f.request, operationId: 'changed-durable-root' })).rejects.toThrow(/durable identity/)
+      f.registry.mockClear()
+      for (const [field, value] of Object.entries({ runId: 'foreign', candidateSha: 'f'.repeat(40), soulId: 'foreign',
+        incarnationId: 'foreign', containerId: 'f'.repeat(64), hostBootId: 'foreign', nativeSessionId: 'foreign' })) {
+        await expect(f.rig.interruptedOrdinaryStopFacts({ ...f.handle, [field]: value })).rejects.toThrow()
+      }
+      expect(f.registry).not.toHaveBeenCalled()
+      await expect(f.control({ ...f.request, action: 'interrupted-stop-facts', path: '/foreign/database' })).rejects.toThrow(/operation/)
+      await fsp.writeFile(f.hostState, JSON.stringify({ hostBootId: 'replaced-boot', workerLaunchCount: 2 }))
+      await expect(f.control({ ...f.request, operationId: 'replaced-host' })).rejects.toThrow(/boot|identity/)
+      await expect(f.rig.interruptedOrdinaryStopFacts(f.handle)).rejects.toThrow(/refused: 409/)
+      expect(f.registry).not.toHaveBeenCalled()
+    } finally { await f.close() }
+  })
+
+  it('awaits owner history preparation in the actual browser case and cleans up when that operation fails', async () => {
+    await import('../../../e2e-browser/specs/runtime-terminal-continuity-rust.spec.js')
+    const callback = registeredManagedBrowserCases.get('synthetic interrupted ordinary Stop preserves history')
+    if (!callback) throw new Error('actual interrupted Stop callback was not registered')
+    const f = await fixture()
+    vi.spyOn(managedBrowser, 'createManagedRuntimeBrowserRig').mockReturnValue(f.rig)
+    vi.spyOn(f.rig, 'runningViewForFreshSession').mockResolvedValue(f.row)
+    vi.spyOn(TestHarness.prototype, 'waitForHarness').mockResolvedValue(undefined)
+    vi.spyOn(TestHarness.prototype, 'waitForConnection').mockResolvedValue(undefined)
+    vi.spyOn(TestHarness.prototype, 'getState').mockResolvedValue({ tabs: { activeTabId: 'stop-tab' },
+      panes: { layouts: { 'stop-tab': { type: 'leaf', id: 'stop-pane', content: { kind: 'fresh-agent', sessionId: 'stop-session' } } } } } as any)
+    let fail!: (error: Error) => void
+    const pending = new Promise<void>((_resolve, reject) => { fail = reject })
+    const prepare = vi.spyOn(f.owned, 'prepareInterruptedOrdinaryStopHistory').mockReturnValue(pending)
+    const cleanup = vi.spyOn(f.owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
+    const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response('{}', { status: 200 }))
+    vi.stubGlobal('fetch', fetcher)
+    const page = { on: () => undefined, goto: async () => undefined,
+      getByRole: () => ({ click: async () => undefined }) }
+    const completion = expect(Reflect.apply(callback, undefined, [{ page }])).rejects.toThrow(/refused: 409/)
+    try {
+      await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce())
+      expect(fetcher).toHaveBeenCalledOnce()
+      expect(fetcher.mock.calls[0][0]).toContain('/api/settings')
+      expect(cleanup).not.toHaveBeenCalled()
+    } finally {
+      fail(new Error('owned history preparation failed'))
+      try { await completion; expect(cleanup).toHaveBeenCalledOnce() }
+      finally { vi.unstubAllGlobals(); await f.close() }
+    }
+  })
+})
+
 describe('closed external owner control', () => {
   function fixture() {
     const owned = new ManagedRuntimeOwner(() => { throw new Error('web factory unused in controller unit') })

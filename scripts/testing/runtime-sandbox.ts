@@ -1206,6 +1206,48 @@ export const Phase3BrowserObservationSchema = z.object({
 }).strict()
 export type Phase3BrowserObservation = z.infer<typeof Phase3BrowserObservationSchema>
 
+const InterruptedOrdinaryStopDurableFactsSchema = z.object({
+  soul: z.object({ soul_id: z.string(), provider_store_id: z.string(), provider_volume_name: z.string(),
+    native_session_id: z.string(), intent_revision: z.number().int(), desired_state: z.string() }).strict(),
+  incarnations: z.array(z.object({ incarnation_id: z.string(), container_id: z.string().nullable(),
+    execution_generation: z.number().int(), grant_id: z.string().nullable(), launch_state: z.string(), cleanup_state: z.string() }).strict()),
+  stops: z.array(z.object({ intent_revision: z.number().int(), outcome: z.string().nullable(),
+    revoke_pending: z.number().int(), settled: z.number().int() }).strict()),
+  writers: z.number().int().nonnegative(), effects: z.array(z.enum(['replacement', 'writer', 'grant', 'recovery'])),
+  tombstones: z.number().int().nonnegative(),
+}).strict()
+const InterruptedOrdinaryStopLifecycleSchema = z.object({
+  event: z.enum(['supervisor.stop_committed', 'supervisor.stop_continuation']),
+  data: z.object({ soulId: z.string(), intentRevision: z.number().int() }),
+})
+export const InterruptedOrdinaryStopFactsSchema = z.object({
+  durable: InterruptedOrdinaryStopDurableFactsSchema, workerLaunchCount: z.number().int().nonnegative(),
+  lifecycle: z.array(InterruptedOrdinaryStopLifecycleSchema),
+}).strict()
+export type InterruptedOrdinaryStopFacts = z.infer<typeof InterruptedOrdinaryStopFactsSchema>
+export const InterruptedOrdinaryStopCrashFactsSchema = z.object({
+  running: z.boolean(), exitCode: z.number().int(), crashPoint: z.literal('ordinary_stop_after_intent').nullable(),
+}).strict()
+export type InterruptedOrdinaryStopCrashFacts = z.infer<typeof InterruptedOrdinaryStopCrashFactsSchema>
+
+// The fixed Task 6 probe installs counters only after setup; browser callers
+// supply an exact registered handle, never SQL or a filesystem path.
+const INTERRUPTED_ORDINARY_STOP_REGISTRY_SCRIPT = String.raw`
+import json,sqlite3,sys
+c=sqlite3.connect('/var/lib/freshell-supervisor/runtime.sqlite3')
+c.row_factory=sqlite3.Row
+if sys.argv[2]=='install':
+ c.executescript("""CREATE TABLE stop_browser_effects(kind TEXT NOT NULL);
+ CREATE TRIGGER stop_browser_incarnation AFTER INSERT ON incarnations BEGIN INSERT INTO stop_browser_effects VALUES('replacement'); END;
+ CREATE TRIGGER stop_browser_writer AFTER INSERT ON writer_claims BEGIN INSERT INTO stop_browser_effects VALUES('writer'); END;
+ CREATE TRIGGER stop_browser_grant AFTER UPDATE OF execution_generation,grant_id ON incarnations WHEN NEW.execution_generation!=OLD.execution_generation OR NEW.grant_id IS NOT OLD.grant_id BEGIN INSERT INTO stop_browser_effects VALUES('grant'); END;
+ CREATE TRIGGER stop_browser_recovery AFTER INSERT ON recovery_attempts BEGIN INSERT INTO stop_browser_effects VALUES('recovery'); END;""")
+soul=dict(c.execute('SELECT soul_id,provider_store_id,provider_volume_name,native_session_id,intent_revision,desired_state FROM souls WHERE soul_id=?',(sys.argv[1],)).fetchone())
+incarnations=[dict(r) for r in c.execute('SELECT incarnation_id,container_id,execution_generation,grant_id,launch_state,cleanup_state FROM incarnations WHERE soul_id=? ORDER BY created_at,rowid',(sys.argv[1],))]
+stops=[dict(r) for r in c.execute('SELECT intent_revision,outcome,revoke_pending,settled FROM ordinary_stops WHERE soul_id=?',(sys.argv[1],))]
+print(json.dumps(dict(soul=soul,incarnations=incarnations,stops=stops,writers=c.execute('SELECT count(*) FROM writer_claims WHERE soul_id=?',(sys.argv[1],)).fetchone()[0],effects=[r[0] for r in c.execute('SELECT kind FROM stop_browser_effects')],tombstones=c.execute('SELECT count(*) FROM stop_tombstones WHERE soul_id=?',(sys.argv[1],)).fetchone()[0])))
+`
+
 const RuntimeOwnerOperationRequestSchema = z.object({
   runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   scenarioId: z.string().min(1), operationId: z.string().min(1),
@@ -1226,6 +1268,8 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'terminal-continuity-receipt',
     'terminal-continuity-diagnostics',
     'opencode-continuity-first-reply',
+    'interrupted-stop-history', 'interrupted-stop-arm', 'interrupted-stop-counters', 'interrupted-stop-facts',
+    'interrupted-stop-crash-facts', 'interrupted-stop-artifact',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
     'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'provider-receipt', 'fresh-agent-launch-facts', 'container-state', 'host-process-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
@@ -1252,6 +1296,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   expectedControlEpoch: z.number().int().nonnegative().optional(),
   expectedIntentRevision: z.number().int().nonnegative().optional(),
   generation: z.number().int().nonnegative().optional(),
+  interruptedStopRetainedTurns: z.number().int().nonnegative().optional(),
   phase3Browser: Phase3BrowserObservationSchema.optional(),
   phase4Browser: Phase4BrowserObservationSchema.optional(),
   historyMeasurementStart: FreshCodexHistoryMeasurementStartSchema.optional(),
@@ -3285,6 +3330,10 @@ export class ManagedRuntimeOwner {
   private lossAssertionsPublished = false
   private readonly terminalChildren = new Map<string, number>()
   private readonly openCodeReadiness = new Map<string, OpencodeReplacementReadiness>()
+  private interruptedStop?: {
+    handle: ExactRuntimeHandle; volumeName: string; runtimeRoot: string; scenarioId: string
+    crashSupervisorId?: string; crash?: InterruptedOrdinaryStopCrashFacts; countersInstalled: boolean
+  }
 
   constructor(
     private readonly webFactory: RuntimeWebFactory,
@@ -3574,7 +3623,7 @@ export class ManagedRuntimeOwner {
     return this.replaceSupervisor('abrupt')
   }
 
-  private async replaceSupervisor(mode: 'graceful' | 'abrupt'): Promise<SupervisorInstance> {
+  private async replaceSupervisor(mode: 'graceful' | 'abrupt', crashPoint?: 'ordinary_stop_after_intent'): Promise<SupervisorInstance> {
     const previous = this.supervisor
     if (mode === 'abrupt') this.runtime.killTrackedContainerExact(previous.containerId)
     else this.runtime.stopSupervisorExact(previous)
@@ -3586,6 +3635,7 @@ export class ManagedRuntimeOwner {
       reuseSecret: true,
       env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
       binaryPath: this.qualificationSupervisorBin,
+      ...(crashPoint ? { crashPoint } : {}),
     })
     return this.supervisor
   }
@@ -4574,6 +4624,126 @@ export class ManagedRuntimeOwner {
     await this.assertCurrentHandle(handle)
     const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
     if (row?.provider !== 'codex' || row.freshAgentSessionType !== 'freshcodex') throw new Error('exact fresh Codex history fixture required')
+  }
+
+  async prepareInterruptedOrdinaryStopHistory(handle: ExactRuntimeHandle): Promise<void> {
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    if (this.supervisor.binaryKind !== 'test' || this.interruptedStop) throw new Error('unprepared interrupted Stop test fixture required')
+    const transcript = [
+      { type: 'session_meta', payload: { id: handle.nativeSessionId, cwd: '/workspace', model_provider: 'openai' } },
+      ...[0, 1, 2].flatMap((index) => [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: `stop-retained-${index}` } },
+        { type: 'event_msg', payload: { type: 'user_message', message: `Synthetic saved prompt ${index}` } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: `stop-retained-${index}`,
+          last_agent_message: `Synthetic saved answer ${index}` } },
+      ]),
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n'
+    await this.ownedProviderExec(handle.containerId, ['node', '--input-type=module', '-e',
+      'import fs from "node:fs"; import path from "node:path"; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1],process.argv[2]);',
+      `/home/freshell/provider/.codex/sessions/2026/03/01/rollout-${handle.nativeSessionId}.jsonl`, transcript])
+    this.interruptedStop = { handle: { ...handle }, volumeName: this.supervisor.volumeName,
+      runtimeRoot: this.supervisor.runtimeRoot, scenarioId: this.supervisor.scenarioId, countersInstalled: false }
+    this.runtime.recordLifecycle('external.interrupted_stop_history_prepared', { severity: 'info', ...handle })
+  }
+
+  // The current-running guard cannot apply while the controller is dead or the
+  // original Stop has settled. Retain its exact admitted identity and check the
+  // original receipt, registry volume and host boot before every later probe.
+  private async interruptedStopFixture(handle: ExactRuntimeHandle) {
+    const fixture = this.interruptedStop
+    if (!fixture || (['runId', 'candidateSha', 'soulId', 'incarnationId', 'containerId', 'hostBootId', 'nativeSessionId'] as const)
+      .some(field => handle[field] !== fixture.handle[field])
+      || this.supervisor.binaryKind !== 'test' || this.supervisor.volumeName !== fixture.volumeName
+      || this.supervisor.runtimeRoot !== fixture.runtimeRoot || this.supervisor.scenarioId !== fixture.scenarioId) {
+      throw new Error('original registered interrupted Stop owner identity required')
+    }
+    const receipts = this.runtime.broker.receipts().filter(receipt => receipt.soulId === handle.soulId
+      && receipt.incarnationId === handle.incarnationId && receipt.containerId === handle.containerId)
+    if (receipts.length !== 1 || receipts[0].runtimeDir !== path.join(fixture.runtimeRoot, handle.incarnationId)) {
+      throw new Error('original interrupted Stop broker receipt required')
+    }
+    const host = z.object({ hostBootId: z.literal(handle.hostBootId), workerLaunchCount: z.number().int().nonnegative() })
+      .safeParse(JSON.parse(await fsp.readFile(path.join(receipts[0].runtimeDir, 'host-state.json'), 'utf8')))
+    if (!host.success) throw new Error('interrupted Stop host boot identity changed or is unreadable')
+    return { fixture, workerLaunchCount: host.data.workerLaunchCount }
+  }
+
+  async armInterruptedOrdinaryStop(handle: ExactRuntimeHandle): Promise<void> {
+    const { fixture } = await this.interruptedStopFixture(handle)
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    if (fixture.crashSupervisorId) throw new Error('interrupted Stop fault is already armed')
+    const supervisor = await this.replaceSupervisor('graceful', 'ordinary_stop_after_intent')
+    fixture.crashSupervisorId = supervisor.containerId
+    this.runtime.recordLifecycle('external.interrupted_stop_armed', { severity: 'info', ...handle,
+      supervisorContainerId: supervisor.containerId, crashPoint: 'ordinary_stop_after_intent' })
+  }
+
+  async installInterruptedOrdinaryStopCounters(handle: ExactRuntimeHandle): Promise<InterruptedOrdinaryStopFacts> {
+    const { fixture } = await this.interruptedStopFixture(handle)
+    await this.assertFreshCodexSavedHistoryFixture(handle)
+    if (fixture.crashSupervisorId !== this.supervisor.containerId || fixture.countersInstalled) {
+      throw new Error('armed interrupted Stop before counter installation required')
+    }
+    const result = await this.readInterruptedOrdinaryStopFacts(handle, true)
+    fixture.countersInstalled = true
+    return result
+  }
+
+  async interruptedOrdinaryStopFacts(handle: ExactRuntimeHandle): Promise<InterruptedOrdinaryStopFacts> {
+    const { fixture } = await this.interruptedStopFixture(handle)
+    if (!fixture.countersInstalled) throw new Error('installed interrupted Stop effect counters required')
+    return this.readInterruptedOrdinaryStopFacts(handle, false)
+  }
+
+  private async readInterruptedOrdinaryStopFacts(handle: ExactRuntimeHandle, install: boolean): Promise<InterruptedOrdinaryStopFacts> {
+    const { workerLaunchCount } = await this.interruptedStopFixture(handle)
+    const durable = InterruptedOrdinaryStopDurableFactsSchema.parse(JSON.parse(this.runtime.execOwnedContainerExact(
+      this.supervisor.containerId, ['python3', '-c', INTERRUPTED_ORDINARY_STOP_REGISTRY_SCRIPT,
+        handle.soulId, install ? 'install' : 'read'])))
+    if (durable.soul.soul_id !== handle.soulId || durable.soul.native_session_id !== handle.nativeSessionId
+      || !durable.incarnations.some(row => row.incarnation_id === handle.incarnationId && row.container_id === handle.containerId)) {
+      throw new Error('interrupted Stop durable identity changed')
+    }
+    const lifecycle = (await this.readOwnedLifecycle()).filter(event => (
+      event.event === 'supervisor.stop_committed' || event.event === 'supervisor.stop_continuation'
+    ) && z.object({ soulId: z.string().optional() }).parse(event.data).soulId === handle.soulId)
+      .map(event => InterruptedOrdinaryStopLifecycleSchema.parse(event))
+    return { durable, workerLaunchCount, lifecycle }
+  }
+
+  async interruptedOrdinaryStopCrashFacts(handle: ExactRuntimeHandle): Promise<InterruptedOrdinaryStopCrashFacts> {
+    const { fixture } = await this.interruptedStopFixture(handle)
+    const containerId = fixture.crashSupervisorId
+    if (!containerId || containerId !== this.supervisor.containerId) throw new Error('exact armed interrupted Stop supervisor required')
+    const state = z.object({ State: z.object({ Running: z.boolean(), ExitCode: z.number().int() }) })
+      .parse(this.runtime.inspectContainer(containerId)).State
+    const observed = this.runtime.containerLogs(containerId).split('\n').some(line => {
+      try { const row = JSON.parse(line); return row.event === 'supervisor.test_crash' && row.point === 'ordinary_stop_after_intent' }
+      catch { return false }
+    })
+    const facts = { running: state.Running, exitCode: state.ExitCode,
+      crashPoint: observed ? 'ordinary_stop_after_intent' as const : null }
+    fixture.crash = facts
+    return facts
+  }
+
+  async publishInterruptedOrdinaryStopResult(handle: ExactRuntimeHandle, retainedTurns: number): Promise<{ artifactRef: string }> {
+    const { fixture } = await this.interruptedStopFixture(handle)
+    const facts = await this.interruptedOrdinaryStopFacts(handle)
+    const crash = fixture.crash
+    if (retainedTurns !== 6 || !crash || crash.running || crash.exitCode !== 134
+      || crash.crashPoint !== 'ordinary_stop_after_intent' || facts.durable.soul.desired_state !== 'stopped') {
+      throw new Error('observed interrupted Stop crash and retained stopped history required')
+    }
+    const target = this.runtime.writeArtifact('task006-interrupted-stop.json', {
+      caseName: 'synthetic interrupted ordinary Stop preserves history', status: 'PASS',
+      soulId: handle.soulId, incarnationId: handle.incarnationId, nativeSessionId: handle.nativeSessionId,
+      intentRevision: facts.durable.soul.intent_revision, crashPoint: crash.crashPoint, crashExitCode: crash.exitCode,
+      retainedTurns, workerLaunchCount: facts.workerLaunchCount, effects: facts.durable.effects,
+    })
+    const artifactRef = `interrupted-ordinary-stop:${createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`
+    this.runtime.recordLifecycle('external.interrupted_stop_artifact', { severity: 'info', ...handle, artifactRef })
+    return { artifactRef }
   }
 
   async publishFreshCodexSavedHistoryPreservation(handle: ExactRuntimeHandle, input: FreshCodexSavedHistoryPreservation): Promise<{ artifactRef: string }> {

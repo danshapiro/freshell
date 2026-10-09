@@ -20,6 +20,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema, Phase4BrowserObservationSchema,
   FreshCodexSavedHistoryPreservationSchema, FreshCodexSavedHistoryMeasurementSchema, FreshCodexControllerReattachmentSchema, FreshCodexHistoryMeasurementFinishSchema, FreshCodexHistoryMeasurementStartSchema, FreshCodexSavedHistoryOwnershipFactsSchema, FreshCodexControllerStartupFactsSchema, FreshCodexRetainedSnapshotFactsSchema, FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHostProcessStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
   RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
+  InterruptedOrdinaryStopFactsSchema, InterruptedOrdinaryStopCrashFactsSchema,
   RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
   OpencodeLossCredentialEvidenceSchema, OpencodeLossAbsenceEvidenceSchema, OpencodeLossRecoverySchema,
   OpencodeLossIncidentEvidenceSchema, RuntimeLossAssertionsArtifactSchema, RuntimeLossReceiptArtifactSchema,
@@ -40,6 +41,7 @@ import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
+import type { InterruptedOrdinaryStopFacts, InterruptedOrdinaryStopCrashFacts } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
 import type { FreshCodexSavedHistoryPreservation, FreshCodexSavedHistoryMeasurement, FreshCodexControllerReattachment, FreshCodexHistoryMeasurementFinish, FreshCodexHistoryMeasurementStart, FreshCodexSavedHistoryOwnershipFacts, RuntimeHostProcessState, FreshCodexControllerStartupFacts, FreshCodexRetainedSnapshotFacts, Phase4BrowserObservation, Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
 import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts, RuntimeChaosReceiptArtifact } from './runtime-sandbox.js'
@@ -726,7 +728,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'historyControllerReattachment' | 'historyMeasurement' | 'historyPreservation' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'terminalQualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'historyControllerReattachment' | 'historyMeasurement' | 'historyPreservation' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'terminalQualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic' | 'interruptedStopRetainedTurns'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -849,6 +851,25 @@ export class ExternalManagedRuntimeRig {
   }
   async prepareFreshCodexSavedHistory(handle: ExactRuntimeHandle): Promise<{ bytes: number }> {
     return this.rpc('freshcodex-history-prepare', z.object({ bytes: z.number().int().positive() }).strict(), { handle })
+  }
+  async prepareInterruptedOrdinaryStopHistory(handle: ExactRuntimeHandle): Promise<void> {
+    await this.rpc('interrupted-stop-history', CompletedOwnerOperationSchema, { handle })
+  }
+  async armInterruptedOrdinaryStop(handle: ExactRuntimeHandle): Promise<void> {
+    await this.rpc('interrupted-stop-arm', CompletedOwnerOperationSchema, { handle })
+  }
+  async installInterruptedOrdinaryStopCounters(handle: ExactRuntimeHandle): Promise<InterruptedOrdinaryStopFacts> {
+    return this.rpc('interrupted-stop-counters', InterruptedOrdinaryStopFactsSchema, { handle })
+  }
+  async interruptedOrdinaryStopFacts(handle: ExactRuntimeHandle): Promise<InterruptedOrdinaryStopFacts> {
+    return this.rpc('interrupted-stop-facts', InterruptedOrdinaryStopFactsSchema, { handle })
+  }
+  async interruptedOrdinaryStopCrashFacts(handle: ExactRuntimeHandle): Promise<InterruptedOrdinaryStopCrashFacts> {
+    return this.rpc('interrupted-stop-crash-facts', InterruptedOrdinaryStopCrashFactsSchema, { handle })
+  }
+  async publishInterruptedOrdinaryStopResult(handle: ExactRuntimeHandle, interruptedStopRetainedTurns: number): Promise<{ artifactRef: string }> {
+    return this.rpc('interrupted-stop-artifact', z.object({ artifactRef: z.string().regex(/^interrupted-ordinary-stop:[a-f0-9]{64}$/) }).strict(),
+      { handle, interruptedStopRetainedTurns })
   }
   async freshCodexSavedHistoryUnchanged(handle: ExactRuntimeHandle): Promise<boolean> {
     return this.rpc('freshcodex-history-unchanged', z.boolean(), { handle })
@@ -1506,6 +1527,15 @@ export function createExternalRuntimeControl(
       case 'freshcodex-controller-startup': result = await owner.freshCodexControllerStartupFacts(handle()); break
       case 'freshcodex-history-snapshot': result = await owner.freshCodexRetainedSnapshotFacts(handle()); break
       case 'freshcodex-history-prepare': result = await owner.prepareFreshCodexSavedHistory(handle()); break
+      case 'interrupted-stop-history': await owner.prepareInterruptedOrdinaryStopHistory(handle()); result = { completed: true }; break
+      case 'interrupted-stop-arm': await owner.armInterruptedOrdinaryStop(handle()); result = { completed: true }; break
+      case 'interrupted-stop-counters': result = await owner.installInterruptedOrdinaryStopCounters(handle()); break
+      case 'interrupted-stop-facts': result = await owner.interruptedOrdinaryStopFacts(handle()); break
+      case 'interrupted-stop-crash-facts': result = await owner.interruptedOrdinaryStopCrashFacts(handle()); break
+      case 'interrupted-stop-artifact':
+        if (request.interruptedStopRetainedTurns === undefined) throw new Error('observed retained Stop turn count required')
+        result = await owner.publishInterruptedOrdinaryStopResult(handle(), request.interruptedStopRetainedTurns)
+        break
       case 'freshcodex-history-unchanged': result = await owner.freshCodexSavedHistoryUnchanged(handle()); break
       case 'freshcodex-coincident-prepare': await owner.prepareCoincidentFreshCodexHistory(handle()); result = { completed: true }; break
       case 'freshcodex-coincident-unchanged': result = await owner.coincidentFreshCodexHistoryUnchanged(handle()); break
@@ -2102,6 +2132,19 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
   return options => webFactory({ ...options, env: { ...options.env, ...preset } })
 }
 
+function selectsInterruptedOrdinaryStop(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv): boolean {
+  if (path.basename(selection.spec) !== 'runtime-terminal-continuity-rust.spec.ts') return false
+  const selector = selection.grep ? new RegExp(selection.grep) : undefined
+  const title = 'Phase 2 managed runtime continuity › synthetic interrupted ordinary Stop preserves history'
+  if (selector ? !selector.test(title) : environment.FRESHELL_RUNTIME_SYNTHETIC_RESUME !== '1') return false
+  requireOptIn(environment, 'FRESHELL_RUNTIME_SYNTHETIC_RESUME')
+  if (!selector || [
+    'Phase 2 managed runtime continuity › P2-G01: real browser shell survives ten graceful/abrupt web replacements',
+    'Phase 2 managed runtime continuity › P2-G04: OpenAI-authenticated OpenCode tool turn survives web replacement in one native session',
+  ].some(other => selector.test(other))) throw new Error('interrupted Stop requires a separate owned fixture registration')
+  return true
+}
+
 /** One owner registration for the selected browser case, with its existing fixed presets. */
 export function createExternalManagedRuntimeOwner(root: string, selection: ExternalBrowserSelection,
   environment: NodeJS.ProcessEnv, webFactory: RuntimeWebFactory, retainedArtifacts = false): ManagedRuntimeOwner {
@@ -2111,15 +2154,16 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
   const tabsCases = tabs ? tabsCaseSelections(selection) : []
   if (tabs && tabsCases.length !== 1) throw new Error('tabs cases require separate owned registrations')
   const history = tabs && new RegExp(tabsCases[0].grep).test(TABS_CASE_TITLES[0])
-  const deterministic = fixture || smoke || history
+  const interruptedStop = selectsInterruptedOrdinaryStop(selection, environment)
+  const deterministic = fixture || smoke || history || interruptedStop
   const sourceSelection = selectsSyntheticSource(selection, environment)
-  const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : smoke ? ['freshopencode'] : history ? ['freshcodex'] : selection.mode ? [selection.mode] : []
+  const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : smoke ? ['freshopencode'] : history || interruptedStop ? ['freshcodex'] : selection.mode ? [selection.mode] : []
   const providers = deterministic || selection.mode ? [] : selection.provider ? [selection.provider] : ['opencode']
   const phase = deterministic ? 3 : selection.provider || selection.mode ? 5
     : path.basename(selection.spec).includes('resurrection') ? 3
       : path.basename(selection.spec).includes('rehydrate') ? 4
         : /chaos|lost-soul/.test(selection.spec) ? 5 : 2
-  const supervisorEnv: Record<string, string> = fixture ? { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '250' } : history ? {
+  const supervisorEnv: Record<string, string> = fixture ? { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '250' } : history || interruptedStop ? {
     FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS: '5000', FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS: '10000',
     FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000',
   } : {}
