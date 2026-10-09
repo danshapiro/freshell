@@ -30,7 +30,7 @@ const broker=new RestrictedDockerBroker({
     : configuration.provider==='codex'
     ? ['/home/freshell/provider',path.join(root,'source-home/.codex')]
     : configuration.provider==='amplifier'
-    ? ['/home/freshell/provider',path.join(root,'source-home/.amplifier')]
+    ? ['/home/freshell/provider',path.join(root,'source-home/.amplifier'),path.join(root,'scenarios/external-amplifier-bundle')]
     : ['/home/freshell/provider',path.join(root,'.opencode'),path.join(root,'scenarios/external-native-resources')]),
   allowedBootstrapFiles:new Set([path.join(root,'grants/environment.env'),path.join(root,'grants/auth.json'),path.join(root,'grants/ca.pem')]),
   allowedHostGatewayAddresses:gateways,
