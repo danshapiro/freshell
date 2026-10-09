@@ -60,6 +60,19 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
   }
 }
 describe('managed native startup channel', () => {
+  it('observes an authorized first-turn Undo as a new empty native startup', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'native-reroot-empty-'))
+    const sidecar = checkpointSidecar(directory)
+    try {
+      sidecar.send({ type: 'create', requestId: 'empty-rollback', cwd: directory, model: 'empty-rollback-native',
+        nativeIdentityTransition: { parentNativeSessionId: root,
+          launch: { ...launch, evidenceRevision: launch.evidenceRevision + 1, requestedNativeSessionId: null } } })
+      const observed = await sidecar.wait('sdk.session.init')
+      expect(observed.cliSessionId).toBe('dddddddd-dddd-4ddd-8ddd-dddddddddddd')
+      expect(observed.nativeIdentityEvidence.source).toBe('startup')
+      expect(sidecar.frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
+    } finally { await sidecar.close(); await rm(directory, { recursive: true, force: true }) }
+  })
   it('admits an authorized native rollback child while preserving ordinary exact-resume refusal', async () => {
     for (const authorized of [true, false]) {
       const directory = await mkdtemp(join(tmpdir(), 'native-reroot-'))

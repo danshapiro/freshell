@@ -549,7 +549,7 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
   })
   state.inputStream = handle
   if (launch) state.nativeChannel = await createNativeSessionChannel({ launch, signal: abort.signal,
-    allowFork: !!state.nativeIdentityTransition })
+    allowFork: !!state.nativeIdentityTransition && req.forkSession === true })
 
   const sdkQuery = query({
     prompt: iterable,
@@ -660,7 +660,8 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
     state.nativeReadyPromise = state.nativeChannel.waitReady(sdkQuery).then(async (observation) => {
       if (sessions.get(sessionId) !== state || state.queryGeneration !== generation || abort.signal.aborted) return
       if (state.nativeIdentityTransition) {
-        if (observation.native.source !== 'fork') throw new Error('native rollback did not acknowledge a fork')
+        const expectedSource = req.forkSession === true ? 'fork' : 'startup'
+        if (observation.native.source !== expectedSource) throw new Error(`native rollback did not acknowledge a ${expectedSource}`)
         if (observation.nativeSessionId === state.nativeIdentityTransition.parentNativeSessionId) throw new Error('native rollback retained the retired root')
       } else if (req.resumeSessionId && observation.nativeSessionId !== req.resumeSessionId) throw new Error('native exact resume changed root')
       if (await nativeProfileDigest(req, state.settings) !== state.nativeProfileDigest) throw new Error('selected native profile changed during startup')
