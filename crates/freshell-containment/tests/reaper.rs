@@ -184,6 +184,7 @@ fn ctrl_c_typed_into_the_pane_reaches_only_the_agent() {
     let mut pane = start(ScriptOpts::default());
     let info = pane.info();
     let agent = pin(info.agent);
+    let nohup = pin(info.nohup);
     assert_eq!(
         info.pgid, info.agent,
         "the agent leads its own process group"
@@ -211,7 +212,12 @@ fn ctrl_c_typed_into_the_pane_reaches_only_the_agent() {
     let status = pane.wait_exit();
     assert!(status.success(), "{status}");
     assert!(agent.has_exited());
-    assert!(!alive(info.nohup), "the shim killed what the agent left");
+    // The shim SIGKILLs what the agent left and exits without waiting for it.
+    eventually(
+        Duration::from_secs(5),
+        "the shim killed what the agent left",
+        || nohup.has_exited(),
+    );
 }
 
 #[test]
@@ -296,9 +302,12 @@ fn the_shim_spares_the_codex_daemon_family() {
         "the shim killed the managed daemon stand-in"
     );
     assert_eq!(process::start_time(info.daemon).unwrap(), start);
-    assert!(
-        !alive(info.nohup),
-        "everything else the agent left is killed"
+    // The agent exits at once, so what it left may be gone before it can be
+    // pinned: its pid is checked instead.
+    eventually(
+        Duration::from_secs(5),
+        "everything else the agent left is killed",
+        || !alive(info.nohup),
     );
     daemon.signal(Sig::Kill).unwrap();
 }
