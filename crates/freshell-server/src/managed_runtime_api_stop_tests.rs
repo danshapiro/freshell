@@ -24,6 +24,9 @@ use tower::ServiceExt;
 #[derive(Default)]
 struct StopBackend {
     uncertain: AtomicBool,
+    // Observation is independent of signal errors; default handles are occupied.
+    empty: AtomicBool,
+    empty_after_error: AtomicBool,
     stopped: Mutex<Vec<(SoulId, IncarnationId)>>,
     history_home: Option<PathBuf>,
 }
@@ -60,11 +63,15 @@ impl RuntimeBackend for StopBackend {
             .unwrap()
             .push((handle.soul_id().clone(), handle.incarnation_id().clone()));
         if self.uncertain.load(Ordering::SeqCst) {
+            if self.empty_after_error.load(Ordering::SeqCst) {
+                self.empty.store(true, Ordering::SeqCst);
+            }
             Err(BackendError::DockerHttp {
                 status: 503,
                 body: "cleanup unconfirmed".into(),
             })
         } else {
+            self.empty.store(true, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -72,7 +79,7 @@ impl RuntimeBackend for StopBackend {
         unreachable!()
     }
     async fn verify_empty(&self, _: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
-        Ok(true)
+        Ok(self.empty.load(Ordering::SeqCst))
     }
     async fn list_known(
         &self,
@@ -484,16 +491,169 @@ async fn automatic_view(registry: &Registry, soul: &RuntimeView) -> ViewIntent {
 }
 
 #[tokio::test]
+async fn stop_backend_observes_occupied_failure_then_successful_cleanup() {
+    let temp = tempfile::Builder::new()
+        .prefix("task007-server-stop-fixture-")
+        .tempdir()
+        .unwrap();
+    let (registry, before) = fixture_soul(temp.path(), false).await;
+    let handle = registry
+        .recovery_context(before.soul_id.clone())
+        .await
+        .unwrap()
+        .prior_handle;
+    let backend = StopBackend::default();
+    assert!(!backend.verify_empty(&handle).await.unwrap());
+
+    backend.uncertain.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        backend.request_stop(&handle, 2).await,
+        Err(BackendError::DockerHttp { status: 503, .. })
+    ));
+    assert!(!backend.verify_empty(&handle).await.unwrap());
+
+    backend.uncertain.store(false, Ordering::SeqCst);
+    backend.request_stop(&handle, 2).await.unwrap();
+    assert!(backend.verify_empty(&handle).await.unwrap());
+    assert_eq!(
+        *backend.stopped.lock().unwrap(),
+        vec![(before.soul_id.clone(), before.incarnation_id.clone()); 2]
+    );
+
+    let concurrent_cleanup = StopBackend::default();
+    concurrent_cleanup.uncertain.store(true, Ordering::SeqCst);
+    concurrent_cleanup
+        .empty_after_error
+        .store(true, Ordering::SeqCst);
+    assert!(!concurrent_cleanup.verify_empty(&handle).await.unwrap());
+    assert!(matches!(
+        concurrent_cleanup.request_stop(&handle, 2).await,
+        Err(BackendError::DockerHttp { status: 503, .. })
+    ));
+    assert!(concurrent_cleanup.verify_empty(&handle).await.unwrap());
+    assert_eq!(
+        *concurrent_cleanup.stopped.lock().unwrap(),
+        vec![(before.soul_id, before.incarnation_id)]
+    );
+}
+
+#[tokio::test]
+async fn stop_error_with_observed_empty_releases_the_exact_owned_writer() {
+    for certify_loss in [false, true] {
+        let backend = Arc::new(StopBackend::default());
+        backend.uncertain.store(true, Ordering::SeqCst);
+        backend.empty_after_error.store(true, Ordering::SeqCst);
+        assert_verified_empty_stop(backend, certify_loss, 1).await;
+    }
+}
+
+#[tokio::test]
+async fn already_empty_stop_releases_the_owned_writer_without_a_signal() {
+    let backend = Arc::new(StopBackend::default());
+    backend.empty.store(true, Ordering::SeqCst);
+    // Even a failing signal must remain unattempted when emptiness is observed first.
+    backend.uncertain.store(true, Ordering::SeqCst);
+    assert_verified_empty_stop(backend, false, 0).await;
+}
+
+async fn assert_verified_empty_stop(
+    backend: Arc<StopBackend>,
+    certify_loss: bool,
+    expected_stop_attempts: usize,
+) {
+    let temp = tempfile::Builder::new()
+        .prefix("task007-server-stop-fixture-")
+        .tempdir()
+        .unwrap();
+    let (registry, before) = fixture_soul(temp.path(), certify_loss).await;
+    let connection = rusqlite::Connection::open(temp.path().join("runtime.sqlite3")).unwrap();
+    let writer_count = || {
+        connection
+            .query_row(
+                "SELECT count(*) FROM writer_claims WHERE soul_id=?1 AND incarnation_id=?2",
+                rusqlite::params![before.soul_id.as_str(), before.incarnation_id.as_str()],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(writer_count(), 1);
+    let certificate = if let Some(incident) = before.incident_id.clone() {
+        Some(serde_json::to_value(registry.loss_certificate(incident).await.unwrap()).unwrap())
+    } else {
+        None
+    };
+    let handle = registry
+        .recovery_context(before.soul_id.clone())
+        .await
+        .unwrap()
+        .prior_handle;
+    assert_eq!(
+        backend.verify_empty(&handle).await.unwrap(),
+        expected_stop_attempts == 0
+    );
+    let (socket, control) = start_control(temp.path(), registry.clone(), backend.clone()).await;
+    let web = web_router(&socket, temp.path()).await;
+    let (status, stopped) = stop(&web, &before, before.intent_revision).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stopped["outcome"], "verified_empty");
+    assert_eq!(stopped["soul"]["cleanupState"], "verified_empty");
+    assert_eq!(stopped["soul"]["desiredState"], "stopped");
+    assert_eq!(
+        stopped["soul"]["recoveryState"],
+        if certify_loss { "lost" } else { "stopped" }
+    );
+    assert_eq!(stopped["soul"]["soulId"], before.soul_id.as_str());
+    assert_eq!(
+        stopped["soul"]["incarnationId"],
+        before.incarnation_id.as_str()
+    );
+    assert_eq!(stopped["soul"]["nativeSessionId"], "retained-thread");
+    assert_eq!(
+        stopped["soul"]["freshAgentSessionId"],
+        "fresh-retained-thread"
+    );
+    assert_eq!(
+        stopped["soul"]["intentRevision"],
+        before.intent_revision + 1
+    );
+    assert_eq!(writer_count(), 0);
+    assert!(backend.verify_empty(&handle).await.unwrap());
+    assert_eq!(
+        *backend.stopped.lock().unwrap(),
+        vec![(before.soul_id.clone(), before.incarnation_id.clone()); expected_stop_attempts]
+    );
+    if let Some(incident) = before.incident_id.clone() {
+        assert_eq!(
+            Some(serde_json::to_value(registry.loss_certificate(incident).await.unwrap()).unwrap()),
+            certificate
+        );
+    }
+    control.abort();
+    assert!(control.await.unwrap_err().is_cancelled());
+    let owned_root = temp.path().to_path_buf();
+    drop(web);
+    drop(connection);
+    drop(registry);
+    drop(temp);
+    assert!(!socket.exists());
+    assert!(!owned_root.exists());
+}
+
+#[tokio::test]
 async fn stopped_hidden_view_satisfies_stale_detach_without_mutating_new_authority() {
     let temp = tempfile::tempdir().unwrap();
     let (registry, before) = fixture_soul(temp.path(), false).await;
     let frozen = automatic_view(&registry, &before).await;
     let backend = Arc::new(StopBackend::default());
-    let (socket, control) = start_control(temp.path(), registry.clone(), backend).await;
+    let (socket, control) = start_control(temp.path(), registry.clone(), backend.clone()).await;
     let web = web_router(&socket, temp.path()).await;
     let (status, stopped) = stop(&web, &before, before.intent_revision).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(stopped["outcome"], "verified_empty");
+    assert_eq!(
+        *backend.stopped.lock().unwrap(),
+        vec![(before.soul_id.clone(), before.incarnation_id.clone())]
+    );
     let hidden = registry.inventory_snapshot().await.unwrap().view_intents[0].clone();
     assert_eq!(hidden.visibility, ViewVisibilityIntent::Hidden);
     assert!(hidden.revision > frozen.revision);
