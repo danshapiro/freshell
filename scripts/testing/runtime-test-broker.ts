@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import { TASK007_BATCH_STORE_PROBE } from './runtime-sandbox.js'
 
 const DOCKER_API_PREFIX = '/v1.47'
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024
@@ -636,14 +637,22 @@ export class RestrictedDockerBroker {
       claude: '/home/freshell/provider/.claude/projects', codex: '/home/freshell/provider/.codex/sessions',
       opencode: '/home/freshell/provider/.local/share/opencode/opencode.db', amplifier: '/home/freshell/provider/.amplifier/projects',
     }
-    if (parsed.User !== '65534:0' || parsed.Tty !== true || !this.validHistoryHelperHost(host, false)
+    // Read the owner binding only when handling a request, after both ESM
+    // modules initialize; the helper admits no caller-selected script.
+    const batch = Array.isArray(cmd) && cmd.length === 5 && cmd[0] === '--no-warnings' && cmd[1] === '-e'
+      && cmd[2] === TASK007_BATCH_STORE_PROBE && cmd[3] === sources.opencode
+      && typeof cmd[4] === 'string' && /^ses_[A-Za-z0-9_-]{1,252}$/.test(cmd[4])
+      && typeof parsed.Image === 'string' && /^sha256:[a-f0-9]{64}$/.test(parsed.Image)
+    const native = typeof workspace === 'string' && Array.isArray(cmd) && cmd.length === 7
+      && cmd[0] === '--no-warnings' && cmd[1] === '--import'
+      && cmd[2] === path.join(workspace, 'node_modules/tsx/dist/loader.mjs')
+      && cmd[3] === path.join(workspace, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts')
+      && typeof cmd[4] === 'string' && Object.hasOwn(sources, cmd[4]) && cmd[5] === sources[cmd[4]]
+      && typeof cmd[6] === 'string' && cmd[6].length > 0
+    if ((!batch && !native) || parsed.User !== '65534:0' || parsed.Tty !== !batch || !this.validHistoryHelperHost(host, false)
       || JSON.stringify(parsed.Env) !== JSON.stringify(['HOME=/home/freshell/provider'])
       || typeof workspace !== 'string' || path.normalize(workspace) !== workspace || !this.isAllowedWorkspacePath(workspace)
-      || !Array.isArray(cmd) || cmd.length !== 7 || cmd[0] !== '--no-warnings' || cmd[1] !== '--import'
-      || cmd[2] !== path.join(workspace, 'node_modules/tsx/dist/loader.mjs')
-      || cmd[3] !== path.join(workspace, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts')
-      || typeof cmd[4] !== 'string' || !Object.hasOwn(sources, cmd[4]) || cmd[5] !== sources[cmd[4]]
-      || typeof cmd[6] !== 'string' || !cmd[6] || !this.policy.allowedImageRefs.has(parsed.Image)) return
+      || !this.policy.allowedImageRefs.has(parsed.Image)) return
     const mounts = host.Mounts
     if (!Array.isArray(mounts) || mounts.length !== 2) return
     const volume = mounts.find(mount => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === true)
