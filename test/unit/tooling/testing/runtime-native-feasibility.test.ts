@@ -37,6 +37,19 @@ function child(caseId: string, failure = false): NativeExperimentOriginal {
   })) as NativeExperimentOriginal
 }
 
+function createFixtureCheckout(directory: string): string {
+  // Cloud test images contain sources without checkout metadata. Exercise the
+  // real harness's Git provenance boundary in an owned repository instead.
+  execFileSync('git', ['init', '-q', directory])
+  const gitOptions = { cwd: directory, encoding: 'utf8' as const }
+  const tree = execFileSync('git', ['hash-object', '-t', 'tree', '-w', '--stdin'], { ...gitOptions, input: '' }).trim()
+  const identity = 'Dan Shapiro <3732858+danshapiro@users.noreply.github.com> 1 +0000'
+  const commit = execFileSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'],
+    { ...gitOptions, input: 'tree ' + tree + '\nauthor ' + identity + '\ncommitter ' + identity + '\n\nNative artifact unit fixture\n' }).trim()
+  execFileSync('git', ['update-ref', 'HEAD', commit], gitOptions)
+  return commit
+}
+
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
   it.each(['root-load-error', 'history-load-error'])('damages only the owned exact native %s source while preserving the sealed source (controlled UID driver only)', fault => {
     const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
@@ -2806,12 +2819,14 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
     })
   it('actual entrypoint prepares finite phase-one artifacts and joins cleanup on preparation failure', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-entry-unit-'))
+    const fixtureCommit = createFixtureCheckout(directory)
     const manifest = path.join(directory, 'artifacts.json')
     const previous = process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
-    fs.writeFileSync(manifest, JSON.stringify({ candidateSha, imageDigest,
+    fs.writeFileSync(manifest, JSON.stringify({ candidateSha: fixtureCommit, imageDigest,
       artifacts: { supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
         host: { path: '/fixture/host', sha256: 'd'.repeat(64) } }, sourceFiles: [] }), { mode: 0o600 })
     process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = manifest
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(directory)
     let selectedPhase: number | undefined
     const prepare = vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function () {
       selectedPhase = this.phase
@@ -2825,7 +2840,7 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
       expect(prepare).toHaveBeenCalledOnce()
       expect(cleanup).toHaveBeenCalledOnce()
     } finally {
-      prepare.mockRestore(); cleanup.mockRestore()
+      prepare.mockRestore(); cleanup.mockRestore(); cwd.mockRestore()
       if (previous === undefined) delete process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
       else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = previous
       fs.rmSync(directory, { recursive: true, force: true })
@@ -2833,12 +2848,14 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
   })
   it.each(['freshclaude', 'kilroy'] as const)('sends the logical %s workload and Claude native grants to the actual launch route', async (mode) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-logical-mode-'))
+    const fixtureCommit = createFixtureCheckout(directory)
     const manifest = path.join(directory, 'artifacts.json')
     const previous = process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
-    fs.writeFileSync(manifest, JSON.stringify({ candidateSha, imageDigest,
+    fs.writeFileSync(manifest, JSON.stringify({ candidateSha: fixtureCommit, imageDigest,
       artifacts: { supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
         host: { path: '/fixture/host', sha256: 'd'.repeat(64) } }, sourceFiles: [] }), { mode: 0o600 })
     process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = manifest
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(directory)
     let scratch: string | undefined
     const requests: any[] = []
     const prepare = vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function () {
@@ -2868,7 +2885,7 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
         .toEqual(['claude_onecli_environment', 'claude_onecli_ca_file'])
       expect(cleanup).toHaveBeenCalledOnce()
     } finally {
-      for (const spy of [prepare, start, write, admin, cleanup]) spy.mockRestore()
+      for (const spy of [prepare, start, write, admin, cleanup, cwd]) spy.mockRestore()
       if (previous === undefined) delete process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
       else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = previous
       if (scratch) fs.rmSync(scratch, { recursive: true, force: true })
@@ -2877,17 +2894,19 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
   })
   it.each((['claude', 'amplifier'] as const).flatMap(provider => (['startup', 'native-turn'] as const).map(caseId => ({ provider, caseId }))))('executes terminal $provider/$caseId profile preparation and paid prerequisite ordering', async ({ provider, caseId }) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-terminal-create-hold-'))
+    const fixtureCommit = createFixtureCheckout(directory)
     const manifest = path.join(directory, 'artifacts.json')
     const preferences = path.join(directory, 'preferences.json'); fs.writeFileSync(preferences, '{}')
     const previous = process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
     const files = (provider === 'amplifier' ? ['grants/env_file', 'grants/ca_file', '.amplifier/settings.yaml', '.amplifier/bundles/default.yaml']
       : caseId === 'startup' ? ['grants/env_file', 'grants/ca_file', 'profile/native-startup-user.json'] : ['grants/env_file', 'grants/ca_file'])
       .map((name) => ({ name: provider + '/' + name, path: preferences, sha256: 'e'.repeat(64) }))
-    fs.writeFileSync(manifest, JSON.stringify({ candidateSha, imageDigest, artifacts: {
+    fs.writeFileSync(manifest, JSON.stringify({ candidateSha: fixtureCommit, imageDigest, artifacts: {
       supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
       host: { path: '/fixture/host', sha256: 'd'.repeat(64) },
     }, sourceFiles: files }))
     process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = manifest
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(directory)
     let scratch: string | undefined
     let generatedProfileRoot: string | undefined
     const prepare = vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function (input) {
@@ -2921,7 +2940,7 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
       expect(cleanup).toHaveBeenCalledOnce()
     } finally {
       prepare.mockRestore(); start.mockRestore(); write.mockRestore(); admin.mockRestore(); raw.mockRestore()
-      server.mockRestore(); evidence.mockRestore(); stop.mockRestore(); cleanup.mockRestore()
+      server.mockRestore(); evidence.mockRestore(); stop.mockRestore(); cleanup.mockRestore(); cwd.mockRestore()
       if (previous === undefined) delete process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
       else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = previous
       fs.rmSync(directory, { recursive: true, force: true })
@@ -2931,10 +2950,12 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
   })
   it.each(['freshcodex','freshopencode','codex'] as const)('holds receiver paid recovery after failed initial create (%s; entrypoint orchestration only)', async mode => {
     const directory=fs.mkdtempSync(path.join(os.tmpdir(),'receiver-paid-hold-')),provider=mode==='freshcodex'||mode==='codex'?'codex':'opencode'
+    const fixtureCommit = createFixtureCheckout(directory)
     const manifest=path.join(directory,'artifacts.json'),previous=process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
-    fs.writeFileSync(manifest,JSON.stringify({candidateSha,imageDigest,artifacts:{supervisor:{path:'/fixture/supervisor',sha256:'c'.repeat(64)},host:{path:'/fixture/host',sha256:'d'.repeat(64)}},
+    fs.writeFileSync(manifest,JSON.stringify({candidateSha:fixtureCommit,imageDigest,artifacts:{supervisor:{path:'/fixture/supervisor',sha256:'c'.repeat(64)},host:{path:'/fixture/host',sha256:'d'.repeat(64)}},
       sourceFiles:['env_file','auth_file','ca_file'].map(suffix=>({name:`${provider}/grants/${suffix}`,path:'/fixture/'+suffix,sha256:'e'.repeat(64)}))}))
     process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE=manifest
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(directory)
     let scratch=''
     const prepare=vi.spyOn(RuntimeHarness.prototype,'prepareNativeArtifacts').mockImplementation(async function(input){scratch=this.testRoot;fs.mkdirSync(scratch,{recursive:true});return{supervisorPath:'/fixture/supervisor',hostPath:'/fixture/host',files:input.sourceFiles,...(mode==='codex'?{serverPath:'/fixture/server'}:{})}})
     const start=vi.spyOn(RuntimeHarness.prototype,'startSupervisor').mockResolvedValue({} as never),write=vi.spyOn(RuntimeHarness.prototype,'writeArtifact').mockReturnValue('fixture')
@@ -2947,20 +2968,14 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
       await expect(runNativeFeasibility([mode==='codex'?'--provider':'--mode',mode,'--case','startup'])).rejects.toThrow('native experiment cases failed')
       expect(server).not.toHaveBeenCalled();expect(admin).toHaveBeenCalledTimes(1);expect(start).toHaveBeenCalledTimes(1);expect(cleanup).toHaveBeenCalledTimes(1)
     }finally{
-      server.mockRestore();serverEvidence.mockRestore();serverStop.mockRestore();prepare.mockRestore();start.mockRestore();write.mockRestore();admin.mockRestore();cleanup.mockRestore()
+      server.mockRestore();serverEvidence.mockRestore();serverStop.mockRestore();prepare.mockRestore();start.mockRestore();write.mockRestore();admin.mockRestore();cleanup.mockRestore();cwd.mockRestore()
       if(previous===undefined)delete process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE;else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE=previous
       if(scratch)fs.rmSync(scratch,{recursive:true,force:true});fs.rmSync(directory,{recursive:true,force:true})
     }
   })
   it('prepares only exact private native artifacts and selected source copies without ambient mounts', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-artifact-unit-'))
-    execFileSync('git', ['init', '-q', directory])
-    const gitOptions = { cwd: directory, encoding: 'utf8' as const }
-    const tree = execFileSync('git', ['hash-object', '-t', 'tree', '-w', '--stdin'], { ...gitOptions, input: '' }).trim()
-    const identity = 'Dan Shapiro <3732858+danshapiro@users.noreply.github.com> 1 +0000'
-    const fixtureCommit = execFileSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'],
-      { ...gitOptions, input: 'tree ' + tree + '\nauthor ' + identity + '\ncommitter ' + identity + '\n\nNative artifact unit fixture\n' }).trim()
-    execFileSync('git', ['update-ref', 'HEAD', fixtureCommit], gitOptions)
+    const fixtureCommit = createFixtureCheckout(directory)
     const bin = path.join(directory, 'bin')
     fs.mkdirSync(bin)
     fs.writeFileSync(path.join(bin, 'docker'), '#!' + process.execPath + '\n' +
