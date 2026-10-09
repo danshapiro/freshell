@@ -55,9 +55,6 @@ pub(super) fn prepare(
     let Some(source) = active.data.as_str() else {
         return Err("Amplifier bundle.active source has an unsupported type".into());
     };
-    if !source.starts_with("file://") {
-        return Ok(result);
-    }
     let mut state = BundleSelection {
         view_bytes: raw.len(),
         ..Default::default()
@@ -560,6 +557,206 @@ fn markdown_frontmatter(raw: &str) -> Option<(&str, usize)> {
 #[cfg(test)]
 mod module_source_tests {
     use super::*;
+
+    #[test]
+    fn managed_provider_amplifier_top_local_forms_consume_modules_context_and_dependencies_after_both_copies(
+    ) {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        let bundle = owned.path().join("external-bundle");
+        let module = bundle.join("modules/probe");
+        for path in [
+            &home.join(".amplifier"),
+            &cwd,
+            &module.join("node_modules/dependency"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let raw_bundle = "bundle: {name: selected}\ncontext:\n  include: [context.md]\nsession:\n  orchestrator:\n    module: probe\n    source: ./modules/probe\n";
+        std::fs::write(bundle.join("bundle.yaml"), raw_bundle).unwrap();
+        std::fs::write(bundle.join("context.md"), "selected-context").unwrap();
+        std::fs::write(module.join("resource"), "module-resource").unwrap();
+        std::fs::write(
+            module.join("node_modules/dependency/index.js"),
+            "module.exports='installed-dependency';",
+        )
+        .unwrap();
+        std::fs::write(module.join("consume.cjs"), "const fs=require('node:fs'),path=require('node:path');process.stdout.write(fs.readFileSync(path.join(__dirname,'resource'),'utf8')+':'+require('dependency')+':'+fs.readFileSync(process.argv[2],'utf8'));").unwrap();
+        for (ordinal, source) in [
+            bundle.join("bundle.yaml").display().to_string(),
+            "../external-bundle/bundle.yaml".into(),
+            "./../external-bundle/bundle.yaml".into(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let raw_settings = format!(
+                "bundle:\n  active: {}\n",
+                serde_json::to_string(source).unwrap()
+            );
+            let settings = home.join(".amplifier/settings.yaml");
+            std::fs::write(&settings, &raw_settings).unwrap();
+            let prepared = prepare(&home, &cwd, &[]).unwrap();
+            let staged_settings = prepared
+                .rewritten_settings
+                .as_ref()
+                .expect("selected top-level local bundle is projected");
+            let projected_source = MarkedYamlOwned::load_from_str(staged_settings).unwrap()[0]
+                .data
+                .as_mapping_get("bundle")
+                .unwrap()
+                .data
+                .as_mapping_get("active")
+                .unwrap()
+                .data
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let stage = owned.path().join(format!("stage-{ordinal}"));
+            let host = owned.path().join(format!("host-{ordinal}"));
+            freshell_platform::provider_environment::copy_environment(
+                &prepared.selections,
+                &stage,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            for (relative, raw) in &prepared.rewritten_resources {
+                std::fs::write(stage.join(relative), raw).unwrap();
+            }
+            let selections = prepared
+                .selections
+                .iter()
+                .map(|selection| CopySelection {
+                    source: stage.join(&selection.destination_relative),
+                    destination_relative: selection.destination_relative.clone(),
+                })
+                .collect::<Vec<_>>();
+            freshell_platform::provider_environment::copy_environment(
+                &selections,
+                &host,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            let relative = Path::new(projected_source.strip_prefix("file://").unwrap())
+                .strip_prefix("/home/freshell/provider")
+                .unwrap();
+            let projected_bundle = host.join(relative);
+            let projected_raw = std::fs::read_to_string(&projected_bundle).unwrap();
+            let document = MarkedYamlOwned::load_from_str(&projected_raw).unwrap();
+            let module_source = document[0]
+                .data
+                .as_mapping_get("session")
+                .unwrap()
+                .data
+                .as_mapping_get("orchestrator")
+                .unwrap()
+                .data
+                .as_mapping_get("source")
+                .unwrap()
+                .data
+                .as_str()
+                .unwrap();
+            let module = host.join(
+                Path::new(module_source.strip_prefix("file://").unwrap())
+                    .strip_prefix("/home/freshell/provider")
+                    .unwrap(),
+            );
+            let context = document[0]
+                .data
+                .as_mapping_get("context")
+                .unwrap()
+                .data
+                .as_mapping_get("include")
+                .unwrap()
+                .data
+                .as_sequence()
+                .unwrap()[0]
+                .data
+                .as_str()
+                .unwrap();
+            let hidden = owned.path().join("hidden-original-bundle");
+            std::fs::rename(&bundle, &hidden).unwrap();
+            let output = std::process::Command::new("node")
+                .arg(module.join("consume.cjs"))
+                .arg(projected_bundle.parent().unwrap().join(context))
+                .current_dir(&cwd)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .output()
+                .unwrap();
+            std::fs::rename(&hidden, &bundle).unwrap();
+            assert!(
+                output.status.success(),
+                "selected top bundle modules and context must work with originals unavailable"
+            );
+            assert_eq!(
+                output.stdout,
+                b"module-resource:installed-dependency:selected-context"
+            );
+            assert_eq!(std::fs::read_to_string(settings).unwrap(), raw_settings);
+            assert_eq!(
+                std::fs::read_to_string(bundle.join("bundle.yaml")).unwrap(),
+                raw_bundle
+            );
+        }
+    }
+
+    #[test]
+    fn managed_provider_amplifier_top_local_forms_block_missing_and_unreadable_sources_and_preserve_native_names(
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".amplifier")).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        let settings = home.join(".amplifier/settings.yaml");
+        let selected = owned.path().join("bundle.yaml");
+        for source in [
+            selected.display().to_string(),
+            "../bundle.yaml".into(),
+            "./../bundle.yaml".into(),
+        ] {
+            for unreadable in [false, true] {
+                if unreadable {
+                    std::fs::write(&selected, "bundle: {name: selected}\n").unwrap();
+                    std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0))
+                        .unwrap();
+                }
+                let raw = format!(
+                    "bundle:\n  active: {}\n",
+                    serde_json::to_string(&source).unwrap()
+                );
+                std::fs::write(&settings, &raw).unwrap();
+                let result = prepare(&home, &cwd, &[]);
+                if unreadable {
+                    std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    std::fs::remove_file(&selected).unwrap();
+                }
+                let error = result
+                    .err()
+                    .expect("unavailable selected top-level local bundle must block preparation");
+                assert!(error.contains(if unreadable { "unreadable" } else { "missing" }));
+                assert_eq!(std::fs::read_to_string(&settings).unwrap(), raw);
+            }
+        }
+        for name in [
+            "registered-bundle",
+            "git+https://example.invalid/bundle",
+            "https://example.invalid/bundle",
+        ] {
+            let raw = format!("bundle:\n  active: {name}\n");
+            std::fs::write(&settings, &raw).unwrap();
+            let prepared = prepare(&home, &cwd, &[]).unwrap();
+            assert!(prepared.selections.is_empty());
+            assert!(prepared.rewritten_settings.is_none());
+            assert_eq!(std::fs::read_to_string(&settings).unwrap(), raw);
+        }
+    }
 
     #[test]
     fn amplifier_local_module_source_executes_after_projection_from_unrelated_cwd() {

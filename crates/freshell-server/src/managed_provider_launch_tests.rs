@@ -673,7 +673,7 @@ async fn managed_provider_amplifier_terminal_native_startup_consumes_prepared_in
         .starts_with("fln-"));
     let home = fixture.join("source-home");
     let workspace = fixture.join("workspace");
-    let bundle = home.join(".amplifier/bundles/selected");
+    let bundle = fixture.join("scenarios/external-amplifier-bundle");
     let skill = home.join(".amplifier/skills/probe");
     let control = fixture.join("scenarios/native/control");
     let runtime = fixture.join("scenarios/n/r");
@@ -681,6 +681,7 @@ async fn managed_provider_amplifier_terminal_native_startup_consumes_prepared_in
     for path in [
         &control,
         &runtime,
+        &home.join(".amplifier"),
         &bundle.join("modules/context-probe/amplifier_module_context_probe"),
         &bundle.join("modules/loop-probe/amplifier_module_loop_probe"),
         &bundle.join("modules/hooks-probe/amplifier_module_hooks_probe"),
@@ -781,7 +782,7 @@ async def on_session_ready(coordinator):
     let conversation_receipt = workspace.join("amplifier-conversation.json");
     let bundle_document=format!("bundle:\n  name: closed-native-bundle\nsession:\n  orchestrator:\n    module: loop-probe\n    source: ./modules/loop-probe\n  context:\n    module: context-probe\n    source: ./modules/context-probe\n    config:\n      conversation_receipt: {}\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\nhooks:\n  - module: hooks-probe\n    source: ./modules/hooks-probe\n    config:\n      receipt: {}\n      session_id: {}\n      key_digest: {}\n",serde_json::to_string(conversation_receipt.to_str().unwrap()).unwrap(),serde_json::to_string(receipt.to_str().unwrap()).unwrap(),native_id,hash(b"synthetic-amplifier-onecli-value"));
     std::fs::write(bundle.join("bundle.yaml"), &bundle_document).unwrap();
-    let settings=format!("bundle:\n  active: file://{}\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\n",bundle.display());
+    let settings = "bundle:\n  active: ../scenarios/external-amplifier-bundle/bundle.yaml\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\n".to_owned();
     std::fs::write(home.join(".amplifier/settings.yaml"), &settings).unwrap();
     let env_file = fixture.join("grants/environment.env");
     std::fs::write(
