@@ -1,7 +1,7 @@
 //! Captures `freshell_unit` events (level, `event` field and every other
 //! field as text) for assertions.
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer};
@@ -47,6 +47,7 @@ impl<S: tracing::Subscriber> Layer<S> for Captured {
 }
 
 pub fn install() -> (Captured, tracing::subscriber::DefaultGuard) {
+    ask_every_dispatcher();
     let cap = Captured::default();
     let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(cap.clone()));
     (cap, guard)
@@ -68,4 +69,16 @@ impl Captured {
                     .all(|(k, v)| e.fields.get(*k).map(String::as_str) == Some(*v))
         })
     }
+}
+
+/// tracing-core caches each callsite's interest at the callsite's first use,
+/// and while at most one dispatcher is registered it asks only the CURRENT
+/// thread's default. A callsite first used on another test's thread (which
+/// has no subscriber) is then cached as "never", and this thread's capture
+/// misses that event for good: random missing events whenever tests that
+/// emit the same events run in parallel. A second dispatcher that lives for
+/// the whole process makes tracing ask every live dispatcher instead.
+fn ask_every_dispatcher() {
+    static SECOND: OnceLock<tracing::Dispatch> = OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 }

@@ -96,8 +96,20 @@ impl Subscriber for Capture {
 
 /// Every event `f` emits on this thread.
 pub fn capture(f: impl FnOnce()) -> Vec<CapturedEvent> {
+    ask_every_dispatcher();
     let capture = Capture::default();
     tracing::subscriber::with_default(capture.clone(), f);
     let events = capture.0.lock().unwrap().clone();
     events
+}
+
+/// tracing-core caches each callsite's interest at the callsite's first use,
+/// and while at most one dispatcher is registered it asks only the CURRENT
+/// thread's default. A callsite first used on another test's thread (which
+/// has no subscriber) is then cached as "never", and a capture running at the
+/// same time misses that event for good. A second dispatcher that lives for
+/// the whole process makes tracing ask every live dispatcher instead.
+fn ask_every_dispatcher() {
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 }
