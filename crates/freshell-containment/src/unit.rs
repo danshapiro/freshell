@@ -811,6 +811,11 @@ impl AgentUnit {
         };
         let escalated = tokio::select! {
             biased;
+            // `Ok`: the target exited. `Err`: its exit cannot be watched
+            // (for example EMFILE). Either way the grace ends here and the
+            // whole-unit kill follows at once, which is safe; confirm_gone
+            // then meets the same watch error and reports it
+            // (`unit.stop.failed`), and attempt 2 retries in Force.
             _ = target.exited() => false,
             _ = joins.wait_for(|n| *n > 0) => true,
             _ = tokio::time::sleep(grace) => graceful,
