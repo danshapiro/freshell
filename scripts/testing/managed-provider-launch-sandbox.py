@@ -219,10 +219,12 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
             if not gateway:
                 raise RuntimeError("closed controller has no owned bridge gateway")
             (root/"controller-gateway.json").write_text(json.dumps({"address":gateway}))
-            # The Claude fixture consumes an ordinary file at the full128MiB
-            # boundary through two independent controller/native routes.
+            # Claude consumes an ordinary file at the full128MiB boundary;
+            # OpenCode qualifies sequential16MiB source views on both routes.
             # Keep a finite overall wait separate from each helper's deadline.
-            waited=docker("wait",controller,timeout=360 if args.provider=="claude" else 180)
+            controller_wait_timeout=360 if args.provider in {"claude","opencode"} else 180
+            receipt["controllerWaitTimeoutSeconds"]=controller_wait_timeout
+            waited=docker("wait",controller,timeout=controller_wait_timeout)
             exit_code=int(waited.stdout.strip())
             outcome=docker("logs",controller,check=False)
             receipt["exitCode"]=exit_code
