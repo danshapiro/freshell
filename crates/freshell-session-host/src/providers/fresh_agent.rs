@@ -83,17 +83,18 @@ enum NativeProofReception {
 }
 
 impl HostedNativeIdentity {
-    fn current_parent_proof(&self) -> Option<HostedParentProof> {
+    fn current_parent_proof(&self, new_query: bool) -> Option<HostedParentProof> {
         let launch = self.launch.as_ref()?;
         let producer_launch = self.producer_launch.as_ref()?;
         let root = self.root.as_ref()?;
         let evidence = self.evidence.as_ref()?;
         if evidence["nativeSessionId"].as_str() != Some(root.as_str())
             || evidence["launch"] != json!(launch)
-            || evidence["providerEvidence"]["launch"] != json!(producer_launch)
-            || evidence["queryGeneration"]
-                .as_u64()
-                .is_none_or(|generation| generation == 0)
+            || (new_query
+                && (evidence["providerEvidence"]["launch"] != json!(producer_launch)
+                    || evidence["queryGeneration"]
+                        .as_u64()
+                        .is_none_or(|generation| generation == 0)))
         {
             return None;
         }
@@ -130,11 +131,7 @@ impl HostedNativeIdentity {
                 launch.requested_native_session_id = None;
             }
         }
-        self.rejected_parent = if new_query {
-            self.current_parent_proof()
-        } else {
-            None
-        };
+        self.rejected_parent = self.current_parent_proof(new_query);
         self.producer_launch = producer.clone();
         self.pending = true;
         self.candidates.clear();
@@ -147,17 +144,26 @@ impl HostedNativeIdentity {
         parent: &str,
         transition_launch: &Option<freshell_runtime_protocol::NativeIdentityLaunch>,
         code: &str,
+        provider: &FreshProvider,
     ) -> bool {
         let Some(prior) = self.rejected_parent.take() else {
             return false;
         };
-        // These Claude handler refusals all precede native writer retirement.
-        // INTERNAL_ERROR also occurs after teardown; BUSY_TURN can mean a
-        // timed-out quiesce probe. Neither proves the saved query is current.
-        if !matches!(
-            code,
-            "INVALID_ROLLBACK_TARGET" | "NOTHING_TO_UNDO" | "REDO_UNAVAILABLE"
-        ) || !self.pending
+        // All admitted codes precede the respective handler's first native
+        // mutation. Codex can respawn before validation, so the caller must
+        // also establish the unchanged native process. Never infer rejection
+        // from generic errors, RPC failures or Claude's quiesce timeout.
+        let before_mutation = match provider {
+            FreshProvider::Claude | FreshProvider::Kilroy | FreshProvider::Opencode => {
+                matches!(
+                    code,
+                    "INVALID_ROLLBACK_TARGET" | "NOTHING_TO_UNDO" | "REDO_UNAVAILABLE"
+                )
+            }
+            FreshProvider::Codex => matches!(code, "INVALID_ROLLBACK_TARGET" | "NOTHING_TO_UNDO"),
+        };
+        if !before_mutation
+            || !self.pending
             || self.root.as_deref() != Some(parent)
             || prior.root != parent
             || self.launch.as_ref() != Some(&prior.launch)
@@ -261,6 +267,9 @@ struct HostedTransport {
     state: ProviderState,
     profile: std::sync::Mutex<Option<FreshAgentProfile>>,
     session_id: Mutex<Option<String>>,
+    // Native runtime that produced the current create/fork/rollback proof.
+    // Runtime identity alone never supplies native observation.
+    native_incarnation: Mutex<Option<String>>,
     prepared_native_checkpoints: std::sync::Mutex<Option<Vec<Value>>>,
     created_rx: Mutex<watch::Receiver<Option<Result<String, String>>>>,
     native_rx: Mutex<watch::Receiver<Option<String>>>,
@@ -440,6 +449,7 @@ impl HostedTransport {
             state,
             profile: std::sync::Mutex::new(None),
             session_id: Mutex::new(None),
+            native_incarnation: Mutex::new(None),
             prepared_native_checkpoints: std::sync::Mutex::new(None),
             created_rx: Mutex::new(created_rx),
             native_rx: Mutex::new(native_rx),
@@ -527,6 +537,25 @@ impl HostedTransport {
             ProviderState::Codex(state) => state.has_live_session(session_id).await,
             ProviderState::Opencode { runtime, .. } => runtime.has_live_session(session_id).await,
         }
+    }
+
+    async fn provider_session_incarnation(&self, session_id: &str) -> Option<String> {
+        match &self.state {
+            ProviderState::Claude(_) => None,
+            ProviderState::Codex(state) => state.live_session_incarnation(session_id).await,
+            ProviderState::Opencode { runtime, owner } => {
+                if !runtime.has_live_session(session_id).await {
+                    return None;
+                }
+                let manager = owner.opencode_shared_handle().lock().await.clone()?;
+                manager.ownership_id().await.filter(|id| !id.is_empty())
+            }
+        }
+    }
+
+    async fn remember_native_runtime(&self, session_id: &str) {
+        let incarnation = self.provider_session_incarnation(session_id).await;
+        *self.native_incarnation.lock().await = incarnation;
     }
 
     async fn retire_provider_session(&self, session_id: &str) -> Result<(), DispatchFailure> {
@@ -809,6 +838,7 @@ impl FreshAgentTransport for HostedTransport {
             // UUID. The temporary SDK create key is not a live-session lookup.
             *self.session_id.lock().await = native_session_id.clone();
         }
+        self.remember_native_runtime(&session_id).await;
         Ok(TransportStart { native_session_id })
     }
 
@@ -1033,6 +1063,7 @@ impl FreshAgentTransport for HostedTransport {
             });
         }
         *self.session_id.lock().await = Some(child.clone());
+        self.remember_native_runtime(&child).await;
         self.native_identity
             .lock()
             .expect("native identity lock")
@@ -1216,6 +1247,8 @@ impl FreshAgentTransport for HostedTransport {
                 turn_id,
                 cwd,
             } => {
+                let prior_incarnation = self.native_incarnation.lock().await.clone();
+                let before_incarnation = self.provider_session_incarnation(&session_id).await;
                 let next_launch = self
                     .native_identity
                     .lock()
@@ -1276,27 +1309,35 @@ impl FreshAgentTransport for HostedTransport {
                         .await;
                 }
                 if let Some(code) = frames.iter().find_map(find_operation_error_code) {
-                    let parent_is_live = new_query
-                        && frames.iter().any(|frame| {
-                            find_correlated_rollback_error(frame, request_id.as_str(), &session_id)
-                                == Some(code)
-                        })
-                        && self.session_id.lock().await.as_ref() == Some(&session_id)
+                    let parent_is_live = frames.iter().any(|frame| {
+                        find_correlated_rollback_error(frame, request_id.as_str(), &session_id)
+                            == Some(code)
+                    }) && self.session_id.lock().await.as_ref()
+                        == Some(&session_id)
                         && self.provider_session_is_live(&session_id).await;
+                    let same_runtime = new_query
+                        || (prior_incarnation.is_some()
+                            && before_incarnation == prior_incarnation
+                            && self.provider_session_incarnation(&session_id).await
+                                == prior_incarnation);
                     let restored = parent_is_live
+                        && same_runtime
                         && self
                             .native_identity
                             .lock()
                             .expect("native identity lock")
-                            .reject_before_native_transition(&session_id, &next_launch, code);
-                    if new_query {
-                        crate::emit_environment_event(
-                            json!({"severity":if restored {"info"} else {"warn"},
+                            .reject_before_native_transition(
+                                &session_id,
+                                &next_launch,
+                                code,
+                                &self.provider,
+                            );
+                    crate::emit_environment_event(
+                        json!({"severity":if restored {"info"} else {"warn"},
                             "event":"host.native_identity.rollback_rejected", "provider":self.provider.as_str(),
                             "requestId":request_id.as_str(), "code":code, "parentProofRestored":restored,
                             "launch":next_launch}),
-                        );
-                    }
+                    );
                     return Err(OperationFailure {
                         kind: if code == "UNSUPPORTED_CAPABILITY" {
                             OperationFailureKind::Unsupported
@@ -1304,7 +1345,7 @@ impl FreshAgentTransport for HostedTransport {
                             OperationFailureKind::Rejected
                         },
                         message: "provider rejected hosted rollback".into(),
-                        acceptance_ambiguous: new_query && !restored,
+                        acceptance_ambiguous: !restored,
                     });
                 }
                 observed_native = frames
@@ -1330,6 +1371,7 @@ impl FreshAgentTransport for HostedTransport {
                     );
                 }
                 *self.session_id.lock().await = Some(root.clone());
+                self.remember_native_runtime(root).await;
                 self.native_identity
                     .lock()
                     .expect("native identity lock")
@@ -2543,10 +2585,12 @@ mod tests {
                 "timeout" => "BUSY_TURN",
                 _ => "INVALID_ROLLBACK_TARGET",
             };
-            let restored = identity
-                .lock()
-                .unwrap()
-                .reject_before_native_transition(PARENT, &next, code);
+            let restored = identity.lock().unwrap().reject_before_native_transition(
+                PARENT,
+                &next,
+                code,
+                &FreshProvider::Claude,
+            );
             assert_eq!(restored, case == "unchanged", "{case}");
             if restored {
                 sender.send(init(PARENT, &launch, 2)).unwrap();
@@ -2772,6 +2816,717 @@ mod tests {
                 assert!(!transport.is_live().await);
                 result.unwrap();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_non_claude_rollback_never_restores_changed_proof_or_stop() {
+        for provider in [FreshProvider::Codex, FreshProvider::Opencode] {
+            for case in [
+                "unchanged",
+                "late-parent-proof",
+                "child-proof",
+                "changed-launch",
+                "wrong-operation",
+                "unobserved",
+                "generic-error",
+                "timeout",
+                "stop",
+            ] {
+                let (sender, receiver) = broadcast::channel(32);
+                let (created, _) = watch::channel(None);
+                let (native, native_rx) = watch::channel(None);
+                let (native_evidence, _) = watch::channel(None);
+                let (events, mut event_rx) = mpsc::channel(32);
+                let (send_outcomes, _) = broadcast::channel(16);
+                let (kill_outcomes, _) = broadcast::channel(16);
+                let mut transport = HostedTransport::new(provider.clone()).await;
+                let identity = Arc::new(std::sync::Mutex::new(HostedNativeIdentity::default()));
+                let owned = Arc::get_mut(&mut transport).unwrap();
+                owned.native_identity = identity.clone();
+                owned.native_rx = Mutex::new(native_rx);
+                *owned.session_id.lock().await = Some("current-root".into());
+                spawn_broadcast_bridge(
+                    provider.clone(),
+                    receiver,
+                    BroadcastBridgeOutputs {
+                        created,
+                        native,
+                        native_evidence,
+                        native_identity: identity.clone(),
+                        events,
+                        send_outcomes,
+                        kill_outcomes,
+                        suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                        refusal_observer: None,
+                    },
+                );
+                let launch = serde_json::from_value(json!({"incarnationId":"refusal-incarnation",
+                    "launchNonce":"refusal-nonce", "evidenceRevision":3, "executionGeneration":2,
+                    "requestedNativeSessionId":"current-root"}))
+                .unwrap();
+                {
+                    let mut identity = identity.lock().unwrap();
+                    identity.launch = Some(launch);
+                    identity.producer_launch = identity.launch.clone();
+                }
+                let materialized = |root: &str| {
+                    json!({"type":"freshAgent.session.materialized", "sessionId":root}).to_string()
+                };
+                sender.send(materialized("current-root")).unwrap();
+                drain_native_bridge(&sender, &mut event_rx).await;
+                let prior = transport.native_identity_evidence().await.unwrap();
+                if case == "unobserved" {
+                    identity.lock().unwrap().evidence = None;
+                }
+                let mut next = identity.lock().unwrap().begin(false).unwrap();
+                match case {
+                    "late-parent-proof" => {
+                        sender.send(materialized("current-root")).unwrap();
+                    }
+                    "child-proof" => {
+                        sender.send(materialized("other-root")).unwrap();
+                    }
+                    "changed-launch" => {
+                        identity
+                            .lock()
+                            .unwrap()
+                            .launch
+                            .as_mut()
+                            .unwrap()
+                            .execution_generation += 1;
+                    }
+                    "wrong-operation" => {
+                        next.as_mut().unwrap().evidence_revision += 1;
+                    }
+                    "stop" => {
+                        transport.clone().stop().await.unwrap();
+                    }
+                    _ => {}
+                }
+                drain_native_bridge(&sender, &mut event_rx).await;
+                let code = match case {
+                    "generic-error" => "INTERNAL_ERROR",
+                    "timeout" => "BUSY_TURN",
+                    _ => "INVALID_ROLLBACK_TARGET",
+                };
+                let restored = identity.lock().unwrap().reject_before_native_transition(
+                    "current-root",
+                    &next,
+                    code,
+                    &provider,
+                );
+                assert_eq!(restored, case == "unchanged", "{provider:?} {case}");
+                if restored {
+                    assert_eq!(transport.native_identity_evidence().await, Some(prior));
+                    assert_eq!(transport.current_native_id().await.unwrap(), "current-root");
+                } else {
+                    assert!(
+                        transport.native_identity_evidence().await.is_none(),
+                        "{provider:?} {case}"
+                    );
+                    assert!(
+                        transport.current_native_id().await.is_err(),
+                        "{provider:?} {case}"
+                    );
+                    assert!(
+                        identity.lock().unwrap().begin(false).is_err(),
+                        "{provider:?} {case}"
+                    );
+                }
+                transport.stop().await.unwrap();
+            }
+        }
+    }
+
+    async fn send_controlled_native_turn(
+        actor: &FreshAgentHostActor,
+        request: &str,
+    ) -> Result<(), String> {
+        let completed = |events: freshell_runtime_protocol::AgentEventBatch| {
+            events
+                .events
+                .iter()
+                .filter(|entry| {
+                    matches!(&entry.event,
+                AgentEvent::Provider { payload }
+                    if payload["event"]["type"] == "freshAgent.turn.complete")
+                })
+                .count()
+        };
+        let before = completed(actor.read_events(0, 256).await);
+        actor
+            .dispatch(RequestId::parse(request).unwrap(), request.into(), None)
+            .await
+            .map_err(|error| error.to_string())?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if completed(actor.read_events(0, 256).await) > before {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "controlled native turn did not finish".to_string())
+    }
+
+    fn rollback_to(turn_id: Option<String>) -> FreshAgentOperation {
+        FreshAgentOperation::Rollback {
+            direction: FreshAgentRollbackDirection::Undo,
+            mode: FreshAgentRollbackMode::ToTurn,
+            turn_id,
+            cwd: None,
+        }
+    }
+
+    async fn exercise_non_claude_rejected_rollback(provider: FreshProvider, case: &str) {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let owned = tempfile::tempdir().unwrap();
+        let keys = [
+            "HOME",
+            "XDG_DATA_HOME",
+            "CODEX_HOME",
+            "CODEX_CMD",
+            "OPENCODE_CMD",
+            "OPENCODE_DB",
+            "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+            "FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES",
+            "FAKE_OPENCODE_AUDIT_LOG",
+            "FAKE_OPENCODE_SNAPSHOT_READ_FAILURE_MARKER",
+            "FAKE_OPENCODE_SELF_EXIT_MARKER",
+            "FAKE_OPENCODE_HANG_SESSION_CREATE",
+            "FAKE_OPENCODE_PROMPT_ERROR",
+            "FAKE_OPENCODE_TOOL_ERROR",
+            "FAKE_OPENCODE_TUI_PARITY",
+            "FAKE_OPENCODE_BUSY_AT_LAUNCH",
+            "FAKE_OPENCODE_REQUIRE_DIRECTORY_ROUTE",
+            "FAKE_OPENCODE_PROJECT_CWD",
+            "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+        ];
+        let _restore = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let native_log = owned.path().join("native-operations.jsonl");
+        let failed_read = owned.path().join("fail-native-read");
+        let process_log = owned.path().join("native-processes.jsonl");
+        std::env::set_var("HOME", owned.path());
+        std::env::set_var("XDG_DATA_HOME", owned.path().join("data"));
+        std::env::set_var("CODEX_HOME", owned.path().join(".codex"));
+        std::env::set_var(
+            "CODEX_CMD",
+            format!(
+                "node {}",
+                repo.join("test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
+                    .display()
+            ),
+        );
+        std::env::set_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1");
+        std::env::set_var(
+            "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+            json!({
+                "recordTurns":true, "appendThreadOperationLogPath":native_log,
+                "exitProcessAfterMethodsOnce":["thread/name/set"]
+            })
+            .to_string(),
+        );
+        std::env::set_var(
+            "OPENCODE_CMD",
+            repo.join("test/e2e-browser/fixtures/fake-opencode.cjs"),
+        );
+        std::env::set_var("FAKE_OPENCODE_AUDIT_LOG", &native_log);
+        std::env::set_var("FAKE_OPENCODE_SNAPSHOT_READ_FAILURE_MARKER", &failed_read);
+        {
+            // Fault exactly AFTER the controlled provider applied its mutation,
+            // before Codex's RPC reply or OpenCode's post-verify read. The real
+            // native handlers must classify this as ambiguous, never cancelled.
+            let fault = owned.path().join("after-native-mutation.cjs");
+            std::fs::write(&fault, format!(
+                "const fs = require('node:fs'); const append = fs.appendFileSync;\nappend({}, JSON.stringify({{pid:process.pid}}) + '\\n');\nfs.appendFileSync = function(file, bytes, ...args) {{ const result = append.call(this, file, bytes, ...args); if ({} && String(file) === {}) {{ const row = JSON.parse(String(bytes)); if (row.method === 'thread/revert') process.exit(0); if (row.event === 'reverted') fs.writeFileSync({}, 'fail post-verify read'); }} return result; }};\n",
+                json!(process_log), case == "post-mutation-failure", json!(native_log), json!(failed_read))).unwrap();
+            let script = match provider {
+                FreshProvider::Codex => {
+                    repo.join("test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
+                }
+                FreshProvider::Opencode => repo.join("test/e2e-browser/fixtures/fake-opencode.cjs"),
+                _ => unreachable!(),
+            };
+            if provider == FreshProvider::Codex {
+                std::env::set_var(
+                    "CODEX_CMD",
+                    format!("node --require {} {}", fault.display(), script.display()),
+                );
+            } else {
+                let wrapper = owned.path().join("opencode-fault.cjs");
+                std::fs::write(
+                    &wrapper,
+                    format!(
+                        "#!/usr/bin/env node\nrequire({}); require({});\n",
+                        json!(fault),
+                        json!(script)
+                    ),
+                )
+                .unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                std::env::set_var("OPENCODE_CMD", wrapper);
+            }
+        }
+        let launch: freshell_runtime_protocol::NativeIdentityLaunch =
+            serde_json::from_value(json!({
+                "incarnationId":"all-provider-refusal", "launchNonce":"all-provider-refusal-nonce",
+                "evidenceRevision":5, "executionGeneration":2, "requestedNativeSessionId":null
+            }))
+            .unwrap();
+        let transport = HostedTransport::new(provider.clone()).await;
+        {
+            let mut identity = transport.native_identity.lock().unwrap();
+            identity.launch = Some(launch.clone());
+            identity.producer_launch = Some(launch.clone());
+        }
+        let result: Result<(), String> = async {
+            let profile = FreshAgentProfile {
+                provider: provider.clone(),
+                runtime_variant: format!("fresh{}", provider.as_str()),
+                cwd: owned.path().to_string_lossy().into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "owned-refusal-store".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: vec![],
+            };
+            let actor =
+                FreshAgentHostActor::open(owned.path().join("actor"), profile, transport.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            send_controlled_native_turn(&actor, "seed-first-turn").await?;
+            send_controlled_native_turn(&actor, "seed-second-turn").await?;
+            let native = actor
+                .profile()
+                .await
+                .native_session_id
+                .ok_or("initial native root missing")?;
+            let before = crate::fresh_native_observation(&launch, &actor)
+                .await
+                .ok_or("initial host proof missing")?;
+            let proof = actor
+                .observed_native_identity_evidence()
+                .await
+                .ok_or("initial evidence missing")?;
+            let snapshot = actor.snapshot().await.map_err(|error| error.to_string())?;
+            if snapshot["capabilities"]["undo"] != true {
+                return Err("controlled live conversation must support Undo".into());
+            }
+            if case != "unchanged" {
+                let original_incarnation = transport
+                    .provider_session_incarnation(&native)
+                    .await
+                    .ok_or("live native incarnation missing")?;
+                match case {
+                    "dead-runtime" => match &transport.state {
+                        ProviderState::Codex(state) => state.shutdown().await,
+                        ProviderState::Opencode { owner, .. } => owner.shutdown().await,
+                        _ => unreachable!(),
+                    },
+                    "recovered-runtime" => match &transport.state {
+                        ProviderState::Codex(state) => {
+                            let home = owned.path().join(".codex").to_string_lossy().into_owned();
+                            let client = state
+                                .management_client_for_root(&home)
+                                .await
+                                .ok_or("missing live app-server client")?;
+                            client
+                                .set_thread_name(&native, "owned-runtime-recovery")
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            tokio::time::timeout(Duration::from_secs(5), async {
+                                while state.has_live_session(&native).await {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
+                            })
+                            .await
+                            .map_err(|_| "controlled native exit was not observed")?;
+                            if state.live_session_incarnation(&native).await.is_some() {
+                                return Err(
+                                    "exited native client retained a live incarnation".into()
+                                );
+                            }
+                            // The actual rollback handler's ensure-alive will now
+                            // resume the SAME root in a different app-server.
+                        }
+                        _ => unreachable!(),
+                    },
+                    "replaced-runtime" => match &transport.state {
+                        ProviderState::Codex(state) => {
+                            state.shutdown().await;
+                            state
+                                .handle_create(
+                                    create_request_for_profile(&actor.profile().await),
+                                    None,
+                                )
+                                .await;
+                        }
+                        ProviderState::Opencode { owner, runtime } => {
+                            owner.shutdown().await;
+                            let profile = actor.profile().await;
+                            runtime
+                                .prepare_managed_native_session(create_request_for_profile(
+                                    &profile,
+                                ))
+                                .await?;
+                        }
+                        _ => unreachable!(),
+                    },
+                    "post-mutation-failure" => {}
+                    _ => unreachable!(),
+                }
+                let operation = if case == "post-mutation-failure" {
+                    FreshAgentOperation::Rollback {
+                        direction: FreshAgentRollbackDirection::Undo,
+                        mode: FreshAgentRollbackMode::Step,
+                        turn_id: None,
+                        cwd: None,
+                    }
+                } else if case == "dead-runtime" {
+                    // This handler refusal happens before an attempted restart.
+                    rollback_to(None)
+                } else {
+                    rollback_to(Some("msg_missing_after_recovery".into()))
+                };
+                let direct = matches!(case, "dead-runtime" | "recovered-runtime")
+                    || (provider == FreshProvider::Codex && case == "replaced-runtime");
+                if direct {
+                    // The host cannot admit these after its liveness/observation
+                    // check. Exercise the adapter's own race/recovery fence too.
+                    let failed = transport
+                        .dispatch_operation(
+                            &RequestId::parse("fenced-refusal").unwrap(),
+                            &operation,
+                        )
+                        .await;
+                    if !matches!(
+                        failed,
+                        Err(OperationFailure {
+                            acceptance_ambiguous: true,
+                            ..
+                        })
+                    ) {
+                        return Err(format!(
+                            "uncertain or changed runtime must stay fenced: {failed:?}"
+                        ));
+                    }
+                } else {
+                    let failed = actor
+                        .semantic_operation(RequestId::parse("fenced-refusal").unwrap(), operation)
+                        .await;
+                    if !matches!(
+                        failed,
+                        Err(freshell_agent_runtime::host_actor::ActorError::AmbiguousDispatch)
+                    ) {
+                        return Err(format!(
+                            "actor must retain ambiguous native transition: {failed:?}"
+                        ));
+                    }
+                }
+                if crate::fresh_native_observation(&launch, &actor)
+                    .await
+                    .is_some()
+                    || actor.snapshot().await.is_ok()
+                    || actor.capture(4096).await.is_ok()
+                    || (!direct
+                        && actor
+                            .dispatch(
+                                RequestId::parse("must-not-reach-native").unwrap(),
+                                "fenced input".into(),
+                                None,
+                            )
+                            .await
+                            .is_ok())
+                {
+                    return Err(
+                        "changed runtime or ambiguous mutation revived the old native proof".into(),
+                    );
+                }
+                if matches!(case, "replaced-runtime" | "recovered-runtime") {
+                    let current = transport
+                        .provider_session_incarnation(&native)
+                        .await
+                        .ok_or("same-root replacement must actually be live")?;
+                    if current == original_incarnation {
+                        return Err("test failed to replace the actual native runtime".into());
+                    }
+                }
+                if case == "post-mutation-failure" {
+                    let operations: Vec<Value> = std::fs::read_to_string(&native_log)
+                        .map_err(|error| error.to_string())?
+                        .lines()
+                        .map(serde_json::from_str)
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| error.to_string())?;
+                    if operations
+                        .iter()
+                        .filter(|row| {
+                            row["method"] == "thread/revert" || row["event"] == "reverted"
+                        })
+                        .count()
+                        != 1
+                    {
+                        return Err("fault must follow an actual controlled native mutation".into());
+                    }
+                    match &transport.state {
+                        ProviderState::Codex(_) => {
+                            let saved: Value = serde_json::from_slice(
+                                &std::fs::read(
+                                    owned
+                                        .path()
+                                        .join(".codex/fake-turns")
+                                        .join(format!("{native}.json")),
+                                )
+                                .map_err(|error| error.to_string())?,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            if saved.as_array().map(Vec::len) != Some(1) {
+                                return Err(
+                                    "native revert did not actually remove the second turn".into(),
+                                );
+                            }
+                        }
+                        ProviderState::Opencode { owner, .. } => {
+                            std::fs::remove_file(&failed_read)
+                                .map_err(|error| error.to_string())?;
+                            let current = owner
+                                .get_opencode_snapshot(&native, Some(&actor.profile().await.cwd))
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            if current["turns"].as_array().map(Vec::len)
+                                >= snapshot["turns"].as_array().map(Vec::len)
+                            {
+                                return Err(
+                                    "native revert did not actually hide the second turn".into()
+                                );
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                return Ok(());
+            }
+            let mut targets = vec![None, Some("msg_stale_target".into())];
+            if provider == FreshProvider::Opencode {
+                targets.push(
+                    snapshot["turns"]
+                        .as_array()
+                        .and_then(|turns| turns.iter().find(|turn| turn["role"] == "assistant"))
+                        .and_then(|turn| turn["id"].as_str().or_else(|| turn["turnId"].as_str()))
+                        .map(str::to_string),
+                );
+                if targets.last().unwrap().is_none() {
+                    return Err("assistant target setup missing".into());
+                }
+            }
+            for (index, target) in targets.into_iter().enumerate() {
+                let request = RequestId::parse(format!("rejected-target-{index}")).unwrap();
+                let rejected = actor
+                    .semantic_operation(request.clone(), rollback_to(target))
+                    .await;
+                if !matches!(
+                    rejected,
+                    Err(freshell_agent_runtime::host_actor::ActorError::Transport(_))
+                ) {
+                    return Err(format!(
+                        "actual provider must reject invalid target: {rejected:?}"
+                    ));
+                }
+                if !transport.provider_session_is_live(&native).await {
+                    return Err("refused target retired the session".into());
+                }
+                if crate::fresh_native_observation(&launch, &actor).await != Some(before.clone())
+                    || actor.observed_native_identity_evidence().await != Some(proof.clone())
+                {
+                    return Err("rejected rollback erased unchanged native host observation".into());
+                }
+                if actor.snapshot().await.map_err(|error| error.to_string())? != snapshot {
+                    return Err("rejected rollback changed native snapshot".into());
+                }
+                let capture = actor
+                    .capture(4096)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if capture.native_session_id != native || !capture.text.contains("seed-first-turn")
+                {
+                    return Err("rejected rollback broke current session capture".into());
+                }
+            }
+            if provider == FreshProvider::Opencode {
+                let unavailable = transport
+                    .dispatch_operation(
+                        &RequestId::parse("redo-without-history").unwrap(),
+                        &FreshAgentOperation::Rollback {
+                            direction: FreshAgentRollbackDirection::Redo,
+                            mode: FreshAgentRollbackMode::Step,
+                            turn_id: None,
+                            cwd: None,
+                        },
+                    )
+                    .await;
+                if !matches!(
+                    unavailable,
+                    Err(OperationFailure {
+                        acceptance_ambiguous: false,
+                        ..
+                    })
+                ) || crate::fresh_native_observation(&launch, &actor).await != Some(before)
+                {
+                    return Err(
+                        "pre-mutation unavailable Redo must preserve current OpenCode proof".into(),
+                    );
+                }
+            }
+            send_controlled_native_turn(&actor, "input-after-refusal").await?;
+            let after_input = actor.snapshot().await.map_err(|error| error.to_string())?;
+            if !actor
+                .capture(4096)
+                .await
+                .map_err(|error| error.to_string())?
+                .text
+                .contains("input-after-refusal")
+            {
+                return Err("subsequent input did not reach the actual native handler".into());
+            }
+            let undo = FreshAgentOperation::Rollback {
+                direction: FreshAgentRollbackDirection::Undo,
+                mode: FreshAgentRollbackMode::Step,
+                turn_id: None,
+                cwd: None,
+            };
+            actor
+                .semantic_operation(
+                    RequestId::parse("legitimate-undo-after-refusal").unwrap(),
+                    undo,
+                )
+                .await
+                .map_err(|error| format!("later legitimate Undo failed: {error}"))?;
+            let after_undo = actor.snapshot().await.map_err(|error| error.to_string())?;
+            if after_undo["turns"].as_array().map(Vec::len)
+                >= after_input["turns"].as_array().map(Vec::len)
+                || actor.profile().await.native_session_id.as_deref() != Some(&native)
+                || crate::fresh_native_observation(&launch, &actor)
+                    .await
+                    .is_none()
+            {
+                return Err(
+                    "legitimate Undo did not retain current native identity and remove its tail"
+                        .into(),
+                );
+            }
+            let after_operation_proof = actor.observed_native_identity_evidence().await;
+            let refused = actor
+                .semantic_operation(
+                    RequestId::parse("rejected-after-undo").unwrap(),
+                    rollback_to(Some("msg_old_tail".into())),
+                )
+                .await;
+            if !matches!(
+                refused,
+                Err(freshell_agent_runtime::host_actor::ActorError::Transport(_))
+            ) || actor.observed_native_identity_evidence().await != after_operation_proof
+                || actor.capture(4096).await.is_err()
+            {
+                return Err(
+                    "refusal after native rollback acknowledgement lost current proof".into(),
+                );
+            }
+            let operations: Vec<Value> = std::fs::read_to_string(&native_log)
+                .map_err(|error| error.to_string())?
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()
+                .map_err(|error| error.to_string())?;
+            if operations
+                .iter()
+                .filter(|row| row["method"] == "thread/revert" || row["event"] == "reverted")
+                .count()
+                != 1
+            {
+                return Err("rejected targets must not dispatch native history mutation".into());
+            }
+            Ok(())
+        }
+        .await;
+        transport
+            .clone()
+            .stop()
+            .await
+            .expect("join the exact owned native fixture before reporting failure");
+        let pids: Vec<u32> = std::fs::read_to_string(&process_log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["pid"]
+                    .as_u64()
+                    .unwrap() as u32
+            })
+            .collect();
+        #[cfg(unix)]
+        for pid in &pids {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while unsafe { libc::kill(*pid as libc::pid_t, 0) } == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the exact recorded controlled native process must be reaped");
+        }
+        eprintln!(
+            "{}",
+            json!({"severity":"info", "event":"test.hosted_rollback.native_processes_closed",
+            "provider":provider.as_str(), "case":case, "pids":pids})
+        );
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_codex_rejected_rollback_preserves_current_native_session() {
+        exercise_non_claude_rejected_rollback(FreshProvider::Codex, "unchanged").await;
+    }
+
+    #[tokio::test]
+    async fn hosted_opencode_rejected_rollback_preserves_current_native_session() {
+        exercise_non_claude_rejected_rollback(FreshProvider::Opencode, "unchanged").await;
+    }
+
+    #[tokio::test]
+    async fn hosted_codex_rollback_fences_replaced_dead_and_ambiguous_runtime() {
+        for case in [
+            "replaced-runtime",
+            "recovered-runtime",
+            "dead-runtime",
+            "post-mutation-failure",
+        ] {
+            exercise_non_claude_rejected_rollback(FreshProvider::Codex, case).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_opencode_rollback_fences_replaced_dead_and_ambiguous_runtime() {
+        for case in ["replaced-runtime", "dead-runtime", "post-mutation-failure"] {
+            exercise_non_claude_rejected_rollback(FreshProvider::Opencode, case).await;
         }
     }
 
