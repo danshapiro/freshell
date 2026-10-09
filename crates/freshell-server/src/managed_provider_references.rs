@@ -430,10 +430,17 @@ process.stdout.write(JSON.stringify(receipts));
                 evaluate_generated_recipe(recipe, env).unwrap(),
             );
         }
+        consume_published(runtime, &child)
+    }
+
+    fn consume_published(
+        runtime: &Path,
+        child: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<String> {
         let result = std::process::Command::new("node")
             .arg("-e")
             .arg(CONSUMER)
-            .arg(&source)
+            .arg(runtime.join("source.json"))
             .arg(runtime)
             .arg(serde_json::to_string(&child).unwrap())
             .output()
@@ -444,6 +451,148 @@ process.stdout.write(JSON.stringify(receipts));
             result.status.code()
         );
         serde_json::from_slice(&result.stdout).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_references_actual_maximum_sources_aliases_reach_child_and_overflow_preserves_projection(
+    ) {
+        let owned = tempfile::tempdir().unwrap();
+        let source = owned.path().join("opencode.json");
+        let runtime = owned.path().join("runtime");
+        let mut fields = serde_json::Map::new();
+        let mut expected = Vec::new();
+        for ordinal in 0..128 {
+            let name = format!("payload-{ordinal:03}");
+            let payload = format!("  selected-reference-nonce-{ordinal:03}\nquote\"slash\\  ");
+            std::fs::write(owned.path().join(&name), &payload).unwrap();
+            for suffix in ["a", "b"] {
+                let alias = format!("alias-{ordinal:03}-{suffix}");
+                std::os::unix::fs::symlink(&name, owned.path().join(&alias)).unwrap();
+                fields.insert(
+                    format!("field-{ordinal:03}-{suffix}"),
+                    serde_json::Value::String(format!("{{file:{alias}}}")),
+                );
+                expected.push(digest(payload.trim()));
+            }
+        }
+        let raw = serde_json::Value::Object(fields.clone()).to_string();
+        std::fs::write(&source, &raw).unwrap();
+        let resolve = |raw: &str| {
+            resolve_file_references(
+                raw,
+                FileSourceOrigin {
+                    declaring_config: &source,
+                    cwd: owned.path(),
+                    original_home: owned.path(),
+                },
+                &|_| None,
+            )
+        };
+        let plan = resolve(&raw).unwrap();
+        assert_eq!(plan.selections.len(), 128);
+        assert_eq!(plan.occurrences.len(), 256);
+        assert_eq!(
+            plan.occurrences
+                .iter()
+                .map(|occurrence| &occurrence.approved_alias)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            256
+        );
+        assert_eq!(consume(&plan, &runtime), expected);
+        let prior_source = std::fs::read(runtime.join("source.json")).unwrap();
+        std::os::unix::fs::symlink("payload-000", owned.path().join("alias-overflow")).unwrap();
+        let mut alias_overflow = fields.clone();
+        alias_overflow.insert(
+            "overflow".into(),
+            serde_json::Value::String("{file:alias-overflow}".into()),
+        );
+        let error = resolve(&serde_json::Value::Object(alias_overflow).to_string())
+            .err()
+            .unwrap();
+        assert_eq!(error.cause, "configuration alias count exceeds 256");
+        std::fs::write(owned.path().join("source-overflow"), b"PRIVATE_OVERFLOW").unwrap();
+        fields.insert(
+            "overflow".into(),
+            serde_json::Value::String("{file:source-overflow}".into()),
+        );
+        let error = resolve(&serde_json::Value::Object(fields).to_string())
+            .err()
+            .unwrap();
+        assert_eq!(error.cause, "configuration reference count exceeds 128");
+        assert!(!error.to_string().contains("PRIVATE_OVERFLOW"));
+        assert_eq!(std::fs::read(&source).unwrap(), raw.as_bytes());
+        assert_eq!(
+            std::fs::read(runtime.join("source.json")).unwrap(),
+            prior_source
+        );
+        assert_eq!(consume_published(&runtime, &Default::default()), expected);
+        assert_eq!(
+            std::fs::read_dir(runtime.join(".freshell/references"))
+                .unwrap()
+                .count(),
+            128
+        );
+    }
+
+    #[test]
+    fn managed_provider_references_actual_maximum_file_events_reach_child_and_overflow_preserves_projection(
+    ) {
+        let owned = tempfile::tempdir().unwrap();
+        let source = owned.path().join("opencode.json");
+        let runtime = owned.path().join("runtime");
+        std::fs::write(owned.path().join("rules"), b"  event-capacity-nonce  ").unwrap();
+        let raw = serde_json::Value::Object(
+            (0..8192)
+                .map(|ordinal| {
+                    (
+                        format!("field-{ordinal:04}"),
+                        serde_json::Value::String("{file:rules}".into()),
+                    )
+                })
+                .collect(),
+        )
+        .to_string();
+        std::fs::write(&source, &raw).unwrap();
+        let resolve = |raw: &str| {
+            resolve_file_references(
+                raw,
+                FileSourceOrigin {
+                    declaring_config: &source,
+                    cwd: owned.path(),
+                    original_home: owned.path(),
+                },
+                &|_| None,
+            )
+        };
+        let plan = resolve(&raw).unwrap();
+        assert_eq!(plan.substitution_events, 8192);
+        assert_eq!(plan.occurrences.len(), 8192);
+        assert_eq!(plan.selections.len(), 1);
+        let expected = vec![digest("event-capacity-nonce"); 8192];
+        assert_eq!(consume(&plan, &runtime), expected);
+        let overflow = format!(
+            "{},\"overflow\":\"{{file:rules}}\"}}",
+            &raw[..raw.len() - 1]
+        );
+        let error = resolve(&overflow).err().unwrap();
+        assert_eq!(
+            error.cause,
+            "configuration source, expansion or event profile limit exceeded"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), raw.as_bytes());
+        assert_eq!(
+            std::fs::read(runtime.join("source.json")).unwrap(),
+            plan.template.as_bytes()
+        );
+        assert_eq!(consume_published(&runtime, &Default::default()), expected);
+        assert_eq!(
+            std::fs::read_dir(runtime.join(".freshell/references"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]
