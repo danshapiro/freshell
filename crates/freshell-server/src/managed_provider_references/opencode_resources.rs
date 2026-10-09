@@ -1,4 +1,4 @@
-//! The two native ordinary resource fields. Keep raw documents and every
+//! Finite native ordinary resource fields. Keep raw documents and every
 //! unrelated string intact; these selections are paths, never private payloads.
 use super::sources::PlannedSourceOccurrence;
 use std::path::{Path, PathBuf};
@@ -74,59 +74,104 @@ fn fields(raw: &str) -> Result<Vec<(&'static str, String)>, &'static str> {
             Token::String(start, end) if depth == 1 && end - start <= 64 => {
                 let key: String = serde_json::from_str(&raw[start..end])
                     .map_err(|_| "invalid selected resource field")?;
-                let field = match key.as_str() {
-                    "plugin" => "OpenCode plugin",
-                    "instructions" => "OpenCode instructions",
-                    _ => continue,
-                };
-                let mut array = Cursor { raw, at: cursor.at };
-                if !matches!(array.next(), Some(Token::Punctuation(b':')))
-                    || !matches!(array.next(), Some(Token::Punctuation(b'[')))
-                {
+                let mut selected = Cursor { raw, at: cursor.at };
+                if !matches!(selected.next(), Some(Token::Punctuation(b':'))) {
                     continue;
                 }
-                let mut array_depth = 1usize;
-                let mut tuple_first = false;
-                while array_depth != 0 {
-                    match array.next().ok_or("incomplete selected resource field")? {
-                        Token::Punctuation(b'[') => {
-                            array_depth += 1;
-                            tuple_first = array_depth == 2;
-                        }
-                        Token::Punctuation(b'{') => {
-                            array_depth += 1;
-                            tuple_first = false;
-                        }
-                        Token::Punctuation(b']' | b'}') => {
-                            array_depth -= 1;
-                            tuple_first = false;
-                        }
-                        Token::String(start, end)
-                            if array_depth == 1
-                                || (field == "OpenCode plugin"
-                                    && array_depth == 2
-                                    && tuple_first) =>
-                        {
-                            tuple_first = false;
-                            if result.len() >= 100_000 || end - start > 64 * 1024 {
-                                return Err("configured resource selection profile exceeded");
-                            }
-                            result.push((
-                                field,
-                                serde_json::from_str(&raw[start..end])
-                                    .map_err(|_| "invalid selected resource path")?,
-                            ));
-                        }
-                        _ if array_depth == 2 => tuple_first = false,
-                        _ => {}
+                match key.as_str() {
+                    "plugin" | "instructions"
+                        if matches!(selected.next(), Some(Token::Punctuation(b'['))) =>
+                    {
+                        let field = if key == "plugin" {
+                            "OpenCode plugin"
+                        } else {
+                            "OpenCode instructions"
+                        };
+                        resource_array(&mut selected, field, &mut result)?;
+                        cursor = selected;
                     }
+                    "skills" if matches!(selected.next(), Some(Token::Punctuation(b'{'))) => {
+                        let mut skills_depth = 1usize;
+                        while skills_depth != 0 {
+                            match selected.next().ok_or("incomplete selected skills field")? {
+                                Token::Punctuation(b'{' | b'[') => skills_depth += 1,
+                                Token::Punctuation(b'}' | b']') => skills_depth -= 1,
+                                Token::String(start, end)
+                                    if skills_depth == 1 && end - start <= 64 =>
+                                {
+                                    let key: String = serde_json::from_str(&raw[start..end])
+                                        .map_err(|_| "invalid selected skills field")?;
+                                    if key != "paths" {
+                                        continue;
+                                    }
+                                    let mut paths = Cursor {
+                                        raw,
+                                        at: selected.at,
+                                    };
+                                    if matches!(paths.next(), Some(Token::Punctuation(b':')))
+                                        && matches!(paths.next(), Some(Token::Punctuation(b'[')))
+                                    {
+                                        resource_array(
+                                            &mut paths,
+                                            "OpenCode skills.paths",
+                                            &mut result,
+                                        )?;
+                                        selected = paths;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        cursor = selected;
+                    }
+                    _ => {}
                 }
-                cursor = array;
             }
             _ => {}
         }
     }
     Ok(result)
+}
+
+fn resource_array(
+    cursor: &mut Cursor<'_>,
+    field: &'static str,
+    result: &mut Vec<(&'static str, String)>,
+) -> Result<(), &'static str> {
+    let mut depth = 1usize;
+    let mut tuple_first = false;
+    while depth != 0 {
+        match cursor.next().ok_or("incomplete selected resource field")? {
+            Token::Punctuation(b'[') => {
+                depth += 1;
+                tuple_first = depth == 2;
+            }
+            Token::Punctuation(b'{') => {
+                depth += 1;
+                tuple_first = false;
+            }
+            Token::Punctuation(b']' | b'}') => {
+                depth -= 1;
+                tuple_first = false;
+            }
+            Token::String(start, end)
+                if depth == 1 || (field == "OpenCode plugin" && depth == 2 && tuple_first) =>
+            {
+                tuple_first = false;
+                if result.len() >= 100_000 || end - start > 64 * 1024 {
+                    return Err("configured resource selection profile exceeded");
+                }
+                result.push((
+                    field,
+                    serde_json::from_str(&cursor.raw[start..end])
+                        .map_err(|_| "invalid selected resource path")?,
+                ));
+            }
+            _ if depth == 2 => tuple_first = false,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn home_path(path: &str, home: &Path) -> PathBuf {
@@ -303,6 +348,8 @@ pub fn select(
                     .parent()
                     .unwrap_or(&source.instance_cwd)
                     .join(path);
+            } else if field == "OpenCode skills.paths" {
+                path = source.instance_cwd.join(path);
             } else {
                 path = source
                     .instance_cwd
@@ -312,11 +359,23 @@ pub fn select(
                     .unwrap_or_else(|| source.instance_cwd.join(path));
             }
         }
+        if field == "OpenCode skills.paths" {
+            // Native instance-cwd resolution normalizes .. before deciding
+            // whether the selected directory is supplied by the workspace.
+            path = freshell_platform::opencode_config::lexical_path(&path);
+        }
         let canonical = checked(&path, field, declaring)?;
         variables.extend(names.into_inner());
         if field == "OpenCode instructions" {
             if !canonical.is_file() {
                 return Err(fail(field, "selected instruction is not a regular file"));
+            }
+            insert(path, field)?;
+            continue;
+        }
+        if field == "OpenCode skills.paths" {
+            if !canonical.is_dir() {
+                return Err(fail(field, "selected skill path is not a directory"));
             }
             insert(path, field)?;
             continue;

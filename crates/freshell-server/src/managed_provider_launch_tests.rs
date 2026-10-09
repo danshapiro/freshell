@@ -3464,12 +3464,40 @@ export default {{id:'closed-shared-{label}',async tui(api,options){{
     std::fs::write(package.join("resource.txt"), "native-adjacent-resource").unwrap();
     let external_instruction = external.join("ordinary-instructions.md");
     std::fs::write(&external_instruction, "native-external-instruction").unwrap();
+    let selected_skills = external.join("selected-skills");
+    let selected_skill = selected_skills.join("probe");
+    std::fs::create_dir_all(selected_skill.join("scripts/node_modules/skill-dependency")).unwrap();
+    std::fs::write(selected_skill.join("SKILL.md"), "---\nname: closed-external-skill\ndescription: selected external skill\n---\nExecute the adjacent synthetic resources.\n").unwrap();
+    std::fs::write(
+        selected_skill.join("scripts/resource"),
+        "native-skill-resource",
+    )
+    .unwrap();
+    std::fs::write(
+        selected_skill.join("scripts/node_modules/skill-dependency/index.js"),
+        "module.exports='native-skill-dependency';",
+    )
+    .unwrap();
+    std::fs::write(selected_skill.join("scripts/run"), "#!/usr/bin/env node\nconst fs=require('node:fs'),path=require('node:path');process.stdout.write(fs.readFileSync(path.join(__dirname,'resource'),'utf8')+':'+require('skill-dependency'));\n").unwrap();
+    std::fs::set_permissions(
+        selected_skill.join("scripts/run"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
     let external_receipt = fixture.join("workspace/native-external-consumed.json");
-    let external_plugin = r#"import fs from 'node:fs';import crypto from 'node:crypto';
+    let external_plugin = r#"import fs from 'node:fs';import crypto from 'node:crypto';import path from 'node:path';import {execFileSync} from 'node:child_process';
 import adjacent from './adjacent.mjs';import child from 'closed-child';import parent from 'closed-parent';
-export default async (_input,options)=>({config:async(config)=>{
+export default async (input,options)=>({config:async(config)=>{
  const digest=value=>crypto.createHash('sha256').update(value).digest('hex');
- fs.writeFileSync(options.receipt,JSON.stringify({adjacent:digest(adjacent),child:digest(child),parent:digest(parent),resource:digest(fs.readFileSync(new URL('./resource.txt',import.meta.url))),instruction:digest(fs.readFileSync(options.instruction)),selected:config.instructions.includes(options.instruction)}));
+ setTimeout(async()=>{
+  try {
+   const response=await input.client.app.skills();
+   const skill=response.data.find(skill=>skill.name==='closed-external-skill');
+   if(!skill)throw Error('selected native skill unavailable');
+   const output=execFileSync(path.join(path.dirname(skill.location),'scripts/run'));
+   fs.writeFileSync(options.receipt,JSON.stringify({adjacent:digest(adjacent),child:digest(child),parent:digest(parent),resource:digest(fs.readFileSync(new URL('./resource.txt',import.meta.url))),instruction:digest(fs.readFileSync(options.instruction)),selected:config.instructions.includes(options.instruction),nativeSkill:true,skillContent:digest(skill.content),skillExecution:digest(output)}));
+  } catch(error) {fs.writeFileSync(options.receipt+'.failure',JSON.stringify({operation:'native_skill_consumer',type:error instanceof TypeError?'TypeError':error.code==='ENOENT'?'ENOENT':'native_skill_unavailable'}));}
+ },0);
 }});
 "#;
     std::fs::write(package.join("index.mjs"), external_plugin).unwrap();
@@ -3477,9 +3505,10 @@ export default async (_input,options)=>({config:async(config)=>{
         serde_json::from_slice(&std::fs::read(&original_config).unwrap()).unwrap();
     original["plugin"].as_array_mut().unwrap().push(json!([reqwest::Url::from_file_path(package.join("index.mjs")).unwrap().to_string(), {"receipt":external_receipt,"instruction":external_instruction}]));
     original["instructions"] = json!([external_instruction]);
+    original["skills"] = json!({"paths":[selected_skills,"../../scenarios/external-native-resources/selected-skills"]});
     std::fs::write(&original_config, serde_json::to_vec(&original).unwrap()).unwrap();
     let original_bytes = std::fs::read(&original_config).unwrap();
-    let expected_external = json!({"adjacent":format!("{:x}",Sha256::digest(b"native-adjacent-import")),"child":format!("{:x}",Sha256::digest(b"native-child-dependency")),"parent":format!("{:x}",Sha256::digest(b"native-parent-dependency")),"resource":format!("{:x}",Sha256::digest(b"native-adjacent-resource")),"instruction":format!("{:x}",Sha256::digest(b"native-external-instruction")),"selected":true});
+    let expected_external = json!({"adjacent":format!("{:x}",Sha256::digest(b"native-adjacent-import")),"child":format!("{:x}",Sha256::digest(b"native-child-dependency")),"parent":format!("{:x}",Sha256::digest(b"native-parent-dependency")),"resource":format!("{:x}",Sha256::digest(b"native-adjacent-resource")),"instruction":format!("{:x}",Sha256::digest(b"native-external-instruction")),"selected":true,"nativeSkill":true,"skillContent":format!("{:x}",Sha256::digest(b"Execute the adjacent synthetic resources.")),"skillExecution":format!("{:x}",Sha256::digest(b"native-skill-resource:native-skill-dependency"))});
     let explicit_config = fixture.join("workspace/selected-config.json");
     let explicit_bytes = br#"{"agent":{"probe":{"description":"{file:./selected-rule}"}}}"#;
     std::fs::write(&explicit_config, explicit_bytes).unwrap();
@@ -3669,6 +3698,7 @@ export default {{id:'closed-directory-discovery',async server(){{
     for (field, selected) in [
         ("OpenCode plugin", package.join("index.mjs")),
         ("OpenCode instructions", external_instruction.clone()),
+        ("OpenCode skills.paths", selected_skills.clone()),
     ] {
         for unreadable in [false, true] {
             let hidden = selected.with_extension("closed-unavailable");
@@ -3679,8 +3709,11 @@ export default {{id:'closed-directory-discovery',async server(){{
             }
             let failed = controller.launch(request.clone()).await;
             if unreadable {
-                std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o644))
-                    .unwrap();
+                std::fs::set_permissions(
+                    &selected,
+                    std::fs::Permissions::from_mode(if selected.is_dir() { 0o755 } else { 0o644 }),
+                )
+                .unwrap();
             } else {
                 std::fs::rename(&hidden, &selected).unwrap();
             }

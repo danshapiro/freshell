@@ -119,6 +119,144 @@ mod configured_resource_tests {
         assert_eq!(plan[0].references.unexpanded_source(), raw);
     }
     #[test]
+    fn managed_provider_configured_skill_paths_execute_whole_directory_after_both_copies() {
+        use std::os::unix::fs::PermissionsExt;
+        let owned = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+            Some(root) => tempfile::tempdir_in(root).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace/nested");
+        let skill_root = owned.path().join("external-skills");
+        let skill = skill_root.join("probe");
+        for path in [&home, &cwd, &skill.join("scripts/node_modules/dependency")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let skill_document = "---\nname: external-probe\ndescription: external selected skill\n---\nRun the adjacent executable.\n";
+        std::fs::write(skill.join("SKILL.md"), skill_document).unwrap();
+        std::fs::write(skill.join("scripts/resource"), "skill-resource").unwrap();
+        std::fs::write(
+            skill.join("scripts/node_modules/dependency/index.js"),
+            "module.exports='skill-dependency';",
+        )
+        .unwrap();
+        std::fs::write(skill.join("scripts/run"), "#!/usr/bin/env node\nconst fs=require('node:fs'),path=require('node:path');process.stdout.write(fs.readFileSync(path.join(__dirname,'resource'),'utf8')+':'+require('dependency'));").unwrap();
+        std::fs::set_permissions(
+            skill.join("scripts/run"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let home_skill_root = home.join("selected-skills");
+        std::os::unix::fs::symlink(&skill_root, &home_skill_root).unwrap();
+        let config = home.join("opencode.jsonc");
+        for spelling in [
+            skill_root.to_str().unwrap(),
+            "../../external-skills",
+            "~/selected-skills",
+        ] {
+            let raw = format!("{{ // native selected field\n\"skills\":{{\"paths\":[{}],\"urls\":[\"https://example.invalid/skills\"]}},\"unrelated\":{{\"skills\":{{\"paths\":[\"/missing-unselected\"]}}}}}}", serde_json::to_string(spelling).unwrap());
+            std::fs::write(&config, &raw).unwrap();
+            let plan = plan_opencode_sources(
+                vec![SourceOccurrence {
+                    logical_path: config.clone(),
+                    canonical_source: config.clone(),
+                    lane: SourceLane::Main,
+                    role: DiscoveryRole::Home,
+                }],
+                &cwd,
+                &home,
+                &|_, _, _| None,
+            )
+            .unwrap();
+            let units = resource_units(
+                &home,
+                &home.join(".config/opencode"),
+                &owned.path().join("workspace"),
+                &plan,
+                None,
+            )
+            .unwrap();
+            let unit = units.iter().find(|(source, _)| source == &skill_root)
+                .unwrap_or_else(|| panic!("configured external skills.paths selects its whole directory for {spelling}; selected {:?}", plan[0].configured_resources));
+            let stage = owned.path().join("controller-stage");
+            let host = owned.path().join("provider-home");
+            copy_environment(
+                &[CopySelection {
+                    source: unit.0.clone(),
+                    destination_relative: unit.1.stage_relative_path.clone().into(),
+                }],
+                &stage,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            copy_environment(
+                &[CopySelection {
+                    source: stage.join(&unit.1.stage_relative_path),
+                    destination_relative: unit.1.provider_relative_path.clone().into(),
+                }],
+                &host,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            let projected = host.join(&unit.1.provider_relative_path).join("probe");
+            let hidden = owned.path().join("hidden-original-skills");
+            std::fs::rename(&skill_root, &hidden).unwrap();
+            let output = std::process::Command::new(projected.join("scripts/run"))
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .output()
+                .unwrap();
+            std::fs::rename(&hidden, &skill_root).unwrap();
+            assert!(output.status.success(), "copied selected skill executable must consume installed dependencies and adjacent resources");
+            assert_eq!(output.stdout, b"skill-resource:skill-dependency");
+            assert_eq!(
+                std::fs::read_to_string(projected.join("SKILL.md")).unwrap(),
+                skill_document
+            );
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn managed_provider_configured_skill_paths_reject_unavailable_or_non_directory_selection() {
+        use std::os::unix::fs::PermissionsExt;
+        let owned = tempfile::tempdir().unwrap();
+        let config = owned.path().join("opencode.json");
+        let missing = owned.path().join("missing");
+        let file = owned.path().join("file");
+        let unreadable = owned.path().join("unreadable");
+        let cyclic = owned.path().join("cyclic");
+        std::fs::write(&file, "not a directory").unwrap();
+        std::fs::create_dir(&unreadable).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0)).unwrap();
+        std::os::unix::fs::symlink(&cyclic, &cyclic).unwrap();
+        for selected in [&missing, &file, &unreadable, &cyclic] {
+            let raw = serde_json::json!({"skills":{"paths":[selected],"urls":["https://example.invalid/skills"]}}).to_string();
+            std::fs::write(&config, &raw).unwrap();
+            let result = plan_opencode_sources(
+                vec![SourceOccurrence {
+                    logical_path: config.clone(),
+                    canonical_source: config.clone(),
+                    lane: SourceLane::Main,
+                    role: DiscoveryRole::Workspace,
+                }],
+                owned.path(),
+                owned.path(),
+                &|_, _, _| None,
+            );
+            let error = result
+                .err()
+                .expect("selected skill directory must be available before publication");
+            assert_eq!(error.field, "OpenCode skills.paths");
+            assert_eq!(error.declaring_source, config);
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+        }
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
     fn managed_provider_configured_external_resources_execute_complete_transport() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
