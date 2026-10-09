@@ -303,7 +303,8 @@ fn select_local_bundle(
                     .and_then(|node| node.data.as_str())
                     .filter(|name| !name.is_empty())
                 {
-                    let namespace_root = native_mapping_value(meta, "namespace_root", 0)?;
+                    let namespace_root = native_mapping_value(meta, "namespace_root", 0)?
+                        .filter(|node| !node.data.is_null());
                     let source_base = if let Some(node) = namespace_root {
                         let relative = node
                             .data
@@ -686,7 +687,8 @@ mod module_source_tests {
     #[test]
     fn managed_provider_amplifier_namespace_context_consumes_native_source_bases_after_both_copies()
     {
-        for nested in [false, true] {
+        for scenario in ["self", "self-null", "nested"] {
+            let nested = scenario == "nested";
             let owned = tempfile::tempdir().unwrap();
             let home = owned.path().join("home");
             let cwd = owned.path().join("workspace");
@@ -704,7 +706,7 @@ mod module_source_tests {
             let raw = if nested {
                 format!("bundle: {{name: root}}\nincludes: [{}]\ncontext:\n  include: ['probe:context/selected.md']\n",serde_json::to_string(&format!("file://{}",child.display())).unwrap())
             } else {
-                "bundle: {name: probe}\ncontext:\n  include: ['probe:context/selected.md']\n".into()
+                format!("bundle: {{name: probe{}}}\ncontext:\n  include: ['probe:context/selected.md']\n",if scenario=="self-null" {", namespace_root: null"} else {""})
             };
             std::fs::write(bundle.join("bundle.yaml"), &raw).unwrap();
             std::fs::write(&child, raw_child).unwrap();
