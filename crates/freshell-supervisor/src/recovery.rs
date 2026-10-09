@@ -316,6 +316,12 @@ impl Supervisor {
                     .mark_recovery_live(request.soul_id.clone(), handle.incarnation_id.clone())
                     .await
                     .map_err(map_registry)?;
+                let owned = self
+                    .registry
+                    .owned_handle(handle.incarnation_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                self.complete_pending_provider_preparation(&owned).await?;
                 Ok(RecoveryResult {
                     outcome: RecoveryOutcome::Reattached,
                     view: self.view_for(&handle.incarnation_id).await?,
@@ -392,6 +398,12 @@ impl Supervisor {
                             )
                             .await
                             .map_err(map_registry)?;
+                        let owned = self
+                            .registry
+                            .owned_handle(handle.incarnation_id.clone())
+                            .await
+                            .map_err(map_registry)?;
+                        self.complete_pending_provider_preparation(&owned).await?;
                         Ok(RecoveryResult {
                             outcome: RecoveryOutcome::Reattached,
                             view: self.view_for(&handle.incarnation_id).await?,
@@ -864,17 +876,13 @@ impl Supervisor {
             )
             .await
             .map_err(map_registry)?;
-        self.commit_provider_preparation(
-            &LaunchWorkload {
-                soul_id: soul_id.clone(),
-                fixture: prepared.fixture,
-                terminal: prepared.terminal.clone(),
-                fresh_agent: prepared.fresh_agent.clone(),
-                resume_spec: prepared.resume_spec.clone(),
-            },
-            &prepared.prepared.incarnation_id,
-        )
-        .await?;
+        let accepted = self
+            .registry
+            .owned_handle(prepared.prepared.incarnation_id.clone())
+            .await
+            .map_err(map_registry)?;
+        self.complete_pending_provider_preparation(&accepted)
+            .await?;
         let elapsed_ms = recovery_started
             .elapsed()
             .as_millis()
@@ -1216,6 +1224,12 @@ impl Supervisor {
                     .mark_recovery_live(soul_id, handle.incarnation_id.clone())
                     .await
                     .map_err(map_registry)?;
+                let owned = self
+                    .registry
+                    .owned_handle(handle.incarnation_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                self.complete_pending_provider_preparation(&owned).await?;
                 Ok(RecoveryResult {
                     outcome: RecoveryOutcome::Reattached,
                     view: self.view_for(&handle.incarnation_id).await?,

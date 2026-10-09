@@ -17,7 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 mod input_reservation;
 pub(crate) use input_reservation::binary_digest;
 pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
@@ -661,16 +661,52 @@ impl Registry {
     }
 
     pub async fn mark_running(&self, incarnation_id: IncarnationId) -> Result<(), RegistryError> {
+        self.mark_running_with_provider_preparation(incarnation_id, false)
+            .await
+    }
+
+    /// Initial/pristine acceptance is proved by the owning service. A resumed
+    /// generation is armed by the exact recovery-success transaction instead.
+    pub(crate) async fn mark_running_with_provider_preparation(
+        &self,
+        incarnation_id: IncarnationId,
+        preparation_accepted: bool,
+    ) -> Result<(), RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = now_millis();
             let changed = tx.execute(
-                "UPDATE incarnations SET launch_state='running',updated_at=?1 WHERE incarnation_id=?2 AND launch_state='starting' AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running')",
-                params![now, incarnation_id.as_str()],
+                "UPDATE incarnations SET launch_state='running',provider_preparation_pending=?3,updated_at=?1 WHERE incarnation_id=?2 AND launch_state='starting' AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running')",
+                params![now, incarnation_id.as_str(), preparation_accepted],
             )?;
             if changed != 1 { return Err(RegistryError::InvalidState(format!("cannot mark RUNNING for {incarnation_id}"))); }
             tx.execute("UPDATE commands SET state='running',updated_at=?1 WHERE incarnation_id=?2", params![now, incarnation_id.as_str()])?;
             tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    pub(crate) async fn provider_preparation_is_pending(
+        &self,
+        incarnation: IncarnationId,
+    ) -> Result<bool, RegistryError> {
+        self.run_blocking(move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1 AND i.provider_preparation_pending=1 AND i.launch_state='running' AND s.desired_state='running' AND s.recovery_state='live')",
+                params![incarnation.as_str()], |row| row.get(0),
+            )?)
+        }).await
+    }
+
+    pub(crate) async fn mark_provider_preparation_complete(
+        &self,
+        incarnation: IncarnationId,
+    ) -> Result<(), RegistryError> {
+        self.run_blocking(move |conn| {
+            conn.execute(
+                "UPDATE incarnations SET provider_preparation_pending=0 WHERE incarnation_id=?1 AND provider_preparation_pending=1",
+                params![incarnation.as_str()],
+            )?;
             Ok(())
         }).await
     }
@@ -1680,6 +1716,10 @@ impl Registry {
                 "UPDATE recovery_attempts SET verdict='succeeded',finished_at=?1 WHERE attempt_id=?2",
                 params![now, attempt_id.as_str()],
             )?;
+            tx.execute(
+                "UPDATE incarnations SET provider_preparation_pending=1 WHERE incarnation_id=?1",
+                params![incarnation_id.as_str()],
+            )?;
             tx.commit()?;
             Ok(())
         })
@@ -1973,6 +2013,7 @@ fn create_schema(
             fresh_agent_spec TEXT,
             prior_incarnation_id TEXT,
             recovery_attempt_id TEXT,
+            provider_preparation_pending INTEGER NOT NULL DEFAULT 0,
             exit_code INTEGER,
             oom_killed INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
@@ -2425,6 +2466,17 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.execute_batch("UPDATE installation SET schema_version=9 WHERE singleton=1;")?;
         tx.commit()?;
         schema = 9;
+    }
+    if schema == 9 {
+        let add_pending = !column_exists(conn, "incarnations", "provider_preparation_pending")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if add_pending {
+            tx.execute_batch("ALTER TABLE incarnations ADD COLUMN provider_preparation_pending INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        // Legacy Running does not prove resumed native acceptance.
+        tx.execute_batch("UPDATE installation SET schema_version=10 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 10;
     }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
@@ -2909,6 +2961,72 @@ mod tests {
             view_intent: None,
             admission: AdmissionPolicy::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn provider_preparation_migration_preserves_unproved_running_and_accepted_pending_state()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("registry");
+        let registry = Registry::open(&root, None).unwrap();
+        let prepared = registry
+            .prepare_launch(prep(SoulId::new(), RequestId::new(), "pending"))
+            .await
+            .unwrap();
+        let id = prepared.incarnation_id.clone();
+        let conn = Connection::open(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET launch_state='running' WHERE incarnation_id=?1",
+            params![id.as_str()],
+        )
+        .unwrap();
+        assert!(
+            !registry
+                .provider_preparation_is_pending(id.clone())
+                .await
+                .unwrap(),
+            "generic Running has no native acceptance proof"
+        );
+        conn.execute_batch("ALTER TABLE incarnations DROP COLUMN provider_preparation_pending; UPDATE installation SET schema_version=9;").unwrap();
+        drop(conn);
+        drop(registry);
+        let migrated = Registry::open(&root, None).unwrap();
+        assert!(
+            !migrated
+                .provider_preparation_is_pending(id.clone())
+                .await
+                .unwrap(),
+            "legacy Running remains uncertain after migration"
+        );
+        let conn = Connection::open(&migrated.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET launch_state='starting' WHERE incarnation_id=?1",
+            params![id.as_str()],
+        )
+        .unwrap();
+        migrated
+            .mark_running_with_provider_preparation(id.clone(), true)
+            .await
+            .unwrap();
+        assert!(migrated
+            .provider_preparation_is_pending(id.clone())
+            .await
+            .unwrap());
+        // Idempotent upgrades preserve a real previously accepted pending proof.
+        conn.execute_batch("UPDATE installation SET schema_version=9;")
+            .unwrap();
+        drop(conn);
+        drop(migrated);
+        let reopened = Registry::open(&root, None).unwrap();
+        assert!(reopened
+            .provider_preparation_is_pending(id.clone())
+            .await
+            .unwrap());
+        reopened
+            .mark_provider_preparation_complete(id.clone())
+            .await
+            .unwrap();
+        assert!(!reopened.provider_preparation_is_pending(id).await.unwrap());
     }
 
     #[tokio::test]

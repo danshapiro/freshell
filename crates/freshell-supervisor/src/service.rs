@@ -83,6 +83,9 @@ mod claude_source_observation;
 #[cfg(test)]
 #[path = "native_auth_lookup_tests.rs"]
 mod native_auth_lookup_tests;
+#[cfg(test)]
+#[path = "provider_preparation_tests.rs"]
+mod provider_preparation_tests;
 impl Drop for AuthLookupScope {
     fn drop(&mut self) {
         self.authorities
@@ -1008,6 +1011,7 @@ impl Supervisor {
                 .map_err(|error| {
                     self.activation_failure(&prepared, state, "read_running_host_status", error)
                 })?;
+            self.complete_pending_provider_preparation(&handle).await?;
             return self
                 .launch_result_from_status(
                     prepared.incarnation_id.clone(),
@@ -1087,13 +1091,6 @@ impl Supervisor {
                 self.activation_failure(&prepared, state, "deliver_execution_grant", error)
             })?;
         crash_if("after_grant_delivery");
-        self.registry
-            .mark_running(handle.incarnation_id().clone())
-            .await
-            .map_err(map_registry)
-            .map_err(|error| {
-                self.activation_failure(&prepared, state, "commit_running_state", error)
-            })?;
         if let Some(native_session_id) = accepted.native_session_id.as_ref() {
             self.registry
                 .record_native_session(
@@ -1107,8 +1104,18 @@ impl Supervisor {
                     self.activation_failure(&prepared, state, "record_native_identity", error)
                 })?;
         }
+        self.registry
+            .mark_running_with_provider_preparation(
+                handle.incarnation_id().clone(),
+                workload.resume_spec.is_none(),
+            )
+            .await
+            .map_err(map_registry)
+            .map_err(|error| {
+                self.activation_failure(&prepared, state, "commit_running_state", error)
+            })?;
         if workload.resume_spec.is_none() {
-            self.commit_provider_preparation(&workload, handle.incarnation_id())
+            self.complete_pending_provider_preparation(&handle)
                 .await
                 .map_err(|error| {
                     self.activation_failure(&prepared, state, "commit_provider_inputs", error)
@@ -2028,6 +2035,55 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Retry only a durable acceptance proof for this immutable incarnation.
+    /// Running alone never authorizes completion of a resumed generation.
+    pub(crate) async fn complete_pending_provider_preparation(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+    ) -> Result<(), RuntimeError> {
+        if !self
+            .registry
+            .provider_preparation_is_pending(handle.incarnation_id().clone())
+            .await
+            .map_err(map_registry)?
+        {
+            return Ok(());
+        }
+        let workload = LaunchWorkload {
+            soul_id: handle.soul_id().clone(),
+            fixture: handle.fixture(),
+            terminal: handle.terminal().cloned(),
+            fresh_agent: handle.fresh_agent().cloned(),
+            resume_spec: None,
+        };
+        if let Err(error) = self
+            .commit_provider_preparation(&workload, handle.incarnation_id())
+            .await
+        {
+            append_event(
+                &self.config.lifecycle_log,
+                "supervisor.provider_preparation.pending",
+                serde_json::json!({
+                    "severity":"error", "soulId":handle.soul_id(), "incarnationId":handle.incarnation_id(),
+                    "operation":"complete_accepted_generation", "errorCode":error.code,
+                }),
+            );
+            return Err(error);
+        }
+        self.registry
+            .mark_provider_preparation_complete(handle.incarnation_id().clone())
+            .await
+            .map_err(map_registry)?;
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.provider_preparation.completed",
+            serde_json::json!({
+                "severity":"info", "soulId":handle.soul_id(), "incarnationId":handle.incarnation_id(),
+            }),
+        );
+        Ok(())
+    }
+
     pub(crate) async fn commit_provider_preparation(
         &self,
         workload: &LaunchWorkload,
@@ -2066,10 +2122,9 @@ impl Supervisor {
                 .commit_prepared_inputs(&handle)
                 .await
                 .map_err(map_backend)?;
-            // Both callers are after HostGrantAccepted and registry commit.
-            // Initial/pristine activation calls here only without resume_spec;
-            // exact resumes reach here from recovery only AFTER native identity
-            // verification, queued-input replay, and recovery-success commit.
+            // The pending flag is armed atomically with initial acceptance or
+            // exact verified recovery success. Healthy retries preserve those
+            // gates while finishing interrupted release/retirement.
             if let Some(prior) = self
                 .registry
                 .prior_provider_owner(incarnation.clone())
