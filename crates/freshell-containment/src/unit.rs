@@ -505,11 +505,20 @@ impl AgentUnit {
     /// backend a scan of every process), so async callers run it on a
     /// blocking task.
     pub fn members(&self) -> io::Result<Vec<ProcIdentity>> {
-        self.inner.backend.members(&self.live_roots())
+        let list = self.inner.backend.members(&self.live_roots())?;
+        log_withheld(&self.log_keys(self.stop_operation()), list.withheld);
+        Ok(list.members)
     }
 
     pub fn stop_in_flight(&self) -> Option<StopHandle> {
         lock(&self.inner.stop).as_ref().map(|s| s.handle.clone())
+    }
+
+    /// The owner operation of the stop in flight, if any.
+    fn stop_operation(&self) -> Option<String> {
+        lock(&self.inner.stop)
+            .as_ref()
+            .and_then(|s| s.operation_id())
     }
 
     /// Pins recorded roots by (pid, start) without rewriting the record; a
@@ -873,7 +882,10 @@ impl AgentUnit {
         pinned.extend(extra.iter().cloned());
         let roots = live_identities(&pinned);
         let spared = match self.inner.backend.clone().kill_all(roots).await {
-            Ok(summary) => Some(summary.spared),
+            Ok(summary) => {
+                log_withheld(keys, summary.withheld);
+                Some(summary.spared)
+            }
             Err(err) => {
                 events::kill_all_failed(keys, &err.to_string());
                 None
@@ -1135,6 +1147,14 @@ impl AgentUnit {
     }
 }
 
+/// Logs the same-uid processes a member scan could not read, with the
+/// unit's keys (nothing when there are none).
+fn log_withheld(keys: &UnitLogKeys, withheld: u64) {
+    if withheld > 0 {
+        events::environ_withheld(keys, withheld);
+    }
+}
+
 /// The not-yet-exited `watches` as sorted, distinct `(pid, start time)`.
 fn live_identities(watches: &[ProcWatch]) -> Vec<(u32, u64)> {
     let mut roots: Vec<(u32, u64)> = watches
@@ -1190,7 +1210,7 @@ impl StopState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendKind, KillSummary};
+    use crate::backend::{BackendKind, KillSummary, MemberList};
     use crate::log_capture::{capture, CapturedEvent, FieldValue};
 
     /// A unit with no processes: the stop has nothing to signal or wait for.
@@ -1206,8 +1226,8 @@ mod tests {
         ) -> BoxFuture<'static, io::Result<KillSummary>> {
             Box::pin(async { Ok(KillSummary::default()) })
         }
-        fn members(&self, _roots: &[(u32, u64)]) -> io::Result<Vec<ProcIdentity>> {
-            Ok(Vec::new())
+        fn members(&self, _roots: &[(u32, u64)]) -> io::Result<MemberList> {
+            Ok(MemberList::default())
         }
         fn confirm_placement(&self, _pid: u32, _roots: &[(u32, u64)]) -> io::Result<()> {
             Ok(())
@@ -1217,6 +1237,42 @@ mod tests {
         }
         fn remove(&self, _emptied: bool) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// A tag backend's report of unreadable environments, with no processes:
+    /// each scan says 2 environments were withheld, each kill says 3.
+    struct Withholding;
+
+    impl UnitBackend for Withholding {
+        fn placement(&self, role: MemberRole, seq: u32) -> io::Result<Placement> {
+            NoProcesses.placement(role, seq)
+        }
+        fn kill_all(
+            self: Arc<Self>,
+            _roots: Vec<(u32, u64)>,
+        ) -> BoxFuture<'static, io::Result<KillSummary>> {
+            Box::pin(async {
+                Ok(KillSummary {
+                    withheld: 3,
+                    ..Default::default()
+                })
+            })
+        }
+        fn members(&self, _roots: &[(u32, u64)]) -> io::Result<MemberList> {
+            Ok(MemberList {
+                members: Vec::new(),
+                withheld: 2,
+            })
+        }
+        fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {
+            NoProcesses.confirm_placement(pid, roots)
+        }
+        fn wait_empty(&self) -> Option<BoxFuture<'static, ()>> {
+            None
+        }
+        fn remove(&self, emptied: bool) -> io::Result<()> {
+            NoProcesses.remove(emptied)
         }
     }
 
@@ -1311,6 +1367,30 @@ mod tests {
         for event in requested {
             assert_eq!(event.level, tracing::Level::INFO);
             assert_unit_keys(event, &unit, "op-1");
+        }
+    }
+
+    #[test]
+    fn the_withheld_environment_count_is_logged_with_every_key_of_the_unit() {
+        let unit = unit_on(Arc::new(Withholding));
+        let events = capture_on_runtime(async {
+            unit.members().unwrap();
+            let handle = unit.stop(
+                StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws").operation("op-1"),
+            );
+            // The kill and the post-Gone sweep's kill each report 3 (the
+            // stop's member scans run on blocking threads, outside capture).
+            handle.wait_swept().await;
+        });
+        let withheld = named(&events, "unit.members.environ_withheld");
+        let got: Vec<(u64, &str)> = withheld
+            .iter()
+            .map(|e| (e.u64("count"), e.str("operation_id")))
+            .collect();
+        assert_eq!(got, [(2, ""), (3, "op-1"), (3, "op-1")]);
+        for event in withheld {
+            assert_eq!(event.level, tracing::Level::INFO);
+            assert_unit_keys(event, &unit, event.str("operation_id"));
         }
     }
 }

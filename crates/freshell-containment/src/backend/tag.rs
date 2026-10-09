@@ -22,10 +22,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 
-use super::{Backend, BackendKind, Capability, KillSummary, UnitBackend};
-use crate::events::{self, UnitLogKeys};
+use super::{Backend, BackendKind, Capability, KillSummary, MemberList, UnitBackend};
 use crate::proc_watch::ProcWatch;
-use crate::process::{self, is_codex_daemon_family, ProcIdentity};
+use crate::process::{self, is_codex_daemon_family};
 use crate::unit::{MemberRole, Placement};
 use crate::{BoxFuture, UnitId, UNIT_ENV};
 
@@ -107,7 +106,7 @@ impl Backend for TagBackend {
 pub(crate) struct TagUnit {
     key: String,
     value: String,
-    /// The unit id its log lines carry (a legacy unit's minted id).
+    /// The unit id its errors name (a legacy unit's minted id).
     unit_id: String,
     wrapper: Option<Vec<String>>,
 }
@@ -183,16 +182,6 @@ impl TagUnit {
         }
     }
 
-    fn log_withheld(&self, withheld: u64) {
-        if withheld > 0 {
-            let keys = UnitLogKeys {
-                unit_id: self.unit_id.clone(),
-                ..Default::default()
-            };
-            events::environ_withheld(&keys, withheld);
-        }
-    }
-
     fn kill_all_now(&self, roots: &[(u32, u64)]) -> io::Result<KillSummary> {
         let mut withheld = None;
         let summary = stop_the_world(
@@ -207,9 +196,11 @@ impl TagUnit {
                     || roots.contains(&(pid, watch.identity().start))
                     || process::parent(pid).is_some_and(|pp| candidates.contains(&pp))
             },
-        );
-        self.log_withheld(withheld.unwrap_or(0));
-        summary
+        )?;
+        Ok(KillSummary {
+            withheld: withheld.unwrap_or(0),
+            ..summary
+        })
     }
 }
 
@@ -232,14 +223,16 @@ impl UnitBackend for TagUnit {
         })
     }
 
-    fn members(&self, roots: &[(u32, u64)]) -> io::Result<Vec<ProcIdentity>> {
+    fn members(&self, roots: &[(u32, u64)]) -> io::Result<MemberList> {
         let scan = self.scan(roots, true);
-        self.log_withheld(scan.withheld);
-        Ok(scan
-            .candidates
-            .difference(&scan.spared)
-            .filter_map(|pid| process::identity(*pid).ok())
-            .collect())
+        Ok(MemberList {
+            members: scan
+                .candidates
+                .difference(&scan.spared)
+                .filter_map(|pid| process::identity(*pid).ok())
+                .collect(),
+            withheld: scan.withheld,
+        })
     }
 
     fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {
@@ -393,6 +386,7 @@ pub(crate) fn stop_the_world(
             .iter()
             .filter_map(|pid| process::identity(*pid).ok())
             .collect(),
+        withheld: 0,
     })
 }
 
@@ -442,7 +436,11 @@ mod tests {
         let unit = fresh_unit();
         let stale = [(pid, start + 1)];
         assert!(
-            unit.members(&stale).unwrap().iter().all(|m| m.pid != pid),
+            unit.members(&stale)
+                .unwrap()
+                .members
+                .iter()
+                .all(|m| m.pid != pid),
             "a root with another start time was listed as a member"
         );
         let refused = unit.confirm_placement(pid, &stale).unwrap_err();
@@ -456,7 +454,12 @@ mod tests {
 
         // The same process recorded with its own start time is a root.
         let current = [(pid, start)];
-        assert!(unit.members(&current).unwrap().iter().any(|m| m.pid == pid));
+        assert!(unit
+            .members(&current)
+            .unwrap()
+            .members
+            .iter()
+            .any(|m| m.pid == pid));
         unit.confirm_placement(pid, &current).unwrap();
         unit.kill_all_now(&current).unwrap();
         use std::os::unix::process::ExitStatusExt;

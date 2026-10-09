@@ -6,8 +6,7 @@
 use std::io;
 use std::sync::Arc;
 
-use super::{Backend, BackendKind, Capability, KillSummary, UnitBackend};
-use crate::process::ProcIdentity;
+use super::{Backend, BackendKind, Capability, KillSummary, MemberList, UnitBackend};
 use crate::unit::{MemberRole, Placement};
 use crate::{BoxFuture, UnitId, UNIT_ENV};
 
@@ -54,8 +53,8 @@ impl UnitBackend for RootsUnit {
         Box::pin(async { Ok(KillSummary::default()) })
     }
 
-    fn members(&self, _roots: &[(u32, u64)]) -> io::Result<Vec<ProcIdentity>> {
-        Ok(Vec::new())
+    fn members(&self, _roots: &[(u32, u64)]) -> io::Result<MemberList> {
+        Ok(MemberList::default())
     }
 
     fn confirm_placement(&self, _pid: u32, _roots: &[(u32, u64)]) -> io::Result<()> {
