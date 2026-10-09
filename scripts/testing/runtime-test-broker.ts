@@ -545,7 +545,7 @@ export class RestrictedDockerBroker {
     const stage = mounts.find(mount => mount.Type === 'bind' && mount.Target === '/run/freshell-opencode-transfer' && mount.ReadOnly === true)
     const workspaceMount = mounts.find(mount => mount.Type === 'bind' && mount.Source === workspace && mount.Target === workspace && mount.ReadOnly === true)
     if (!binary || !volume || !stage || !workspaceMount || typeof stage.Source !== 'string'
-      || path.normalize(stage.Source) !== stage.Source || !/^opencode-transfer-[a-zA-Z0-9-]+\.ready$/.test(path.basename(stage.Source))) return
+      || path.normalize(stage.Source) !== stage.Source || !/^(?:opencode-transfer-[a-zA-Z0-9-]+|stopped-repair-[a-f0-9]{48})\.ready$/.test(path.basename(stage.Source))) return
     if (mounts.length === 5) {
       const git = mounts.find(mount => mount !== binary && mount !== volume && mount !== stage && mount !== workspaceMount)
       if (!git || git.Type !== 'bind' || git.ReadOnly !== true || git.Source !== git.Target

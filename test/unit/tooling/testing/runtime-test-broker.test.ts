@@ -344,7 +344,9 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
 }
 
 const repairName = 'freshell-opencode-repair-11111111-1111-4111-8111-111111111111'
-const repairStage = '/tmp/owned/r/scenario/x/opencode-transfers/opencode-transfer-one.ready'
+const repairStageRoot = '/tmp/owned/r/scenario/x/opencode-transfers'
+const repairStageBasename = `stopped-repair-${'0123456789abcdef'.repeat(3)}.ready`
+const repairStage = path.join(repairStageRoot, repairStageBasename)
 const repairEnv = [
   'HOME=/home/freshell/provider',
   'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db',
@@ -355,7 +357,7 @@ const repairEnv = [
   'OPENCODE_MODEL=fixture-configured',
 ].sort()
 
-function stoppedRepairBody() {
+function stoppedRepairBody(stageSource = repairStage) {
   return {
     Image: 'sha256:fixture-image', User: '0:0', WorkingDir: '/workspace', Tty: false,
     Entrypoint: ['/runtime/freshell-session-host'],
@@ -369,7 +371,7 @@ function stoppedRepairBody() {
       Mounts: [
         { Type: 'bind', Source: '/tmp/owned/freshell-session-host', Target: '/runtime/freshell-session-host', ReadOnly: true },
         { Type: 'volume', Source: providerVolume, Target: '/home/freshell/provider', ReadOnly: false },
-        { Type: 'bind', Source: repairStage, Target: '/run/freshell-opencode-transfer', ReadOnly: true },
+        { Type: 'bind', Source: stageSource, Target: '/run/freshell-opencode-transfer', ReadOnly: true },
         { Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true },
       ],
     },
@@ -384,11 +386,15 @@ async function registerRepairOwner(request: BrokerHttpFixture['request']) {
 }
 
 describe('receipt-owned stopped OpenCode repair HTTP routes', () => {
-  it('admits the production repair worker body and binds its lifecycle and cleanup to the original receipt', async () => {
+  it.each([
+    ['stopped-repair', repairStage],
+    ['opencode-transfer', path.join(repairStageRoot, 'opencode-transfer-one.ready')],
+  ])('admits the %s repair worker body and binds its lifecycle and cleanup to the original receipt', async (_family, stageSource) => {
     await withHttpBroker(async ({ request, forwarded, broker }) => {
       await registerRepairOwner(request)
       expect((await request('GET', `/v1.47/volumes/${providerVolume}`)).status).toBe(200)
-      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody())).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody(stageSource))).status).toBe(201)
+      expect(forwarded.at(-1)).toEqual({ method: 'POST', url: `/v1.47/containers/create?name=${repairName}`, body: stoppedRepairBody(stageSource) })
       expect(forwarded.at(-1)?.body.Env).toEqual(repairEnv)
       expect(forwarded[0].body.Env).toEqual([])
       expect(broker.historyHelperNames()).toContain(repairName)
@@ -410,10 +416,41 @@ describe('receipt-owned stopped OpenCode repair HTTP routes', () => {
         expect(forwarded).toHaveLength(count)
       }
       const count = forwarded.length
-      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody())).status).toBe(403)
+      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody(stageSource))).status).toBe(403)
       expect(forwarded).toHaveLength(count)
       expect((await request('DELETE', `/v1.47/containers/${repairName}?force=1`)).status).toBe(204)
       expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${repairName}?force=1`)
+    })
+  })
+
+  it.each([
+    ['47 hex characters', `stopped-repair-${'a'.repeat(47)}.ready`],
+    ['49 hex characters', `stopped-repair-${'a'.repeat(49)}.ready`],
+    ['nonhex character', `stopped-repair-${'a'.repeat(47)}g.ready`],
+    ['uppercase hex', `stopped-repair-${'A'.repeat(48)}.ready`],
+    ['wrong prefix', `stopped-transfer-${'a'.repeat(48)}.ready`],
+    ['wrong suffix', `stopped-repair-${'a'.repeat(48)}.partial`],
+    ['trailing suffix', `stopped-repair-${'a'.repeat(48)}.ready.extra`],
+  ])('rejects a stopped-repair stage with %s without forwarding or granting cleanup authority', async (_reason, basename) => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      const before = forwarded.length
+      const body = stoppedRepairBody(path.join(repairStageRoot, basename))
+      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, body)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect(broker.historyHelperNames()).toEqual([])
+      expect([...broker.receiptIds()]).toEqual([ownedId])
+      expect((await request('DELETE', `/v1.47/containers/${repairName}?force=1`)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+    })
+  })
+
+  it('keeps stopped-repair stages out of ordinary host transfer admission', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      const body = createBody([...ordinaryBinds, actorBind, `${repairStage}:/run/freshell-opencode-transfer:ro`])
+      expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', body)).status).toBe(403)
+      expect(forwarded).toHaveLength(0)
+      expect(broker.receipts()).toHaveLength(0)
     })
   })
 
@@ -428,19 +465,23 @@ describe('receipt-owned stopped OpenCode repair HTTP routes', () => {
         body => { body.HostConfig.Mounts[0].Source = '/tmp/owned/other-approved-host' },
         body => { body.HostConfig.Mounts[1].Source = 'freshell-provider-ffffffffffffffffffffffff' },
         body => { body.HostConfig.Mounts[1].ReadOnly = true },
-        body => { body.HostConfig.Mounts[2].Source = '/tmp/owned/r/foreign/x/opencode-transfers/opencode-transfer-one.ready' },
+        body => { body.HostConfig.Mounts[2].Source = `/tmp/owned/r/foreign/x/opencode-transfers/${repairStageBasename}` },
         body => { body.HostConfig.Mounts[2].ReadOnly = false },
-        body => { body.HostConfig.Mounts[2].Source = '/tmp/owned/r/scenario/x/opencode-transfers/../opencode-transfers/opencode-transfer-one.ready' },
+        body => { body.HostConfig.Mounts[2].Source = `${repairStageRoot}/../opencode-transfers/${repairStageBasename}` },
+        body => { body.HostConfig.Mounts[2].Source = `tmp/owned/r/scenario/x/opencode-transfers/${repairStageBasename}` },
         body => { body.HostConfig.Mounts[3].Source = '/foreign' },
         body => { body.HostConfig.Mounts[3].ReadOnly = false },
         body => { body.HostConfig.Mounts.push({ Type: 'bind', Source: '/etc', Target: '/etc', ReadOnly: true }) },
         body => { body.Cmd[0] = 'serve' },
+        body => { body.Entrypoint = ['/bin/sh'] },
         body => { body.Cmd[6] = '/foreign' },
         body => { body.Cmd[8] = '0' },
+        body => { body.Cmd[10] = '65534' },
         body => { body.Cmd.push('--extra') },
         body => { body.WorkingDir = '/foreign' },
         body => { body.Tty = true },
         body => { body.User = '65534:0' },
+        body => { Object.assign(body, { Labels: { 'com.freshell.managed': 'true' } }) },
         ...['HOME', 'OPENCODE_DB', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME'].map(key => (body: ReturnType<typeof stoppedRepairBody>) => {
           body.Env[body.Env.findIndex(value => value.startsWith(`${key}=`))] = `${key}=/foreign`
         }),
@@ -454,6 +495,7 @@ describe('receipt-owned stopped OpenCode repair HTTP routes', () => {
         body => { Object.assign(body.HostConfig, { Privileged: true }) },
         body => { Object.assign(body.HostConfig, { Binds: ['/etc:/etc:rw'] }) },
         body => { Object.assign(body.HostConfig, { PortBindings: { '80/tcp': [{ HostPort: '80' }] } }) },
+        body => { Object.assign(body.HostConfig, { ExtraHosts: ['foreign:127.0.0.1'] }) },
         body => { body.HostConfig.SecurityOpt = [] },
         body => { body.HostConfig.MemorySwap = 0 },
         body => { body.HostConfig.PidsLimit = 0 },
