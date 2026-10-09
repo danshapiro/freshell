@@ -1115,6 +1115,52 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn provider_input_publisher_commit_without_indexed_descriptor_needs_no_daemon() {
+        let owned = tempfile::tempdir().unwrap();
+        let terminal: TerminalLaunchSpec = serde_json::from_value(json!({
+            "terminalId":"terminal-nonindexed","streamId":"stream-nonindexed","mode":"codex","program":"codex",
+            "cwd":"/fixture/workspace","workspacePath":"/fixture/workspace","runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"project-nonindexed",
+            "providerLaunchContext":{
+                "preparation":{"codex":{"tui_args":[],"sidecar_args":[]}},
+                "mcpCapability":{"grantId":"grant-nonindexed","endpoint":"http://host.docker.internal:3344","providerRelativePath":".freshell/mcp-capability.json"},
+                "preparedInputs":{"generationId":"grant-nonindexed","manifest":{"relativePath":".freshell/input-manifest.json","sha256":"a".repeat(64),"sourceCount":0,"aliasCount":0,"recipeCount":0}}
+            }
+        })).unwrap();
+        terminal.validate().unwrap();
+        let handle = crate::registry::OwnedRuntimeHandle::from_registry(
+            InstallationId::parse("installation-nonindexed").unwrap(),
+            SoulId::parse("soul-nonindexed").unwrap(),
+            IncarnationId::parse("incarnation-nonindexed").unwrap(),
+            freshell_runtime_protocol::LaunchNonce::new(),
+            DockerDaemonId::parse("daemon-nonindexed").unwrap(),
+            "c".repeat(64),
+            format!("sha256:{}", "a".repeat(64)),
+            owned.path().join("runtime"),
+            owned.path().join("session-host"),
+            "d".repeat(64),
+            RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 128 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 64,
+            },
+            None,
+            Some(terminal),
+            None,
+            "freshell-provider-nonindexed".into(),
+        );
+        // There is intentionally no daemon/socket: ordinary prepared inputs
+        // never created an indexed publisher, so their commit must be inert.
+        let backend = DockerEngineBackend::new(owned.path().join("absent-daemon.sock"));
+        let committed = backend.commit_prepared_inputs(&handle).await;
+        drop(backend);
+        assert!(
+            committed.is_ok(),
+            "nonindexed commit must not inspect or retire a publisher: {committed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_input_publisher_rechecks_actual_capacity_before_payload_read() {
         use std::os::unix::fs::MetadataExt;
         use std::time::{Duration, UNIX_EPOCH};

@@ -636,7 +636,10 @@ impl RuntimeBackend for DockerEngineBackend {
                     .fresh_agent()
                     .and_then(|spec| spec.provider_launch_context.as_ref())
             });
-        if let Some(inputs) = context.and_then(|context| context.prepared_inputs.as_ref()) {
+        if let Some(inputs) = context
+            .and_then(|context| context.prepared_inputs.as_ref())
+            .filter(|inputs| inputs.indexed_files.is_some())
+        {
             self.release_indexed_publication(
                 handle.soul_id(),
                 handle.incarnation_id(),
