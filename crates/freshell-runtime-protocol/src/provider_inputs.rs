@@ -470,6 +470,115 @@ mod tests {
         assert!(!format!("{received:?}").contains("PRIVATE_PATH_INPUT_SENTINEL"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_frozen_inputs_actual_maximum_profile_reaches_guarded_child() {
+        const MAXIMUM_VALUE_NAME: &str = "FRESHELL_TEST_MAXIMUM_PROVIDER_VALUE";
+        let marker = format!("N{:0127}", 0);
+        if std::env::var_os(&marker).is_some() || std::env::var_os(MAXIMUM_VALUE_NAME).is_some() {
+            let variables = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+            let maximum_value_case = variables.contains_key(MAXIMUM_VALUE_NAME);
+            let names = if maximum_value_case { 1 } else { 128 };
+            let value_bytes = if maximum_value_case { 64 * 1024 } else { 1920 };
+            assert_eq!(variables.len(), names);
+            assert!(variables
+                .values()
+                .all(|value| value.len() == value_bytes && value.bytes().all(|byte| byte == b'x')));
+            if !maximum_value_case {
+                assert!(variables.keys().all(|name| name.len() == 128));
+            }
+            let total = variables
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>();
+            assert_eq!(
+                total,
+                if maximum_value_case {
+                    MAXIMUM_VALUE_NAME.len() + 64 * 1024
+                } else {
+                    256 * 1024
+                }
+            );
+            assert!(ProviderPathInputs::new(variables).is_ok());
+            println!(
+                "frozen_input_actual_environment {}",
+                serde_json::json!({"names":names,"valueBytes":value_bytes,"totalBytes":total})
+            );
+            return;
+        }
+
+        let exact = (0..128)
+            .map(|id| (format!("N{id:0127}"), "x".repeat(1920)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let full = ProviderPathInputs::new(exact.clone()).unwrap();
+        let mut over = exact;
+        over.get_mut(&marker).unwrap().push('x');
+        assert!(
+            ProviderPathInputs::new(over).is_err(),
+            "one extra shared byte must fail before dispatch"
+        );
+        assert!(ProviderPathInputs::new(std::collections::BTreeMap::from([(
+            format!("N{}", "0".repeat(128)),
+            "x".into()
+        )]))
+        .is_err());
+        let maximum_value = ProviderPathInputs::new(std::collections::BTreeMap::from([(
+            MAXIMUM_VALUE_NAME.into(),
+            "x".repeat(64 * 1024),
+        )]))
+        .unwrap();
+        assert!(ProviderPathInputs::new(std::collections::BTreeMap::from([(
+            MAXIMUM_VALUE_NAME.into(),
+            "x".repeat(64 * 1024 + 1)
+        )]))
+        .is_err());
+
+        for inputs in [full, maximum_value] {
+            let encoded =
+                crate::bounded_json_bytes(&inputs, crate::MAX_CONTROL_FRAME_BYTES).unwrap();
+            let received: ProviderPathInputs = serde_json::from_slice(&encoded).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.env_clear().envs(received.iter()).args([
+                "--exact",
+                "provider_inputs::tests::provider_frozen_inputs_actual_maximum_profile_reaches_guarded_child",
+                "--nocapture",
+            ]);
+            freshell_platform::provider_exec::check_command(&command, false, &[]).unwrap();
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "isolated exact-profile child failed"
+            );
+            let diagnostic = String::from_utf8(output.stdout).unwrap();
+            let receipt = diagnostic
+                .lines()
+                .find_map(|line| {
+                    line.split_once("frozen_input_actual_environment ")
+                        .map(|(_, receipt)| receipt)
+                })
+                .expect("exact selected profile must be consumed in the actual child");
+            let value: serde_json::Value = serde_json::from_str(receipt).unwrap();
+            assert_eq!(value["names"], received.iter().count());
+            assert_eq!(
+                value["valueBytes"],
+                received.iter().map(|(_, value)| value.len()).max().unwrap()
+            );
+            assert_eq!(
+                value.as_object().unwrap().len(),
+                3,
+                "child diagnostics carry numbers only"
+            );
+            assert_eq!(
+                value["totalBytes"],
+                received
+                    .iter()
+                    .map(|(name, value)| name.len() + value.len())
+                    .sum::<usize>()
+            );
+            println!("frozen_input_actual_environment {value}");
+        }
+    }
+
     fn prepared() -> PreparedProviderInputs {
         PreparedProviderInputs {
             generation_id: "grant-synthetic".into(),
