@@ -18,6 +18,8 @@ struct Daemon {
     fail: Option<&'static str>,
     grants: usize,
     host_tasks: Vec<tokio::task::JoinHandle<()>>,
+    reject_inputs: bool,
+    consumed_rejection: bool,
 }
 struct Backend(Arc<Mutex<Daemon>>, std::path::PathBuf);
 
@@ -94,6 +96,17 @@ fn limits() -> RuntimeLimits {
 
 #[async_trait]
 impl RuntimeBackend for Backend {
+    async fn observe_initial_auth_volume(
+        &self,
+        reservation: &crate::registry::OwnedInputReservation,
+    ) -> Result<InitialAuthVolumeObservation, BackendError> {
+        Ok(reservation
+            .prior_observation
+            .clone()
+            .unwrap_or(InitialAuthVolumeObservation::Absent {
+                daemon_id: DockerDaemonId::parse("synthetic-daemon").unwrap(),
+            }))
+    }
     async fn create_stopped(
         &self,
         spec: &CreateRuntimeSpec,
@@ -140,6 +153,8 @@ impl RuntimeBackend for Backend {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let envelope: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                let rejected = state.lock().unwrap().reject_inputs;
+                let consumed_rejection = state.lock().unwrap().consumed_rejection;
                 let result = match envelope.body {
                     HostCommand::Hello {
                         challenge,
@@ -151,6 +166,21 @@ impl RuntimeBackend for Backend {
                         effective_limits: limits(),
                     },
                     HostCommand::GrantExecution { .. } => {
+                        if state.lock().unwrap().reject_inputs {
+                            write_frame(
+                                &mut socket,
+                                &HostReply {
+                                    request_id: envelope.request_id,
+                                    result: Err(RuntimeError::new(
+                                        RuntimeErrorCode::ProviderInputsChanged,
+                                        "configuration reference selection changed",
+                                    )),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            continue;
+                        }
                         state.lock().unwrap().grants += 1;
                         HostResult::GrantAccepted {
                             host_boot_id: boot.clone(),
@@ -162,13 +192,21 @@ impl RuntimeBackend for Backend {
                     }
                     HostCommand::Status { .. } => HostResult::Status {
                         host_boot_id: boot.clone(),
-                        worker_pid: Some(1234),
-                        worker_launch_count: 1,
+                        worker_pid: if rejected { None } else { Some(1234) },
+                        worker_launch_count: u64::from(!rejected),
                         max_control_epoch: 100,
-                        max_execution_generation: 100,
+                        max_execution_generation: if rejected && !consumed_rejection {
+                            0
+                        } else {
+                            100
+                        },
                         fixture_evidence: serde_json::json!({}),
                         exited: false,
-                        native_session_id: Some("ses_exact".into()),
+                        native_session_id: if rejected {
+                            None
+                        } else {
+                            Some("ses_exact".into())
+                        },
                     },
                     HostCommand::ProbeRecovery {
                         resume_spec: Some(spec),
@@ -191,6 +229,17 @@ impl RuntimeBackend for Backend {
             }
         });
         self.0.lock().unwrap().host_tasks.push(task);
+        Ok(())
+    }
+    async fn discard_rejected_provider_inputs(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        let mut state = self.0.lock().unwrap();
+        assert!(state.reject_inputs && !state.consumed_rejection);
+        assert!(!state.running.contains(handle.incarnation_id()));
+        state.generations.remove(&generation(handle));
+        state.publishers.remove(&generation(handle));
         Ok(())
     }
     async fn commit_prepared_inputs(
@@ -253,8 +302,17 @@ impl RuntimeBackend for Backend {
             configured_limits: limits(),
         })
     }
-    async fn request_stop(&self, _: &OwnedRuntimeHandle, _: u64) -> Result<(), BackendError> {
-        panic!("healthy retry must not stop a workload")
+    async fn request_stop(&self, handle: &OwnedRuntimeHandle, _: u64) -> Result<(), BackendError> {
+        let mut state = self.0.lock().unwrap();
+        assert!(
+            state.reject_inputs && !state.consumed_rejection,
+            "healthy or consumed retry must not stop a workload"
+        );
+        state.running.remove(handle.incarnation_id());
+        state
+            .events
+            .push(format!("stop-rejected:{}", generation(handle)));
+        Ok(())
     }
     async fn force_stop(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
         panic!("healthy retry must not stop a workload")
@@ -555,5 +613,219 @@ async fn provider_accepted_completion_retries_after_registry_success_on_fresh_he
             task.abort();
             let _ = task.await;
         }
+    }
+}
+
+#[tokio::test]
+async fn provider_initial_changed_inputs_requires_unconsumed_host_and_settled_owned_cleanup() {
+    for consumed in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("registry");
+        let registry = Registry::open(&root, None).unwrap();
+        let soul = SoulId::new();
+        let daemon = Arc::new(Mutex::new(Daemon {
+            reject_inputs: true,
+            consumed_rejection: consumed,
+            ..Default::default()
+        }));
+        daemon
+            .lock()
+            .unwrap()
+            .generations
+            .insert("prior-usable".into());
+        let callback = UnixListener::bind(temp.path().join("mcp.sock")).unwrap();
+        let callback_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = callback.accept().await.unwrap();
+                let mut raw = vec![];
+                stream.read_to_end(&mut raw).await.unwrap();
+                stream.write_all(b"ok").await.unwrap();
+            }
+        });
+        let config = SupervisorConfig {
+            runtime_root: temp.path().join("runtime"),
+            control_socket_path: temp.path().join("control.sock"),
+            host_binary_path: temp.path().join("synthetic-host"),
+            image_ref: format!("sha256:{}", "a".repeat(64)),
+            test_run_id: "provider-initial-replan".into(),
+            control_secret: "synthetic-control-secret".into(),
+            lifecycle_log: temp.path().join("lifecycle.jsonl"),
+            admission: crate::admission::AdmissionPolicy::default(),
+        };
+        std::fs::write(&config.host_binary_path, "synthetic-host-artifact").unwrap();
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            Arc::new(Backend(daemon.clone(), root)),
+            config.clone(),
+        )
+        .unwrap();
+        let reservation = registry
+            .reserve_initial_inputs(
+                ReserveProviderInputsRequest {
+                    expected_control_epoch: Some(registry.control_epoch()),
+                    soul_id: soul.clone(),
+                    provider: "opencode".into(),
+                    creation_seed_ref: "seed".into(),
+                },
+                config.image_ref.clone(),
+                config.host_binary_path.clone(),
+            )
+            .await
+            .unwrap();
+        let receipt = registry
+            .record_initial_observation(
+                reservation,
+                InitialAuthVolumeObservation::Absent {
+                    daemon_id: DockerDaemonId::parse("synthetic-daemon").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut input = context(&soul, 1);
+        input
+            .prepared_inputs
+            .as_mut()
+            .unwrap()
+            .initial_auth_reservation = Some(receipt.reservation_id.clone());
+        let terminal:TerminalLaunchSpec=serde_json::from_value(serde_json::json!({"terminalId":"terminal","streamId":"stream","mode":"opencode","program":"opencode","args":[],"env":{},"cwd":temp.path(),"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"project","workspacePath":temp.path(),"providerLaunchContext":input,"providerSecretReferences":references()})).unwrap();
+        let preparation = LaunchPreparation {
+            soul_id: soul.clone(),
+            provider: "opencode".into(),
+            provider_store_id: "store-exact".into(),
+            native_session_id: None,
+            creation_seed_ref: "seed".into(),
+            request_id: RequestId::new(),
+            payload_digest: "replan-test".into(),
+            requested_limits: limits(),
+            profile: RuntimeProfile::Custom,
+            project_key: "project".into(),
+            fixture: None,
+            terminal: Some(terminal.clone()),
+            fresh_agent: None,
+            view_intent: None,
+            admission: crate::admission::AdmissionPolicy::default(),
+        };
+        let prepared = registry.prepare_launch(preparation.clone()).await.unwrap();
+        let error = supervisor
+            .activate_prepared(
+                prepared.clone(),
+                LaunchWorkload {
+                    soul_id: soul.clone(),
+                    fixture: None,
+                    terminal: Some(terminal),
+                    fresh_agent: None,
+                    resume_spec: None,
+                },
+                limits(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            if consumed {
+                RuntimeErrorCode::HostUnreachable
+            } else {
+                RuntimeErrorCode::ProviderInputsChanged
+            }
+        );
+        let view = registry.inventory().await.unwrap().pop().unwrap();
+        assert_eq!(
+            view.launch_state,
+            if consumed {
+                LaunchState::Starting
+            } else {
+                LaunchState::Stopped
+            }
+        );
+        assert!(daemon.lock().unwrap().generations.contains("prior-usable"));
+        assert_eq!(
+            daemon.lock().unwrap().generations.contains("grant-1"),
+            consumed,
+            "only positively rejected generation can be retired"
+        );
+        assert_eq!(daemon.lock().unwrap().grants, 0);
+        if !consumed {
+            for ordinal in 2..=3 {
+                let reserved = registry
+                    .reserve_initial_inputs(
+                        ReserveProviderInputsRequest {
+                            expected_control_epoch: Some(registry.control_epoch()),
+                            soul_id: soul.clone(),
+                            provider: "opencode".into(),
+                            creation_seed_ref: "seed".into(),
+                        },
+                        config.image_ref.clone(),
+                        config.host_binary_path.clone(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    reserved.id, receipt.reservation_id,
+                    "replan reuses exact creation authority"
+                );
+                let retained = reserved.prior_observation.clone().unwrap();
+                assert!(
+                    matches!(&retained,InitialAuthVolumeObservation::OwnedUndispatched {incarnation_id,..} if incarnation_id==&prepared.incarnation_id)
+                );
+                registry
+                    .record_initial_observation(reserved, retained)
+                    .await
+                    .unwrap();
+                let mut next = preparation.clone();
+                next.request_id = RequestId::new();
+                next.payload_digest = format!("replan-{ordinal}");
+                let mut next_context = context(&soul, ordinal);
+                next_context
+                    .prepared_inputs
+                    .as_mut()
+                    .unwrap()
+                    .initial_auth_reservation = Some(receipt.reservation_id.clone());
+                next.terminal.as_mut().unwrap().provider_launch_context = Some(next_context);
+                let workload = LaunchWorkload {
+                    soul_id: soul.clone(),
+                    fixture: None,
+                    terminal: next.terminal.clone(),
+                    fresh_agent: None,
+                    resume_spec: None,
+                };
+                let prepared = registry.prepare_launch(next).await.unwrap();
+                assert_eq!(
+                    supervisor
+                        .activate_prepared(prepared, workload, limits())
+                        .await
+                        .unwrap_err()
+                        .code,
+                    RuntimeErrorCode::ProviderInputsChanged
+                );
+                assert_eq!(
+                    daemon.lock().unwrap().generations,
+                    BTreeSet::from(["prior-usable".to_string()]),
+                    "each rejected generation is settled while prior input remains"
+                );
+            }
+            assert!(
+                registry
+                    .reserve_initial_inputs(
+                        ReserveProviderInputsRequest {
+                            expected_control_epoch: Some(registry.control_epoch()),
+                            soul_id: soul.clone(),
+                            provider: "opencode".into(),
+                            creation_seed_ref: "seed".into()
+                        },
+                        config.image_ref.clone(),
+                        config.host_binary_path.clone()
+                    )
+                    .await
+                    .is_err(),
+                "two pre-dispatch replans are the complete bound"
+            );
+        }
+        let tasks = std::mem::take(&mut daemon.lock().unwrap().host_tasks);
+        for task in tasks {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        callback_task.abort();
+        assert!(callback_task.await.unwrap_err().is_cancelled());
     }
 }

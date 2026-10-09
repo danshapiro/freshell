@@ -742,9 +742,73 @@ impl Supervisor {
             {
                 return Err(denied());
             }
-            return Ok(freshell_runtime_protocol::NativeAuthValues(
-                std::collections::BTreeMap::new(),
-            ));
+            let values = match expected {
+                freshell_runtime_protocol::InitialAuthVolumeObservation::Absent { .. } => {
+                    std::collections::BTreeMap::new()
+                }
+                freshell_runtime_protocol::InitialAuthVolumeObservation::OwnedUndispatched {
+                    incarnation_id,
+                    ..
+                } => {
+                    // Preparation may already have installed a typed auth file
+                    // before refusing the input selection. Read the exact owned
+                    // quiescent store rather than inventing native-auth absence.
+                    let lock = self.lifecycle_lock(&request.soul_id).await;
+                    let _held = lock.lock().await;
+                    if self
+                        .registry
+                        .initial_input_reservation(
+                            request.soul_id.clone(),
+                            request.attempt_authority.clone(),
+                        )
+                        .await
+                        .map_err(map_registry)?
+                        .is_none()
+                    {
+                        return Err(denied());
+                    };
+                    let prior = self
+                        .registry
+                        .owned_handle(incarnation_id)
+                        .await
+                        .map_err(map_registry)?;
+                    let values = tokio::time::timeout(
+                        Duration::from_secs(25),
+                        self.backend.read_native_auth(
+                            &prior,
+                            &request.keys,
+                            &self.config.host_binary_path,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "initial replan native auth lookup timed out",
+                        )
+                    })?
+                    .map_err(|_| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "initial replan native auth lookup unavailable",
+                        )
+                    })?;
+                    if self
+                        .registry
+                        .initial_input_reservation(
+                            request.soul_id.clone(),
+                            request.attempt_authority.clone(),
+                        )
+                        .await
+                        .map_err(map_registry)?
+                        .is_none()
+                    {
+                        return Err(denied());
+                    };
+                    values
+                }
+            };
+            return Ok(freshell_runtime_protocol::NativeAuthValues(values));
         }
         let authority = {
             let authorities = self
@@ -1084,12 +1148,35 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "enable_long_lived_runtime", error)
             })?;
-        let accepted = self
+        let accepted = match self
             .send_grant(&handle, &workload, &authenticated, &grant)
             .await
-            .map_err(|error| {
-                self.activation_failure(&prepared, state, "deliver_execution_grant", error)
-            })?;
+        {
+            Ok(accepted) => accepted,
+            Err(error)
+                if error.code == RuntimeErrorCode::ProviderInputsChanged
+                    && workload.resume_spec.is_none() =>
+            {
+                // The typed refusal alone cannot authorize redispatch: verify
+                // this exact boot has never crossed its durable grant fence.
+                self.settle_rejected_initial_inputs(&handle, &authenticated, &grant)
+                    .await?;
+                return Err(self.activation_failure(
+                    &prepared,
+                    state,
+                    "provider_inputs_changed_before_dispatch",
+                    error,
+                ));
+            }
+            Err(error) => {
+                return Err(self.activation_failure(
+                    &prepared,
+                    state,
+                    "deliver_execution_grant",
+                    error,
+                ))
+            }
+        };
         crash_if("after_grant_delivery");
         if let Some(native_session_id) = accepted.native_session_id.as_ref() {
             self.registry
@@ -1139,6 +1226,75 @@ impl Supervisor {
             effective_limits: authenticated.effective_limits,
             fixture_evidence: accepted.fixture_evidence,
         })
+    }
+
+    async fn settle_rejected_initial_inputs(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        host: &AuthenticatedHost,
+        grant: &crate::registry::ExecutionGrantRecord,
+    ) -> Result<(), RuntimeError> {
+        let unavailable = || {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "initial provider input rejection is unconfirmed; retain ownership and reconcile",
+            )
+        };
+        self.registry
+            .validate_rejected_initial_inputs(handle.incarnation_id().clone())
+            .await
+            .map_err(|_| unavailable())?;
+        let status = self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                host,
+                HostCommand::Status {
+                    incarnation_id: handle.incarnation_id().clone(),
+                },
+            )
+            .await
+            .map_err(|_| unavailable())?;
+        let never_dispatched = matches!(
+            status,
+            HostResult::Status {
+                host_boot_id,
+                worker_pid: None,
+                worker_launch_count: 0,
+                max_execution_generation,
+                native_session_id: None,
+                ..
+            } if host_boot_id == grant.host_boot_id
+                && max_execution_generation < grant.execution_generation
+        );
+        if !never_dispatched {
+            return Err(unavailable());
+        }
+        self.backend
+            .request_stop(handle, 2)
+            .await
+            .map_err(|_| unavailable())?;
+        if !self
+            .verify_empty_with_budget(handle, Duration::from_secs(3))
+            .await
+            .map_err(|_| unavailable())?
+        {
+            return Err(unavailable());
+        };
+        self.backend
+            .discard_rejected_provider_inputs(handle)
+            .await
+            .map_err(|_| unavailable())?;
+        self.registry
+            .settle_rejected_initial_inputs(handle.incarnation_id().clone())
+            .await
+            .map_err(|_| unavailable())?;
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.provider_inputs.initial_replan_ready",
+            serde_json::json!({"severity":"info","soulId":handle.soul_id(),"incarnationId":handle.incarnation_id(),"operation":"settle_unconsumed_generation"}),
+        );
+        Ok(())
     }
 
     fn activation_failure(

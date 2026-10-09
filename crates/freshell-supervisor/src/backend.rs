@@ -154,6 +154,16 @@ pub trait RuntimeBackend: Send + Sync {
             "initial auth source observation unavailable".into(),
         ))
     }
+    /// Remove only the generation of a positively rejected, stopped initial
+    /// host. The owning supervisor must prove the grant was never consumed.
+    async fn discard_rejected_provider_inputs(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unavailable(
+            "rejected provider input cleanup unavailable".into(),
+        ))
+    }
     async fn commit_prepared_inputs(
         &self,
         _handle: &OwnedRuntimeHandle,
@@ -650,6 +660,13 @@ impl RuntimeBackend for DockerEngineBackend {
             .await?;
         }
         Ok(())
+    }
+    async fn discard_rejected_provider_inputs(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        self.remove_stopped_input_workload(handle).await?;
+        self.remove_stopped_indexed_inputs(handle).await
     }
     async fn retire_prior_prepared_inputs(
         &self,

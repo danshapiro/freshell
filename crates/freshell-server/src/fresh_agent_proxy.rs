@@ -645,15 +645,58 @@ impl HostedFreshAgentProxy {
             }),
             expected_control_epoch: None,
         };
-        let launched = self
-            .client
-            .launch(request_id, request)
+        let launched = if provider == FreshProvider::Opencode {
+            let home = std::env::var_os("HOME").map(PathBuf::from).ok_or(())?;
+            let original = |name: &str| std::env::var(name).ok();
+            let references = request
+                .fresh_agent
+                .as_ref()
+                .unwrap()
+                .provider_secret_references
+                .iter()
+                .filter(|r| !r.profile.is_configuration_file())
+                .cloned()
+                .collect();
+            crate::managed_provider_references::launch_initial_opencode(
+                crate::managed_provider_references::OpencodePreparation {
+                    client: &self.client,
+                    soul: &soul,
+                    creation_seed: &message.request_id,
+                    home: &home,
+                    cwd: &cwd,
+                    workspace: &workspace,
+                    original: &original,
+                    references,
+                    auth_authority: None,
+                    selected_sources: None,
+                    accepted_global_root: None,
+                    selected_resource_roots: None,
+                    native_source_flags: None,
+                    rebind_enabled: None,
+                    inherited_inline: None,
+                    inline_edits: Some(freshell_platform::opencode_config::OwnedConfigEdits {
+                        disable_snapshots: true,
+                        ..Default::default()
+                    }),
+                },
+                request_id,
+                request,
+            )
             .await
             .map_err(|error| {
-                let _ =
-                    crate::managed_mcp_capability::revoke_mcp_capability(&mcp_capability.grant_id);
-                tracing::warn!(?error, "fresh_agent.create.launch_failed");
-            })?;
+                tracing::warn!(event="fresh_agent.create.initial_opencode_failed",%error);
+            })?
+        } else {
+            self.client
+                .launch(request_id, request)
+                .await
+                .map_err(|error| {
+                    let _ = crate::managed_mcp_capability::revoke_mcp_capability(
+                        &mcp_capability.grant_id,
+                    );
+                    tracing::warn!(?error, "fresh_agent.create.launch_failed");
+                })?
+        };
         let naming_projection = match message.naming_handle.as_deref() {
             Some(handle) if !handle.trim().is_empty() => {
                 admit_pending_projection(

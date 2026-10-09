@@ -1020,6 +1020,10 @@ async fn qualify_candidate_helper_transport(
                 observation: InitialAuthVolumeObservation::Absent { daemon_id },
                 ..
             } => daemon_id.clone(),
+            ClaudeSourceOwner::Initial {
+                observation: InitialAuthVolumeObservation::OwnedUndispatched { .. },
+                ..
+            } => unreachable!("OpenCode rejected inputs do not authorize Claude source discovery"),
             ClaudeSourceOwner::Retained { handle, .. } => handle.daemon_id().clone(),
         };
         let retained_name = match owner {

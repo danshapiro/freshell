@@ -2864,6 +2864,14 @@ pub struct ProviderInputReservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InitialAuthVolumeObservation {
+    /// The exact creation-owned volume after a positively rejected initial
+    /// grant. This is retained ownership evidence, not a claim of absence.
+    OwnedUndispatched {
+        #[serde(rename = "daemonId")]
+        daemon_id: DockerDaemonId,
+        #[serde(rename = "incarnationId")]
+        incarnation_id: IncarnationId,
+    },
     Absent {
         #[serde(rename = "daemonId")]
         daemon_id: DockerDaemonId,

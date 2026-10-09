@@ -127,6 +127,26 @@ fn endpoint() -> Result<String, String> {
         .ok_or("managed MCP controller is unconfigured".into())
 }
 
+#[cfg(test)]
+pub(crate) fn accept_initial_replan_fixture_preparation(
+    soul: &SoulId,
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+) -> Result<(), String> {
+    let capability = context
+        .mcp_capability
+        .as_ref()
+        .ok_or("fixture capability missing")?;
+    let incarnation = IncarnationId::new();
+    store().activate(
+        &capability.grant_id,
+        soul.clone(),
+        incarnation.clone(),
+        &capability_dir()?,
+        &endpoint()?,
+    )?;
+    store().commit_preparation(&capability.grant_id, soul, &incarnation, &capability_dir()?)
+}
+
 pub(crate) fn configure(
     bind_host: &str,
     port: u16,

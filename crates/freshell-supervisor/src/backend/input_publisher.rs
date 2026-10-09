@@ -978,7 +978,7 @@ impl DockerEngineBackend {
         let Some(inputs) = context(prior).and_then(|v| v.prepared_inputs.as_ref()) else {
             return Ok(());
         };
-        let Some(files) = inputs.indexed_files.as_ref() else {
+        if inputs.indexed_files.is_none() {
             return Ok(());
         };
         let next = context(current)
@@ -995,6 +995,62 @@ impl DockerEngineBackend {
         if next.generation_id == inputs.generation_id {
             return Ok(());
         }
+        self.remove_stopped_indexed_inputs(prior).await
+    }
+
+    pub(super) async fn remove_stopped_input_workload(
+        &self,
+        prior: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        let state = self.inspect(prior).await?.state;
+        match state {
+            BackendRuntimeState::Missing => {}
+            BackendRuntimeState::Created
+            | BackendRuntimeState::Exited
+            | BackendRuntimeState::Dead => {
+                // Docker refuses removal if this exact proved object becomes
+                // running again. Retirement never forces a workload stop.
+                let removed = self
+                    .request_bounded(
+                        "DELETE",
+                        &format!("{DOCKER_API}/containers/{}?force=0", prior.container_id()),
+                        None,
+                        64 * 1024,
+                    )
+                    .await?;
+                if !matches!(removed.status, 204 | 404) {
+                    return Err(fail(
+                        "prior input workload removal uncertain; preserve generation",
+                    ));
+                }
+            }
+            _ => {
+                return Err(fail(
+                    "prior input workload remains live or uncertain; preserve generation",
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn remove_stopped_indexed_inputs(
+        &self,
+        prior: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        let context = prior
+            .terminal()
+            .and_then(|s| s.provider_launch_context.as_ref())
+            .or_else(|| {
+                prior
+                    .fresh_agent()
+                    .and_then(|s| s.provider_launch_context.as_ref())
+            });
+        let Some(inputs) = context.and_then(|c| c.prepared_inputs.as_ref()) else {
+            return Ok(());
+        };
+        let Some(files) = inputs.indexed_files.as_ref() else {
+            return Ok(());
+        };
         if files.volume_name
             != freshell_runtime_protocol::indexed_provider_volume_name(
                 prior.soul_id(),
@@ -1005,34 +1061,7 @@ impl DockerEngineBackend {
         }
         let ownership = json!({"com.freshell.managed-inputs":"true","com.freshell.installation-id":prior.installation_id(),"com.freshell.soul-id":prior.soul_id(),"com.freshell.incarnation-id":prior.incarnation_id(),"com.freshell.input-generation":inputs.generation_id});
         let operation = async {
-            let state = self.inspect(prior).await?.state;
-            match state {
-                BackendRuntimeState::Missing => {}
-                BackendRuntimeState::Created
-                | BackendRuntimeState::Exited
-                | BackendRuntimeState::Dead => {
-                    // Docker refuses removal if this exact proved object becomes
-                    // running again. Retirement never forces a workload stop.
-                    let removed = self
-                        .request_bounded(
-                            "DELETE",
-                            &format!("{DOCKER_API}/containers/{}?force=0", prior.container_id()),
-                            None,
-                            64 * 1024,
-                        )
-                        .await?;
-                    if !matches!(removed.status, 204 | 404) {
-                        return Err(fail(
-                            "prior input workload removal uncertain; preserve generation",
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(fail(
-                        "prior input workload remains live or uncertain; preserve generation",
-                    ))
-                }
-            }
+            self.remove_stopped_input_workload(prior).await?;
             self.release_indexed_publication(
                 prior.soul_id(),
                 prior.incarnation_id(),

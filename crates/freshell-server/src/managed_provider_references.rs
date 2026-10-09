@@ -1369,3 +1369,80 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         references,
     })
 }
+
+/// Rebuild only a positively rejected, never-dispatched initial OpenCode input
+/// generation. Other failures retain their inputs for ownership reconciliation.
+pub(crate) async fn launch_initial_opencode(
+    preparation: OpencodePreparation<'_>,
+    mut request_id: freshell_runtime_protocol::RequestId,
+    mut launch: freshell_runtime_protocol::LaunchRequest,
+) -> Result<freshell_runtime_protocol::LaunchResult, String> {
+    use freshell_runtime_protocol::RuntimeErrorCode;
+    let mut retries = 0;
+    loop {
+        match preparation
+            .client
+            .launch(request_id.clone(), launch.clone())
+            .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if error.runtime_code() == Some(RuntimeErrorCode::ProviderInputsChanged)
+                    && launch.native_session_id.is_none() =>
+            {
+                let context = launch
+                    .terminal
+                    .as_ref()
+                    .and_then(|s| s.provider_launch_context.as_ref())
+                    .or_else(|| {
+                        launch
+                            .fresh_agent
+                            .as_ref()
+                            .and_then(|s| s.provider_launch_context.as_ref())
+                    });
+                if let Some(capability) = context.and_then(|c| c.mcp_capability.as_ref()) {
+                    crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id)?;
+                }
+                if retries == 2 {
+                    tracing::warn!(event="provider.inputs.initial_replan.exhausted", provider="opencode", soul_id=%launch.soul_id, retries);
+                    return Err("OpenCode configuration reference selection kept changing; two pre-dispatch retries exhausted".into());
+                }
+                retries += 1;
+                tracing::info!(event="provider.inputs.initial_replan", provider="opencode", soul_id=%launch.soul_id, retry=retries);
+                let prepared = prepare_managed_opencode(OpencodePreparation {
+                    client: preparation.client,
+                    soul: preparation.soul,
+                    creation_seed: preparation.creation_seed,
+                    home: preparation.home,
+                    cwd: preparation.cwd,
+                    workspace: preparation.workspace,
+                    original: preparation.original,
+                    references: preparation.references.clone(),
+                    auth_authority: None,
+                    selected_sources: None,
+                    accepted_global_root: None,
+                    selected_resource_roots: None,
+                    native_source_flags: None,
+                    rebind_enabled: None,
+                    inherited_inline: None,
+                    inline_edits: preparation.inline_edits.clone(),
+                })
+                .await?;
+                if let Some(terminal) = launch.terminal.as_mut() {
+                    terminal.provider_secret_references = prepared.references;
+                    terminal.provider_launch_context = Some(prepared.context);
+                } else if let Some(fresh) = launch.fresh_agent.as_mut() {
+                    fresh.provider_secret_references = prepared.references;
+                    fresh.provider_launch_context = Some(prepared.context);
+                } else {
+                    return Err("initial OpenCode workload unavailable".into());
+                }
+                // A new approved generation has a different semantic payload.
+                // Keep the public creation/soul identity and use a fresh control
+                // request identity rather than replaying a rejected digest.
+                request_id = freshell_runtime_protocol::RequestId::new();
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}

@@ -105,9 +105,15 @@ impl DockerEngineBackend {
             return Ok(());
         };
         let reservation = &bound.reservation;
-        let freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
-            daemon_id: observed,
-        } = &bound.observation;
+        let (observed, volume_owner, retained) = match &bound.observation {
+            freshell_runtime_protocol::InitialAuthVolumeObservation::Absent { daemon_id } => {
+                (daemon_id, &spec.incarnation_id, false)
+            }
+            freshell_runtime_protocol::InitialAuthVolumeObservation::OwnedUndispatched {
+                daemon_id,
+                incarnation_id,
+            } => (daemon_id, incarnation_id, true),
+        };
         if !rootless
             || observed != daemon
             || reservation.installation_id != spec.installation_id
@@ -129,22 +135,18 @@ impl DockerEngineBackend {
         bound
             .verify_artifact()
             .map_err(|_| fail("initial auth reserved runtime artifact changed or unreadable"))?;
-        let labels = json!({
-            "com.freshell.installation-id":spec.installation_id.as_str(),
-            "com.freshell.soul-id":spec.soul_id.as_str(),
-            "freshell.input.reservation":reservation.id,
-            "freshell.input.incarnation":spec.incarnation_id.as_str(),
-            "freshell.input.intent":"1",
-            "freshell.input.daemon":daemon.as_str(),
-            "freshell.input.image":reservation.image_ref,
-            "freshell.input.binary-sha256":reservation.binary_sha256
-        });
+        let labels = reserved_volume_labels(reservation, daemon, volume_owner);
         let path = format!("{DOCKER_API}/volumes/{}", spec.provider_volume_name);
         let response = self
             .request_bounded("GET", &path, None, 64 * 1024)
             .await
             .map_err(|_| fail("reserved initial volume observation failed"))?;
         if response.status == 404 {
+            if retained {
+                return Err(fail(
+                    "owned undispatched provider volume is missing; preserve inputs",
+                ));
+            }
             if self
                 .daemon_id()
                 .await
@@ -228,9 +230,40 @@ impl DockerEngineBackend {
             )
             .await
             .map_err(|_| fail("initial auth reserved volume observation failed"))?;
-        if response.status != 404 {
-            return Err(fail("initial auth absence requires an actual reserved-volume 404; use an owned existing source"));
-        }
+        let observation = match &reservation.prior_observation {
+            Some(
+                owned
+                @ freshell_runtime_protocol::InitialAuthVolumeObservation::OwnedUndispatched {
+                    daemon_id: expected,
+                    incarnation_id,
+                },
+            ) => {
+                let value: Value = serde_json::from_slice(&response.body)
+                    .map_err(|_| fail("owned undispatched volume response invalid"))?;
+                if reservation.provider != "opencode"
+                    || expected != &daemon_id
+                    || response.status != 200
+                    || value["Name"] != reservation.provider_volume_name
+                    || value["Driver"] != "local"
+                    || value["Labels"]
+                        != reserved_volume_labels(reservation, &daemon_id, incarnation_id)
+                    || !(value["Options"].is_null() || value["Options"] == json!({}))
+                {
+                    return Err(fail(
+                        "owned undispatched volume identity changed; preserve inputs",
+                    ));
+                }
+                owned.clone()
+            }
+            _ => {
+                if response.status != 404 {
+                    return Err(fail("initial auth absence requires an actual reserved-volume 404; use an owned existing source"));
+                }
+                freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+                    daemon_id: daemon_id.clone(),
+                }
+            }
+        };
         if self
             .daemon_id()
             .await
@@ -239,7 +272,7 @@ impl DockerEngineBackend {
         {
             return Err(fail("initial auth source daemon changed"));
         }
-        Ok(freshell_runtime_protocol::InitialAuthVolumeObservation::Absent { daemon_id })
+        Ok(observation)
     }
     pub(super) async fn read_auth_helper(
         &self,
@@ -648,6 +681,56 @@ mod tests {
         backend.create_stopped(&spec).await.unwrap();
         assert_eq!(requests.lock().unwrap().iter().filter(|r|r.starts_with("POST") && r.contains("/volumes/create ")).count(),1,
             "lost workload-create acknowledgement must reuse the same exact labelled reservation volume");
+        let mut retained = binding.clone();
+        retained.observation =
+            freshell_runtime_protocol::InitialAuthVolumeObservation::OwnedUndispatched {
+                daemon_id: match &binding.observation {
+                    freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+                        daemon_id,
+                    } => daemon_id.clone(),
+                    _ => unreachable!(),
+                },
+                incarnation_id: binding.incarnation_id.clone(),
+            };
+        retained.reservation.prior_observation = Some(retained.observation.clone());
+        assert_eq!(
+            backend
+                .observe_initial_volume(&retained.reservation)
+                .await
+                .unwrap(),
+            retained.observation
+        );
+        let mut replanned = spec.clone();
+        retained.incarnation_id = IncarnationId::new();
+        replanned.incarnation_id = retained.incarnation_id.clone();
+        replanned.initial_input_reservation = Some(retained.clone());
+        backend
+            .create_stopped(&replanned)
+            .await
+            .expect("fresh approved host reuses exact undispatched creation-owned volume");
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.starts_with("POST") && r.contains("/volumes/create "))
+                .count(),
+            1
+        );
+        let owned_value = volume.lock().unwrap().clone().unwrap();
+        *volume.lock().unwrap() = None;
+        assert!(
+            backend
+                .observe_initial_volume(&retained.reservation)
+                .await
+                .is_err(),
+            "missing retained volume is not new absence"
+        );
+        assert!(
+            backend.create_stopped(&replanned).await.is_err(),
+            "replan cannot recreate a missing owned volume"
+        );
+        *volume.lock().unwrap() = Some(owned_value);
         volume.lock().unwrap().as_mut().unwrap()["Labels"]["freshell.input.reservation"] =
             json!("foreign-reservation");
         assert!(
@@ -661,7 +744,7 @@ mod tests {
                 .iter()
                 .filter(|r| r.contains("/containers/create?"))
                 .count(),
-            2
+            3
         );
         std::fs::write(&spec.host_binary_path, b"changed synthetic artifact").unwrap();
         assert!(
@@ -675,7 +758,7 @@ mod tests {
                 .iter()
                 .filter(|r| r.contains("/containers/create?"))
                 .count(),
-            2
+            3
         );
         server.abort();
         let _ = server.await;
@@ -897,4 +980,21 @@ mod tests {
             let _ = server.await;
         }
     }
+}
+
+fn reserved_volume_labels(
+    reservation: &crate::registry::OwnedInputReservation,
+    daemon: &DockerDaemonId,
+    incarnation: &freshell_runtime_protocol::IncarnationId,
+) -> Value {
+    json!({
+        "com.freshell.installation-id":reservation.installation_id.as_str(),
+        "com.freshell.soul-id":reservation.soul_id.as_str(),
+        "freshell.input.reservation":reservation.id,
+        "freshell.input.incarnation":incarnation.as_str(),
+        "freshell.input.intent":"1",
+        "freshell.input.daemon":daemon.as_str(),
+        "freshell.input.image":reservation.image_ref,
+        "freshell.input.binary-sha256":reservation.binary_sha256
+    })
 }

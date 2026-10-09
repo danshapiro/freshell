@@ -141,7 +141,9 @@ impl BrokerAuthorizedBackend {
         }
         let (daemon_id, reservation_id, retained) = match owner {
             freshell_supervisor::backend::ClaudeSourceOwner::Initial { observation, .. } => {
-                let InitialAuthVolumeObservation::Absent { daemon_id } = observation;
+                let InitialAuthVolumeObservation::Absent { daemon_id } = observation else {
+                    return Err(invalid());
+                };
                 let ClaudeSourceAuthority::InitialReservation { reservation_id } =
                     &request.authority
                 else {
@@ -414,6 +416,12 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
         reservation: &OwnedInputReservation,
     ) -> Result<InitialAuthVolumeObservation, BackendError> {
         self.real().observe_initial_auth_volume(reservation).await
+    }
+    async fn discard_rejected_provider_inputs(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        self.real().discard_rejected_provider_inputs(handle).await
     }
     async fn commit_prepared_inputs(
         &self,

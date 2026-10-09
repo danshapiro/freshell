@@ -386,15 +386,58 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 }),
                 expected_control_epoch: None,
             };
-            let result = match self.client.launch(request_id, launch).await {
-                Ok(result) => result,
-                Err(error) => {
-                    if let Some(capability) = &mcp_capability {
-                        let _ = crate::managed_mcp_capability::revoke_mcp_capability(
-                            &capability.grant_id,
-                        );
+            let result = if request.mode == "opencode" {
+                let home = original_provider_home(&request.env)?;
+                let original = |name: &str| {
+                    request
+                        .env
+                        .get(name)
+                        .cloned()
+                        .or_else(|| std::env::var(name).ok())
+                };
+                let references = launch
+                    .terminal
+                    .as_ref()
+                    .unwrap()
+                    .provider_secret_references
+                    .iter()
+                    .filter(|r| !r.profile.is_configuration_file())
+                    .cloned()
+                    .collect();
+                crate::managed_provider_references::launch_initial_opencode(
+                    crate::managed_provider_references::OpencodePreparation {
+                        client: &self.client,
+                        soul: &soul_id,
+                        creation_seed: create_key,
+                        home: &home,
+                        cwd: &cwd,
+                        workspace: &workspace,
+                        original: &original,
+                        references,
+                        auth_authority: None,
+                        selected_sources: None,
+                        accepted_global_root: None,
+                        selected_resource_roots: None,
+                        native_source_flags: None,
+                        rebind_enabled: None,
+                        inherited_inline: None,
+                        inline_edits: None,
+                    },
+                    request_id,
+                    launch,
+                )
+                .await?
+            } else {
+                match self.client.launch(request_id, launch).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if let Some(capability) = &mcp_capability {
+                            let _ = crate::managed_mcp_capability::revoke_mcp_capability(
+                                &capability.grant_id,
+                            );
+                        }
+                        return Err(error.to_string());
                     }
-                    return Err(error.to_string());
                 }
             };
             Ok(ManagedTerminalDescriptor {
@@ -1266,3 +1309,7 @@ mod tests {
 #[cfg(all(test, unix))]
 #[path = "managed_output_rpc_tests.rs"]
 mod managed_output_rpc_tests;
+
+#[cfg(all(test, unix))]
+#[path = "managed_runtime_opencode_replan_tests.rs"]
+mod opencode_replan_tests;
