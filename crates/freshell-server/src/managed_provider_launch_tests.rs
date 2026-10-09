@@ -798,10 +798,16 @@ async def on_session_ready(coordinator):
         "native-nested-namespace-context",
     )
     .unwrap();
+    std::fs::create_dir_all(bundle.parent().unwrap().join("context")).unwrap();
+    std::fs::write(
+        bundle.parent().unwrap().join("context/self.md"),
+        "wrong-standalone-parent-context",
+    )
+    .unwrap();
     let namespace_child = bundle.join("behaviors/probe.yaml");
     let namespace_child_raw="bundle: {name: probe, namespace_root: ..}\ncontext: {include: ['probe:context/selected.md']}\n";
     std::fs::write(&namespace_child, namespace_child_raw).unwrap();
-    let bundle_document=format!("bundle:\n  name: closed-native-bundle\nincludes: [{}]\ncontext: {{include: ['closed-native-bundle:context/self.md']}}\nsession:\n  orchestrator:\n    module: loop-probe\n    source: ./modules/loop-probe\n  context:\n    module: context-probe\n    source: ./modules/context-probe\n    config:\n      conversation_receipt: {}\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\nhooks:\n  - module: hooks-probe\n    source: ./modules/hooks-probe\n    config:\n      receipt: {}\n      session_id: {}\n      key_digest: {}\n",serde_json::to_string(&format!("file://{}",namespace_child.display())).unwrap(),serde_json::to_string(conversation_receipt.to_str().unwrap()).unwrap(),serde_json::to_string(receipt.to_str().unwrap()).unwrap(),native_id,hash(b"synthetic-amplifier-onecli-value"));
+    let bundle_document=format!("bundle:\n  name: closed-native-bundle\n  namespace_root: ..\nincludes: [{}]\ncontext: {{include: ['closed-native-bundle:context/self.md']}}\nsession:\n  orchestrator:\n    module: loop-probe\n    source: ./modules/loop-probe\n  context:\n    module: context-probe\n    source: ./modules/context-probe\n    config:\n      conversation_receipt: {}\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\nhooks:\n  - module: hooks-probe\n    source: ./modules/hooks-probe\n    config:\n      receipt: {}\n      session_id: {}\n      key_digest: {}\n",serde_json::to_string(&format!("file://{}",namespace_child.display())).unwrap(),serde_json::to_string(conversation_receipt.to_str().unwrap()).unwrap(),serde_json::to_string(receipt.to_str().unwrap()).unwrap(),native_id,hash(b"synthetic-amplifier-onecli-value"));
     std::fs::write(bundle.join("bundle.yaml"), &bundle_document).unwrap();
     let settings = "bundle:\n  active: ../scenarios/external-amplifier-bundle/bundle.yaml\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\n".to_owned();
     std::fs::write(home.join(".amplifier/settings.yaml"), &settings).unwrap();
