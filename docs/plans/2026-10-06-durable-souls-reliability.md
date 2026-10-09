@@ -563,33 +563,33 @@ Run: `git commit -m "fix(supervisor): persist bounded automatic recovery retries
 - Consumes: durable stopped intent, exact original `OwnedRuntimeHandle`, current incarnation/revision and recorded Stop outcome.
 - Produces: `Registry::pending_stop_handles() -> Result<Vec<OwnedRuntimeHandle>, RegistryError>` and internal `Supervisor::finish_stop_handle(&OwnedRuntimeHandle) -> Result<StopOutcome, RuntimeError>`. This method does not commit a new intent; ordinary Stop and restart continuation share it.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Add `ordinary_stop_crash` sandbox tests at durable intent commit before IPC, after graceful request, after force-stop/verified empty before outcome persistence, and after outcome commit before capability revocation. Restart supervisor; assert original intent revision/native root/store/history remain, no creation/grant/recovery occurs, only the exact owned handle is signaled, and state converges idempotently to VerifiedEmpty. Repeat with unavailable backend, surviving workload and ownership-label mismatch: state remains accurately BackendUnavailable/TerminationUnconfirmed/BlockedOwnership, never falsely stopped or resurrected. Add stale handle/new intent concurrency and an empty already-removed enclosure case. Add the exact browser case `synthetic interrupted ordinary Stop preserves history`: click Close pane to invoke ordinary Stop on a registered synthetic managed pane, crash the isolated supervisor at the intent boundary, reconnect and see stopped with retained transcript and unchanged root/intent revision; assert zero replacement/writer/grant recreation. Gate only this case on exact `FRESHELL_RUNTIME_SYNTHETIC_RESUME=1` independently of live provider flags; Task 8 and final-candidate coverage select it explicitly through configured Cloud.
 
 Extend the schema fixture produced by Task 5: reopen a pre-Task-6 registry with an incomplete ordinary Stop, migrate it, and prove pending capability revocation survives reopen and completes once after a crash between outcome persistence and revoke. A completed legacy Stop is not turned into a new stop intent or provider start. Run the migration/revocation case with the `ordinary_stop_crash` parent matrix, not a static schema equality check.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor ordinary_stop_crash -- --ignored"`
 
 Expected: FAIL because desired Stopped souls are not resumed by startup/observer ordinary Stop reconciliation. The parent suite validates a nonzero selected case count.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Extract existing `stop`'s authenticated IPC/graceful/backend verification/force/verification/outcome sequence into `finish_stop_handle`; retain two-second graceful request and three-second bounded empty checks, exact ownership mismatch semantics and capability revocation. `stop` commits intent once, cancels retries in that transaction, then calls the helper under the lifecycle lock. Registry selects current desired Stopped handles whose durable Stop transaction is incomplete or whose verified cleanup/revocation remains pending. Startup and observer settle these before/alongside running recovery with existing concurrency limits; they do not call `begin_stop_expected` again or increment intent. Before each signal/outcome mutation, recheck current revision/handle ownership; stale/new intent returns without effect. If exact container is absent, backend's qualified empty result may finish Stop; arbitrary inspection failure may not. Positively inspected exactly owned never-started Created enclosures also finish Stop without starting a provider. Bound the actual initial observation, graceful/force calls and each observation within the three-second empty-check window; a silent backend leaves an honest unresolved outcome and releases the lifecycle lock for later same-intent continuation. Add the next registry migration after Task 5's actual version for durable ordinary-Stop progress/outcome and pending capability revoke status, keyed by exact soul/incarnation/intent revision and recorded grant identity. Transactionally persist the outcome plus revoke obligation before external revoke; mark settled only after successful acknowledgement, retry failures idempotently without reopening provider. Migrate legacy completed rows conservatively without fabricating absent grant authority. Preserve separate loss cleanup machinery and never convert an ordinary Stop to Lost. Emit continuation/result events.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor ordinary_stop_crash -- --ignored"`
 
 Expected: PASS at every selected boundary, including honest unresolved backend/ownership cases.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Remove duplicate stop termination branches now shared by ordinary invocation/startup; reuse applicable exact-handle termination helpers in recovery only when semantics match. Keep lifecycle lock acquisition outside the helper to avoid recursive locking.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `cargo test -p freshell-supervisor`
 
@@ -597,7 +597,7 @@ Run: `scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor
 
 Expected: PASS for Stop-vs-recovery CAS, tombstones, writer claim release, exact ownership and pending capability revocation. Browser proof executes in Task 8.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 Run: `git add crates/freshell-supervisor/src/backend.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/registry.rs crates/freshell-supervisor/src/inventory.rs crates/freshell-supervisor/src/recovery.rs test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts`
 
