@@ -2716,31 +2716,40 @@ impl CapabilityStore {
     ) -> Result<(), String> {
         let path = grant_path(directory, grant_id)?;
         let mut grants = self.grants.lock().unwrap();
-        if let Some(existing) = grants.get(grant_id) {
-            if existing.soul_id != soul_id || existing.endpoint != endpoint {
-                return Err("managed MCP grant identity mismatch".into());
+        // A delayed callback cannot create authority after an undispatched
+        // preparation was aborted. Cold memory must recover the existing
+        // bounded ownership record, including its prior-generation graph.
+        let existing = if let Some(existing) = grants.get(grant_id) {
+            existing.clone()
+        } else {
+            let stored = read_stored_capability(directory, grant_id)?;
+            Grant {
+                soul_id: stored.soul_id,
+                incarnation_id: stored.incarnation_id,
+                token: stored.scope,
+                expires_at: stored.expires_at,
+                endpoint: stored.endpoint,
+                path: path.clone(),
+                preparation: stored.preparation,
             }
-            if existing.incarnation_id.as_ref() == Some(&incarnation_id) {
-                return Ok(());
-            }
+        };
+        if existing.soul_id != soul_id || existing.endpoint != endpoint {
+            return Err("managed MCP grant identity mismatch".into());
         }
-        let mut preparation = grants
-            .get(grant_id)
-            .and_then(|grant| grant.preparation.clone());
-        if let Some(preparation) = preparation.as_mut() {
+        if existing.incarnation_id.as_ref() == Some(&incarnation_id) {
+            grants.entry(grant_id.into()).or_insert(existing);
+            return Ok(());
+        }
+        let mut grant = existing;
+        if let Some(preparation) = grant.preparation.as_mut() {
             if preparation.phase != InputPreparationPhase::Committed {
                 preparation.phase = InputPreparationPhase::Bound;
             }
         }
-        let grant = Grant {
-            preparation,
-            soul_id,
-            incarnation_id: Some(incarnation_id),
-            token: new_secret(),
-            expires_at: now_secs() + GRANT_LIFETIME_SECS,
-            endpoint: endpoint.into(),
-            path: path.clone(),
-        };
+        grant.incarnation_id = Some(incarnation_id);
+        grant.token = new_secret();
+        grant.expires_at = now_secs() + GRANT_LIFETIME_SECS;
+        grant.path = path.clone();
         write_capability(&path, &grant)?;
         grants.insert(grant_id.into(), grant);
         Ok(())
@@ -5996,6 +6005,160 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             }
         }
         assert!(failed.is_empty(), "cold pending abort changed unconfirmed ownership or rejected an undispatched preparation: {failed:?}");
+    }
+
+    #[test]
+    fn managed_mcp_activation_callback_preserves_cold_ownership_and_rejects_aborted_delivery() {
+        let mut failed = Vec::new();
+        for case in [
+            "warm_aborted",
+            "cold_aborted",
+            "warm_pending",
+            "cold_pending",
+            "cold_bound",
+            "cold_wrong_soul",
+            "cold_wrong_endpoint",
+        ] {
+            let owned = tempfile::tempdir().unwrap();
+            let store = CapabilityStore::default();
+            let soul = SoulId::new();
+            let endpoint = "http://host.docker.internal:4000";
+            let prior = store
+                .issue(
+                    soul.clone(),
+                    owned.path(),
+                    endpoint.into(),
+                    None,
+                    Default::default(),
+                    None,
+                )
+                .unwrap();
+            let prior_incarnation = IncarnationId::new();
+            store
+                .activate(
+                    &prior.grant_id,
+                    soul.clone(),
+                    prior_incarnation.clone(),
+                    owned.path(),
+                    endpoint,
+                )
+                .unwrap();
+            store
+                .commit_preparation(&prior.grant_id, &soul, &prior_incarnation, owned.path())
+                .unwrap();
+            let prior_stage = staged_provider_root_path(owned.path(), &prior.grant_id).unwrap();
+            std::fs::create_dir_all(&prior_stage).unwrap();
+            std::fs::write(prior_stage.join("usable-resource"), b"prior-callback-input").unwrap();
+            let current = store
+                .issue_replacement(
+                    soul.clone(),
+                    owned.path(),
+                    endpoint.into(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let current_stage = staged_provider_root_path(owned.path(), &current.grant_id).unwrap();
+            std::fs::create_dir_all(&current_stage).unwrap();
+            std::fs::write(
+                current_stage.join("usable-resource"),
+                b"current-callback-input",
+            )
+            .unwrap();
+            let incarnation = IncarnationId::new();
+            if case == "cold_bound" {
+                store
+                    .activate(
+                        &current.grant_id,
+                        soul.clone(),
+                        incarnation.clone(),
+                        owned.path(),
+                        endpoint,
+                    )
+                    .unwrap();
+            }
+            let aborted = case.ends_with("aborted");
+            if aborted {
+                store
+                    .abort_preparation(&current.grant_id, &soul, owned.path())
+                    .unwrap();
+            }
+            let path = grant_path(owned.path(), &current.grant_id).unwrap();
+            let before = std::fs::read(&path).ok();
+            let cold = CapabilityStore::default();
+            let target = if case.starts_with("warm") {
+                &store
+            } else {
+                &cold
+            };
+            let requested_soul = if case == "cold_wrong_soul" {
+                SoulId::new()
+            } else {
+                soul.clone()
+            };
+            let requested_endpoint = if case == "cold_wrong_endpoint" {
+                "http://host.docker.internal:4001"
+            } else {
+                endpoint
+            };
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "action":"activate", "controlSecret":"closed-synthetic-control-secret",
+                "soulId":requested_soul, "grantId":current.grant_id, "incarnationId":incarnation
+            }))
+            .unwrap();
+            let result = apply_callback(
+                &bytes,
+                "closed-synthetic-control-secret",
+                target,
+                owned.path(),
+                requested_endpoint,
+                owned.path(),
+            );
+            let should_accept = matches!(case, "warm_pending" | "cold_pending" | "cold_bound");
+            let stored = read_stored_capability(owned.path(), &current.grant_id).ok();
+            let graph_retained = stored.as_ref().is_some_and(|stored| {
+                stored.soul_id == soul
+                    && stored.endpoint == endpoint
+                    && stored.incarnation_id.as_ref() == Some(&incarnation)
+                    && stored.preparation.as_ref().is_some_and(|preparation| {
+                        preparation.phase == InputPreparationPhase::Bound
+                            && preparation.prior_grant_ids == [prior.grant_id.clone()]
+                    })
+                    && target.authenticates(&stored.scope)
+            });
+            let journal_unchanged = std::fs::read(&path).ok() == before;
+            let prior_retained = std::fs::read(prior_stage.join("usable-resource"))
+                .is_ok_and(|bytes| bytes == b"prior-callback-input");
+            let current_retained = std::fs::read(current_stage.join("usable-resource"))
+                .is_ok_and(|bytes| bytes == b"current-callback-input");
+            let memory_absent = !target
+                .grants
+                .lock()
+                .unwrap()
+                .contains_key(&current.grant_id);
+            eprintln!(
+                "preparation_activation_callback {}",
+                serde_json::json!({
+                    "case":case,"callbackAccepted":result.is_ok(),"priorGraphRetained":graph_retained,
+                    "journalUnchanged":journal_unchanged,"priorInputsRetained":prior_retained,
+                    "currentInputsRetained":current_retained,"memoryAbsent":memory_absent
+                })
+            );
+            if result.is_ok() != should_accept
+                || !prior_retained
+                || current_retained == aborted
+                || (should_accept && !graph_retained)
+                || (!should_accept && (!journal_unchanged || !memory_absent))
+                || (case == "cold_bound" && !journal_unchanged)
+            {
+                failed.push(case);
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "activation changed cold ownership or recreated aborted preparation: {failed:?}"
+        );
     }
 
     #[test]
