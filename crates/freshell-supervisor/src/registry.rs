@@ -22,7 +22,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 const ACTIVE_STATES: &str = "'prepared','created','starting','running','stopping'";
 
 type ExistingSoulLaunchRow = (
@@ -307,6 +307,21 @@ pub struct OwnedRuntimeHandle {
     terminal: Option<TerminalLaunchSpec>,
     fresh_agent: Option<FreshAgentLaunchSpec>,
     provider_volume_name: String,
+    // Ordinary Stop alone needs this fence. Keep it off the already-large
+    // handle carried through nested recovery futures and their polling stacks.
+    ordinary_stop: Option<Box<StopFence>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StopFence {
+    pub intent_revision: u64,
+    pub execution_generation: u64,
+}
+
+pub(crate) struct StopProgress {
+    pub outcome: Option<StopOutcome>,
+    pub capability: Option<(String, String)>,
+    pub settled: bool,
 }
 
 impl OwnedRuntimeHandle {
@@ -347,7 +362,16 @@ impl OwnedRuntimeHandle {
             terminal,
             fresh_agent,
             provider_volume_name,
+            ordinary_stop: None,
         }
+    }
+
+    pub(crate) fn stop_fence(&self) -> Result<StopFence, RegistryError> {
+        self.ordinary_stop.as_deref().copied().ok_or_else(|| {
+            RegistryError::InvalidState(
+                "runtime handle was not issued by an ordinary Stop transaction".into(),
+            )
+        })
     }
 
     pub fn installation_id(&self) -> &InstallationId {
@@ -1252,6 +1276,13 @@ impl Registry {
                     });
                 }
             }
+            // Capture ownership before changing PREPARED to stopping. An
+            // uncommitted enclosure must never acquire mutation authority.
+            let owned = load_owned_handle(&tx, installation, &incarnation_id);
+            let execution_generation: u64 = tx.query_row(
+                "SELECT execution_generation FROM incarnations WHERE incarnation_id=?1",
+                [incarnation_id.as_str()], |row| row.get(0),
+            )?;
             let now = now_millis();
             let next = revision
                 .checked_add(1)
@@ -1281,10 +1312,89 @@ impl Registry {
                 "UPDATE input_commands SET state='ambiguous',updated_at=?1 WHERE soul_id=?2 AND state='dispatching'",
                 params![now, soul_id.as_str()],
             )?;
+            insert_ordinary_stop(&tx, &soul_id, &incarnation_id, next, execution_generation,
+                owned.as_ref().ok(), owned.is_err().then_some(StopOutcome::BlockedOwnership))?;
+            if owned.is_err() {
+                tx.execute("UPDATE incarnations SET cleanup_state='blocked_ownership' WHERE incarnation_id=?1", [incarnation_id.as_str()])?;
+            }
             tx.commit()?;
-            load_owned_handle(&conn, installation, &incarnation_id)
+            let mut handle = owned?;
+            handle.ordinary_stop = Some(Box::new(StopFence { intent_revision: next, execution_generation }));
+            Ok(handle)
         })
         .await
+    }
+
+    /// Only the exact, still-current ordinary transaction issues a Stop
+    /// handle. Lost cleanup and repaired stopped data use separate authority.
+    pub async fn pending_stop_handles(&self) -> Result<Vec<OwnedRuntimeHandle>, RegistryError> {
+        let installation = self.installation_id().clone();
+        self.run_blocking(move |conn| {
+            let mut query = conn.prepare("SELECT p.incarnation_id,p.intent_revision,p.execution_generation FROM ordinary_stops p JOIN souls s ON s.soul_id=p.soul_id WHERE p.settled=0 AND s.desired_state='stopped' AND s.intent_revision=p.intent_revision ORDER BY p.updated_at,p.soul_id")?;
+            let rows = query.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?)))?.collect::<Result<Vec<_>,_>>()?;
+            let mut handles = Vec::new();
+            for (raw, intent_revision, execution_generation) in rows {
+                let incarnation = IncarnationId::parse(raw).map_err(|_| RegistryError::Integrity("invalid Stop incarnation".into()))?;
+                match load_owned_handle(&conn, installation.clone(), &incarnation) {
+                    Ok(mut handle) => {
+                        handle.ordinary_stop = Some(Box::new(StopFence { intent_revision, execution_generation }));
+                        if validate_ordinary_stop(&conn, &handle).is_ok() { handles.push(handle); }
+                    }
+                    Err(error) => tracing::warn!(incarnation_id=%incarnation, intent_revision, execution_generation, reason="blocked_ownership", error=%error, "supervisor.stop_pending_unowned"),
+                }
+            }
+            Ok(handles)
+        }).await
+    }
+
+    pub(crate) async fn stop_progress(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<StopProgress, RegistryError> {
+        let handle = handle.clone();
+        self.run_blocking(move |conn| validate_ordinary_stop(&conn, &handle))
+            .await
+    }
+
+    pub(crate) async fn record_ordinary_stop_outcome(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        outcome: StopOutcome,
+    ) -> Result<(), RegistryError> {
+        let handle = handle.clone();
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let progress = validate_ordinary_stop(&tx, &handle)?;
+            if !progress.settled && progress.outcome != Some(StopOutcome::VerifiedEmpty) {
+                mark_stop_outcome_in_tx(&tx, handle.incarnation_id(), outcome)?;
+                let pending = outcome == StopOutcome::VerifiedEmpty && progress.capability.is_some();
+                tx.execute("UPDATE ordinary_stops SET outcome=?1,revoke_pending=?2,settled=?3,updated_at=?4 WHERE soul_id=?5 AND incarnation_id=?6 AND intent_revision=?7",
+                    params![stop_outcome_name(outcome),pending,outcome == StopOutcome::VerifiedEmpty && !pending,now_millis(),handle.soul_id().as_str(),handle.incarnation_id().as_str(),handle.stop_fence()?.intent_revision])?;
+            }
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    pub(crate) async fn acknowledge_stop_revoke(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        endpoint: &str,
+        grant_id: &str,
+    ) -> Result<(), RegistryError> {
+        let handle = handle.clone();
+        let capability = (endpoint.to_owned(), grant_id.to_owned());
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let progress = validate_ordinary_stop(&tx, &handle)?;
+            if progress.outcome != Some(StopOutcome::VerifiedEmpty) || progress.capability.as_ref() != Some(&capability) {
+                return Err(RegistryError::InvalidState("Stop revoke acknowledgement changed target".into()));
+            }
+            tx.execute("UPDATE ordinary_stops SET revoke_pending=0,settled=1,updated_at=?1 WHERE soul_id=?2 AND incarnation_id=?3 AND intent_revision=?4 AND revoke_pending=1",
+                params![now_millis(),handle.soul_id().as_str(),handle.incarnation_id().as_str(),handle.stop_fence()?.intent_revision])?;
+            tx.commit()?;
+            Ok(())
+        }).await
     }
 
     /// Explicitly resumes a soul whose stopped OpenCode store was repaired.
@@ -1400,25 +1510,11 @@ impl Registry {
     ) -> Result<(), RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let (launch_state, cleanup_state) = match outcome {
-                StopOutcome::VerifiedEmpty => ("stopped", "verified_empty"),
-                StopOutcome::BlockedOwnership => ("stopping", "blocked_ownership"),
-                StopOutcome::BackendUnavailable | StopOutcome::TerminationUnconfirmed => ("stopping", "termination_unconfirmed"),
-            };
-            let now = now_millis();
-            tx.execute("UPDATE incarnations SET launch_state=?1,cleanup_state=?2,updated_at=?3 WHERE incarnation_id=?4", params![launch_state, cleanup_state, now, incarnation_id.as_str()])?;
-            if outcome == StopOutcome::VerifiedEmpty {
-                tx.execute("DELETE FROM writer_claims WHERE incarnation_id=?1", params![incarnation_id.as_str()])?;
-                tx.execute("DELETE FROM admission_reservations WHERE incarnation_id=?1", params![incarnation_id.as_str()])?;
-                tx.execute("UPDATE commands SET state='stopped',updated_at=?1 WHERE incarnation_id=?2", params![now, incarnation_id.as_str()])?;
-                tx.execute(
-                    "UPDATE souls SET recovery_state='stopped',recovery_reason='STOP_INTENT',recovery_attempt_id=NULL,updated_at=?1 WHERE soul_id=(SELECT soul_id FROM incarnations WHERE incarnation_id=?2) AND desired_state='stopped' AND recovery_state!='lost'",
-                    params![now, incarnation_id.as_str()],
-                )?;
-            }
+            mark_stop_outcome_in_tx(&tx, &incarnation_id, outcome)?;
             tx.commit()?;
             Ok(())
-        }).await
+        })
+        .await
     }
 
     pub async fn begin_input(
@@ -3647,6 +3743,204 @@ fn charge_successful_recovery(
     Ok(())
 }
 
+fn stop_outcome_name(outcome: StopOutcome) -> &'static str {
+    match outcome {
+        StopOutcome::VerifiedEmpty => "verified_empty",
+        StopOutcome::BackendUnavailable => "backend_unavailable",
+        StopOutcome::TerminationUnconfirmed => "termination_unconfirmed",
+        StopOutcome::BlockedOwnership => "blocked_ownership",
+    }
+}
+
+fn parse_stop_outcome(value: &str) -> Result<StopOutcome, RegistryError> {
+    match value {
+        "verified_empty" => Ok(StopOutcome::VerifiedEmpty),
+        "backend_unavailable" => Ok(StopOutcome::BackendUnavailable),
+        "termination_unconfirmed" => Ok(StopOutcome::TerminationUnconfirmed),
+        "blocked_ownership" => Ok(StopOutcome::BlockedOwnership),
+        _ => Err(RegistryError::Integrity(
+            "unknown ordinary Stop outcome".into(),
+        )),
+    }
+}
+
+fn create_ordinary_stop_schema(conn: &Connection) -> Result<(), RegistryError> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS ordinary_stops (
+        soul_id TEXT NOT NULL REFERENCES souls(soul_id),
+        incarnation_id TEXT NOT NULL REFERENCES incarnations(incarnation_id),
+        intent_revision INTEGER NOT NULL,
+        execution_generation INTEGER NOT NULL,
+        outcome TEXT CHECK(outcome IN ('verified_empty','backend_unavailable','termination_unconfirmed','blocked_ownership')),
+        capability_endpoint TEXT,
+        capability_grant_id TEXT,
+        revoke_pending INTEGER NOT NULL CHECK(revoke_pending IN (0,1)),
+        settled INTEGER NOT NULL CHECK(settled IN (0,1)),
+        updated_at INTEGER NOT NULL,
+        CHECK((capability_endpoint IS NULL) = (capability_grant_id IS NULL)),
+        CHECK(revoke_pending=0 OR (outcome='verified_empty' AND capability_grant_id IS NOT NULL AND settled=0)),
+        PRIMARY KEY(soul_id,incarnation_id,intent_revision)
+    );")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_ordinary_stop(
+    conn: &Connection,
+    soul: &SoulId,
+    incarnation: &IncarnationId,
+    revision: u64,
+    generation: u64,
+    handle: Option<&OwnedRuntimeHandle>,
+    outcome: Option<StopOutcome>,
+) -> Result<(), RegistryError> {
+    let capability = handle.and_then(|handle| {
+        handle
+            .terminal()
+            .and_then(|terminal| terminal.provider_launch_context.as_ref())
+            .or_else(|| {
+                handle
+                    .fresh_agent()
+                    .and_then(|agent| agent.provider_launch_context.as_ref())
+            })
+            .and_then(|context| context.mcp_capability.as_ref())
+    });
+    let pending = outcome == Some(StopOutcome::VerifiedEmpty) && capability.is_some();
+    conn.execute("INSERT OR IGNORE INTO ordinary_stops(soul_id,incarnation_id,intent_revision,execution_generation,outcome,capability_endpoint,capability_grant_id,revoke_pending,settled,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![soul.as_str(),incarnation.as_str(),revision,generation,outcome.map(stop_outcome_name),capability.map(|c| &c.endpoint),capability.map(|c| &c.grant_id),pending,outcome == Some(StopOutcome::VerifiedEmpty) && !pending,now_millis()])?;
+    Ok(())
+}
+
+fn migrate_ordinary_stops(conn: &Connection) -> Result<(), RegistryError> {
+    let installation: String =
+        conn.query_row("SELECT installation_id FROM installation", [], |r| r.get(0))?;
+    let installation = InstallationId::parse(installation)
+        .map_err(|_| RegistryError::Integrity("invalid installation".into()))?;
+    // Old tombstones did not name an incarnation. Admit only an unambiguous
+    // latest enclosure that already existed at that exact ordinary Stop.
+    let mut query = conn.prepare("SELECT s.soul_id,s.intent_revision,i.incarnation_id,i.execution_generation,i.cleanup_state FROM souls s JOIN stop_tombstones t ON t.soul_id=s.soul_id AND t.intent_revision=s.intent_revision JOIN incarnations i ON i.soul_id=s.soul_id WHERE s.desired_state='stopped' AND s.recovery_state!='lost' AND s.recovery_reason='STOP_INTENT' AND t.actor='supervisor' AND t.reason='managed stop' AND i.created_at<=t.committed_at AND NOT EXISTS(SELECT 1 FROM incarnations newer WHERE newer.soul_id=s.soul_id AND newer.incarnation_id!=i.incarnation_id AND newer.created_at>=i.created_at)")?;
+    let rows = query
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, u64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (soul, revision, incarnation, generation, cleanup) in rows {
+        let soul = SoulId::parse(soul)
+            .map_err(|_| RegistryError::Integrity("invalid Stop soul".into()))?;
+        let incarnation = IncarnationId::parse(incarnation)
+            .map_err(|_| RegistryError::Integrity("invalid Stop incarnation".into()))?;
+        let owned = load_owned_handle(conn, installation.clone(), &incarnation);
+        let outcome = match cleanup.as_str() {
+            "verified_empty" => Some(StopOutcome::VerifiedEmpty),
+            "blocked_ownership" => Some(StopOutcome::BlockedOwnership),
+            "termination_unconfirmed" => Some(StopOutcome::TerminationUnconfirmed),
+            _ if owned.is_err() => Some(StopOutcome::BlockedOwnership),
+            _ => None,
+        };
+        insert_ordinary_stop(
+            conn,
+            &soul,
+            &incarnation,
+            revision,
+            generation,
+            owned.as_ref().ok(),
+            outcome,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_ordinary_stop(
+    conn: &Connection,
+    handle: &OwnedRuntimeHandle,
+) -> Result<StopProgress, RegistryError> {
+    let fence = handle.stop_fence()?;
+    let (desired, revision, current_incarnation): (String,u64,String) = conn.query_row(
+        "SELECT desired_state,intent_revision,(SELECT incarnation_id FROM incarnations WHERE soul_id=s.soul_id ORDER BY created_at DESC,rowid DESC LIMIT 1) FROM souls s WHERE soul_id=?1",
+        [handle.soul_id().as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    )?;
+    if revision != fence.intent_revision {
+        return Err(RegistryError::StaleIntentRevision {
+            expected: fence.intent_revision,
+            current: revision,
+        });
+    }
+    if desired != "stopped" || current_incarnation != handle.incarnation_id().as_str() {
+        return Err(RegistryError::InvalidState(
+            "ordinary Stop target changed".into(),
+        ));
+    }
+    let current = load_owned_handle(
+        conn,
+        handle.installation_id.clone(),
+        handle.incarnation_id(),
+    )?;
+    if current.launch_nonce != handle.launch_nonce
+        || current.daemon_id != handle.daemon_id
+        || current.container_id != handle.container_id
+        || current.image_ref != handle.image_ref
+        || current.runtime_dir != handle.runtime_dir
+        || current.host_binary_path != handle.host_binary_path
+        || current.immutable_config_digest != handle.immutable_config_digest
+        || current.launch_policy != handle.launch_policy
+        || current.provider_store_id != handle.provider_store_id
+        || current.provider_volume_name != handle.provider_volume_name
+        || current.requested_limits != handle.requested_limits
+    {
+        return Err(RegistryError::InvalidState(
+            "ordinary Stop ownership changed".into(),
+        ));
+    }
+    type Row = (Option<String>, Option<String>, Option<String>, bool);
+    let (outcome, endpoint, grant, settled): Row = conn.query_row(
+        "SELECT p.outcome,p.capability_endpoint,p.capability_grant_id,p.settled FROM ordinary_stops p JOIN incarnations i ON i.incarnation_id=p.incarnation_id WHERE p.soul_id=?1 AND p.incarnation_id=?2 AND p.intent_revision=?3 AND p.execution_generation=?4 AND i.execution_generation=p.execution_generation",
+        params![handle.soul_id().as_str(),handle.incarnation_id().as_str(),fence.intent_revision,fence.execution_generation],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    )?;
+    Ok(StopProgress {
+        outcome: outcome.as_deref().map(parse_stop_outcome).transpose()?,
+        capability: endpoint.zip(grant),
+        settled,
+    })
+}
+
+fn mark_stop_outcome_in_tx(
+    conn: &Connection,
+    incarnation: &IncarnationId,
+    outcome: StopOutcome,
+) -> Result<(), RegistryError> {
+    let (launch_state, cleanup_state) = match outcome {
+        StopOutcome::VerifiedEmpty => ("stopped", "verified_empty"),
+        StopOutcome::BlockedOwnership => ("stopping", "blocked_ownership"),
+        StopOutcome::BackendUnavailable | StopOutcome::TerminationUnconfirmed => {
+            ("stopping", "termination_unconfirmed")
+        }
+    };
+    let now = now_millis();
+    conn.execute("UPDATE incarnations SET launch_state=?1,cleanup_state=?2,updated_at=?3 WHERE incarnation_id=?4", params![launch_state,cleanup_state,now,incarnation.as_str()])?;
+    if outcome == StopOutcome::VerifiedEmpty {
+        conn.execute(
+            "DELETE FROM writer_claims WHERE incarnation_id=?1",
+            [incarnation.as_str()],
+        )?;
+        conn.execute(
+            "DELETE FROM admission_reservations WHERE incarnation_id=?1",
+            [incarnation.as_str()],
+        )?;
+        conn.execute(
+            "UPDATE commands SET state='stopped',updated_at=?1 WHERE incarnation_id=?2",
+            params![now, incarnation.as_str()],
+        )?;
+        conn.execute("UPDATE souls SET recovery_state='stopped',recovery_reason='STOP_INTENT',recovery_attempt_id=NULL,updated_at=?1 WHERE soul_id=(SELECT soul_id FROM incarnations WHERE incarnation_id=?2) AND desired_state='stopped' AND recovery_state!='lost'", params![now,incarnation.as_str()])?;
+    }
+    Ok(())
+}
+
 fn create_recovery_retry_schema(conn: &Connection) -> Result<(), RegistryError> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS recovery_retries (
         soul_id TEXT NOT NULL REFERENCES souls(soul_id),
@@ -4071,6 +4365,7 @@ fn create_schema(
         CREATE TRIGGER view_intents_inventory_delete AFTER DELETE ON view_intents BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
     "#))?;
     create_recovery_retry_schema(&tx)?;
+    create_ordinary_stop_schema(&tx)?;
     tx.execute("INSERT INTO installation (singleton,installation_id,schema_version,control_epoch,inventory_revision,initial_scan_state) VALUES (1,?1,?2,0,0,'pending')", params![installation_id.as_str(), SCHEMA_VERSION])?;
     tx.execute(
         "INSERT INTO rollout_state (singleton,mode,updated_at) VALUES (1,'legacy',?1)",
@@ -4539,6 +4834,14 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.execute_batch("UPDATE installation SET schema_version=15,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
         tx.commit()?;
         schema = 15;
+    }
+    if schema == 15 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        create_ordinary_stop_schema(&tx)?;
+        migrate_ordinary_stops(&tx)?;
+        tx.execute_batch("UPDATE installation SET schema_version=16,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 16;
     }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(

@@ -7744,115 +7744,162 @@ mod automatic_retry_tests {
         assert_root_and_successes(&supervisor, &soul, 0).await;
     }
 
+    struct ReservedReplacement {
+        supervisor: Supervisor,
+        backend: Arc<RetryBackend>,
+        soul: SoulId,
+        original_intent_revision: u64,
+        attempt_id: String,
+        handle: OwnedRuntimeHandle,
+    }
+
+    async fn reserved_replacement(root: &Path, starting: bool) -> ReservedReplacement {
+        let (supervisor, backend, _) = open(root, 0);
+        let soul = seed(&supervisor).await;
+        let original = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let reserved = supervisor
+            .registry
+            .reserve_due_recovery_retry(soul.clone(), original.intent_revision, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let start = supervisor
+            .registry
+            .begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::ProviderExit,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        supervisor
+            .registry
+            .mark_stop_outcome(
+                original.prior_handle.incarnation_id().clone(),
+                StopOutcome::VerifiedEmpty,
+            )
+            .await
+            .unwrap();
+        let replacement = supervisor
+            .registry
+            .prepare_replacement(
+                start,
+                None,
+                None,
+                original.resume_spec,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        let runtime = root
+            .join("runtime")
+            .join(replacement.prepared.incarnation_id.as_str());
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"retry-secret").unwrap();
+        let created = backend
+            .create_stopped(&CreateRuntimeSpec {
+                installation_id: supervisor.registry.installation_id().clone(),
+                soul_id: soul.clone(),
+                incarnation_id: replacement.prepared.incarnation_id.clone(),
+                image_ref: supervisor.config.image_ref.clone(),
+                host_binary_path: supervisor.config.host_binary_path.clone(),
+                runtime_dir: runtime.clone(),
+                limits: original.requested_limits,
+                test_run_id: "retry-reopen".into(),
+                terminal: None,
+                fresh_agent: None,
+                opencode_transfer_dir: None,
+                provider_volume_name: "retry-volume".into(),
+            })
+            .await
+            .unwrap();
+        supervisor
+            .registry
+            .commit_created(
+                replacement.prepared.incarnation_id.clone(),
+                crate::registry::BackendCreatedRecord {
+                    daemon_id: created.daemon_id,
+                    container_id: created.container_id.clone(),
+                    image_ref: supervisor.config.image_ref.clone(),
+                    runtime_dir: runtime,
+                    host_binary_path: supervisor.config.host_binary_path.clone(),
+                    immutable_config_digest: created.immutable_config_digest,
+                    launch_policy: None,
+                },
+            )
+            .await
+            .unwrap();
+        if starting {
+            let handle = supervisor
+                .registry
+                .owned_handle(replacement.prepared.incarnation_id.clone())
+                .await
+                .unwrap();
+            backend.start_host(&handle).await.unwrap();
+            supervisor
+                .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+                .await
+                .unwrap();
+            let boot = HostBootId::parse(
+                std::fs::read_to_string(handle.runtime_dir().join("fixture-boot")).unwrap(),
+            )
+            .unwrap();
+            supervisor
+                .registry
+                .commit_execution_grant(
+                    handle.incarnation_id().clone(),
+                    boot,
+                    original.requested_limits,
+                )
+                .await
+                .unwrap();
+        }
+        let handle = supervisor
+            .registry
+            .owned_handle(replacement.prepared.incarnation_id)
+            .await
+            .unwrap();
+        ReservedReplacement {
+            supervisor,
+            backend,
+            soul,
+            original_intent_revision: original.intent_revision,
+            attempt_id: reserved.reserved_attempt_id.unwrap().to_string(),
+            handle,
+        }
+    }
+
+    async fn close_retry_hosts(backend: &RetryBackend) {
+        let hosts = backend
+            .hosts
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|(_, task)| task)
+            .collect::<Vec<_>>();
+        for task in hosts {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     #[tokio::test]
     async fn retry_resumes_owned_created_and_starting_replacements_without_creation() {
         for starting in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let (supervisor, backend, _) = open(dir.path(), 0);
-            let soul = seed(&supervisor).await;
-            let original = supervisor
-                .registry
-                .recovery_context(soul.clone())
-                .await
-                .unwrap();
-            let reserved = supervisor
-                .registry
-                .reserve_due_recovery_retry(soul.clone(), original.intent_revision, 0)
-                .await
-                .unwrap()
-                .unwrap();
-            let start = supervisor
-                .registry
-                .begin_recovery(
-                    soul.clone(),
-                    RecoveryTrigger::ProviderExit,
-                    RecoveryPath::NativeResume,
-                )
-                .await
-                .unwrap();
-            supervisor
-                .registry
-                .mark_stop_outcome(
-                    original.prior_handle.incarnation_id().clone(),
-                    StopOutcome::VerifiedEmpty,
-                )
-                .await
-                .unwrap();
-            let replacement = supervisor
-                .registry
-                .prepare_replacement(
-                    start,
-                    None,
-                    None,
-                    original.resume_spec,
-                    RecoveryPath::NativeResume,
-                )
-                .await
-                .unwrap();
-            let runtime = dir
-                .path()
-                .join("runtime")
-                .join(replacement.prepared.incarnation_id.as_str());
-            std::fs::create_dir_all(&runtime).unwrap();
-            std::fs::write(runtime.join("secret"), b"retry-secret").unwrap();
-            let created = backend
-                .create_stopped(&CreateRuntimeSpec {
-                    installation_id: supervisor.registry.installation_id().clone(),
-                    soul_id: soul.clone(),
-                    incarnation_id: replacement.prepared.incarnation_id.clone(),
-                    image_ref: supervisor.config.image_ref.clone(),
-                    host_binary_path: supervisor.config.host_binary_path.clone(),
-                    runtime_dir: runtime.clone(),
-                    limits: original.requested_limits,
-                    test_run_id: "retry-reopen".into(),
-                    terminal: None,
-                    fresh_agent: None,
-                    opencode_transfer_dir: None,
-                    provider_volume_name: "retry-volume".into(),
-                })
-                .await
-                .unwrap();
-            supervisor
-                .registry
-                .commit_created(
-                    replacement.prepared.incarnation_id.clone(),
-                    crate::registry::BackendCreatedRecord {
-                        daemon_id: created.daemon_id,
-                        container_id: created.container_id.clone(),
-                        image_ref: supervisor.config.image_ref.clone(),
-                        runtime_dir: runtime,
-                        host_binary_path: supervisor.config.host_binary_path.clone(),
-                        immutable_config_digest: created.immutable_config_digest,
-                        launch_policy: None,
-                    },
-                )
-                .await
-                .unwrap();
-            if starting {
-                let handle = supervisor
-                    .registry
-                    .owned_handle(replacement.prepared.incarnation_id.clone())
-                    .await
-                    .unwrap();
-                backend.start_host(&handle).await.unwrap();
-                supervisor
-                    .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-                    .await
-                    .unwrap();
-                let boot = HostBootId::parse(
-                    std::fs::read_to_string(handle.runtime_dir().join("fixture-boot")).unwrap(),
-                )
-                .unwrap();
-                supervisor
-                    .registry
-                    .commit_execution_grant(
-                        handle.incarnation_id().clone(),
-                        boot,
-                        original.requested_limits,
-                    )
-                    .await
-                    .unwrap();
-            }
+            let ReservedReplacement {
+                supervisor,
+                backend,
+                soul,
+                original_intent_revision: _,
+                attempt_id,
+                handle,
+            } = reserved_replacement(dir.path(), starting).await;
+            close_retry_hosts(&backend).await;
             drop(supervisor);
             drop(backend);
             let (supervisor, backend, _) = open(dir.path(), 1_000);
@@ -7869,18 +7916,76 @@ mod automatic_retry_tests {
             );
             assert_eq!(
                 current.prior_handle.incarnation_id(),
-                &replacement.prepared.incarnation_id
+                handle.incarnation_id()
             );
-            assert_eq!(current.prior_handle.container_id(), created.container_id);
+            assert_eq!(current.prior_handle.container_id(), handle.container_id());
             assert_eq!(backend.count("creates"), 1);
-            assert_eq!(
-                attempts(dir.path()),
-                vec![(
-                    reserved.reserved_attempt_id.unwrap().to_string(),
-                    "succeeded".into()
-                )]
-            );
+            assert_eq!(attempts(dir.path()), vec![(attempt_id, "succeeded".into())]);
             assert_root_and_successes(&supervisor, &soul, 1).await;
+            close_retry_hosts(&backend).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_cancels_reserved_created_and_starting_replacements() {
+        for starting in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let ReservedReplacement {
+                supervisor,
+                backend,
+                soul,
+                original_intent_revision,
+                attempt_id,
+                handle,
+            } = reserved_replacement(dir.path(), starting).await;
+            let stop = supervisor.registry.begin_stop(soul.clone()).await.unwrap();
+            assert_eq!(stop.incarnation_id(), handle.incarnation_id());
+            assert!(supervisor
+                .registry
+                .recovery_retry(soul.clone(), original_intent_revision)
+                .await
+                .unwrap()
+                .is_none());
+            close_retry_hosts(&backend).await;
+            drop(supervisor);
+            drop(backend);
+            let (supervisor, backend, _) = open(dir.path(), 1_000);
+            let report = supervisor.reconcile_startup().await.unwrap();
+            assert!(
+                report.results.iter().all(|result| result.error.is_none()),
+                "{report:?}"
+            );
+            let current = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(current.desired_state, DesiredState::Stopped);
+            assert_eq!(
+                current.intent_revision,
+                stop.stop_fence().unwrap().intent_revision
+            );
+            assert_eq!(
+                current.prior_handle.incarnation_id(),
+                handle.incarnation_id()
+            );
+            assert_eq!(current.prior_handle.container_id(), handle.container_id());
+            assert_eq!(backend.count("creates"), 1);
+            assert_eq!(attempts(dir.path()), vec![(attempt_id, "cancelled".into())]);
+            assert!(supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .is_empty());
+            assert_root_and_successes(&supervisor, &soul, 0).await;
+            let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+            let (generation, writers): (u64,u64) = conn.query_row(
+                "SELECT execution_generation,(SELECT count(*) FROM writer_claims WHERE soul_id=?1) FROM incarnations WHERE incarnation_id=?2",
+                rusqlite::params![soul.as_str(), handle.incarnation_id().as_str()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(generation, u64::from(starting));
+            assert_eq!(writers, 0);
+            close_retry_hosts(&backend).await;
         }
     }
 

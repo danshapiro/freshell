@@ -83,6 +83,38 @@ impl Supervisor {
         let timeout = startup_soul_timeout();
         let mut tasks = JoinSet::new();
 
+        for handle in self
+            .registry
+            .pending_stop_handles()
+            .await
+            .map_err(map_registry)?
+        {
+            let supervisor = self.clone();
+            let semaphore = Arc::clone(&semaphore);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tasks.spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let observed = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(observed, Ordering::SeqCst);
+                let result =
+                    tokio::time::timeout(timeout, supervisor.continue_pending_stop(&handle)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, String>(StartupSoulResult {
+                    soul_id: handle.soul_id().clone(),
+                    outcome: None,
+                    error: match result {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error.message),
+                        Err(_) => Some(format!("startup Stop exceeded {}ms", timeout.as_millis())),
+                    },
+                })
+            });
+        }
+
         for (soul_id, intent_revision) in latest {
             let only_due_retry = due.contains_key(&soul_id);
             let supervisor = self.clone();
@@ -222,6 +254,31 @@ impl Supervisor {
         }
         let mut tasks = JoinSet::new();
         let semaphore = Arc::new(Semaphore::new(startup_concurrency_limit()));
+        for handle in self
+            .registry
+            .pending_stop_handles()
+            .await
+            .map_err(map_registry)?
+        {
+            let supervisor = self.clone();
+            let semaphore = Arc::clone(&semaphore);
+            tasks.spawn(async move {
+                let _permit = semaphore.acquire_owned().await.map_err(|error| {
+                    RuntimeError::new(RuntimeErrorCode::RegistryFailure, error.to_string())
+                })?;
+                tokio::time::timeout(
+                    startup_soul_timeout(),
+                    supervisor.continue_pending_stop(&handle),
+                )
+                .await
+                .map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::BackendUnavailable,
+                        "ordinary Stop continuation timed out",
+                    )
+                })?
+            });
+        }
         for (_, view) in latest {
             if view.desired_state != DesiredState::Running
                 || (!due.contains_key(&view.soul_id)
@@ -351,6 +408,27 @@ impl Supervisor {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    async fn continue_pending_stop(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+    ) -> Result<(), RuntimeError> {
+        let lock = self.lifecycle_lock(handle.soul_id()).await;
+        let _guard = lock.lock().await;
+        self.finish_stop_handle(handle).await?;
+        let progress = self
+            .registry
+            .stop_progress(handle)
+            .await
+            .map_err(map_registry)?;
+        if !progress.settled {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryBlocked,
+                format!("ordinary Stop remains pending: {:?}", progress.outcome),
+            ));
         }
         Ok(())
     }
