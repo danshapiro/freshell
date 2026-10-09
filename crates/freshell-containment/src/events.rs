@@ -28,10 +28,25 @@ macro_rules! keyed {
     };
 }
 
-/// A stop was requested (`mode`: graceful or force).
+/// A stop was requested (`mode`: graceful or force): the request that
+/// started the unit's stop (`joined: false`).
 pub fn stop_requested(k: &UnitLogKeys, reason: &str, mode: &str, initiator: &str) {
     keyed!(info, k, "unit.stop.requested", reason = %reason, mode = %mode, initiator = %initiator,
-        "unit stop requested");
+        joined = false, replaced_reason = false, "unit stop requested");
+}
+
+/// A stop request that joined the stop already in flight (`joined: true`),
+/// with the joiner's own reason, mode and initiator; `replaced_reason` says
+/// whether it took over the stop's reason (a user kill joining a weaker stop).
+pub fn stop_joined(
+    k: &UnitLogKeys,
+    reason: &str,
+    mode: &str,
+    initiator: &str,
+    replaced_reason: bool,
+) {
+    keyed!(info, k, "unit.stop.requested", reason = %reason, mode = %mode, initiator = %initiator,
+        joined = true, replaced_reason, "unit stop request joined the stop in flight");
 }
 
 /// A signal was sent to one member (`pid` 0 when the target has no single pid).

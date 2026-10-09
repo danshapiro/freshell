@@ -577,7 +577,7 @@ impl AgentUnit {
     }
 
     fn join(&self, state: &Arc<StopState>, req: StopRequest) {
-        let replaced = {
+        let (replaced, operation_id) = {
             let mut m = lock(&state.m);
             if req.mode == StopMode::Force {
                 m.forced = true;
@@ -586,14 +586,22 @@ impl AgentUnit {
             if replace {
                 m.reason = req.reason.clone();
             }
-            replace.then(|| (m.reason.as_str(), m.operation_id.clone()))
+            (replace, m.operation_id.clone())
         };
+        let keys = self.log_keys(operation_id);
+        events::stop_joined(
+            &keys,
+            req.reason.as_str(),
+            req.mode.as_str(),
+            &req.initiator,
+            replaced,
+        );
         if req.mode == StopMode::Force {
             state.force_joins.send_modify(|n| *n += 1);
         }
-        if let Some((reason, operation_id)) = replaced {
+        if replaced {
             let unit = self.clone();
-            let keys = self.log_keys(operation_id);
+            let reason = req.reason.as_str();
             tokio::spawn(async move {
                 let rewritten = blocking(move || unit.rewrite_stopping_reason(reason)).await;
                 if let Err(err) = rewritten.and_then(|r| r) {
@@ -1176,5 +1184,133 @@ impl StopState {
 
     fn elapsed_ms(&self) -> u64 {
         self.requested.elapsed().as_millis() as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{BackendKind, KillSummary};
+    use crate::log_capture::{capture, CapturedEvent, FieldValue};
+
+    /// A unit with no processes: the stop has nothing to signal or wait for.
+    struct NoProcesses;
+
+    impl UnitBackend for NoProcesses {
+        fn placement(&self, _role: MemberRole, _seq: u32) -> io::Result<Placement> {
+            Ok(Placement::default())
+        }
+        fn kill_all(
+            self: Arc<Self>,
+            _roots: Vec<(u32, u64)>,
+        ) -> BoxFuture<'static, io::Result<KillSummary>> {
+            Box::pin(async { Ok(KillSummary::default()) })
+        }
+        fn members(&self, _roots: &[(u32, u64)]) -> io::Result<Vec<ProcIdentity>> {
+            Ok(Vec::new())
+        }
+        fn confirm_placement(&self, _pid: u32, _roots: &[(u32, u64)]) -> io::Result<()> {
+            Ok(())
+        }
+        fn wait_empty(&self) -> Option<BoxFuture<'static, ()>> {
+            None
+        }
+        fn remove(&self, _emptied: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn unit_on(backend: Arc<dyn UnitBackend>) -> AgentUnit {
+        AgentUnit::new(
+            UnitId::mint(),
+            backend,
+            Capability {
+                kind: BackendKind::LinuxTag,
+                full: false,
+                reason: None,
+            },
+            Arc::new(RecordStore::open(std::path::Path::new(""))),
+            UnitLabel {
+                provider: "codex".into(),
+                session_id: Some("s-1".into()),
+                terminal_id: Some("t-1".into()),
+                mode: "codex".into(),
+                create_request_id: None,
+            },
+            None,
+        )
+    }
+
+    /// Every event `f` emits on this thread, `f` running on a current-thread
+    /// runtime (so the stop task runs on this thread too).
+    fn capture_on_runtime(f: impl std::future::Future<Output = ()>) -> Vec<CapturedEvent> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        capture(|| runtime.block_on(f))
+    }
+
+    fn named<'a>(events: &'a [CapturedEvent], name: &str) -> Vec<&'a CapturedEvent> {
+        events.iter().filter(|e| e.str("event") == name).collect()
+    }
+
+    fn assert_unit_keys(event: &CapturedEvent, unit: &AgentUnit, operation_id: &str) {
+        assert_eq!(event.str("unit_id"), unit.id().as_str(), "{event:?}");
+        assert_eq!(event.str("provider"), "codex", "{event:?}");
+        assert_eq!(event.str("session_id"), "s-1", "{event:?}");
+        assert_eq!(event.str("terminal_id"), "t-1", "{event:?}");
+        assert_eq!(event.str("operation_id"), operation_id, "{event:?}");
+    }
+
+    #[test]
+    fn every_joining_stop_request_is_logged_with_its_own_reason_mode_and_initiator() {
+        let unit = unit_on(Arc::new(NoProcesses));
+        let events = capture_on_runtime(async {
+            let handle = unit.stop(
+                StopRequest::new(
+                    StopMode::Graceful {
+                        grace: Duration::from_secs(30),
+                    },
+                    StopReason::Cleanup,
+                    "idle-cleanup",
+                )
+                .operation("op-1"),
+            );
+            // Both join before the stop task first runs.
+            unit.stop(StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws"));
+            unit.stop(StopRequest::new(
+                StopMode::Force,
+                StopReason::Respawn,
+                "mcp",
+            ));
+            handle.wait().await;
+        });
+        let requested = named(&events, "unit.stop.requested");
+        let got: Vec<(&str, &str, &str, &FieldValue, &FieldValue)> = requested
+            .iter()
+            .map(|e| {
+                (
+                    e.str("reason"),
+                    e.str("mode"),
+                    e.str("initiator"),
+                    &e.fields["joined"],
+                    &e.fields["replaced_reason"],
+                )
+            })
+            .collect();
+        let (yes, no) = (&FieldValue::Bool(true), &FieldValue::Bool(false));
+        assert_eq!(
+            got,
+            [
+                ("cleanup", "graceful", "idle-cleanup", no, no),
+                ("shift-x", "force", "ws", yes, yes),
+                ("respawn", "force", "mcp", yes, no),
+            ]
+        );
+        for event in requested {
+            assert_eq!(event.level, tracing::Level::INFO);
+            assert_unit_keys(event, &unit, "op-1");
+        }
     }
 }
