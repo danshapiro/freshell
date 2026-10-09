@@ -36,10 +36,12 @@
 //! to hard and stays there, which is where Node ends anyway. Those sites are
 //! the Claude sidecar, the Claude model-catalog probe and the Claude
 //! session-names helper. Sites whose program may be Node, Bun or native (the
-//! Codex app-server command, `opencode`) keep the reset; there a reset that
-//! is several milliseconds late, which needs the spawning thread to stall,
-//! can still leave a Node or Bun child, and what it starts later, at the
-//! original limit.
+//! Codex app-server command, `opencode`, and the PTY, whose program is the
+//! CLI itself in a terminal-mode coding-agent pane, for example the npm
+//! `codex` launcher) keep the reset, because shells and native programs need
+//! it; there a reset that is several milliseconds late, which needs the
+//! spawning thread to stall, can still leave a Node or Bun child, and what it
+//! starts later, at the original limit.
 //!
 //! Only Linux can set another process's limit. On macOS every child keeps
 //! the raised limit (a pre-exec step would bring back the fork), and Windows
