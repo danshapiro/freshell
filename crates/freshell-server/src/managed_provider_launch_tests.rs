@@ -16,6 +16,33 @@ use std::{
     time::Duration,
 };
 
+// Read only the fixture's actual native process (or its bounded hook ancestry).
+// argv/environment bytes stay transient; only profile compliance is reported.
+const NATIVE_EXEC_PROFILE: &str = r#"
+function nativeExecProfile(target) {
+ let pid=target==='self'?process.pid:process.ppid;
+ if(target==='claude') {
+  let found=false;
+  for(let depth=0;depth<16&&pid>1;depth++) {
+   if(fs.readlinkSync('/proc/'+pid+'/exe').split('/').pop()==='claude') {found=true;break;}
+   const status=fs.readFileSync('/proc/'+pid+'/status','utf8');
+   pid=Number(status.match(/^PPid:\s+(\d+)/m)[1]);
+  }
+  if(!found)throw Error('closed native hook ancestry unavailable');
+ }
+ const prefix='/proc/'+pid+'/',argv=fs.readFileSync(prefix+'cmdline'),env=fs.readFileSync(prefix+'environ');
+ const strings=[...argv.toString().split('\0').filter(Boolean),...env.toString().split('\0').filter(Boolean)];
+ const stack=fs.readFileSync(prefix+'limits','utf8').match(/^Max stack size\s+(\S+)/m)[1];
+ const result={stackAtLeast8MiB:stack==='unlimited'||Number(stack)>=8388608,aggregateWithin1MiB:argv.length+env.length+8*(strings.length+2)+Buffer.byteLength(fs.readlinkSync(prefix+'exe'))+1<=1048576,completeStringsWithin32Pages:strings.every(value=>Buffer.byteLength(value)+1<=131072)};
+ if(Object.values(result).some(value=>!value))throw Error('closed final native execution profile exceeded');
+ return result;
+}
+"#;
+
+fn native_exec_profile() -> Value {
+    json!({"stackAtLeast8MiB":true,"aggregateWithin1MiB":true,"completeStringsWithin32Pages":true})
+}
+
 fn assert_private_sentinels_absent(root: &Path, certificate_sentinel: &[u8]) {
     for entry in std::fs::read_dir(root).unwrap() {
         let entry = entry.unwrap();
@@ -615,16 +642,22 @@ async fn managed_provider_amplifier_terminal_native_startup_consumes_prepared_in
     std::fs::write(skill.join("run"),"#!/usr/bin/env node\nconst fs=require('node:fs'),path=require('node:path');process.stdout.write(fs.readFileSync(path.join(__dirname,'resource'),'utf8')+':'+require('probe-dependency'));").unwrap();
     std::fs::set_permissions(skill.join("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let context_module = r#"__amplifier_module_type__='context'
+import hashlib,json
+from pathlib import Path
 class Context:
-    def __init__(self): self.messages=[]; self.factory=None
+    def __init__(self,session_id,config): self.messages=[]; self.factory=None; self.session_id=session_id; self.config=config
     async def add_message(self,message): self.messages.append(message)
     async def get_messages(self): return list(self.messages)
     async def get_messages_for_request(self,**kwargs): return list(self.messages)
-    async def set_messages(self,messages): self.messages=list(messages)
+    async def set_messages(self,messages):
+        self.messages=list(messages)
+        pair=[{'role':m.get('role'),'content':m.get('content')} for m in self.messages if m.get('role') in ['user','assistant']]
+        value={'sessionId':self.session_id,'roles':[m['role'] for m in pair],'messageCount':len(pair),'digest':hashlib.sha256(json.dumps(pair,separators=(',',':'),sort_keys=True).encode()).hexdigest()}
+        Path(self.config['conversation_receipt']).write_text(json.dumps(value))
     async def clear(self): self.messages=[]
     async def set_system_prompt_factory(self,factory): self.factory=factory
     def get_context_info(self): return {'message_count':len(self.messages),'token_count':0}
-async def mount(coordinator,config=None): await coordinator.mount('context',Context())
+async def mount(coordinator,config=None): await coordinator.mount('context',Context(coordinator.session_id,config or {}))
 "#;
     let loop_module = r#"__amplifier_module_type__='orchestrator'
 class Loop:
@@ -632,9 +665,10 @@ class Loop:
 async def mount(coordinator,config=None): await coordinator.mount('orchestrator',Loop())
 "#;
     let hook_module = r#"__amplifier_module_type__='hook'
-import hashlib,json,os,subprocess,urllib.request
+import hashlib,json,os,resource,secrets,subprocess,urllib.request
 from pathlib import Path
 from amplifier_core import HookResult
+from amplifier_app_cli.session_store import SessionStore
 _consumer=None
 async def mount(coordinator,config=None):
     global _consumer
@@ -644,7 +678,22 @@ async def mount(coordinator,config=None):
         output=subprocess.check_output([str(Path.home()/'.amplifier/skills/probe/run')])
         request=urllib.request.Request(os.environ['FRESHELL_URL']+'/api/mcp',data=b'{}',headers={'x-auth-token':os.environ['FRESHELL_TOKEN']})
         with urllib.request.urlopen(request,timeout=5) as response: authenticated=response.status==200
-        result={'nativeCallback':event=='on_session_ready','exactIdentity':data.get('session_id')==config['session_id'],'physicalHome':str(Path.home()),'authenticated':authenticated,'scopedAlias':os.environ.get('FRESHELL')=='1','onecli':hashlib.sha256(os.environ.get('OPENAI_API_KEY','').encode()).hexdigest()==config['key_digest'],'nativeModuleInstaller':uv.startswith('uv 0.8.22'),'resourceAndDependency':hashlib.sha256(output).hexdigest()}
+        seed_receipt=Path(config['receipt']).with_suffix('.seed.json')
+        if not seed_receipt.exists():
+            store=SessionStore()
+            transcript,metadata=store.load(coordinator.session_id)
+            if transcript: raise RuntimeError('closed seed setup requires an empty native stub')
+            pair=[{'role':'user','content':secrets.token_hex(16)},{'role':'assistant','content':secrets.token_hex(16)}]
+            store.save(coordinator.session_id,pair,metadata)
+            persisted,persisted_metadata=store.load(coordinator.session_id)
+            if persisted!=pair or persisted_metadata.get('session_id')!=coordinator.session_id: raise RuntimeError('closed native seed verification failed')
+            value={'sessionId':coordinator.session_id,'roles':[m['role'] for m in pair],'messageCount':len(pair),'digest':hashlib.sha256(json.dumps(pair,separators=(',',':'),sort_keys=True).encode()).hexdigest()}
+            seed_receipt.write_text(json.dumps(value))
+        argv=Path('/proc/self/cmdline').read_bytes(); env=Path('/proc/self/environ').read_bytes(); strings=[value for value in (argv+env).split(b'\x00') if value]
+        stack=resource.getrlimit(resource.RLIMIT_STACK)[0]
+        profile={'stackAtLeast8MiB':stack==resource.RLIM_INFINITY or stack>=8388608,'aggregateWithin1MiB':len(argv)+len(env)+8*(len(strings)+2)+len(os.readlink('/proc/self/exe').encode())+1<=1048576,'completeStringsWithin32Pages':all(len(value)+1<=131072 for value in strings)}
+        if not all(profile.values()): raise RuntimeError('closed final native execution profile exceeded')
+        result={'finalExecProfile':profile,'nativeCallback':event=='on_session_ready','exactIdentity':data.get('session_id')==config['session_id'],'physicalHome':str(Path.home()),'authenticated':authenticated,'scopedAlias':os.environ.get('FRESHELL')=='1','onecli':hashlib.sha256(os.environ.get('OPENAI_API_KEY','').encode()).hexdigest()==config['key_digest'],'nativeModuleInstaller':uv.startswith('uv 0.8.22'),'resourceAndDependency':hashlib.sha256(output).hexdigest()}
         Path(config['receipt']).write_text(json.dumps(result))
         return HookResult(action='continue')
     _consumer=consume
@@ -668,7 +717,8 @@ async def on_session_ready(coordinator):
     }
     let native_id = "41a04bb3-86f0-463d-97c5-f085e8a9ea4b";
     let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-    let bundle_document=format!("bundle:\n  name: closed-native-bundle\nsession:\n  orchestrator:\n    module: loop-probe\n    source: ./modules/loop-probe\n  context:\n    module: context-probe\n    source: ./modules/context-probe\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\nhooks:\n  - module: hooks-probe\n    source: ./modules/hooks-probe\n    config:\n      receipt: {}\n      session_id: {}\n      key_digest: {}\n",serde_json::to_string(receipt.to_str().unwrap()).unwrap(),native_id,hash(b"synthetic-amplifier-onecli-value"));
+    let conversation_receipt = workspace.join("amplifier-conversation.json");
+    let bundle_document=format!("bundle:\n  name: closed-native-bundle\nsession:\n  orchestrator:\n    module: loop-probe\n    source: ./modules/loop-probe\n  context:\n    module: context-probe\n    source: ./modules/context-probe\n    config:\n      conversation_receipt: {}\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\nhooks:\n  - module: hooks-probe\n    source: ./modules/hooks-probe\n    config:\n      receipt: {}\n      session_id: {}\n      key_digest: {}\n",serde_json::to_string(conversation_receipt.to_str().unwrap()).unwrap(),serde_json::to_string(receipt.to_str().unwrap()).unwrap(),native_id,hash(b"synthetic-amplifier-onecli-value"));
     std::fs::write(bundle.join("bundle.yaml"), &bundle_document).unwrap();
     let settings=format!("bundle:\n  active: file://{}\nproviders:\n  - module: provider-vllm\n    config:\n      base_url: http://127.0.0.1:9\n      default_model: closed-model-free\n",bundle.display());
     std::fs::write(home.join(".amplifier/settings.yaml"), &settings).unwrap();
@@ -694,28 +744,26 @@ async def on_session_ready(coordinator):
     std::fs::write(&secret_file, "closed-synthetic-control-secret").unwrap();
     std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     freshell_supervisor::backend::docker::configure_capability_dir(&socket).unwrap();
-    let supervisor = Supervisor::new(
-        registry.clone(),
-        Arc::new(BrokerAuthorizedBackend {
-            real: DockerEngineBackend::new(fixture.join("broker.sock")),
-            control: control.clone(),
-            handoff: fixture.join("handoff"),
-            certificate_sentinel: b"synthetic-amplifier-onecli-value".to_vec(),
-        }),
-        SupervisorConfig {
-            runtime_root: runtime,
-            control_socket_path: socket.clone(),
-            host_binary_path: PathBuf::from(
-                std::env::var_os("FRESHELL_PROVIDER_LAUNCH_HOST_BINARY").unwrap(),
-            ),
-            image_ref: std::env::var("FRESHELL_PROVIDER_LAUNCH_IMAGE").unwrap(),
-            test_run_id: std::env::var("FRESHELL_PROVIDER_LAUNCH_RUN_ID").unwrap(),
-            control_secret: "closed-synthetic-control-secret".into(),
-            lifecycle_log: fixture.join("lifecycle.jsonl"),
-            admission: AdmissionPolicy::default(),
-        },
-    )
-    .unwrap();
+    let backend = Arc::new(BrokerAuthorizedBackend {
+        real: DockerEngineBackend::new(fixture.join("broker.sock")),
+        control: control.clone(),
+        handoff: fixture.join("handoff"),
+        certificate_sentinel: b"synthetic-amplifier-onecli-value".to_vec(),
+    });
+    let supervisor_config = SupervisorConfig {
+        runtime_root: runtime,
+        control_socket_path: socket.clone(),
+        host_binary_path: PathBuf::from(
+            std::env::var_os("FRESHELL_PROVIDER_LAUNCH_HOST_BINARY").unwrap(),
+        ),
+        image_ref: std::env::var("FRESHELL_PROVIDER_LAUNCH_IMAGE").unwrap(),
+        test_run_id: std::env::var("FRESHELL_PROVIDER_LAUNCH_RUN_ID").unwrap(),
+        control_secret: "closed-synthetic-control-secret".into(),
+        lifecycle_log: fixture.join("lifecycle.jsonl"),
+        admission: AdmissionPolicy::default(),
+    };
+    let supervisor =
+        Supervisor::new(registry.clone(), backend.clone(), supervisor_config.clone()).unwrap();
     let control_task = tokio::spawn({
         let socket = socket.clone();
         async move {
@@ -978,7 +1026,7 @@ async def on_session_ready(coordinator):
             json!({"provider":"amplifier","route":"terminal","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"classes":classes,"classifiedErrors":classified_errors})
         );
     }
-    let expected = json!({"nativeCallback":true,"exactIdentity":true,"physicalHome":"/home/freshell/provider","authenticated":true,"scopedAlias":true,"onecli":true,"nativeModuleInstaller":true,"resourceAndDependency":hash(b"closed-amplifier-resource:closed-amplifier-dependency")});
+    let expected = json!({"finalExecProfile":native_exec_profile(),"nativeCallback":true,"exactIdentity":true,"physicalHome":"/home/freshell/provider","authenticated":true,"scopedAlias":true,"onecli":true,"nativeModuleInstaller":true,"resourceAndDependency":hash(b"closed-amplifier-resource:closed-amplifier-dependency")});
     assert_eq!(observed.expect("real Amplifier must activate selected local module and executable skill before a model turn"),expected);
     assert!(
         !output.exited,
@@ -986,7 +1034,7 @@ async def on_session_ready(coordinator):
     );
     println!(
         "provider_launch_consumer {}",
-        json!({"provider":"amplifier","route":"terminal","digest":hash(serde_json::to_vec(&expected).unwrap().as_slice())})
+        json!({"provider":"amplifier","route":"terminal","finalExecProfile":native_exec_profile(),"digest":hash(serde_json::to_vec(&expected).unwrap().as_slice())})
     );
     assert_eq!(
         std::fs::read_to_string(home.join(".amplifier/settings.yaml")).unwrap(),
@@ -996,12 +1044,461 @@ async def on_session_ready(coordinator):
         std::fs::read_to_string(bundle.join("bundle.yaml")).unwrap(),
         bundle_document
     );
+    let soul = SoulId::parse(terminal.soul_id.clone()).unwrap();
+    let prior = registry.active_handle_for_soul(soul.clone()).await.unwrap();
+    let prior_generation = prior
+        .terminal()
+        .unwrap()
+        .provider_launch_context
+        .as_ref()
+        .unwrap()
+        .prepared_inputs
+        .as_ref()
+        .unwrap()
+        .generation_id
+        .clone();
+    let hidden_home = fixture.join("source-home-unavailable");
+    std::fs::rename(&home, &hidden_home).unwrap();
+    let healthy = client
+        .recover(soul.clone(), RecoveryTrigger::HostUnreachable)
+        .await
+        .unwrap();
+    assert_eq!(healthy.outcome, RecoveryOutcome::Reattached);
+    let attached = registry.active_handle_for_soul(soul.clone()).await.unwrap();
+    assert_eq!(attached.incarnation_id(), prior.incarnation_id());
+    assert_eq!(attached.container_id(), prior.container_id());
+    assert_eq!(
+        attached.provider_volume_name(),
+        prior.provider_volume_name()
+    );
+    // Reopen real production registry/supervisor/controller instances, keeping
+    // the same provider-owned volume and frozen preparation authority. Joining
+    // the old control listener cannot stop the independently owned native CLI.
+    drop(controller);
+    control_task.abort();
+    let _ = control_task.await;
+    drop(registry);
+    let registry = Registry::open(
+        fixture.join("registry"),
+        Some(
+            InstallationId::parse(std::env::var("FRESHELL_PROVIDER_LAUNCH_INSTALLATION").unwrap())
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    let supervisor = Supervisor::new(registry.clone(), backend, supervisor_config).unwrap();
+    std::fs::remove_file(&socket).unwrap();
+    let control_task = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            serve_control(supervisor, &socket).await.unwrap();
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let _cold_controller = crate::managed_runtime::ServerManagedRuntimeController::from_env()
+        .await
+        .unwrap()
+        .unwrap();
+    let client = freshell_runtime_client::RuntimeClient::new(
+        socket.clone(),
+        "closed-synthetic-control-secret",
+    );
+    let cold = client
+        .recover(soul.clone(), RecoveryTrigger::HostUnreachable)
+        .await
+        .unwrap();
+    assert_eq!(cold.outcome, RecoveryOutcome::Reattached);
+    let cold_handle = registry.active_handle_for_soul(soul.clone()).await.unwrap();
+    assert_eq!(cold_handle.incarnation_id(), prior.incarnation_id());
+    assert_eq!(cold_handle.container_id(), prior.container_id());
+    assert_eq!(
+        cold_handle.provider_volume_name(),
+        prior.provider_volume_name()
+    );
+    assert_eq!(
+        cold_handle
+            .terminal()
+            .unwrap()
+            .provider_launch_context
+            .as_ref()
+            .unwrap()
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .generation_id,
+        prior_generation
+    );
+    let real = DockerEngineBackend::new(fixture.join("broker.sock"));
+    real.force_stop(&prior)
+        .await
+        .expect("stop only exact registry-owned Amplifier fixture runtime");
+    assert!(real.verify_empty(&prior).await.unwrap());
+    std::fs::remove_file(&receipt).unwrap();
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(120),
+        client.recover(soul.clone(), RecoveryTrigger::HostUnreachable),
+    )
+    .await
+    .expect("finite actual Amplifier native recovery")
+    .unwrap();
+    println!(
+        "provider_recovery_outcome {}",
+        json!({"provider":"amplifier","outcome":recovered.outcome,"probe":recovered.probe.as_ref().map(|probe|match probe {RecoveryProbe::ResumeReady {..}=>"native_resume",RecoveryProbe::PristineSeedReady {..}=>"pristine_seed",_=>"other"})})
+    );
+    if let Some(RecoveryProbe::Blocked {
+        reason, retry_hint, ..
+    }) = &recovered.probe
+    {
+        let repair = retry_hint.repair.as_deref().unwrap_or("");
+        let labels = [
+            "manifest",
+            "copy",
+            "symlink",
+            "changed",
+            "ordinary",
+            "projection",
+            "bundle",
+            "module",
+            "mount",
+            "native",
+            "session",
+            "store",
+            "helper",
+            "metadata",
+            "cwd",
+            "credential",
+            "bootstrap",
+            "runtime",
+            "image",
+            "missing",
+            "unavailable",
+            "frozen",
+            "already exists",
+            "conflict",
+            "private",
+            "reference",
+            "failed",
+            "read",
+            "write",
+            "input",
+            "selection",
+            "permission",
+            "host",
+            "grant",
+            "socket",
+            "closed",
+            "auth",
+            "secret",
+            "environment",
+            "capability",
+            "lease",
+            "volume",
+            "scope",
+            "ownership",
+        ];
+        println!(
+            "provider_recovery_diagnostic {}",
+            json!({"provider":"amplifier","reason":reason,"repairBytes":repair.len(),"repairClasses":labels.into_iter().filter(|label|repair.to_ascii_lowercase().contains(label)).collect::<Vec<_>>()})
+        );
+        for line in std::fs::read_to_string(fixture.join("lifecycle.jsonl"))
+            .unwrap()
+            .lines()
+        {
+            if let Ok(event) = serde_json::from_str::<Value>(line) {
+                if event["event"] == "supervisor.activation_failed"
+                    || event["event"] == "supervisor.recovery.activation_failed"
+                {
+                    println!(
+                        "provider_activation_diagnostic {}",
+                        json!({"event":event["event"],"stage":event["data"]["stage"],"errorCode":event["data"]["errorCode"],"errorClass":event["data"]["errorClass"]})
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(recovered.outcome, RecoveryOutcome::Replaced);
+    assert!(
+        matches!(recovered.probe, Some(RecoveryProbe::ResumeReady { .. })),
+        "existing completed conversation must use genuine native resume"
+    );
+    let current = registry.active_handle_for_soul(soul.clone()).await.unwrap();
+    assert_ne!(current.incarnation_id(), prior.incarnation_id());
+    assert_eq!(current.provider_volume_name(), prior.provider_volume_name());
+    let generation = &current
+        .terminal()
+        .unwrap()
+        .provider_launch_context
+        .as_ref()
+        .unwrap()
+        .prepared_inputs
+        .as_ref()
+        .unwrap()
+        .generation_id;
+    assert_ne!(generation, &prior_generation);
+    let expected_conversation: Value = serde_json::from_slice(
+        &std::fs::read(receipt.with_extension("seed.json"))
+            .expect("native writer's completed pair receipt"),
+    )
+    .unwrap();
+    assert_eq!(expected_conversation["sessionId"], native_id);
+    assert_eq!(expected_conversation["roles"], json!(["user", "assistant"]));
+    assert_eq!(expected_conversation["messageCount"], 2);
+    assert_eq!(expected_conversation["digest"].as_str().unwrap().len(), 64);
+    let restored = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(&conversation_receipt) {
+                if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                    break value;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .ok();
+    if restored.is_none() {
+        let output = client
+            .read_output(soul.clone(), 0, 64 * 1024)
+            .await
+            .unwrap();
+        let text = crate::ai_title::strip_ansi(
+            &output
+                .frames
+                .iter()
+                .map(|frame| frame.data.as_str())
+                .collect::<String>(),
+        );
+        let labels = [
+            "Error",
+            "failed",
+            "Traceback",
+            "No such file",
+            "Permission denied",
+            "not found",
+            "bundle",
+            "Bundle",
+            "source",
+            "Source",
+            "context",
+            "Context",
+            "session",
+            "Session",
+            "ModuleNotFoundError",
+            "ModuleLoadError",
+            "ModuleValidationError",
+            "FileNotFoundError",
+            "RuntimeError",
+            "TypeError",
+            "AttributeError",
+            "not installed",
+            "not mounted",
+            "missing",
+            "resolve",
+            "activate",
+            "initialize",
+            "load",
+            "transcript",
+            "history",
+            "No module named",
+            "Failed to activate",
+            "Could not find",
+            "does not exist",
+            "Invalid",
+            "uv",
+            "read-only",
+            "reference",
+            "settings",
+        ];
+        println!(
+            "provider_conversation_diagnostic {}",
+            json!({"provider":"amplifier","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"nativeStartupConsumerExists":receipt.exists(),"originalBundleMentioned":text.contains(bundle.to_str().unwrap()),"projectedBundleMentioned":text.contains("/home/freshell/provider/.freshell/resources/amplifier-local-0"),"fileSourceMissing":text.contains("File source not found"),"classes":labels.into_iter().filter(|label|text.contains(label)).collect::<Vec<_>>() })
+        );
+    }
+    assert_eq!(
+        restored.expect(
+            "genuine native resume must restore the completed pair into its actual context"
+        ),
+        expected_conversation
+    );
+    assert!(!home.exists());
+    println!(
+        "provider_recovery_consumer {}",
+        json!({"provider":"amplifier","route":"terminal","outcome":recovered.outcome,"sameOwnedHome":true,"originalOrdinaryUnavailable":true,"priorGeneration":prior_generation,"generationId":generation,"nativeSessionId":native_id,"messageCount":2,"conversationDigest":expected_conversation["digest"],"healthyReattachSameRuntime":true,"coldProductionConstructorsReopened":true})
+    );
+    let accepted_inputs = current
+        .terminal()
+        .unwrap()
+        .provider_launch_context
+        .as_ref()
+        .unwrap()
+        .prepared_inputs
+        .as_ref()
+        .unwrap();
+    let accepted_manifest = control
+        .join("provider-roots")
+        .join(generation)
+        .join(&accepted_inputs.manifest.relative_path);
+    assert!(
+        !client
+            .read_output(soul.clone(), 0, 64 * 1024)
+            .await
+            .unwrap()
+            .exited,
+        "replacement native process must remain usable before authority loss"
+    );
+    std::fs::rename(
+        &accepted_manifest,
+        accepted_manifest.with_extension("unavailable"),
+    )
+    .unwrap();
+    let still_live = client
+        .recover(soul.clone(), RecoveryTrigger::HostUnreachable)
+        .await
+        .unwrap();
+    if still_live.outcome != RecoveryOutcome::Reattached {
+        let output = client.read_output(soul.clone(), 0, 64 * 1024).await.ok();
+        let text = crate::ai_title::strip_ansi(
+            &output
+                .as_ref()
+                .map(|output| {
+                    output
+                        .frames
+                        .iter()
+                        .map(|frame| frame.data.as_str())
+                        .collect::<String>()
+                })
+                .unwrap_or_default(),
+        );
+        let labels = [
+            "Error",
+            "failed",
+            "Traceback",
+            "AttributeError",
+            "TypeError",
+            "KeyError",
+            "get_messages",
+            "get_context_info",
+            "set_messages",
+            "session",
+            "context",
+            "Context",
+            "bundle",
+            "source",
+            "manifest",
+            "token",
+            "message",
+            "dict",
+            "list",
+            "Permission denied",
+            "not found",
+        ];
+        let probe = match &still_live.probe {
+            Some(RecoveryProbe::Blocked { path, reason, .. }) => {
+                json!({"path":path,"reason":reason})
+            }
+            _ => json!(null),
+        };
+        let inspection = match real.inspect(&current).await {
+            Ok(value) => json!({"state":format!("{:?}",value.state)}),
+            Err(error) => {
+                let text = error.to_string();
+                let labels = [
+                    "manifest",
+                    "metadata",
+                    "prepared",
+                    "provider",
+                    "source",
+                    "unavailable",
+                    "changed",
+                    "missing",
+                    "ownership",
+                    "mount",
+                    "file",
+                ];
+                json!({"errorClasses":labels.into_iter().filter(|label|text.to_ascii_lowercase().contains(label)).collect::<Vec<_>>()})
+            }
+        };
+        println!(
+            "provider_environment_authority_diagnostic {}",
+            json!({"provider":"amplifier","outcome":still_live.outcome,"probe":probe,"inspection":inspection,"outputAvailable":output.is_some(),"exited":output.as_ref().map(|value|value.exited),"exitCode":output.as_ref().and_then(|value|value.exit_code),"outputBytes":text.len(),"classes":labels.into_iter().filter(|label|text.contains(label)).collect::<Vec<_>>() })
+        );
+    }
+    assert_eq!(still_live.outcome, RecoveryOutcome::Reattached);
+    assert_eq!(
+        registry
+            .active_handle_for_soul(soul.clone())
+            .await
+            .unwrap()
+            .container_id(),
+        current.container_id()
+    );
+    real.force_stop(&current)
+        .await
+        .expect("stop only the exact replacement fixture runtime");
+    assert!(real.verify_empty(&current).await.unwrap());
+    let blocked = tokio::time::timeout(
+        Duration::from_secs(120),
+        client.recover(soul.clone(), RecoveryTrigger::HostUnreachable),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(blocked.outcome, RecoveryOutcome::Blocked);
+    assert!(
+        matches!(blocked.probe, Some(RecoveryProbe::Blocked { reason, .. }) if reason != freshell_runtime_protocol::RecoveryBlockReason::StoreMissing)
+    );
+    let retained = registry
+        .owned_handle(current.incarnation_id().clone())
+        .await
+        .unwrap();
+    assert_eq!(retained.incarnation_id(), current.incarnation_id());
+    assert_eq!(
+        retained.provider_volume_name(),
+        current.provider_volume_name()
+    );
+    assert_eq!(
+        retained
+            .terminal()
+            .unwrap()
+            .provider_launch_context
+            .as_ref()
+            .unwrap()
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .generation_id,
+        *generation
+    );
+    assert_eq!(
+        std::fs::read_dir(fixture.join("handoff"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json"))
+            .count(),
+        2
+    );
+    println!(
+        "provider_environment_authority_consumer {}",
+        json!({"provider":"amplifier","outcome":blocked.outcome,"healthyReattachSameRuntime":true,"acceptedGenerationRetained":true,"nativeNotRedispatched":true,"nativeStoreAbsenceNotInferred":true})
+    );
+    std::fs::rename(&hidden_home, &home).unwrap();
     client
         .stop(SoulId::parse(terminal.soul_id).unwrap())
         .await
         .unwrap();
     web_task.abort();
     control_task.abort();
+    let _ = web_task.await;
+    let _ = control_task.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1126,13 +1623,17 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
  const input=JSON.parse(raw),root=path.resolve(__dirname,'..');
  const endpoint=process.env.FRESHELL_URL,token=process.env.FRESHELL_TOKEN;
  const authenticated=await new Promise(resolve=>{if(!endpoint||!token)return resolve(false);const req=http.request(new URL('/api/mcp',endpoint),{method:'POST',headers:{'x-auth-token':token}},res=>{res.resume();resolve(res.statusCode===200)});req.on('error',()=>resolve(false));req.end('{}')});
- const record={hook:input.hook_event_name==='SessionStart',physicalHome:process.env.HOME,nativeIdentity:{uid:process.getuid(),euid:process.geteuid(),gid:process.getgid(),egid:process.getegid(),groups:[...new Set([...process.getgroups(),process.getegid()])].sort((a,b)=>a-b)},settings:['closed-selected-settings','closed-explicit-settings'].includes(process.env.CLAUDE_SELECTED_NONCE),authenticated,scopedAlias:process.env.FRESHELL==='1',onecli:hash(process.env.ANTHROPIC_API_KEY||'')===process.argv[3],
+ const record={finalExecProfile:nativeExecProfile('claude'),hook:input.hook_event_name==='SessionStart',physicalHome:process.env.HOME,nativeIdentity:{uid:process.getuid(),euid:process.geteuid(),gid:process.getgid(),egid:process.getegid(),groups:[...new Set([...process.getgroups(),process.getegid()])].sort((a,b)=>a-b)},settings:['closed-selected-settings','closed-explicit-settings'].includes(process.env.CLAUDE_SELECTED_NONCE),authenticated,scopedAlias:process.env.FRESHELL==='1',onecli:hash(process.env.ANTHROPIC_API_KEY||'')===process.argv[3],
  refreshStageAbsent:fs.readdirSync(process.env.HOME).every(name=>!name.startsWith('.freshell-provider-refresh-')),
  memory:hash(fs.readFileSync(path.join(process.env.HOME,'.claude/CLAUDE.md'))),skill:hash(fs.readFileSync(path.join(root,'skills/probe/SKILL.md'))),resource:hash(require('node:child_process').execFileSync(path.join(__dirname,'run'))),diskResource:hash(fs.readFileSync(path.join(__dirname,'disk-resource'))),dependency:hash(require('probe-dependency'))};
  fs.writeFileSync(process.argv[2],JSON.stringify(record));
 });
 "#;
-    std::fs::write(plugin.join("scripts/consume.cjs"), consumer).unwrap();
+    std::fs::write(
+        plugin.join("scripts/consume.cjs"),
+        format!("{NATIVE_EXEC_PROFILE}{consumer}"),
+    )
+    .unwrap();
     let flag_receipt = workspace.join("claude-flag-receipt.json");
     std::fs::write(plugin.join("scripts/flag.cjs"), "const fs=require('node:fs'),crypto=require('node:crypto');const hash=v=>crypto.createHash('sha256').update(v).digest('hex');let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{const input=JSON.parse(raw);fs.writeFileSync(process.argv[2],JSON.stringify({flag:input.hook_event_name==='SessionStart'&&process.env.CLAUDE_SELECTED_NONCE==='closed-explicit-settings',resource:hash(require('node:child_process').execFileSync(__dirname+'/run')),dependency:hash(require('probe-dependency'))}))})").unwrap();
     let flag_commands = selected_config.join("commands");
@@ -1460,7 +1961,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         .ok()
     }
     let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-    let expected = json!({"hook":true,"physicalHome":"/home/freshell/provider","nativeIdentity":source_identity,"settings":true,"authenticated":true,"scopedAlias":true,"onecli":true,"refreshStageAbsent":true,"memory":hash(&memory),"skill":hash(std::fs::read(plugin.join("skills/probe/SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-claude-resource"),"diskResource":hash(&disk_resource),"dependency":hash(b"closed-claude-dependency")});
+    let expected = json!({"finalExecProfile":native_exec_profile(),"hook":true,"physicalHome":"/home/freshell/provider","nativeIdentity":source_identity,"settings":true,"authenticated":true,"scopedAlias":true,"onecli":true,"refreshStageAbsent":true,"memory":hash(&memory),"skill":hash(std::fs::read(plugin.join("skills/probe/SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-claude-resource"),"diskResource":hash(&disk_resource),"dependency":hash(b"closed-claude-dependency")});
     let imported_bytes = std::fs::read(home.join("imported-memory.md")).unwrap();
     let mut expected_imports = serde_json::Map::new();
     expected_imports.insert("imported-memory.md".into(), json!(hash(&imported_bytes)));
@@ -1750,7 +2251,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         imported_graph(&instructions_events, &expected_imports).await;
         println!(
             "provider_launch_consumer {}",
-            json!({"provider":"claude","route":"terminal","digest":qualified_digest})
+            json!({"provider":"claude","route":"terminal","finalExecProfile":native_exec_profile(),"digest":qualified_digest})
         );
         if std::env::var("FRESHELL_PROVIDER_LAUNCH_CLAUDE_SOURCE_GUARD").as_deref()
             == Ok("retained")
@@ -2018,7 +2519,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     );
     println!(
         "provider_launch_consumer {}",
-        json!({"provider":"claude","route":"fresh","digest":qualified_digest})
+        json!({"provider":"claude","route":"fresh","finalExecProfile":native_exec_profile(),"digest":qualified_digest})
     );
     assert_eq!(
         std::fs::read_to_string(selected_config.join("settings.json")).unwrap(),
@@ -2344,7 +2845,7 @@ let result={};if(message.method==='initialize'){
  const nativeArgv=fs.readFileSync('/proc/'+process.ppid+'/cmdline','utf8').split('\0');
  const retainedMcpRecipe=nativeArgv.includes('mcp_servers.freshell.command="node"')&&nativeArgv.includes('mcp_servers.freshell.args=["/opt/freshell-mcp/server.js"]')&&nativeArgv.some(arg=>arg.startsWith('mcp_servers.freshell.env_vars='));
  const policy=JSON.parse(require('node:child_process').execFileSync('codex',['execpolicy','check','--rules',path.join(process.env.CODEX_HOME,'rules/probe.rules'),'closed-fixture-never-run'],{encoding:'utf8'}));
- const record={globalInstructions:digest(fs.readFileSync(path.join(process.env.CODEX_HOME,'AGENTS.md'))),nativeRuleForbidden:policy.decision==='forbidden',physicalHome:process.env.HOME,initialized:true,authenticated,retainedMcpRecipe,scopedAlias:process.env.FRESHELL==='1',endpointPresent:!!endpoint,tokenPresent:!!token,
+ const record={finalExecProfile:nativeExecProfile('parent'),globalInstructions:digest(fs.readFileSync(path.join(process.env.CODEX_HOME,'AGENTS.md'))),nativeRuleForbidden:policy.decision==='forbidden',physicalHome:process.env.HOME,initialized:true,authenticated,retainedMcpRecipe,scopedAlias:process.env.FRESHELL==='1',endpointPresent:!!endpoint,tokenPresent:!!token,
    user:digest(fs.readFileSync(path.join(process.env.CODEX_HOME,'user.md'))),project:digest(fs.readFileSync(path.join(process.cwd(),'.codex/project.md'))),
    role:digest(fs.readFileSync(path.join(process.cwd(),'.codex/agents/role.md'))),skill:digest(fs.readFileSync(path.join(__dirname,'../SKILL.md'))),
    resource:digest(require('node:child_process').execFileSync(path.join(__dirname,'run'))),dependency:digest(require('probe-dependency'))};
@@ -2352,7 +2853,11 @@ let result={};if(message.method==='initialize'){
 }else if(message.method==='tools/list')result={tools:[]};else if(message.method==='resources/list')result={resources:[]};else if(message.method==='prompts/list')result={prompts:[]};
 process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\n');});
 "#;
-    std::fs::write(skill.join("scripts/server.cjs"), server).unwrap();
+    std::fs::write(
+        skill.join("scripts/server.cjs"),
+        format!("{NATIVE_EXEC_PROFILE}{server}"),
+    )
+    .unwrap();
     let plugin = home.join(".codex/plugins/cache/fixture/probe/local");
     let plugin_data_name = format!("{:x}", Sha256::digest(b"fixture\0probe"));
     let plugin_data = home
@@ -2537,7 +3042,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
         .map_err(|_| "native Codex must initialize its configured MCP consumer")
     }
     let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-    let expected = json!({"globalInstructions":hash(b"closed-global-instructions"),"nativeRuleForbidden":true,"physicalHome":"/home/freshell/provider","initialized":true,"authenticated":true,"retainedMcpRecipe":true,"scopedAlias":true,"endpointPresent":true,"tokenPresent":true,"user":hash(b"closed-user-input"),"project":hash(b"closed-project-input"),"role":hash(b"closed-role-input"),"skill":hash(std::fs::read(skill.join("SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-codex-resource"),"dependency":hash(b"closed-codex-dependency")});
+    let expected = json!({"finalExecProfile":native_exec_profile(),"globalInstructions":hash(b"closed-global-instructions"),"nativeRuleForbidden":true,"physicalHome":"/home/freshell/provider","initialized":true,"authenticated":true,"retainedMcpRecipe":true,"scopedAlias":true,"endpointPresent":true,"tokenPresent":true,"user":hash(b"closed-user-input"),"project":hash(b"closed-project-input"),"role":hash(b"closed-role-input"),"skill":hash(std::fs::read(skill.join("SKILL.md")).unwrap().as_slice()),"resource":hash(b"closed-codex-resource"),"dependency":hash(b"closed-codex-dependency")});
     let consumed_terminal = consumed(&receipt).await;
     if consumed_terminal.is_err() {
         let output = client
@@ -2593,7 +3098,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
     );
     println!(
         "provider_launch_consumer {}",
-        json!({"provider":"codex","route":"terminal","digest":hash(serde_json::to_vec(&json!({"ordinary":expected,"installed":expected_plugin})).unwrap().as_slice())})
+        json!({"provider":"codex","route":"terminal","finalExecProfile":native_exec_profile(),"digest":hash(serde_json::to_vec(&json!({"ordinary":expected,"installed":expected_plugin})).unwrap().as_slice())})
     );
     client
         .stop(SoulId::parse(terminal.soul_id).unwrap())
@@ -2632,7 +3137,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
     );
     println!(
         "provider_launch_consumer {}",
-        json!({"provider":"codex","route":"fresh","digest":hash(serde_json::to_vec(&json!({"ordinary":expected,"installed":expected_plugin})).unwrap().as_slice())})
+        json!({"provider":"codex","route":"fresh","finalExecProfile":native_exec_profile(),"digest":hash(serde_json::to_vec(&json!({"ordinary":expected,"installed":expected_plugin})).unwrap().as_slice())})
     );
     assert_eq!(
         std::fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
@@ -2896,14 +3401,19 @@ export default {id:'closed-native-tui-fixture',async tui(api,options){
         "selected-root-resource",
     )
     .unwrap();
-    std::fs::write(resource_root.join("plugins/selected/index.mjs"), r#"import fs from 'node:fs';import crypto from 'node:crypto';import dependency from 'fixture-dependency';
+    let selected_root_plugin = r#"import fs from 'node:fs';import crypto from 'node:crypto';import dependency from 'fixture-dependency';
 const home=import.meta.url.startsWith('file:///home/freshell/provider/.opencode/');
 export default {id:'closed-writable-selected-root-'+(home?'home':'workspace'),async server(input,options){return {async config(config){
  const root=new URL('../../',import.meta.url); const path=new URL('provider-owned-write',root);
  fs.writeFileSync(path,'selected-root-write');
- fs.writeFileSync(home?options.homeReceipt:options.receipt,JSON.stringify({physicalHome:process.env.HOME,privateRule:crypto.createHash('sha256').update(config.agent.rootScope.prompt).digest('hex'),dependency:crypto.createHash('sha256').update(dependency).digest('hex'),resource:crypto.createHash('sha256').update(fs.readFileSync(new URL('./resource',import.meta.url))).digest('hex'),write:crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex')}));
+ fs.writeFileSync(home?options.homeReceipt:options.receipt,JSON.stringify({finalExecProfile:nativeExecProfile('self'),physicalHome:process.env.HOME,privateRule:crypto.createHash('sha256').update(config.agent.rootScope.prompt).digest('hex'),dependency:crypto.createHash('sha256').update(dependency).digest('hex'),resource:crypto.createHash('sha256').update(fs.readFileSync(new URL('./resource',import.meta.url))).digest('hex'),write:crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex')}));
 }}}};
-"#).unwrap();
+"#;
+    std::fs::write(
+        resource_root.join("plugins/selected/index.mjs"),
+        format!("{NATIVE_EXEC_PROFILE}{selected_root_plugin}"),
+    )
+    .unwrap();
     let root_config = serde_json::to_vec(
         &json!({"agent":{"rootScope":{"prompt":"{file:./private-root-rule}"}}, "plugin":[["./plugins/selected/index.mjs", {"receipt":root_receipt, "homeReceipt":home_root_receipt}]]}),
     )
@@ -3101,7 +3611,7 @@ export default {{id:'closed-directory-discovery',async server(){{
         }
     };
     assert_eq!(terminal_receipt, expected);
-    let expected_root = json!({"physicalHome":"/home/freshell/provider","privateRule":format!("{:x}",Sha256::digest(b"shared-home-private-rule")),"dependency":format!("{:x}",Sha256::digest(b"selected-root-dependency")),"resource":format!("{:x}",Sha256::digest(b"selected-root-resource")),"write":format!("{:x}",Sha256::digest(b"selected-root-write"))});
+    let expected_root = json!({"finalExecProfile":native_exec_profile(),"physicalHome":"/home/freshell/provider","privateRule":format!("{:x}",Sha256::digest(b"shared-home-private-rule")),"dependency":format!("{:x}",Sha256::digest(b"selected-root-dependency")),"resource":format!("{:x}",Sha256::digest(b"selected-root-resource")),"write":format!("{:x}",Sha256::digest(b"selected-root-write"))});
     assert_eq!(read_receipt(&root_receipt).await.unwrap(), expected_root);
     assert_eq!(
         read_receipt(&home_root_receipt).await.unwrap(),
@@ -3217,7 +3727,7 @@ export default {{id:'closed-directory-discovery',async server(){{
     assert_eq!(std::fs::read(&explicit_config).unwrap(), explicit_bytes);
     println!(
         "provider_launch_consumer {}",
-        json!({"provider":"opencode","route":"terminal","workspaceScope":"default-home","digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&expected).unwrap()))})
+        json!({"provider":"opencode","route":"terminal","finalExecProfile":native_exec_profile(),"workspaceScope":"default-home","digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&expected).unwrap()))})
     );
     client
         .stop(SoulId::parse(terminal.soul_id).unwrap())
@@ -3342,7 +3852,7 @@ export default {{id:'closed-directory-discovery',async server(){{
     .expect("native plugin must stop the fresh request before the model loop");
     println!(
         "provider_launch_consumer {}",
-        json!({"provider":"opencode","route":"fresh","workspaceScope":"workspace-under-home","digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&fresh_expected).unwrap()))})
+        json!({"provider":"opencode","route":"fresh","finalExecProfile":native_exec_profile(),"workspaceScope":"workspace-under-home","digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&fresh_expected).unwrap()))})
     );
     // Scan only run-owned durable/staged surfaces; referenced payloads belong
     // in private indexed files, not ordinary resource/configuration trees.

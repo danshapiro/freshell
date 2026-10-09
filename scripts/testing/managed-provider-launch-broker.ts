@@ -50,7 +50,9 @@ const timer=setInterval(()=>{
     }
     const directory=path.join(root,'handoff')
     const entries=fs.readdirSync(directory).filter((name)=>name.endsWith('.json'))
-    if (entries.length>(configuration.provider==='amplifier'?1:2)) throw new Error('closed provider fixture exceeds its finite two launch attempts')
+    // Amplifier uses one exact soul for initial seed establishment and its
+    // genuine existing-conversation replacement; other fixtures have two routes.
+    if (entries.length>2) throw new Error('closed provider fixture exceeds its finite two launch attempts')
     for (const name of entries) {
       if (accepted.has(name)) continue
       if (!/^[a-zA-Z0-9_-]{1,128}\.json$/.test(name)) throw new Error('closed provider fixture handoff name invalid')

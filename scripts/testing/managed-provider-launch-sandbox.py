@@ -95,6 +95,26 @@ def main():
             })
         if labels.get(LABEL)!=run and labels.get("com.freshell.runtime-test-run-id")!=run and not fixed_helper:
             raise RuntimeError("closed startup container cleanup ownership changed")
+        # Inspect only this failed fixture's exact broker-recorded runtime.
+        # Provider/host log bytes remain transient; evidence is finite labels.
+        runtime_ids={item["containerId"] for item in receipt.get("broker",{}).get("receipts",[])}
+        if receipt.get("exitCode",0)!=0 and value["Id"] in runtime_ids:
+            output=docker("logs","--tail","64",value["Id"],check=False)
+            text=output.stdout+output.stderr
+            classes=[label for label in ["Operation not permitted","Permission denied","Read-only file system","No such file or directory","Directory not empty","symlink","source","destination","chown","ownership","group","mount","file","existing","metadata","manifest","unsafe","selected","stage","provider.environment.copy.failed"] if label.lower() in text.lower()]
+            copy_failures=[]
+            for line in text.splitlines():
+                try:event=json.loads(line)
+                except (ValueError,TypeError):continue
+                if event.get("event")!="provider.environment.copy.failed":continue
+                # Only closed operation and error-kind enums leave transient logs.
+                # Neither paths nor arbitrary corrective text enter receipts.
+                operations={"plan","select","resolve","inspect","read_directory","set_private_mode","create_stage","resolve_selection","inspect_destination","create_stage_parent","create_directory","open","create_file","read","write","create_link","publish","publish_directory","publish_leaf","inspect_mounted_file","open_mounted_file","backup_mounted_file","restore_mounted_file","publish_mounted_file","select_resource_scope","resolve_lookup_context","resolve_package_scope","resolve_selected_alias","inspect_link_target"}
+                operation=event.get("operation")
+                cause=re.search(r"\((\w+), OS (?:Some\((\d+)\)|None)\)",event.get("corrective_message", ""))
+                kinds={"NotFound","PermissionDenied","AlreadyExists","NotADirectory","IsADirectory","DirectoryNotEmpty","ReadOnlyFilesystem","InvalidInput","InvalidData","Unsupported","Other","StorageFull","TooManyLinks","FilesystemLoop"}
+                copy_failures.append({"operation":operation if operation in operations else "unclassified","cause":cause.group(1) if cause and cause.group(1) in kinds else "unclassified","osCode":int(cause.group(2)) if cause and cause.group(2) else None,"limit":event.get("limit_kind") if event.get("limit_kind") in {"entries","file_bytes","total_bytes","depth"} else None})
+            receipt.setdefault("failedRuntimeDiagnostics",[]).append({"id":value["Id"],"bytes":len(text.encode()),"classes":classes,"copyFailures":copy_failures,"privateInputLeak":any(marker in text for marker in ["synthetic-amplifier-onecli-value","synthetic-onecli-shadowed","AUTH_PREFIX"] )})
         docker("rm","--force",value["Id"])
     def create(name,*arguments):
         owned.append(name)
@@ -212,16 +232,21 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                 receipt["claudeSourceGuard"]=args.claude_source_guard
             receipt["consumedRoutes"]=[json.loads(line.split("provider_launch_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_launch_consumer " in line]
             receipt["candidateObservers"]=[json.loads(line.split("provider_candidate_observer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_candidate_observer " in line]
-            if args.claude_source_guard in {"retained","retained-fresh"}:
+            if args.provider=="amplifier" or args.claude_source_guard in {"retained","retained-fresh"}:
                 receipt["recoveryConsumers"]=[json.loads(line.split("provider_recovery_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_recovery_consumer " in line]
                 recovered=receipt["recoveryConsumers"]
                 route_mismatch_recovery=len(recovered)!=1 or any(value.get("outcome")!="replaced" or value.get("sameOwnedHome") is not True or value.get("originalOrdinaryUnavailable") is not True or value.get("generationId")==value.get("priorGeneration") for value in recovered)
+                if args.provider=="amplifier":
+                    receipt["authorityConsumers"]=[json.loads(line.split("provider_environment_authority_consumer ",1)[1]) for line in outcome.stdout.splitlines() if "provider_environment_authority_consumer " in line]
+                    authority=receipt["authorityConsumers"]
+                    route_mismatch_recovery=route_mismatch_recovery or any(value.get("messageCount")!=2 or value.get("nativeSessionId")!="41a04bb3-86f0-463d-97c5-f085e8a9ea4b" or not re.fullmatch(r"[a-f0-9]{64}",value.get("conversationDigest","")) or value.get("coldProductionConstructorsReopened") is not True or value.get("healthyReattachSameRuntime") is not True for value in recovered)
+                    route_mismatch_recovery=route_mismatch_recovery or len(authority)!=1 or any(value.get("outcome")!="blocked" or any(value.get(field) is not True for field in ["healthyReattachSameRuntime","acceptedGenerationRetained","nativeNotRedispatched","nativeStoreAbsenceNotInferred"]) for value in authority)
             print(outcome.stdout,end="",flush=True);print(outcome.stderr,end="",flush=True)
             expected_routes={("opencode","terminal"),("opencode","fresh"),("opencode","terminal-tui")} if args.provider=="opencode" else ({(args.provider,"terminal")} if args.provider=="amplifier" else {(args.provider,"terminal"),(args.provider,"fresh")})
             if args.claude_source_guard in {"retained","retained-fresh"}:expected_routes={("claude","fresh" if args.claude_source_guard=="retained-fresh" else "terminal")}
             observed_routes={(item.get("provider"),item.get("route")) for item in receipt["consumedRoutes"]}
             route_mismatch=len(receipt["consumedRoutes"])!=len(expected_routes) or observed_routes!=expected_routes
-            if args.claude_source_guard in {"retained","retained-fresh"}:route_mismatch=route_mismatch or route_mismatch_recovery
+            if args.provider=="amplifier" or args.claude_source_guard in {"retained","retained-fresh"}:route_mismatch=route_mismatch or route_mismatch_recovery
             if args.claude_source_guard=="changed-git":
                 receipt["blockedRoutes"]=[json.loads(line.split("provider_source_guard ",1)[1]) for line in outcome.stdout.splitlines() if "provider_source_guard " in line]
                 blocked={(item.get("provider"),item.get("route")) for item in receipt["blockedRoutes"]}
