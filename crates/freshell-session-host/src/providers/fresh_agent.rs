@@ -497,6 +497,20 @@ impl HostedTransport {
     }
 
     async fn current_native_id(&self) -> Result<String, String> {
+        {
+            let identity = self.native_identity.lock().expect("native identity lock");
+            if identity.pending {
+                return Err("native identity transition is unsettled".into());
+            }
+            if let Some(root) = identity.root.as_ref() {
+                if identity.evidence.is_none() {
+                    return Err("current native identity has not been observed".into());
+                }
+                // A correlated operation may consume buffered native proof
+                // before another watch event. Its settled root owns reads.
+                return Ok(root.clone());
+            }
+        }
         if let Some(native) = self.native_rx.lock().await.borrow().clone() {
             return Ok(native);
         }
@@ -2147,12 +2161,17 @@ mod tests {
         for arrival in ["early", "delayed", "replaced-query"] {
             let (sender, receiver) = broadcast::channel(32);
             let (created, _) = watch::channel(None);
-            let (native, _native_rx) = watch::channel(None);
+            let (native, native_rx) = watch::channel(None);
             let (native_evidence, _evidence_rx) = watch::channel(None);
             let (events, mut event_rx) = mpsc::channel(32);
             let (send_outcomes, _) = broadcast::channel(16);
             let (kill_outcomes, _) = broadcast::channel(16);
             let identity = Arc::new(std::sync::Mutex::new(HostedNativeIdentity::default()));
+            let mut transport =
+                HostedTransport::new_with_context(FreshProvider::Claude, None).await;
+            let owned = Arc::get_mut(&mut transport).unwrap();
+            owned.native_identity = identity.clone();
+            owned.native_rx = Mutex::new(native_rx);
             spawn_broadcast_bridge(
                 FreshProvider::Claude,
                 receiver,
@@ -2217,6 +2236,10 @@ mod tests {
                     "nativeBinding":{"launch":next,"queryGeneration":2}}}).to_string()).unwrap();
             }
             drain(&sender, &mut event_rx).await;
+            assert!(
+                transport.current_native_id().await.is_err(),
+                "{arrival}: unsettled reads cannot reuse the startup parent's watch value"
+            );
             {
                 let mut state = identity.lock().unwrap();
                 assert!(
@@ -2241,6 +2264,11 @@ mod tests {
                 );
                 assert_eq!(state.launch.as_ref().unwrap().evidence_revision, 8);
             }
+            assert_eq!(
+                transport.current_native_id().await.ok().as_deref(),
+                (arrival == "early").then_some(CHILD),
+                "{arrival}: buffered current proof must serve the acknowledged child; absent proof remains fenced"
+            );
             let generation = if arrival == "replaced-query" { 2 } else { 1 };
             sender.send(init(PARENT, &next, generation + 10)).unwrap();
             sender
@@ -2248,6 +2276,7 @@ mod tests {
                 .unwrap();
             sender.send(init(CHILD, &next, generation)).unwrap();
             drain(&sender, &mut event_rx).await;
+            assert_eq!(transport.current_native_id().await.unwrap(), CHILD);
             let state = identity.lock().unwrap();
             let evidence = state
                 .evidence
@@ -3096,6 +3125,8 @@ mod tests {
         let native = actor.profile().await.native_session_id;
         let fork = actor.fork(RequestId::new(), registered.clone(), None).await;
         let fork_evidence = actor.observed_native_identity_evidence().await;
+        let fork_snapshot = actor.snapshot().await;
+        let fork_capture = actor.capture(1024).await;
         transport.stop().await.unwrap();
         let snapshot = result.expect("registered zero-turn OpenCode is live snapshot truth");
         assert_eq!(snapshot["threadId"], registered);
@@ -3109,6 +3140,16 @@ mod tests {
         );
         assert_eq!(native.as_deref(), Some(registered.as_str()));
         let fork = fork.expect("controlled native HTTP fork succeeds without a prompt");
+        assert_eq!(
+            fork_snapshot.expect("snapshot reads the acknowledged native child")["threadId"],
+            fork.child_session_id
+        );
+        assert_eq!(
+            fork_capture
+                .expect("capture reads the acknowledged native child")
+                .native_session_id,
+            fork.child_session_id
+        );
         assert_eq!(
             fork_evidence
                 .as_ref()
