@@ -336,3 +336,18 @@ fn a_command_ended_by_a_core_dumping_signal_ends_the_shim_with_that_signal_witho
         "the shim dumped core in the command's place: {status:?}"
     );
 }
+
+#[test]
+fn a_malformed_open_file_limit_is_noted_on_stderr_and_the_command_still_runs() {
+    let out = std::process::Command::new(test_shim().exe)
+        .args(["--nofile-soft=lots", "--reaper", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.lines().count(), 1, "one line: {stderr:?}");
+    assert!(
+        stderr.contains("--nofile-soft") && stderr.contains("lots"),
+        "{stderr:?}"
+    );
+}

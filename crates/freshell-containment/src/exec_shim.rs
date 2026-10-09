@@ -10,7 +10,8 @@
 //!   command starts with the server's original limit instead of the server's
 //!   raised one. The server passes `child_nofile::original_soft_limit()`
 //!   here; resetting the shim from outside after its spawn would come too
-//!   late for the command it already started.
+//!   late for the command it already started. A malformed value is ignored
+//!   with a one-line note on stderr.
 //!
 //! Without `--reaper` it runs the command, waits for it and exits with its
 //! status (128 + the signal number when a signal ended it).
@@ -36,6 +37,12 @@ fn parse_options(options: &[OsString]) -> Options {
             parsed.reaper = true;
         } else if let Some(n) = option.strip_prefix("--nofile-soft=") {
             parsed.nofile_soft = n.parse().ok();
+            if parsed.nofile_soft.is_none() {
+                // The server builds this value, so this is a wiring mistake.
+                eprintln!(
+                    "freshell-unit-exec: ignoring malformed --nofile-soft value {n:?}; the open-file limit stays as inherited"
+                );
+            }
         }
     }
     parsed
