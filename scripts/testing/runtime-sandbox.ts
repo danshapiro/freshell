@@ -87,6 +87,21 @@ export type SyntheticSource = {
   selectedSentinel: string
 }
 
+export type SyntheticSourceFamily = Omit<SyntheticSource, 'databasePath' | 'unrelatedId'>
+export type SyntheticSevenRootSource = SyntheticSource & {
+  families: readonly [SyntheticSourceFamily, SyntheticSourceFamily, SyntheticSourceFamily,
+    SyntheticSourceFamily, SyntheticSourceFamily, SyntheticSourceFamily, SyntheticSourceFamily]
+}
+
+type SyntheticSourceInput = {
+  repoRoot: string
+  databasePath: string
+  workspace: string
+  nonce: string
+  messageCount?: number
+  batch?: 'stopped-repair-seven-roots'
+}
+
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
@@ -95,31 +110,24 @@ function sha1(value: string): string {
   return createHash('sha1').update(value).digest('hex')
 }
 
-export function seedManagedOpenCodeSource(input: {
-  repoRoot: string
-  databasePath: string
-  workspace: string
-  nonce: string
-  messageCount?: number
-}): SyntheticSource {
+export function seedManagedOpenCodeSource(input: SyntheticSourceInput & { batch: 'stopped-repair-seven-roots' }): SyntheticSevenRootSource
+export function seedManagedOpenCodeSource(input: SyntheticSourceInput): SyntheticSource
+export function seedManagedOpenCodeSource(input: SyntheticSourceInput): SyntheticSource | SyntheticSevenRootSource {
   const { repoRoot, databasePath, workspace, nonce } = input
   const messageCount = input.messageCount ?? 106
   if (!Number.isInteger(messageCount) || messageCount < 2 || messageCount % 2 !== 0) {
     throw new Error('synthetic OpenCode message count must be an even integer of at least two')
   }
+  if (input.batch !== undefined && input.batch !== 'stopped-repair-seven-roots') {
+    throw new Error('unknown synthetic OpenCode batch')
+  }
   const nativeIdNonce = sha256(nonce).slice(0, 16)
   const nativeId = (prefix: string, index: number): string =>
     `${prefix}_${nativeIdNonce}${String(index).padStart(10, '0')}`
-  const rootId = nativeId('ses', 0)
-  const childId = nativeId('ses', 1)
-  const grandchildId = nativeId('ses', 2)
   const unrelatedId = nativeId('ses', 3)
   // Project IDs are not prefixed IDs: v1.18.21 derives them from a remote URL
   // with Hash.fast(`git-remote:${normalizedRemote}`).
   const projectId = sha1('git-remote:fixture.invalid/freshell/managed-opencode')
-  const selectedSentinel = `SELECTED_HISTORY_${nonce}`
-  const baselineMessages = new Map<string, string>()
-  const baselineParts = new Map<string, string>()
   const now = Date.now() - 600_000
 
   fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 })
@@ -130,7 +138,7 @@ export function seedManagedOpenCodeSource(input: {
     db.exec('CREATE TABLE message_seq (session_id TEXT PRIMARY KEY, next INTEGER NOT NULL); CREATE TABLE provider_config (id TEXT PRIMARY KEY, value TEXT);')
     const insertMigration = db.prepare('INSERT INTO migration (id, time_completed) VALUES (?, ?)')
     MIGRATIONS.forEach((migration, index) => insertMigration.run(migration, index + 100))
-    db.prepare('INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) VALUES (?, ?, ?, ?, ?)')
+    db.prepare("INSERT INTO project (id, worktree, time_created, time_updated, sandboxes, vcs) VALUES (?, ?, ?, ?, ?, 'git')")
       .run(projectId, workspace, now, now, '[]')
     db.prepare('INSERT INTO project_directory (project_id, directory, time_created) VALUES (?, ?, ?)')
       .run(projectId, workspace, now)
@@ -141,102 +149,119 @@ export function seedManagedOpenCodeSource(input: {
       (id, project_id, workspace_id, parent_id, slug, directory, title, version,
        time_created, time_updated, metadata)
       VALUES (?, ?, ?, ?, ?, ?, ?, '1.18.21', ?, ?, ?)`)
-    for (const [id, parent, title, offset] of [
-      [rootId, null, `Synthetic managed OpenCode ${nonce}`, 0],
-      [childId, rootId, `Synthetic child ${nonce}`, 1],
-      [grandchildId, childId, `Synthetic grandchild ${nonce}`, 2],
-      [unrelatedId, null, 'UNRELATED_SESSION_SENTINEL', 3],
-    ] as const) {
-      // These are ordinary local sessions. OpenCode 1.18.21 rejects prompts
-      // attached to a workspace adapter that is not enabled in the TUI.
-      insertSession.run(id, projectId, null, parent, id, workspace, title, now + offset, now + offset, JSON.stringify({ opaque: 'OPAQUE_ROW_SENTINEL' }))
-    }
-
+    insertSession.run(unrelatedId, projectId, null, null, unrelatedId, workspace, 'UNRELATED_SESSION_SENTINEL', now + 3, now + 3, JSON.stringify({ opaque: 'OPAQUE_ROW_SENTINEL' }))
     const insertMessage = db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
     const insertPart = db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
-    const tokens = { total: 0, input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
-    let lastMessageId = ''
-    for (let index = 0; index < messageCount; index++) {
-      const id = nativeId('msg', index)
-      const time = now + 100 + index
-      const assistant = index % 2 === 1
-      const data = JSON.stringify(assistant
-        ? {
-          role: 'assistant',
-          parentID: nativeId('msg', index - 1),
-          providerID: 'openai',
-          modelID: 'gpt-5.6-luna',
-          mode: 'build',
-          agent: 'build',
-          path: { cwd: workspace, root: workspace },
-          cost: 0,
-          tokens,
-          finish: 'stop',
-          time: { created: time, completed: time },
+    const unrelatedMessageId = nativeId('msg', messageCount + 2)
+    insertMessage.run(unrelatedMessageId, unrelatedId, now + 500, now + 500, JSON.stringify({
+      role: 'user', agent: 'build', model: { providerID: 'openai', modelID: 'gpt-5.6-luna' }, time: { created: now + 500 },
+    }))
+    insertPart.run(nativeId('prt', (messageCount + 2) * 3 + 1), unrelatedMessageId, unrelatedId, now + 500, now + 500, JSON.stringify({ type: 'text', text: 'UNRELATED_MESSAGE_SENTINEL' }))
+
+    const insertFamily = (familyIndex: number): SyntheticSourceFamily => {
+      const familyNonce = familyIndex === 0 ? nonce : `${nonce}:family:${familyIndex}`
+      const familyIdNonce = sha256(familyNonce).slice(0, 16)
+      const nativeId = (prefix: string, index: number): string => `${prefix}_${familyIdNonce}${String(index).padStart(10, '0')}`
+      const rootId = nativeId('ses', 0)
+      const childId = nativeId('ses', 1)
+      const grandchildId = nativeId('ses', 2)
+      const selectedSentinel = `SELECTED_HISTORY_${familyNonce}`
+      const baselineMessages = new Map<string, string>()
+      const baselineParts = new Map<string, string>()
+      for (const [id, parent, title, offset] of [
+        [rootId, null, `Synthetic managed OpenCode ${familyNonce}`, 0],
+        [childId, rootId, `Synthetic child ${familyNonce}`, 1],
+        [grandchildId, childId, `Synthetic grandchild ${familyNonce}`, 2],
+      ] as const) {
+        // These are ordinary local sessions. OpenCode 1.18.21 rejects prompts
+        // attached to a workspace adapter that is not enabled in the TUI.
+        insertSession.run(id, projectId, null, parent, id, workspace, title, now + offset, now + offset, JSON.stringify({ opaque: 'OPAQUE_ROW_SENTINEL' }))
+      }
+
+      const tokens = { total: 0, input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+      let lastMessageId = ''
+      for (let index = 0; index < messageCount; index++) {
+        const id = nativeId('msg', index)
+        const time = now + 100 + index
+        const assistant = index % 2 === 1
+        const data = JSON.stringify(assistant
+          ? {
+            role: 'assistant',
+            parentID: nativeId('msg', index - 1),
+            providerID: 'openai',
+            modelID: 'gpt-5.6-luna',
+            mode: 'build',
+            agent: 'build',
+            path: { cwd: workspace, root: workspace },
+            cost: 0,
+            tokens,
+            finish: 'stop',
+            time: { created: time, completed: time },
+          }
+          : {
+            role: 'user',
+            agent: 'build',
+            model: { providerID: 'openai', modelID: 'gpt-5.6-luna' },
+            time: { created: time },
+          })
+        const part = JSON.stringify({ type: 'text', text: `${selectedSentinel}_${index}` })
+        insertMessage.run(id, rootId, time, time, data)
+        if (assistant) {
+          const startId = nativeId('prt', index * 3)
+          insertPart.run(startId, id, rootId, time, time, JSON.stringify({ type: 'step-start' }))
+          baselineParts.set(startId, sha256(JSON.stringify({ type: 'step-start' })))
         }
-        : {
+        const textId = nativeId('prt', index * 3 + 1)
+        insertPart.run(textId, id, rootId, time, time, part)
+        baselineMessages.set(id, sha256(data))
+        baselineParts.set(textId, sha256(part))
+        if (assistant) {
+          const finish = JSON.stringify({ type: 'step-finish', reason: 'stop', cost: 0, tokens })
+          const finishId = nativeId('prt', index * 3 + 2)
+          insertPart.run(finishId, id, rootId, time, time, finish)
+          baselineParts.set(finishId, sha256(finish))
+        }
+        lastMessageId = id
+      }
+      for (const [messageIndex, id, label] of [
+        [messageCount, childId, 'CHILD_HISTORY_SENTINEL'],
+        [messageCount + 1, grandchildId, 'GRANDCHILD_HISTORY_SENTINEL'],
+      ] as const) {
+        const messageId = nativeId('msg', messageIndex)
+        const partId = nativeId('prt', messageIndex * 3 + 1)
+        const data = JSON.stringify({
           role: 'user',
           agent: 'build',
           model: { providerID: 'openai', modelID: 'gpt-5.6-luna' },
-          time: { created: time },
+          time: { created: now + 500 },
         })
-      const part = JSON.stringify({ type: 'text', text: `${selectedSentinel}_${index}` })
-      insertMessage.run(id, rootId, time, time, data)
-      if (assistant) {
-        const startId = nativeId('prt', index * 3)
-        insertPart.run(startId, id, rootId, time, time, JSON.stringify({ type: 'step-start' }))
-        baselineParts.set(startId, sha256(JSON.stringify({ type: 'step-start' })))
-      }
-      const textId = nativeId('prt', index * 3 + 1)
-      insertPart.run(textId, id, rootId, time, time, part)
-      baselineMessages.set(id, sha256(data))
-      baselineParts.set(textId, sha256(part))
-      if (assistant) {
-        const finish = JSON.stringify({ type: 'step-finish', reason: 'stop', cost: 0, tokens })
-        const finishId = nativeId('prt', index * 3 + 2)
-        insertPart.run(finishId, id, rootId, time, time, finish)
-        baselineParts.set(finishId, sha256(finish))
-      }
-      lastMessageId = id
-    }
-    for (const [messageIndex, id, label] of [
-      [messageCount, childId, 'CHILD_HISTORY_SENTINEL'],
-      [messageCount + 1, grandchildId, 'GRANDCHILD_HISTORY_SENTINEL'],
-      [messageCount + 2, unrelatedId, 'UNRELATED_MESSAGE_SENTINEL'],
-    ] as const) {
-      const messageId = nativeId('msg', messageIndex)
-      const partId = nativeId('prt', messageIndex * 3 + 1)
-      const data = JSON.stringify({
-        role: 'user',
-        agent: 'build',
-        model: { providerID: 'openai', modelID: 'gpt-5.6-luna' },
-        time: { created: now + 500 },
-      })
-      const part = JSON.stringify({ type: 'text', text: label })
-      insertMessage.run(messageId, id, now + 500, now + 500, data)
-      insertPart.run(partId, messageId, id, now + 500, now + 500, part)
-      if (id !== unrelatedId) {
+        const part = JSON.stringify({ type: 'text', text: label })
+        insertMessage.run(messageId, id, now + 500, now + 500, data)
+        insertPart.run(partId, messageId, id, now + 500, now + 500, part)
         baselineMessages.set(messageId, sha256(data))
         baselineParts.set(partId, sha256(part))
       }
+      db.prepare('INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?, 1, ?)').run(rootId, `owner_${familyNonce}`)
+      const rootInfo = {
+        id: rootId,
+        slug: rootId,
+        projectID: projectId,
+        directory: workspace,
+        title: `Synthetic managed OpenCode ${familyNonce}`,
+        version: '1.18.21',
+        time: { created: now, updated: now },
+      }
+      db.prepare('INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, 1, ?, ?)')
+        .run(nativeId('evt', 0), rootId, 'session.created.1', JSON.stringify({ sessionID: rootId, info: rootInfo }))
+      db.prepare('INSERT INTO session_context_epoch (session_id, baseline, snapshot, baseline_seq) VALUES (?, ?, ?, 1)')
+        .run(rootId, 'baseline', JSON.stringify({ opaque: 'CONTEXT_SENTINEL' }))
+      db.prepare('INSERT INTO todo (session_id, content, status, priority, position, time_created, time_updated) VALUES (?, ?, ?, ?, 1, ?, ?)')
+        .run(rootId, 'synthetic todo', 'pending', 'high', now + 503, now + 503)
+      db.prepare('INSERT INTO message_seq (session_id, next) VALUES (?, ?)').run(rootId, messageCount + 1)
+      return { rootId, childId, grandchildId, baselineMessages, baselineParts, lastMessageId, selectedSentinel }
     }
-    db.prepare('INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?, 1, ?)').run(rootId, `owner_${nonce}`)
-    const rootInfo = {
-      id: rootId,
-      slug: rootId,
-      projectID: projectId,
-      directory: workspace,
-      title: `Synthetic managed OpenCode ${nonce}`,
-      version: '1.18.21',
-      time: { created: now, updated: now },
-    }
-    db.prepare('INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, 1, ?, ?)')
-      .run(nativeId('evt', 0), rootId, 'session.created.1', JSON.stringify({ sessionID: rootId, info: rootInfo }))
-    db.prepare('INSERT INTO session_context_epoch (session_id, baseline, snapshot, baseline_seq) VALUES (?, ?, ?, 1)')
-      .run(rootId, 'baseline', JSON.stringify({ opaque: 'CONTEXT_SENTINEL' }))
-    db.prepare('INSERT INTO todo (session_id, content, status, priority, position, time_created, time_updated) VALUES (?, ?, ?, ?, 1, ?, ?)')
-      .run(rootId, 'synthetic todo', 'pending', 'high', now + 503, now + 503)
-    db.prepare('INSERT INTO message_seq (session_id, next) VALUES (?, ?)').run(rootId, messageCount + 1)
+    const first = insertFamily(0)
+    const families = input.batch === undefined ? undefined : [first, insertFamily(1), insertFamily(2), insertFamily(3), insertFamily(4), insertFamily(5), insertFamily(6)] as const
     db.prepare('INSERT INTO account (id, email, url, access_token, refresh_token, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?)')
       .run(`account_${nonce}`, 'synthetic@example.invalid', 'https://example.invalid', 'ACCOUNT_TOKEN_SENTINEL', 'ACCOUNT_REFRESH_SENTINEL', now, now)
     db.prepare('INSERT INTO control_account (email, url, access_token, refresh_token, active, time_created, time_updated) VALUES (?, ?, ?, ?, 1, ?, ?)')
@@ -244,7 +269,8 @@ export function seedManagedOpenCodeSource(input: {
     db.prepare('INSERT INTO credential (id, label, value, time_created, time_updated) VALUES (?, ?, ?, ?, ?)')
       .run(nativeId('cred', 0), 'synthetic', 'CREDENTIAL_VALUE_SENTINEL', now, now)
     db.prepare('INSERT INTO provider_config (id, value) VALUES (?, ?)').run(`provider_${nonce}`, 'PROVIDER_CONFIG_SENTINEL')
-    return { databasePath, rootId, childId, grandchildId, unrelatedId, baselineMessages, baselineParts, lastMessageId, selectedSentinel }
+    const source = { databasePath, unrelatedId, ...first }
+    return families ? { ...source, families } : source
   } finally {
     db.close()
   }

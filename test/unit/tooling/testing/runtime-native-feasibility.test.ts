@@ -12,7 +12,7 @@ import { createServer as createHttpServer } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
 import WebSocket, { WebSocketServer } from 'ws'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
-import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
+import { RuntimeHarness, seedManagedOpenCodeSource, type SyntheticSource } from '../../../../scripts/testing/runtime-sandbox.js'
 import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   prepareOwnedOpenCodeTuiSource,
   openCodeTuiDisposalObserver,
@@ -51,6 +51,47 @@ function createFixtureCheckout(directory: string): string {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each([undefined, 'stopped-repair-seven-roots'] as const)('canonical source seeds complete disjoint native Git families in one store (%s)', batch => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'task007-seed-'))
+    try {
+      const databasePath = path.join(root, 'source.sqlite')
+      const input = { repoRoot: process.cwd(), databasePath, workspace: root, nonce: 'task007-canonical', batch }
+      const source = seedManagedOpenCodeSource(input) as SyntheticSource & { families?: readonly Omit<SyntheticSource, 'databasePath' | 'unrelatedId'>[] }
+      const families = batch ? source.families : [source]
+      expect(families).toHaveLength(batch ? 7 : 1)
+      const database = new DatabaseSync(databasePath, { readOnly: true })
+      try {
+        // Native project discovery selects Git projects by the actual workspace.
+        expect(database.prepare('SELECT worktree,vcs FROM project WHERE worktree=? AND vcs=?').all(root, 'git')).toEqual([{ worktree: root, vcs: 'git' }])
+        expect(database.prepare('SELECT count(*) AS count FROM project_directory').get()?.count).toBe(1)
+        expect(database.prepare('SELECT count(*) AS count FROM account').get()?.count).toBe(1)
+        expect(database.prepare('SELECT count(*) AS count FROM credential').get()?.count).toBe(1)
+        expect(database.prepare('SELECT count(*) AS count FROM provider_config').get()?.count).toBe(1)
+        expect(database.prepare('SELECT count(*) AS count FROM session WHERE parent_id IS NULL').get()?.count).toBe((batch ? 7 : 1) + 1)
+        const ids = new Set<string>()
+        for (const family of families!) {
+          for (const id of [family.rootId, family.childId, family.grandchildId]) {
+            expect(ids.has(id)).toBe(false)
+            ids.add(id)
+          }
+          expect(database.prepare('SELECT parent_id FROM session WHERE id=?').get(family.childId)?.parent_id).toBe(family.rootId)
+          expect(database.prepare('SELECT parent_id FROM session WHERE id=?').get(family.grandchildId)?.parent_id).toBe(family.childId)
+          expect(database.prepare('SELECT count(*) AS count FROM message WHERE session_id=?').get(family.rootId)?.count).toBe(106)
+          const messages = database.prepare('SELECT id,data FROM message WHERE session_id IN (?,?,?)').all(family.rootId, family.childId, family.grandchildId)
+          const parts = database.prepare('SELECT id,data FROM part WHERE session_id IN (?,?,?)').all(family.rootId, family.childId, family.grandchildId)
+          expect(messages).toHaveLength(108)
+          expect(family.baselineMessages.size).toBe(messages.length)
+          expect(family.baselineParts.size).toBe(parts.length)
+          for (const row of messages) expect(family.baselineMessages.get(String(row.id))).toBe(createHash('sha256').update(String(row.data)).digest('hex'))
+          for (const row of parts) expect(family.baselineParts.get(String(row.id))).toBe(createHash('sha256').update(String(row.data)).digest('hex'))
+          expect(database.prepare('SELECT session_id FROM message WHERE id=?').get(family.lastMessageId)?.session_id).toBe(family.rootId)
+          expect(database.prepare('SELECT count(*) AS count FROM event WHERE aggregate_id=?').get(family.rootId)?.count).toBe(1)
+          expect(family.baselineMessages.has(String(database.prepare('SELECT id FROM message WHERE session_id=?').get(source.unrelatedId)?.id))).toBe(false)
+        }
+        expect(source.rootId).toBe(families![0].rootId)
+      } finally { database.close() }
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  })
   it.each(['root-load-error', 'history-load-error'])('damages only the owned exact native %s source while preserving the sealed source (controlled UID driver only)', fault => {
     const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
     fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
