@@ -197,7 +197,19 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
         }
     }
     if let Some(mcp) = member(raw, &top, "mcp") {
-        for (_, range) in object_members(mcp, 0)? {
+        // Native Object.entries sees only the last value for each decoded
+        // server name. Discard overwritten entries before selecting their cwd.
+        let mut names = std::collections::BTreeSet::new();
+        let mut winners = Vec::new();
+        for (name, range) in object_members(mcp, 0)?.into_iter().rev() {
+            let name = serde_json::from_str::<String>(&mcp[name])
+                .map_err(|_| "invalid selected MCP server name")?;
+            if names.insert(name) {
+                winners.push(range);
+            }
+        }
+        drop(names);
+        for range in winners.into_iter().rev() {
             let entry = &mcp[range];
             let entries = object_members(entry, 0)?;
             if member(entry, &entries, "type")

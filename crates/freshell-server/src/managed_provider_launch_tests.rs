@@ -3604,6 +3604,10 @@ export default async (input,options)=>({config:async(config)=>{
         "\"instructions\":",
         "\"\\u0069\\u006e\\u0073\\u0074\\u0072\\u0075\\u0063\\u0074\\u0069\\u006f\\u006e\\u0073\":",
     );
+    let ordinary = ordinary.replace(
+        "\"mcp\":{",
+        "\"mcp\":{\"closed-cwd-probe\":{\"type\":\"local\",\"cwd\":\"/missing-obsolete-mcp\"},\"disabled-duplicate\":{\"type\":\"local\",\"cwd\":\"/missing-obsolete-disabled-mcp\"},\"disabled-duplicate\":{\"type\":\"remote\",\"url\":\"https://example.test/mcp\",\"enabled\":false},",
+    ).replace("\"closed-cwd-probe\":{\"command\":", "\"closed-cwd-\\u0070robe\":{\"command\":");
     let duplicate_resources = format!(
         "{{\"plugin\":[\"file:///missing-obsolete-plugin.mjs\"],\"instructions\":[\"/missing-obsolete-instructions.md\"],\"skills\":{{\"paths\":[\"/missing-obsolete-skills\"]}},{}",
         &ordinary[1..],

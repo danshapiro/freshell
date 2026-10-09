@@ -81,6 +81,9 @@ mod configured_resource_tests {
                 r#"{{"skills":{{"paths":[{obsolete_json}]}},"skills":{{"paths":[{skills_json}]}}}}"#
             ),
             format!(r#"{{"skills":{{"paths":[{obsolete_json}],"pa\u0074hs":[{skills_json}]}}}}"#),
+            format!(
+                r#"{{"mcp":{{"same":{{"type":"local","cwd":{obsolete_json}}},"sa\u006de":{{"type":"local","cwd":{skills_json},"command":["node","run"]}}}}}}"#
+            ),
         ];
         for (index, raw) in cases.iter().enumerate() {
             std::fs::write(&config, raw).unwrap();
@@ -195,7 +198,13 @@ mod configured_resource_tests {
             std::fs::rename(&hidden, owned.path().join("external")).unwrap();
             assert_eq!(std::fs::read_to_string(&config).unwrap(), *raw);
         }
-        for field in ["plugin", "instructions", "skills-object", "skills-paths"] {
+        for field in [
+            "plugin",
+            "instructions",
+            "skills-object",
+            "skills-paths",
+            "mcp-name",
+        ] {
             for final_missing in [false, true] {
                 let final_value = if final_missing {
                     format!("[{obsolete_json}]")
@@ -209,6 +218,17 @@ mod configured_resource_tests {
                     "skills-object" => format!(
                         r#"{{"skills":{{"paths":[{skills_json}]}},"skills":{{"paths":{final_value}}}}}"#
                     ),
+                    "mcp-name" => {
+                        let winner = if final_missing {
+                            format!(r#"{{"type":"local","cwd":{obsolete_json}}}"#)
+                        } else {
+                            r#"{"type":"remote","url":"https://example.test/mcp","enabled":false}"#
+                                .into()
+                        };
+                        format!(
+                            r#"{{"mcp":{{"same":{{"type":"local","cwd":{obsolete_json}}},"\u0073\u0061\u006d\u0065":{winner}}}}}"#
+                        )
+                    }
                     _ => {
                         format!(r#"{{"skills":{{"paths":[{skills_json}],"paths":{final_value}}}}}"#)
                     }
