@@ -3614,7 +3614,10 @@ export default async (input,options)=>({config:async(config)=>{
     // Five logical native aliases share one accepted immutable 16 MiB raw
     // source. The actual controller stage and actual host must not turn the
     // 80 MiB cumulative read volume into a simultaneous-source limit.
-    let repeated_static_source = fixture.join("source-home/.config/opencode/static-capacity.jsonc");
+    // Keep the shared backing file in the workspace mounted for the provider.
+    // Workspace aliases must remain resolvable during the provider-owned
+    // refresh, after the controller's original HOME is outside its mounts.
+    let repeated_static_source = fixture.join("workspace/static-capacity.jsonc");
     let mut static_capacity =
         r#"{"agent":{"liveCapacity":{"description":"native-live-capacity-nonce"}}}"#.to_string();
     // JSONC block padding keeps the same inclusive physical-source size while
