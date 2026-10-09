@@ -1363,3 +1363,42 @@ async fn a_preloaded_thread_held_elsewhere_fails_the_native_at_startup() {
         "the failed native's other preload ended with it"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turns_rollout_is_on_disk_before_turn_start_is_answered() {
+    let home = tempfile::tempdir().unwrap();
+    // The helper spawn gives the native real work (a flock) right after it answers, so
+    // a rollout written after the answer is reliably caught missing.
+    let fake = FakeAppServer::spawn(
+        json!({"threadStartThreadId": "t-roll", "turnCompleteDelayMs": 60000,
+               "helperThreadOnTurn": {"id": "t-roll-helper", "durationMs": 60000}}),
+        home.path(),
+        &[],
+    )
+    .await;
+    let native = fake.native().await.pid;
+    let mut rpc = connected(fake.port).await;
+    rpc.call("thread/start", json!({})).await.unwrap();
+    assert!(
+        !rollout_exists(home.path(), "t-roll"),
+        "thread/start alone writes no rollout"
+    );
+    start_turn(&mut rpc, "t-roll").await;
+    // SIGKILLed the instant turn/start is answered: nothing after the answer runs.
+    assert!(fake.signal_native(SIGKILL));
+    wait_until("native exit", Duration::from_secs(2), || !pid_alive(native)).await;
+    assert!(
+        rollout_exists(home.path(), "t-roll"),
+        "the rollout exists once turn/start has been answered"
+    );
+    wait_until("lock release", Duration::from_secs(2), || {
+        !lock_held(&thread_lock_path(home.path(), "t-roll"))
+    })
+    .await;
+    let b = FakeAppServer::spawn(json!({"resumeNeedsRollout": true}), home.path(), &[]).await;
+    connected(b.port)
+        .await
+        .call("thread/resume", json!({"threadId": "t-roll"}))
+        .await
+        .expect("a conversation killed right after turn/start resumes");
+}

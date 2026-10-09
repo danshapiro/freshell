@@ -940,6 +940,18 @@ function handleConnection(socket) {
       // response implies the witness entry is already on disk.
       appendThreadOperation(method, message.params, result)
       maybeWriteRolloutForMethod(method, message.params)
+      // A non-ephemeral turn's rollout. The native role writes it here, before the
+      // answer, so a native killed at any point after answering turn/start (SIGKILL
+      // included) leaves a resumable conversation; the single-process fake keeps
+      // writing it after its awaited turn, below.
+      const turnRolloutThreadId = method === 'turn/start'
+        && message.params?.threadId
+        && !nativeRole?.isEphemeral(message.params.threadId)
+        ? message.params.threadId
+        : null
+      const nativeRolloutPath = nativeRole && turnRolloutThreadId
+        ? ensureDurableArtifact(turnRolloutThreadId).thread.path
+        : null
       socket.send(JSON.stringify({
         id: message.id,
         result,
@@ -958,8 +970,8 @@ function handleConnection(socket) {
       }
       if (method === 'turn/start' && (behavior.recordTurns || nativeRole) && result?.turn?.id) {
         // A native turn runs detached (like a real app-server), so the rest of the
-        // post-response handling — the rollout write included — happens at turn
-        // start; the single-process fake keeps awaiting it as before.
+        // post-response handling happens at turn start; the single-process fake
+        // keeps awaiting it as before.
         const turnLifecycle = (async () => {
           // recordTurns opt-in: a recorded turn closes with the real turn
           // lifecycle notifications (thread/status active → turn/started →
@@ -1060,9 +1072,8 @@ function handleConnection(socket) {
           watches.delete(watchId)
         }
       }
-      if (method === 'turn/start' && message.params?.threadId && !nativeRole?.isEphemeral(message.params.threadId)) {
-        const { thread } = ensureDurableArtifact(message.params.threadId)
-        const rolloutPath = thread.path
+      if (turnRolloutThreadId) {
+        const rolloutPath = nativeRolloutPath ?? ensureDurableArtifact(turnRolloutThreadId).thread.path
         const rolloutParent = path.dirname(rolloutPath)
         for (const [watchId, watchedPath] of watches) {
           if (watchedPath !== rolloutPath && watchedPath !== rolloutParent) {
