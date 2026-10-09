@@ -140,6 +140,9 @@ impl Registry {
                 &expected_targets,
                 &persisted_roots,
             )?;
+            crate::recovery::stopped_repair_crash_boundary(
+                "stopped_repair_after_repair_cas_before_withdrawal",
+            );
             finish_pending_withdrawal(
                 &mut conn,
                 &operation_id,
@@ -1305,6 +1308,8 @@ fn finish_pending_withdrawal(
         &mut check_generation,
     )?;
     check_generation()?;
+
+    crate::recovery::stopped_repair_crash_boundary("stopped_repair_during_withdrawal_before_ack");
 
     let original = load_operation(conn, operation_id)?;
     validate_scope_receipts(&original.scope, &original.owner_choices, roots)?;

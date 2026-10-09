@@ -55,6 +55,40 @@ type StoppedRepairGroups = BTreeMap<
     )>,
 >;
 
+pub(crate) fn stopped_repair_crash_boundary(point: &'static str) {
+    crate::service::crash_if(point);
+    #[cfg(test)]
+    if std::env::var("FRESHELL_TASK007_STOPPED_REPAIR_CRASH_POINT")
+        .ok()
+        .as_deref()
+        == Some(point)
+    {
+        assert_eq!(
+            std::env::var("FRESHELL_SANDBOX_MODE").as_deref(),
+            Ok("runtime-suite")
+        );
+        assert!(Path::new("/.dockerenv").exists());
+        let marker = PathBuf::from(
+            std::env::var_os("FRESHELL_TASK007_STOPPED_REPAIR_CRASH_MARKER")
+                .expect("owned crash marker"),
+        );
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .expect("fresh owned boundary marker");
+        file.write_all(point.as_bytes())
+            .and_then(|()| file.sync_all())
+            .expect("record and sync actual stopped-repair boundary");
+        std::fs::File::open(marker.parent().expect("owned marker directory"))
+            .and_then(|directory| directory.sync_all())
+            .expect("sync boundary marker directory");
+        eprintln!("{{\"severity\":\"info\",\"event\":\"supervisor.stopped_repair.test_crash\",\"point\":\"{point}\"}}");
+        std::process::abort();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NativeIdentityWait {
     Observed {
@@ -167,6 +201,29 @@ pub(crate) fn native_identity_wait_timeout(opencode_tui_readiness_required: bool
     } else {
         NATIVE_IDENTITY_STARTUP_TIMEOUT
     }
+}
+
+#[cfg(any(test, feature = "runtime-test-faults"))]
+fn stopped_repair_resume_observation_fault(
+    context: &RecoveryContext,
+    status: &crate::service::HostStatus,
+    native_capability: bool,
+    requested: bool,
+    elapsed_ms: u64,
+) -> Option<NativeIdentityWait> {
+    (requested
+        && native_capability
+        && !status.exited
+        && context.provider == "opencode"
+        && context.native_import_state == NativeImportState::Completed
+        && context.native_import_authority == "verified_import_receipt"
+        && context.opencode_adoption_baseline.is_some()
+        && current_native_observation(context, status).is_some())
+    .then(|| NativeIdentityWait::HostUnavailable {
+        message: "stopped-repair Resume observation rejected by the isolated test fault".into(),
+        transient: None,
+        elapsed_ms,
+    })
 }
 
 fn native_identity_wait_cancellation(
@@ -1451,6 +1508,7 @@ impl Supervisor {
                 return Err(stopped_repair_blocked("provider_reader_or_import_failed"));
             }
         };
+        stopped_repair_crash_boundary("stopped_repair_after_import_publication");
         let after_helper_views = self.registry.inventory().await.map_err(map_registry)?;
         if stopped_repair_execution_generation(&after_helper_views, captured)
             .map_err(|_| stopped_repair_blocked("old_cleanup_generation_changed"))?
@@ -4674,6 +4732,26 @@ impl Supervisor {
                     native_capability && observation.incarnation_id == *incarnation_id
                 })
                 .cloned();
+            #[cfg(feature = "runtime-test-faults")]
+            if let Some(failure) = stopped_repair_resume_observation_fault(
+                &current,
+                &status,
+                native_capability && observation.is_some(),
+                std::env::var("FRESHELL_RUNTIME_STOPPED_REPAIR_RESUME_OBSERVATION_FAIL")
+                    .ok()
+                    .as_deref()
+                    == Some("1"),
+                elapsed_ms,
+            ) {
+                crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.stopped_repair_resume_observation_test_failure",
+                    serde_json::json!({"severity":"warn","reason":"test_observation_failure",
+                        "soulId":soul_id,"incarnationId":incarnation_id,
+                        "executionGeneration":status.max_execution_generation}),
+                );
+                return failure;
+            }
             if !status.exited && persist_observation {
                 if let Some(observation) = observation.as_ref() {
                     let mut fence = current.write_fence();
@@ -5181,6 +5259,179 @@ pub(crate) mod tests {
     use freshell_runtime_protocol::{
         FreshAgentLaunchSpec, FreshProvider, IncarnationId, RequestId,
     };
+
+    #[tokio::test]
+    async fn stopped_repair_resume_observation_fault_requires_current_saved_baseline() {
+        use freshell_runtime_protocol::{
+            HostBootId, NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let mut context = registry.recovery_context(soul).await.unwrap();
+        context.provider = "opencode".into();
+        context.native_session_id = Some("ses_repaired".into());
+        context.native_import_state = NativeImportState::Completed;
+        context.native_import_authority = "verified_import_receipt".into();
+        context.native_identity_launch = Some(NativeIdentityLaunch {
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: prepared.launch_nonce.as_str().into(),
+            evidence_revision: context.evidence_revision,
+            execution_generation: 1,
+            requested_native_session_id: context.native_session_id.clone(),
+        });
+        // A typed baseline for this domain test, not native continuity evidence.
+        let payload = b"x";
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload));
+        let manifest_json = serde_json::json!({"version":1,"provider_schema":"opencode-1.18.21",
+            "root_session_id":"ses_repaired","source_store_id":"a".repeat(64),
+            "source_schema_fingerprint":"b".repeat(64),"migration_journal_fingerprint":"c".repeat(64),
+            "generation":"d".repeat(64),"assets":[],"rows":[],"row_count":0,
+            "payload_bytes":payload.len(),"payload_sha256":payload_sha256}).to_string();
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: payload.len() as u64,
+            sha256: payload_sha256,
+        }];
+        let image = format!("sha256:{}", "e".repeat(64));
+        let descriptor = OpenCodeTransferDescriptor {
+            transfer_id: "repaired-baseline".into(),
+            provider: "opencode".into(),
+            source_store_id: "a".repeat(64),
+            root_session_id: "ses_repaired".into(),
+            source_generation: "d".repeat(64),
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint: "b".repeat(64),
+            migration_journal_fingerprint: "c".repeat(64),
+            destination_store_id: context.provider_store_id.clone(),
+            destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
+            target_image_ref: image.clone(),
+            target_build_receipt: opencode_target_build_receipt(&image, "opencode-1.18.21"),
+            incarnation_id: prepared.incarnation_id.to_string(),
+            bundle_sha256: opencode_transfer_bundle_digest(&manifest_json, &files),
+            manifest_json,
+            files,
+            total_bytes: payload.len() as u64,
+        };
+        context.opencode_adoption_baseline =
+            Some(OpenCodeAdoptionBaseline::from_descriptor(descriptor).unwrap());
+        let launch = context.native_identity_launch.as_ref().unwrap();
+        let make_status = || crate::service::HostStatus {
+            max_execution_generation: 1,
+            native_identity_observation: Some(NativeIdentityObservation {
+                native_session_id: "ses_repaired".into(),
+                incarnation_id: launch.incarnation_id.clone(),
+                launch_nonce: launch.launch_nonce.clone(),
+                evidence_revision: launch.evidence_revision,
+                source: NativeIdentitySource::OpencodeTui,
+                evidence_digest: "f".repeat(64),
+            }),
+            host_boot_id: HostBootId::new(),
+            worker_pid: Some(123),
+            worker_launch_count: 1,
+            fixture_evidence: serde_json::json!({}),
+            exited: false,
+            native_session_id: context.native_session_id.clone(),
+            opencode_adoption: Default::default(),
+            opencode_transfer_receipt: None,
+        };
+        let status = make_status();
+        let baseline = context.opencode_adoption_baseline.clone();
+        let failure = stopped_repair_resume_observation_fault(&context, &status, true, true, 17);
+        assert!(matches!(
+            failure,
+            Some(NativeIdentityWait::HostUnavailable {
+                transient: None,
+                elapsed_ms: 17,
+                ..
+            })
+        ));
+        assert_eq!(context.opencode_adoption_baseline, baseline);
+        assert!(
+            stopped_repair_resume_observation_fault(&context, &status, true, false, 17).is_none()
+        );
+        assert!(
+            stopped_repair_resume_observation_fault(&context, &status, false, true, 17).is_none()
+        );
+        for guard in [
+            "exited",
+            "missing",
+            "root",
+            "incarnation",
+            "nonce",
+            "evidence",
+            "generation",
+            "source",
+        ] {
+            let mut invalid = make_status();
+            match guard {
+                "exited" => invalid.exited = true,
+                "missing" => invalid.native_identity_observation = None,
+                "root" => {
+                    invalid
+                        .native_identity_observation
+                        .as_mut()
+                        .unwrap()
+                        .native_session_id = "ses_other".into()
+                }
+                "incarnation" => {
+                    invalid
+                        .native_identity_observation
+                        .as_mut()
+                        .unwrap()
+                        .incarnation_id = IncarnationId::new()
+                }
+                "nonce" => {
+                    invalid
+                        .native_identity_observation
+                        .as_mut()
+                        .unwrap()
+                        .launch_nonce = "old".into()
+                }
+                "evidence" => {
+                    invalid
+                        .native_identity_observation
+                        .as_mut()
+                        .unwrap()
+                        .evidence_revision += 1
+                }
+                "generation" => invalid.max_execution_generation += 1,
+                "source" => {
+                    invalid.native_identity_observation.as_mut().unwrap().source =
+                        NativeIdentitySource::ClaudeNativeEvent
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                stopped_repair_resume_observation_fault(&context, &invalid, true, true, 17)
+                    .is_none(),
+                "{guard}"
+            );
+        }
+        let mut ordinary = context.clone();
+        ordinary.opencode_adoption_baseline = None;
+        assert!(
+            stopped_repair_resume_observation_fault(&ordinary, &status, true, true, 17).is_none()
+        );
+        ordinary = context.clone();
+        ordinary.provider = "claude".into();
+        assert!(
+            stopped_repair_resume_observation_fault(&ordinary, &status, true, true, 17).is_none()
+        );
+        ordinary = context.clone();
+        ordinary.native_import_state = NativeImportState::Pending;
+        assert!(
+            stopped_repair_resume_observation_fault(&ordinary, &status, true, true, 17).is_none()
+        );
+        ordinary = context.clone();
+        ordinary.native_import_authority = "legacy_unknown".into();
+        assert!(
+            stopped_repair_resume_observation_fault(&ordinary, &status, true, true, 17).is_none()
+        );
+    }
 
     #[tokio::test]
     async fn provider_observed_replacement() {

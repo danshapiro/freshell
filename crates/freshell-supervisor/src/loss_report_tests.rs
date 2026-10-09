@@ -12,6 +12,1415 @@ use freshell_runtime_protocol::{
 use rusqlite::{params, Connection};
 use std::collections::BTreeSet;
 
+// Private, provider-free historical setup. These records never qualify a
+// current import, reader or provider launch; production obtains those later.
+const TASK007_INPUT_ENV: &str = "FRESHELL_TASK007_STOPPED_FIXTURE_INPUT_FILE";
+const TASK007_OUTPUT_ENV: &str = "FRESHELL_TASK007_STOPPED_FIXTURE_OUTPUT_DIR";
+const TASK007_ROOT_ORDINALS: [usize; 9] = [0, 1, 2, 3, 4, 5, 6, 0, 1];
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007FixtureInput {
+    schema_version: u32,
+    fixture_id: String,
+    run_id: String,
+    candidate_sha: String,
+    installation_id: freshell_runtime_protocol::InstallationId,
+    owner_root: PathBuf,
+    runtime_root: PathBuf,
+    workspace_path: PathBuf,
+    cwd: PathBuf,
+    git_common_dir: Option<PathBuf>,
+    image_ref: String,
+    host_binary_path: PathBuf,
+    host_binary_sha256: String,
+    docker_daemon_id: DockerDaemonId,
+    broker_socket_path: PathBuf,
+    source: Task007FixtureSource,
+    targets: [Task007FixtureTarget; 9],
+    canonical_choices: [Task007FixtureChoice; 2],
+    explicit_views: [Task007FixtureView; 4],
+    unrelated: Task007UnrelatedInput,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007FixtureSource {
+    root_session_ids: [String; 7],
+    unrelated_session_id: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007FixtureTarget {
+    soul_id: SoulId,
+    provider_store_id: String,
+    terminal_id: String,
+    stream_id: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007FixtureChoice {
+    root_ordinal: usize,
+    target_ordinal: usize,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007FixtureView {
+    target_ordinal: usize,
+    view_id: freshell_runtime_protocol::ViewIntentId,
+    owner_id: String,
+    workspace_id: String,
+    tab_id: String,
+    pane_id: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007UnrelatedInput {
+    target: Task007FixtureTarget,
+    view_id: freshell_runtime_protocol::ViewIntentId,
+    owner_id: String,
+    workspace_id: String,
+    tab_id: String,
+    pane_id: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007FixtureOutput {
+    schema_version: u32,
+    evidence_kind: String,
+    fixture_id: String,
+    run_id: String,
+    candidate_sha: String,
+    installation_id: freshell_runtime_protocol::InstallationId,
+    docker_daemon_id: DockerDaemonId,
+    image_ref: String,
+    host_binary_sha256: String,
+    workspace_path: PathBuf,
+    runtime_root: PathBuf,
+    registry: Task007RegistryOutput,
+    targets: [Task007TargetOutput; 9],
+    canonical_choices: [Task007ChoiceOutput; 2],
+    unrelated: Task007UnrelatedOutput,
+    historical_control_epoch: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007RegistryOutput {
+    file: String,
+    schema_version: u32,
+    sha256: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007TargetOutput {
+    root_session_id: String,
+    soul_id: SoulId,
+    provider_store_id: String,
+    incarnation_id: IncarnationId,
+    launch_nonce: LaunchNonce,
+    container_id: String,
+    provider_volume_name: String,
+    runtime_dir: PathBuf,
+    host_binary_path: PathBuf,
+    immutable_config_digest: String,
+    incident_id: freshell_runtime_protocol::IncidentId,
+    expected_intent_revision: u64,
+    view_ids: Vec<freshell_runtime_protocol::ViewIntentId>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007ChoiceOutput {
+    root_session_id: String,
+    soul_id: SoulId,
+    expected_intent_revision: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007UnrelatedOutput {
+    soul_id: SoulId,
+    incident_id: freshell_runtime_protocol::IncidentId,
+    view_id: freshell_runtime_protocol::ViewIntentId,
+    expected_intent_revision: u64,
+    notice_ids: Vec<String>,
+    outbox_event_ids: Vec<String>,
+    exports: Vec<Task007ExportOutput>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007ExportOutput {
+    file: String,
+    sha256: String,
+}
+
+fn task007_fixture_paths(
+    input: Option<std::ffi::OsString>,
+    output: Option<std::ffi::OsString>,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    match (input, output) {
+        (None, None) => Ok(None),
+        (Some(input), Some(output)) if !input.is_empty() && !output.is_empty() => {
+            Ok(Some((input.into(), output.into())))
+        }
+        _ => Err("both private Task7 fixture paths are required".into()),
+    }
+}
+
+#[cfg(unix)]
+async fn task007_publish_fixture(
+    input_file: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Result<serde_json::Value, String> {
+    use crate::backend::{CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend};
+    use freshell_runtime_protocol::{
+        RuntimeLaunchPolicy, UpsertViewIntentRequest, ViewIntentKind, ViewIntentRequest,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let input: Task007FixtureInput =
+        serde_json::from_slice(&fs::read(input_file).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    task007_validate_input(&input, input_file, output_dir)?;
+    let registry = Registry::open(output_dir, Some(input.installation_id.clone()))
+        .map_err(|e| e.to_string())?;
+    let historical_epoch = registry.control_epoch();
+    let backend = DockerEngineBackend::new(&input.broker_socket_path);
+    let mut targets = Vec::new();
+    for (ordinal, target) in input.targets.iter().enumerate() {
+        let native_root = &input.source.root_session_ids[TASK007_ROOT_ORDINALS[ordinal]];
+        let terminal = task007_terminal(&input, target)?;
+        let prepared = registry
+            .prepare_launch(task007_launch(target, native_root, Some(terminal.clone())))
+            .await
+            .map_err(|e| e.to_string())?;
+        let runtime_dir = input.runtime_root.join(prepared.incarnation_id.as_str());
+        fs::create_dir(&runtime_dir).map_err(|e| e.to_string())?;
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        let volume =
+            crate::registry::stable_provider_volume_name(&input.installation_id, &target.soul_id);
+        let created = backend
+            .create_stopped(&CreateRuntimeSpec {
+                installation_id: input.installation_id.clone(),
+                soul_id: target.soul_id.clone(),
+                incarnation_id: prepared.incarnation_id.clone(),
+                image_ref: input.image_ref.clone(),
+                host_binary_path: input.host_binary_path.clone(),
+                runtime_dir: runtime_dir.clone(),
+                limits: limits(),
+                test_run_id: input.run_id.clone(),
+                terminal: Some(terminal),
+                fresh_agent: None,
+                opencode_transfer_dir: None,
+                provider_volume_name: volume.clone(),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        if created.daemon_id != input.docker_daemon_id {
+            return Err("private fixture Docker daemon changed".into());
+        }
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    daemon_id: created.daemon_id,
+                    container_id: created.container_id.clone(),
+                    image_ref: input.image_ref.clone(),
+                    runtime_dir: runtime_dir.clone(),
+                    host_binary_path: input.host_binary_path.clone(),
+                    immutable_config_digest: created.immutable_config_digest.clone(),
+                    launch_policy: Some(RuntimeLaunchPolicy::ProviderVolumeV1),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let loss = task007_historical_loss(&registry, &prepared).await?;
+        targets.push(serde_json::json!({
+            "rootSessionId":native_root,"soulId":target.soul_id,"providerStoreId":target.provider_store_id,
+            "incarnationId":prepared.incarnation_id,"launchNonce":prepared.launch_nonce,
+            "containerId":created.container_id,"providerVolumeName":volume,"runtimeDir":runtime_dir,
+            "hostBinaryPath":input.host_binary_path,"immutableConfigDigest":created.immutable_config_digest,
+            "incidentId":loss.incident_id,"expectedIntentRevision":loss.expected_intent_revision,"viewIds":[],
+        }));
+    }
+    for view in &input.explicit_views {
+        let target = &input.targets[view.target_ordinal];
+        registry
+            .upsert_view_intent(UpsertViewIntentRequest {
+                soul_id: target.soul_id.clone(),
+                view_id: Some(view.view_id.clone()),
+                intent: ViewIntentRequest {
+                    owner_id: view.owner_id.clone(),
+                    workspace_id: view.workspace_id.clone(),
+                    kind: ViewIntentKind::Explicit,
+                    preferred_tab_id: Some(view.tab_id.clone()),
+                    preferred_pane_id: Some(view.pane_id.clone()),
+                    ..ViewIntentRequest::default()
+                },
+                expected_revision: None,
+                expected_soul_intent_revision: targets[view.target_ordinal]
+                    ["expectedIntentRevision"]
+                    .as_u64()
+                    .unwrap(),
+                expected_control_epoch: None,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        targets[view.target_ordinal]["viewIds"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(view.view_id));
+    }
+    // The unrelated prior record is historical only: it owns no physical
+    // enclosure. Reuse the established historical binding helper, then assign
+    // its intended root before recording any fictional observation.
+    let unrelated_prepared = registry
+        .prepare_launch(task007_launch(
+            &input.unrelated.target,
+            &input.source.unrelated_session_id,
+            None,
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    registry
+        .commit_created(
+            unrelated_prepared.incarnation_id.clone(),
+            BackendCreatedRecord {
+                daemon_id: input.docker_daemon_id.clone(),
+                container_id: "0".repeat(64),
+                image_ref: input.image_ref.clone(),
+                runtime_dir: output_dir.join("historical-unrelated"),
+                host_binary_path: input.host_binary_path.clone(),
+                immutable_config_digest: format!("sha256:{}", "0".repeat(64)),
+                launch_policy: None,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let unrelated = task007_historical_loss(&registry, &unrelated_prepared).await?;
+    registry
+        .upsert_view_intent(UpsertViewIntentRequest {
+            soul_id: unrelated.soul_id.clone(),
+            view_id: Some(input.unrelated.view_id.clone()),
+            intent: ViewIntentRequest {
+                owner_id: input.unrelated.owner_id.clone(),
+                workspace_id: input.unrelated.workspace_id.clone(),
+                kind: ViewIntentKind::Explicit,
+                preferred_tab_id: Some(input.unrelated.tab_id.clone()),
+                preferred_pane_id: Some(input.unrelated.pane_id.clone()),
+                ..ViewIntentRequest::default()
+            },
+            expected_revision: None,
+            expected_soul_intent_revision: unrelated.expected_intent_revision,
+            expected_control_epoch: None,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let exporter = IncidentExporter::new(output_dir.join("incidents"), "task007-fictional-secret");
+    for pending in registry
+        .pending_incident_exports(100)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        registry
+            .export_and_ack_incident(pending, exporter.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let lifecycle = targets.iter().map(|target|serde_json::json!({"severity":"info","event":"historical.fixture.loss","data":{"incidentId":target["incidentId"],"soulId":target["soulId"]}}))
+        .chain(std::iter::once(serde_json::json!({"severity":"info","event":"historical.fixture.unrelated","data":{"incidentId":unrelated.incident_id,"soulId":unrelated.soul_id}})))
+        .map(|value|format!("{value}\n")).collect::<String>();
+    task007_sync_file(&output_dir.join("lifecycle.jsonl"), lifecycle.as_bytes())?;
+    let canonical_choices = input.canonical_choices.iter().map(|choice|serde_json::json!({
+        "rootSessionId":input.source.root_session_ids[choice.root_ordinal],
+        "soulId":targets[choice.target_ordinal]["soulId"],"expectedIntentRevision":targets[choice.target_ordinal]["expectedIntentRevision"],
+    })).collect::<Vec<_>>();
+    // Close every registry handle before downgrading and checkpointing. The
+    // completed schema-7 bytes are never reopened with Registry before install.
+    let database_path = registry.database_path().to_path_buf();
+    drop(registry);
+    let connection = Connection::open(&database_path).map_err(|e| e.to_string())?;
+    let unrelated_notice_ids = connection.prepare(
+        "SELECT DISTINCT notice_id FROM runtime_notices,json_each(incident_ids_json) WHERE value=?1 ORDER BY notice_id",
+    ).map_err(|e|e.to_string())?.query_map([unrelated.incident_id.as_str()],|row|row.get::<_,String>(0))
+        .map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    let unrelated_outbox_ids = connection.prepare(
+        "SELECT DISTINCT event_id FROM outbox,json_tree(payload) WHERE value=?1 ORDER BY event_id",
+    ).map_err(|e|e.to_string())?.query_map([unrelated.incident_id.as_str()],|row|row.get::<_,String>(0))
+        .map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    task007_schema_seven(&connection).map_err(|e| e.to_string())?;
+    let checkpoint: (u32, u32, u32) = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|e| e.to_string())?;
+    if checkpoint != (0, 0, 0) {
+        return Err("private schema-7 snapshot has a busy or incomplete WAL checkpoint".into());
+    }
+    connection.close().map_err(|(_, e)| e.to_string())?;
+    fs::set_permissions(&database_path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())?;
+    fs::File::open(&database_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    let unrelated_exports = fs::read_dir(output_dir.join("incidents")).map_err(|e|e.to_string())?
+        .map(|entry|entry.map_err(|e|e.to_string())).collect::<Result<Vec<_>,_>>()?
+        .into_iter().filter(|entry|entry.file_name().to_string_lossy().starts_with(unrelated.incident_id.as_str()))
+        .map(|entry|Ok(serde_json::json!({"file":format!("incidents/{}",entry.file_name().to_string_lossy()),"sha256":format!("{:x}",Sha256::digest(fs::read(entry.path()).map_err(|e|e.to_string())?))})))
+        .collect::<Result<Vec<_>,String>>()?;
+    let metadata = serde_json::json!({
+        "schemaVersion":1,"evidenceKind":"historical-fixture-setup","fixtureId":input.fixture_id,"runId":input.run_id,"candidateSha":input.candidate_sha,
+        "installationId":input.installation_id,"dockerDaemonId":input.docker_daemon_id,"imageRef":input.image_ref,"hostBinarySha256":input.host_binary_sha256,
+        "workspacePath":input.workspace_path,"runtimeRoot":input.runtime_root,
+        "registry":{"file":"runtime.sqlite3","schemaVersion":7,"sha256":format!("{:x}",Sha256::digest(fs::read(&database_path).map_err(|e|e.to_string())?))},
+        "targets":targets,"canonicalChoices":canonical_choices,
+        "unrelated":{"soulId":unrelated.soul_id,"incidentId":unrelated.incident_id,"viewId":input.unrelated.view_id,"expectedIntentRevision":unrelated.expected_intent_revision,"noticeIds":unrelated_notice_ids,"outboxEventIds":unrelated_outbox_ids,"exports":unrelated_exports},
+        "historicalControlEpoch":historical_epoch,
+    });
+    let metadata: Task007FixtureOutput =
+        serde_json::from_value(metadata).map_err(|e| e.to_string())?;
+    task007_sync_file(
+        &output_dir.join("metadata.json"),
+        &serde_json::to_vec_pretty(&metadata).map_err(|e| e.to_string())?,
+    )?;
+    fs::File::open(output_dir)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(metadata).map_err(|e| e.to_string())
+}
+
+#[cfg(unix)]
+fn task007_sync_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(unix)]
+fn task007_validate_input(
+    input: &Task007FixtureInput,
+    input_file: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    let invalid = || "invalid private Task7 historical fixture input".to_string();
+    for path in [
+        &input.owner_root,
+        &input.runtime_root,
+        &input.workspace_path,
+        &input.cwd,
+        &input.host_binary_path,
+        &input.broker_socket_path,
+        input_file,
+        output_dir,
+    ] {
+        if !path.is_absolute() || fs::canonicalize(path).map_err(|_| invalid())? != *path {
+            return Err(invalid());
+        }
+    }
+    if !input_file.starts_with(&input.owner_root)
+        || !output_dir.starts_with(&input.owner_root)
+        || output_dir == input.owner_root
+        || !input.runtime_root.starts_with(&input.owner_root)
+        || !input.cwd.starts_with(&input.workspace_path)
+        || !input.host_binary_path.starts_with(&input.owner_root)
+        || !input.broker_socket_path.starts_with(&input.owner_root)
+    {
+        return Err(invalid());
+    }
+    let input_metadata = fs::metadata(input_file).map_err(|_| invalid())?;
+    let output_metadata = fs::metadata(output_dir).map_err(|_| invalid())?;
+    let owner_metadata = fs::metadata(&input.owner_root).map_err(|_| invalid())?;
+    if !input_metadata.is_file()
+        || input_metadata.permissions().mode() & 0o777 != 0o600
+        || !output_metadata.is_dir()
+        || output_metadata.permissions().mode() & 0o777 != 0o700
+        || !owner_metadata.is_dir()
+        || owner_metadata.permissions().mode() & 0o777 != 0o700
+        || owner_metadata.uid() != unsafe { libc::geteuid() }
+        || input_metadata.uid() != unsafe { libc::geteuid() }
+        || output_metadata.uid() != unsafe { libc::geteuid() }
+        || fs::read_dir(output_dir)
+            .map_err(|_| invalid())?
+            .next()
+            .is_some()
+        || !fs::metadata(&input.broker_socket_path)
+            .map_err(|_| invalid())?
+            .file_type()
+            .is_socket()
+    {
+        return Err(invalid());
+    }
+    if let Some(git) = &input.git_common_dir {
+        if !git.is_absolute() || fs::canonicalize(git).map_err(|_| invalid())? != *git {
+            return Err(invalid());
+        }
+    }
+    let lower_hex = |value: &str, length: usize| {
+        value.len() == length
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if input.schema_version != 1
+        || input.fixture_id.is_empty()
+        || input.run_id.is_empty()
+        || !lower_hex(&input.candidate_sha, 40)
+        || !lower_hex(input.image_ref.strip_prefix("sha256:").unwrap_or(""), 64)
+        || !lower_hex(&input.host_binary_sha256, 64)
+        || input.host_binary_sha256
+            != format!(
+                "{:x}",
+                Sha256::digest(fs::read(&input.host_binary_path).map_err(|_| invalid())?)
+            )
+    {
+        return Err(invalid());
+    }
+    let roots = input
+        .source
+        .root_session_ids
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if roots.len() != 7
+        || roots
+            .iter()
+            .any(|root| !root.starts_with("ses_") || root.len() <= 4)
+        || roots.contains(&input.source.unrelated_session_id)
+        || !input.source.unrelated_session_id.starts_with("ses_")
+    {
+        return Err(invalid());
+    }
+    for identifiers in [
+        input
+            .targets
+            .iter()
+            .map(|t| t.soul_id.as_str())
+            .chain(std::iter::once(input.unrelated.target.soul_id.as_str()))
+            .collect::<Vec<_>>(),
+        input
+            .targets
+            .iter()
+            .map(|t| t.provider_store_id.as_str())
+            .chain(std::iter::once(
+                input.unrelated.target.provider_store_id.as_str(),
+            ))
+            .collect(),
+        input
+            .targets
+            .iter()
+            .map(|t| t.terminal_id.as_str())
+            .chain(std::iter::once(input.unrelated.target.terminal_id.as_str()))
+            .collect(),
+        input
+            .targets
+            .iter()
+            .map(|t| t.stream_id.as_str())
+            .chain(std::iter::once(input.unrelated.target.stream_id.as_str()))
+            .collect(),
+    ] {
+        if identifiers.iter().any(|id| id.is_empty())
+            || identifiers.iter().collect::<BTreeSet<_>>().len() != 10
+        {
+            return Err(invalid());
+        }
+    }
+    if input
+        .canonical_choices
+        .iter()
+        .map(|c| c.root_ordinal)
+        .collect::<BTreeSet<_>>()
+        != BTreeSet::from([0, 1])
+        || input.canonical_choices.iter().any(|c| {
+            c.target_ordinal >= 9 || TASK007_ROOT_ORDINALS[c.target_ordinal] != c.root_ordinal
+        })
+        || input
+            .explicit_views
+            .iter()
+            .map(|v| v.target_ordinal)
+            .collect::<BTreeSet<_>>()
+            != BTreeSet::from([0, 1, 7, 8])
+        || input
+            .explicit_views
+            .iter()
+            .map(|v| v.view_id.as_str())
+            .chain(std::iter::once(input.unrelated.view_id.as_str()))
+            .collect::<BTreeSet<_>>()
+            .len()
+            != 5
+        || input.explicit_views.iter().any(|v| {
+            [&v.owner_id, &v.workspace_id, &v.tab_id, &v.pane_id]
+                .iter()
+                .any(|value| value.is_empty())
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn task007_terminal(
+    input: &Task007FixtureInput,
+    target: &Task007FixtureTarget,
+) -> Result<freshell_runtime_protocol::TerminalLaunchSpec, String> {
+    serde_json::from_value(serde_json::json!({"terminalId":target.terminal_id,"streamId":target.stream_id,"mode":"opencode","program":"opencode",
+        "env":{"HOME":"/home/freshell/provider","XDG_DATA_HOME":"/home/freshell/provider/.local/share","XDG_CONFIG_HOME":"/home/freshell/provider/.config"},
+        "cwd":input.cwd,"workspacePath":input.workspace_path,"gitCommonDir":input.git_common_dir,"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"task007-fictional"})).map_err(|e|e.to_string())
+}
+
+fn task007_launch(
+    target: &Task007FixtureTarget,
+    root: &str,
+    terminal: Option<freshell_runtime_protocol::TerminalLaunchSpec>,
+) -> LaunchPreparation {
+    LaunchPreparation {
+        soul_id: target.soul_id.clone(),
+        provider: "opencode".into(),
+        provider_store_id: target.provider_store_id.clone(),
+        native_session_id: Some(root.into()),
+        creation_seed_ref: "task007-historical-setup".into(),
+        request_id: freshell_runtime_protocol::RequestId::new(),
+        payload_digest: "task007-historical-setup".into(),
+        requested_limits: limits(),
+        profile: RuntimeProfile::Custom,
+        project_key: "task007-fictional".into(),
+        fixture: None,
+        terminal,
+        fresh_agent: None,
+        view_intent: None,
+        admission: AdmissionPolicy::default(),
+    }
+}
+
+async fn task007_historical_loss(
+    registry: &Registry,
+    prepared: &crate::registry::PreparedLaunch,
+) -> Result<freshell_runtime_protocol::LostSoulRepairTarget, String> {
+    let grant = registry
+        .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+        .await
+        .map_err(|e| e.to_string())?;
+    let context = registry
+        .recovery_context(prepared.soul_id.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    let launch = registry
+        .bind_native_identity_launch(NativeIdentityLaunch {
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: prepared.launch_nonce.to_string(),
+            evidence_revision: context.evidence_revision,
+            execution_generation: grant.execution_generation,
+            requested_native_session_id: context.native_session_id.clone(),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let context = registry
+        .recovery_context(prepared.soul_id.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    registry
+        .record_native_identity_observation(
+            prepared.soul_id.clone(),
+            NativeIdentityObservation {
+                native_session_id: context.native_session_id.clone().unwrap(),
+                incarnation_id: launch.incarnation_id,
+                launch_nonce: launch.launch_nonce,
+                evidence_revision: launch.evidence_revision,
+                source: NativeIdentitySource::OpencodeTui,
+                evidence_digest: "a".repeat(64),
+            },
+            context.write_fence(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    registry
+        .mark_running(prepared.incarnation_id.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    let connection = Connection::open(registry.database_path()).map_err(|e| e.to_string())?;
+    connection
+        .execute(
+            "UPDATE souls SET allocation_state='verified_durable' WHERE soul_id=?1",
+            [prepared.soul_id.as_str()],
+        )
+        .map_err(|e| e.to_string())?;
+    drop(connection);
+    let context = registry
+        .recovery_context(prepared.soul_id.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    let loss = registry
+        .prepare_loss(decision_for(registry, &context).map_err(|e| e.to_string())?)
+        .await
+        .map_err(|e| e.to_string())?;
+    registry
+        .finalize_loss_cleanup(
+            loss.certificate.incident_id.clone(),
+            freshell_runtime_protocol::StopOutcome::VerifiedEmpty,
+            cleanup(&loss),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let connection = Connection::open(registry.database_path()).map_err(|e| e.to_string())?;
+    connection
+        .execute(
+            "UPDATE incarnations SET grant_id=NULL WHERE incarnation_id=?1",
+            [prepared.incarnation_id.as_str()],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(freshell_runtime_protocol::LostSoulRepairTarget {
+        soul_id: prepared.soul_id.clone(),
+        incident_id: loss.certificate.incident_id,
+        expected_intent_revision: loss.committed_intent_revision,
+    })
+}
+
+fn task007_schema_seven(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "foreign_keys", false)?;
+    conn.execute_batch("DROP TRIGGER cancel_recovery_retry_on_intent;")?;
+    for table in [
+        "ordinary_stops",
+        "recovery_retries",
+        "stopped_repair_root_receipts",
+        "stopped_repair_withdrawals",
+        "stopped_repair_operations",
+        "native_origin_owners",
+    ] {
+        conn.execute_batch(&format!("DROP TABLE {table};"))?;
+    }
+    for column in [
+        "identity_revision",
+        "native_import_revision",
+        "native_import_state",
+        "native_import_source_store_id",
+        "native_import_root_session_id",
+        "native_import_source_generation",
+        "native_import_schema_fingerprint",
+        "native_import_migration_fingerprint",
+        "native_import_complete_inventory",
+        "native_import_authority",
+        "claude_fork_recipe",
+    ] {
+        conn.execute_batch(&format!("ALTER TABLE souls DROP COLUMN {column};"))?;
+    }
+    for column in [
+        "captured_control_epoch",
+        "captured_identity_revision",
+        "captured_evidence_revision",
+        "captured_native_import_revision",
+        "captured_native_import_state",
+        "captured_source_store_id",
+        "captured_root_session_id",
+        "captured_source_generation",
+        "captured_source_schema_fingerprint",
+        "captured_migration_fingerprint",
+        "captured_native_import_complete",
+        "captured_native_import_authority",
+    ] {
+        conn.execute_batch(&format!("ALTER TABLE loss_incidents DROP COLUMN {column};"))?;
+    }
+    for column in [
+        "launch_policy",
+        "native_identity_launch",
+        "native_identity_observation",
+    ] {
+        conn.execute_batch(&format!("ALTER TABLE incarnations DROP COLUMN {column};"))?;
+    }
+    conn.execute(
+        "UPDATE installation SET schema_version=7 WHERE singleton=1",
+        [],
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn task007_export_stopped_repair_fixture() {
+    let paths = task007_fixture_paths(
+        std::env::var_os(TASK007_INPUT_ENV),
+        std::env::var_os(TASK007_OUTPUT_ENV),
+    )
+    .expect("private fixture environment must be supplied together");
+    if let Some((input, output)) = paths {
+        task007_publish_fixture(&input, &output)
+            .await
+            .expect("publish complete historical setup before the registry opens");
+    }
+}
+
+#[test]
+fn task007_private_fixture_environment_is_inert_or_complete() {
+    assert!(task007_fixture_paths(None, None).unwrap().is_none());
+    assert!(task007_fixture_paths(Some("input".into()), None).is_err());
+    assert!(task007_fixture_paths(None, Some("output".into())).is_err());
+    assert!(task007_fixture_paths(Some("".into()), Some("output".into())).is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn task007_private_fixture_publishes_actual_create_only_schema_seven() {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = tempfile::tempdir().unwrap();
+    let owner_root = root.path().canonicalize().unwrap();
+    let workspace = owner_root.join("workspace");
+    let runtime_root = owner_root.join("runtimes");
+    let output = owner_root.join("output");
+    for directory in [&workspace, &runtime_root, &output] {
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let host = owner_root.join("host");
+    fs::write(&host, b"never executed fixture host").unwrap();
+    let socket = owner_root.join("broker.sock");
+    let daemon_id = DockerDaemonId::new();
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let daemon = daemon_id.clone();
+    let (shutdown, mut receiver) = tokio::sync::oneshot::channel();
+    let broker = tokio::spawn(async move {
+        let mut created = Vec::new();
+        loop {
+            let (mut stream, _) = tokio::select! {
+                _ = &mut receiver => break,
+                accepted = listener.accept() => accepted.unwrap(),
+            };
+            let mut raw = Vec::new();
+            while !raw.ends_with(b"\r\n\r\n") {
+                raw.push(stream.read_u8().await.unwrap());
+            }
+            let header = String::from_utf8(raw).unwrap();
+            let length = header
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            let (status, response) = if header.starts_with("GET /v1.47/info ") {
+                (
+                    200,
+                    serde_json::json!({"ID":daemon,"SecurityOptions":["name=rootless"]}),
+                )
+            } else {
+                assert!(
+                    header.starts_with("POST /v1.47/containers/create?"),
+                    "producer may only create stopped enclosures: {header}"
+                );
+                created.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                (
+                    201,
+                    serde_json::json!({"Id":format!("{:064x}",created.len())}),
+                )
+            };
+            let bytes = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        created
+    });
+    let input = Task007FixtureInput {
+        schema_version: 1,
+        fixture_id: "task007-unit".into(),
+        run_id: "task007-owned".into(),
+        candidate_sha: "a".repeat(40),
+        installation_id: freshell_runtime_protocol::InstallationId::new(),
+        owner_root: owner_root.clone(),
+        runtime_root,
+        workspace_path: workspace.clone(),
+        cwd: workspace,
+        git_common_dir: None,
+        image_ref: format!("sha256:{}", "b".repeat(64)),
+        host_binary_path: host.clone(),
+        host_binary_sha256: format!("{:x}", Sha256::digest(fs::read(host).unwrap())),
+        docker_daemon_id: daemon_id,
+        broker_socket_path: socket,
+        source: Task007FixtureSource {
+            root_session_ids: std::array::from_fn(|i| format!("ses_task007root{i}")),
+            unrelated_session_id: "ses_task007unrelated".into(),
+        },
+        targets: std::array::from_fn(|i| Task007FixtureTarget {
+            soul_id: SoulId::new(),
+            provider_store_id: format!("task007-store-{i}"),
+            terminal_id: format!("task007-terminal-{i}"),
+            stream_id: format!("task007-stream-{i}"),
+        }),
+        canonical_choices: [
+            Task007FixtureChoice {
+                root_ordinal: 0,
+                target_ordinal: 7,
+            },
+            Task007FixtureChoice {
+                root_ordinal: 1,
+                target_ordinal: 1,
+            },
+        ],
+        explicit_views: std::array::from_fn(|i| Task007FixtureView {
+            target_ordinal: [0, 1, 7, 8][i],
+            view_id: freshell_runtime_protocol::ViewIntentId::new(),
+            owner_id: "task007-view-owner".into(),
+            workspace_id: "task007-workspace".into(),
+            tab_id: format!("tab-{i}"),
+            pane_id: format!("pane-{i}"),
+        }),
+        unrelated: Task007UnrelatedInput {
+            target: Task007FixtureTarget {
+                soul_id: SoulId::new(),
+                provider_store_id: "task007-unrelated-store".into(),
+                terminal_id: "task007-unrelated-term".into(),
+                stream_id: "task007-unrelated-stream".into(),
+            },
+            view_id: freshell_runtime_protocol::ViewIntentId::new(),
+            owner_id: "task007-unrelated-owner".into(),
+            workspace_id: "task007-workspace".into(),
+            tab_id: "unrelated-tab".into(),
+            pane_id: "unrelated-pane".into(),
+        },
+    };
+    let input_file = owner_root.join("input.json");
+    fs::write(&input_file, serde_json::to_vec(&input).unwrap()).unwrap();
+    fs::set_permissions(&input_file, fs::Permissions::from_mode(0o600)).unwrap();
+    for fault in [
+        "schema",
+        "host-hash",
+        "duplicate-root",
+        "duplicate-soul",
+        "foreign-owner",
+        "wrong-choice",
+        "unbalanced-views",
+        "unknown-field",
+    ] {
+        let mut invalid = serde_json::to_value(&input).unwrap();
+        match fault {
+            "schema" => invalid["schemaVersion"] = serde_json::json!(2),
+            "host-hash" => invalid["hostBinarySha256"] = serde_json::json!("0".repeat(64)),
+            "duplicate-root" => {
+                invalid["source"]["rootSessionIds"][1] =
+                    invalid["source"]["rootSessionIds"][0].clone()
+            }
+            "duplicate-soul" => {
+                invalid["targets"][1]["soulId"] = invalid["targets"][0]["soulId"].clone()
+            }
+            "foreign-owner" => invalid["ownerRoot"] = serde_json::json!("/"),
+            "wrong-choice" => {
+                invalid["canonicalChoices"][0]["targetOrdinal"] = serde_json::json!(2)
+            }
+            "unbalanced-views" => {
+                invalid["explicitViews"][0]["targetOrdinal"] = serde_json::json!(2)
+            }
+            _ => invalid["launchNonce"] = serde_json::json!("owner-must-not-inject-nonce"),
+        }
+        // A filesystem root is canonical but is not a private owned run root.
+        fs::write(&input_file, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(
+            task007_publish_fixture(&input_file, &output).await.is_err(),
+            "{fault}"
+        );
+        assert!(
+            fs::read_dir(&output).unwrap().next().is_none(),
+            "invalid input must not open a registry: {fault}"
+        );
+    }
+    fs::write(&input_file, serde_json::to_vec(&input).unwrap()).unwrap();
+    fs::set_permissions(&input_file, fs::Permissions::from_mode(0o640)).unwrap();
+    assert!(task007_publish_fixture(&input_file, &output).await.is_err());
+    assert!(fs::read_dir(&output).unwrap().next().is_none());
+    fs::set_permissions(&input_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let result = task007_publish_fixture(&input_file, &output).await;
+    shutdown.send(()).unwrap();
+    let created = broker.await.unwrap();
+    let metadata = result.expect("historical producer must create and checkpoint actual bindings");
+    assert_eq!(created.len(), 9);
+    assert_eq!(metadata["evidenceKind"], "historical-fixture-setup");
+    let targets = metadata["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 9);
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(target["containerId"], format!("{:064x}", index + 1));
+        assert_eq!(
+            target["rootSessionId"],
+            input.source.root_session_ids[TASK007_ROOT_ORDINALS[index]]
+        );
+        assert_eq!(
+            created[index]["Labels"]["com.freshell.incarnation-id"],
+            target["incarnationId"]
+        );
+        assert_eq!(
+            created[index]["Labels"]["com.freshell.soul-id"],
+            target["soulId"]
+        );
+        assert!(target["immutableConfigDigest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert_ne!(
+            target["immutableConfigDigest"],
+            format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&created[index]).unwrap())
+            ),
+            "Docker body hashes are not immutable config identities"
+        );
+    }
+    assert!(!metadata["unrelated"]["noticeIds"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!metadata["unrelated"]["outboxEventIds"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let database = Connection::open(output.join("runtime.sqlite3")).unwrap();
+    assert_eq!(
+        database
+            .query_row("SELECT schema_version FROM installation", [], |r| r
+                .get::<_, u32>(0))
+            .unwrap(),
+        7
+    );
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('souls') WHERE name='identity_revision'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(database.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('native_origin_owners','stopped_repair_operations','recovery_retries','ordinary_stops')",[],|r|r.get::<_,u32>(0)).unwrap(),0);
+    assert_eq!(
+        database
+            .query_row("SELECT count(*) FROM writer_claims", [], |r| r
+                .get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT count(*) FROM incarnations WHERE grant_id IS NOT NULL",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(database.query_row("SELECT count(*) FROM incarnations WHERE launch_state IN ('prepared','created','starting','running','stopping')",[],|r|r.get::<_,u32>(0)).unwrap(),0);
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT count(*) FROM loss_incidents WHERE cleanup_state!='closed'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(database.query_row("SELECT count(*) FROM souls WHERE desired_state='stopped' AND recovery_state='lost'",[],|r|r.get::<_,u32>(0)).unwrap(),10);
+    drop(database);
+    assert_eq!(
+        metadata["registry"]["sha256"],
+        format!(
+            "{:x}",
+            Sha256::digest(fs::read(output.join("runtime.sqlite3")).unwrap())
+        )
+    );
+    let migrated = Registry::open(&output, Some(input.installation_id.clone())).unwrap();
+    for root in &input.source.root_session_ids[..2] {
+        let candidates = migrated
+            .stopped_repair_owner_candidates(root.clone())
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.explicit_view_count == 1));
+    }
+    assert!(
+        task007_publish_fixture(&input_file, &output).await.is_err(),
+        "refuse replacing a previously opened fixture"
+    );
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007CrashFixture {
+    input_file: PathBuf,
+    registry_root: PathBuf,
+    source_database_file: PathBuf,
+    metadata_file: PathBuf,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Task007CrashAttempt {
+    fixture: Task007CrashFixture,
+    operation_id: freshell_runtime_protocol::RequestId,
+    request: freshell_runtime_protocol::RestoreLostSoulsRequest,
+}
+
+#[cfg(unix)]
+fn task007_read_private_json<T: serde::de::DeserializeOwned>(file: &std::path::Path) -> T {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = fs::symlink_metadata(file).expect("owned private Task7 fixture file");
+    assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    serde_json::from_slice(&fs::read(file).unwrap())
+        .expect("complete typed private Task7 fixture JSON")
+}
+
+fn task007_sandbox_only() {
+    assert_eq!(
+        std::env::var("FRESHELL_SANDBOX_MODE").as_deref(),
+        Ok("runtime-suite")
+    );
+    assert!(std::path::Path::new("/.dockerenv").exists());
+}
+
+#[cfg(unix)]
+fn task007_crash_supervisor(fixture: &Task007CrashFixture) -> Supervisor {
+    let input: Task007FixtureInput = task007_read_private_json(&fixture.input_file);
+    assert!(fixture.registry_root.starts_with(&input.owner_root));
+    assert!(fixture.source_database_file.starts_with(&input.owner_root));
+    assert!(fixture.metadata_file.starts_with(&input.owner_root));
+    let registry = Registry::open(&fixture.registry_root, Some(input.installation_id)).unwrap();
+    Supervisor::new(
+        registry,
+        std::sync::Arc::new(crate::backend::DockerEngineBackend::new(
+            input.broker_socket_path,
+        )),
+        SupervisorConfig {
+            runtime_root: input.runtime_root,
+            control_socket_path: input.owner_root.join("task007-parent-control.sock"),
+            host_binary_path: input.host_binary_path,
+            image_ref: input.image_ref,
+            test_run_id: input.run_id,
+            control_secret: "task007-fictional-secret".into(),
+            lifecycle_log: fixture.registry_root.join("lifecycle.jsonl"),
+            admission: AdmissionPolicy::default(),
+        },
+    )
+    .unwrap()
+}
+
+#[cfg(unix)]
+async fn task007_run_stopped_crash_parent(point: &str) {
+    use freshell_runtime_protocol::{
+        CanonicalOwnerChoice, PreflightLostSoulsRequest, RepairBatchSourceSelection, RequestId,
+        RestoreLostSoulsRequest, SoulRepairStatus,
+    };
+    use freshell_sessions::opencode_transfer::HostOpenCodeInventory;
+    use std::os::unix::process::ExitStatusExt;
+    task007_sandbox_only();
+    // Physical, asynchronously brokered fixture packaging belongs to Task8.
+    // Missing setup fails explicitly; these tests never invent current worker
+    // receipts, substitute a local HOME/UID, or count an inert helper as proof.
+    let manifest = PathBuf::from(std::env::var_os("FRESHELL_TASK007_STOPPED_REPAIR_CRASH_FIXTURES")
+        .expect("PhaseB must provide three fresh physical stopped fixtures before destructive execution"));
+    let mut cases: std::collections::BTreeMap<String, Task007CrashFixture> =
+        task007_read_private_json(&manifest);
+    assert_eq!(cases.len(), 3, "exactly three fresh fixture contexts");
+    assert_eq!(
+        cases
+            .values()
+            .map(|fixture| &fixture.registry_root)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        3,
+        "each destructive parent owns distinct durable bytes"
+    );
+    let fixture = cases
+        .remove(point)
+        .expect("fresh exact fixture for this actual boundary");
+    let metadata: serde_json::Value = task007_read_private_json(&fixture.metadata_file);
+    assert_eq!(metadata["evidenceKind"], "historical-fixture-setup");
+    let input: Task007FixtureInput = task007_read_private_json(&fixture.input_file);
+    let source_before = fs::read(&fixture.source_database_file).unwrap();
+    let supervisor = task007_crash_supervisor(&fixture);
+    let inventory = HostOpenCodeInventory::new(fixture.source_database_file.clone())
+        .with_trusted_mount_for_selected_session(input.workspace_path.clone());
+    let selection = RepairBatchSourceSelection {
+        source_store_id: format!(
+            "{:x}",
+            Sha256::digest(
+                fixture
+                    .source_database_file
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_bytes()
+            )
+        ),
+        root_session_ids: input.source.root_session_ids.to_vec(),
+    };
+    let scope = supervisor
+        .preflight_lost_souls_from_inventory(
+            PreflightLostSoulsRequest {
+                source: selection.clone(),
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            },
+            inventory.clone(),
+        )
+        .await
+        .unwrap();
+    let targets = scope
+        .targets
+        .iter()
+        .map(|member| member.target.clone())
+        .collect::<Vec<_>>();
+    let request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source: selection,
+        targets: targets.clone(),
+        canonical_owners: input
+            .canonical_choices
+            .iter()
+            .map(|choice| {
+                let target = targets
+                    .iter()
+                    .find(|target| target.soul_id == input.targets[choice.target_ordinal].soul_id)
+                    .unwrap();
+                CanonicalOwnerChoice {
+                    root_session_id: input.source.root_session_ids[choice.root_ordinal].clone(),
+                    soul_id: target.soul_id.clone(),
+                    expected_intent_revision: target.expected_intent_revision,
+                }
+            })
+            .collect(),
+        expected_control_epoch: Some(supervisor.registry.control_epoch()),
+    };
+    let operation_id = RequestId::new();
+    supervisor
+        .registry
+        .prepare_stopped_repair_operation(operation_id.clone(), request.clone(), scope)
+        .await
+        .unwrap();
+    let unrelated = metadata["unrelated"]["exports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| {
+            let path = fixture
+                .registry_root
+                .join(artifact["file"].as_str().unwrap());
+            let bytes = fs::read(&path).unwrap();
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&bytes)),
+                artifact["sha256"].as_str().unwrap()
+            );
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    let marker = input.owner_root.join(format!("{point}.reached"));
+    let attempt_file = input.owner_root.join(format!("{point}.attempt.json"));
+    task007_sync_file(
+        &attempt_file,
+        &serde_json::to_vec(&Task007CrashAttempt {
+            fixture,
+            operation_id: operation_id.clone(),
+            request: request.clone(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    drop(supervisor);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "loss_report::tests::task007_stopped_repair_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(
+            "FRESHELL_TASK007_STOPPED_REPAIR_CRASH_ATTEMPT",
+            &attempt_file,
+        )
+        .env("FRESHELL_TASK007_STOPPED_REPAIR_CRASH_POINT", point)
+        .env("FRESHELL_TASK007_STOPPED_REPAIR_CRASH_MARKER", &marker)
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGABRT),
+        "must abort at the actual durable boundary: {status:?}"
+    );
+    assert_eq!(fs::read_to_string(&marker).unwrap(), point);
+    for (path, bytes) in &unrelated {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            *bytes,
+            "unrelated exports survive interruption"
+        );
+    }
+    let attempt: Task007CrashAttempt = task007_read_private_json(&attempt_file);
+    let resumed = task007_crash_supervisor(&attempt.fixture);
+    let status: String = Connection::open(resumed.registry.database_path())
+        .unwrap()
+        .query_row(
+            "SELECT status FROM stopped_repair_operations WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        status,
+        if point == "stopped_repair_after_import_publication" {
+            "importing"
+        } else {
+            "withdraw_pending"
+        }
+    );
+    let mut retry = request;
+    retry.expected_control_epoch = Some(resumed.registry.control_epoch());
+    let result = resumed
+        .restore_lost_souls_with_inventory(operation_id.clone(), retry.clone(), async {
+            Ok(inventory.clone())
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.status, SoulRepairStatus::Complete);
+    assert_eq!(result.repaired_target_count, 9);
+    assert_eq!(result.roots.len(), 7);
+    assert_eq!(
+        resumed
+            .restore_lost_souls_with_inventory(operation_id.clone(), retry, async { Ok(inventory) })
+            .await
+            .unwrap(),
+        result,
+        "repeat the exact operation after durable completion"
+    );
+    let receipts = resumed
+        .registry
+        .stopped_repair_root_receipts(operation_id)
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 7);
+    for receipt in &receipts {
+        let context = resumed
+            .registry
+            .recovery_context(receipt.canonical_soul_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            context.desired_state,
+            freshell_runtime_protocol::DesiredState::Stopped
+        );
+        assert_eq!(
+            context.recovery_state,
+            freshell_runtime_protocol::RecoveryState::DataRepairComplete
+        );
+        assert_eq!(
+            context.native_session_id.as_deref(),
+            Some(receipt.root_session_id.as_str())
+        );
+        assert_eq!(context.provider_store_id, receipt.destination_store_id);
+        assert_eq!(
+            context.opencode_adoption_baseline,
+            Some(receipt.adoption_baseline.clone())
+        );
+        assert!(receipt.row_count > 0 && !receipt.structural_sha256.is_empty());
+    }
+    for target in &targets {
+        assert!(resumed
+            .registry
+            .loss_certificate(target.incident_id.clone())
+            .await
+            .is_err());
+        for suffix in ["open.json", "closed.json"] {
+            assert!(!attempt
+                .fixture
+                .registry_root
+                .join("incidents")
+                .join(format!("{}.{suffix}", target.incident_id))
+                .exists());
+        }
+    }
+    for (path, bytes) in unrelated {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            bytes,
+            "unrelated physical artifacts survive exact withdrawal"
+        );
+    }
+    assert_eq!(
+        fs::read(attempt.fixture.source_database_file).unwrap(),
+        source_before,
+        "source store is never imported into or mutated"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "Docker runtime-suite only; needs fresh physical PhaseB stopped-import fixtures"]
+async fn stopped_repair_crash_after_import_publication() {
+    task007_run_stopped_crash_parent("stopped_repair_after_import_publication").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "Docker runtime-suite only; needs fresh physical PhaseB stopped-import fixtures"]
+async fn stopped_repair_crash_after_repair_cas_before_withdrawal() {
+    task007_run_stopped_crash_parent("stopped_repair_after_repair_cas_before_withdrawal").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "Docker runtime-suite only; needs fresh physical PhaseB stopped-import fixtures"]
+async fn stopped_repair_crash_during_withdrawal_before_ack() {
+    task007_run_stopped_crash_parent("stopped_repair_during_withdrawal_before_ack").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "owned subprocess helper for the three actual stopped-repair crash parents"]
+async fn task007_stopped_repair_child() {
+    task007_sandbox_only();
+    let file = PathBuf::from(
+        std::env::var_os("FRESHELL_TASK007_STOPPED_REPAIR_CRASH_ATTEMPT")
+            .expect("owned parent attempt"),
+    );
+    let mut attempt: Task007CrashAttempt = task007_read_private_json(&file);
+    let input: Task007FixtureInput = task007_read_private_json(&attempt.fixture.input_file);
+    let supervisor = task007_crash_supervisor(&attempt.fixture);
+    attempt.request.expected_control_epoch = Some(supervisor.registry.control_epoch());
+    let inventory = freshell_sessions::opencode_transfer::HostOpenCodeInventory::new(
+        attempt.fixture.source_database_file,
+    )
+    .with_trusted_mount_for_selected_session(input.workspace_path);
+    let result = supervisor
+        .restore_lost_souls_with_inventory(attempt.operation_id, attempt.request, async {
+            Ok(inventory)
+        })
+        .await;
+    panic!("actual named stopped-repair boundary was not reached: {result:?}");
+}
+
 fn request_only_absence_reference(context: &RecoveryContext) -> String {
     let fields = serde_json::to_vec(&(
         &context.provider,
@@ -45,7 +1454,7 @@ fn evidence(context: Option<&RecoveryContext>) -> Vec<RecoveryPathEvidence> {
                 connection.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
                 connection.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES ('unrelated-exact-root','slug','prj','/synthetic','synthetic','1.18.21',1,1)", []).unwrap();
             }
-            let terminal = native_census_terminal(&context.provider);
+            let terminal = context.terminal.clone().unwrap_or_else(|| native_census_terminal(&context.provider));
             let spec = freshell_agent_runtime::build_resume_spec(
                 freshell_agent_runtime::ResumeSpecInput {
                     provider: &context.provider,
@@ -2638,52 +4047,7 @@ async fn durable_souls_schema_seven_nine_rows_remain_unbound_until_verified_repa
     let database = registry.database_path().to_path_buf();
     drop(registry);
     let conn = Connection::open(&database).unwrap();
-    conn.pragma_update(None, "foreign_keys", false).unwrap();
-    for table in [
-        "stopped_repair_root_receipts",
-        "stopped_repair_withdrawals",
-        "stopped_repair_operations",
-        "native_origin_owners",
-    ] {
-        conn.execute_batch(&format!("DROP TABLE {table};")).unwrap();
-    }
-    for column in [
-        "identity_revision",
-        "native_import_revision",
-        "native_import_state",
-        "native_import_source_store_id",
-        "native_import_root_session_id",
-        "native_import_source_generation",
-        "native_import_schema_fingerprint",
-        "native_import_migration_fingerprint",
-        "native_import_complete_inventory",
-        "native_import_authority",
-    ] {
-        conn.execute_batch(&format!("ALTER TABLE souls DROP COLUMN {column};"))
-            .unwrap();
-    }
-    for column in [
-        "captured_control_epoch",
-        "captured_identity_revision",
-        "captured_evidence_revision",
-        "captured_native_import_revision",
-        "captured_native_import_state",
-        "captured_source_store_id",
-        "captured_root_session_id",
-        "captured_source_generation",
-        "captured_source_schema_fingerprint",
-        "captured_migration_fingerprint",
-        "captured_native_import_complete",
-        "captured_native_import_authority",
-    ] {
-        conn.execute_batch(&format!("ALTER TABLE loss_incidents DROP COLUMN {column};"))
-            .unwrap();
-    }
-    conn.execute(
-        "UPDATE installation SET schema_version=7 WHERE singleton=1",
-        [],
-    )
-    .unwrap();
+    task007_schema_seven(&conn).unwrap();
     assert_eq!(conn.query_row("SELECT count(*) FROM pragma_table_info('souls') WHERE name IN ('identity_revision','native_import_revision')",[],|row|row.get::<_,u64>(0)).unwrap(),0);
     assert_eq!(conn.query_row("SELECT count(*) FROM souls WHERE desired_state='stopped' AND recovery_state='lost' AND intent_revision=2",[],|row|row.get::<_,u64>(0)).unwrap(),9);
     assert_eq!(conn.query_row("SELECT count(*) FROM loss_incidents WHERE intent_revision=1 AND cleanup_state='closed'",[],|row|row.get::<_,u64>(0)).unwrap(),9);
