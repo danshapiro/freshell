@@ -91,6 +91,14 @@ if [ "$#" -lt 1 ]; then
 fi
 CMD="$1"
 
+# This one committed library selector needs the owned runtime broker and its
+# daemon-host paths. Every parent and its aborting child still runs enclosed.
+if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "$#" -eq 1 ] && \
+   [ "${CMD}" = "cargo test -p freshell-supervisor stopped_repair_crash_ -- --ignored" ]; then
+  cd "${REPO_ROOT}"
+  exec pnpm exec tsx "${REPO_ROOT}/scripts/testing/task007-destructive-sandbox.ts"
+fi
+
 if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
   echo "[sandbox] image ${IMAGE_TAG} not found, building it first..." >&2
   "${REPO_ROOT}/scripts/sandbox-build.sh"

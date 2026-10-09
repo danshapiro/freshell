@@ -6,6 +6,14 @@ import path from 'node:path'
 
 const DOCKER_API_PREFIX = '/v1.47'
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024
+const CLEANUP_DRAIN_MS = 5_000
+
+export type BrokerSettlementFailure = {
+  method: string
+  url: string
+  reason: string
+  allocationUnknown: boolean
+}
 
 export type BrokerReceipt = {
   containerId: string
@@ -32,6 +40,7 @@ export type BrokerEvent = {
   helperName?: string
   requestDigest?: string
   providerVolumeName?: string
+  allocationUnknown?: boolean
   destructive: boolean
   unsafeAttempt: boolean
 }
@@ -64,6 +73,12 @@ export class RestrictedDockerBroker {
   private readonly historyHelpers = new Map<string, { owner: BrokerReceipt; containerId?: string }>()
   private readonly events: BrokerEvent[] = []
   private server?: http.Server
+  private readonly pendingRequests = new Set<Promise<void>>()
+  private readonly incomingRequests = new Set<IncomingMessage>()
+  private readonly upstreamRequests = new Set<http.ClientRequest>()
+  private readonly settlementFailures: BrokerSettlementFailure[] = []
+  private draining = false
+  private drainExpired = false
   private stopFailuresRemaining = 0
 
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
@@ -133,7 +148,14 @@ export class RestrictedDockerBroker {
     fs.chmodSync(path.dirname(this.policy.logPath), 0o700)
     fs.rmSync(this.policy.proxySocketPath, { force: true })
     this.server = http.createServer((request, response) => {
-      this.handle(request, response).catch(() => {
+      if (this.draining) {
+        response.writeHead(503, { connection: 'close' })
+        response.end('owner cleanup in progress')
+        request.resume()
+        return
+      }
+      this.incomingRequests.add(request)
+      const settlement = this.handle(request, response).catch(() => {
         try {
           this.record({
             method: request.method ?? 'GET', url: request.url ?? '/',
@@ -147,6 +169,12 @@ export class RestrictedDockerBroker {
           response.destroy()
         }
       })
+      this.pendingRequests.add(settlement)
+      const forget = () => {
+        this.pendingRequests.delete(settlement)
+        this.incomingRequests.delete(request)
+      }
+      settlement.then(forget, forget)
     })
     await new Promise<void>((resolve, reject) => {
       this.server!.once('error', reject)
@@ -157,9 +185,31 @@ export class RestrictedDockerBroker {
 
   async close(): Promise<void> {
     if (!this.server) return
-    await new Promise<void>((resolve) => this.server!.close(() => resolve()))
+    const closed = new Promise<void>((resolve) => this.server!.close(() => resolve()))
+    this.server.closeAllConnections()
+    await closed
     this.server = undefined
     fs.rmSync(this.policy.proxySocketPath, { force: true })
+  }
+
+  /** The owner first stops its exact producers/enclosures, keeping this broker
+   * available until their already-forwarded operations publish their receipts. */
+  async awaitPendingRequests(): Promise<BrokerSettlementFailure[]> {
+    this.draining = true
+    // Only shutdown has a deadline. A healthy helper wait may legitimately run
+    // for the full scenario. Expiry destroys and joins our actual transports;
+    // it cannot establish whether an unacknowledged daemon create allocated.
+    const deadline = setTimeout(() => {
+      this.drainExpired = true
+      for (const request of this.upstreamRequests) request.destroy(new Error('cleanup_deadline'))
+      for (const request of this.incomingRequests) request.destroy()
+    }, CLEANUP_DRAIN_MS)
+    try {
+      while (this.pendingRequests.size) await Promise.all([...this.pendingRequests])
+      return [...this.settlementFailures]
+    } finally {
+      clearTimeout(deadline)
+    }
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -618,7 +668,10 @@ export class RestrictedDockerBroker {
   }
 
   private forward(request: IncomingMessage, body: Buffer): Promise<DockerResponse> {
+    if (this.drainExpired) return Promise.reject(new Error('broker cleanup deadline expired'))
     return new Promise((resolve, reject) => {
+      let result: DockerResponse | undefined
+      let failure: string | undefined
       const upstream = http.request({
         socketPath: this.policy.realSocketPath,
         path: request.url,
@@ -627,9 +680,28 @@ export class RestrictedDockerBroker {
       }, (upstreamResponse) => {
         const chunks: Buffer[] = []
         upstreamResponse.on('data', (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
-        upstreamResponse.once('end', () => resolve({ statusCode: upstreamResponse.statusCode ?? 500, headers: upstreamResponse.headers, body: Buffer.concat(chunks) }))
+        upstreamResponse.once('end', () => { result = { statusCode: upstreamResponse.statusCode ?? 500, headers: upstreamResponse.headers, body: Buffer.concat(chunks) } })
+        const failResponse = () => { failure ??= 'upstream_response_incomplete'; upstream.destroy() }
+        upstreamResponse.once('aborted', failResponse)
+        upstreamResponse.once('error', failResponse)
+        upstreamResponse.once('close', () => { if (!upstreamResponse.complete) failResponse() })
       })
-      upstream.once('error', reject)
+      this.upstreamRequests.add(upstream)
+      upstream.once('error', () => { failure ??= this.drainExpired ? 'cleanup_deadline' : 'upstream_request_failed' })
+      upstream.once('close', () => {
+        this.upstreamRequests.delete(upstream)
+        if (result && !failure) { resolve(result); return }
+        const details: BrokerSettlementFailure = { method: request.method ?? 'GET', url: request.url ?? '/',
+          reason: failure ?? 'upstream_response_incomplete',
+          allocationUnknown: request.method === 'POST' && !!request.url?.startsWith(`${DOCKER_API_PREFIX}/containers/create?`) }
+        this.settlementFailures.push(details)
+        try {
+          this.record({ ...details, decision: 'block', destructive: false, unsafeAttempt: false })
+          reject(new Error(details.reason))
+        } catch (error) {
+          reject(error)
+        }
+      })
       if (body.length > 0) upstream.write(body)
       upstream.end()
     })

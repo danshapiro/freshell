@@ -23,6 +23,7 @@ const runtime = [
   "scripts/testing/task002-retained-fixture.ts",
   "scripts/testing/runtime-external-browser.ts",
   "scripts/testing/runtime-sandbox.ts",
+  "scripts/testing/task007-destructive-sandbox.ts",
   "scripts/testing/runtime-test-broker.ts",
   "scripts/testing/runtime-provider-qualification.ts",
   "scripts/testing/runtime-fresh-agent-qualification.ts",

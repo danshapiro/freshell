@@ -286,6 +286,18 @@ describe('selected production owner registration', () => {
       FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000',
     } }))
   })
+  it('registers the stopped nine-soul runbook independently of native phase-three cases', () => {
+    const selection = { spec: 'test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts',
+      grep: '^stopped nine-soul restoration runbook$' }
+    const web = () => { throw new Error('batch registration never launches web') }
+    const owned = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection,
+      { FRESHELL_RUNTIME_SYNTHETIC_RESUME: '1' }, web)
+    expect(owned.fixtureRegistrationFacts()).toEqual({ phase: 3, enabledProviders: [],
+      freshAgentModes: [], fixtureFreshAgentModes: [] })
+    expect(() => runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection, {}, web)).toThrow(/opt.in|SYNTHETIC/)
+    expect(() => runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, { ...selection, grep: '.*' },
+      { FRESHELL_RUNTIME_SYNTHETIC_RESUME: '1' }, web)).toThrow(/separate|exact/)
+  })
   it('preserves the all-mode fixture observer interval on an actual supervisor replacement', async () => {
     const owner = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
       spec: 'test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts',
@@ -1307,6 +1319,46 @@ describe('closed external owner control', () => {
     const request = { runId: context.runId, candidateSha: context.candidateSha, scenarioId: 'browser-managed-runtime', operationId: 'operation-owned', action: 'inventory' }
     return { owned, context, inventory, stop, request }
   }
+  it('forwards only registered batch IDs and fixed faults while keeping repair IDs distinct from transport retries', async () => {
+    const { owned, context, request } = fixture()
+    const facts = { fixtureId: 'fixture-batch', families: Array.from({ length: 7 }, (_, index) => ({ rootId: `ses_root_${index}`,
+      childId: `ses_child_${index}`, grandchildId: `ses_grand_${index}`, baselineMessages: {}, baselineParts: {} })),
+      targets: Array.from({ length: 9 }, (_, index) => ({ soulId: `soul-${index}`, providerStoreId: `store-${index}`,
+        rootSessionId: `ses_root_${index % 7}`, terminalId: `terminal-${index}`, streamId: `stream-${index}`,
+        incidentId: `incident-${index}`, viewIds: [] })), canonicalChoices: [0, 1].map(index => ({ rootSessionId: `ses_root_${index}`, soulId: `soul-${index}` })),
+      unrelated: { soulId: 'unrelated', incidentId: 'unrelated-incident', viewId: 'unrelated-view', noticeIds: [], outboxEventIds: [], exportSha256: [] } }
+    const read = vi.spyOn(owned, 'syntheticStoppedRepairBatchFacts').mockResolvedValue(facts)
+    const fault = vi.spyOn(owned, 'setSyntheticStoppedRepairFault').mockResolvedValue({ controlEpoch: 27 })
+    const observation = vi.spyOn(owned, 'syntheticStoppedRepairBatchObservation').mockRejectedValue(new Error('actual operation is absent'))
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on('data', chunk => chunks.push(Buffer.from(chunk)))
+      req.on('end', () => {
+        if (req.headers['x-auth-token'] !== context.token) { res.writeHead(401).end(); return }
+        control(JSON.parse(Buffer.concat(chunks).toString('utf8'))).then(result => {
+          res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(result))
+        }, () => res.writeHead(400).end())
+      })
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}/__managed_runtime`
+    const remote = new runner.ExternalManagedRuntimeRig(context, async (_url, init) => fetch(endpoint, init))
+    try {
+    await expect(remote.prepareSyntheticStoppedRepairBatch()).resolves.toEqual(facts)
+    await expect(remote.setSyntheticStoppedRepairFault('fixture-batch', 'none')).resolves.toEqual({ controlEpoch: 27 })
+    expect(fault).toHaveBeenCalledExactlyOnceWith('fixture-batch', 'none')
+    const query = { ...request, action: 'synthetic-stopped-repair-observation', fixtureId: 'fixture-batch', repairOperationId: 'repair-current' }
+    await expect(control(query)).rejects.toThrow(/absent/)
+    await expect(control(query)).rejects.toThrow(/absent/)
+    expect(observation).toHaveBeenCalledExactlyOnceWith('fixture-batch', 'repair-current')
+    await expect(control({ ...query, operationId: 'foreign-path', databasePath: '/foreign' })).rejects.toThrow(/operation/)
+    await expect(control({ ...request, operationId: 'generic-fault', action: 'synthetic-stopped-repair-fault',
+      fixtureId: 'fixture-batch', stoppedRepairFault: 'source_generation_change' })).rejects.toThrow(/operation/)
+    await expect(control({ ...request, operationId: 'missing-id', action: 'synthetic-stopped-repair-observation' })).rejects.toThrow(/fixture|operation/)
+    expect(read).toHaveBeenCalledOnce()
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())) }
+  })
   it('preserves a body-free typed diagnostic when an admitted owner operation is refused', async () => {
     const { owned, context, request } = fixture()
     const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-soul',
