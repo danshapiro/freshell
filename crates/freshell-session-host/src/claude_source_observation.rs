@@ -78,6 +78,7 @@ pub(crate) async fn verify_final(
         &request,
         &request_sha256,
         &expected,
+        (uid, gid),
         std::time::Duration::from_secs(20),
         std::time::Duration::from_secs(5),
     )
@@ -115,6 +116,7 @@ async fn read_final_child(
     child: &mut tokio::process::Child,
     request: &ObservationRequest,
     request_sha256: &str,
+    identity: (u32, u32),
     exchange_timeout: std::time::Duration,
     cleanup_timeout: std::time::Duration,
 ) -> Result<ObservationReply, String> {
@@ -165,9 +167,39 @@ async fn read_final_child(
         Ok(completed) => completed,
         Err(reason) => {
             let cleanup = async {
-                child
-                    .start_kill()
-                    .map_err(|_| "Claude final source reader termination failed")?;
+                // Restricted root cannot signal a provider-UID child without
+                // CAP_KILL. The unreaped child keeps this exact PID owned;
+                // use the same identity as ordinary refresh cleanup.
+                if child
+                    .try_wait()
+                    .map_err(|_| "Claude final source reader join failed")?
+                    .is_none()
+                {
+                    let pid = child
+                        .id()
+                        .ok_or("Claude final source reader identity unavailable")?
+                        .to_string();
+                    let status = tokio::process::Command::new("/usr/bin/setpriv")
+                        .args(crate::provider_identity_args(identity.0, identity.1))
+                        .args(["/usr/bin/kill", "-KILL", "--", &pid])
+                        .env_clear()
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await
+                        .map_err(|_| "Claude final source reader termination failed")?;
+                    // A concurrent exit can make kill report failure. Join
+                    // first: complete ownership settlement is authoritative.
+                    if !status.success()
+                        && child
+                            .try_wait()
+                            .map_err(|_| "Claude final source reader join failed")?
+                            .is_none()
+                    {
+                        return Err("Claude final source reader termination failed");
+                    }
+                }
                 child
                     .wait()
                     .await
@@ -191,6 +223,7 @@ async fn verify_final_child(
     request: &ObservationRequest,
     request_sha256: &str,
     expected: &freshell_platform::claude_inputs::observation::NativeObservation,
+    identity: (u32, u32),
     exchange_timeout: std::time::Duration,
     cleanup_timeout: std::time::Duration,
 ) -> Result<(), RuntimeError> {
@@ -200,6 +233,7 @@ async fn verify_final_child(
         child,
         request,
         request_sha256,
+        identity,
         exchange_timeout,
         cleanup_timeout,
     )
@@ -1361,6 +1395,23 @@ mod tests {
         let home = root.path().join("home");
         std::fs::create_dir(&cwd).unwrap();
         std::fs::create_dir(&home).unwrap();
+        let deployed_identity = std::env::var_os("FRESHELL_TEST_RESTRICTED_READER").is_some();
+        let (uid, gid) = if deployed_identity {
+            assert_eq!(unsafe { libc::geteuid() }, 0);
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let capabilities = status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:\t"))
+                .unwrap();
+            let capabilities = u64::from_str_radix(capabilities, 16).unwrap();
+            assert_eq!(capabilities, (1 << 0) | (1 << 6) | (1 << 7));
+            for path in [root.path(), &cwd, &home] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            (65534, 0)
+        } else {
+            (unsafe { libc::geteuid() }, unsafe { libc::getegid() })
+        };
         let request = ObservationRequest {
             version: 1,
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -1401,10 +1452,15 @@ mod tests {
         }
         let body = root.path().join("reply.bin");
         std::fs::write(&body, bytes).unwrap();
-        std::fs::set_permissions(&body, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(
+            &body,
+            std::fs::Permissions::from_mode(if deployed_identity { 0o644 } else { 0o600 }),
+        )
+        .unwrap();
         let script = root.path().join("reader.cjs");
         std::fs::write(&script, r#"const fs=require('node:fs');
 const mode=process.argv[2],body=fs.readFileSync(process.argv[3]);
+if(process.getuid()!==Number(process.argv[4]))process.exit(7);
 process.stdin.on('data',()=>{}).on('end',()=>{
  const header=Buffer.alloc(4);header.writeUInt32BE(body.length+(mode==='oversized'||mode==='short-body'?1:0));
  if(mode==='stall'){setInterval(()=>{},10000);return;}
@@ -1416,10 +1472,13 @@ process.stdin.on('data',()=>{}).on('end',()=>{
  if(mode==='nonzero')process.exitCode=6;
 });
 "#).unwrap();
-        let mut child = tokio::process::Command::new("node")
+        let mut child = tokio::process::Command::new("/usr/bin/setpriv")
+            .args(crate::provider_identity_args(uid, gid))
+            .arg("node")
             .arg(&script)
             .arg(mode)
             .arg(&body)
+            .arg(uid.to_string())
             .current_dir(&cwd)
             .env_clear()
             .env("HOME", &home)
@@ -1436,6 +1495,7 @@ process.stdin.on('data',()=>{}).on('end',()=>{
             &request,
             &request_sha256,
             &expected,
+            (uid, gid),
             std::time::Duration::from_secs(2),
             std::time::Duration::from_millis(200),
         )
@@ -1446,7 +1506,13 @@ process.stdin.on('data',()=>{}).on('end',()=>{
         // fallback records a failed production join; it cannot make it pass.
         if !joined_before_test_cleanup {
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                child.kill().await.unwrap();
+                crate::run_provider_refresh_cleanup(
+                    uid,
+                    gid,
+                    "/usr/bin/kill",
+                    &["-KILL", "--", &child.id().unwrap().to_string()],
+                )
+                .unwrap();
                 child.wait().await.unwrap();
             })
             .await
@@ -1473,6 +1539,7 @@ process.stdin.on('data',()=>{}).on('end',()=>{
             "wrong-binding",
             "wrong-runtime",
             "stall",
+            "eof-stall",
         ] {
             let case = reader_case(mode).await;
             assert!(
