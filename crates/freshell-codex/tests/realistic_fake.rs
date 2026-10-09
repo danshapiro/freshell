@@ -51,6 +51,58 @@ fn locks_row_pid(path: &Path) -> Option<u32> {
         .ok()
 }
 
+/// Runs the launcher directly (stderr captured) under a throwaway `HOME`, with
+/// `CODEX_HOME` set only when given, and waits up to 5 s for it to exit. Returns its
+/// exit code and stderr, or `None` when it still runs (its native and every process
+/// the native pinned are then killed).
+async fn launcher_exit(
+    behavior: Value,
+    home: &Path,
+    codex_home: Option<&str>,
+) -> (Option<i32>, String) {
+    use tokio::io::AsyncReadExt;
+    let manifest_dir = home.join("manifests");
+    let mut cmd = tokio::process::Command::new("node");
+    cmd.arg(fixture_path("fake-codex-launcher.mjs"))
+        .args([
+            "app-server",
+            "--listen",
+            &format!("ws://127.0.0.1:{}", unique_free_port()),
+        ])
+        // Never the developer's home, even if the fake falls back to `~/.codex`.
+        .env("HOME", home)
+        .env_remove("CODEX_HOME")
+        .env("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1")
+        .env("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string())
+        .env("FAKE_CODEX_MANIFEST_DIR", &manifest_dir)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(codex_home) = codex_home {
+        cmd.env("CODEX_HOME", codex_home);
+    }
+    let mut child = cmd.spawn().expect("spawn fake launcher");
+    let launcher = child.id().expect("launcher pid");
+    let mut stderr = child.stderr.take().expect("launcher stderr");
+    let stderr = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text).await;
+        text
+    });
+    match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(status) => (
+            status.expect("wait for the launcher").code(),
+            stderr.await.expect("stderr reader"),
+        ),
+        Err(_) => {
+            if let Some(native) = read_native_manifest(&manifest_dir, launcher) {
+                native.kill_all();
+            }
+            (None, String::new())
+        }
+    }
+}
+
 /// Whether any rollout file under `<codex_home>/sessions/` names `id`.
 fn rollout_exists(codex_home: &Path, id: &str) -> bool {
     fn walk(dir: &Path, id: &str) -> bool {
@@ -1154,4 +1206,28 @@ async fn every_reported_process_is_pinned_and_ends_with_the_fake() {
         },
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_native_refuses_to_run_without_an_explicit_codex_home() {
+    // Unset or empty, CODEX_HOME would fall back to `~/.codex` (here a throwaway HOME),
+    // where the native would create, lock and delete real thread lock files.
+    for codex_home in [None, Some("")] {
+        let home = tempfile::tempdir().unwrap();
+        let (code, stderr) = launcher_exit(
+            json!({"preloadedThreads": ["t-home"]}),
+            home.path(),
+            codex_home,
+        )
+        .await;
+        assert_eq!(code, Some(1), "CODEX_HOME={codex_home:?}: {stderr}");
+        assert!(
+            stderr.contains("requires an explicit CODEX_HOME"),
+            "CODEX_HOME={codex_home:?}: {stderr}"
+        );
+        assert!(
+            !home.path().join(".codex").exists(),
+            "CODEX_HOME={codex_home:?}: nothing is created under the default Codex home"
+        );
+    }
 }

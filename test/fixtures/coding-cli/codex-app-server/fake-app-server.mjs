@@ -511,7 +511,8 @@ let nativeTurnCounter = 0
 const nativeRole = process.env.FAKE_CODEX_ROLE === 'native'
   ? (await import('./native-role.mjs')).createNativeRole({
       behavior,
-      codexHome: getCodexHome(),
+      // null without an explicit CODEX_HOME: the native role then refuses to start.
+      codexHome: hasExplicitCodexHome() ? getCodexHome() : null,
       broadcast: (method, params) => broadcastNotification(method, params),
       openConnections: () => [...(wss?.clients ?? [])].filter((client) => client.readyState === 1),
       sendTo: (socket, method, params) => {

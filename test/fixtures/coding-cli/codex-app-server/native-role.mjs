@@ -13,6 +13,12 @@ import path from 'node:path'
 import { acquireThreadLock, heldThreadIds, releaseThreadLock } from './fake-lock.mjs'
 
 export function createNativeRole({ behavior, codexHome, broadcast, openConnections, sendTo }) {
+  // The native creates, locks and deletes real thread lock files, so it never falls
+  // back to the user's own ~/.codex: an unset or empty CODEX_HOME is a startup error.
+  if (!codexHome) {
+    process.stderr.write('FAKE_CODEX_ROLE=native requires an explicit CODEX_HOME (it never uses the real ~/.codex)\n')
+    process.exit(1)
+  }
   if (process.platform !== 'linux' && !process.env.FAKE_CODEX_LOCK_HOLDER) {
     process.stderr.write('FAKE_CODEX_LOCK_HOLDER is required off Linux\n')
     process.exit(1)
