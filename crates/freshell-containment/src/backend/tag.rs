@@ -320,8 +320,11 @@ pub(crate) fn daemon_family_within(set: &BTreeSet<u32>) -> BTreeSet<u32> {
 /// stopped with SIGSTOP through its watch. Then each stopped process's argv
 /// is read again: one that exec'd into the daemon family between the check
 /// and the stop (and its stopped descendants) is resumed with SIGCONT and
-/// spared; every other one gets SIGKILL through its watch. Nothing waits for
-/// the killed processes to exit.
+/// spared, before anything is killed; every other one then gets SIGKILL
+/// through its watch, descendants before ancestors ([`kill_order`]), so no
+/// exit orphans a process group that still has a stopped member (the kernel
+/// would SIGHUP that whole group, spared members included). Nothing waits
+/// for the killed processes to exit.
 pub(crate) fn stop_the_world(
     mut find: impl FnMut() -> (BTreeSet<u32>, BTreeSet<u32>),
     belongs: impl Fn(&ProcWatch, &BTreeSet<u32>) -> bool,
@@ -367,14 +370,17 @@ pub(crate) fn stop_the_world(
         .intersection(&stopped_set)
         .copied()
         .collect();
-    let mut killed = 0;
-    for (pid, watch) in &stopped {
-        if !resumed.contains(pid) && watch.send(libc::SIGKILL).is_ok() {
-            killed += 1;
-        }
-    }
+    // The spared resume first: a process still stopped when its process
+    // group is orphaned would bring the kernel's SIGHUP down on the group.
     for pid in &resumed {
         let _ = stopped[pid].send(libc::SIGCONT);
+    }
+    let doomed: BTreeSet<u32> = stopped_set.difference(&resumed).copied().collect();
+    let mut killed = 0;
+    for pid in kill_order(&doomed, process::parent) {
+        if stopped[&pid].send(libc::SIGKILL).is_ok() {
+            killed += 1;
+        }
     }
     spared.extend(&resumed);
     if let Some(err) = pin_error {
@@ -389,6 +395,39 @@ pub(crate) fn stop_the_world(
         withheld: 0,
         not_frozen: None,
     })
+}
+
+/// The order in which the sweep SIGKILLs its stopped processes: deepest in
+/// the process tree first, so every process is killed after all of its
+/// descendants (ties: higher pids first).
+///
+/// When a process exits, the kernel checks whether that orphans a process
+/// group (no member left with a parent in another group of the same session)
+/// that still has a stopped member, and if so sends SIGHUP and SIGCONT to the
+/// whole group, spared daemon-family members included. A SIGKILL already
+/// sent clears a process's stopped state, so when no process exits before
+/// everything below it has been sent its SIGKILL, no group it links is ever
+/// orphaned with a stopped member. Depth is counted over the whole parent
+/// chain (one-shot reads), not only within `doomed`, so an ancestor reached
+/// through a spared process is still killed after its descendants.
+pub(crate) fn kill_order(doomed: &BTreeSet<u32>, parent: impl Fn(u32) -> Option<u32>) -> Vec<u32> {
+    let depth = |pid: u32| {
+        let mut depth = 0;
+        let mut at = pid;
+        while depth < MAX_ANCESTRY {
+            match parent(at) {
+                Some(up) if up > 0 && up != at => {
+                    depth += 1;
+                    at = up;
+                }
+                _ => break,
+            }
+        }
+        depth
+    };
+    let mut order: Vec<(usize, u32)> = doomed.iter().map(|pid| (depth(*pid), *pid)).collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    order.into_iter().map(|(_, pid)| pid).collect()
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -420,6 +459,168 @@ mod tests {
             let _ = self.watch.signal(Sig::Kill);
             let _ = self.child.wait();
         }
+    }
+
+    /// A process exiting while a member of a process group it links to the
+    /// rest of its session is still stopped makes the kernel send SIGHUP and
+    /// SIGCONT to that whole group, spared daemon-family members included. So
+    /// every process is killed only after all of its descendants: when it
+    /// exits, nothing below it is still stopped.
+    #[test]
+    fn the_sweep_kills_every_process_after_all_of_its_descendants() {
+        // 10 is the reaper shim (lowest pid), 20 its agent, 30/31 the
+        // agent's children, 40 a grandchild, 25 an orphan the shim adopted;
+        // 15 runs outside the set under 1 (another tree).
+        let parents: BTreeMap<u32, u32> = [
+            (10, 1),
+            (20, 10),
+            (25, 10),
+            (30, 20),
+            (31, 20),
+            (40, 30),
+            (15, 1),
+        ]
+        .into_iter()
+        .collect();
+        let parent = |pid: u32| parents.get(&pid).copied();
+        let doomed: BTreeSet<u32> = parents.keys().copied().collect();
+        let order = kill_order(&doomed, parent);
+        assert_eq!(
+            order.iter().copied().collect::<BTreeSet<u32>>(),
+            doomed,
+            "every doomed process is killed exactly once: {order:?}"
+        );
+        let at = |pid: u32| order.iter().position(|p| *p == pid).unwrap();
+        for pid in parents.keys() {
+            let mut ancestor = parent(*pid);
+            while let Some(up) = ancestor {
+                if doomed.contains(&up) {
+                    assert!(
+                        at(*pid) < at(up),
+                        "{pid} must be killed before its ancestor {up}: {order:?}"
+                    );
+                }
+                ancestor = parent(up);
+            }
+        }
+    }
+
+    /// The kernel side of the rule above. The test's child Q (the lowest
+    /// pid, in the test's process group) starts R, which starts 250 sleepers,
+    /// and then L, which leads its own process group with a spared
+    /// daemon-family process S in it; so the pids run Q < R < sleepers < L <
+    /// S, and Q has only two children (its exit is quick). The sweep stops Q,
+    /// R, the sleepers and L, spares S, and kills the stopped ones: if Q
+    /// exited while L was still stopped, L's group would be orphaned with a
+    /// stopped member and the kernel would SIGHUP S.
+    #[test]
+    fn a_spared_process_survives_the_sweep_of_its_process_groups_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let script = format!(
+            r#"pipe(my $ready, my $done) or die;
+my $r = fork();
+if ($r == 0) {{
+  close $ready;
+  for (1..250) {{ my $c = fork(); if ($c == 0) {{ exec "sleep", "600"; }} }}
+  close $done;
+  sleep 600; exit 0;
+}}
+close $done;
+my $eof = <$ready>;
+my $l = fork();
+if ($l == 0) {{
+  setpgrp(0, 0);
+  my $s = fork();
+  if ($s == 0) {{ exec "perl", "-e", "sleep 600", "app-server", "--managed-daemon"; }}
+  open(my $f, ">", "{0}.tmp") or die; print $f "$$ $s"; close $f; rename("{0}.tmp", "{0}");
+  sleep 600; exit 0;
+}}
+sleep 600;"#,
+            pids.display()
+        );
+        let mut q = std::process::Command::new("perl")
+            .args(["-e", &script])
+            .spawn()
+            .unwrap();
+        // Our own unreaped child: its pid names it.
+        let q_watch = ProcWatch::open(q.id()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (l, s) = loop {
+            if let Ok(raw) = std::fs::read_to_string(&pids) {
+                let v: Vec<u32> = raw.split_whitespace().map(|p| p.parse().unwrap()).collect();
+                break (v[0], v[1]);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tree never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let s_watch = ProcWatch::open(s).unwrap();
+        // Pinned while S is certainly still S (L, its parent, sleeps 600 s).
+        let s_start = s_watch.identity().start;
+        struct KillOnDrop(Vec<ProcWatch>);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                for watch in &self.0 {
+                    let _ = watch.signal(Sig::Kill);
+                }
+            }
+        }
+        let _cleanup = KillOnDrop(vec![s_watch.clone(), q_watch.clone()]);
+        // S runs its daemon-family argv only once it has exec'd.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !process::argv(s).is_ok_and(|argv| is_codex_daemon_family(&argv)) {
+            assert!(std::time::Instant::now() < deadline, "S never exec'd");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let me = std::process::id();
+        let root = q.id();
+        let doomed = std::cell::RefCell::new(Vec::new());
+        stop_the_world(
+            || {
+                let mut candidates = with_descendants(BTreeSet::from([root]), me);
+                candidates.retain(|pid| process::is_running(*pid));
+                let spared = daemon_family_within(&candidates);
+                (candidates, spared)
+            },
+            |watch, candidates| {
+                let pid = watch.pid();
+                let member =
+                    pid == root || process::parent(pid).is_some_and(|pp| candidates.contains(&pp));
+                if member {
+                    doomed.borrow_mut().push(watch.clone());
+                }
+                member
+            },
+        )
+        .unwrap();
+        let doomed = doomed.into_inner();
+        assert!(
+            doomed.iter().any(|w| w.pid() == l),
+            "L was stopped and killed"
+        );
+        for watch in &doomed {
+            let start = std::time::Instant::now();
+            while !watch.has_exited() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "{} survived",
+                    watch.pid()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        // Any orphaned-group SIGHUP was sent during those exits; give it time
+        // to land.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !s_watch.has_exited() && process::start_time(s).ok() == Some(s_start),
+            "the spared daemon-family process was killed"
+        );
+        let _ = q.wait();
     }
 
     fn fresh_unit() -> TagUnit {
