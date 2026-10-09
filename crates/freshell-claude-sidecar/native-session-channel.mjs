@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from 'node:crypto'
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 
@@ -49,8 +49,49 @@ async function readNativeTranscript(path, allowMissing = false) {
 
 /** Whether the pinned native loader has an unfinished operation on first
  * input. This never qualifies a checkpoint or proves an effect outcome. */
-export async function nativeTranscriptHasDeferredOperation({ path, allowMissing = false }) {
-  const { rows, lines } = await readNativeTranscript(path, allowMissing)
+export async function inspectNativeForkSource(recipe, childSessionId) {
+  if (!recipe || !validRoot(childSessionId) || recipe.childSessionId !== childSessionId
+    || recipe.recoveryDisabled === true
+    || !validRoot(recipe.parentSessionId) || recipe.parentSessionId === childSessionId
+    || !isAbsolute(recipe.parentTranscript ?? '') || !isAbsolute(recipe.childTranscript ?? '')
+    || !/^[a-f0-9]{64}$/.test(recipe.parentSha256 ?? '')) throw new Error('invalid native fork source')
+  const source = await readNativeTranscript(recipe.parentTranscript)
+  if (createHash('sha256').update(source.bytes).digest('hex') !== recipe.parentSha256) throw new Error('native fork source changed')
+  const candidates = source.rows.filter((row) => typeof row.uuid === 'string' && row.uuid
+    && !['mode', 'atis-latch', 'queue-operation', 'last-prompt'].includes(row.type))
+  if (!candidates.length || !source.rows.some(row => row.sessionId === recipe.parentSessionId)
+    || source.rows.some(row => ['user', 'assistant'].includes(row.type) && row.sessionId !== recipe.parentSessionId)) throw new Error('native fork parent identity changed')
+  const byId = new Map(candidates.map((row) => [row.uuid, row]))
+  const chain = [], seen = new Set()
+  let row = candidates.at(-1)
+  while (row) {
+    if (seen.has(row.uuid)) throw new Error('native fork source cycle')
+    seen.add(row.uuid); chain.unshift(row); row = byId.get(row.parentUuid)
+  }
+  if (recipe.target?.kind === 'empty') return { rows: [], lines: [] }
+  const index = chain.findIndex((row) => row.uuid === recipe.target?.cutoffUuid)
+  if (recipe.target?.kind !== 'prefix' || index < 0
+    || (recipe.target.dropTurnUuid && chain[index + 1]?.uuid !== recipe.target.dropTurnUuid)) throw new Error('native fork cutoff changed')
+  const kept = chain.slice(0, index + 1)
+  return { rows: kept, lines: kept.map(row => JSON.stringify(row)) }
+}
+
+export async function nativeTranscriptHasDeferredOperation({ path, allowMissing = false, parentFork, nativeSessionId }) {
+  let transcript
+  try {
+    transcript = await readNativeTranscript(path, allowMissing && !parentFork)
+    if (parentFork) {
+      const messages = transcript.rows.filter(row => ['user', 'assistant'].includes(row.type))
+      if (!messages.length || messages.some(row => row.sessionId !== nativeSessionId)) {
+        throw new Error('native fork child has no complete current history')
+      }
+    }
+  }
+  catch (error) {
+    if (error?.code !== 'ENOENT' || !parentFork || parentFork.childTranscript !== path) throw error
+    transcript = await inspectNativeForkSource(parentFork, nativeSessionId)
+  }
+  const { rows, lines } = transcript
   // A crash or a batch can leave native tool requests without the supported
   // solo checkpoint. Ordinary input must not ask the loader to replay them.
   const pending = new Set()

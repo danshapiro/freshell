@@ -29,6 +29,7 @@ pub use qualification_policy::{
 pub mod host_actor;
 pub mod opencode_transfer;
 pub mod snapshot_projection;
+pub use freshell_runtime_protocol::{ClaudeForkRecipe, ClaudeForkTarget};
 
 #[cfg(test)]
 #[path = "snapshot_projection_tests.rs"]
@@ -486,6 +487,9 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum ProviderStoreProbe {
+    ParentBackedClaudeFork {
+        evidence: Vec<String>,
+    },
     Ready {
         evidence: Vec<String>,
     },
@@ -628,6 +632,7 @@ pub fn build_resume_spec(input: ResumeSpecInput<'_>) -> Result<ResumeSpec, Adapt
     }
     let resume_argv = exact_resume_args(provider, &terminal.args, native_session_id)?;
     Ok(ResumeSpec {
+        claude_fork: None,
         schema_version: RESUME_SPEC_SCHEMA_VERSION,
         provider_session: ProviderSessionRef {
             provider: provider.to_string(),
@@ -933,11 +938,206 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
 }
 
 fn probe_selected_provider_store(provider_home: &Path, spec: &ResumeSpec) -> ProviderStoreProbe {
-    probe_selected_provider_identity(
+    let ordinary = probe_selected_provider_identity(
         provider_home,
         &spec.provider_session.provider,
         &spec.provider_session.native_session_id,
-    )
+    );
+    let Some(recipe) = spec.claude_fork.as_ref() else {
+        return ordinary;
+    };
+    if !matches!(spec.provider_session.provider.as_str(), "claude" | "kilroy")
+        || !matches!(spec.mode.as_str(), "freshclaude" | "kilroy")
+        || recipe
+            .validate(&spec.provider_session.native_session_id)
+            .is_err()
+    {
+        return blocked(
+            RecoveryBlockReason::StoreUnreadable,
+            "Claude fork recipe is not current",
+            Vec::new(),
+            None,
+        );
+    }
+    // A present child always owns recovery. Never hide partial/corrupt child
+    // state behind an older parent prefix after a possibly accepted input.
+    match inspect_native_path(provider_home, &provider_home.join(&recipe.child_transcript)) {
+        Ok(true) => {
+            let current =
+                read_stable_claude_transcript(&provider_home.join(&recipe.child_transcript));
+            let valid_child = current.as_ref().is_ok_and(|content| {
+                let messages: Vec<_> = content
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|row| matches!(row["type"].as_str(), Some("user" | "assistant")))
+                    .collect();
+                !messages.is_empty()
+                    && messages
+                        .iter()
+                        .all(|row| row["sessionId"] == recipe.child_session_id)
+            });
+            if !valid_child {
+                return blocked(
+                    RecoveryBlockReason::StoreUnreadable,
+                    "Claude child transcript is unreadable",
+                    Vec::new(),
+                    None,
+                );
+            }
+            return ordinary;
+        }
+        Err(probe) => return probe,
+        Ok(false) => {}
+    }
+    if !matches!(ordinary, ProviderStoreProbe::DefinitivelyUnavailable { .. }) {
+        return ordinary;
+    }
+    if recipe.recovery_disabled {
+        return blocked(RecoveryBlockReason::StoreUnreadable,
+            "Claude child history has not materialized after a possibly accepted effect; parent-prefix recovery is disabled", Vec::new(), None);
+    }
+    match read_verified_claude_fork_parent(provider_home, recipe) {
+        Ok(_) => ProviderStoreProbe::ParentBackedClaudeFork {
+            evidence: vec!["native Claude fork is recoverable from its verified parent prefix; child transcript not materialized".into()],
+        },
+        Err(_) => blocked(RecoveryBlockReason::StoreUnreadable, "Claude fork parent/cutoff could not be verified", Vec::new(), None),
+    }
+}
+
+fn read_stable_claude_transcript(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|_| "Claude transcript unavailable")?;
+    let before = file
+        .metadata()
+        .map_err(|_| "Claude transcript metadata unavailable")?;
+    if !before.is_file() || before.len() == 0 || before.len() > 32 * 1024 * 1024 {
+        return Err("Claude transcript exceeds bounded complete read".into());
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(32 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Claude transcript read failed")?;
+    let after = file
+        .metadata()
+        .map_err(|_| "Claude transcript metadata unavailable")?;
+    let current = fs::metadata(path).map_err(|_| "Claude transcript path changed")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let stamp = |m: &fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        if stamp(&before) != stamp(&after) || stamp(&after) != stamp(&current) {
+            return Err("Claude transcript changed".into());
+        }
+    }
+    if bytes.len() as u64 != before.len()
+        || after.len() != current.len()
+        || bytes.last() != Some(&b'\n')
+    {
+        return Err("Claude transcript changed or has incomplete EOF".into());
+    }
+    let content = String::from_utf8(bytes).map_err(|_| "Claude transcript is not UTF-8")?;
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        serde_json::from_str::<serde_json::Value>(line)
+            .map_err(|_| "Claude transcript is incomplete")?;
+    }
+    Ok(content)
+}
+
+/// Called only inside the existing provider-UID reader. This returns private
+/// source bytes; callers must never put them in probe evidence or shared logs.
+pub fn read_verified_claude_fork_parent(
+    home: &Path,
+    recipe: &ClaudeForkRecipe,
+) -> Result<String, String> {
+    recipe.validate(&recipe.child_session_id)?;
+    if recipe.recovery_disabled {
+        return Err("Claude fork recovery was disabled before effect dispatch".into());
+    }
+    let path = home.join(&recipe.parent_transcript);
+    if inspect_native_path(home, &path).ok() != Some(true) {
+        return Err("Claude fork parent unavailable".into());
+    }
+    let content = read_stable_claude_transcript(&path)?;
+    if hex::encode(Sha256::digest(content.as_bytes())) != recipe.parent_sha256 {
+        return Err("Claude fork parent changed".into());
+    }
+    let rows = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Claude fork parent invalid")?;
+    if !rows
+        .iter()
+        .any(|row| row["sessionId"] == recipe.parent_session_id)
+        || rows.iter().any(|row| {
+            matches!(row["type"].as_str(), Some("user" | "assistant"))
+                && row["sessionId"] != recipe.parent_session_id
+        })
+    {
+        return Err("Claude fork parent identity changed".into());
+    }
+    let candidates: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row["uuid"].as_str().is_some_and(|id| !id.is_empty())
+                && !matches!(
+                    row["type"].as_str(),
+                    Some("mode" | "atis-latch" | "queue-operation" | "last-prompt")
+                )
+        })
+        .collect();
+    let mut chain = Vec::new();
+    let mut current = candidates.last().copied();
+    while let Some(row) = current {
+        let id = row["uuid"].as_str().unwrap();
+        if chain
+            .iter()
+            .any(|item: &&serde_json::Value| item["uuid"] == id)
+        {
+            return Err("Claude fork parent cycle".into());
+        }
+        chain.push(row);
+        current = row["parentUuid"].as_str().and_then(|parent| {
+            candidates
+                .iter()
+                .rev()
+                .copied()
+                .find(|row| row["uuid"] == parent)
+        });
+    }
+    chain.reverse();
+    match &recipe.target {
+        ClaudeForkTarget::Empty if !chain.is_empty() => {}
+        ClaudeForkTarget::Prefix {
+            cutoff_uuid,
+            drop_turn_uuid,
+        } => {
+            let index = chain
+                .iter()
+                .position(|row| row["uuid"] == *cutoff_uuid)
+                .ok_or("Claude fork cutoff missing")?;
+            if drop_turn_uuid
+                .as_ref()
+                .is_some_and(|guard| chain.get(index + 1).is_none_or(|row| row["uuid"] != *guard))
+            {
+                return Err("Claude fork drop-turn guard changed".into());
+            }
+        }
+        _ => return Err("Claude fork parent has no native chain".into()),
+    }
+    Ok(content)
 }
 
 fn probe_selected_provider_identity(
@@ -2991,6 +3191,7 @@ mod tests {
 
     fn resume_spec_for_test(provider: &str, session_id: &str, provider_home: &Path) -> ResumeSpec {
         ResumeSpec {
+            claude_fork: None,
             schema_version: RESUME_SPEC_SCHEMA_VERSION,
             provider_session: ProviderSessionRef {
                 provider: provider.into(),
@@ -3025,6 +3226,102 @@ mod tests {
             evidence_revision: 1,
             never_dispatched: false,
         }
+    }
+
+    #[test]
+    fn claude_parent_backed_fork_is_positive_without_certifying_child_absence() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let first = "11111111-1111-4111-8111-111111111111";
+        let last = "22222222-2222-4222-8222-222222222222";
+        let removed = "33333333-3333-4333-8333-333333333333";
+        let parent_path = format!(".claude/projects/work/{parent}.jsonl");
+        fs::create_dir_all(home.path().join(".claude/projects/work")).unwrap();
+        let content = [
+            serde_json::json!({"type":"user","sessionId":parent,"uuid":first,"parentUuid":null,"message":{"role":"user","content":"kept"}}),
+            serde_json::json!({"type":"assistant","sessionId":parent,"uuid":last,"parentUuid":first,"message":{"role":"assistant","content":[]}}),
+            serde_json::json!({"type":"user","sessionId":parent,"uuid":removed,"parentUuid":last,"message":{"role":"user","content":"undone"}}),
+        ].iter().map(|row| format!("{row}\n")).collect::<String>();
+        fs::write(home.path().join(&parent_path), &content).unwrap();
+        let mut spec = resume_spec_for_test("claude", child, home.path());
+        spec.mode = "freshclaude".into();
+        spec.claude_fork = Some(freshell_runtime_protocol::ClaudeForkRecipe {
+            recovery_disabled: false,
+            child_session_id: child.into(),
+            parent_session_id: parent.into(),
+            parent_transcript: parent_path.clone(),
+            child_transcript: format!(".claude/projects/work/{child}.jsonl"),
+            parent_sha256: hex::encode(Sha256::digest(content.as_bytes())),
+            target: freshell_runtime_protocol::ClaudeForkTarget::Prefix {
+                cutoff_uuid: last.into(),
+                drop_turn_uuid: Some(removed.into()),
+            },
+        });
+        let probe = probe_provider_store(home.path(), &spec);
+        assert_eq!(
+            serde_json::to_value(&probe).unwrap()["kind"],
+            "parent_backed_claude_fork",
+            "{probe:?}"
+        );
+        let child_path = home
+            .path()
+            .join(&spec.claude_fork.as_ref().unwrap().child_transcript);
+        spec.claude_fork.as_mut().unwrap().recovery_disabled = true;
+        assert!(
+            matches!(
+                probe_provider_store(home.path(), &spec),
+                ProviderStoreProbe::Blocked { .. }
+            ),
+            "missing child after an ambiguous effect is a blocker, never inspected absence"
+        );
+        for child_content in [
+            format!("{}\n", serde_json::json!({"type":"mode","sessionId":child})),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"user","sessionId":parent,"uuid":first})
+            ),
+            format!(
+                "{}",
+                serde_json::json!({"type":"user","sessionId":child,"uuid":first})
+            ),
+        ] {
+            fs::write(&child_path, child_content).unwrap();
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "partial, wrong-root, or metadata-only child must not inherit its parent proof"
+            );
+        }
+        fs::write(
+            &child_path,
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"user","sessionId":child,"uuid":first})
+            ),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                probe_provider_store(home.path(), &spec),
+                ProviderStoreProbe::Ready { .. }
+            ),
+            "an actual materialized child takes precedence even after source recovery is disabled"
+        );
+        fs::remove_file(child_path).unwrap();
+        spec.claude_fork.as_mut().unwrap().recovery_disabled = false;
+        fs::write(home.path().join(&parent_path), format!("{content}{{}}\n")).unwrap();
+        assert!(matches!(
+            probe_provider_store(home.path(), &spec),
+            ProviderStoreProbe::Blocked { .. }
+        ));
+        fs::remove_file(home.path().join(&parent_path)).unwrap();
+        assert!(matches!(
+            probe_provider_store(home.path(), &spec),
+            ProviderStoreProbe::Blocked { .. }
+        ));
     }
 
     #[test]

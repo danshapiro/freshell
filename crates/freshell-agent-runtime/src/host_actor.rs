@@ -147,6 +147,16 @@ pub struct OperationAck {
     pub native_session_id: Option<String>,
 }
 
+/// Private actor persistence. Only the body-free recipe crosses host/supervisor
+/// acknowledgement; the existing Claude rollback record stays in owned storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeForkState {
+    pub native_session_id: String,
+    pub recipe: Option<freshell_runtime_protocol::ClaudeForkRecipe>,
+    pub rollback: Option<Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchFailure {
     pub message: String,
@@ -197,6 +207,18 @@ pub enum FreshAgentOperation {
 
 #[async_trait]
 pub trait FreshAgentTransport: Send + Sync {
+    async fn restore_claude_fork_state(&self, _state: ClaudeForkState) -> Result<(), String> {
+        Ok(())
+    }
+    async fn claude_fork_state(&self) -> Option<ClaudeForkState> {
+        None
+    }
+    async fn disable_claude_fork_recovery(
+        &self,
+        _destroys_redo: bool,
+    ) -> Result<Option<ClaudeForkState>, String> {
+        Ok(None)
+    }
     async fn resume_native_permission_recovery(&self) -> Result<(), DispatchFailure> {
         Ok(())
     }
@@ -305,6 +327,26 @@ struct PersistedCommand {
     operation_failure: Option<OperationFailureKind>,
 }
 
+fn validate_claude_fork_state(
+    context: &ClaudeForkState,
+    profile: &FreshAgentProfile,
+) -> Result<(), ActorError> {
+    if !matches!(
+        profile.provider,
+        FreshProvider::Claude | FreshProvider::Kilroy
+    ) || profile.native_session_id.as_deref() != Some(&context.native_session_id)
+        || serde_json::to_vec(context).map_err(persist)?.len() > 32 * 1024 * 1024
+    {
+        return Err(ActorError::NativeIdentityMismatch);
+    }
+    if let Some(recipe) = &context.recipe {
+        recipe
+            .validate(&context.native_session_id)
+            .map_err(|_| ActorError::NativeIdentityMismatch)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DecisionState {
@@ -331,6 +373,8 @@ struct PersistedActorState {
     commands: BTreeMap<String, PersistedCommand>,
     #[serde(default)]
     completed_forks: BTreeMap<String, ForkTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_fork_state: Option<ClaudeForkState>,
     decisions: BTreeMap<String, PersistedDecision>,
     events: VecDeque<JournalEvent>,
     event_bytes: usize,
@@ -345,6 +389,7 @@ impl PersistedActorState {
             profile,
             commands: BTreeMap::new(),
             completed_forks: BTreeMap::new(),
+            claude_fork_state: None,
             decisions: BTreeMap::new(),
             events: VecDeque::new(),
             event_bytes: 0,
@@ -566,6 +611,13 @@ impl FreshAgentHostActor {
             PersistedActorState::new(profile)
         };
 
+        if let Some(context) = state.claude_fork_state.clone() {
+            validate_claude_fork_state(&context, &state.profile)?;
+            transport
+                .restore_claude_fork_state(context)
+                .await
+                .map_err(ActorError::Transport)?;
+        }
         let mut native_recovery_prepared = false;
         if matches!(
             state.profile.provider,
@@ -601,6 +653,10 @@ impl FreshAgentHostActor {
                 event_byte_cap,
                 event_count_cap,
             )?;
+        }
+        if let Some(context) = transport.claude_fork_state().await {
+            validate_claude_fork_state(&context, &state.profile)?;
+            state.claude_fork_state = Some(context);
         }
         write_state(&state_dir, &state)?;
         let actor = Arc::new(Self {
@@ -644,6 +700,38 @@ impl FreshAgentHostActor {
 
     pub async fn profile(&self) -> FreshAgentProfile {
         self.state.lock().await.profile.clone()
+    }
+
+    async fn prepare_claude_effect(
+        &self,
+        state: &mut PersistedActorState,
+        destroys_redo: bool,
+    ) -> Result<(), ActorError> {
+        if let Some(context) = self
+            .transport
+            .disable_claude_fork_recovery(destroys_redo)
+            .await
+            .map_err(ActorError::Transport)?
+        {
+            validate_claude_fork_state(&context, &state.profile)?;
+            state.claude_fork_state = Some(context);
+        }
+        if let Some(recipe) = state
+            .claude_fork_state
+            .as_mut()
+            .and_then(|context| context.recipe.as_mut())
+        {
+            recipe.recovery_disabled = true;
+        }
+        Ok(())
+    }
+
+    pub async fn claude_fork_recipe(&self) -> Option<freshell_runtime_protocol::ClaudeForkRecipe> {
+        let state = self.state.lock().await;
+        state
+            .claude_fork_state
+            .as_ref()
+            .and_then(|context| context.recipe.clone())
     }
 
     pub async fn observed_native_session_id(&self) -> Option<String> {
@@ -754,9 +842,9 @@ impl FreshAgentHostActor {
                 .get_mut(request_id.as_str())
                 .expect("inserted")
                 .state = CommandState::Dispatching;
+            self.prepare_claude_effect(&mut state, true).await?;
             write_state(&self.state_dir, &state)?;
         }
-
         let result = self
             .transport
             .dispatch(&request_id, &text, &dispatch_profile)
@@ -1009,6 +1097,9 @@ impl FreshAgentHostActor {
                 .get_mut(request_id.as_str())
                 .expect("inserted semantic operation")
                 .state = CommandState::Dispatching;
+            if matches!(operation, FreshAgentOperation::Compact { .. }) {
+                self.prepare_claude_effect(&mut state, false).await?;
+            }
             write_state(&self.state_dir, &state)?;
             self.native_identity_transition
                 .store(true, Ordering::SeqCst);
@@ -1018,6 +1109,11 @@ impl FreshAgentHostActor {
             .transport
             .dispatch_operation(&request_id, &operation)
             .await;
+        let claude_context = if result.is_ok() {
+            self.transport.claude_fork_state().await
+        } else {
+            None
+        };
         let mut state = self.state.lock().await;
         let (outcome, native_session_id) = {
             let command = state
@@ -1075,6 +1171,12 @@ impl FreshAgentHostActor {
                     self.event_byte_cap,
                     self.event_count_cap,
                 )?;
+            }
+        }
+        if outcome.is_ok() {
+            if let Some(context) = claude_context {
+                validate_claude_fork_state(&context, &state.profile)?;
+                state.claude_fork_state = Some(context);
             }
         }
         let command_state = state
@@ -1322,6 +1424,7 @@ impl FreshAgentHostActor {
             }
             pending.state = DecisionState::Dispatching;
             pending.response_digest = Some(response_digest);
+            self.prepare_claude_effect(&mut state, false).await?;
             write_state(&self.state_dir, &state)?;
         }
         let result = self

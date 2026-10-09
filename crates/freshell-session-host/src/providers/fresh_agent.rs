@@ -285,9 +285,9 @@ impl HostedTransport {
         let (broadcast_tx, broadcast_rx) = broadcast::channel(1024);
         let broadcast_tx = Arc::new(broadcast_tx);
         let state = match provider {
-            FreshProvider::Claude | FreshProvider::Kilroy => {
-                ProviderState::Claude(FreshClaudeState::new(Arc::clone(&broadcast_tx)))
-            }
+            FreshProvider::Claude | FreshProvider::Kilroy => ProviderState::Claude(
+                FreshClaudeState::new(Arc::clone(&broadcast_tx)).with_managed_forks(),
+            ),
             FreshProvider::Codex => {
                 let sidecar_args = context
                     .and_then(|context| match &context.preparation {
@@ -543,6 +543,34 @@ impl HostedTransport {
 
 #[async_trait]
 impl FreshAgentTransport for HostedTransport {
+    async fn restore_claude_fork_state(
+        &self,
+        context: freshell_agent_runtime::host_actor::ClaudeForkState,
+    ) -> Result<(), String> {
+        match &self.state {
+            ProviderState::Claude(state) => state.restore_managed_fork_state(context).await,
+            _ => Err("Claude fork state belongs to another provider".into()),
+        }
+    }
+    async fn claude_fork_state(
+        &self,
+    ) -> Option<freshell_agent_runtime::host_actor::ClaudeForkState> {
+        match &self.state {
+            ProviderState::Claude(state) => state.managed_fork_state().await,
+            _ => None,
+        }
+    }
+    async fn disable_claude_fork_recovery(
+        &self,
+        destroys_redo: bool,
+    ) -> Result<Option<freshell_agent_runtime::host_actor::ClaudeForkState>, String> {
+        match &self.state {
+            ProviderState::Claude(state) => {
+                state.disable_managed_fork_recovery(destroys_redo).await
+            }
+            _ => Ok(None),
+        }
+    }
     async fn prepare_native_permission_recovery(
         &self,
         checkpoints: Vec<Value>,

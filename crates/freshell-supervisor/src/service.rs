@@ -1628,6 +1628,7 @@ impl Supervisor {
             Ok(HostResult::FreshAgentCommand {
                 state: CommandState::ProviderAcked | CommandState::Completed,
                 native_session_id,
+                ..
             }) => {
                 if let Some(native_session_id) = native_session_id {
                     self.registry
@@ -1851,6 +1852,16 @@ impl Supervisor {
         let host = self
             .authenticate_current_fresh_host(&soul_id, &handle)
             .await?;
+        let fence = self
+            .registry
+            .recovery_write_fence(soul_id.clone())
+            .await
+            .map_err(map_registry)?
+            .for_incarnation(handle.incarnation_id().clone());
+        self.registry
+            .disable_claude_fork_recovery_fenced(soul_id.clone(), fence)
+            .await
+            .map_err(map_registry)?;
         match self
             .send_authenticated_host_command(
                 handle.incarnation_id().clone(),
@@ -1917,6 +1928,7 @@ impl Supervisor {
             HostResult::FreshAgentCommand {
                 state,
                 native_session_id,
+                claude_fork,
             } => {
                 let identity_update = classify_fresh_agent_operation_identity(
                     prior_native.as_deref(),
@@ -1939,7 +1951,7 @@ impl Supervisor {
                     }
                     FreshAgentNativeIdentityUpdate::Transition => {
                         self.registry
-                            .transition_native_session_fenced(
+                            .transition_native_session_with_claude_fork_fenced(
                                 soul_id.clone(),
                                 handle.incarnation_id().clone(),
                                 prior_native
@@ -1949,6 +1961,7 @@ impl Supervisor {
                                     .as_deref()
                                     .expect("transition classification requires child"),
                                 fence,
+                                claude_fork,
                             )
                             .await
                             .map_err(map_registry)?;
@@ -2094,6 +2107,16 @@ impl Supervisor {
         let host = self
             .authenticate_current_fresh_host(&soul_id, &handle)
             .await?;
+        let fence = self
+            .registry
+            .recovery_write_fence(soul_id.clone())
+            .await
+            .map_err(map_registry)?
+            .for_incarnation(handle.incarnation_id().clone());
+        self.registry
+            .disable_claude_fork_recovery_fenced(soul_id.clone(), fence)
+            .await
+            .map_err(map_registry)?;
         match self
             .send_authenticated_host_command(
                 handle.incarnation_id().clone(),
@@ -4146,6 +4169,7 @@ mod opencode_transfer_restart_tests {
                             HostResult::FreshAgentCommand {
                                 state: CommandState::ProviderAcked,
                                 native_session_id: Some("native-child".into()),
+                                claude_fork: None,
                             }
                         }
                         HostCommand::FreshAgentFork { .. } => HostResult::FreshAgentFork(

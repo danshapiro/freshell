@@ -56,10 +56,52 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
       }
       throw new Error(`missing ${type}: ${JSON.stringify(frames)}`)
     },
-    close: async () => { send({ type: 'shutdown' }); await exited },
+    close: async (awaitNativeShutdown = false) => { if (child.exitCode === null) send({ type: 'shutdown', awaitNativeShutdown }); await exited },
   }
 }
 describe('managed native startup channel', () => {
+  it('joins the old native writer before acknowledging managed rollback shutdown', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'native-rollback-shutdown-'))
+    const worker = checkpointSidecar(directory, 'current', false, true)
+    try {
+      worker.send({ type: 'create', requestId: 'join-native-writer', cwd: directory })
+      await worker.wait('sdk.session.init')
+      await worker.wait('probe.native-child')
+      const before = Date.now()
+      await worker.close(true)
+      expect(Date.now() - before).toBeGreaterThanOrEqual(100)
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it('reopens the same acknowledged unmaterialized child from its guarded parent before accepting input', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'native-parent-backed-'))
+    const directory = join(home, '.claude/projects/work')
+    await mkdir(directory, { recursive: true })
+    const parent = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const cutoff = '11111111-1111-4111-8111-111111111111'
+    const dropped = '22222222-2222-4222-8222-222222222222'
+    const source = JSON.stringify({ type: 'user', sessionId: parent, uuid: cutoff, parentUuid: null,
+      message: { content: 'retained parent input' } }) + '\n' + JSON.stringify({ type: 'user', sessionId: parent,
+      uuid: dropped, parentUuid: cutoff, message: { content: 'undone input' } }) + '\n'
+    await writeFile(join(directory, parent + '.jsonl'), source)
+    const recipe = { childSessionId: root, parentSessionId: parent,
+      parentTranscript: '.claude/projects/work/' + parent + '.jsonl', childTranscript: '.claude/projects/work/' + root + '.jsonl',
+      parentSha256: createHash('sha256').update(source).digest('hex'), target: { kind: 'prefix', cutoffUuid: cutoff, dropTurnUuid: dropped } }
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const worker = checkpointSidecar(directory, 'native-current', false, false, home)
+        try {
+          worker.send({ type: 'create', requestId: 'reopen-parent-' + attempt, cwd: directory, resumeSessionId: root,
+            nativeForkRecipe: recipe, permissionMode: 'default' })
+          const observed = await worker.wait('sdk.session.init')
+          expect(observed.cliSessionId).toBe(root)
+          expect(observed.nativeIdentityEvidence.source).toBe('fork')
+          expect(worker.frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
+          await expect(readFile(join(directory, root + '.jsonl'))).rejects.toMatchObject({ code: 'ENOENT' })
+        } finally { await worker.close() }
+      }
+      expect(await readFile(join(directory, parent + '.jsonl'), 'utf8')).toBe(source)
+    } finally { await rm(home, { recursive: true, force: true }) }
+  })
   it('observes an authorized first-turn Undo as a new empty native startup', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'native-reroot-empty-'))
     const sidecar = checkpointSidecar(directory)

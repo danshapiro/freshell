@@ -265,6 +265,10 @@ pub struct CredentialReference {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumeSpec {
+    /// Native UUID-preserving recovery of an acknowledged Claude fork before
+    /// its first input materializes a child transcript. Intent, not observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_fork: Option<ClaudeForkRecipe>,
     #[serde(default = "default_resume_spec_schema_version")]
     pub schema_version: u32,
     pub provider_session: ProviderSessionRef,
@@ -319,6 +323,76 @@ pub struct ResumeSpec {
     /// True only when the durable command journal proves no provider input was
     /// ever dispatched. It is the sole authority for pristine-seed recovery.
     pub never_dispatched: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeForkRecipe {
+    /// Retains the missing-child blocker after a potentially accepted effect.
+    /// A disabled source can never recreate its older prefix.
+    #[serde(default)]
+    pub recovery_disabled: bool,
+    pub child_session_id: String,
+    pub parent_session_id: String,
+    pub parent_transcript: String,
+    pub child_transcript: String,
+    pub parent_sha256: String,
+    pub target: ClaudeForkTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ClaudeForkTarget {
+    Prefix {
+        cutoff_uuid: String,
+        drop_turn_uuid: Option<String>,
+    },
+    Empty,
+}
+
+impl ClaudeForkRecipe {
+    pub fn validate(&self, child: &str) -> Result<(), String> {
+        let uuid = |value: &str| uuid::Uuid::parse_str(value).is_ok();
+        let path = |value: &str, root: &str| {
+            let path = std::path::Path::new(value);
+            value.len() <= 4096
+                && path.starts_with(".claude/projects")
+                && path
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+                && path.file_name().and_then(|name| name.to_str())
+                    == Some(format!("{root}.jsonl").as_str())
+        };
+        if self.child_session_id != child
+            || !uuid(child)
+            || !uuid(&self.parent_session_id)
+            || child == self.parent_session_id
+            || !path(&self.parent_transcript, &self.parent_session_id)
+            || !path(&self.child_transcript, child)
+            || self.parent_sha256.len() != 64
+            || !self
+                .parent_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err("invalid Claude parent-backed fork recipe".into());
+        }
+        if let ClaudeForkTarget::Prefix {
+            cutoff_uuid,
+            drop_turn_uuid,
+        } = &self.target
+        {
+            if !uuid(cutoff_uuid) || drop_turn_uuid.as_ref().is_some_and(|id| !uuid(id)) {
+                return Err("invalid Claude fork cutoff".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4228,6 +4302,8 @@ pub enum HostResult {
     TerminalOutput(RuntimeOutputBatch),
     FreshAgentCommand {
         state: CommandState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_fork: Option<ClaudeForkRecipe>,
         /// Provider identity observed and durably recorded by the host actor
         /// at the same acceptance boundary as this acknowledgement.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4605,6 +4681,7 @@ mod tests {
     #[test]
     fn recovery_contract_serializes_references_not_credential_bytes() {
         let spec = ResumeSpec {
+            claude_fork: None,
             schema_version: RESUME_SPEC_SCHEMA_VERSION,
             provider_session: ProviderSessionRef {
                 provider: "claude".into(),

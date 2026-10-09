@@ -749,6 +749,27 @@ pub(crate) fn raw_chain_tip(transcript: &str) -> Option<String> {
     raw_chain(transcript).last().map(|l| l.uuid.clone())
 }
 
+/// In-memory view of a native query's retained prefix. Rows and UUID anchors
+/// come unchanged from the verified parent; this never creates a transcript.
+pub(crate) fn fork_prefix(transcript: &str, cutoff: Option<&str>) -> Result<String, String> {
+    let Some(cutoff) = cutoff else {
+        return Ok(String::new());
+    };
+    let chain = raw_chain(transcript);
+    let end = chain
+        .iter()
+        .position(|line| line.uuid == cutoff)
+        .ok_or("native fork cutoff is not on the current raw chain")?;
+    chain[..=end]
+        .iter()
+        .map(|line| {
+            serde_json::to_string(&line.obj)
+                .map(|value| value + "\n")
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
 /// Chain-entry equality for LCP: `uuid` + `message` content ONLY (never
 /// sessionId/entrypoint/gitBranch/promptId — a fork rewrites those metadata
 /// fields on the kept prefix lines).
@@ -1988,6 +2009,23 @@ mod tests {
             Some("a2")
         );
         assert_eq!(raw_chain_tip(""), None, "no chain lines => no tip");
+    }
+
+    #[test]
+    fn parent_backed_prefix_preserves_native_anchors_for_successive_undo_and_redo() {
+        let original = uuid_transcript_with_carriers();
+        let first = resolve_resume_point(&original, "native-child", ResumeTarget::Step).unwrap();
+        let current = fork_prefix(&original, first.resume_at_uuid.as_deref()).unwrap();
+        assert_eq!(raw_chain_tip(&current), first.resume_at_uuid);
+        assert_eq!(raw_lcp_end(&current, &original), raw_chain_tip(&current));
+        let earlier =
+            resolve_resume_point(&current, "native-next-child", ResumeTarget::Step).unwrap();
+        let empty = fork_prefix(&original, earlier.resume_at_uuid.as_deref()).unwrap();
+        assert!(raw_chain_tip(&empty).is_none());
+        assert_eq!(raw_lcp_end(&empty, &original), None);
+        assert!(fork_prefix(&original, Some("missing-native-anchor")).is_err());
+        let restored = fork_prefix(&original, raw_chain_tip(&original).as_deref()).unwrap();
+        assert_eq!(raw_lcp_end(&restored, &original), raw_chain_tip(&original));
     }
 
     #[test]

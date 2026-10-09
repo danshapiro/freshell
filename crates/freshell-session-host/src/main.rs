@@ -830,6 +830,7 @@ async fn dispatch_with_effects(
                         .await
                         .map(|observation| observation.native_session_id);
                     Ok(HostResult::FreshAgentCommand {
+                        claude_fork: actor.claude_fork_recipe().await,
                         state: freshell_runtime_protocol::CommandState::ProviderAcked,
                         native_session_id,
                     })
@@ -855,6 +856,7 @@ async fn dispatch_with_effects(
                         .map_err(map_actor_error)?;
                     let native_session_id = actor.profile().await.native_session_id;
                     Ok(HostResult::FreshAgentCommand {
+                        claude_fork: actor.claude_fork_recipe().await,
                         state: command_state,
                         native_session_id,
                     })
@@ -916,6 +918,7 @@ async fn dispatch_with_effects(
                         .map_err(map_actor_error)?;
                     commit_fresh_native_transition(state, &actor, prior_native.as_deref()).await?;
                     Ok(HostResult::FreshAgentCommand {
+                        claude_fork: actor.claude_fork_recipe().await,
                         state: command_state,
                         native_session_id: actor.profile().await.native_session_id,
                     })
@@ -952,6 +955,7 @@ async fn dispatch_with_effects(
                         .map_err(map_actor_error)?;
                     commit_fresh_native_transition(state, &actor, prior_native.as_deref()).await?;
                     Ok(HostResult::FreshAgentCommand {
+                        claude_fork: actor.claude_fork_recipe().await,
                         state: command_state,
                         native_session_id: actor.profile().await.native_session_id,
                     })
@@ -1006,6 +1010,7 @@ async fn dispatch_with_effects(
                         .map_err(map_actor_error)?;
                     let native_session_id = actor.profile().await.native_session_id;
                     Ok(HostResult::FreshAgentCommand {
+                        claude_fork: actor.claude_fork_recipe().await,
                         state: freshell_runtime_protocol::CommandState::Completed,
                         native_session_id,
                     })
@@ -5859,6 +5864,7 @@ mod tests {
             HostResult::FreshAgentCommand {
                 state: freshell_runtime_protocol::CommandState::ProviderAcked,
                 native_session_id: Some(ref native),
+                ..
             }
             if native == "fixture-native-thread"
         ));
@@ -6282,6 +6288,7 @@ mod tests {
             runtime_variant: launch.runtime_variant.clone(),
             fixture_transport: None,
             opencode_adoption_baseline: None,
+            claude_fork: None,
             program: "opencode".into(),
             resume_argv: Vec::new(),
             provider_home: home.to_string_lossy().into_owned(),
@@ -7426,6 +7433,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             runtime_variant: "managed_terminal_pty".into(),
             fixture_transport: None,
             opencode_adoption_baseline: None,
+            claude_fork: None,
             program: launcher.to_string_lossy().into_owned(),
             resume_argv: vec!["--continue".into(), "--model".into(), "free-model".into()],
             provider_home: "/home/freshell/provider".into(),
@@ -8844,6 +8852,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             runtime_variant: "managed_terminal_pty".into(),
             fixture_transport: None,
             opencode_adoption_baseline: None,
+            claude_fork: None,
             program: terminal.program.clone(),
             resume_argv: Vec::new(),
             provider_home: terminal.env["HOME"].clone(),

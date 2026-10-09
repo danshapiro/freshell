@@ -141,6 +141,7 @@ fn exact_resume_candidate_base(
     if let Some(stored) = context.resume_spec.clone() {
         let expected = context.native_session_id.as_deref();
         if stored.provider_session.provider != context.provider
+            || (stored.claude_fork.is_some() && stored.claude_fork != context.claude_fork)
             || stored.provider_session.provider_store_id != context.provider_store_id
             || expected != Some(stored.provider_session.native_session_id.as_str())
         {
@@ -164,6 +165,7 @@ fn exact_resume_candidate_base(
 
     if let Some(agent) = context.fresh_agent.as_ref() {
         let spec = ResumeSpec {
+            claude_fork: context.claude_fork.clone(),
             schema_version: RESUME_SPEC_SCHEMA_VERSION,
             provider_session: ProviderSessionRef {
                 provider: agent.provider.as_str().into(),
@@ -256,6 +258,7 @@ fn exact_resume_candidate_base(
 
     if context.fixture == Some(freshell_runtime_protocol::FixtureKind::NativeSession) {
         let spec = ResumeSpec {
+            claude_fork: None,
             schema_version: RESUME_SPEC_SCHEMA_VERSION,
             provider_session: ProviderSessionRef {
                 provider: context.provider.clone(),
@@ -408,6 +411,7 @@ mod tests {
         let soul = SoulId::parse("soul-resume-catalog").unwrap();
         let incarnation = IncarnationId::parse("incarnation-resume-catalog").unwrap();
         RecoveryContext {
+            claude_fork: None,
             native_identity_launch: None,
             soul_id: soul.clone(),
             prior_handle: OwnedRuntimeHandle::from_registry(

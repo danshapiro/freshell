@@ -9,10 +9,10 @@ export function query({ prompt, options }) {
     void options.canUseTool('Bash', { command: 'owned-preinit-effect' }, {}).then((decision) =>
       process.stdout.write(JSON.stringify({ type: 'probe.preinit-permission', decision }) + '\n'))
   }
-  const nativeRoot = options.model === 'empty-rollback-native' ? 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+  const nativeRoot = options.sessionId ?? (options.model === 'empty-rollback-native' ? 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
     : options.model === 'fork-retained-parent' ? options.resume : options.forkSession
     ? (++nativeForks === 1 ? 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' : 'cccccccc-cccc-4ccc-8ccc-cccccccccccc')
-    : options.resume ?? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    : options.resume ?? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
   const checkpointScenario = process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT === '1'
   const child = checkpointScenario && process.env.FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY === '1'
     ? options.spawnClaudeCodeProcess({ command: process.execPath,
@@ -23,7 +23,8 @@ export function query({ prompt, options }) {
     process.stdout.write(JSON.stringify({ type: 'probe.native-child', pid: child.pid }) + '\n')
     child.once('close', () => nativeChildren.delete(child.pid))
   }
-  const transcriptPath = checkpointScenario ? join(options.cwd, 'native.jsonl') : '/owned/native.jsonl'
+  const transcriptPath = options.sessionId ? join(options.cwd, nativeRoot + '.jsonl')
+    : checkpointScenario ? join(options.cwd, 'native.jsonl') : '/owned/native.jsonl'
   const loaded = new Promise((resolve, reject) => {
     const command = options.settings?.hooks?.SessionStart?.[0]?.hooks?.[0]?.command
     const child = exec(command, { env: options.env }, (error) => {

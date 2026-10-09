@@ -589,6 +589,7 @@ pub async fn probe_resume(
     };
     match result {
         Ok(ProviderStoreProbe::Ready { evidence }) => {
+            resume_spec.claude_fork = None;
             if matches!(
                 provider.as_str(),
                 "phase1-fixture" | "native-session-fixture"
@@ -617,6 +618,10 @@ pub async fn probe_resume(
                 resume_spec: Box::new(resume_spec),
             }
         }
+        Ok(ProviderStoreProbe::ParentBackedClaudeFork { .. }) => RecoveryProbe::ResumeReady {
+            evidence_revision: resume_spec.evidence_revision,
+            resume_spec: Box::new(resume_spec),
+        },
         Ok(ProviderStoreProbe::DefinitivelyUnavailable {
             reason,
             evidence,

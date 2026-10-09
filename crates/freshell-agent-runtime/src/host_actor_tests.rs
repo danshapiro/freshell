@@ -216,6 +216,194 @@ struct OperationTransport {
     operation_native_session_id: Option<String>,
 }
 
+struct ParentForkTransport {
+    state_dir: std::path::PathBuf,
+    current: std::sync::Mutex<Option<ClaudeForkState>>,
+    fork: ClaudeForkState,
+}
+
+#[async_trait]
+impl FreshAgentTransport for ParentForkTransport {
+    async fn restore_claude_fork_state(&self, state: ClaudeForkState) -> Result<(), String> {
+        *self.current.lock().unwrap() = Some(state);
+        Ok(())
+    }
+    async fn claude_fork_state(&self) -> Option<ClaudeForkState> {
+        self.current.lock().unwrap().clone()
+    }
+    async fn disable_claude_fork_recovery(
+        &self,
+        _destroys_redo: bool,
+    ) -> Result<Option<ClaudeForkState>, String> {
+        if let Some(state) = self.current.lock().unwrap().as_mut() {
+            if let Some(recipe) = state.recipe.as_mut() {
+                recipe.recovery_disabled = true;
+            }
+        }
+        Ok(self.current.lock().unwrap().clone())
+    }
+    async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+        if profile.native_session_id.as_deref() == Some(&self.fork.native_session_id)
+            && self
+                .current
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|state| state.recipe.as_ref())
+                .is_none_or(|recipe| recipe.recovery_disabled)
+        {
+            return Err("no child transcript and no current parent recipe".into());
+        }
+        Ok(TransportStart {
+            native_session_id: profile
+                .native_session_id
+                .clone()
+                .or_else(|| Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into())),
+        })
+    }
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        let persisted: PersistedActorState = serde_json::from_slice(
+            &fs::read(self.state_dir.join("fresh-agent-state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            persisted
+                .claude_fork_state
+                .unwrap()
+                .recipe
+                .unwrap()
+                .recovery_disabled,
+            "old prefix disabled before ambiguous dispatch"
+        );
+        assert!(
+            self.current
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .recipe
+                .as_ref()
+                .unwrap()
+                .recovery_disabled
+        );
+        Err(DispatchFailure {
+            message: "accepted input reply lost".into(),
+            acceptance_ambiguous: true,
+        })
+    }
+    async fn supports_operation(&self, _: &FreshAgentOperation) -> Result<bool, String> {
+        Ok(true)
+    }
+    async fn dispatch_operation(
+        &self,
+        _: &RequestId,
+        _: &FreshAgentOperation,
+    ) -> Result<OperationAck, OperationFailure> {
+        *self.current.lock().unwrap() = Some(self.fork.clone());
+        Ok(OperationAck {
+            provider_ack_id: Some("native-undo".into()),
+            native_session_id: Some(self.fork.native_session_id.clone()),
+        })
+    }
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        unreachable!()
+    }
+    async fn interrupt(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn parent_backed_fork_survives_actor_reopen_but_never_an_ambiguous_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let fork = ClaudeForkState {
+        native_session_id: child.into(),
+        recipe: Some(crate::ClaudeForkRecipe {
+            recovery_disabled: false,
+            child_session_id: child.into(),
+            parent_session_id: parent.into(),
+            parent_transcript: format!(".claude/projects/work/{parent}.jsonl"),
+            child_transcript: format!(".claude/projects/work/{child}.jsonl"),
+            parent_sha256: "a".repeat(64),
+            target: crate::ClaudeForkTarget::Empty,
+        }),
+        rollback: Some(
+            serde_json::json!({"originalSessionId":parent,"originalTipUuid":"native-anchor","entries":[{"removedTurns":[{"id":"retained-native-id"}]}]}),
+        ),
+    };
+    let transport = || {
+        Arc::new(ParentForkTransport {
+            state_dir: dir.path().into(),
+            current: std::sync::Mutex::new(None),
+            fork: fork.clone(),
+        })
+    };
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "parent-backed", None),
+        transport(),
+    )
+    .await
+    .unwrap();
+    actor
+        .semantic_operation(
+            RequestId::parse("parent-backed-undo").unwrap(),
+            FreshAgentOperation::Rollback {
+                direction: FreshAgentRollbackDirection::Undo,
+                mode: FreshAgentRollbackMode::Step,
+                turn_id: None,
+                cwd: None,
+            },
+        )
+        .await
+        .unwrap();
+    let child_profile = actor.profile().await;
+    drop(actor);
+    let resumed_transport = transport();
+    let actor =
+        FreshAgentHostActor::open(dir.path(), child_profile.clone(), resumed_transport.clone())
+            .await
+            .expect("acknowledged child must survive a pre-input crash");
+    assert_eq!(
+        actor.observed_native_session_id().await.as_deref(),
+        Some(child)
+    );
+    assert_eq!(
+        resumed_transport.current.lock().unwrap().as_ref(),
+        Some(&fork)
+    );
+    assert!(matches!(
+        actor
+            .dispatch(
+                RequestId::parse("ambiguous-child-input").unwrap(),
+                "new input".into(),
+                None
+            )
+            .await,
+        Err(ActorError::AmbiguousDispatch)
+    ));
+    drop(actor);
+    assert!(
+        FreshAgentHostActor::open(dir.path(), child_profile, transport())
+            .await
+            .is_err(),
+        "an ambiguous input cannot restore an older prefix"
+    );
+}
+
 #[async_trait]
 impl FreshAgentTransport for OperationTransport {
     async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {

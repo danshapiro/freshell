@@ -7,7 +7,7 @@ import { inspectNativeDeferredCheckpoint, nativeTranscriptHasDeferredOperation }
 const recoverable = new Set(['checkpointed', 'approval_waiting'])
 const phases = new Set([...recoverable, 'continuing', 'dispatching', 'resolved', 'interrupted'])
 
-export function createNativeCheckpointStore({ recordPath, transcriptPath, nativeSessionId, profileDigest, allowMissingTranscript = false }) {
+export function createNativeCheckpointStore({ recordPath, transcriptPath, nativeSessionId, profileDigest, allowMissingTranscript = false, parentFork }) {
   if (!isAbsolute(recordPath) || !isAbsolute(transcriptPath) || !/^[a-f0-9]{64}$/.test(profileDigest)) {
     throw new Error('native checkpoint store requires its exact owned paths and profile')
   }
@@ -60,10 +60,12 @@ export function createNativeCheckpointStore({ recordPath, transcriptPath, native
     return JSON.stringify(proof) === JSON.stringify(record.checkpoint)
   }
   return {
+    disableParentFork: () => { if (parentFork) { parentFork = undefined; allowMissingTranscript = false } },
     inputState: () => run(async () => {
       try {
         const record = await read()
-        if (!record) return await nativeTranscriptHasDeferredOperation({ path: transcriptPath, allowMissing: allowMissingTranscript }) ? 'blocked' : 'clear'
+        if (!record) return await nativeTranscriptHasDeferredOperation({ path: transcriptPath, allowMissing: allowMissingTranscript,
+          parentFork, nativeSessionId }) ? 'blocked' : 'clear'
         if (await consumed(record)) return await nativeTranscriptHasDeferredOperation({ path: transcriptPath }) ? 'blocked' : 'clear'
         return recoverable.has(record.phase) && await current(record) ? 'recoverable' : 'blocked'
       } catch { return 'blocked' }

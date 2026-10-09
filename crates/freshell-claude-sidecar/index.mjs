@@ -81,7 +81,7 @@ import { isAbsolute, join, resolve } from 'node:path'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
-import { createNativeSessionChannel, nativeInputDigest } from './native-session-channel.mjs'
+import { createNativeSessionChannel, inspectNativeForkSource, nativeInputDigest } from './native-session-channel.mjs'
 import { createNativeCheckpointStore } from './native-checkpoint-state.mjs'
 import { spawnObservedNative } from './native-process.mjs'
 import {
@@ -540,6 +540,8 @@ async function consumeStream(sessionId, sdkQuery) {
 // ── request handlers ─────────────────────────────────────────────────────────
 async function openSessionQuery(sessionId, state, req, launch, announceCreated = true) {
   const abort = state.abort
+  const fork = state.parentFork
+  const prefix = fork?.target.kind === 'prefix'
   const generation = state.queryGeneration = (state.queryGeneration ?? 0) + 1
   state.nativeBatch = undefined
   state.nativeReady = false
@@ -549,19 +551,20 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
   })
   state.inputStream = handle
   if (launch) state.nativeChannel = await createNativeSessionChannel({ launch, signal: abort.signal,
-    allowFork: !!state.nativeIdentityTransition && req.forkSession === true })
+    allowFork: prefix || (!!state.nativeIdentityTransition && req.forkSession === true) })
 
   const sdkQuery = query({
     prompt: iterable,
     options: {
       cwd: req.cwd || undefined,
-      resume: req.resumeSessionId,
+      resume: fork ? prefix ? fork.parentTranscript : undefined : req.resumeSessionId,
+      sessionId: fork?.childSessionId,
       // kata 1wxv Task 4 (fork-at-point emulation): the ONLY sanctioned lane is
       // the query() options triple — NEVER the standalone forkSession() fn (it
       // remaps every uuid).
-      resumeSessionAt: req.resumeSessionAt || undefined,
-      forkSession: req.forkSession === true || undefined,
-      resumeDropsTurn: req.resumeDropsTurn || undefined,
+      resumeSessionAt: fork ? prefix ? fork.target.cutoffUuid : undefined : req.resumeSessionAt || undefined,
+      forkSession: fork ? prefix || undefined : req.forkSession === true || undefined,
+      resumeDropsTurn: fork ? prefix ? fork.target.dropTurnUuid || undefined : undefined : req.resumeDropsTurn || undefined,
       model: req.model,
       permissionMode: req.permissionMode,
       // Enables the user's in-session permission selector; the selected mode
@@ -659,7 +662,13 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
   if (state.nativeChannel) {
     state.nativeReadyPromise = state.nativeChannel.waitReady(sdkQuery).then(async (observation) => {
       if (sessions.get(sessionId) !== state || state.queryGeneration !== generation || abort.signal.aborted) return
-      if (state.nativeIdentityTransition) {
+      if (fork) {
+        if (observation.nativeSessionId !== fork.childSessionId
+          || observation.native.source !== (prefix ? 'fork' : 'startup')
+          || observation.native.transcript_path !== fork.childTranscript) throw new Error('native parent-backed fork did not observe its exact child')
+        await inspectNativeForkSource(fork, observation.nativeSessionId)
+        if (state.queryGeneration !== generation || abort.signal.aborted) return
+      } else if (state.nativeIdentityTransition) {
         const expectedSource = req.forkSession === true ? 'fork' : 'startup'
         if (observation.native.source !== expectedSource) throw new Error(`native rollback did not acknowledge a ${expectedSource}`)
         if (observation.nativeSessionId === state.nativeIdentityTransition.parentNativeSessionId) throw new Error('native rollback retained the retired root')
@@ -670,10 +679,10 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
       state.nativeStore = createNativeCheckpointStore({ nativeSessionId: observation.nativeSessionId,
         transcriptPath: observation.native.transcript_path,
         recordPath: join(process.env.HOME, '.freshell', 'native-checkpoints', 'claude', observation.nativeSessionId + '.json'),
-        profileDigest: state.nativeProfileDigest, allowMissingTranscript: !req.resumeSessionId })
+        profileDigest: state.nativeProfileDigest, allowMissingTranscript: !req.resumeSessionId && !fork, parentFork: fork })
       state.nativeReady = true
       state.cliSessionId = observation.nativeSessionId
-      if (state.nativeIdentityTransition) {
+      if (state.nativeIdentityTransition || fork) {
         // The operation selected this child once. Any later checkpoint query
         // must resume it exactly, without repeating the original fork options.
         state.createRequest = { ...req, resumeSessionId: observation.nativeSessionId }
@@ -681,6 +690,7 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
         delete state.createRequest.forkSession
         delete state.createRequest.resumeSessionAt
         delete state.createRequest.resumeDropsTurn
+        delete state.createRequest.nativeForkRecipe
       }
       state.nativeIdentityTransition = undefined
       emit({ type: 'sdk.session.init', sessionId, cliSessionId: observation.nativeSessionId,
@@ -817,6 +827,20 @@ async function handleCreate(req) {
       launch = next
       state.nativeIdentityTransition = transition
     }
+    if (req.nativeForkRecipe) {
+      const recipe = req.nativeForkRecipe
+      if (!launch || (!state.nativeIdentityTransition && launch.requestedNativeSessionId !== recipe.childSessionId)) {
+        throw new Error('native fork recipe does not match the current exact launch')
+      }
+      const path = (value, root) => {
+        if (typeof value !== 'string' || !value.startsWith('.claude/projects/') || value.split('/').some(part => !part || part === '..' || part === '.')
+          || !value.endsWith('/' + root + '.jsonl') || !isAbsolute(process.env.HOME ?? '')) throw new Error('invalid native fork source path')
+        return join(process.env.HOME, value)
+      }
+      state.parentFork = { ...recipe, parentTranscript: path(recipe.parentTranscript, recipe.parentSessionId),
+        childTranscript: path(recipe.childTranscript, recipe.childSessionId) }
+      await inspectNativeForkSource(state.parentFork, recipe.childSessionId)
+    }
     state.createRequest = req
     state.launch = launch
     if (launch) state.nativeProfileDigest = await nativeProfileDigest(req, state.settings)
@@ -847,6 +871,8 @@ async function handleSend(req) {
       emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'Current native query changed before input admission' })
       return
     }
+    st.nativeStore.disableParentFork()
+    st.parentFork = undefined
   }
   // ep4-r3: /compact is the only dispatch rollback ever absorbs; mark it so
   // the quiesce handler can drain never-handed compacts from the input queue
@@ -970,6 +996,25 @@ function shutdown() {
   sessions.clear()
 }
 
+let pendingShutdown
+function shutdownAndExit(awaitNativeShutdown = false) {
+  if (pendingShutdown) return
+  if (!awaitNativeShutdown) { shutdown(); process.exit(0) }
+  const closures = [...sessions.values()].map(state => state.nativeChannel && !state.nativeChildClosed
+    ? Promise.reject(new Error('native writer closure is unavailable')) : state.nativeChildClosed)
+  shutdown()
+  pendingShutdown = (async () => {
+    let timer
+    try {
+      await Promise.race([Promise.all(closures), new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('native writer shutdown timed out')), 4_000)
+      })])
+      process.exit(0)
+    } catch { process.exit(1) }
+    finally { clearTimeout(timer) }
+  })()
+}
+
 // ── stdin dispatch loop (newline-JSON) ───────────────────────────────────────
 const rl = createInterface({ input: process.stdin })
 rl.on('line', (line) => {
@@ -1046,14 +1091,14 @@ rl.on('line', (line) => {
       }
       break
     }
-    case 'shutdown': shutdown(); process.exit(0); break
+    case 'shutdown': shutdownAndExit(req.awaitNativeShutdown === true); break
     default: logerr(`unknown request type: ${req?.type}`)
   }
 })
 // stdin closed (Rust reaped us): abort every query and exit so no claude CLI
 // grandchild is left mid-stream.
-rl.on('close', () => { shutdown(); process.exit(0) })
-process.on('SIGTERM', () => { shutdown(); process.exit(0) })
-process.on('SIGINT', () => { shutdown(); process.exit(0) })
+rl.on('close', () => shutdownAndExit())
+process.on('SIGTERM', () => shutdownAndExit())
+process.on('SIGINT', () => shutdownAndExit())
 
 logerr('ready')

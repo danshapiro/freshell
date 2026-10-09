@@ -5131,6 +5131,7 @@ pub(crate) mod tests {
                         HostResult::FreshAgentCommand {
                             state: freshell_runtime_protocol::CommandState::ProviderAcked,
                             native_session_id: Some(native.into()),
+                            claude_fork: None,
                         }
                     }
                     _ => panic!("unexpected pending-release command"),

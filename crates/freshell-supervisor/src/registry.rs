@@ -21,7 +21,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 const ACTIVE_STATES: &str = "'prepared','created','starting','running','stopping'";
 
 type ExistingSoulLaunchRow = (
@@ -409,6 +409,7 @@ impl OwnedRuntimeHandle {
 
 #[derive(Debug, Clone)]
 pub struct RecoveryContext {
+    pub claude_fork: Option<freshell_runtime_protocol::ClaudeForkRecipe>,
     pub native_identity_launch: Option<freshell_runtime_protocol::NativeIdentityLaunch>,
     pub soul_id: SoulId,
     pub prior_handle: OwnedRuntimeHandle,
@@ -1562,6 +1563,21 @@ impl Registry {
             .await
     }
 
+    pub async fn disable_claude_fork_recovery_fenced(
+        &self,
+        soul_id: SoulId,
+        fence: RecoveryWriteFence,
+    ) -> Result<(), RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            invalidate_claude_fork_recovery(&tx, &soul_id)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn mark_input_completed(
         &self,
         soul_id: SoulId,
@@ -1622,6 +1638,7 @@ impl Registry {
                     "queued input changed during replacement claim".into(),
                 ));
             }
+            invalidate_claude_fork_recovery(&tx, &soul_id)?;
             tx.commit()?;
             Ok(Some(QueuedInput { request_id, data }))
         })
@@ -1645,6 +1662,9 @@ impl Registry {
                     "input command {} is not journaled",
                     request_id
                 )));
+            }
+            if matches!(state, "dispatching" | "ambiguous") {
+                invalidate_claude_fork_recovery(&tx, &soul_id)?;
             }
             tx.commit()?;
             Ok(())
@@ -1782,6 +1802,31 @@ impl Registry {
         child_session_id: &str,
         fence: RecoveryWriteFence,
     ) -> Result<RecoveryWriteFence, RegistryError> {
+        self.transition_native_session_with_claude_fork_fenced(
+            soul_id,
+            incarnation_id,
+            expected_parent,
+            child_session_id,
+            fence,
+            None,
+        )
+        .await
+    }
+
+    pub async fn transition_native_session_with_claude_fork_fenced(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        expected_parent: &str,
+        child_session_id: &str,
+        fence: RecoveryWriteFence,
+        claude_fork: Option<freshell_runtime_protocol::ClaudeForkRecipe>,
+    ) -> Result<RecoveryWriteFence, RegistryError> {
+        if let Some(recipe) = &claude_fork {
+            recipe
+                .validate(child_session_id)
+                .map_err(|_| RegistryError::NativeIdentityConflict)?;
+        }
         let expected_parent = expected_parent.to_string();
         let child_session_id = child_session_id.to_string();
         if expected_parent.is_empty()
@@ -1811,6 +1856,9 @@ impl Registry {
                 params![incarnation_id.as_str()], |row| row.get(0),
             ).optional()?.ok_or_else(|| RegistryError::UnknownIncarnation(incarnation_id.clone()))?;
             if owner != soul_id.as_str() {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            if claude_fork.is_some() && !matches!(provider.as_str(), "claude" | "kilroy") {
                 return Err(RegistryError::NativeIdentityConflict);
             }
             // The response to a successful provider fork can be lost. Retrying
@@ -1883,8 +1931,8 @@ impl Registry {
             // Any prior resume proof names the old branch. It must be
             // re-materialized from the child before a later replacement.
             let updated = tx.execute(
-                "UPDATE souls SET native_session_id=?1,identity_revision=identity_revision+1,evidence_revision=evidence_revision+1,resume_spec=NULL,allocation_state='materializing',durability_state='live_only',checkpoint_revision=0,updated_at=?2 WHERE soul_id=?3 AND intent_revision=?4 AND identity_revision=?5 AND evidence_revision=?6",
-                params![child_session_id, now, soul_id.as_str(), fence.intent_revision, fence.identity_revision, fence.evidence_revision],
+                "UPDATE souls SET native_session_id=?1,identity_revision=identity_revision+1,evidence_revision=evidence_revision+1,resume_spec=NULL,allocation_state='materializing',durability_state='live_only',checkpoint_revision=0,updated_at=?2,claude_fork_recipe=?7 WHERE soul_id=?3 AND intent_revision=?4 AND identity_revision=?5 AND evidence_revision=?6",
+                params![child_session_id, now, soul_id.as_str(), fence.intent_revision, fence.identity_revision, fence.evidence_revision, claude_fork.as_ref().map(serde_json::to_string).transpose()?],
             )?;
             if updated != 1 {
                 return Err(RegistryError::NativeIdentityConflict);
@@ -1932,6 +1980,11 @@ impl Registry {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            if let Some(recipe) = &resume_spec.claude_fork {
+                let current: Option<String> = tx.query_row("SELECT claude_fork_recipe FROM souls WHERE soul_id=?1", params![soul_id.as_str()], |row| row.get(0))?;
+                let current: Option<freshell_runtime_protocol::ClaudeForkRecipe> = current.map(|raw| serde_json::from_str(&raw)).transpose()?;
+                if current.as_ref() != Some(recipe) { return Err(RegistryError::NativeIdentityConflict); }
+            }
             let (provider, store, native, evidence, existing): (
                 String,
                 String,
@@ -1963,6 +2016,7 @@ impl Registry {
             if let Some(existing) = existing {
                 let existing: ResumeSpec = serde_json::from_str(&existing)?;
                 if existing.provider_session == resume_spec.provider_session
+                    && existing.claude_fork == resume_spec.claude_fork
                     && existing.program == resume_spec.program
                     && existing.cwd == resume_spec.cwd
                     && existing.workspace_path == resume_spec.workspace_path
@@ -1989,7 +2043,7 @@ impl Registry {
                 "resume_captured"
             };
             let changed = tx.execute(
-                "UPDATE souls SET resume_spec=?1,evidence_revision=?2,allocation_state='verified_durable',durability_state=?3,checkpoint_revision=?4,updated_at=?5 WHERE soul_id=?6 AND intent_revision=?7 AND identity_revision=?8 AND native_import_revision=?9 AND evidence_revision=?10",
+                "UPDATE souls SET resume_spec=?1,evidence_revision=?2,allocation_state='verified_durable',durability_state=?3,checkpoint_revision=?4,updated_at=?5,claude_fork_recipe=?11 WHERE soul_id=?6 AND intent_revision=?7 AND identity_revision=?8 AND native_import_revision=?9 AND evidence_revision=?10",
                 params![
                     encoded,
                     next_evidence,
@@ -2001,6 +2055,7 @@ impl Registry {
                     fence.identity_revision,
                     fence.native_import_revision,
                     fence.evidence_revision,
+                    resume_spec.claude_fork.as_ref().map(serde_json::to_string).transpose()?,
                 ],
             )?;
             if changed != 1 {
@@ -3360,6 +3415,7 @@ fn create_schema(
             durability_state TEXT NOT NULL,
             allocation_state TEXT NOT NULL,
             resume_spec TEXT,
+            claude_fork_recipe TEXT,
             checkpoint_revision INTEGER NOT NULL,
             evidence_revision INTEGER NOT NULL,
             identity_revision INTEGER NOT NULL DEFAULT 0,
@@ -4094,6 +4150,15 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.commit()?;
         schema = 13;
     }
+    if schema == 13 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !column_exists(&tx, "souls", "claude_fork_recipe")? {
+            tx.execute_batch("ALTER TABLE souls ADD COLUMN claude_fork_recipe TEXT;")?;
+        }
+        tx.execute_batch("UPDATE installation SET schema_version=14,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 14;
+    }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
             "unsupported older schema {schema}"
@@ -4491,6 +4556,23 @@ fn validate_live_native_observation(
     Ok(())
 }
 
+fn invalidate_claude_fork_recovery(
+    tx: &rusqlite::Transaction<'_>,
+    soul_id: &SoulId,
+) -> Result<(), RegistryError> {
+    let current: Option<String> = tx.query_row(
+        "SELECT claude_fork_recipe FROM souls WHERE soul_id=?1",
+        params![soul_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if let Some(raw) = current {
+        let mut recipe: freshell_runtime_protocol::ClaudeForkRecipe = serde_json::from_str(&raw)?;
+        recipe.recovery_disabled = true;
+        tx.execute("UPDATE souls SET claude_fork_recipe=?3,resume_spec=NULL,durability_state='live_only',allocation_state='materializing',updated_at=?2 WHERE soul_id=?1", params![soul_id.as_str(), now_millis(), serde_json::to_string(&recipe)?])?;
+    }
+    Ok(())
+}
+
 fn validate_recovery_write_fence(
     tx: &rusqlite::Transaction<'_>,
     soul_id: &SoulId,
@@ -4868,6 +4950,14 @@ fn load_recovery_context(
     )?;
     let never_dispatched = dispatched_count == 0 && row.2.is_none();
     Ok(RecoveryContext {
+        claude_fork: conn
+            .query_row(
+                "SELECT claude_fork_recipe FROM souls WHERE soul_id=?1",
+                params![soul_id.as_str()],
+                |r| r.get::<_, Option<String>>(0),
+            )?
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()?,
         native_identity_launch: conn
             .query_row(
                 "SELECT native_identity_launch FROM incarnations WHERE incarnation_id=?1",
@@ -6785,6 +6875,108 @@ pub(crate) mod tests {
             params![soul.as_str(), prepared.incarnation_id.as_str()], |row| row.get(0),
         ).unwrap();
         assert_eq!((parent_claims, child_claims), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn parent_backed_fork_registry_reopen_preserves_child_and_dispatch_invalidates_stale_probe(
+    ) {
+        use freshell_runtime_protocol::{ClaudeForkRecipe, ClaudeForkTarget};
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let prepared = materialize_fresh_runtime(&registry, soul.clone(), workspace.path()).await;
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        registry
+            .record_native_session(soul.clone(), prepared.incarnation_id.clone(), parent.into())
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let recipe = ClaudeForkRecipe {
+            recovery_disabled: false,
+            child_session_id: child.into(),
+            parent_session_id: parent.into(),
+            parent_transcript: format!(".claude/projects/work/{parent}.jsonl"),
+            child_transcript: format!(".claude/projects/work/{child}.jsonl"),
+            parent_sha256: "a".repeat(64),
+            target: ClaudeForkTarget::Empty,
+        };
+        registry
+            .transition_native_session_with_claude_fork_fenced(
+                soul.clone(),
+                prepared.incarnation_id,
+                parent,
+                child,
+                context.write_fence(),
+                Some(recipe.clone()),
+            )
+            .await
+            .unwrap();
+        drop(registry);
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(context.native_session_id.as_deref(), Some(child));
+        assert_eq!(context.claude_fork.as_ref(), Some(&recipe));
+        let candidate = crate::resume_catalog::exact_resume_candidate(&context, Some(child))
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.claude_fork.as_ref(), Some(&recipe));
+        registry
+            .store_verified_resume_spec_fenced(soul.clone(), candidate, context.write_fence())
+            .await
+            .unwrap();
+        let before = registry.recovery_context(soul.clone()).await.unwrap();
+        let stale_probe = before.resume_spec.clone().unwrap();
+        let input = RequestId::new();
+        registry
+            .begin_input(soul.clone(), input.clone(), b"child input", None)
+            .await
+            .unwrap();
+        registry
+            .mark_input_dispatching(soul.clone(), input.clone())
+            .await
+            .unwrap();
+        let after = registry.recovery_context(soul.clone()).await.unwrap();
+        let disabled = after
+            .claude_fork
+            .as_ref()
+            .expect("retain the fork identity after retiring its recovery prefix");
+        assert_eq!(
+            serde_json::to_value(disabled).unwrap()["recoveryDisabled"],
+            true,
+            "disable older prefix in the durable dispatch transaction"
+        );
+        assert!(after.resume_spec.is_none());
+        let disabled_candidate = crate::resume_catalog::exact_resume_candidate(&after, Some(child))
+            .unwrap()
+            .unwrap();
+        assert!(disabled_candidate.claude_fork.unwrap().recovery_disabled);
+        assert!(
+            registry
+                .store_verified_resume_spec_fenced(soul.clone(), stale_probe, before.write_fence())
+                .await
+                .is_err(),
+            "a pre-dispatch probe cannot restore the retired recipe"
+        );
+        registry
+            .mark_input_ambiguous(soul.clone(), input)
+            .await
+            .unwrap();
+        drop(registry);
+        let registry = Registry::open(dir.path(), None).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                registry
+                    .recovery_context(soul)
+                    .await
+                    .unwrap()
+                    .claude_fork
+                    .unwrap()
+            )
+            .unwrap()["recoveryDisabled"],
+            true
+        );
     }
 
     #[tokio::test]
