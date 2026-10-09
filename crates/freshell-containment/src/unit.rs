@@ -535,8 +535,7 @@ impl AgentUnit {
     ///
     /// A Force join makes the report's mode `"force"` and skips what is left
     /// of the soft signal's grace (all of it when it arrives before the
-    /// signal), except a join that was spent retrying a failed Stopping
-    /// write: the agent still gets its soft signal's grace after that.
+    /// signal, including the join that retried a failed Stopping write).
     /// A Shift-X or kill-command join on a respawn,
     /// stuck-restart, handoff or cleanup stop takes over its reason. A
     /// joiner's own callbacks and operation id are dropped: it awaits the
@@ -643,13 +642,13 @@ impl AgentUnit {
             StopMode::Force
         };
         let keys = self.log_keys(state.operation_id());
-        let retried_by = self.persist(&state, &keys).await;
+        self.persist(&state, &keys).await;
         let snapshot = if self.inner.capability.full {
             Vec::new()
         } else {
             self.snapshot().await?
         };
-        let escalated = self.soft_phase(&state, mode, retried_by, &keys).await;
+        let escalated = self.soft_phase(&state, mode, &keys).await;
         let spared = self.kill_unit(&keys, &snapshot).await;
         let lock_released = self
             .confirm_gone(&state, &keys, Instant::now(), &snapshot, &spared)
@@ -659,15 +658,12 @@ impl AgentUnit {
     }
 
     /// Step a: save Stopping before any signal. A failed write waits, with
-    /// nothing signalled, for the next Force request, which retries it once.
-    /// Returns the Force-join count the successful write started from: the
-    /// joins up to it were spent retrying the write and do not also cut the
-    /// soft signal's grace short.
-    async fn persist(&self, state: &Arc<StopState>, keys: &UnitLogKeys) -> u64 {
+    /// nothing signalled, for the next Force request, which retries it once
+    /// (and, like every Force join, then cuts the soft grace short).
+    async fn persist(&self, state: &Arc<StopState>, keys: &UnitLogKeys) {
         let mut joins = state.force_joins.subscribe();
         let unconfirmed_at = tokio::time::Instant::from_std(state.requested) + UNCONFIRMED_AFTER;
         let mut logged = false;
-        let mut retried = false;
         loop {
             let seen = *joins.borrow_and_update();
             let (unit, st) = (self.clone(), state.clone());
@@ -686,11 +682,10 @@ impl AgentUnit {
             match written {
                 Ok(()) => {
                     lock(&self.inner.members).saved = true;
-                    return if retried { seen } else { 0 };
+                    return;
                 }
                 Err(err) => events::persist_failed(keys, &err.to_string()),
             }
-            retried = true;
             loop {
                 tokio::select! {
                     biased;
@@ -782,16 +777,10 @@ impl AgentUnit {
     }
 
     /// Step c: the soft signal and its grace. Returns whether the stop
-    /// escalated: a Graceful grace ran out, or a Force request (other than
-    /// the ones spent retrying the Stopping write, up to `retried_by`) cut a
-    /// grace short or arrived before it began.
-    async fn soft_phase(
-        &self,
-        state: &StopState,
-        mode: StopMode,
-        retried_by: u64,
-        keys: &UnitLogKeys,
-    ) -> bool {
+    /// escalated: a Graceful grace ran out, or a Force join cut a grace short
+    /// or arrived before it began (Shift-X on a Stopping unit escalates
+    /// straight to force).
+    async fn soft_phase(&self, state: &StopState, mode: StopMode, keys: &UnitLogKeys) -> bool {
         let mut joins = state.force_joins.subscribe();
         let (signal, signal_name, grace) = match mode {
             StopMode::Force => (Sig::Interrupt, "SIGINT", FORCE_GRACE),
@@ -804,7 +793,7 @@ impl AgentUnit {
         let escalated = tokio::select! {
             biased;
             _ = target.exited() => false,
-            _ = joins.wait_for(|n| *n > retried_by) => true,
+            _ = joins.wait_for(|n| *n > 0) => true,
             _ = tokio::time::sleep(grace) => graceful,
         };
         if escalated && graceful {

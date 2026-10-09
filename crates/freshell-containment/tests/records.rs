@@ -193,10 +193,8 @@ async fn a_failed_stopping_write_sends_no_signal_until_a_force_join_saves_it() {
     let root = tempfile::tempdir().unwrap();
     let c = rebuild("tag", root.path());
     let unit = c.create_unit(UnitId::mint(), label()).unwrap();
-    let s = agent_script(&AgentOpts {
-        exit_on_int: true,
-        ..Default::default()
-    });
+    // Ignores SIGINT: only the joining Shift-X can end the soft grace early.
+    let s = agent_script(&AgentOpts::default());
     let _child = spawn_main(&unit, &s).await;
     let p = read_pids(&s).await;
 
@@ -215,6 +213,10 @@ async fn a_failed_stopping_write_sends_no_signal_until_a_force_join_saves_it() {
     assert!(cap.has(tracing::Level::ERROR, "unit.stop.persist_failed"));
     assert!(alive(p.main), "no signal before Stopping is saved");
     assert!(!s.marker.exists(), "no SIGINT before Stopping is saved");
+    assert!(
+        !cap.has(tracing::Level::INFO, "unit.stop.signal_sent"),
+        "nothing is signalled before Stopping is saved"
+    );
     assert!(handle
         .wait_for(Duration::from_millis(5500).saturating_sub(t0.elapsed()))
         .await
@@ -228,10 +230,18 @@ async fn a_failed_stopping_write_sends_no_signal_until_a_force_join_saves_it() {
         StopReason::ShiftX,
         "test",
     ));
-    handle.wait().await;
+    let report = handle.wait().await;
     assert!(
-        std::fs::read_to_string(&s.marker).unwrap().contains("INT"),
-        "the saved stop then interrupts the agent"
+        cap.has_with(
+            tracing::Level::INFO,
+            "unit.stop.signal_sent",
+            &[("signal", "SIGINT"), ("target", "main")]
+        ),
+        "the saved stop sends the soft signal first"
+    );
+    assert!(
+        report.escalated,
+        "a Shift-X on a Stopping unit escalates straight to force, even the one that saved Stopping"
     );
     assert!(!units.join(format!("{}.json", unit.id())).exists());
 }
