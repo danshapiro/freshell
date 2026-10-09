@@ -111,7 +111,7 @@ Final evidence order: Task 7 adds the complete synthetic runbook-flow scenario; 
 
 **Before Step 1:** Verify the existing immutable `preservation/opencode-20261006T074448Z/manifest.json`, source HEAD `8362581b8c90de7e192a353b2256a7a5e71b5494`, merge-base `e04a1d8601a2180c85128b3ed4154350d5e0ad25`, tracked patch SHA256 `b61d22f940e1103e7d847213c25d42efc2f6075c308092212ec5c338460493d2` and each exact captured fixture hash/length. Its coherent flag and immutable bytes are authoritative for this integration; no new source capture is needed when they verify. Record no secret values. Replay chronological committed feature commits in the destination only, resolving each against current main. Never apply `git diff d0cc7cb5e..8362581b8` or a whole tree overlay. Apply the coherent captured dirty patch after replay. Keep source unchanged. Historical test code arrives with reuse; the following count regression is a fresh red phase. Repair compile/typecheck/Clippy blockers so the test fails for behavior.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 In the existing exact-batch tests, clone the eight-target fixture's valid duplicate target to a **different soul and incident** with its own revision, mapped to a second existing root. Run `validate_exact_batch(&scope)` and the stopped repair operation. Assert nine accepted targets, seven imports, seven stopped canonical owners, two redundant mappings removed only after explicit view rebind, nine exact incident withdrawals, and preserved unrelated notices. Against the independently frozen nine-target/seven-root scope, reject 8 or 10 submitted targets, duplicate soul/incident, substituted or missing/extra roots, stale source/target revisions, conflicting owner receipts and stale canonical choices. Exercise sole eligible owner, retired duplicates and a genuine unresolved owner with typed choices. Then add a valid tenth eligible target: the old scope refuses drift before writes; a freshly server-resolved ten-target scope succeeds with the same binary, imports each distinct root once and preserves unrelated records. The ninth target must be valid except for old count policy; do not make the test fail on absent APIs or fixture setup.
 
@@ -123,7 +123,7 @@ Add native transfer qualification regressions before any complete-export claim: 
 
 Prepare the finite native driver/adapter as test-fixture plumbing before changing the production transfer behavior, so its red execution uses the pre-fix exporter/importer/reader and never fails merely because the driver or binary is missing. Build the pre-fix owned session-host/image with pinned consumer, record its immutable digest as owning-shell `opencode_transfer_image_digest`, and retain imported pre-fix behavior receipts for branches already repaired by integration. Assign the count tests the exact names `stopped_repair_exact_batch_nine` in runtime-protocol and `restore_lost_souls_nine` in supervisor. Add normally running, nonignored `durable_souls_rehearsal_pipeline` behavioral cases in `crates/freshell-agent-runtime/src/opencode_transfer_tests.rs`: use bounded fictional source fixtures to run the same public `export_exact_session`/`import_bundle_payload`/`verify_installed_store` pipeline used by the real driver. Compare complete imported native rows/assets and independently read results; mutate one source reference, truncate payload, reduce destination capacity, conflict destination, mismatch root/digest and supply unreadable provider context to prove refusal without source writes or partial-completion claims. Add default-included driver tests executing finite manifest admission, child lifecycle and receipt derivation: missing/private-input/candidate/real-source binding refuses, failed native consumer or cleanup refuses, six/eight completed roots refuses, and synthetic fixture metadata never qualifies as real rehearsal. No ignored/skipped/environment-conditional test or default synthetic success counts as real evidence. Define the strict explicit driver/adapter below; Task 11 executes it on all seven real roots after permission/native-consumer fixes. Prefix every added schema-7 fence, semantic-schema admission/refusal, attachment-authority, saved-revert and cleanup regression with `durable_souls_` in its owning sessions/agent-runtime/supervisor/session-host test module or native-transfer integration test. All default-run `durable_souls_` cases use pure code/SQLite and ordinary current-UID owned temporary files, including real production reader-context/copier calls with deterministic fault injection. Cargo workspace CI requires no rig, installed provider CLI or conditional skips. The separate finite native driver uses pinned OpenCode 1.18.21 in an owned rootless rig with synthetic data, no provider prompt/grant mutation, and cannot be counted from cargo fixture results. Add wire tests executing the exported production schemas on valid scoped nine-target requests/replies, absent/malformed scope and duplicate payloads, then run semantic membership/stale-revision refusals through the actual server/client route (a schema alone cannot know the server scope), then feed accepted replies through the existing client recovery path; legacy payloads retain their documented semantics. Each selector below must list and execute positive case counts. Imported behavior already fixed needs its executed historical red receipt plus current positive coverage; record each genuinely missing branch's fresh red failure before fixing it.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `cargo test -p freshell-runtime-protocol stopped_repair_exact_batch_nine`
 
@@ -141,7 +141,7 @@ Run: `pnpm exec tsx scripts/testing/opencode-native-transfer-check.ts --image-di
 
 Expected: all four native groups execute positively; genuinely missing semantic/asset/revert/transfer branches FAIL for their actual native behavior, and already-fixed imported branches retain actual pre-fix evidence plus current execution. Missing prerequisite/binary/image/driver is not behavioral red. The named scope tests FAIL because the integrated old implementation requires eight targets and cannot bind independently resolved membership; each missing schema/fence/asset/revert/cleanup/parser branch also has an executed intended red failure or imported pre-fix failure evidence. Confirm nonzero executed fixture tests for every selected package and the native-transfer integration target (which exercises Rust APIs, not the external pinned consumer); setup, missing binaries and fetch errors do not count as red.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Create the finite owner-side `scripts/testing/opencode-restoration-rehearsal.ts` driver with CLI `--mode real --manifest-file <absolute-private-json-path> --scratch-dir <fresh-private-absolute-directory>`. All three arguments are required; there is no default/synthetic/fixture CLI mode. Missing argument/file/real-source provenance, nonprivate input/scratch, wrong candidate/image or invalid scope fails nonzero before transfer. `runRealRootRehearsal({ manifestFile, scratchDir }): Promise<RehearsalReceipt>` consumes Task 11's exact private manifest, revalidates read-only source identity/root fingerprints against current external preflight and uses existing `RuntimeHarness` for only owned rootless containers, immutable image, exact provider UID/GID, finite native decoder and cleanup. `RehearsalReceipt { kind: 'real-root-rehearsal'; candidateSha; imageDigest; sourceIdentity; targetScopeDigest; runCount; expectedRootCount; exportedRootCount; importedRootCount; nativeReadableRootCount; failedRootCount; cleanupStatus; rootEvidence }` derives every count from completed original per-root artifacts; current approved-preparation scope requires one run/seven distinct real roots, zero failed roots and successful owned-resource cleanup. Any fixture/synthetic artifact, missing reference, count mismatch or failed root/cleanup refuses a real receipt; no catch-and-fallback path.
 
@@ -149,7 +149,7 @@ The bounded Rust example `crates/freshell-agent-runtime/examples/opencode_restor
 
 Apply this exact contract patch: add authenticated `POST /api/runtime/soul-loss-repairs/preflight`, accepting the exact inspected source-store reference and root selection. The supervisor independently reads the qualified source and registry, resolves every eligible stopped false-loss target for those roots, and returns a read-only `RepairBatchScope` preview with a scope ID computed from its complete source/member/revision descriptor using the existing digest helper; it creates no live registry row. The request cannot define its own expected target set: on first apply the supervisor independently resolves that same scope again, compares the scope ID and every submitted member/revision/choice, then stores the validated original scope transactionally in the existing stopped-repair operation. A completed/pending retry loads that original operation scope and validates its exact operation progress rather than regenerating removed incidents. No signature/key/audit system is introduced. Return body-free exact members/revisions/fingerprint and typed owner alternatives. The existing `POST /api/runtime/soul-loss-repairs` restore route/runtime-client/protocol pass `scope_id` to `validate_exact_batch(&scope)`; missing/unknown scope or any member, revision, root mapping, eligible-owner or source-fingerprint drift refuses before import. Freeze scope with the repair operation and recheck its CAS at commit; completed retries use the same original scope and durable progress rather than resolving withdrawn rows anew. Replace eight assumptions with equality against these frozen sets, including admission/CAS/withdrawal/results. Counts derive from the sets; no production 9/7 or 8 constants remain. Replace positional `targets[7]` duplicate handling with grouping by exact `(source_store_id, native_root_id)` and canonical-owner evidence. A sole eligible owner is chosen; multiple eligible candidates require explicit typed selection matching the current revision; no eligible owner blocks. Preserve receipt/import and exact CAS fencing. Execute schema-7 migration/backfill and exact unbound-legacy admission against the nine-row shape before treating protected identity/import revisions as usable. Current F02 metadata has two equally eligible duplicate pairs; final owner selection is deliberate typed strategy in Task 11, independent of chronology. Reconcile the three sessions wiring overlaps by retaining current Codex modules/dependencies/indexing and adding OpenCode export wiring. Do not remove current-main fixes. Replace raw sqlite_master formatting-hash equality with narrow semantically qualified source-schema relationships and exact migration-set checks; do not use blanket SQL normalization or accept an arbitrary new schema. Native asset recognition follows the pinned FilePart/tool-attachment authority positions while preserving arbitrary metadata and source attribution unchanged. Snapshot lookup uses native datahome/snapshot/project-ID/SHA1(canonical real Git worktree), with exact tree closure and managed representation checks. One current saved tree is unavailable at the inspected workspace and derived pinned store; this is not global absence. Retain its reference and complete source graph, search only qualified retained artifact locations, and qualify supported preservation/asset representation rather than fabricate a tree. Ordinary native prompt cleanup removes reverted messages/parts and clears revert without snapshot.restore; admit that current projection only through proven pinned native transition authority while retaining the immutable imported baseline independently. Undo/unrevert still needs the exact saved tree: do not report recovered undo assets without it. Full bounded serialization, actual destination capacity, complete closure/import and provider-UID readability remain gates for all seven roots; raw SQL size or operator reads do not clear them.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `cargo test -p freshell-runtime-protocol stopped_repair_exact_batch_nine`
 
@@ -173,11 +173,11 @@ Resolve the Task 1 candidate image digest on the owned garageserver rig and set 
 
 Expected: PASS for exactly four selected/executed native case groups, each with positive assertions, zero failed/skipped groups and verified owned cleanup. This native matrix is separate from normal cargo tests.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Consolidate exact-scope equality and source/revision checks in one shared validator; derive counts/replies from frozen operation state. Keep grouping/owner validation shared between preflight and CAS, without widening admission to arbitrary bulk operations.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `cargo test -p freshell-sessions -p freshell-runtime-protocol -p freshell-runtime-client -p freshell-agent-runtime -p freshell-supervisor`
 
@@ -221,7 +221,7 @@ Run: `scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor
 
 Expected: PASS with newer Codex reconstruction intact and all six imported crash-parent matrices executed. Assert every selector has nonzero cases. Host-default ignored destructive cases do not count as executed. No capability/real-provider qualification is claimed by this task.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 Stage only the reconciled OpenCode implementation and its exact fixture/tests, excluding unrelated source dirty files or historic plan edits. Explicitly stage the required rehearsal driver/adapter/test/config with `git add scripts/testing/opencode-native-transfer-check.ts test/unit/tooling/testing/opencode-native-transfer-check.test.ts scripts/testing/opencode-restoration-rehearsal.ts crates/freshell-agent-runtime/examples/opencode_restoration_rehearsal.rs test/unit/tooling/testing/opencode-restoration-rehearsal.test.ts crates/freshell-agent-runtime/src/opencode_transfer_tests.rs tsconfig.runtime.json`. Run `git diff --cached --stat`, inspect every staged path, then `git commit -m "fix(runtime): integrate exact nine-soul OpenCode repair"`. Preserve replayed atomic source commits and record the capture hashes and final source/destination provenance in the external task report.
 
@@ -242,11 +242,11 @@ Stage only the reconciled OpenCode implementation and its exact fixture/tests, e
 - Consumes: exact typed bootstrap references and owned provider HOME/UID/GID; existing bounded copier and projection API from the environment source, reviewed against its two recorded Critical defects.
 - Produces: atomic refresh with staging inside an existing writable provider volume, preservation of pre-existing inodes/siblings on failure, creator-owned path ledger, and projection/readability under actual provider identity. Existing blocked souls can retry the exact root after fixture dependency repair. Persisted/versioned launch-time policy defines ownership matching; narrow legacy recognition preserves saved identity/digest and distinguishes an owned policy mismatch from a foreign enclosure. Authenticated reattach requires the needed host capabilities, qualified store evidence and current native observation; an alive status never bypasses a blocked reader. Provider-specific CA reference support, if needed, uses exact canonical private regular-file references named in Global Constraint 6, typed protocol/bootstrap allowlisting, and provider-owned `.config/onecli/gateway-ca.pem` publication; this includes conditional Claude CA support with native Node `NODE_EXTRA_CA_CERTS` pointing only to that mounted provider-owned path, covered by bootstrap/resolver/protocol/provider-UID readability and actual trust tests. Supply the actual supported native trust variable for each selected provider pointing to that mounted path. No generic environment-name pass-through or unmounted CA path is accepted.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Extend default production copier/publication tests with normal current-UID owned temporary directories and deterministic filesystem/publication fault injection; prepare a pre-existing config containing executable-resource and unrelated sibling sentinels. They call the actual production copier/projection and require no root/sudo, UID switch, Docker, second physical filesystem or installed CLI. Separately extend finite owned `probe-provider-config-readonly-home.py` to repeat initial/resume/fault publication as UID 65534/GID 0 with zero capabilities, read-only container root and writable provider HOME on a verified different filesystem (record distinct device IDs); no current-account fixture result qualifies that physical boundary. Inject a copy/publication failure after replacing the first file. Assert original inode/bytes and siblings survive, no staging escapes the provider volume, the next refresh succeeds, and OpenCode expectation publication is readable/writable under the same provider identity. Add resolver-to-bootstrap-to-publication tests for typed selected-agent auth mode/stub shape, private CA reference/readability, valid typed-auth plus proxy-only environment, conflicting auth mode, alias disagreement/loopback refusal, native trust path and refresh ownership. In an owned rig, create a soul blocked by this permission failure, fix only its fixture config dependency, retry, and assert same soul/native root/store plus exactly one replacement. Define independent synthetic browser cases `synthetic config-blocked exact retry` and `synthetic legacy retained-runtime exact retry` in `runtime-managed-provider-qualification-rust.spec.ts`, gated by exact `FRESHELL_RUNTIME_SYNTHETIC_RESUME=1` independently of provider live qualification; the first covers the config blocker, the second the legacy fixtures below. Task 8 executes both on configured Cloud without Task 9 native semantics. Do not use a current-account temp-directory pass as the real-identity proof. Add a scratch retained-container fixture for the exact known legacy mount shape (/tmp and /run/opencode-tmp, no /run/freshell-private and no provider context requiring it), matching saved labels/full ID/image/digest; test narrow recognition across supervisor upgrade, epoch 1 to 3, extra/missing/foreign mounts, unreachable or capability-unknown old host, blocked store with exited=false, exact fenced replacement, interrupted retry and one writer. A mutable host binary pathname does not identify the old running build. Record detailed pre-attempt matcher/capability/store reason before retry budget is consumed.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `cargo test -p freshell-platform provider_environment`
 
@@ -256,7 +256,7 @@ Prepare the owned pre-fix candidate session-host/image and extended finite fixtu
 
 Expected: three positive native initial/refresh/rollback-fault groups execute; missing publication behavior FAILS with actual UID/capabilities/distinct-filesystem evidence. Missing binary/image is a setup failure, never red. Default Rust tests independently FAIL on staging/rollback/ownership behavior. If a captured source fix already passes, retain its pre-fix failing receipt and verify the test against the rejected `c4c55c1a2` implementation in an isolated scratch checkout; do not revert the source or destination to manufacture red.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Integrate only the bounded provider-environment fix from `c4c55c1a2` plus repair `5033898b4`, including writable-HOME staging and replacement recovery, after independently validating captured committed bytes; never trust rejected `c4c55c1a2` alone. The repair's exact three paths are provider_environment.rs, session-host main.rs and the Python probe; review any needed later `d39188f1f` changes independently and reuse only bounded relevant bytes. Reconcile against Task 1 launch/import gates rather than replacing main.rs wholesale. Source-to-stage copying reads canonical bounded files; stage files and parent directories are creator-owned inside the writable provider volume. Run private destination operations as the owning provider UID/GID, using the repository's subprocess privilege drop. Write/sync replacement files before rename, retain prior inode references until all publication steps succeed, and restore each replaced inode on failure. Cleanup removes only paths in this attempt's creator-owned ledger. Preserve executable resources without following escaped paths. Refresh the selected TUI/plugin config and adoption expectation under the same identity on exact resume; return a typed recoverable permission/preparation blocker with structured context. Persist/version the launch-time profile for new enclosures and recognize only the exact known legacy profile when every protected ownership comparison still matches; never ignore mount policy broadly or rewrite saved digest. Retain required Hello capabilities and reject an old host whose feature semantics are unknown. If exact reattach cannot qualify current store and native observation, use the existing verified-empty-before-replacement transaction only after retained-store/current-image compatibility passes in scratch. Preserve blocked stores on unknown compatibility, never fall back to a new root. Before Task 4 native probes, privately prepare genuine selected-provider authorization through OneCLI on garageserver. Its process-local API is 127.0.0.1:10254 and gateway 10255; host loopback is not container reachability. The earlier 20-row inventory was capped and does not establish Anthropic absence. Establish exact project/organization/selected-agent authority and deployed response contract, obtain complete metadata privately, and prefer supported genuine existing grants. Initialization-capable preparation belongs to implementation, distinct from read-only Stage 2; never expose raw responses or secret values. Generic secret --file sends bytes verbatim and does not extract native Claude OAuth JSON. Actual Haiku access remains separately required for terminal Claude/FreshClaude/Kilroy.
 
@@ -264,7 +264,7 @@ Use the effective selected-agent server contract with a typed private response r
 
 Amplifier uses the intended effective agent (prior LunaRoute metadata belongs to garageserver), identified ordinary bundle/provider configuration and resolved module/logging revisions. Generic bootstrap does not automatically select specialized LunaRoute-to-VLLM mapping; use supported VLLM api_key/base_url/model config or bounded managed mapping and prove native lunaroute instance alias plus actual upstream origin. CLI pins do not freeze dynamic bundles. Receipt relabeling/model aliases cannot substitute for native evidence. Preserve Kilroy's documented bootstrap exception. Repair failed grant/network/profile prerequisites before early native gates or broad qualification. Do not broaden privileges or mutate host config.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `cargo test -p freshell-platform provider_environment`
 
@@ -274,17 +274,17 @@ Build/prepare the owned candidate session-host and `freshell-managed-runtime:pha
 
 Expected: PASS, and the real rootless probe reports UID/GID, zero capabilities, read-only root, writable volume, successful selected-plugin exact-resume refresh and full rollback preservation after the first replacement. The separate fault case must verify every original inode/byte/sibling survives, rather than count initial preparation as rollback proof. The probe owns and cleans only its labeled fixture containers/volumes; missing native prerequisites or zero/skipped cases fail nonzero. Require positive selected/executed counts for initial, exact-resume refresh and rollback-fault groups, distinct filesystem device evidence, and zero failed/skipped groups. Preserve executed native behavioral red before missing publication fixes (or imported pre-fix evidence for already repaired branches). This mandatory garageserver gate is separate from ordinary cargo CI and repeats on the final candidate before PR/readiness.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep one bounded copier/publication implementation for initial and resumed launch. Share the replacement ledger and typed failure conversion; avoid a second bootstrap-only path with different ownership semantics.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `cargo test -p freshell-platform -p freshell-runtime-protocol -p freshell-agent-runtime -p freshell-session-host -p freshell-supervisor -p freshell-server --features freshell-server/managed-runtime-v1`
 
 Expected: PASS, including initial setup, concurrent selected-config generation, plugin expectation write and blocked exact-resume retry. The actual browser scenario runs through Task 8's supported cloud topology before final completion.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 Run: `git add crates/freshell-platform/src/provider_environment.rs crates/freshell-platform/src/lib.rs crates/freshell-session-host/src/main.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-supervisor/src/backend.rs crates/freshell-supervisor/src/registry.rs crates/freshell-runtime-protocol/src/lib.rs scripts/testing/probe-provider-config-readonly-home.py crates/freshell-server/src/managed_provider_bootstrap.rs crates/freshell-session-host/src/provider_secret_resolution.rs crates/freshell-platform/src/managed_child_secrets.rs test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts crates/freshell-server/src/managed_mcp_capability.rs crates/freshell-server/src/managed_runtime.rs crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-server/src/managed_runtime_api_stop_tests.rs crates/freshell-supervisor/src/backend/native_history.rs scripts/testing/runtime-sandbox.ts scripts/testing/runtime-amplifier-onecli.ts crates/freshell-sessions/src/amplifier_stub.rs crates/freshell-session-host/src/providers/mod.rs crates/freshell-session-host/src/retained_store.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/loss_report_tests.rs docker/runtime/Dockerfile scripts/testing/runtime-test-broker.ts test/unit/tooling/testing/runtime-test-broker.test.ts test/unit/tooling/testing/runtime-amplifier-onecli.test.ts scripts/testing/task002-config-legacy-fixtures.ts tsconfig.runtime.json test/e2e-browser/helpers/managed-runtime.ts`
 
@@ -300,21 +300,21 @@ Run: `git commit -m "fix(runtime): refresh provider config with owned filesystem
 - Consumes: `RecoveryContext`, `RecoveryProbe`, `EvidenceStoreState`, existing qualified exact-source census and verified `ResumeSpec`.
 - Produces: `RecoveryProbe::Blocked` for dispatched coding souls without independent identity/storage proof; `DefinitivelyUnavailable` only for complete qualified exact absence. No new negative-evidence shortcut or session-selection heuristic.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Add `dispatched_missing_identity_cannot_certify_loss` beside the current offline probe tests: use the existing dispatched coding context fixture, clear `native_session_id` and `resume_spec`, retain provider volume evidence, and run both online and offline production probes and the two-probe/final loss path. Assert Blocked/unknown, no loss certificate/outbox/tombstone, no provider-volume deletion, no replacement, and preserved outputs. Parameterize Claude, Codex, OpenCode, Amplifier and requested fresh modes freshclaude, Kilroy, freshcodex and freshopencode. Add unreadable, missing mount, incomplete/depth/byte-bound census, ambiguous root, conflicting identity and reader failure cases. Keep a fully inspected exact-row absent case that does certify genuine absence, a proved pristine-seed case, and existing shell terminal-end tests.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `cargo test -p freshell-supervisor dispatched_missing_identity_cannot_certify_loss`
 
 Expected: FAIL because `offline_probe` currently labels native resume definitively unavailable and store Missing without provider inspection.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Patch `offline_probe` in this order: preserve verified saved spec; preserve identity-without-spec blocker; preserve `never_dispatched` proof; for a dispatched coding provider with no verified exact native identity/spec, return the existing NativeResume StoreUnreadable blocker with reason `provider identity or exact storage census has not been verified`, rather than falling through checkpoint absence. Do not make the guard apply to a qualified shell policy. Online native readers and host probing apply the same invariant. A reader result is Absent only after complete canonical store inspection for the exact requested root under real provider identity/environment, with all candidates inspected and no truncation/errors/ambiguity; otherwise retain Unresolved/Blocked. `exact_resume_candidate` returning None for missing identity is unknown, never a missing-store certificate. Checkpoint absence cannot upgrade unknown native state. Final loss CAS revalidates qualified census/identity/intent generations and rejects any earlier unsupported negative. Retain imported-baseline receipts independent of transient recovery state.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `cargo test -p freshell-supervisor dispatched_missing_identity_cannot_certify_loss`
 
@@ -322,17 +322,17 @@ Run: `cargo test -p freshell-supervisor loss_report`
 
 Expected: PASS for conservative unknown state and legitimate fully inspected loss, with no destructive effect in blocked cases.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Centralize native evidence classification in the existing native-history/loss boundary; remove duplicate missing-ID absence conversion. Keep evidence bodies outside the registry; persist body-free qualified receipt references/generations only.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `cargo test -p freshell-agent-runtime -p freshell-session-host -p freshell-supervisor`
 
 Expected: PASS for source census, true loss, pristine seed, materialization fencing, baseline retry persistence and retained output. No loss test is skipped or weakened.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 Run: `git add crates/freshell-supervisor/src/recovery.rs crates/freshell-supervisor/src/resume_catalog.rs crates/freshell-supervisor/src/backend.rs crates/freshell-supervisor/src/backend/native_history.rs crates/freshell-supervisor/src/loss_report.rs crates/freshell-supervisor/src/loss_report_tests.rs crates/freshell-session-host/src/main.rs crates/freshell-agent-runtime/src/lib.rs crates/freshell-supervisor/src/registry.rs crates/freshell-server/src/managed_runtime_api_stop_tests.rs`
 
@@ -378,7 +378,7 @@ Run: `git commit -m "fix(supervisor): require inspected evidence before native l
 - Consumes: requested native root from verified ResumeSpec, authenticated current host, current incarnation and generation, per-launch random nonce, provider-native events/store reads.
 - Produces: additive `NativeIdentityObservation { native_session_id: String, incarnation_id: IncarnationId, launch_nonce: String, evidence_revision: u64, source: NativeIdentitySource, evidence_digest: String }`, with serde tagged `NativeIdentitySource` values `codex_app_server`, `opencode_tui`, `claude_native_event`, `amplifier_native_loaded_context`, `fresh_provider_handshake`. `native_session_id` remains null/unobserved until this evidence passes validation. Persist requested identity separately; preserve legacy response compatibility without certifying legacy echoes. The finite early runner consumes existing `RuntimeHarness` and exact selected grants, owns candidate image/synthetic stores/cleanup, and accepts `--provider claude|codex|opencode|amplifier` or `--mode freshclaude|kilroy|freshcodex|freshopencode`, plus `--case startup|native-turn|approval-checkpoint`. Startup fault matrices cover terminal Claude/Amplifier and FreshClaude/Kilroy; approval-checkpoint is restricted to the two Claude-backed fresh modes. Native-turn selects one bounded real native turn/schema/profile inspection. Candidate packaging may use the existing test qualification routing without promoting production manifest fields. The runner stays a finite native experiment, with no arbitrary shell/production command interface or general probe framework. This native-only implementation probe is not Cloud browser qualification or a backend substitute; it must never operate on existing real roots.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Add `requested_identity_is_not_provider_observation` in the production host launch/status tests and `provider_observed_replacement` in supervisor's production replacement fixture. Launch a resumable test provider with the correct requested root but no native acknowledgement and a pre-existing matching transcript. Assert host status has no observed identity and supervisor replacement never becomes LIVE. Then emit wrong-root, previous-incarnation/nonce, stale evidence revision, and correct current native acknowledgement; only the final one publishes LIVE. Exercise replacement through real host status, not a direct `verify_native_identity` call alone. Add provider exit, bounded timeout, Stop cancellation and post-repair baseline-only retries; wrong or missing observation cleans only the owned failed replacement, preserves original history/root and has one writer at most. Codex retains its app-server handshake/event and durable receipt tests; OpenCode resumes must run the existing TUI observation gate even when a resume ID was requested. Reattach of an existing retained enclosure uses the same current-store/observation/capability gates; `exited=false` must not bypass Blocked or DefinitivelyUnavailable store evidence.
 
@@ -394,7 +394,7 @@ For Amplifier select and identify the actual CLI/core/foundation/provider/loggin
 
 Also prove the bounded native approval path early for both FreshClaude and Kilroy: one fixture-owned harmless solo tool, native PreToolUse defer checkpoint, durable checkpoint inspection, host/enclosure death, exact root resume with current native gate, current same-ToolUseID request, Allow/Deny, correlated native result and independently counted effect (one/zero respectively). The selected native supports defer only for print mode and a single tool batch; continuation occurs on first input and does not solve startup identity by itself. Crash before checkpoint, changed/missing tool/input/profile/root, multiple tools, stale callback and effect-before-observation retain honest interrupted/ambiguous state without automatic replay. A durable UI card is never a resurrected callback. If this restricted mechanism cannot deliver requested pending continuity, independently implement and prove a supported native alternative before broad qualification; safe refusal is containment, not qualification PASS or a permanent deferral.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `cargo test -p freshell-session-host requested_identity_is_not_provider_observation`
 
@@ -404,7 +404,7 @@ Run: `pnpm run test:vitest run test/unit/lib/managed-runtime-wire.test.ts --conf
 
 Expected: FAIL because non-Codex PTY initializes observed ID from request and because the supervisor accepts an authenticated echo.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Keep requested root only in the launch specification; observed identity begins absent for all providers and is published solely from the current native acknowledgement. OpenCode's initial and resumed native TUI gate uses the actual public `slots.register({slots: ...})` wrapper, whose host supplies the registration ID; do not add an unsupported caller ID. Derive the active V1 message tail using saved full/part revert semantics, rather than the raw last message, and qualify exact-root hydration completion. Global TUI ready or a V2-empty projection alone cannot prove V1 active history is loaded/empty. Preserve the independent full baseline/store check, nonce/incarnation/generation revalidation and input blocking. Run actual null-slot render/disposal, root/load-error, V1/V2 empty, full/part revert, baseline-only resume and cancellation cases against the pinned TUI.
 
@@ -418,7 +418,7 @@ For pending approval, persist body-free exact root/native ToolUseID/input digest
 
 The observation module hashes body-free producer evidence and validates exact current incarnation/nonce/root/revision. Host main returns typed source evidence. Supervisor waits boundedly, checks exit/Stop/cancellation, revalidates store/intent/ownership/capability before committing LIVE, and cannot replay observations across replacement incarnations. The same requirements cover legacy reattach and new replacements. Every early feasibility failure must be resolved before the mode's broad/final qualification; it never authorizes requested-ID echoes, synthetic prompts, unsupported flags or deferred completion.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `cargo test -p freshell-session-host requested_identity_is_not_provider_observation`
 
@@ -448,11 +448,11 @@ Run: `pnpm exec tsx scripts/testing/runtime-native-feasibility.ts --mode kilroy 
 
 Expected: positive execution of each full described fault matrix; no-input native acknowledgement precedes input, and checkpoint/native outcomes/effect counts meet the bounded contract with exact owned cleanup. Task 9 still supplies full upstream recovery/continuity campaigns; these early gates do not replace them.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Use one observation binder/validator for terminal and fresh modes while leaving each native source adapter separate. Reuse Codex/OpenCode implementations; do not create a generic filesystem identity picker.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `cargo test -p freshell-platform -p freshell-runtime-protocol -p freshell-agent-runtime -p freshell-freshagent -p freshell-session-host -p freshell-supervisor -p freshell-server --features freshell-server/managed-runtime-v1`
 
@@ -466,7 +466,7 @@ Regenerate the additive contract using `pnpm exec tsx port/contract/generate-man
 
 Root-admitted resume-response prerequisite under G/root-task004-codex-resume-observation-resolution.md: execute real-WebSocket correlated successful thread/resume response tests, without a thread/started notification, that obtain the actual returned loaded-thread candidate with truthful resume provenance and identical forwarded bytes. Preserve small/bounded-large streaming behavior, errors/unknown request IDs/unrelated methods/missing or malformed IDs/ephemeral/wrong or competing identities and every existing host input/native identity gate; never infer loaded identity from a requested argument or rendered history. Run RED/GREEN/refactor and full affected Codex/dependent host checks and Clippy, bind genuine default host/SP/private artifacts, then necessary current native recovery and independent exact cleanup. The old397 wire was not captured, so its exact cause remains unknown and that receipt stays failed. This scope repairs the independently confirmed adapter gap; it does not grant Task 4 acceptance or loosen other gates. Source owns the three-path prerequisite and safe plan-only application; coordinator remains G-only.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 Run: `git add tsconfig.runtime.json scripts/testing/runtime-native-feasibility.ts test/unit/tooling/testing/runtime-native-feasibility.test.ts crates/freshell-session-host/src/providers/native_identity.rs crates/freshell-session-host/src/providers/mod.rs crates/freshell-session-host/src/providers/fresh_agent.rs crates/freshell-session-host/src/pty.rs crates/freshell-session-host/src/main.rs crates/freshell-platform/src/cli_launch.rs crates/freshell-runtime-protocol/src/lib.rs shared/managed-runtime.ts port/contract/managed-runtime.schema.json test/unit/lib/managed-runtime-wire.test.ts crates/freshell-supervisor/src/recovery.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/registry.rs crates/freshell-server/src/managed_runtime.rs crates/freshell-freshagent/src/claude.rs crates/freshell-claude-sidecar/index.mjs crates/freshell-claude-sidecar/permission-channel.mjs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-agent-runtime/src/host_actor_tests.rs extensions/amplifier/freshell-native-resume.patch docker/runtime/Dockerfile extensions/opencode/freshell-rebind-plugin.ts test/unit/extensions/opencode-rebind-plugin.test.ts test/unit/claude-sidecar/permission-channel.test.ts test/unit/claude-sidecar/session-settings.test.ts test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts`
 
