@@ -288,6 +288,35 @@ async fn a_lock_on_one_file_is_not_reported_for_another() {
     );
 }
 
+/// Holders are matched by the file's identity, not by how its path is
+/// spelled: a lock taken through the real path is found through a symlinked
+/// Codex home and through a symlink to the lock file itself, and each entry
+/// names the path as the caller spelled it.
+#[tokio::test]
+async fn a_symlinked_spelling_of_the_lock_path_matches_its_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let lock = home.join("t.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let linked_home = dir.path().join("linked-home");
+    std::os::unix::fs::symlink(&home, &linked_home).unwrap();
+    let via_linked_home = linked_home.join("t.lock");
+    let linked_lock = dir.path().join("linked.lock");
+    std::os::unix::fs::symlink(&lock, &linked_lock).unwrap();
+
+    let holder_child = spawn_holder(&lock).await;
+    let pid = holder_child.pid();
+
+    let spellings = [via_linked_home.clone(), linked_lock.clone()];
+    let expected = vec![
+        holder(pid, "sleep", &via_linked_home),
+        holder(pid, "sleep", &linked_lock),
+    ];
+    assert_eq!(lock_holders_among(&spellings, &[pid]), expected);
+    assert_eq!(lock_holders(&spellings), expected);
+}
+
 /// The exact name of [`lock_holders_fall_back_to_stat_where_statx_is_refused`].
 const STATX_REFUSED_TEST: &str = "lock_holders_fall_back_to_stat_where_statx_is_refused";
 /// Set (to the errno the filter answers) in a re-run of this test binary
