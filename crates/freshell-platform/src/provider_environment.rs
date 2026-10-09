@@ -1552,6 +1552,197 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_copy_entry_capacity_survives_both_stages_and_rejects_one_more() {
+        let root = executable_fixture();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        for index in 0..99_999 {
+            fs::write(source.join(format!("f{index:05}")), []).unwrap();
+        }
+        fs::write(source.join("f99998"), b"entry-capacity-nonce").unwrap();
+        let (first, second, home) = copy_default_twice(&source, root.path());
+        assert_eq!((first.entries, second.entries), (100_000, 100_000));
+        assert_eq!((first.bytes, second.bytes), (20, 20));
+        assert_eq!(
+            fs::read(home.join("resource/f99998")).unwrap(),
+            b"entry-capacity-nonce"
+        );
+        fs::write(source.join("extra"), []).unwrap();
+        let rejected = copy_environment(
+            &[selection(&source, "resource")],
+            &home,
+            &[],
+            CopyLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(rejected.limit_kind, Some("entries"));
+        assert_eq!(
+            (rejected.observed, rejected.permitted),
+            (Some(100_001), Some(100_000))
+        );
+        assert_eq!(
+            fs::read(home.join("resource/f99998")).unwrap(),
+            b"entry-capacity-nonce"
+        );
+        assert!(!home.join("resource/extra").exists());
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 1);
+    }
+
+    fn copy_default_twice(source: &Path, root: &Path) -> (CopyReport, CopyReport, PathBuf) {
+        let stage = root.join("stage");
+        let first = copy_environment(
+            &[selection(source, "resource")],
+            &stage,
+            &[],
+            CopyLimits::default(),
+        )
+        .unwrap();
+        let home = root.join("home");
+        let second = copy_environment(
+            &[selection(&stage.join("resource"), "resource")],
+            &home,
+            &[],
+            CopyLimits::default(),
+        )
+        .unwrap();
+        (first, second, home)
+    }
+
+    fn verify_capacity_payloads(home: &Path) {
+        for index in 0..4 {
+            let mut input = File::open(home.join(format!("resource/payload{index}"))).unwrap();
+            let mut bytes = 0u64;
+            let mut actual = [0u8; 64 * 1024];
+            loop {
+                let length = input.read(&mut actual).unwrap();
+                if length == 0 {
+                    break;
+                }
+                assert!(actual[..length].iter().all(|byte| *byte == 0x5a));
+                bytes += length as u64;
+            }
+            assert_eq!(bytes, 128 * 1024 * 1024);
+        }
+    }
+
+    fn mark_capacity_sources_unread(source: &Path) -> std::time::SystemTime {
+        let before = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        for index in 0..4 {
+            File::options()
+                .write(true)
+                .open(source.join(format!("payload{index}")))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_accessed(before))
+                .unwrap();
+        }
+        before
+    }
+
+    fn verify_capacity_sources_unread(source: &Path, before: std::time::SystemTime) {
+        for index in 0..4 {
+            assert_eq!(
+                fs::metadata(source.join(format!("payload{index}")))
+                    .unwrap()
+                    .accessed()
+                    .unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn default_copy_byte_capacity_reads_both_complete_stages_and_rejects_overflow() {
+        let root = executable_fixture();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let block = [0x5au8; 64 * 1024];
+        for index in 0..4 {
+            let mut file = File::create(source.join(format!("payload{index}"))).unwrap();
+            for _ in 0..2048 {
+                file.write_all(&block).unwrap();
+            }
+        }
+        let (first, second, home) = copy_default_twice(&source, root.path());
+        assert_eq!(
+            (first.bytes, second.bytes),
+            (512 * 1024 * 1024, 512 * 1024 * 1024)
+        );
+        verify_capacity_payloads(&home);
+        fs::write(source.join("extra"), b"x").unwrap();
+        let unread = mark_capacity_sources_unread(&source);
+        let total = copy_environment(
+            &[selection(&source, "resource")],
+            &home,
+            &[],
+            CopyLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(total.limit_kind, Some("total_bytes"));
+        assert_eq!(
+            (total.observed, total.permitted),
+            (Some(512 * 1024 * 1024 + 1), Some(512 * 1024 * 1024))
+        );
+        assert!(!home.join("resource/extra").exists());
+        verify_capacity_sources_unread(&source, unread);
+        verify_capacity_payloads(&home);
+        fs::remove_file(source.join("extra")).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(source.join("payload0"))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let unread = mark_capacity_sources_unread(&source);
+        let file = copy_environment(
+            &[selection(&source, "resource")],
+            &home,
+            &[],
+            CopyLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(file.limit_kind, Some("file_bytes"));
+        assert_eq!(
+            (file.observed, file.permitted),
+            (Some(128 * 1024 * 1024 + 1), Some(128 * 1024 * 1024))
+        );
+        verify_capacity_sources_unread(&source, unread);
+        verify_capacity_payloads(&home);
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn default_copy_depth_capacity_survives_both_stages_and_rejects_one_more() {
+        let root = executable_fixture();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let mut leaf = source.clone();
+        let mut relative = PathBuf::new();
+        for _ in 0..63 {
+            leaf.push("d");
+            relative.push("d");
+            fs::create_dir(&leaf).unwrap();
+        }
+        fs::write(leaf.join("nonce"), b"depth-capacity-nonce").unwrap();
+        let (_, _, home) = copy_default_twice(&source, root.path());
+        let published = home.join("resource").join(&relative).join("nonce");
+        assert_eq!(fs::read(&published).unwrap(), b"depth-capacity-nonce");
+        fs::create_dir(leaf.join("d")).unwrap();
+        fs::write(leaf.join("d/extra"), b"x").unwrap();
+        let error = copy_environment(
+            &[selection(&source, "resource")],
+            &home,
+            &[],
+            CopyLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.limit_kind, Some("depth"));
+        assert_eq!((error.observed, error.permitted), (Some(65), Some(64)));
+        assert_eq!(fs::read(published).unwrap(), b"depth-capacity-nonce");
+        assert!(!home.join("resource").join(relative).join("d").exists());
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn concrete_credential_identities_exclude_aliases_but_keep_package_auth() {
