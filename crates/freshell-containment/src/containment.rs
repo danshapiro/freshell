@@ -58,12 +58,21 @@ impl Containment {
     fn probe(opts: &SelectOptions) -> Self {
         #[cfg(target_os = "linux")]
         {
-            // Task 5 inserts the systemd user-manager probe here.
-            Self::tag_with(
-                BackendKind::LinuxTag,
-                "no systemd user manager backend",
-                opts,
-            )
+            // The store opens first: the probe hashes the canonical state
+            // root, which opening the store creates.
+            let store = Arc::new(RecordStore::open(&opts.state_root));
+            match crate::backend::systemd::SystemdBackend::probe(opts) {
+                Ok(backend) => Self {
+                    backend: Arc::new(backend),
+                    store,
+                },
+                Err(reason) => Self::tag_on(
+                    BackendKind::LinuxTag,
+                    &format!("systemd backend unavailable: {reason}"),
+                    opts,
+                    store,
+                ),
+            }
         }
         #[cfg(target_os = "macos")]
         {
@@ -97,13 +106,28 @@ impl Containment {
 
     #[cfg(unix)]
     fn tag_with(kind: BackendKind, reason: &str, opts: &SelectOptions) -> Self {
+        Self::tag_on(
+            kind,
+            reason,
+            opts,
+            Arc::new(RecordStore::open(&opts.state_root)),
+        )
+    }
+
+    #[cfg(unix)]
+    fn tag_on(
+        kind: BackendKind,
+        reason: &str,
+        opts: &SelectOptions,
+        store: Arc<RecordStore>,
+    ) -> Self {
         Self {
             backend: Arc::new(crate::backend::tag::TagBackend::new(
                 kind,
                 reason,
                 opts.shim.as_ref(),
             )),
-            store: Arc::new(RecordStore::open(&opts.state_root)),
+            store,
         }
     }
 

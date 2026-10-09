@@ -149,6 +149,39 @@ impl ProcWatch {
         }
     }
 
+    /// Blocks the calling thread until the process exits or `limit` passes:
+    /// one `poll` of the pidfd armed with the deadline (re-armed with the
+    /// time left only when a signal interrupts it). `Ok(true)` once it has
+    /// exited, `Ok(false)` at the deadline. For blocking threads only.
+    pub(crate) fn wait_exited_blocking(&self, limit: std::time::Duration) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if self.has_exited() {
+                return Ok(true);
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Ok(false);
+            }
+            let mut pfd = libc::pollfd {
+                fd: self.inner.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Round up, so the wait never ends just before the deadline.
+            let ms = left.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+            // SAFETY: one valid pollfd and a finite timeout.
+            let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+            if ready < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     /// Send a signal to THIS incarnation. An already-exited process is Ok(()).
     pub fn signal(&self, sig: Sig) -> io::Result<()> {
         self.send(match sig {

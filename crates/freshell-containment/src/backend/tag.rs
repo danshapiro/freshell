@@ -387,6 +387,7 @@ pub(crate) fn stop_the_world(
             .filter_map(|pid| process::identity(*pid).ok())
             .collect(),
         withheld: 0,
+        not_frozen: None,
     })
 }
 

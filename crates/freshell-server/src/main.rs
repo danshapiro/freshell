@@ -3463,11 +3463,15 @@ async fn main() -> ExitCode {
     // `prepare_retention("server-shutdown")` and their records flip to
     // Retained — instead of handing them to the teardown worker.
     //
-    // Supervisor caveat (recorded, no code — reports/V6.md NA-1): the in-repo
-    // systemd unit is NOT installed today (restarts are script-driven). If it
-    // is ever adopted, its KillMode must not be `control-group` — a cgroup
-    // kill would slaughter the retained sidecars this deliberately keeps
-    // alive (`process_group(0)` detaches the pgid, not the cgroup).
+    // Supervisor caveat (recorded, no code): under the systemd containment
+    // backend, coding-agent panes run in their own unit slices
+    // (`freshell.slice/freshell-n<ns>.slice/...`), siblings outside the
+    // server's own systemd unit, so they survive a stop or restart of a
+    // `KillMode=control-group` server unit (Stage 2 V1 §LB-04). Under the
+    // Linux tag backend (no reachable user manager), pane processes stay in
+    // the server's cgroup and a control-group stop kills them with the
+    // server. The `containment.backend` log line names the selected backend
+    // and, when degraded, the reason.
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
         .begin_shutdown_retention();
     registry.kill_all();

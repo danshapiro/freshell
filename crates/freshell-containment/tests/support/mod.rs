@@ -401,3 +401,107 @@ pub async fn eventually(limit: Duration, what: &str, mut cond: impl FnMut() -> b
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// The systemd backend's per-server namespace, computed here from the
+/// documented rule (an independent oracle): the first 16 lowercase hex
+/// digits of the SHA-256 of the canonicalized state root (an empty root
+/// hashes the empty string).
+pub fn systemd_namespace(state_root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = std::fs::canonicalize(state_root).unwrap_or_else(|_| state_root.to_path_buf());
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Linux: the cgroup v2 path (`0::` line of `/proc/<pid>/cgroup`).
+pub fn cgroup_path_of(pid: u32) -> String {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .unwrap_or_else(|e| panic!("cannot read the cgroup of {pid}: {e}"));
+    raw.lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .unwrap_or_else(|| panic!("no cgroup v2 line for {pid}: {raw}"))
+        .to_string()
+}
+
+/// The systemd unit slice holding `pid` (`freshell-n<ns>-<unit id>.slice`)
+/// and its cgroup directory, or `None` when `pid` is not in one (the tag
+/// backend) or is gone.
+pub fn unit_slice_of(pid: u32) -> Option<(String, PathBuf)> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let path = raw.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let mut dir = PathBuf::from("/sys/fs/cgroup");
+    let mut parts = path.split('/').filter(|p| !p.is_empty());
+    for part in parts.by_ref() {
+        dir.push(part);
+        if part == "freshell.slice" {
+            break;
+        }
+    }
+    let ns_slice = parts.next()?;
+    dir.push(ns_slice);
+    let unit_slice = parts.next()?;
+    let ns = ns_slice.strip_suffix(".slice")?;
+    if !ns.starts_with("freshell-n") || !unit_slice.starts_with(&format!("{ns}-u")) {
+        return None;
+    }
+    dir.push(unit_slice);
+    Some((unit_slice.to_string(), dir))
+}
+
+/// `systemctl --user stop <unit>`, ignoring every failure (cleanup of the
+/// test's own slices only; "not loaded" is fine).
+pub fn stop_user_unit(unit: &str) {
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "stop", unit])
+        .stdin(std::process::Stdio::null())
+        .output();
+}
+
+/// Stops one of the test's own systemd slices when dropped (a slice the
+/// product leaves running on purpose, or one a failed test left behind).
+pub struct StopSliceOnDrop(Option<String>);
+
+impl StopSliceOnDrop {
+    /// The unit slice holding `pid` now (nothing on the tag backend).
+    pub fn holding(pid: u32) -> Self {
+        Self(unit_slice_of(pid).map(|(name, _)| name))
+    }
+
+    pub fn named(name: impl Into<String>) -> Self {
+        Self(Some(name.into()))
+    }
+}
+
+impl Drop for StopSliceOnDrop {
+    fn drop(&mut self) {
+        if let Some(name) = &self.0 {
+            stop_user_unit(name);
+        }
+    }
+}
+
+/// A temporary state root. Implicit systemd slices are never collected, so
+/// on drop it stops the namespace slices (`freshell-n<ns>.slice`) of the
+/// root itself and of its `selected` backend root, with every unit slice
+/// the test left in them (all of them the test's own).
+pub struct StateRoot(tempfile::TempDir);
+
+impl StateRoot {
+    pub fn new() -> Self {
+        Self(tempfile::tempdir().unwrap())
+    }
+
+    pub fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for StateRoot {
+    fn drop(&mut self) {
+        for root in [self.0.path().join("selected"), self.0.path().to_path_buf()] {
+            if root.is_dir() {
+                stop_user_unit(&format!("freshell-n{}.slice", systemd_namespace(&root)));
+            }
+        }
+    }
+}

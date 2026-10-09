@@ -153,6 +153,14 @@ pub fn stop_failed(k: &UnitLogKeys, attempt: u32, final_attempt: bool, error: &s
         "unit stop attempt failed");
 }
 
+/// The whole-unit kill could not confirm the unit's cgroup frozen first
+/// (`detail`: no frozen event within the deadline, or the write's error);
+/// the kill went ahead on the unfrozen cgroup.
+pub fn freeze_timeout(k: &UnitLogKeys, detail: &str) {
+    keyed!(warn, k, "unit.stop.freeze_timeout", detail = %detail,
+        "unit kill went ahead without a frozen cgroup");
+}
+
 /// The whole-unit kill failed (the pinned roots are still killed directly).
 pub fn kill_all_failed(k: &UnitLogKeys, error: &str) {
     keyed!(error, k, "unit.stop.kill_all_failed", error = %error,

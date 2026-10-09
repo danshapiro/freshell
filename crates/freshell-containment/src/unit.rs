@@ -889,6 +889,9 @@ impl AgentUnit {
         let spared = match self.inner.backend.clone().kill_all(roots).await {
             Ok(summary) => {
                 log_withheld(keys, summary.withheld);
+                if let Some(detail) = &summary.not_frozen {
+                    events::freeze_timeout(keys, detail);
+                }
                 Some(summary.spared)
             }
             Err(err) => {
@@ -1102,7 +1105,12 @@ impl AgentUnit {
             }
         };
         events::descendants_survived(keys, &survivors);
-        if let Err(err) = self.inner.backend.remove(emptied) {
+        // Releasing can run a deadline-bounded command (systemd).
+        let backend = self.inner.backend.clone();
+        if let Err(err) = blocking(move || backend.remove(emptied))
+            .await
+            .and_then(|r| r)
+        {
             events::release_failed(keys, &err.to_string());
         }
         survivors

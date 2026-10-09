@@ -187,6 +187,92 @@ pub(crate) fn real_uid(pid: u32) -> Option<u32> {
         .ok()
 }
 
+/// Linux: the first `name` found in a `PATH` directory (one-shot helper
+/// commands are run by this absolute path).
+#[cfg(target_os = "linux")]
+pub(crate) fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH")?
+        .to_str()?
+        .split(':')
+        .map(|d| std::path::Path::new(d).join(name))
+        .find(|p| p.is_file())
+}
+
+/// What a one-shot helper command printed, and how it ended.
+#[cfg(target_os = "linux")]
+pub(crate) struct CommandOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Linux: runs one helper command (stdin null, stdout and stderr captured)
+/// under ONE deadline rule shared by every one-shot command the crate runs:
+/// it waits at most `deadline` for the command to exit (a pidfd wait armed
+/// with the deadline, no polling) and then for its output to close. On
+/// timeout the command is killed through its pin and reaped, and the error
+/// is `ErrorKind::TimedOut` ("timed out"). Blocks the calling thread: async
+/// callers run it on a blocking task.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_capture_with_deadline(
+    cmd: &mut std::process::Command,
+    deadline: std::time::Duration,
+) -> io::Result<CommandOutput> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    use crate::proc_watch::{ProcWatch, Sig};
+
+    let until = std::time::Instant::now() + deadline;
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "timed out");
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // The child is unreaped until `wait` below, so its pid names it.
+    let watch = match ProcWatch::open(child.id()) {
+        Ok(watch) => watch,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
+    // Each pipe is drained on its own thread (a full pipe must never stall
+    // the command); its text arrives once the pipe closes.
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut text);
+            }
+            let _ = tx.send(String::from_utf8_lossy(&text).into_owned());
+        });
+        rx
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let exited = watch.wait_exited_blocking(deadline);
+    if !matches!(exited, Ok(true)) {
+        let _ = watch.signal(Sig::Kill);
+        let _ = child.wait();
+        exited?;
+        return Err(timed_out());
+    }
+    let status = child.wait()?;
+    let left = || until.saturating_duration_since(std::time::Instant::now());
+    let stdout = stdout.recv_timeout(left()).map_err(|_| timed_out())?;
+    let stderr = stderr.recv_timeout(left()).map_err(|_| timed_out())?;
+    Ok(CommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 // Off Linux the process facts below answer "nothing" until the per-OS
 // bodies land (Windows: Task 6, macOS: Task 7). No backend there finds
 // members through them yet.
@@ -237,4 +323,63 @@ fn unsupported() -> io::Error {
         io::ErrorKind::Unsupported,
         "process facts are not implemented on this OS yet",
     )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_helper_command_reports_its_status_and_both_outputs() {
+        let out = run_capture_with_deadline(
+            Command::new("sh").args(["-c", "echo out; echo err >&2; exit 3"]),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout, "out\n");
+        assert_eq!(out.stderr, "err\n");
+    }
+
+    #[test]
+    fn a_helper_command_past_its_deadline_is_killed_reaped_and_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let t0 = Instant::now();
+        let err = run_capture_with_deadline(
+            Command::new("sh").args([
+                "-c",
+                &format!("echo $$ > '{}'; exec sleep 600", pid_file.display()),
+            ]),
+            Duration::from_millis(300),
+        )
+        .err()
+        .expect("the command outlived its deadline");
+        let took = t0.elapsed();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Reaped, not a zombie: the pid names no process of ours any more.
+        assert!(
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_err()
+                || parent(pid) != Some(std::process::id()),
+            "the timed-out command {pid} is still our child"
+        );
+    }
+
+    #[test]
+    fn find_on_path_returns_an_absolute_program_path() {
+        let sh = find_on_path("sh").expect("sh is on PATH");
+        assert!(sh.is_absolute() && sh.is_file(), "{}", sh.display());
+        assert!(find_on_path("freshell-no-such-program-x").is_none());
+    }
 }

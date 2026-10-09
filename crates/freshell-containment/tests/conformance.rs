@@ -112,6 +112,11 @@ async fn graceful_stop_escalates_after_its_grace() {
             "{name}: polite first"
         );
         assert!(report.escalated, "{name}: escalated after grace");
+        // Gone confirms the unit's main (on the tag backend, the reaper shim
+        // above the agent), not every descendant: the agent, killed in the
+        // same sweep, is checked once the post-Gone sweep is done.
+        let survivors = unit.stop_in_flight().unwrap().wait_swept().await;
+        assert!(survivors.is_empty(), "{name}: survivors {survivors:?}");
         assert!(!alive(p.main), "{name}");
     }
 }
@@ -135,6 +140,7 @@ async fn a_second_force_stop_joins_and_skips_the_grace() {
             "{name}: {:?}",
             t0.elapsed()
         );
+        first.wait_swept().await;
     }
 }
 
@@ -165,6 +171,7 @@ async fn force_on_a_graceful_stop_escalates_immediately() {
             "{name}: {:?}",
             t0.elapsed()
         );
+        polite.wait_swept().await;
     }
 }
 
@@ -180,6 +187,8 @@ async fn the_codex_managed_daemon_is_never_signalled() {
         let p = read_pids(&s).await;
         assert!(alive(p.daemon));
         let daemon = ProcWatch::open(p.daemon).unwrap();
+        // The slice the spared daemon keeps running is stopped at the end.
+        let _slice = StopSliceOnDrop::holding(p.daemon);
         unit.stop(StopRequest::new(
             StopMode::Force,
             StopReason::ShiftX,
@@ -235,6 +244,7 @@ async fn a_member_holding_the_conversation_lock_is_killed_before_gone() {
             "{name}: lock released at Gone"
         );
         assert!(!alive(p.locker), "{name}");
+        unit.stop_in_flight().unwrap().wait_swept().await;
     }
 }
 
@@ -263,7 +273,7 @@ async fn placement_carries_the_unit_tag_and_a_unit_with_nothing_running_is_gone_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopping_is_persisted_before_any_signal_and_on_gone_runs_before_the_handle_resolves() {
-    let root = tempfile::tempdir().unwrap();
+    let root = StateRoot::new();
     for (name, c) in backends_with_state(root.path()) {
         let unit = c.create_unit(UnitId::mint(), label()).unwrap();
         let path = record_path(root.path(), name, &unit);
@@ -333,6 +343,8 @@ async fn the_codex_daemon_family_is_never_signalled() {
         });
         let _child = spawn_main(&unit, &s).await;
         let p = read_pids(&s).await;
+        // The slice the spared daemon family keeps running is stopped at the end.
+        let _slice = StopSliceOnDrop::holding(p.daemon);
         let family: Vec<(u32, u64)> = [p.daemon, p.updater, p.installer, p.legacy]
             .into_iter()
             .map(|pid| {
@@ -421,6 +433,7 @@ async fn a_unit_refuses_members_once_its_stop_has_begun() {
         late.wait();
         handle.wait().await;
         assert!(unit.placement(MemberRole::Screen).is_err(), "{name}");
+        handle.wait_swept().await;
     }
 }
 
@@ -448,7 +461,7 @@ async fn confirm_placement_accepts_members_and_rejects_strangers() {
             StopReason::ShiftX,
             "test",
         ))
-        .wait()
+        .wait_swept()
         .await;
     }
 }
@@ -538,6 +551,7 @@ async fn a_user_kill_joining_a_weaker_stop_wins_its_reason() {
         assert_eq!(report.mode, "force", "{name}");
         assert!(report.escalated, "{name}");
         assert!(t0.elapsed() < Duration::from_secs(2), "{name}");
+        cleanup.wait_swept().await;
 
         // (b) A kill command joining a respawn's stop.
         let unit = c.create_unit(UnitId::mint(), label()).unwrap();
@@ -556,6 +570,7 @@ async fn a_user_kill_joining_a_weaker_stop_wins_its_reason() {
             "mcp",
         ));
         assert_eq!(respawn.wait().await.reason, "kill-command", "{name}");
+        respawn.wait_swept().await;
 
         // (c) A weaker joiner never replaces the reason.
         let unit = c.create_unit(UnitId::mint(), label()).unwrap();
@@ -574,6 +589,7 @@ async fn a_user_kill_joining_a_weaker_stop_wins_its_reason() {
             "respawn",
         ));
         assert_eq!(user.wait().await.reason, "shift-x", "{name}");
+        user.wait_swept().await;
     }
 }
 

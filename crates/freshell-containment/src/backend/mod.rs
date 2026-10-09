@@ -10,8 +10,12 @@ use crate::process::ProcIdentity;
 use crate::unit::{MemberRole, Placement};
 use crate::{BoxFuture, UnitId};
 
+#[cfg(target_os = "linux")]
+pub(crate) mod inotify;
 #[cfg(windows)]
 pub(crate) mod roots;
+#[cfg(target_os = "linux")]
+pub(crate) mod systemd;
 #[cfg(unix)]
 pub(crate) mod tag;
 
@@ -54,6 +58,10 @@ pub(crate) struct KillSummary {
     pub spared: Vec<ProcIdentity>,
     /// See [`MemberList::withheld`].
     pub withheld: u64,
+    /// Why the kill could not confirm its container frozen first (cgroup
+    /// backends; `None` elsewhere). The kill still ran; the unit logs it
+    /// with its keys (`unit.stop.freeze_timeout`).
+    pub not_frozen: Option<String>,
 }
 
 /// One one-shot reading of a unit's live, non-spared members.

@@ -25,7 +25,7 @@ fn read_record(path: &std::path::Path) -> UnitRecord {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_unit_records_the_unit_before_anything_spawns_and_gone_deletes_it() {
-    let root = tempfile::tempdir().unwrap();
+    let root = StateRoot::new();
     for (name, c) in backends_with_state(root.path()) {
         let unit = c
             .create_unit(
@@ -91,8 +91,8 @@ async fn create_unit_records_the_unit_before_anything_spawns_and_gone_deletes_it
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_server_finishes_only_its_own_recorded_units() {
-    let root_a = tempfile::tempdir().unwrap();
-    let root_b = tempfile::tempdir().unwrap();
+    let root_a = StateRoot::new();
+    let root_b = StateRoot::new();
     for ((name, a), (_, b)) in backends_with_state(root_a.path())
         .into_iter()
         .zip(backends_with_state(root_b.path()))
@@ -153,7 +153,7 @@ async fn a_server_finishes_only_its_own_recorded_units() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_containment_on_the_same_state_root_does_not_take_over_its_records() {
-    let root = tempfile::tempdir().unwrap();
+    let root = StateRoot::new();
     for (name, a) in backends_with_state(root.path()) {
         let unit_a = a.create_unit(UnitId::mint(), label()).unwrap();
         let path_a = record_path(root.path(), name, &unit_a);
@@ -249,7 +249,7 @@ async fn a_failed_stopping_write_sends_no_signal_until_a_force_join_saves_it() {
 #[tokio::test(flavor = "current_thread")]
 async fn boot_never_signals_a_recorded_root_whose_start_time_differs() {
     let (cap, _guard) = capture::install();
-    let root = tempfile::tempdir().unwrap();
+    let root = StateRoot::new();
     for (name, c) in backends_with_state(root.path()) {
         let mut sleep = OwnChild::sleep();
         let pid = sleep.id();
@@ -372,7 +372,7 @@ impl Drop for ForkedPause {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_containment_frees_its_records_even_while_a_forked_child_holds_their_descriptors()
 {
-    let root = tempfile::tempdir().unwrap();
+    let root = StateRoot::new();
     for (name, a) in backends_with_state(root.path()) {
         let unit = a.create_unit(UnitId::mint(), label()).unwrap();
         let record = read_record(&record_path(root.path(), name, &unit));
