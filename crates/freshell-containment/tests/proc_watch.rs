@@ -193,13 +193,40 @@ fn identity_carries_the_process_name_and_never_its_arguments() {
     assert!(!json.contains(SECRET), "JSON leaks argv: {json}");
 }
 
+/// The test's own Windows child, killed (through its handle, which pins
+/// that process) and waited for when dropped, so a failed assertion leaves
+/// nothing running.
+#[cfg(windows)]
+struct OwnChild(std::process::Child);
+
+#[cfg(windows)]
+impl OwnChild {
+    fn powershell(script: &str) -> Self {
+        Self(
+            std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", script])
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
 async fn exited_fires_when_a_windows_process_exits() {
-    let child = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", "Start-Sleep -Milliseconds 400"])
-        .spawn()
-        .unwrap();
+    let child = OwnChild::powershell("Start-Sleep -Milliseconds 400");
     let watch = ProcWatch::open(child.id()).unwrap();
     assert!(!watch.has_exited());
     tokio::time::timeout(Duration::from_secs(10), watch.exited())
@@ -212,10 +239,7 @@ async fn exited_fires_when_a_windows_process_exits() {
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_terminates_a_windows_process() {
-    let child = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 600"])
-        .spawn()
-        .unwrap();
+    let child = OwnChild::powershell("Start-Sleep -Seconds 600");
     let watch = ProcWatch::open(child.id()).unwrap();
     watch.signal(Sig::Kill).unwrap();
     tokio::time::timeout(Duration::from_secs(10), watch.exited())
