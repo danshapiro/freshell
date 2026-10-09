@@ -12,8 +12,9 @@
 //!
 //! One-shot reads only; nothing here waits or polls. Holders are named by
 //! process name, never by command line (argv can carry secrets). File
-//! identities are read without a server round trip (see [`file_id`]), so a
-//! lookup does not wait on a slow or unreachable network mount.
+//! identities are read without a server round trip (except as noted on
+//! [`file_id`]), so a lookup does not wait on a slow or unreachable network
+//! mount.
 
 use std::path::{Path, PathBuf};
 
@@ -163,9 +164,9 @@ fn file_id(path: &Path) -> Option<FileId> {
 /// target (sockets, pipes and anonymous inodes are never lock files), then
 /// the fdinfo `lock:` line (both are kernel bookkeeping and never reach the
 /// file's filesystem), and only then the identity of the open file, read
-/// without a server round trip ([`file_id`]). A full scan passes thousands
-/// of other processes' open files, so it reads the identity of locked ones
-/// only.
+/// without a server round trip (except as noted on [`file_id`]). A full scan
+/// passes thousands of other processes' open files, so it reads the identity
+/// of locked ones only.
 #[cfg(target_os = "linux")]
 fn fd_holds_lock(pid: u32, fd: &str, wanted: &[FileId]) -> Option<FileId> {
     let link = format!("/proc/{pid}/fd/{fd}");
