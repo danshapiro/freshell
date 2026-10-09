@@ -258,7 +258,7 @@ function retainedStoreHelperBody() {
 
 type ForwardedRequest = { method: string; url: string; body: any }
 type BrokerHttpFixture = {
-  request(method: string, url: string, body?: unknown): Promise<{ status: number; body: string }>
+  request(method: string, url: string, body?: unknown, timeoutMs?: number): Promise<{ status: number; body: string }>
   forwarded: ForwardedRequest[]
   broker: RestrictedDockerBroker
   loseHelperAck(): void
@@ -266,7 +266,7 @@ type BrokerHttpFixture = {
 }
 
 async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,
-  options: { allowTask2LegacyNegativeFixtures?: boolean } = {},
+  options: { allowTask2LegacyNegativeFixtures?: boolean; delayHelperWait?: boolean; gitWorkspace?: string } = {},
 ) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-broker-history-'))
   const socket = path.join(dir, 'docker.sock')
@@ -274,6 +274,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
   const forwarded: ForwardedRequest[] = []
   let loseAck = false
   let helperAckId = helperId
+  let waitingResponse: http.ServerResponse | undefined
   const upstream = http.createServer(async (req, res) => {
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(Buffer.from(chunk))
@@ -289,7 +290,12 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       res.end(JSON.stringify({ Id: body.Entrypoint ? helperAckId : ownedId }))
       return
     }
+    if (options.delayHelperWait && req.url?.includes('/wait?')) {
+      waitingResponse = res
+      return
+    }
     if (req.method === 'DELETE' || req.url?.endsWith('/start') || req.url?.endsWith('/update')) {
+      if (req.method === 'DELETE') waitingResponse?.destroy()
       res.statusCode = 204
       res.end()
       return
@@ -311,17 +317,18 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     allowedHostBinaryPaths: new Set(['/tmp/owned/freshell-session-host', '/tmp/owned/other-approved-host']),
     allowedImageRefs: new Set(['sha256:fixture-image', 'sha256:other-approved-image', `sha256:${'b'.repeat(64)}`]),
     allowTerminalWorkloads: true,
-    allowedWorkspaceRoots: new Set(['/workspace']),
+    allowedWorkspaceRoots: new Set(['/workspace', ...(options.gitWorkspace ? [options.gitWorkspace] : [])]),
     testRunId: 'run-one',
     logPath: path.join(dir, 'broker.jsonl'),
   })
-  const request: BrokerHttpFixture['request'] = (method, url, body) => new Promise((resolve, reject) => {
+  const request: BrokerHttpFixture['request'] = (method, url, body, timeoutMs) => new Promise((resolve, reject) => {
     const req = http.request({ socketPath: proxy, path: url, method }, (res) => {
       const chunks: Buffer[] = []
       res.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
       res.on('end', () => resolve({ status: res.statusCode!, body: Buffer.concat(chunks).toString() }))
     })
     req.on('error', reject)
+    if (timeoutMs !== undefined) req.setTimeout(timeoutMs, () => req.destroy(new Error('owned helper wait timed out')))
     req.end(body === undefined ? undefined : Buffer.isBuffer(body) ? body : JSON.stringify(body))
   })
   try {
@@ -329,11 +336,185 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     await instance.start()
     await run({ request, forwarded, broker: instance, loseHelperAck: () => { loseAck = true }, returnHelperId: (id) => { helperAckId = id } })
   } finally {
+    upstream.closeAllConnections()
     await instance.close()
     await new Promise<void>((resolve) => upstream.close(() => resolve()))
     await fs.rm(dir, { recursive: true, force: true })
   }
 }
+
+const repairName = 'freshell-opencode-repair-11111111-1111-4111-8111-111111111111'
+const repairStage = '/tmp/owned/r/scenario/x/opencode-transfers/opencode-transfer-one.ready'
+const repairEnv = [
+  'HOME=/home/freshell/provider',
+  'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db',
+  'PATH=/usr/local/bin:/usr/bin:/bin',
+  'XDG_CONFIG_HOME=/home/freshell/provider/.config',
+  'XDG_DATA_HOME=/home/freshell/provider/.local/share',
+  'TERM=xterm-256color',
+  'OPENCODE_MODEL=fixture-configured',
+].sort()
+
+function stoppedRepairBody() {
+  return {
+    Image: 'sha256:fixture-image', User: '0:0', WorkingDir: '/workspace', Tty: false,
+    Entrypoint: ['/runtime/freshell-session-host'],
+    Cmd: ['opencode-stopped-repair-worker', '--stage-dir', '/run/freshell-opencode-transfer',
+      '--workspace-root', '/workspace', '--expected-cwd', '/workspace', '--provider-uid', '65534', '--provider-gid', '0'],
+    Env: [...repairEnv],
+    HostConfig: {
+      NetworkMode: 'none', ReadonlyRootfs: true, CapDrop: ['ALL'], CapAdd: ['SETUID', 'SETGID'],
+      SecurityOpt: ['no-new-privileges'], Memory: 256 * 1024 * 1024, MemorySwap: 256 * 1024 * 1024,
+      NanoCpus: 500_000_000, PidsLimit: 32, Tmpfs: { '/tmp': 'rw,noexec,nosuid,nodev,size=16m' },
+      Mounts: [
+        { Type: 'bind', Source: '/tmp/owned/freshell-session-host', Target: '/runtime/freshell-session-host', ReadOnly: true },
+        { Type: 'volume', Source: providerVolume, Target: '/home/freshell/provider', ReadOnly: false },
+        { Type: 'bind', Source: repairStage, Target: '/run/freshell-opencode-transfer', ReadOnly: true },
+        { Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true },
+      ],
+    },
+  }
+}
+
+async function registerRepairOwner(request: BrokerHttpFixture['request']) {
+  const body = JSON.parse(createBody(ordinaryBinds).toString())
+  // OpenCode's ordinary host environment does not copy terminal.env; the repair helper does.
+  body.Env = []
+  expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', body)).status).toBe(201)
+}
+
+describe('receipt-owned stopped OpenCode repair HTTP routes', () => {
+  it('admits the production repair worker body and binds its lifecycle and cleanup to the original receipt', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      expect((await request('GET', `/v1.47/volumes/${providerVolume}`)).status).toBe(200)
+      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody())).status).toBe(201)
+      expect(forwarded.at(-1)?.body.Env).toEqual(repairEnv)
+      expect(forwarded[0].body.Env).toEqual([])
+      expect(broker.historyHelperNames()).toContain(repairName)
+      expect(broker.receiptIds().has(helperId)).toBe(true)
+      expect(broker.receipts()).toHaveLength(1)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({ helperName: repairName, ownerContainerId: ownedId, providerVolumeName: providerVolume })
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).body).toBe('{"StatusCode":0}')
+      expect((await request('GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=0`)).status).toBe(200)
+      for (const [method, url] of [
+        ['POST', `/v1.47/containers/${helperId}/kill`],
+        ['POST', `/v1.47/containers/${helperId}/update`],
+        ['POST', `/v1.47/containers/${repairName}/start`],
+        ['DELETE', `/v1.47/containers/${helperId}?force=0`],
+        ['DELETE', '/v1.47/containers/freshell-opencode-repair-foreign?force=1'],
+      ]) {
+        const count = forwarded.length
+        expect((await request(method, url)).status).toBe(403)
+        expect(forwarded).toHaveLength(count)
+      }
+      const count = forwarded.length
+      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody())).status).toBe(403)
+      expect(forwarded).toHaveLength(count)
+      expect((await request('DELETE', `/v1.47/containers/${repairName}?force=1`)).status).toBe(204)
+      expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${repairName}?force=1`)
+    })
+  })
+
+  it('rejects changed repair sources, identity, command and privileges before contacting Docker', async () => {
+    await withHttpBroker(async ({ request, forwarded }) => {
+      const create = (body: ReturnType<typeof stoppedRepairBody>) => request('POST', `/v1.47/containers/create?name=${repairName}`, body)
+      expect((await create(stoppedRepairBody())).status).toBe(403)
+      expect(forwarded).toHaveLength(0)
+      await registerRepairOwner(request)
+      const mutations: ((body: ReturnType<typeof stoppedRepairBody>) => void)[] = [
+        body => { body.Image = 'sha256:other-approved-image' },
+        body => { body.HostConfig.Mounts[0].Source = '/tmp/owned/other-approved-host' },
+        body => { body.HostConfig.Mounts[1].Source = 'freshell-provider-ffffffffffffffffffffffff' },
+        body => { body.HostConfig.Mounts[1].ReadOnly = true },
+        body => { body.HostConfig.Mounts[2].Source = '/tmp/owned/r/foreign/x/opencode-transfers/opencode-transfer-one.ready' },
+        body => { body.HostConfig.Mounts[2].ReadOnly = false },
+        body => { body.HostConfig.Mounts[2].Source = '/tmp/owned/r/scenario/x/opencode-transfers/../opencode-transfers/opencode-transfer-one.ready' },
+        body => { body.HostConfig.Mounts[3].Source = '/foreign' },
+        body => { body.HostConfig.Mounts[3].ReadOnly = false },
+        body => { body.HostConfig.Mounts.push({ Type: 'bind', Source: '/etc', Target: '/etc', ReadOnly: true }) },
+        body => { body.Cmd[0] = 'serve' },
+        body => { body.Cmd[6] = '/foreign' },
+        body => { body.Cmd[8] = '0' },
+        body => { body.Cmd.push('--extra') },
+        body => { body.WorkingDir = '/foreign' },
+        body => { body.Tty = true },
+        body => { body.User = '65534:0' },
+        ...['HOME', 'OPENCODE_DB', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME'].map(key => (body: ReturnType<typeof stoppedRepairBody>) => {
+          body.Env[body.Env.findIndex(value => value.startsWith(`${key}=`))] = `${key}=/foreign`
+        }),
+        body => { body.Env = [] },
+        body => { body.Env.push('malformed') },
+        body => { body.Env.push('TERM=xterm\0foreign') },
+        body => { body.Env.push(body.Env[0]) },
+        body => { body.HostConfig.NetworkMode = 'bridge' },
+        body => { body.HostConfig.ReadonlyRootfs = false },
+        body => { body.HostConfig.CapAdd.push('CHOWN') },
+        body => { Object.assign(body.HostConfig, { Privileged: true }) },
+        body => { Object.assign(body.HostConfig, { Binds: ['/etc:/etc:rw'] }) },
+        body => { Object.assign(body.HostConfig, { PortBindings: { '80/tcp': [{ HostPort: '80' }] } }) },
+        body => { body.HostConfig.SecurityOpt = [] },
+        body => { body.HostConfig.MemorySwap = 0 },
+        body => { body.HostConfig.PidsLimit = 0 },
+        body => { body.HostConfig.Tmpfs['/tmp'] = 'rw,size=1g' },
+      ]
+      for (const mutate of mutations) {
+        const body = stoppedRepairBody()
+        mutate(body)
+        const count = forwarded.length
+        expect((await create(body)).status).toBe(403)
+        expect(forwarded).toHaveLength(count)
+      }
+    })
+  })
+
+  it('admits the production optional read-only Git common directory with a workspace-local cwd', async () => {
+    await withHttpBroker(async ({ request, forwarded }) => {
+      await registerRepairOwner(request)
+      const body = stoppedRepairBody()
+      body.WorkingDir = '/workspace/nested'
+      body.Cmd[6] = body.WorkingDir
+      body.HostConfig.Mounts.push({ Type: 'bind', Source: '/workspace-git', Target: '/workspace-git', ReadOnly: true })
+      try {
+        expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, body)).status).toBe(201)
+        expect(forwarded.at(-1)?.body).toEqual(body)
+      } finally {
+        expect((await request('DELETE', `/v1.47/containers/${repairName}?force=1`)).status).toBe(204)
+      }
+    }, { gitWorkspace: '/workspace-git' })
+  })
+
+  it('retains exact-name cleanup authority when the repair create acknowledgement is lost', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker, loseHelperAck }) => {
+      await registerRepairOwner(request)
+      loseHelperAck()
+      try {
+        expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody())).status).toBe(503)
+        expect(broker.historyHelperNames()).toContain(repairName)
+        expect(broker.receiptIds().has(helperId)).toBe(false)
+      } finally {
+        expect((await request('DELETE', `/v1.47/containers/${repairName}?force=1`)).status).toBe(204)
+      }
+      expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${repairName}?force=1`)
+    })
+  })
+
+  it('permits exact-name cleanup after the owned repair wait times out', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody())).status).toBe(201)
+      try {
+        expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+        await expect(request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`, undefined, 100)).rejects.toThrow('owned helper wait timed out')
+        expect(forwarded.some(entry => entry.url.endsWith('/wait?condition=not-running'))).toBe(true)
+        expect(broker.historyHelperNames()).toContain(repairName)
+      } finally {
+        expect((await request('DELETE', `/v1.47/containers/${repairName}?force=1`)).status).toBe(204)
+      }
+    }, { delayHelperWait: true })
+  })
+})
 
 describe('receipt-owned read-only history HTTP routes', () => {
   it('admits only the fixed Node native reader on the exact receipt workspace and read-only provider source', async () => {

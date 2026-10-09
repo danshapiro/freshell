@@ -213,10 +213,11 @@ export class RestrictedDockerBroker {
 
     if (method === 'POST' && url.startsWith(`${DOCKER_API_PREFIX}/containers/create?`)) {
       const name = new URL(url, 'http://docker').searchParams.get('name') ?? ''
-      if (name.startsWith('freshell-history-')) {
-        const owner = this.validateHistoryHelper(name, body)
+      if (name.startsWith('freshell-history-') || name.startsWith('freshell-opencode-repair-')) {
+        const owner = name.startsWith('freshell-opencode-repair-')
+          ? this.validateStoppedRepairHelper(name, body) : this.validateHistoryHelper(name, body)
         if (!owner || this.historyHelpers.has(name)) {
-          this.block(response, method, url, 403, 'history helper does not match an owned read-only source', false)
+          this.block(response, method, url, 403, 'helper does not match its owned source and topology', false)
           return
         }
         // Reserve the exact validated name before forwarding: Docker may create it but lose its acknowledgement.
@@ -468,6 +469,53 @@ export class RestrictedDockerBroker {
     return { ok: true, incarnationId, soulId, imageRef, runtimeDir, hostBinaryPath, ...(providerVolumeName ? { providerVolumeName } : {}), ...(workspacePath ? { workspacePath } : {}) }
   }
 
+  private validateStoppedRepairHelper(name: string, body: Buffer): BrokerReceipt | undefined {
+    if (!/^freshell-opencode-repair-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(name)) return
+    let parsed: Record<string, any>
+    try { parsed = JSON.parse(body.toString('utf8')) } catch { return }
+    const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
+    const host = parsed.HostConfig ?? {}
+    const workspace = parsed.Cmd?.[4]
+    const cwd = parsed.WorkingDir
+    if (parsed.User !== '0:0' || parsed.Tty !== false || Object.keys(parsed.Labels ?? {}).length !== 0
+      || !same(parsed.Entrypoint, ['/runtime/freshell-session-host'])
+      || typeof workspace !== 'string' || path.normalize(workspace) !== workspace || !this.isAllowedWorkspacePath(workspace)
+      || typeof cwd !== 'string' || path.normalize(cwd) !== cwd
+      || !(cwd === workspace || isStrictDescendant(cwd, workspace))
+      || !same(parsed.Cmd, ['opencode-stopped-repair-worker', '--stage-dir', '/run/freshell-opencode-transfer',
+        '--workspace-root', workspace, '--expected-cwd', cwd, '--provider-uid', '65534', '--provider-gid', '0'])
+      || !this.validHistoryHelperHost(host, false, ['SETUID', 'SETGID'])
+      || (host.PortBindings && Object.keys(host.PortBindings).length > 0)
+      || (host.ExtraHosts?.length ?? 0) !== 0) return
+    const mounts: Record<string, any>[] = host.Mounts
+    if (!Array.isArray(mounts) || ![4, 5].includes(mounts.length)
+      || new Set(mounts.map(mount => mount.Target)).size !== mounts.length) return
+    const binary = mounts.find(mount => mount.Type === 'bind' && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
+    const volume = mounts.find(mount => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === false)
+    const stage = mounts.find(mount => mount.Type === 'bind' && mount.Target === '/run/freshell-opencode-transfer' && mount.ReadOnly === true)
+    const workspaceMount = mounts.find(mount => mount.Type === 'bind' && mount.Source === workspace && mount.Target === workspace && mount.ReadOnly === true)
+    if (!binary || !volume || !stage || !workspaceMount || typeof stage.Source !== 'string'
+      || path.normalize(stage.Source) !== stage.Source || !/^opencode-transfer-[a-zA-Z0-9-]+\.ready$/.test(path.basename(stage.Source))) return
+    if (mounts.length === 5) {
+      const git = mounts.find(mount => mount !== binary && mount !== volume && mount !== stage && mount !== workspaceMount)
+      if (!git || git.Type !== 'bind' || git.ReadOnly !== true || git.Source !== git.Target
+        || typeof git.Source !== 'string' || path.normalize(git.Source) !== git.Source
+        || !this.isAllowedWorkspacePath(git.Source) || git.Source === workspace || isStrictDescendant(git.Source, workspace)) return
+    }
+    const requiredEnv = new Map([
+      ['HOME', '/home/freshell/provider'], ['XDG_DATA_HOME', '/home/freshell/provider/.local/share'],
+      ['XDG_CONFIG_HOME', '/home/freshell/provider/.config'], ['OPENCODE_DB', '/home/freshell/provider/.local/share/opencode/opencode.db'],
+    ])
+    // Production clones terminal.env, then forces these four locations. The ordinary host's Env is a different projection.
+    if (!Array.isArray(parsed.Env) || parsed.Env.some((value: unknown) => typeof value !== 'string' || value.indexOf('=') < 1 || value.includes('\0'))) return
+    const env: string[] = parsed.Env
+    const keys = env.map(value => value.slice(0, value.indexOf('=')))
+    if (new Set(keys).size !== keys.length || [...requiredEnv].some(([key, value]) => !env.includes(`${key}=${value}`))) return
+    return this.receipts().find(receipt => receipt.imageRef === parsed.Image && receipt.hostBinaryPath === binary.Source
+      && receipt.providerVolumeName === volume.Source && receipt.workspacePath === workspace
+      && path.dirname(stage.Source) === path.join(path.dirname(receipt.runtimeDir), 'opencode-transfers'))
+  }
+
   private validateHistoryHelper(name: string, body: Buffer): BrokerReceipt | undefined {
     if (!/^freshell-history-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(name)) return
     let parsed: Record<string, any>
@@ -520,10 +568,10 @@ export class RestrictedDockerBroker {
       && receipt.imageRef === parsed.Image && receipt.hostBinaryPath === binary.Source)
   }
 
-  private validHistoryHelperHost(host: Record<string, any>, retained: boolean): boolean {
+  private validHistoryHelperHost(host: Record<string, any>, retained: boolean, capAdd: string[] = []): boolean {
     const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
     return host.NetworkMode === 'none' && host.ReadonlyRootfs === true && host.Privileged !== true
-      && (host.PidMode ?? '') === '' && (host.Binds?.length ?? 0) === 0 && (host.CapAdd?.length ?? 0) === 0
+      && (host.PidMode ?? '') === '' && (host.Binds?.length ?? 0) === 0 && same(host.CapAdd ?? [], capAdd)
       && same(host.CapDrop, ['ALL']) && same(host.SecurityOpt, ['no-new-privileges'])
       && host.Memory === 256 * 1024 * 1024 && host.MemorySwap === 256 * 1024 * 1024
       && host.NanoCpus === 500_000_000 && host.PidsLimit === 32
