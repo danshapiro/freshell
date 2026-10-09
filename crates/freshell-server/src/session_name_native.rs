@@ -1095,7 +1095,9 @@ impl ClaudeNativeNameAdapter {
                 self.helper_path.display()
             )
         })?;
-        freshell_platform::child_nofile::restore_after_spawn(child.id(), &self.node);
+        // No open-file reset (`freshell_platform::child_nofile`): the helper
+        // is always Node, which raises its own soft limit to the hard limit
+        // at start, and a reset landing after that check would pin it lower.
         use tokio::io::AsyncWriteExt;
         if let Some(stdin) = child.stdin.as_mut() {
             let mut line = request.to_string();

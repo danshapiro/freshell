@@ -178,7 +178,10 @@ impl ModelCatalogProbe for ClaudeCatalogProbe {
             let child = command.spawn().map_err(|error| {
                 claude_probe_error(format!("Cannot start Claude model catalog: {error}"))
             })?;
-            freshell_platform::child_nofile::restore_after_spawn(child.id(), "node");
+            // No open-file reset (`freshell_platform::child_nofile`): the
+            // probe is always Node, which raises its own soft limit to the
+            // hard limit at start, and a reset landing after that check
+            // would pin it lower.
             #[cfg(target_os = "linux")]
             let process_group = child.id();
             let output =

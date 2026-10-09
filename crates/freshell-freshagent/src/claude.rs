@@ -9576,7 +9576,9 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
             entry.display()
         )
     })?;
-    freshell_platform::child_nofile::restore_after_spawn(child.id(), &node);
+    // No open-file reset (`freshell_platform::child_nofile`): the sidecar is
+    // always Node, which raises its own soft limit to the hard limit at
+    // start, and a reset landing after that check would pin it lower.
     let stdin = child.stdin.take().ok_or("sidecar stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("sidecar stdout unavailable")?;
     // Drain stderr so verbose SDK/CLI logs can never fill the pipe and stall the sidecar.

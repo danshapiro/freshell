@@ -2863,3 +2863,155 @@ async fn an_invalid_observation_title_retains_provenance_without_offering_or_rea
     assert_eq!(sync.status, NativeSyncStatus::Pending);
     assert!(sync.reason.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// The helper is always Node, so its spawn leaves the open-file limit alone.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod helper_open_file_limit {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use freshell_platform::child_nofile;
+    use freshell_protocol::native_location::NativeLocation;
+
+    use crate::session_name_native::ClaudeNativeNameAdapter;
+
+    /// Set in the re-run copy of this test binary: the directory the role
+    /// works in.
+    const ROLE_DIR_ENV: &str = "FRESHELL_TEST_HELPER_NOFILE_DIR";
+
+    /// The soft limit the role's process "started with".
+    const ORIGINAL_SOFT: u64 = 512;
+
+    /// Stands in for Node but never raises its own limit. After a pause long
+    /// enough for any reset by its spawner to land, it records the limit it
+    /// runs with beside itself.
+    const SH_RECORDER: &str = "sleep 0.5\n\
+dir=$(dirname \"$0\")\n\
+printf '%s %s\\n' \"$(ulimit -Sn)\" \"$(ulimit -Hn)\" > \"$dir/limits.tmp\"\n\
+mv \"$dir/limits.tmp\" \"$dir/limits\"\n";
+
+    /// A Node program that records, after the same pause, the limit it runs
+    /// with once Node's own start-up is done.
+    const NODE_RECORDER: &str = "import { readFileSync, renameSync, writeFileSync } from 'node:fs'\n\
+setTimeout(() => {\n\
+  const row = readFileSync('/proc/self/limits', 'utf8').split('\\n').find((line) => line.startsWith('Max open files'))\n\
+  const [soft, hard] = row.trim().split(/\\s+/).slice(3, 5)\n\
+  const tmp = new URL('./limits.tmp', import.meta.url)\n\
+  writeFileSync(tmp, `${soft} ${hard}\\n`)\n\
+  renameSync(tmp, new URL('./limits', import.meta.url))\n\
+}, 500)\n";
+
+    fn own_limits() -> (u64, u64) {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid out-pointer to an rlimit.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        (lim.rlim_cur, lim.rlim_max)
+    }
+
+    fn set_own_soft(soft: u64) {
+        let lim = libc::rlimit {
+            rlim_cur: soft,
+            rlim_max: own_limits().1,
+        };
+        // SAFETY: a valid rlimit whose soft value does not exceed its hard value.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) }, 0);
+    }
+
+    /// Node raises its own soft open-file limit to the hard limit as it
+    /// starts, but only when the two differ. A reset after the spawn that
+    /// landed after Node's check would pin the helper at the server's
+    /// original soft limit, so this spawn site leaves the limit alone
+    /// (`freshell_platform::child_nofile`).
+    ///
+    /// The open-file record is process-wide and set once, so the check runs
+    /// in a fresh copy of this test binary (the re-run role convention of
+    /// `session_name_generation_tests.rs`).
+    #[test]
+    fn the_claude_helper_spawn_leaves_its_childs_open_file_limit_alone() {
+        if let Some(dir) = std::env::var_os(ROLE_DIR_ENV) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("role runtime")
+                .block_on(role(Path::new(&dir)));
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "session_name_native::tests::helper_open_file_limit::the_claude_helper_spawn_leaves_its_childs_open_file_limit_alone",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(ROLE_DIR_ENV, dir.path())
+            .output()
+            .expect("run the role");
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "the role failed:\n{report}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("checked"))
+                .ok()
+                .as_deref(),
+            Some("ok"),
+            "the role never ran:\n{report}"
+        );
+    }
+
+    /// The server's start-up (record the original soft limit, raise to the
+    /// hard limit), then one helper spawn with `sh` standing in for Node and
+    /// one with real `node`: both must end at the hard limit.
+    async fn role(dir: &Path) {
+        let hard = own_limits().1;
+        assert!(
+            hard > ORIGINAL_SOFT,
+            "the test needs a hard limit above {ORIGINAL_SOFT} (got {hard})"
+        );
+        set_own_soft(ORIGINAL_SOFT);
+        child_nofile::record_original_soft_limit(ORIGINAL_SOFT);
+        set_own_soft(hard);
+
+        for (node, recorder) in [("sh", SH_RECORDER), ("node", NODE_RECORDER)] {
+            let stage = dir.join(node);
+            std::fs::create_dir_all(&stage).expect("stage dir");
+            let helper_path = stage.join("session-names.mjs");
+            std::fs::write(&helper_path, recorder).expect("write the recorder");
+            let adapter = ClaudeNativeNameAdapter {
+                node: node.to_string(),
+                helper_path,
+            };
+            let location = NativeLocation::Claude {
+                config_root: stage.display().to_string(),
+                transcript_path: None,
+                project_directory_key: None,
+                transcript_cwd: Some(stage.display().to_string()),
+                effective_project_key_override: None,
+            };
+            let mut child = adapter
+                .spawn_helper(&location, &serde_json::json!({ "op": "read" }))
+                .await
+                .expect("spawn the helper");
+            tokio::time::timeout(Duration::from_secs(15), child.wait())
+                .await
+                .expect("the recorder exits on its own")
+                .expect("wait for the recorder");
+            let raw = std::fs::read_to_string(stage.join("limits")).expect("the recorded limit");
+            let limits: Vec<u64> = raw
+                .split_whitespace()
+                .map(|v| v.parse().expect("a number"))
+                .collect();
+            assert_eq!(limits, vec![hard, hard], "the helper run by {node}");
+        }
+        std::fs::write(dir.join("checked"), "ok").expect("mark the role as run");
+    }
+}
