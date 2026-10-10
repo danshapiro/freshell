@@ -472,7 +472,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       await page.reload()
       await harness.waitForHarness()
       await harness.waitForConnection()
-      const pane = page.locator(`[data-pane-id="${created.paneId}"]`)
+      const pane = page.locator(`[data-pane-shell="true"][data-pane-id="${created.paneId}"]`)
       await expect(pane.getByText('Synthetic saved answer 2', { exact: true })).toBeVisible({ timeout: 60_000 })
       const original = (await harness.getPaneLayout(created.tabId)).content
       expect(original.soulId).toBe(view.soulId)
