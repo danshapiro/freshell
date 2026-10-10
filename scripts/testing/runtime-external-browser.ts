@@ -828,32 +828,37 @@ export class ExternalManagedRuntimeRig {
     }
     let response: Response | undefined
     for (let attempt = 0; attempt < 2; attempt++) {
+      response = undefined
       try {
         response = await this.transport(`${this.descriptor.baseUrl}/__managed_runtime`, {
           ...request, signal: AbortSignal.timeout(90_000),
         })
-        break
       } catch {
         if (attempt === 1) throw new Error(`closed owner ${action} transport did not settle`)
-        process.stderr.write(`${JSON.stringify({ severity: 'warn', event: 'managed_external_owner_transport_retry',
-          runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, operationId, action })}\n`)
       }
+      if (response?.ok) break
+      if (response) {
+        const status = response.status
+        const contentType = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase()
+        const server = response.headers.get('server')?.trim().toLowerCase()
+        const ray = response.headers.get('cf-ray'), relayRequest = response.headers.get(OWNED_RELAY_REQUEST_HEADER)
+        emitExternalDiagnostic('client', () => process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'managed_external_owner_http_failed',
+          runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, operationId, action, status,
+          server: server === OWNED_RELAY_SERVER ? 'owned_relay' : server === 'cloudflare' ? 'cloudflare' : 'unknown',
+          contentType: !contentType ? 'absent' : contentType === 'application/json' ? 'json'
+            : contentType === 'text/html' ? 'html' : contentType === 'text/plain' ? 'text' : 'other',
+          cloudflareRay: ray && /^[a-f0-9]{16}-[A-Z]{3}$/.test(ray) ? ray : null,
+          relayRequestId: relayRequest && z.string().uuid().safeParse(relayRequest).success ? relayRequest : null,
+        })}\n`))
+        // Only the read-only status poll may share the existing transport retry for this upstream response.
+        const upstreamStatusFailure = action === 'retained-status' && status === 502
+          && server === 'cloudflare' && contentType === 'text/html' && relayRequest === null
+        if (!upstreamStatusFailure || attempt === 1) throw new Error(`closed owner operation refused: ${status}`)
+      }
+      process.stderr.write(`${JSON.stringify({ severity: 'warn', event: 'managed_external_owner_transport_retry',
+        runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, operationId, action })}\n`)
     }
     if (!response) throw new Error('closed owner transport produced no response')
-    if (!response.ok) {
-      const contentType = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase()
-      const server = response.headers.get('server')?.trim().toLowerCase()
-      const ray = response.headers.get('cf-ray'), relayRequest = response.headers.get(OWNED_RELAY_REQUEST_HEADER)
-      emitExternalDiagnostic('client', () => process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'managed_external_owner_http_failed',
-        runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, operationId, action, status: response.status,
-        server: server === OWNED_RELAY_SERVER ? 'owned_relay' : server === 'cloudflare' ? 'cloudflare' : 'unknown',
-        contentType: !contentType ? 'absent' : contentType === 'application/json' ? 'json'
-          : contentType === 'text/html' ? 'html' : contentType === 'text/plain' ? 'text' : 'other',
-        cloudflareRay: ray && /^[a-f0-9]{16}-[A-Z]{3}$/.test(ray) ? ray : null,
-        relayRequestId: relayRequest && z.string().uuid().safeParse(relayRequest).success ? relayRequest : null,
-      })}\n`))
-      throw new Error(`closed owner operation refused: ${response.status}`)
-    }
     let body: unknown
     try { body = await response.json() } catch { throw new Error('closed owner reply is not valid JSON') }
     const reply = z.object({ runId: z.literal(this.descriptor.runId), candidateSha: z.literal(this.descriptor.candidateSha),

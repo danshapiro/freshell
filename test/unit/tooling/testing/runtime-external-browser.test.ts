@@ -743,6 +743,137 @@ describe('owned stable relay admission and lifetime (transport unit coverage onl
 describe('owner HTTP failure observability', () => {
   const context = () => runner.resolveManagedExternalDescriptor(descriptor)!
   const operationId = '550e8400-e29b-41d4-a716-446655440000'
+  const edgeHeaders = { server: 'cloudflare', 'content-type': 'text/html; charset=UTF-8', 'cf-ray': '0123456789abcdef-SJC' }
+  const edgeFailure = () => new Response('private-response-sentinel', { status: 502, headers: edgeHeaders })
+  const ownerReply = (init: RequestInit, result: unknown) => {
+    const request = JSON.parse(String(init.body))
+    return new Response(JSON.stringify({ runId: request.runId, candidateSha: request.candidateSha,
+      operationId: request.operationId, result }))
+  }
+  it('retries the observed upstream retained-status 502 and returns the actual validated owner stage', async () => {
+    const bound = context(), write = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    const timeout = vi.spyOn(AbortSignal, 'timeout')
+    const stage = { kind: 'failed', sequence: 7 }
+    let attempts = 0
+    const transport = vi.fn(async (_url: string, init: RequestInit) => ++attempts === 1
+      ? edgeFailure() : ownerReply(init, stage))
+    try {
+      const rig = new runner.ExternalManagedRuntimeRig(bound, transport)
+      await expect(rig.retainedFixtureStage()).resolves.toEqual(stage)
+      expect(transport).toHaveBeenCalledTimes(2)
+      const requests = transport.mock.calls.map(([url, init]) => ({ url, method: init.method, headers: init.headers, body: init.body }))
+      expect(requests[1]).toEqual(requests[0])
+      expect(JSON.parse(String(requests[0].body))).toMatchObject({ runId: bound.runId, candidateSha: bound.candidateSha,
+        scenarioId: 'browser-managed-runtime', action: 'retained-status', operationId: expect.any(String) })
+      expect(timeout.mock.calls).toEqual([[90_000], [90_000]])
+      const events = write.mock.calls.map(([line]) => JSON.parse(String(line)))
+      expect(events.filter(event => event.event === 'managed_external_owner_http_failed')).toEqual([
+        expect.objectContaining({ action: 'retained-status', status: 502, server: 'cloudflare', contentType: 'html', relayRequestId: null }),
+      ])
+      expect(events.filter(event => event.event === 'managed_external_owner_transport_retry')).toEqual([
+        { severity: 'warn', event: 'managed_external_owner_transport_retry', runId: bound.runId, candidateSha: bound.candidateSha,
+          operationId: JSON.parse(String(requests[0].body)).operationId, action: 'retained-status' },
+      ])
+      expect(JSON.stringify(events)).not.toContain('private-')
+      expect(JSON.stringify(events)).not.toContain(bound.token)
+    } finally { timeout.mockRestore(); write.mockRestore() }
+  })
+  it.each([
+    ['edge', 'edge'], ['fetch', 'edge'], ['edge', 'fetch'], ['fetch', 'fetch'],
+  ] as const)('shares the original two-attempt budget for retained-status failures %s then %s', async (first, second) => {
+    const write = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    const timeout = vi.spyOn(AbortSignal, 'timeout')
+    let attempts = 0
+    const transport = vi.fn(async (_url: string, _init: RequestInit) => {
+      const failure = [first, second][attempts++]
+      if (failure === 'fetch') throw new TypeError('private-fetch-sentinel')
+      return edgeFailure()
+    })
+    try {
+      const rig = new runner.ExternalManagedRuntimeRig(context(), transport)
+      await expect(rig.retainedFixtureStage()).rejects.toThrow(second === 'edge'
+        ? 'closed owner operation refused: 502' : 'closed owner retained-status transport did not settle')
+      expect(transport).toHaveBeenCalledTimes(2)
+      expect(transport.mock.calls[1]).toEqual([transport.mock.calls[0][0],
+        expect.objectContaining({ method: transport.mock.calls[0][1].method,
+          headers: transport.mock.calls[0][1].headers, body: transport.mock.calls[0][1].body })])
+      expect(timeout.mock.calls).toEqual([[90_000], [90_000]])
+      const events = write.mock.calls.map(([line]) => JSON.parse(String(line)))
+      expect(events.filter(event => event.event === 'managed_external_owner_transport_retry')).toHaveLength(1)
+      const failures = events.filter(event => event.event === 'managed_external_owner_http_failed')
+      expect(failures).toHaveLength([first, second].filter(value => value === 'edge').length)
+      for (const failure of failures) expect(failure).toMatchObject({ action: 'retained-status', status: 502,
+        server: 'cloudflare', contentType: 'html', relayRequestId: null,
+        operationId: JSON.parse(String(transport.mock.calls[0][1].body)).operationId })
+      expect(JSON.stringify(events)).not.toContain('private-')
+    } finally { timeout.mockRestore(); write.mockRestore() }
+  })
+  it('preserves successful fetch-rejection recovery with the same retained-status operation', async () => {
+    const write = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    let attempts = 0
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      if (++attempts === 1) throw new TypeError('fetch failed')
+      return ownerReply(init, { kind: 'finished', sequence: 3 })
+    })
+    try {
+      const rig = new runner.ExternalManagedRuntimeRig(context(), transport)
+      await expect(rig.retainedFixtureStage()).resolves.toEqual({ kind: 'finished', sequence: 3 })
+      expect(transport).toHaveBeenCalledTimes(2)
+      expect(transport.mock.calls[1][1].body).toBe(transport.mock.calls[0][1].body)
+    } finally { write.mockRestore() }
+  })
+  it.each([
+    [502, { server: 'cloudflare', 'content-type': 'application/json' }],
+    [502, { server: 'unknown', 'content-type': 'text/html' }],
+    [502, { ...edgeHeaders, 'x-freshell-relay-request-id': operationId }],
+    [502, { ...edgeHeaders, 'x-freshell-relay-request-id': 'invalid-owned-header' }],
+    [409, edgeHeaders],
+    [503, edgeHeaders],
+  ])('refuses retained-status HTTP %i without retry for headers %j', async (status, headers) => {
+    const write = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    const transport = vi.fn(async (_url: string, _init: RequestInit) => new Response(null, { status, headers }))
+    try {
+      const rig = new runner.ExternalManagedRuntimeRig(context(), transport)
+      await expect(rig.retainedFixtureStage()).rejects.toThrow(`closed owner operation refused: ${status}`)
+      expect(transport).toHaveBeenCalledOnce()
+      expect(write.mock.calls.map(([line]) => JSON.parse(String(line)).event)).toEqual(['managed_external_owner_http_failed'])
+    } finally { write.mockRestore() }
+  })
+  it.each(['start', 'observe', 'finish', 'replace-web'] as const)('never retries upstream 502 for the mutating %s operation', async action => {
+    const write = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    const transport = vi.fn(async (_url: string, _init: RequestInit) => edgeFailure())
+    try {
+      const rig = new runner.ExternalManagedRuntimeRig(context(), transport)
+      const result = action === 'start' ? rig.startRetainedFixture('legacy')
+        : action === 'observe' ? rig.observeRetainedFixture(7)
+          : action === 'finish' ? rig.finishRetainedFixture() : rig.crashAndRestartWeb()
+      await expect(result).rejects.toThrow('closed owner operation refused: 502')
+      expect(transport).toHaveBeenCalledOnce()
+      const sent = JSON.parse(String(transport.mock.calls[0][1].body))
+      if (action === 'start') expect(sent.challengeId).toBe('legacy')
+      if (action === 'observe') expect(sent.generation).toBe(7)
+    } finally { write.mockRestore() }
+  })
+  it.each(['wrong-run', 'invalid-stage', 'invalid-json'] as const)('preserves %s refusal after the upstream retained-status retry', async invalid => {
+    const write = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    let attempts = 0
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      if (++attempts === 1) return edgeFailure()
+      if (invalid === 'invalid-json') return new Response('not JSON')
+      if (invalid === 'invalid-stage') return ownerReply(init, { kind: 'preparing', sequence: -1 })
+      const request = JSON.parse(String(init.body))
+      return new Response(JSON.stringify({ runId: 'wrong-run', candidateSha: request.candidateSha,
+        operationId: request.operationId, result: { kind: 'preparing', sequence: 0 } }))
+    })
+    try {
+      const rig = new runner.ExternalManagedRuntimeRig(context(), transport)
+      await expect(rig.retainedFixtureStage()).rejects.toThrow(invalid === 'invalid-json'
+        ? 'closed owner reply is not valid JSON' : invalid === 'invalid-stage'
+          ? 'closed owner retained-status reply result is missing or invalid'
+          : 'closed owner reply has invalid run, candidate, operation or shape')
+      expect(transport).toHaveBeenCalledTimes(2)
+    } finally { write.mockRestore() }
+  })
   it('records receipt and completion for control-local retained status while the ordinary backend is unavailable', async () => {
     const bound = context(), recordLifecycle = vi.fn()
     const stage = { kind: 'observe', sequence: 1, phase: 'store_blocked', context: { token: 'private-context-sentinel' } }
@@ -793,8 +924,8 @@ describe('owner HTTP failure observability', () => {
     } finally { await relay.stop() }
   })
   it.each([
-    [{ server: 'cloudflare', 'content-type': 'text/html', 'cf-ray': '0123456789abcdef-SJC' },
-      { server: 'cloudflare', contentType: 'html', cloudflareRay: '0123456789abcdef-SJC' }],
+    [{ server: 'cloudflare', 'content-type': 'text/html', 'cf-ray': '0123456789abcdef-SJC', 'x-freshell-relay-request-id': operationId },
+      { server: 'cloudflare', contentType: 'html', cloudflareRay: '0123456789abcdef-SJC', relayRequestId: operationId }],
     [{ server: 'freshell-managed-runtime-relay', 'content-type': 'application/json', 'x-freshell-relay-request-id': operationId },
       { server: 'owned_relay', contentType: 'json', cloudflareRay: null, relayRequestId: operationId }],
     [{ server: 'private-header-sentinel', 'content-type': 'private-header-sentinel', 'cf-ray': 'private-header-sentinel',
