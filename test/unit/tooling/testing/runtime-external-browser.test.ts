@@ -29,7 +29,7 @@ import * as runner from '../../../../scripts/testing/runtime-external-browser.js
 import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type SupervisorInstance, type Phase3BrowserObservation, type RuntimeLossAssertions, type RuntimeWebConstructOptions } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 import { stopManagedRuntimeSoul, createManagedOpenCodeRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
-import { structuredChaosLog } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
+import { structuredChaosLog, reportInterruptedOrdinaryStopAckFailure } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import type { BrokerReceipt } from '../../../../scripts/testing/runtime-test-broker.js'
 import type { ProviderQualificationRow } from '../../../../scripts/testing/provider-qualification-receipt.js'
@@ -1085,6 +1085,100 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       if (nextPid) await expect(fsp.stat(`/proc/${nextPid}`)).rejects.toThrow()
       await fsp.rm(directory, { recursive: true })
     }
+  })
+})
+
+describe('interrupted ordinary Stop ACK diagnostic', () => {
+  const prefix = '[interrupted-ordinary-stop-ack-sockets] '
+  const capture = {
+    expected: { presentationSessionId: 'presentation-owned', nativeSessionId: 'native-owned', soulId: 'soul-owned' },
+    sentAtStop: 1, receivedAtStop: 1, stopSocketAtMs: 50,
+    sent: [{ type: 'hello', token: 'PRIVATE_AUTH_TOKEN' },
+      { type: 'freshAgent.kill', sessionId: 'presentation-owned', provider: 'codex', sessionType: 'freshcodex',
+        observedEpoch: 77, observedGeneration: 9, text: 'PRIVATE_TRANSCRIPT', token: 'PRIVATE_AUTH_TOKEN' }],
+    received: [{ type: 'freshAgent.event', event: { type: 'freshAgent.message', text: 'PRIVATE_TRANSCRIPT' } },
+      { type: 'freshAgent.event', sessionId: 'other-presentation', provider: 'codex',
+        event: { type: 'freshAgent.killed', sessionId: 'native-owned', provider: 'codex', sessionType: 'freshcodex',
+          success: false, code: 'STOP_FAILED', text: 'PRIVATE_TRANSCRIPT', url: 'PRIVATE_SOCKET_URL' } },
+      { type: 'freshAgent.killed', sessionId: 'presentation-owned', success: false, code: 'ACK_FAILED',
+        settings: { token: 'PRIVATE_AUTH_TOKEN' } },
+      { type: 'freshAgent.message', text: 'PRIVATE_TRANSCRIPT' }],
+    sentSocketFacts: [{ socketOrdinal: 1, atMs: 1 }, { socketOrdinal: 2, atMs: 51 }],
+    receivedSocketFacts: [{ socketOrdinal: 1, atMs: 2 }, { socketOrdinal: 2, atMs: 52 },
+      { socketOrdinal: 2, atMs: 53 }, { socketOrdinal: 2, atMs: 54 }],
+    socketLifecycle: [{ socketOrdinal: 1, atMs: 0, event: 'created' },
+      { socketOrdinal: 1, atMs: 49, event: 'closed' }, { socketOrdinal: 2, atMs: 50, event: 'created' },
+      { socketOrdinal: 2, atMs: 51, event: 'open-observed-by-frame' }],
+  }
+
+  it('retains the complete sanitized failure in actual zero-retry line reporter output', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-ack-output-'))
+    try {
+      const require = createRequire(import.meta.url)
+      const helper = path.join(sourceRoot, 'test/e2e-browser/helpers/runtime-chaos-evidence.ts')
+      const config = path.join(directory, 'playwright.config.mjs')
+      await fsp.writeFile(path.join(directory, 'package.json'), JSON.stringify({ type: 'module' }))
+      await fsp.writeFile(config, `export default ${JSON.stringify({ testDir: directory, retries: 0, workers: 1,
+        reporter: 'line', outputDir: path.join(directory, 'results') })}`)
+      await fsp.writeFile(path.join(directory, 'ack.spec.ts'), `
+        import playwright from ${JSON.stringify(require.resolve('@playwright/test'))}
+        import { reportInterruptedOrdinaryStopAckFailure } from ${JSON.stringify(helper)}
+        const { test, expect } = playwright
+        test('owned zero-retry ACK failure', async ({}, testInfo) => {
+          const failure = new Error('ORIGINAL_ACK_ASSERTION')
+          try { await reportInterruptedOrdinaryStopAckFailure(failure, testInfo, ${JSON.stringify(capture)}) }
+          catch (observed) { expect(observed).toBe(failure); throw observed }
+        })
+      `)
+      const result = spawnSync(process.execPath, [require.resolve('@playwright/test/cli'), 'test', '--config', config], {
+        cwd: sourceRoot, encoding: 'utf8', timeout: 30_000,
+        env: { ...process.env, CI: '1', FORCE_COLOR: '0' },
+      })
+      expect(result.error).toBeUndefined()
+      expect(result.status).toBe(1)
+      const output = `${result.stdout}${result.stderr}`.replace(/\u001b\[[0-9;]*[A-Za-z]/g, '')
+      expect(output).toContain('ORIGINAL_ACK_ASSERTION')
+      expect(output).toMatch(/1 failed/)
+      expect(output).not.toContain('retry #')
+      const line = output.split(/\r?\n/).find(row => row.startsWith(prefix))
+      expect(line, 'diagnostic must survive the collected text output').toBeDefined()
+      expect(line!.length).toBeGreaterThan(300)
+      const diagnostic = JSON.parse(line!.slice(prefix.length))
+      expect(diagnostic).toMatchObject({ severity: 'error', event: 'interrupted_ordinary_stop_ack_missing',
+        expected: capture.expected, sentAtStop: 1, receivedAtStop: 1, stopSocketAtMs: 50,
+        sent: [{ arrayIndex: 1, socketOrdinal: 2, atMs: 51, type: 'freshAgent.kill', sessionId: 'presentation-owned',
+          observedEpoch: 77, observedGeneration: 9 }],
+        received: [{ arrayIndex: 1, socketOrdinal: 2, atMs: 52, type: 'freshAgent.event',
+          sessionId: 'other-presentation', eventSessionId: 'native-owned', success: false, code: 'STOP_FAILED' },
+        { arrayIndex: 2, socketOrdinal: 2, atMs: 53, type: 'freshAgent.killed', success: false, code: 'ACK_FAILED' }],
+        socketLifecycle: capture.socketLifecycle })
+      expect(diagnostic.sent).toHaveLength(1)
+      expect(diagnostic.received).toHaveLength(2)
+      expect(line).not.toMatch(/PRIVATE_|token|text|settings|url/)
+      // A prefix keeps the record in Cloud textPayload, fetched unchanged by
+      // the launcher's existing execution-log failure path.
+      expect(() => JSON.parse(line!)).toThrow()
+    } finally { await fsp.rm(directory, { recursive: true, force: true }) }
+  })
+
+  it('emits before attachment failure and rethrows the identical original assertion', async () => {
+    const failure = new Error('original assertion')
+    const writes: string[] = []
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => { writes.push(String(chunk)); return true })
+    let emittedBeforeAttach = false
+    const attach = vi.fn<Parameters<typeof reportInterruptedOrdinaryStopAckFailure>[1]['attach']>(async () => {
+      emittedBeforeAttach = writes.some(line => line.startsWith(prefix))
+      throw new Error('attachment unavailable')
+    })
+    try {
+      await expect(reportInterruptedOrdinaryStopAckFailure(failure, { attach }, capture)).rejects.toBe(failure)
+      expect(attach).toHaveBeenCalledOnce()
+      expect(emittedBeforeAttach).toBe(true)
+      expect(writes.filter(line => line.startsWith(prefix))).toHaveLength(1)
+      const attachedBody = attach.mock.calls[0][1].body
+      expect(Buffer.isBuffer(attachedBody)).toBe(true)
+      expect(writes[0]).toBe(`${prefix}${attachedBody!.toString()}\n`)
+    } finally { write.mockRestore() }
   })
 })
 
@@ -3544,7 +3638,8 @@ describe('closed Cloud metadata handoff', () => {
 describe('actual Cloud launcher browser image binding', () => {
   const imageManifest = { schemaVersion: 2, mediaType: 'application/vnd.oci.image.manifest.v1+json', config: {}, layers: [] }
   const fixtureDigest = `sha256:${createHash('sha256').update(JSON.stringify(imageManifest)).digest('hex')}`
-  async function launch(external: boolean, digest: string, observedImage?: string, executionImage?: string, registryDocuments?: Record<string, unknown>) {
+  async function launch(external: boolean, digest: string, observedImage?: string, executionImage?: string,
+    registryDocuments?: Record<string, unknown>, diagnosticLog?: string) {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-cloud-image-'))
     try {
       const scripts = path.join(directory, 'scripts')
@@ -3568,6 +3663,7 @@ if(args[0]==='artifacts'){console.log(process.env.TEST_DIGEST);process.exit(0)}
 if(args.includes('create')){const image=args.find(x=>x.startsWith('--image=')).slice(8);fs.writeFileSync(process.env.TEST_CALLS+'.image',image);process.exit(0)}
 if(args.includes('describe')){const job=args.find(x=>x.startsWith('freshell-e2e-'));const observed=args.includes('executions')?process.env.TEST_EXECUTION_IMAGE:process.env.TEST_OBSERVED_IMAGE;const containers=[{image:observed||fs.readFileSync(process.env.TEST_CALLS+'.image','utf8')}];console.log(JSON.stringify({metadata:{name:job,labels:{'freshell-managed-run':'${descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID}','freshell-managed-candidate':'${'a'.repeat(40)}'}},spec:{template:{spec:args.includes('executions')?{containers}:{template:{spec:{containers}}}}}}));process.exit(0)}
 if(args.includes('execute')){const job=args.find(x=>x.startsWith('freshell-e2e-'));console.log('Execution ['+job+'-fixture] has failed.');process.exit(73)}
+if(args.includes('logs')&&args.includes('read')){process.stdout.write(process.env.TEST_DIAGNOSTIC_LOG||'');process.exit(0)}
 process.exit(0);\n`
       for (const name of ['git', 'gcloud', 'pnpm']) await fsp.writeFile(path.join(bin, name), command, { mode: 0o700 })
       const registryFixture = path.join(directory, 'registry-fixture.mjs')
@@ -3585,7 +3681,8 @@ process.exit(0);\n`
         env: { ...process.env, ...descriptor, PATH: `${bin}${path.delimiter}${process.env.PATH}`,
           FRESHELL_GCP_ACCOUNT: 'owned-fixture@example.test', TEST_CALLS: calls,
           TEST_EXTERNAL: external ? '1' : '0', TEST_DIGEST: digest, TEST_OBSERVED_IMAGE: observedImage,
-          TEST_EXECUTION_IMAGE: executionImage, TEST_REGISTRY_DOCUMENTS: JSON.stringify(registryDocuments ?? { [digest]: imageManifest }) },
+          TEST_EXECUTION_IMAGE: executionImage, TEST_REGISTRY_DOCUMENTS: JSON.stringify(registryDocuments ?? { [digest]: imageManifest }),
+          TEST_DIAGNOSTIC_LOG: diagnosticLog },
         encoding: 'utf8', timeout: 20_000,
       })
       const operations = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { name: string; args: string[] })
@@ -3593,6 +3690,29 @@ process.exit(0);\n`
       return { child, operations, events }
     } finally { await fsp.rm(directory, { recursive: true, force: true }) }
   }
+
+  it('retains interrupted ordinary Stop ACK diagnostic through the actual failed-execution log consumer', async () => {
+    const writes: string[] = []
+    const failure = new Error('original ACK failure')
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => { writes.push(String(chunk)); return true })
+    try {
+      await expect(reportInterruptedOrdinaryStopAckFailure(failure, { attach: async () => undefined }, {
+        expected: { presentationSessionId: 'presentation-owned', nativeSessionId: 'native-owned', soulId: 'soul-owned' },
+        sentAtStop: 0, receivedAtStop: 0, stopSocketAtMs: 10,
+        sent: [{ type: 'freshAgent.kill', sessionId: 'presentation-owned', observedEpoch: 77,
+          observedGeneration: 9, token: 'PRIVATE_AUTH_TOKEN', text: 'PRIVATE_TRANSCRIPT' }],
+        received: [], sentSocketFacts: [{ socketOrdinal: 1, atMs: 11 }], receivedSocketFacts: [],
+        socketLifecycle: [{ socketOrdinal: 1, atMs: 0, event: 'created' }],
+      })).rejects.toBe(failure)
+    } finally { write.mockRestore() }
+    const diagnosticLog = writes.join('')
+    expect(diagnosticLog.length).toBeGreaterThan(300)
+    const result = await launch(true, fixtureDigest, undefined, undefined, undefined, diagnosticLog)
+    expect(result.child.status).toBe(1)
+    expect(result.operations.some(row => row.name === 'gcloud' && row.args.includes('logs') && row.args.includes('read'))).toBe(true)
+    expect(result.child.stdout).toContain(diagnosticLog)
+    expect(result.child.stdout).not.toMatch(/PRIVATE_AUTH_TOKEN|PRIVATE_TRANSCRIPT/)
+  })
 
   it('pins the uniquely verified Linux amd64 manifest from the candidate index before create', async () => {
     const childManifest = { schemaVersion: 2, mediaType: 'application/vnd.oci.image.manifest.v1+json', config: {}, layers: [] }

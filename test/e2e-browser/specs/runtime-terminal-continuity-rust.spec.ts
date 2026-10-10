@@ -15,6 +15,7 @@ import { waitForOpenCodeTerminalCondition } from '../helpers/opencode-native-his
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { reportInterruptedOrdinaryStopAckFailure } from '../helpers/runtime-chaos-evidence.js'
 
 function findTerminalLeaves(node: any, out: any[] = []): any[] {
   if (!node) return out
@@ -523,25 +524,10 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
           return message.sessionId === original.sessionId && event.type === 'freshAgent.killed' && event.success === false
         }), { timeout: 30_000 }).toBe(true)
       } catch (failure) {
-        try {
-          const killFrames = (frames: any[], offset: number, socketFacts: typeof sentSocketFacts) => frames.slice(offset).flatMap((message, index) => {
-            const event = message.type === 'freshAgent.event' ? message.event : message
-            if (!['freshAgent.kill', 'freshAgent.killed'].includes(event?.type)) return []
-            return [{ ...socketFacts[offset + index], arrayIndex: offset + index,
-              type: message.type, eventType: event.type, sessionId: message.sessionId, eventSessionId: event.sessionId,
-              provider: message.provider, eventProvider: event.provider,
-              sessionType: message.sessionType, eventSessionType: event.sessionType,
-              observedEpoch: message.observedEpoch, observedGeneration: message.observedGeneration,
-              success: event.success, code: event.code }]
-          })
-          await testInfo.attach('interrupted-ordinary-stop-ack-sockets', {
-            contentType: 'application/json',
-            body: Buffer.from(JSON.stringify({ expected: { presentationSessionId: original.sessionId ?? null,
-              nativeSessionId: nativeId, soulId: view.soulId }, sentAtStop, receivedAtStop, stopSocketAtMs,
-              sent: killFrames(sent, sentAtStop, sentSocketFacts),
-              received: killFrames(received, receivedAtStop, receivedSocketFacts), socketLifecycle })),
-          })
-        } finally { throw failure }
+        await reportInterruptedOrdinaryStopAckFailure(failure, testInfo, {
+          expected: { presentationSessionId: original.sessionId ?? null, nativeSessionId: nativeId, soulId: view.soulId },
+          sentAtStop, receivedAtStop, stopSocketAtMs, sent, received, sentSocketFacts, receivedSocketFacts, socketLifecycle,
+        })
       }
       expect(sent.slice(sentAtStop).filter((frame) => frame.type === 'freshAgent.kill')).toHaveLength(1)
       await expect(pane).toBeVisible()
