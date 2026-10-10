@@ -2,15 +2,146 @@
 //! daemon-family exclusion, and the per-OS reads the backends build on.
 //!
 //! Linux reads `/proc`; Windows reads process objects and a Toolhelp32
-//! snapshot; the macOS bodies land in a later task behind the same names
-//! (until then they answer `ErrorKind::Unsupported`).
+//! snapshot; macOS reads libproc (zombie-aware, see `crate::darwin`) and
+//! `KERN_PROCARGS2`.
 //! A process's arguments (argv) are read only for [`is_codex_daemon_family`]
 //! and are never logged or sent anywhere: argv can carry secrets.
 
 use std::io;
 
+/// One environment variable of another process, as far as this server can
+/// read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvRead {
+    /// The variable is set to this value.
+    Value(String),
+    /// The environment was read and lacks the variable, or the process is
+    /// gone.
+    Absent,
+    /// The process runs, but the kernel does not show its environment:
+    /// another user's or a non-dumpable process on Linux; on macOS a
+    /// restricted (entitled) program, whose environment the kernel trims
+    /// silently while System Integrity Protection is on. Never "untagged".
+    Withheld,
+}
+
+/// The value of `key` among `KEY=VALUE` entries.
+#[cfg(any(unix, test))]
+fn env_lookup<'a>(entries: impl IntoIterator<Item = &'a [u8]>, key: &str) -> EnvRead {
+    let prefix = format!("{key}=");
+    entries
+        .into_iter()
+        .find_map(|kv| kv.strip_prefix(prefix.as_bytes()))
+        .map_or(EnvRead::Absent, |v| {
+            EnvRead::Value(String::from_utf8_lossy(v).into_owned())
+        })
+}
+
+/// Linux: `/proc/<pid>/environ`; a permission error (another uid, a
+/// non-dumpable process) is `Withheld`, any other error (gone) `Absent`.
+#[cfg(target_os = "linux")]
+pub fn environ_read(pid: u32, key: &str) -> EnvRead {
+    match std::fs::read(format!("/proc/{pid}/environ")) {
+        Ok(raw) => env_lookup(raw.split(|b| *b == 0), key),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => EnvRead::Withheld,
+        Err(_) => EnvRead::Absent,
+    }
+}
+
+/// macOS: `Withheld` when the program is restricted (`CS_RESTRICT`) or the
+/// environment section of `KERN_PROCARGS2` is empty (the kernel trims it
+/// silently; an `env -i` process looks the same), `Absent` when a readable
+/// section lacks `key` or the process is gone (or exiting: the kernel
+/// answers EINVAL).
+#[cfg(target_os = "macos")]
+pub fn environ_read(pid: u32, key: &str) -> EnvRead {
+    if crate::darwin::cs_flags(pid).is_some_and(|f| f & crate::darwin::CS_RESTRICT != 0) {
+        return EnvRead::Withheld;
+    }
+    let Some(args) = crate::darwin::procargs(pid)
+        .ok()
+        .and_then(|raw| parse_procargs(&raw))
+    else {
+        return EnvRead::Absent;
+    };
+    if args.env.is_empty() {
+        return EnvRead::Withheld;
+    }
+    env_lookup(args.env.iter().map(Vec::as_slice), key)
+}
+
+/// Windows: another process's environment is not read; the unit's job is
+/// the membership authority there.
+#[cfg(windows)]
+pub fn environ_read(_pid: u32, _key: &str) -> EnvRead {
+    EnvRead::Absent
+}
+
+/// One environment value, when it can be read and is set (see
+/// [`environ_read`] for the cases that tell absent from withheld).
+pub fn environ_value(pid: u32, key: &str) -> Option<String> {
+    match environ_read(pid, key) {
+        EnvRead::Value(value) => Some(value),
+        EnvRead::Absent | EnvRead::Withheld => None,
+    }
+}
+
+/// The parts of a macOS `KERN_PROCARGS2` area.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+struct ProcArgs {
+    argv: Vec<String>,
+    /// `KEY=VALUE` entries, raw.
+    env: Vec<Vec<u8>>,
+}
+
+/// Parses a `KERN_PROCARGS2` area: `argc` (a native-endian `i32`), the
+/// exec path NUL-terminated, NUL padding, exactly `argc` NUL-terminated
+/// argv strings, then NUL-terminated `KEY=VALUE` strings until an empty
+/// string (or the end, when the kernel trimmed the environment). `argv`
+/// never reads past its `argc` strings, so no environment entry can be
+/// taken for an argument. `None` when the area is too short for `argc`.
+#[cfg(any(target_os = "macos", test))]
+fn parse_procargs(raw: &[u8]) -> Option<ProcArgs> {
+    let argc = i32::from_ne_bytes(raw.get(..4)?.try_into().ok()?);
+    let argc = usize::try_from(argc).ok()?;
+    let mut at = 4;
+    // One NUL-terminated string from `at` (the rest of the area when it has
+    // no NUL), and the position after its terminator.
+    let next = |at: usize| -> (&[u8], usize) {
+        let rest = &raw[at.min(raw.len())..];
+        let len = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+        (&rest[..len], at + len + 1)
+    };
+    let (_exec_path, after) = next(at);
+    at = after;
+    while raw.get(at) == Some(&0) {
+        at += 1;
+    }
+    let mut argv = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        if at >= raw.len() {
+            break;
+        }
+        let (arg, after) = next(at);
+        argv.push(String::from_utf8_lossy(arg).into_owned());
+        at = after;
+    }
+    let mut env = Vec::new();
+    while at < raw.len() {
+        let (entry, after) = next(at);
+        if entry.is_empty() {
+            break;
+        }
+        env.push(entry.to_vec());
+        at = after;
+    }
+    Some(ProcArgs { argv, env })
+}
+
 /// One process incarnation. `name` is the process name (Linux
-/// `/proc/<pid>/comm`, Windows the image file name), never its arguments: argv can carry tokens
+/// `/proc/<pid>/comm`, Windows the image file name, macOS `pbi_name` or
+/// `pbi_comm`), never its arguments: argv can carry tokens
 /// (`--token=…`, `https://user:pass@…`, `-c …bearer_token="…"`) and the log
 /// scrubber cannot redact every shape, so logs and the wire carry only `name`
 /// plus `pid` (plus `start` for survivors).
@@ -18,7 +149,8 @@ use std::io;
 pub struct ProcIdentity {
     pub pid: u32,
     /// OS start time of this incarnation (Linux: clock ticks since boot;
-    /// Windows: the creation time in 100 ns intervals since 1601).
+    /// Windows: the creation time in 100 ns intervals since 1601; macOS:
+    /// microseconds since the epoch).
     /// `(pid, start)` names one process forever; a recycled pid differs.
     pub start: u64,
     pub name: String,
@@ -88,9 +220,10 @@ pub fn start_time(pid: u32) -> io::Result<u64> {
         .ok_or_else(|| io::Error::other("no starttime"))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn start_time(_pid: u32) -> io::Result<u64> {
-    Err(unsupported())
+/// macOS: `pbi_start_tvsec * 1_000_000 + pbi_start_tvusec` (zombies too).
+#[cfg(target_os = "macos")]
+pub fn start_time(pid: u32) -> io::Result<u64> {
+    crate::darwin::bsdinfo(pid).map(|info| crate::darwin::start_of(&info))
 }
 
 /// The process name. Linux: `/proc/<pid>/comm` without its trailing newline.
@@ -100,9 +233,10 @@ pub fn name(pid: u32) -> io::Result<String> {
     Ok(raw.trim_end_matches('\n').to_string())
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn name(_pid: u32) -> io::Result<String> {
-    Err(unsupported())
+/// macOS: `pbi_name`, or `pbi_comm` when that is empty.
+#[cfg(target_os = "macos")]
+pub fn name(pid: u32) -> io::Result<String> {
+    crate::darwin::bsdinfo(pid).map(|info| crate::darwin::name_of(&info))
 }
 
 /// Linux: the process's arguments. Only [`is_codex_daemon_family`] callers
@@ -152,27 +286,6 @@ pub fn all_pids() -> Vec<u32> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Linux: one environment value, or None when unreadable (other uid,
-/// non-dumpable) — callers log unreadable candidates, never guess.
-#[cfg(target_os = "linux")]
-pub fn environ_value(pid: u32, key: &str) -> Option<String> {
-    environ_entry(pid, key).ok().flatten()
-}
-
-/// Linux: one environment value of `pid`: `Ok(Some)` when set, `Ok(None)`
-/// when absent, `Err` when the environment cannot be read (another uid, a
-/// non-dumpable process). The tag backend counts unreadable same-uid
-/// processes instead of silently treating them as untagged.
-#[cfg(target_os = "linux")]
-pub(crate) fn environ_entry(pid: u32, key: &str) -> io::Result<Option<String>> {
-    let raw = std::fs::read(format!("/proc/{pid}/environ"))?;
-    let prefix = format!("{key}=");
-    Ok(raw.split(|b| *b == 0).find_map(|kv| {
-        let s = String::from_utf8_lossy(kv);
-        s.strip_prefix(&prefix).map(str::to_string)
-    }))
 }
 
 /// Linux: the real uid of `pid` (`/proc/<pid>/status`), readable even for
@@ -607,62 +720,60 @@ pub fn all_pids() -> Vec<u32> {
     snapshot().into_iter().map(|(p, _, _)| p).collect()
 }
 
-/// Windows: another process's environment is not readable through a
-/// supported API; the unit's job is the membership authority there.
-#[cfg(windows)]
-pub fn environ_value(_pid: u32, _key: &str) -> Option<String> {
-    None
+// macOS: libproc facts, every lookup zombie-aware (`crate::darwin`).
+
+/// macOS: the process's arguments: exactly the `argc` strings of
+/// `KERN_PROCARGS2`, never the environment that follows them. Only
+/// [`is_codex_daemon_family`] callers read this, and never log it.
+#[cfg(target_os = "macos")]
+pub fn argv(pid: u32) -> io::Result<Vec<String>> {
+    let raw = crate::darwin::procargs(pid)?;
+    parse_procargs(&raw)
+        .map(|args| args.argv)
+        .ok_or_else(|| io::Error::other("malformed KERN_PROCARGS2 area"))
 }
 
-// macOS: the process facts below answer "nothing" until its bodies land
-// (Task 7). No backend there finds members through them yet.
-
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn argv(_pid: u32) -> io::Result<Vec<String>> {
-    Err(unsupported())
+/// macOS: true while the process exists and is not a zombie (a process
+/// that has begun exiting still runs until it becomes one).
+#[cfg(target_os = "macos")]
+pub fn is_running(pid: u32) -> bool {
+    crate::darwin::bsdinfo(pid).is_ok_and(|info| !crate::darwin::is_zombie(&info))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn is_running(_pid: u32) -> bool {
-    false
+#[cfg(target_os = "macos")]
+pub fn parent(pid: u32) -> Option<u32> {
+    crate::darwin::bsdinfo(pid).ok().map(|info| info.pbi_ppid)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn parent(_pid: u32) -> Option<u32> {
-    None
+/// macOS: the processes whose parent is `pid` (the kernel's own filter of
+/// its process list, zombies included).
+#[cfg(target_os = "macos")]
+pub fn children(pid: u32) -> Vec<u32> {
+    crate::darwin::child_pids(pid)
+        .into_iter()
+        .filter(|child| *child != pid)
+        .collect()
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn children(_pid: u32) -> Vec<u32> {
-    Vec::new()
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
 pub fn all_pids() -> Vec<u32> {
-    Vec::new()
+    crate::darwin::all_pids()
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn environ_value(_pid: u32, _key: &str) -> Option<String> {
-    None
+/// macOS: the real uid of `pid` (`pbi_ruid`).
+#[cfg(target_os = "macos")]
+pub(crate) fn real_uid(pid: u32) -> Option<u32> {
+    crate::darwin::bsdinfo(pid).ok().map(|info| info.pbi_ruid)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn environ_entry(_pid: u32, _key: &str) -> io::Result<Option<String>> {
-    Err(unsupported())
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn real_uid(_pid: u32) -> Option<u32> {
-    None
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "process facts are not implemented on this OS yet",
-    )
+/// macOS: the process the system holds responsible for `pid`: itself after
+/// a disclaimed spawn (the `--disclaim` shim), otherwise copied from its
+/// parent at fork and kept through `setsid`, exec and reparenting. Read
+/// through private libSystem functions resolved at run time; `None` when
+/// they do not exist here or the pid cannot be read.
+#[cfg(target_os = "macos")]
+pub fn responsible_pid(pid: u32) -> Option<u32> {
+    crate::darwin::responsible_pid(pid)
 }
 
 #[cfg(test)]
@@ -717,6 +828,70 @@ mod command_line_tests {
         assert_eq!(split("\"C:\\dir\\\" x"), ["C:\\dir\\", "x"]);
         assert_eq!(split(""), Vec::<String>::new());
         assert_eq!(split("   "), Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
+mod procargs_tests {
+    use super::{env_lookup, parse_procargs, EnvRead, ProcArgs};
+
+    /// A `KERN_PROCARGS2` area: argc, the exec path, NUL padding, then the
+    /// given NUL-separated strings.
+    fn area(argc: i32, strings: &[&str], tail: &[u8]) -> Vec<u8> {
+        let mut raw = argc.to_ne_bytes().to_vec();
+        raw.extend_from_slice(b"/usr/local/bin/node\0\0\0\0");
+        for s in strings {
+            raw.extend_from_slice(s.as_bytes());
+            raw.push(0);
+        }
+        raw.extend_from_slice(tail);
+        raw
+    }
+
+    #[test]
+    fn argv_is_exactly_argc_strings_and_the_environment_follows_them() {
+        let raw = area(
+            3,
+            &["node", "-e", "", "FRESHELL_UNIT_ID=u1", "PATH=/bin", ""],
+            b"executable_path=/x\0",
+        );
+        assert_eq!(
+            parse_procargs(&raw).unwrap(),
+            ProcArgs {
+                argv: vec!["node".into(), "-e".into(), "".into()],
+                env: vec![b"FRESHELL_UNIT_ID=u1".to_vec(), b"PATH=/bin".to_vec()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_trimmed_environment_is_an_empty_section() {
+        // The kernel trims a restricted program's area right after argv.
+        let raw = area(2, &["/bin/sleep", "60"], &[0, 0, 0]);
+        let parsed = parse_procargs(&raw).unwrap();
+        assert_eq!(parsed.argv, ["/bin/sleep", "60"]);
+        assert!(parsed.env.is_empty());
+        let cut = area(2, &["/bin/sleep", "60"], b"");
+        assert!(parse_procargs(&cut).unwrap().env.is_empty());
+    }
+
+    #[test]
+    fn a_short_or_truncated_area_never_reads_past_its_end() {
+        assert_eq!(parse_procargs(&[1, 0]), None);
+        assert_eq!(parse_procargs(&(-1i32).to_ne_bytes()), None);
+        // argc promises more strings than the area holds.
+        let raw = area(5, &["a", "b"], b"");
+        assert_eq!(parse_procargs(&raw).unwrap().argv, ["a", "b"]);
+    }
+
+    #[test]
+    fn an_environment_lookup_tells_a_value_from_an_absent_key() {
+        let entries: [&[u8]; 2] = [b"FRESHELL_UNIT_IDX=no", b"FRESHELL_UNIT_ID=u1"];
+        assert_eq!(
+            env_lookup(entries, "FRESHELL_UNIT_ID"),
+            EnvRead::Value("u1".into())
+        );
+        assert_eq!(env_lookup(entries, "OTHER"), EnvRead::Absent);
     }
 }
 

@@ -15,13 +15,13 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
-use crate::backend::{Capability, UnitBackend, UnitObserver};
+use crate::backend::{Capability, MemberList, UnitBackend, UnitObserver};
 use crate::events::{self, UnitLogKeys};
 use crate::proc_watch::{ProcWatch, Sig};
 use crate::process::ProcIdentity;
@@ -272,6 +272,8 @@ struct StopState {
     /// Counts Force requests that joined; the soft phase and a failed
     /// persist wait on it.
     force_joins: watch::Sender<u64>,
+    /// The withheld-environment count was logged for this stop (once).
+    withheld_logged: AtomicBool,
     m: Mutex<StopMut>,
 }
 
@@ -447,6 +449,7 @@ impl AgentUnit {
         if kill_now {
             let _ = watch.signal(Sig::Kill);
         }
+        watch.watch_lock_paths(&lock(&self.inner.lock_paths));
         let new = identity_of(watch);
         let dropped = previous
             .map(|w| identity_of(&w))
@@ -474,7 +477,13 @@ impl AgentUnit {
         matches!((&m.main, &m.screen), (Some(main), Some(screen)) if main.identity() == screen.identity())
     }
 
+    /// The unit's conversation lock files, checked before Gone. Every
+    /// pinned watch gets them too (on macOS a watch opened while its
+    /// process was already exiting waits for their unlock).
     pub fn set_lock_paths(&self, paths: Vec<PathBuf>) {
+        for watch in self.pinned_watches() {
+            watch.watch_lock_paths(&paths);
+        }
         *lock(&self.inner.lock_paths) = paths;
     }
 
@@ -507,9 +516,39 @@ impl AgentUnit {
     /// backend a scan of every process), so async callers run it on a
     /// blocking task.
     pub fn members(&self) -> io::Result<Vec<ProcIdentity>> {
-        let list = self.inner.backend.members(&self.live_roots())?;
-        log_withheld(&self.log_keys(self.stop_operation()), list.withheld);
+        let list = self.member_list()?;
+        self.note_withheld(&self.log_keys(self.stop_operation()), list.withheld);
         Ok(list.members)
+    }
+
+    /// One reading of the members, nothing logged (the stop's own scans run
+    /// on blocking threads and report the withheld count back).
+    fn member_list(&self) -> io::Result<MemberList> {
+        self.inner.backend.members(&self.live_roots())
+    }
+
+    /// The members plus every `extra` process they do not include.
+    fn members_and(&self, extra: Vec<ProcIdentity>) -> Vec<ProcIdentity> {
+        let mut members = self.member_list().unwrap_or_default().members;
+        for process in extra {
+            if !members.iter().any(|m| m.pid == process.pid) {
+                members.push(process);
+            }
+        }
+        members
+    }
+
+    /// Logs the same-uid processes a member scan could not read, with the
+    /// unit's keys: once per stop while one is in flight, else per call.
+    fn note_withheld(&self, keys: &UnitLogKeys, withheld: u64) {
+        if withheld == 0 {
+            return;
+        }
+        let stop = lock(&self.inner.stop).clone();
+        if stop.is_some_and(|stop| stop.withheld_logged.swap(true, Ordering::SeqCst)) {
+            return;
+        }
+        events::environ_withheld(keys, withheld);
     }
 
     /// The backend's "unit is empty" event (see `testing::unit_empty_wait`).
@@ -533,7 +572,10 @@ impl AgentUnit {
     pub(crate) fn pin_recorded_roots(&self, roots: &[(u32, u64)]) {
         for (pid, start) in roots {
             match ProcWatch::open_expecting(*pid, *start) {
-                Ok(watch) => lock(&self.inner.members).roots.push(watch),
+                Ok(watch) => {
+                    watch.watch_lock_paths(&lock(&self.inner.lock_paths));
+                    lock(&self.inner.members).roots.push(watch);
+                }
                 Err(err) => {
                     events::root_not_pinned(&self.log_keys(None), *pid, *start, &err.to_string())
                 }
@@ -672,7 +714,7 @@ impl AgentUnit {
         let snapshot = if self.inner.capability.full {
             Vec::new()
         } else {
-            self.snapshot().await?
+            self.snapshot(&keys).await?
         };
         let escalated = self.soft_phase(&state, mode, &keys).await;
         let spared = self.kill_unit(&keys, &snapshot).await;
@@ -790,16 +832,20 @@ impl AgentUnit {
     /// Step b (non-full backends): pin every current member before the soft
     /// signal, so one that loses both its tag and its parent link during the
     /// grace is still killed (Stage 2: LB-44).
-    async fn snapshot(&self) -> io::Result<Vec<ProcWatch>> {
+    async fn snapshot(&self, keys: &UnitLogKeys) -> io::Result<Vec<ProcWatch>> {
         let unit = self.clone();
-        blocking(move || {
-            unit.members()
-                .unwrap_or_default()
+        let (watches, withheld) = blocking(move || {
+            let list = unit.member_list().unwrap_or_default();
+            let watches: Vec<ProcWatch> = list
+                .members
                 .into_iter()
                 .filter_map(|p| ProcWatch::open_expecting(p.pid, p.start).ok())
-                .collect()
+                .collect();
+            (watches, list.withheld)
         })
-        .await
+        .await?;
+        self.note_withheld(keys, withheld);
+        Ok(watches)
     }
 
     /// Step c: the soft signal and its grace. Returns whether the stop
@@ -895,7 +941,7 @@ impl AgentUnit {
         let roots = live_identities(&pinned);
         let spared = match self.inner.backend.clone().kill_all(roots).await {
             Ok(summary) => {
-                log_withheld(keys, summary.withheld);
+                self.note_withheld(keys, summary.withheld);
                 if let Some(detail) = &summary.not_frozen {
                     events::freeze_timeout(keys, detail);
                 }
@@ -967,6 +1013,7 @@ impl AgentUnit {
     /// the main's exit only when no other live process shares its open file
     /// description): every member still holding a lock path is killed
     /// through a pinned watch, then the holders are checked once more.
+    #[cfg(not(target_os = "macos"))]
     async fn check_locks(&self, snapshot: &[ProcWatch]) -> io::Result<bool> {
         let paths = lock(&self.inner.lock_paths).clone();
         if paths.is_empty() {
@@ -986,6 +1033,7 @@ impl AgentUnit {
     }
 
     /// The unit members (and live snapshot members) holding any of `paths`.
+    #[cfg(not(target_os = "macos"))]
     async fn member_lock_holders(
         &self,
         paths: &[PathBuf],
@@ -993,24 +1041,102 @@ impl AgentUnit {
     ) -> io::Result<Vec<ProcIdentity>> {
         let unit = self.clone();
         let paths = paths.to_vec();
-        let snapshot: Vec<ProcIdentity> = snapshot
-            .iter()
-            .filter(|w| !w.has_exited())
-            .map(|w| w.identity().clone())
-            .collect();
+        let snapshot = live_identity_list(snapshot);
         blocking(move || {
-            let mut members = unit.members().unwrap_or_default();
-            for extra in snapshot {
-                if !members.iter().any(|m| m.pid == extra.pid) {
-                    members.push(extra);
-                }
-            }
+            let members = unit.members_and(snapshot);
             let pids: Vec<u32> = members.iter().map(|m| m.pid).collect();
             let holders = locks::lock_holders_among(&paths, &pids);
             members
                 .into_iter()
                 .filter(|m| holders.iter().any(|h| h.pid == m.pid))
                 .collect()
+        })
+        .await
+    }
+
+    /// macOS: a process that has begun exiting no longer shows its
+    /// descriptors, though they (and its lock) may still be open, and a
+    /// watch opened on it then proves nothing until it is a zombie. So a
+    /// member lock holder is confirmed released only through an exit watch
+    /// registered before its exit (the pinned roots and the snapshot taken
+    /// before the soft signal; Codex's holder is normally its native main,
+    /// a pinned root), awaited also for such members whose descriptors can
+    /// no longer be read. A holder found after the kill with no such watch
+    /// is killed, and its lock file's unlock (`NOTE_FUNLOCK`, registered
+    /// before the scan that found it) is awaited. Then the holders are
+    /// checked once more.
+    #[cfg(target_os = "macos")]
+    async fn check_locks(&self, snapshot: &[ProcWatch]) -> io::Result<bool> {
+        let paths = lock(&self.inner.lock_paths).clone();
+        if paths.is_empty() {
+            return Ok(true);
+        }
+        let unlocks = locks::UnlockEvents::watch(&paths)?;
+        let mut watched = self.pinned_watches();
+        watched.extend(snapshot.iter().cloned());
+        let watch_of = |who: &ProcIdentity| {
+            watched
+                .iter()
+                .find(|w| identity_of(w) == (who.pid, who.start))
+                .cloned()
+        };
+        let scan = self.member_lock_scan(&paths, snapshot).await?;
+        let mut awaited: Vec<ProcWatch> = Vec::new();
+        let mut pending: Vec<PathBuf> = Vec::new();
+        for (who, path) in &scan.holders {
+            match watch_of(who) {
+                Some(watch) => awaited.push(watch),
+                None => {
+                    if let Ok(watch) = ProcWatch::open_expecting(who.pid, who.start) {
+                        let _ = watch.signal(Sig::Kill);
+                    }
+                    if !pending.contains(path) {
+                        pending.push(path.clone());
+                    }
+                }
+            }
+        }
+        awaited.extend(scan.unreadable.iter().filter_map(watch_of));
+        for watch in &awaited {
+            watch.watch_lock_paths(&paths);
+            let _ = watch.signal(Sig::Kill);
+            watch.exited().await?;
+        }
+        while !pending.is_empty() {
+            let unlocked = unlocks.next().await?;
+            pending.retain(|path| !unlocked.contains(path));
+        }
+        Ok(self
+            .member_lock_scan(&paths, snapshot)
+            .await?
+            .holders
+            .is_empty())
+    }
+
+    /// macOS: one descriptor scan of the unit members (and live snapshot
+    /// members) for `paths`.
+    #[cfg(target_os = "macos")]
+    async fn member_lock_scan(
+        &self,
+        paths: &[PathBuf],
+        snapshot: &[ProcWatch],
+    ) -> io::Result<MemberLockScan> {
+        let unit = self.clone();
+        let paths = paths.to_vec();
+        let snapshot = live_identity_list(snapshot);
+        blocking(move || {
+            let members = unit.members_and(snapshot);
+            let pids: Vec<u32> = members.iter().map(|m| m.pid).collect();
+            let scan = locks::scan_among(&paths, &pids);
+            let member = |pid: u32| members.iter().find(|m| m.pid == pid).cloned();
+            MemberLockScan {
+                holders: scan
+                    .holders
+                    .into_iter()
+                    .filter_map(|h| member(h.pid).map(|m| (m, h.path)))
+                    .collect(),
+                unreadable: scan.unreadable.into_iter().filter_map(member).collect(),
+            }
         })
         .await
     }
@@ -1091,7 +1217,7 @@ impl AgentUnit {
                     Err(_) => false,
                 };
                 let unit = self.clone();
-                let survivors = blocking(move || unit.members().unwrap_or_default())
+                let survivors = blocking(move || unit.member_list().unwrap_or_default().members)
                     .await
                     .unwrap_or_default();
                 (emptied, survivors)
@@ -1101,8 +1227,9 @@ impl AgentUnit {
                 // still a member, under the same bound.
                 let unit = self.clone();
                 let left: Vec<ProcWatch> = blocking(move || {
-                    unit.members()
+                    unit.member_list()
                         .unwrap_or_default()
+                        .members
                         .into_iter()
                         .filter_map(|p| ProcWatch::open_expecting(p.pid, p.start).ok())
                         .collect()
@@ -1215,12 +1342,22 @@ impl UnitObserver for RecordRoots {
     }
 }
 
-/// Logs the same-uid processes a member scan could not read, with the
-/// unit's keys (nothing when there are none).
-fn log_withheld(keys: &UnitLogKeys, withheld: u64) {
-    if withheld > 0 {
-        events::environ_withheld(keys, withheld);
-    }
+/// The identities of the not-yet-exited `watches`.
+fn live_identity_list(watches: &[ProcWatch]) -> Vec<ProcIdentity> {
+    watches
+        .iter()
+        .filter(|w| !w.has_exited())
+        .map(|w| w.identity().clone())
+        .collect()
+}
+
+/// macOS: what one member descriptor scan found: the holders with the lock
+/// file each holds, and the members whose descriptors could not be read
+/// although they still run (they have begun exiting).
+#[cfg(target_os = "macos")]
+struct MemberLockScan {
+    holders: Vec<(ProcIdentity, PathBuf)>,
+    unreadable: Vec<ProcIdentity>,
 }
 
 /// The not-yet-exited `watches` as sorted, distinct `(pid, start time)`.
@@ -1255,6 +1392,7 @@ impl StopState {
             requested: Instant::now(),
             requested_ms: now_ms(),
             force_joins: watch::channel(0).0,
+            withheld_logged: AtomicBool::new(false),
             m: Mutex::new(StopMut {
                 mode: req.mode,
                 forced: req.mode == StopMode::Force,
@@ -1518,11 +1656,12 @@ mod tests {
         let unit = unit_on(Arc::new(Withholding));
         let events = capture_on_runtime(async {
             unit.members().unwrap();
+            unit.members().unwrap();
             let handle = unit.stop(
                 StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws").operation("op-1"),
             );
-            // The kill and the post-Gone sweep's kill each report 3 (the
-            // stop's member scans run on blocking threads, outside capture).
+            // The snapshot's scan reports 2 and every kill reports 3; the
+            // stop logs once, the first count it met.
             handle.wait_swept().await;
         });
         let withheld = named(&events, "unit.members.environ_withheld");
@@ -1530,7 +1669,7 @@ mod tests {
             .iter()
             .map(|e| (e.u64("count"), e.str("operation_id")))
             .collect();
-        assert_eq!(got, [(2, ""), (3, "op-1"), (3, "op-1")]);
+        assert_eq!(got, [(2, ""), (2, ""), (2, "op-1")]);
         for event in withheld {
             assert_eq!(event.level, tracing::Level::INFO);
             assert_unit_keys(event, &unit, event.str("operation_id"));

@@ -354,7 +354,8 @@ async fn the_unit_tag_is_read_or_reported_withheld() {
     let id = UnitId::mint();
     let codex_home = tempfile::tempdir().unwrap();
     // (what, command, process name after exec, argv after exec, may be withheld)
-    let cases: Vec<(&str, Vec<String>, &str, Vec<String>, bool)> = vec![
+    type Case = (&'static str, Vec<String>, &'static str, Vec<String>, bool);
+    let cases: Vec<Case> = vec![
         (
             "sleep",
             vec!["/bin/sleep".into(), "60".into()],
@@ -655,7 +656,7 @@ async fn a_withheld_environment_falls_back_to_roots_and_descendants() {
             .unwrap_or_else(|_| panic!("the {what} node survived the stop"))
             .unwrap();
     }
-    if reads.iter().any(|r| *r == EnvRead::Withheld) {
+    if reads.contains(&EnvRead::Withheld) {
         assert!(
             cap.has(tracing::Level::INFO, "unit.members.environ_withheld"),
             "a stop that met withheld environments logs it"

@@ -15,6 +15,17 @@
 //! Codex's `LockFileEx` lock lives on a handle that is never inherited and
 //! ends only when that handle closes.
 //!
+//! macOS reads each candidate's descriptors through libproc: a process
+//! holds a lock file when one of its vnode descriptors refers to that file
+//! (same device and inode as `stat` of the path) and the open file is
+//! marked `FHASLOCK` (it took a `flock` lock). A process that has begun
+//! exiting no longer shows its descriptors, so an empty answer about a
+//! dying process proves nothing: the unit confirms such holders through an
+//! exit watch registered before their exit, or an unlock event
+//! ([`UnlockEvents`]). The kernel fills each vnode descriptor's stat from
+//! its filesystem, so a lookup can wait on a hung network mount; callers
+//! bound it.
+//!
 //! One-shot reads only; nothing here waits or polls. Holders are named by
 //! process name, never by command line (argv can carry secrets). On Linux,
 //! file identities are read without a server round trip (except as noted on
@@ -378,17 +389,176 @@ mod restart_manager {
     }
 }
 
-/// Not implemented on this OS yet: no visible holder (macOS: Task 7,
-/// libproc `FHASLOCK`).
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn lock_holders(_paths: &[PathBuf]) -> Vec<LockHolder> {
-    Vec::new()
+/// macOS: every process of this server's (effective) uid that currently
+/// holds one of `paths` (other users' descriptor tables cannot be read).
+#[cfg(target_os = "macos")]
+pub fn lock_holders(paths: &[PathBuf]) -> Vec<LockHolder> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let pids: Vec<u32> = crate::process::all_pids()
+        .into_iter()
+        .filter(|pid| crate::darwin::bsdinfo(*pid).is_ok_and(|info| info.pbi_uid == me))
+        .collect();
+    lock_holders_among(paths, &pids)
 }
 
-/// Not implemented on this OS yet: no visible holder (macOS: Task 7).
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn lock_holders_among(_paths: &[PathBuf], _pids: &[u32]) -> Vec<LockHolder> {
-    Vec::new()
+/// macOS: [`lock_holders`] restricted to `pids` (a unit's members), one
+/// entry per (pid, path).
+#[cfg(target_os = "macos")]
+pub fn lock_holders_among(paths: &[PathBuf], pids: &[u32]) -> Vec<LockHolder> {
+    scan_among(paths, pids).holders
+}
+
+/// One macOS descriptor scan: the visible holders, and the pids whose
+/// descriptors could not be read although the process still runs (it has
+/// begun exiting, so it may still hold a lock it no longer shows).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+pub(crate) struct LockScan {
+    pub holders: Vec<LockHolder>,
+    pub unreadable: Vec<u32>,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn scan_among(paths: &[PathBuf], pids: &[u32]) -> LockScan {
+    use crate::darwin;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut wanted: Vec<(&PathBuf, (u32, u64))> = Vec::new();
+    for path in paths {
+        if wanted.iter().any(|(p, _)| *p == path) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(path) {
+            // `st_dev` is a signed 32-bit value here; its bits are the
+            // `vst_dev` libproc reports.
+            wanted.push((path, (meta.dev() as u32, meta.ino())));
+        }
+    }
+    let mut scan = LockScan::default();
+    if wanted.is_empty() {
+        return scan;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for &pid in pids {
+        if !seen.insert(pid) {
+            continue;
+        }
+        let fds = match darwin::fds(pid) {
+            Ok(fds) => fds,
+            Err(_) => {
+                if crate::process::is_running(pid) {
+                    scan.unreadable.push(pid);
+                }
+                continue;
+            }
+        };
+        let mut held: Vec<(u32, u64)> = Vec::new();
+        for fd in fds
+            .iter()
+            .filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
+        {
+            let Some(info) = darwin::vnode_fd_info(pid, fd.proc_fd) else {
+                continue;
+            };
+            if info.pfi.fi_openflags & darwin::FHASLOCK == 0 {
+                continue;
+            }
+            let id = (info.pvi.vi_stat.vst_dev, info.pvi.vi_stat.vst_ino);
+            if wanted.iter().any(|(_, w)| *w == id) && !held.contains(&id) {
+                held.push(id);
+            }
+        }
+        if held.is_empty() {
+            continue;
+        }
+        let name = crate::process::name(pid).unwrap_or_default();
+        scan.holders.extend(
+            wanted
+                .iter()
+                .filter(|(_, id)| held.contains(id))
+                .map(|(path, _)| LockHolder {
+                    pid,
+                    name: name.clone(),
+                    path: (*path).clone(),
+                }),
+        );
+    }
+    scan
+}
+
+/// macOS: unlock events on a set of lock files (`EVFILT_VNODE` /
+/// `NOTE_FUNLOCK`, posted when a `flock` lock on the file is released by
+/// `flock(2)` or by the last close of its open file). Registered when made,
+/// so an unlock that happens after that is never missed.
+#[cfg(target_os = "macos")]
+pub(crate) struct UnlockEvents {
+    kq: std::sync::Arc<crate::darwin::Kqueue>,
+    /// The watched files (kept open while registered), by descriptor.
+    files: Vec<(std::fs::File, PathBuf)>,
+}
+
+#[cfg(target_os = "macos")]
+impl UnlockEvents {
+    /// Watches every one of `paths` that exists.
+    pub(crate) fn watch(paths: &[PathBuf]) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let kq = crate::darwin::Kqueue::new()?;
+        let mut files = Vec::new();
+        for path in paths {
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_EVTONLY)
+                .open(path)
+            else {
+                continue; // no file, no holder
+            };
+            kq.change(
+                file.as_raw_fd() as usize,
+                libc::EVFILT_VNODE,
+                libc::EV_ADD | libc::EV_CLEAR,
+                crate::darwin::NOTE_FUNLOCK,
+            )?;
+            files.push((file, path.clone()));
+        }
+        Ok(Self {
+            kq: std::sync::Arc::new(kq),
+            files,
+        })
+    }
+
+    /// Waits (on a blocking thread, woken when this is dropped) for unlock
+    /// events, and returns the paths that were unlocked.
+    pub(crate) async fn next(&self) -> std::io::Result<Vec<PathBuf>> {
+        use std::os::fd::AsRawFd;
+        let kq = self.kq.clone();
+        let unlocked: Vec<usize> = tokio::task::spawn_blocking(move || {
+            kq.wait(None).map(|events| {
+                events
+                    .iter()
+                    .filter(|e| e.filter == libc::EVFILT_VNODE)
+                    .map(|e| e.ident)
+                    .collect()
+            })
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        Ok(self
+            .files
+            .iter()
+            .filter(|(file, _)| unlocked.contains(&(file.as_raw_fd() as usize)))
+            .map(|(_, path)| path.clone())
+            .collect())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for UnlockEvents {
+    fn drop(&mut self) {
+        // A wait still blocked in `next` returns.
+        let _ = self.kq.wake();
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

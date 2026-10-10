@@ -11,6 +11,8 @@ use std::pin::Pin;
 
 mod backend;
 pub mod containment;
+#[cfg(target_os = "macos")]
+mod darwin;
 pub mod events;
 pub mod exec_shim;
 pub mod listener;

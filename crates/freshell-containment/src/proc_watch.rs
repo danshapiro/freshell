@@ -15,10 +15,24 @@
 //! per watch. Only `Sig::Kill` exists there (`TerminateProcess`); the soft
 //! signals answer `ErrorKind::Unsupported`.
 //!
-//! The macOS body lands in a later task behind the same API (until then
-//! `open` answers `ErrorKind::Unsupported`).
+//! macOS uses a kqueue `EVFILT_PROC`/`NOTE_EXIT` registration made at
+//! `open`, with one blocking `kevent` thread per awaited watch publishing to
+//! a `tokio::sync::watch` (started by the first `exited` await). macOS has
+//! no pinning handle, and a process that has begun exiting is already
+//! invisible to a late registration and to a plain lookup while its
+//! descriptors (and any `flock` it holds) may still be open. So "exited" is
+//! concluded only from a `NOTE_EXIT` on a registration made before the exit
+//! began, from the zombie-aware lookup showing it a zombie (`SZOMB`, set
+//! after `NOTE_EXIT`), or from that lookup answering that it was reaped;
+//! never from a refused registration alone. A watch opened on an exiting
+//! process re-reads it once at a 1 s deadline after `open` and on each
+//! unlock of the unit's lock files (`watch_lock_paths`). `signal` re-checks
+//! the start time through the zombie-aware lookup, then sends with
+//! `kill(2)`.
 
 use std::io;
+use std::path::PathBuf;
+#[cfg(any(target_os = "linux", windows))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -38,7 +52,11 @@ pub struct ProcWatch {
 
 struct Inner {
     identity: ProcIdentity,
+    #[cfg(any(target_os = "linux", windows))]
     exited: AtomicBool,
+    /// The kqueue registration, its waiter thread and its published state.
+    #[cfg(target_os = "macos")]
+    mac: Arc<mac::Shared>,
     #[cfg(target_os = "linux")]
     fd: std::os::fd::OwnedFd,
     /// The pidfd's reactor registration (a duplicate fd), made by the first
@@ -86,6 +104,13 @@ impl ProcWatch {
     pub fn pid(&self) -> u32 {
         self.inner.identity.pid
     }
+
+    /// Hands the unit's lock files to this watch: on macOS a watch opened
+    /// while its process was already exiting re-reads the process on each
+    /// unlock of one of them (the release it waits for). Elsewhere an exit
+    /// watch needs no help.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn watch_lock_paths(&self, _paths: &[PathBuf]) {}
 }
 
 #[cfg(target_os = "linux")]
@@ -428,38 +453,338 @@ unsafe extern "system" fn on_process_exit(
     tx.send_replace(true);
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
 impl ProcWatch {
-    fn open_inner(_pid: u32, _expect_start: Option<u64>) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "ProcWatch is not implemented on this OS yet",
-        ))
+    fn open_inner(pid: u32, expect_start: Option<u64>) -> io::Result<Self> {
+        use crate::darwin::{self, Kqueue};
+        let gone = || io::Error::new(io::ErrorKind::NotFound, "process gone");
+        let kq = Kqueue::new()?;
+        let registered = kq.change(
+            pid as usize,
+            libc::EVFILT_PROC,
+            libc::EV_ADD | libc::EV_ONESHOT,
+            libc::NOTE_EXIT,
+        );
+        let (info, opened) = match registered {
+            Ok(()) => {
+                // Read after the registration pinned an incarnation. An exit
+                // event already pending means the registered process has
+                // exited: `info` names it only if this pid now shows that
+                // incarnation as a zombie, or no process at all.
+                let info = darwin::bsdinfo(pid).map_err(|_| gone())?;
+                if mac::exit_event(&kq.wait(Some(std::time::Duration::ZERO))?) {
+                    match darwin::bsdinfo(pid) {
+                        Ok(now)
+                            if darwin::start_of(&now) == darwin::start_of(&info)
+                                && darwin::is_zombie(&now) => {}
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        _ => return Err(gone()),
+                    }
+                    (info, mac::Opened::Exited)
+                } else {
+                    (info, mac::Opened::Live)
+                }
+            }
+            // A zombie, or a process that has begun exiting (its descriptors
+            // may still be open): refused registration alone proves nothing.
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {
+                let info = darwin::bsdinfo(pid).map_err(|_| gone())?;
+                let opened = if darwin::is_zombie(&info) {
+                    mac::Opened::Exited
+                } else {
+                    mac::Opened::Exiting
+                };
+                (info, opened)
+            }
+            Err(err) => return Err(err),
+        };
+        let identity = ProcIdentity {
+            pid,
+            start: darwin::start_of(&info),
+            name: darwin::name_of(&info),
+        };
+        if expect_start.is_some_and(|s| s != identity.start) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "different incarnation",
+            ));
+        }
+        let shared = Arc::new(mac::Shared::new(kq, &identity, opened));
+        Ok(Self {
+            inner: Arc::new(Inner {
+                identity,
+                mac: shared,
+            }),
+        })
     }
 
+    /// Non-blocking: is the process proven to have exited (zombies count)?
+    /// A pending exit event is collected; a watch opened while its process
+    /// was already exiting re-reads it (one zombie-aware lookup).
     pub fn has_exited(&self) -> bool {
-        self.inner.exited.load(Ordering::SeqCst)
+        self.inner.mac.has_exited()
     }
 
+    /// Resolves when the process has exited, by one of the proofs in the
+    /// module docs. The first await starts the watch's waiter thread; a
+    /// thread that cannot be started, or a wait that fails, answers `Err`,
+    /// and a later await starts a new one. Needs no particular runtime.
     pub async fn exited(&self) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "ProcWatch is not implemented on this OS yet",
-        ))
+        let shared = &self.inner.mac;
+        if shared.has_exited() {
+            return Ok(());
+        }
+        let mut rx = shared.subscribe();
+        mac::Shared::start_waiter(shared)?;
+        let outcome = rx
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| io::Error::other("exit watch closed"))?
+            .clone();
+        match outcome {
+            Some(Err(msg)) => Err(io::Error::other(msg)),
+            _ => Ok(()),
+        }
     }
 
-    pub fn signal(&self, _sig: Sig) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "ProcWatch is not implemented on this OS yet",
-        ))
+    /// See the cross-platform declaration: on macOS the files are registered
+    /// for `NOTE_FUNLOCK` only on a watch opened while its process was
+    /// exiting.
+    pub(crate) fn watch_lock_paths(&self, paths: &[PathBuf]) {
+        self.inner.mac.watch_lock_paths(paths);
     }
 
-    #[allow(dead_code)] // the Unix tag backend's sweep; macOS fills it in (Task 7)
-    pub(crate) fn send(&self, _signum: i32) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "ProcWatch is not implemented on this OS yet",
-        ))
+    /// Send a signal to THIS incarnation. An already-exited process is Ok(()).
+    pub fn signal(&self, sig: Sig) -> io::Result<()> {
+        self.send(match sig {
+            Sig::Interrupt => libc::SIGINT,
+            Sig::Terminate => libc::SIGTERM,
+            Sig::Kill => libc::SIGKILL,
+        })
+    }
+
+    /// Any signal number, to THIS incarnation (the stop-the-world sweep's
+    /// SIGSTOP and SIGCONT): the pid is re-checked to be this incarnation,
+    /// alive, right before `kill(2)`. An exited process is Ok(()).
+    pub(crate) fn send(&self, signum: i32) -> io::Result<()> {
+        use crate::darwin;
+        if self.has_exited() {
+            return Ok(());
+        }
+        match darwin::bsdinfo(self.pid()) {
+            Ok(info)
+                if darwin::start_of(&info) == self.inner.identity.start
+                    && !darwin::is_zombie(&info) => {}
+            _ => return Ok(()),
+        }
+        // SAFETY: plain kill(2) of a pid just verified to be this
+        // incarnation (pids are handed out in order, so one exiting and
+        // being reused in between is not a practical concern).
+        if unsafe { libc::kill(self.pid() as libc::pid_t, signum) } != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The macOS watch state shared by a `ProcWatch` and its waiter thread.
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    use crate::darwin::{self, Kqueue};
+    use crate::process::ProcIdentity;
+
+    /// A watch opened on a process that had already begun exiting re-reads
+    /// it once this long after `open` (a one-shot read at a deadline).
+    const EXITING_RECHECK: Duration = Duration::from_secs(1);
+
+    /// What `open` found.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Opened {
+        /// Registered before any exit: its `NOTE_EXIT` will come.
+        Live,
+        /// Refused because the process had begun exiting.
+        Exiting,
+        /// Already proven exited.
+        Exited,
+    }
+
+    /// `None` while waiting; `Some(Ok)` once exited; `Some(Err)` when the
+    /// waiter thread stopped on an error (the next await starts another).
+    type State = Option<Result<(), String>>;
+
+    pub(super) struct Shared {
+        kq: Kqueue,
+        pid: u32,
+        start: u64,
+        exiting: bool,
+        opened: Instant,
+        exited: AtomicBool,
+        state: tokio::sync::watch::Sender<State>,
+        /// Whether a waiter thread is running.
+        waiter: Mutex<bool>,
+        /// The watch was dropped: the waiter thread returns.
+        shutdown: AtomicBool,
+        /// Lock files registered for `NOTE_FUNLOCK` (kept open while
+        /// registered).
+        lock_files: Mutex<Vec<std::fs::File>>,
+    }
+
+    fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether `events` hold the registered process's exit.
+    pub(super) fn exit_event(events: &[libc::kevent]) -> bool {
+        events
+            .iter()
+            .any(|e| e.filter == libc::EVFILT_PROC && e.fflags & libc::NOTE_EXIT != 0)
+    }
+
+    impl Shared {
+        pub(super) fn new(kq: Kqueue, identity: &ProcIdentity, opened: Opened) -> Self {
+            let exited = opened == Opened::Exited;
+            Self {
+                kq,
+                pid: identity.pid,
+                start: identity.start,
+                exiting: opened == Opened::Exiting,
+                opened: Instant::now(),
+                exited: AtomicBool::new(exited),
+                state: tokio::sync::watch::channel(exited.then_some(Ok(()))).0,
+                waiter: Mutex::new(false),
+                shutdown: AtomicBool::new(false),
+                lock_files: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(super) fn subscribe(&self) -> tokio::sync::watch::Receiver<State> {
+            self.state.subscribe()
+        }
+
+        pub(super) fn has_exited(&self) -> bool {
+            if self.exited.load(Ordering::SeqCst) {
+                return true;
+            }
+            let proven = if self.exiting {
+                darwin::proven_exited(self.pid, self.start)
+            } else {
+                self.kq
+                    .wait(Some(Duration::ZERO))
+                    .is_ok_and(|events| exit_event(&events))
+            };
+            if proven {
+                self.mark_exited();
+            }
+            proven
+        }
+
+        fn mark_exited(&self) {
+            if !self.exited.swap(true, Ordering::SeqCst) {
+                self.state.send_replace(Some(Ok(())));
+            }
+            // A waiter thread, if one runs, has nothing left to wait for.
+            let _ = self.kq.wake();
+        }
+
+        /// Starts the waiter thread unless one runs (clearing the error of
+        /// one that stopped).
+        pub(super) fn start_waiter(shared: &Arc<Self>) -> io::Result<()> {
+            let mut running = lock(&shared.waiter);
+            if *running {
+                return Ok(());
+            }
+            shared.state.send_if_modified(|state| {
+                let failed = matches!(state, Some(Err(_)));
+                if failed {
+                    *state = None;
+                }
+                failed
+            });
+            let thread_shared = shared.clone();
+            std::thread::Builder::new()
+                .name("freshell-procwatch".into())
+                .stack_size(64 * 1024)
+                .spawn(move || thread_shared.wait_for_exit())?;
+            *running = true;
+            Ok(())
+        }
+
+        /// The waiter thread: blocks in `kevent` until the exit event, the
+        /// watch's drop, or (for a watch opened on an exiting process) a
+        /// moment to re-read the process: its deadline, or an unlock event.
+        fn wait_for_exit(&self) {
+            let mut recheck_at = self.exiting.then(|| self.opened + EXITING_RECHECK);
+            loop {
+                if self.shutdown.load(Ordering::SeqCst) || self.exited.load(Ordering::SeqCst) {
+                    return;
+                }
+                let timeout = recheck_at.map(|at| at.saturating_duration_since(Instant::now()));
+                let events = match self.kq.wait(timeout) {
+                    Ok(events) => events,
+                    Err(err) => {
+                        let mut running = lock(&self.waiter);
+                        *running = false;
+                        self.state
+                            .send_replace(Some(Err(format!("exit watch failed: {err}"))));
+                        return;
+                    }
+                };
+                if recheck_at.is_some_and(|at| Instant::now() >= at) {
+                    recheck_at = None;
+                }
+                if exit_event(&events)
+                    || (self.exiting && darwin::proven_exited(self.pid, self.start))
+                {
+                    self.mark_exited();
+                    return;
+                }
+            }
+        }
+
+        /// Registers `NOTE_FUNLOCK` on each lock file, on a watch opened
+        /// while its process was exiting (the only one that needs it).
+        pub(super) fn watch_lock_paths(&self, paths: &[PathBuf]) {
+            if !self.exiting || self.exited.load(Ordering::SeqCst) {
+                return;
+            }
+            let mut files = lock(&self.lock_files);
+            for path in paths {
+                let Ok(file) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_EVTONLY)
+                    .open(path)
+                else {
+                    continue;
+                };
+                let registered = self.kq.change(
+                    file.as_raw_fd() as usize,
+                    libc::EVFILT_VNODE,
+                    libc::EV_ADD | libc::EV_CLEAR,
+                    darwin::NOTE_FUNLOCK,
+                );
+                if registered.is_ok() {
+                    files.push(file);
+                }
+            }
+        }
+    }
+
+    /// The last `ProcWatch` clone is gone: its waiter thread returns.
+    impl Drop for super::Inner {
+        fn drop(&mut self) {
+            self.mac.shutdown.store(true, Ordering::SeqCst);
+            let _ = self.mac.kq.wake();
+        }
     }
 }

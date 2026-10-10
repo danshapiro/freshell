@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use super::{Backend, BackendKind, Capability, KillSummary, MemberList, UnitBackend};
 use crate::proc_watch::ProcWatch;
-use crate::process::{self, is_codex_daemon_family};
+use crate::process::{self, is_codex_daemon_family, EnvRead};
 use crate::unit::{MemberRole, Placement};
 use crate::{BoxFuture, UnitId, UNIT_ENV};
 
@@ -137,7 +137,7 @@ impl TagUnit {
     }
 
     fn carries_tag(&self, pid: u32) -> bool {
-        matches!(process::environ_entry(pid, &self.key), Ok(Some(v)) if v == self.value)
+        matches!(process::environ_read(pid, &self.key), EnvRead::Value(v) if v == self.value)
     }
 
     /// One reading of the unit. `count_withheld` also counts the same-uid
@@ -153,12 +153,14 @@ impl TagUnit {
             if pid == me {
                 continue;
             }
-            match process::environ_entry(pid, &self.key) {
-                Ok(Some(v)) if v == self.value => {
+            match process::environ_read(pid, &self.key) {
+                EnvRead::Value(v) if v == self.value => {
                     candidates.insert(pid);
                 }
-                Ok(_) => {}
-                Err(_) => {
+                EnvRead::Value(_) | EnvRead::Absent => {}
+                // Neither tagged nor untagged: such a process is a member
+                // only through the roots (and their descendants).
+                EnvRead::Withheld => {
                     if count_withheld && process::real_uid(pid) == Some(my_uid) {
                         withheld += 1;
                     }

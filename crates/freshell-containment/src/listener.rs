@@ -188,9 +188,45 @@ mod windows_tables {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn listening_socket_owner(_port: u16, _candidates: &[u32]) -> Option<u32> {
-    None // macOS: Task 7 (libproc)
+/// macOS: the pid (among `candidates` and their descendants) holding a
+/// TCP socket in LISTEN state on `port`, read through libproc
+/// (`PROC_PIDFDSOCKETINFO` on each candidate's socket descriptors). Same
+/// contract as on Linux.
+#[cfg(target_os = "macos")]
+pub fn listening_socket_owner(port: u16, candidates: &[u32]) -> Option<u32> {
+    let mut seen = std::collections::HashSet::new();
+    let mut frontier: Vec<u32> = candidates.to_vec();
+    while let Some(pid) = frontier.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if listens_on(pid, port) {
+            return Some(pid);
+        }
+        frontier.extend(crate::process::children(pid));
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn listens_on(pid: u32, port: u16) -> bool {
+    use crate::darwin;
+    let Ok(fds) = darwin::fds(pid) else {
+        return false;
+    };
+    fds.iter()
+        .filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32)
+        .filter_map(|fd| darwin::socket_fd_info(pid, fd.proc_fd))
+        .any(|info| {
+            if info.psi.soi_kind != darwin::SOCKINFO_TCP {
+                return false;
+            }
+            // SAFETY: `soi_kind` says the TCP member is the one filled.
+            let tcp = unsafe { info.psi.soi_proto.pri_tcp };
+            // The local port is in network byte order in the low 16 bits.
+            tcp.tcpsi_state == darwin::TSI_S_LISTEN
+                && u16::from_be(tcp.tcpsi_ini.insi_lport as u16) == port
+        })
 }
 
 #[cfg(test)]
