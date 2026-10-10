@@ -7,6 +7,6 @@ export default defineConfig({
   ...baseConfig,
   test: {
     ...baseConfig.test,
-    include: ['test/unit/tooling/sandbox-test.sandbox.ts', 'test/unit/tooling/run-rust-tests.test.ts'],
+    include: ['test/unit/tooling/sandbox-test.sandbox.ts', 'test/unit/tooling/run-rust-tests.test.ts', 'test/unit/tooling/rust-launcher-resources.sandbox.ts'],
   },
 })

@@ -12,7 +12,7 @@ if (process.env.FRESHELL_SANDBOX_MODE !== 'runtime-suite') {
 }
 
 function fixture(mode: string) {
-  const root = mkdtempSync(path.join(os.tmpdir(), 'sandbox-wrapper-'))
+  const root = mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'sandbox-wrapper-'))
   for (const subdir of ['scripts', 'bin', 'control']) mkdirSync(path.join(root, subdir))
   copyFileSync(path.resolve('scripts/sandbox-test.sh'), path.join(root, 'scripts/sandbox-test.sh'))
   const receipt = path.join(root, 'receipt.jsonl')

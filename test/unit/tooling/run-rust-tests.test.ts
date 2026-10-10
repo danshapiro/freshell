@@ -1,66 +1,19 @@
 // @vitest-environment node
-import { spawnSync } from 'node:child_process'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import os from 'node:os'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { createRequire } from 'node:module'
 import { describe, expect, it } from 'vitest'
-
-const require = createRequire(import.meta.url)
-const tsx = require.resolve('tsx')
-const launcher = path.resolve('scripts/testing/run-rust-tests.ts')
-
-function fixture() {
-  const root = mkdtempSync(path.join(os.tmpdir(), 'rust-launcher-'))
-  mkdirSync(path.join(root, 'scripts/testing'), { recursive: true })
-  mkdirSync(path.join(root, 'target'))
-  mkdirSync(path.join(root, 'bin'))
-  copyFileSync(launcher, path.join(root, 'scripts/testing/run-rust-tests.ts'))
-  writeFileSync(path.join(root, 'package.json'), '{"type":"module"}')
-  symlinkSync(path.resolve('node_modules'), path.join(root, 'node_modules'), 'dir')
-  const receipt = path.join(root, 'receipt.jsonl')
-  const executable = (file: string, body: string) => {
-    writeFileSync(`${file}.mjs`, body)
-    const quote = (word: string) => `'${word.replaceAll("'", "'\\''")}'`
-    writeFileSync(file, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(`${file}.mjs`)} "$@"\n`)
-    chmodSync(file, 0o755)
-  }
-  executable(path.join(root, 'bin/cargo'), `
-    import fs from 'node:fs';
-    const args = process.argv.slice(2);
-    fs.appendFileSync(process.env.RECEIPT, JSON.stringify({kind:'cargo', args,
-      binary:process.env.FRESHELL_SERVER_BIN, route:process.env.FRESHELL_RUST_TEST_SANDBOX, jobs:process.env.CARGO_BUILD_JOBS,
-      tmp:process.env.TMPDIR, executableTmp:process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR})+'\\n');
-    process.exit(Number(args[0]==='build' ? process.env.BUILD_EXIT || 0 : process.env.TEST_EXIT || 0));
-  `)
-  executable(path.join(root, 'scripts/sandbox-test.sh'), `
-    import fs from 'node:fs';
-    import cp from 'node:child_process';
-    const args = process.argv.slice(2);
-    fs.appendFileSync(process.env.RECEIPT, JSON.stringify({kind:'sandbox', args})+'\\n');
-    if (process.env.SANDBOX_EXIT) process.exit(Number(process.env.SANDBOX_EXIT));
-    const command = args[1]
-      .replace('mktemp -d /workspace/target/', 'mktemp -d ' + ${JSON.stringify(root)} + '/target/')
-      .replace('node --import tsx /workspace/scripts/testing/run-rust-tests.ts', 'node --import tsx ' + ${JSON.stringify(root)} + '/scripts/testing/run-rust-tests.ts');
-    const result = cp.spawnSync('bash', ['-c', command], {env:process.env, stdio:'inherit'});
-    process.exit(result.status ?? 1);
-  `)
-  return {
-    root,
-    run(env: NodeJS.ProcessEnv = {}, args: string[] = []) {
-      const result = spawnSync(process.execPath, ['--import', tsx, path.join(root, 'scripts/testing/run-rust-tests.ts'), ...args], {
-        env: { ...process.env, PATH: `${root}/bin:${process.env.PATH}`, RECEIPT: receipt,
-          FRESHELL_RUST_TEST_SANDBOX: '0', FRESHELL_SERVER_BIN: '/host/stale-server', ...env },
-        encoding: 'utf8', timeout: 15_000,
-      })
-      const events = existsSync(receipt) ? readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : []
-      return { ...result, events }
-    },
-    cleanup() { rmSync(root, { recursive: true, force: true }) },
-  }
-}
+import { fixture } from './run-rust-tests-fixture.js'
 
 describe('Rust test launcher children', () => {
+  it('executes CommonJS fixtures without inheriting the checkout module format', () => {
+    const f = fixture()
+    try {
+      const marker = path.join(f.root, 'executed')
+      const result = f.run({ FRESHELL_RUST_TEST_SANDBOX: '1', COMMONJS_PROBE: marker })
+      expect(result.status, result.stderr).toBe(0)
+      expect(readFileSync(marker, 'utf8')).toBe('executed')
+    } finally { f.cleanup() }
+  })
   it('builds before testing and selects the current checkout binary with disabled routing', () => {
     const f = fixture()
     try {
@@ -105,7 +58,7 @@ describe('Rust test launcher children', () => {
       expect(result.events[2].args).toEqual(['test', '--workspace', '--locked', ...args.slice(1)])
       expect(result.events[2].binary).toBe(path.join(f.root, 'target/debug/freshell-server'))
       expect(result.events[2].tmp).toBe(result.events[2].executableTmp)
-      expect(result.events[2].tmp).toMatch(new RegExp(`^${f.root}/target/\\.freshell-rust-tests-[^/]+$`))
+      expect(result.events[2].tmp).toMatch(new RegExp(`^${f.artifacts}/\\.freshell-rust-tests-[^/]+$`))
       expect(existsSync(result.events[2].tmp)).toBe(false)
     } finally { f.cleanup() }
   })
