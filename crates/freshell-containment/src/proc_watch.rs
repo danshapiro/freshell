@@ -25,10 +25,12 @@
 //! began, from the zombie-aware lookup showing it a zombie (`SZOMB`, set
 //! after `NOTE_EXIT`), or from that lookup answering that it was reaped;
 //! never from a refused registration alone. A watch opened on an exiting
-//! process re-reads it once at a 1 s deadline after `open` and on each
-//! unlock of the unit's lock files (`watch_lock_paths`). `signal` re-checks
-//! the start time through the zombie-aware lookup, then sends with
-//! `kill(2)`.
+//! process re-reads it 1 s and 5 s after each waiter starts and on each
+//! unlock of the unit's lock files (`watch_lock_paths`); when the 5 s read
+//! still finds no proof, `exited()` answers an error instead of waiting
+//! forever (no event marks the end of such an exit), and a later await
+//! waits again. `signal` re-checks the start time through the zombie-aware
+//! lookup, then sends with `kill(2)`.
 
 use std::io;
 use std::path::PathBuf;
@@ -553,8 +555,10 @@ impl ProcWatch {
 
     /// Resolves when the process has exited, by one of the proofs in the
     /// module docs. The first await starts the watch's waiter thread; a
-    /// thread that cannot be started, or a wait that fails, answers `Err`,
-    /// and a later await starts a new one. Needs no particular runtime.
+    /// thread that cannot be started, a wait that fails, or (for a watch
+    /// opened on an exiting process) an exit still unproven at the last
+    /// deadline answers `Err`, and a later await starts a new one. Needs no
+    /// particular runtime.
     pub async fn exited(&self) -> io::Result<()> {
         let shared = &self.inner.mac;
         if shared.has_exited() {
@@ -630,9 +634,12 @@ mod mac {
     use crate::darwin::{self, Kqueue};
     use crate::process::ProcIdentity;
 
-    /// A watch opened on a process that had already begun exiting re-reads
-    /// it once this long after `open` (a one-shot read at a deadline).
-    const EXITING_RECHECK: Duration = Duration::from_secs(1);
+    /// A watch opened on a process that had already begun exiting has no
+    /// exit event to wait for: each waiter re-reads it at these deadlines
+    /// after it starts (one-shot reads at deadlines, not an interval), and
+    /// when the last one passes without a proof the wait answers an error
+    /// instead of waiting forever (a later await starts a new waiter).
+    const EXITING_RECHECKS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(5)];
 
     /// What `open` found.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -654,7 +661,6 @@ mod mac {
         pid: u32,
         start: u64,
         exiting: bool,
-        opened: Instant,
         exited: AtomicBool,
         state: tokio::sync::watch::Sender<State>,
         /// Whether a waiter thread is running.
@@ -685,7 +691,6 @@ mod mac {
                 pid: identity.pid,
                 start: identity.start,
                 exiting: opened == Opened::Exiting,
-                opened: Instant::now(),
                 exited: AtomicBool::new(exited),
                 state: tokio::sync::watch::channel(exited.then_some(Ok(()))).0,
                 waiter: Mutex::new(false),
@@ -748,26 +753,36 @@ mod mac {
 
         /// The waiter thread: blocks in `kevent` until the exit event, the
         /// watch's drop, or (for a watch opened on an exiting process) a
-        /// moment to re-read the process: its deadline, or an unlock event.
+        /// moment to re-read the process: one of its deadlines, or an
+        /// unlock event. Such a watch's wait ends with an error at its last
+        /// deadline when the exit is still unproven.
         fn wait_for_exit(&self) {
-            let mut recheck_at = self.exiting.then(|| self.opened + EXITING_RECHECK);
+            let started = Instant::now();
+            let mut rechecks: Vec<Instant> = if self.exiting {
+                EXITING_RECHECKS
+                    .iter()
+                    .rev()
+                    .map(|after| started + *after)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             loop {
                 if self.shutdown.load(Ordering::SeqCst) || self.exited.load(Ordering::SeqCst) {
                     return;
                 }
-                let timeout = recheck_at.map(|at| at.saturating_duration_since(Instant::now()));
+                let timeout = rechecks
+                    .last()
+                    .map(|at| at.saturating_duration_since(Instant::now()));
                 let events = match self.kq.wait(timeout) {
                     Ok(events) => events,
-                    Err(err) => {
-                        let mut running = lock(&self.waiter);
-                        *running = false;
-                        self.state
-                            .send_replace(Some(Err(format!("exit watch failed: {err}"))));
-                        return;
-                    }
+                    Err(err) => return self.stop_waiting(format!("exit watch failed: {err}")),
                 };
-                if recheck_at.is_some_and(|at| Instant::now() >= at) {
-                    recheck_at = None;
+                let now = Instant::now();
+                let mut deadline_passed = false;
+                while rechecks.last().is_some_and(|at| now >= *at) {
+                    rechecks.pop();
+                    deadline_passed = true;
                 }
                 if exit_event(&events)
                     || (self.exiting && darwin::proven_exited(self.pid, self.start))
@@ -775,7 +790,21 @@ mod mac {
                     self.mark_exited();
                     return;
                 }
+                if self.exiting && deadline_passed && rechecks.is_empty() {
+                    return self.stop_waiting(format!(
+                        "exit not proven: process {} had begun exiting when it was watched and was still exiting {}s later",
+                        self.pid,
+                        EXITING_RECHECKS[EXITING_RECHECKS.len() - 1].as_secs()
+                    ));
+                }
             }
+        }
+
+        /// Ends this waiter with an error; the next await starts another.
+        fn stop_waiting(&self, error: String) {
+            let mut running = lock(&self.waiter);
+            *running = false;
+            self.state.send_replace(Some(Err(error)));
         }
 
         /// Registers `NOTE_FUNLOCK` on each lock file, on a watch opened
