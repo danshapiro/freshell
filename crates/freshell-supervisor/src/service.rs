@@ -2268,8 +2268,6 @@ impl Supervisor {
         max_bytes: u64,
         expected_stream_epoch: Option<String>,
     ) -> Result<RuntimeOutputBatch, RuntimeError> {
-        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
-        let _guard = lifecycle_lock.lock().await;
         let context = self
             .registry
             .recovery_context(soul_id.clone())
@@ -2294,6 +2292,25 @@ impl Supervisor {
             .await?
         {
             HostResult::TerminalOutput(output) => {
+                // A web read may be abandoned while its host is unreachable.
+                // Keep read-only IPC outside lifecycle custody so those reads
+                // cannot queue ahead of recovery or Stop. Revalidate every
+                // captured fence before publishing output or recording identity.
+                let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+                let _guard = lifecycle_lock.lock().await;
+                let current = self
+                    .registry
+                    .recovery_context(soul_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                if current.write_fence() != context.write_fence()
+                    || &output.incarnation_id != handle.incarnation_id()
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::OwnershipMismatch,
+                        "terminal output owner changed during host read",
+                    ));
+                }
                 if let Some(native_session_id) = output.native_session_id.as_ref() {
                     record_terminal_identity_observation(
                         &self.registry,
@@ -6729,6 +6746,197 @@ mod interrupted_transaction_tests {
 mod native_observation_ipc_tests {
     use super::*;
     use rusqlite::{params, Connection};
+
+    #[tokio::test]
+    async fn pending_terminal_output_io_does_not_block_replacement_and_refuses_late_output() {
+        for stall_hello in [false, true] {
+            for native_session_id in [None, Some("ses_old".to_string())] {
+                pending_terminal_output_case(stall_hello, native_session_id, "incarnation").await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_output_without_identity_still_revalidates_every_captured_fence() {
+        for change in [
+            "intent_revision",
+            "identity_revision",
+            "evidence_revision",
+            "native_import_revision",
+            "recovery_attempt_id",
+            "reply_incarnation",
+            "unchanged",
+        ] {
+            pending_terminal_output_case(false, None, change).await;
+        }
+    }
+
+    async fn pending_terminal_output_case(
+        stall_hello: bool,
+        native_session_id: Option<String>,
+        change: &'static str,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let old = crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let runtime = dir.path().join("host");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        Connection::open(registry.database_path())
+            .unwrap()
+            .execute(
+                "UPDATE incarnations SET runtime_dir=?1 WHERE incarnation_id=?2",
+                params![runtime.to_string_lossy(), old.incarnation_id.as_str()],
+            )
+            .unwrap();
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+        let limits = registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .requested_limits;
+        let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let boot = HostBootId::new();
+            let (mut hello, _) = listener.accept().await.unwrap();
+            let request: Envelope<HostCommand> = read_frame(&mut hello).await.unwrap();
+            let HostCommand::Hello {
+                incarnation_id,
+                challenge,
+            } = request.body
+            else {
+                panic!("expected handshake")
+            };
+            let mut pending_tx = Some(pending_tx);
+            let mut release_rx = Some(release_rx);
+            if stall_hello {
+                pending_tx.take().unwrap().send(()).unwrap();
+                release_rx.take().unwrap().await.unwrap();
+            }
+            write_frame(
+                &mut hello,
+                &HostReply {
+                    request_id: request.request_id,
+                    result: Ok(HostResult::Hello {
+                        proof: host_proof(b"synthetic-secret", &challenge, &boot, &incarnation_id),
+                        host_boot_id: boot.clone(),
+                        capabilities: vec![],
+                        effective_limits: limits,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+            let (mut output, _) = listener.accept().await.unwrap();
+            let request: Envelope<HostCommand> = read_frame(&mut output).await.unwrap();
+            assert!(matches!(
+                request.body,
+                HostCommand::TerminalReadOutput { .. }
+            ));
+            assert_eq!(
+                request.auth,
+                Some(host_proof(
+                    b"synthetic-secret",
+                    "command-auth",
+                    &boot,
+                    &incarnation_id,
+                ))
+            );
+            if !stall_hello {
+                pending_tx.take().unwrap().send(()).unwrap();
+                release_rx.take().unwrap().await.unwrap();
+            }
+            write_frame(
+                &mut output,
+                &HostReply {
+                    request_id: request.request_id,
+                    result: Ok(HostResult::TerminalOutput(RuntimeOutputBatch {
+                        incarnation_id: if change == "reply_incarnation" {
+                            IncarnationId::new()
+                        } else {
+                            incarnation_id
+                        },
+                        terminal_id: "terminal-old".into(),
+                        stream_epoch: "epoch-old".into(),
+                        retained_from_seq: 0,
+                        head_seq: 0,
+                        reset_required: false,
+                        truncated: false,
+                        exited: false,
+                        exit_code: None,
+                        native_session_id,
+                        frames: vec![],
+                    })),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let read = {
+            let supervisor = supervisor.clone();
+            let soul = soul.clone();
+            tokio::spawn(async move { supervisor.terminal_read_output(soul, 0, 4096, None).await })
+        };
+        pending_rx.await.unwrap();
+        let lifecycle = supervisor.lifecycle_lock(&soul).await;
+        let replacement_guard =
+            tokio::time::timeout(Duration::from_millis(250), lifecycle.lock()).await;
+        let replacement_was_unblocked = replacement_guard.is_ok();
+        if let Ok(_guard) = replacement_guard {
+            if change == "incarnation" {
+                registry
+                    .mark_stop_outcome(old.incarnation_id.clone(), StopOutcome::VerifiedEmpty)
+                    .await
+                    .unwrap();
+                crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            } else if change != "unchanged" && change != "reply_incarnation" {
+                let update = match change {
+                    "intent_revision" => "intent_revision=intent_revision+1",
+                    "identity_revision" => "identity_revision=identity_revision+1",
+                    "evidence_revision" => "evidence_revision=evidence_revision+1",
+                    "native_import_revision" => "native_import_revision=native_import_revision+1",
+                    "recovery_attempt_id" => "recovery_attempt_id='recovery-other'",
+                    _ => panic!("unknown fixture mutation"),
+                };
+                Connection::open(registry.database_path())
+                    .unwrap()
+                    .execute(
+                        &format!("UPDATE souls SET {update} WHERE soul_id=?1"),
+                        params![soul.as_str()],
+                    )
+                    .unwrap();
+            }
+        }
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .unwrap()
+            .unwrap();
+        responder.await.unwrap();
+        assert!(
+            replacement_was_unblocked,
+            "read-only host IO must not retain lifecycle custody (hello={stall_hello})"
+        );
+        if change == "unchanged" {
+            let output = result.unwrap();
+            assert_eq!(output.incarnation_id, old.incarnation_id);
+            assert_eq!(output.stream_epoch, "epoch-old");
+        } else {
+            assert!(result.is_err(), "changed {change} output must be refused");
+        }
+        assert_eq!(
+            registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .native_session_id,
+            None,
+            "the late read must not publish its old root"
+        );
+    }
 
     #[tokio::test]
     async fn delayed_terminal_ipc_cannot_reverse_identity_or_bind_an_old_incarnation() {
