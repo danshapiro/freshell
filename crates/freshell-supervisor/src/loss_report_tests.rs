@@ -3754,6 +3754,10 @@ async fn stale_lifecycle_writer_does_not_recreate_withdrawn_incident_after_retra
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_stale_exporter_and_rotator_preserve_exact_withdrawal() {
+    #[cfg(unix)]
+    if run_task007_owned_case_child(Task007OwnedCase::ConcurrentWithdrawal).await {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let (registry, prepared) = prepared_loss(dir.path()).await;
     let incident = prepared.certificate.incident_id.clone();
@@ -3791,11 +3795,14 @@ async fn concurrent_stale_exporter_and_rotator_preserve_exact_withdrawal() {
     let retract_lifecycle = lifecycle.clone();
     let retract_incident = incident.clone();
     let retraction = std::thread::spawn(move || {
+        let waiting = std::time::Instant::now();
         let _coordinator = crate::loss_report::incident_file_coordinator();
+        let acquired = std::time::Instant::now();
         held_tx.send(()).unwrap();
         release_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
+        let producers_ready = std::time::Instant::now();
         let conn = Connection::open(database).unwrap();
         // Model the committed exact withdrawal while queued producers retain
         // their older snapshots; their production rechecks must reject them.
@@ -3812,6 +3819,16 @@ async fn concurrent_stale_exporter_and_rotator_preserve_exact_withdrawal() {
                 &retract_lifecycle,
             )
             .unwrap();
+        let completed = std::time::Instant::now();
+        drop(_coordinator);
+        eprintln!(
+            "{}",
+            serde_json::json!({"severity":"debug","event":"task007.withdrawal.coordinator_timing",
+            "waitMs":acquired.duration_since(waiting).as_millis(),
+            "producerWaitMs":producers_ready.duration_since(acquired).as_millis(),
+            "retractionMs":completed.duration_since(producers_ready).as_millis(),
+            "holdMs":completed.duration_since(acquired).as_millis()})
+        );
     });
     held_rx.await.unwrap();
     let stale_registry = registry.clone();
@@ -4401,57 +4418,90 @@ async fn import_stopped_fixture_root(
     receipt
 }
 
+#[cfg(unix)]
+enum Task007OwnedCase {
+    BaselineRetry,
+    ConcurrentWithdrawal,
+}
+
+#[cfg(unix)]
+async fn run_task007_owned_case_child(case: Task007OwnedCase) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    let (flag, name) = match case {
+        Task007OwnedCase::BaselineRetry => (
+            "FRESHELL_TASK007_BASELINE_RETRY_CHILD",
+            "loss_report::tests::stopped_repair_resume_failure_retry_preserves_baseline",
+        ),
+        Task007OwnedCase::ConcurrentWithdrawal => (
+            "FRESHELL_TASK007_WITHDRAWAL_CONCURRENCY_CHILD",
+            "loss_report::tests::concurrent_stale_exporter_and_rotator_preserve_exact_withdrawal",
+        ),
+    };
+    if std::env::var(flag).ok().as_deref() == Some("1") {
+        return false;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let stdout_path = home.path().join("stdout.log");
+    let stderr_path = home.path().join("stderr.log");
+    let private_output = |path: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+    };
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--nocapture"])
+        .env_clear()
+        .env(flag, "1")
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .stdout(private_output(&stdout_path))
+        .stderr(private_output(&stderr_path))
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        let output_exceeded = [&stdout_path, &stderr_path]
+            .iter()
+            .any(|path| fs::metadata(path).unwrap().len() > 2 * 1024 * 1024);
+        if std::time::Instant::now() >= deadline || output_exceeded {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("owned {name} child exceeded its finite time/output limit");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let status = child.wait().unwrap();
+    assert!(
+        [&stdout_path, &stderr_path]
+            .iter()
+            .all(|path| fs::metadata(path).unwrap().len() <= 2 * 1024 * 1024),
+        "completed owned {name} child exceeded its output limit"
+    );
+    let stdout = fs::read_to_string(stdout_path).unwrap();
+    let stderr = fs::read_to_string(stderr_path).unwrap();
+    assert!(status.success(), "{stdout}\n{stderr}");
+    assert_eq!(stdout.matches("test result:").count(), 1);
+    assert!(
+        stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "exact owned child must execute its one case: {stdout}\n{stderr}"
+    );
+    eprintln!(
+        "{}",
+        serde_json::json!({"severity":"debug", "event":"task007.owned_case_child.completed",
+        "case":name, "pid":child.id(), "selected":1, "executed":1, "passed":1, "exitCode":status.code()})
+    );
+    true
+}
+
 #[tokio::test]
 async fn stopped_repair_resume_failure_retry_preserves_baseline() {
     #[cfg(unix)]
-    {
-        const CHILD: &str = "FRESHELL_TASK007_BASELINE_RETRY_CHILD";
-        if std::env::var(CHILD).ok().as_deref() != Some("1") {
-            use std::os::unix::fs::OpenOptionsExt;
-            let home = tempfile::tempdir().unwrap();
-            let stdout_path = home.path().join("stdout.log");
-            let stderr_path = home.path().join("stderr.log");
-            let private_output = |path: &std::path::Path| {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(path)
-                    .unwrap()
-            };
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-            child
-                .args([
-                    "loss_report::tests::stopped_repair_resume_failure_retry_preserves_baseline",
-                    "--exact",
-                    "--nocapture",
-                ])
-                .env_clear()
-                .env(CHILD, "1")
-                .env("HOME", home.path())
-                .env("XDG_DATA_HOME", home.path().join("data"))
-                .stdout(private_output(&stdout_path))
-                .stderr(private_output(&stderr_path));
-            let mut child = child.spawn().unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while child.try_wait().unwrap().is_none() {
-                if std::time::Instant::now() >= deadline {
-                    child.kill().unwrap();
-                    let _ = child.wait();
-                    panic!("isolated baseline test exceeded its finite deadline");
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            let status = child.wait().unwrap();
-            let stdout = fs::read_to_string(stdout_path).unwrap();
-            let stderr = fs::read_to_string(stderr_path).unwrap();
-            assert!(status.success(), "{stdout}\n{stderr}");
-            assert!(
-                stdout.contains("1 passed"),
-                "actual child test must execute"
-            );
-            return;
-        }
+    if run_task007_owned_case_child(Task007OwnedCase::BaselineRetry).await {
+        return;
     }
     use freshell_runtime_protocol::{
         CanonicalOwnerChoice, DesiredState, PreflightLostSoulsRequest, RecoverRequest,
