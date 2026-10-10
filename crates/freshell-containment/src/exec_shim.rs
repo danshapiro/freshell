@@ -14,11 +14,12 @@
 //!   (`crate::reaper`), the Linux fallback backend's member root. Other OSes
 //!   ignore it (no backend there places with it).
 //! - `--setsid` (macOS): make this process its own session leader (it
-//!   already is one under a PTY), then exec the command in place, so the pid
-//!   the spawner saw is the command's and everything it starts that never
-//!   calls `setsid` stays in its session: the macOS backend's root
-//!   placement, which its fork tracker follows. Exit 127 when the command
-//!   cannot be started. Other OSes ignore it.
+//!   already is one under a PTY; one spawned as a process-group leader
+//!   first moves into its parent's group), then exec the command in place,
+//!   so the pid the spawner saw is the command's and everything it starts
+//!   that never calls `setsid` stays in its session: the macOS backend's
+//!   root placement, which its fork tracker follows. Exit 127 when the
+//!   command cannot be started. Other OSes ignore it.
 //! - `--nofile-soft=<n>` (Linux): lower this shim's own open-file soft limit
 //!   to `n` (capped at the hard limit) before it starts the command, so the
 //!   command starts with the server's original limit instead of the server's
@@ -118,11 +119,31 @@ mod macos {
 
     use super::START_FAILED_EXIT;
 
-    /// `setsid()`; it fails (EPERM) only when this process already leads a
-    /// process group, as a PTY child leads its own session: nothing to do.
+    /// Makes this process lead its own session. `setsid()` is refused
+    /// (EPERM) for a process that leads a process group: a PTY child
+    /// already leads its own session (nothing to do), while a process the
+    /// spawner made a group leader (`process_group(0)`) first moves into its
+    /// parent's group, in the same session, after which `setsid()` makes it
+    /// the leader of a new session and of a new group of its own. Any other
+    /// failure is reported on stderr, and the command still runs.
     pub(super) fn become_session_leader() {
-        // SAFETY: plain setsid(2) on this single-threaded process.
-        unsafe { libc::setsid() };
+        // SAFETY: plain process-identity calls on this single-threaded
+        // process, before it execs.
+        let led = unsafe {
+            let me = libc::getpid();
+            libc::setsid() >= 0
+                || libc::getsid(0) == me
+                || (libc::getpgrp() == me && {
+                    let parent_group = libc::getpgid(libc::getppid());
+                    parent_group > 0 && libc::setpgid(0, parent_group) == 0 && libc::setsid() >= 0
+                })
+        };
+        if !led {
+            eprintln!(
+                "freshell-unit-exec: cannot make this process its own session leader ({}); what it starts may not stay linked to it after its parent exits",
+                std::io::Error::last_os_error()
+            );
+        }
     }
 
     /// Replaces this process with `program rest...` (searched on `PATH`).
