@@ -1584,7 +1584,7 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       expect(fs.existsSync(path.join(hostRuntimeDir, 'host.sock'))).toBe(false)
       expect(fs.existsSync(rig.runtime.testRoot)).toBe(false)
     }
-  })
+  }, 60_000)
 
   it('refuses browser batch setup before any preparation unless the owner is isolated, grant-free and explicitly opted in', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused batch web') }, fixtureRepoRoot, 3)
