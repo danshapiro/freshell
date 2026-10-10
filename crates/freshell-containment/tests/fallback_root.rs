@@ -51,7 +51,10 @@ fn the_fallback_state_root_is_removed_when_the_process_exits() {
     );
     let root = stdout
         .lines()
-        .find_map(|line| line.split_once("FALLBACK_ROOT=").map(|(_, root)| root.trim()))
+        .find_map(|line| {
+            line.split_once("FALLBACK_ROOT=")
+                .map(|(_, root)| root.trim())
+        })
         .unwrap_or_else(|| panic!("the child names its fallback root: {stdout}"));
     assert!(
         !Path::new(root).exists(),
