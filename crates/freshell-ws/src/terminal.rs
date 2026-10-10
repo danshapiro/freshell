@@ -81,6 +81,10 @@ mod terminal_create_ordering_tests;
 #[path = "terminal_launch_prep_tests.rs"]
 mod terminal_launch_prep_tests;
 
+#[cfg(test)]
+#[path = "terminal_kill_tests.rs"]
+mod terminal_kill_tests;
+
 #[path = "connection_writer.rs"]
 mod connection_writer;
 #[path = "interactive_creates.rs"]
@@ -1829,7 +1833,8 @@ async fn handle_client_text(
             // the initiator).
             handle_kill(
                 kill,
-                ws_tx,
+                conn_sink,
+                create_cancel_rx,
                 state,
                 &connection_initiator("ws-kill", conn_id, conn_identity),
             )
@@ -3107,6 +3112,33 @@ struct TerminalOwnershipClaim {
 }
 
 impl TerminalOwnershipClaim {
+    /// Registers the spawned row as this claim's partial runtime (the
+    /// watchdog's reap target: its terminal id and pid), stamped with the
+    /// unit the row was spawned into: a stop of that unit then moves this
+    /// Starting key to Stopping and releases it only at Gone (so a commit
+    /// racing the stop fails stale instead of committing Live for a dying
+    /// pane).
+    fn register_spawned_row(&self, state: &WsState, terminal_id: &str) {
+        let Some(ownership) = state.ownership.as_ref() else {
+            return;
+        };
+        ownership.register_partial_runtime(
+            &self.locator.provider,
+            &self.locator.session_id,
+            self.ticket.operation_id(),
+            self.ticket.generation(),
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(terminal_id.to_string()),
+                live_session_key: None,
+                pid: state.registry.pid_of(terminal_id),
+                ownership_id: None,
+                unit_id: state.registry.unit_id_for(terminal_id),
+                hold: freshell_ownership::HoldKind::Main,
+            },
+        );
+    }
+
     /// Commit `Live{Terminal}` for the spawned runtime and retain the claim.
     /// `Err` (stale generation / foreign operation) means the key was
     /// recovered out from under us mid-create — the caller must tear its
@@ -3131,6 +3163,78 @@ impl TerminalOwnershipClaim {
             }
             stale => Err(stale),
         }
+    }
+}
+
+/// The create settle point's LATE claim (Task 4 review M1, b8ke ext r6 F1):
+/// a create that spawned with no coordinator claim claims `locator` for the
+/// row it spawned. `Ok(Some(claim))` when granted — the claim's Starting
+/// key is registered with the spawned row and, for a pane in its unit
+/// whose start no stop has cancelled, stamped with the unit (as the
+/// pre-spawn claim is), so a stop of the unit from now on moves it to
+/// Stopping and releases it only at Gone; `Ok(None)` without an owner
+/// registry; `Err(reason)` when the key moved on (the caller tears the
+/// unclaimed child down).
+#[allow(clippy::too_many_arguments)]
+fn claim_late_for_spawned_row(
+    state: &WsState,
+    locator: &SessionLocator,
+    create_request_id: &str,
+    conn_id: u64,
+    attach_window_op: Option<String>,
+    terminal_id: &str,
+    scope: Option<&crate::unit_lifecycle::StartScope>,
+) -> Result<Option<TerminalOwnershipClaim>, String> {
+    let operation_id = format!("term-create-late-{create_request_id}");
+    let initiator = format!("ws-conn-{conn_id}");
+    let claim = match attach_window_op {
+        None => freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
+            &state.ownership,
+            &locator.provider,
+            &locator.session_id,
+            &operation_id,
+            // No observed fence: the create holds no prior observation to
+            // fence against (the Adopt arm claimed nothing).
+            None,
+            &initiator,
+            now_ms().max(0) as u64,
+        ),
+        Some(window_op) => {
+            freshell_freshagent::ownership_lane::begin_terminal_lane_claim_under_attach_window(
+                &state.ownership,
+                &locator.provider,
+                &locator.session_id,
+                &operation_id,
+                None,
+                &initiator,
+                now_ms().max(0) as u64,
+                &window_op,
+            )
+        }
+    };
+    match claim {
+        freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
+            let claim = TerminalOwnershipClaim {
+                ticket,
+                registry: state.registry.clone(),
+                locator: locator.clone(),
+            };
+            // A start a stop already cancelled is left unstamped: that stop
+            // (perhaps Gone already) moved no key of this create's, and the
+            // give-up before the commit releases the claim at the unit's
+            // Gone.
+            if !scope.is_some_and(|scope| scope.cancelled()) {
+                claim.register_spawned_row(state, terminal_id);
+            }
+            Ok(Some(claim))
+        }
+        freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => Ok(None),
+        freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+            Err("a live terminal owner holds the key the create settled under".to_string())
+        }
+        freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(outcome) => Err(format!(
+            "the coordinator refused the late claim: {outcome:?}"
+        )),
     }
 }
 
@@ -3222,16 +3326,23 @@ fn take_create_claims(
 
 /// Releases a sessionRef lease (and its retained coordinator claim) when
 /// dropped: handed to an abandoned start, it runs after the unit's Gone —
-/// the confirmed death `force_release_after_confirmed_kill` requires.
+/// the confirmed death `force_release_after_confirmed_kill` requires. The
+/// lease is released only while this create still holds it: a reopen that
+/// took the conversation's lease once it went Vacant keeps it (Task 12
+/// re-review 3, m2).
 struct ReleaseLeaseAfterGone {
     registry: freshell_terminal::TerminalRegistry,
     locator: SessionLocator,
+    /// The create the lease belongs to.
+    holder_create_request_id: String,
 }
 
 impl Drop for ReleaseLeaseAfterGone {
     fn drop(&mut self) {
-        self.registry
-            .force_release_after_confirmed_kill(&self.locator);
+        self.registry.force_release_after_confirmed_kill_for_holder(
+            &self.locator,
+            &self.holder_create_request_id,
+        );
     }
 }
 
@@ -3245,6 +3356,7 @@ async fn teardown_create_spawn(
     claims: Box<dyn std::any::Any + Send>,
     locator: &SessionLocator,
     terminal_id: &str,
+    create_request_id: &str,
 ) {
     match scope {
         Some(scope) => scope.abandon(Some(Box::new((
@@ -3252,6 +3364,7 @@ async fn teardown_create_spawn(
             ReleaseLeaseAfterGone {
                 registry: state.registry.clone(),
                 locator: locator.clone(),
+                holder_create_request_id: create_request_id.to_string(),
             },
         )))),
         None => {
@@ -4789,6 +4902,11 @@ pub(crate) async fn handle_create(
     conn_identity: &ConnectionIdentity,
     asserted_at: i64,
 ) -> bool {
+    // A create for a pane a kill stopped spawns nothing (every flavor and
+    // mode; a prepared launch is given up as it drops).
+    if let Some(answered) = refuse_killed_create(state, out, &create.request_id).await {
+        return answered;
+    }
     // P1 (graceful restore/resume S1): destructure the prepared values at
     // the TOP so `prepared_codex`'s Drop guard is alive across EVERY
     // pre-plan early return below (keyed-create adopt, D8 lease, rate
@@ -6799,6 +6917,10 @@ pub(crate) async fn handle_create(
     // PIN2_PTY_SPAWN_ANCHOR: either the local PTY spawn OR the supervisor's
     // host-owned PTY makes the preallocated identity observable.
     // `Ok(Some(screen pid))` for a unit row, `Ok(None)` otherwise.
+    let mut killed_managed_start: Option<(
+        freshell_containment::ManagedStartGuard,
+        freshell_containment::ManagedStartOutcome,
+    )> = None;
     let create_result: std::io::Result<Option<u32>> = if use_managed_runtime {
         let managed = ManagedTerminalLaunch {
             spec: spec.clone(),
@@ -6815,19 +6937,62 @@ pub(crate) async fn handle_create(
             view_pane_id: create.pane_id.clone(),
             create_request_id: Some(create.request_id.clone()),
         };
-        match state.registry.launch_managed(managed).await {
-            Ok(descriptor) => {
-                state.registry.register_managed(descriptor);
-                tracing::info!(
-                    terminal_id = %terminal_id,
-                    mode = %mode,
-                    "terminal.created_managed: PTY/process ownership lives in session host"
-                );
-                Ok(None)
+        // The launch is in flight under the pane's create-request id until
+        // it is registered or stopped, so a kill of the starting pane waits
+        // for it instead of answering before a soul may start (LB-13). A
+        // pane killed before or while it launched has its outcome reported
+        // only once the create was answered as stopped.
+        let start = state.units.managed_starts().begin(&create.request_id);
+        if state.units.killed_start(&create.request_id) {
+            killed_managed_start = Some((
+                start,
+                freshell_containment::ManagedStartOutcome::StoppedVerified,
+            ));
+            Err(pane_stopped_error())
+        } else {
+            match state.registry.launch_managed(managed).await {
+                Ok(descriptor) if state.units.killed_start(&create.request_id) => {
+                    // Killed while it launched: the soul is stopped (the
+                    // supervisor serializes this with the soul's launch)
+                    // and no facade is registered.
+                    let stopped = state.registry.managed_stop_descriptor(descriptor).await;
+                    tracing::info!(
+                        terminal_id = %terminal_id,
+                        mode = %mode,
+                        stopped = stopped.is_ok(),
+                        event = "terminal.create.managed_killed_while_launching",
+                        "a managed pane killed while it launched is stopped, not registered"
+                    );
+                    killed_managed_start = Some((
+                        start,
+                        match stopped {
+                            Ok(()) => freshell_containment::ManagedStartOutcome::StoppedVerified,
+                            Err(error) => {
+                                freshell_containment::ManagedStartOutcome::StopFailed(error)
+                            }
+                        },
+                    ));
+                    Err(pane_stopped_error())
+                }
+                Ok(descriptor) => {
+                    state.registry.register_managed(descriptor);
+                    start.finish(freshell_containment::ManagedStartOutcome::Registered);
+                    tracing::info!(
+                        terminal_id = %terminal_id,
+                        mode = %mode,
+                        "terminal.created_managed: PTY/process ownership lives in session host"
+                    );
+                    Ok(None)
+                }
+                Err(error) => {
+                    start.finish(freshell_containment::ManagedStartOutcome::StopFailed(
+                        format!("managed runtime launch failed: {error}"),
+                    ));
+                    Err(std::io::Error::other(format!(
+                        "managed runtime launch failed: {error}"
+                    )))
+                }
             }
-            Err(error) => Err(std::io::Error::other(format!(
-                "managed runtime launch failed: {error}"
-            ))),
         }
     } else {
         // A Codex pane's TUI starts in the pane's unit (its screen). A unit
@@ -6988,6 +7153,17 @@ pub(crate) async fn handle_create(
             )));
         }
         cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+        // A managed pane killed while it started is answered as stopped;
+        // only then is the kill that waited for it told how it ended.
+        if is_pane_stopped_error(&err) {
+            let answered = refuse_killed_create(state, out, &create.request_id)
+                .await
+                .unwrap_or(true);
+            if let Some((start, outcome)) = killed_managed_start.take() {
+                start.finish(outcome);
+            }
+            return answered;
+        }
         let label = mode_label(&mode, cli.as_ref());
         let env_var = state
             .cli_commands
@@ -7021,27 +7197,11 @@ pub(crate) async fn handle_create(
     // b8ke delta round-2 F2: the spawned terminal's partial runtime (the
     // watchdog's reap target — the pid + terminal id the stale-Starting
     // recovery kills and confirms). Registered only when THIS create
-    // holds the coordinator claim.
-    if let (Some(ownership), Some(claim)) = (state.ownership.as_ref(), terminal_ownership.as_ref())
-    {
-        ownership.register_partial_runtime(
-            &claim.locator.provider,
-            &claim.locator.session_id,
-            claim.ticket.operation_id(),
-            claim.ticket.generation(),
-            freshell_ownership::OwnerIdentity {
-                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
-                terminal_id: Some(terminal_id.clone()),
-                live_session_key: None,
-                pid: state.registry.pid_of(&terminal_id),
-                ownership_id: None,
-                // A unit row's start is stamped with its unit: a stop of the
-                // unit moves this Starting key to Stopping and commits it at
-                // Gone.
-                unit_id: state.registry.unit_id_for(&terminal_id),
-                hold: freshell_ownership::HoldKind::Main,
-            },
-        );
+    // holds the coordinator claim. A unit row's start is stamped with its
+    // unit: a stop of the unit moves this Starting key to Stopping and
+    // commits it at Gone.
+    if let Some(claim) = terminal_ownership.as_ref() {
+        claim.register_spawned_row(state, &terminal_id);
     }
 
     // The TUI is the unit's screen: pin it and note the terminal, so every
@@ -7389,6 +7549,7 @@ pub(crate) async fn handle_create(
                 ReleaseLeaseAfterGone {
                     registry: state.registry.clone(),
                     locator: locator.clone(),
+                    holder_create_request_id: create.request_id.clone(),
                 },
             ))));
             return send_create_error(
@@ -7469,56 +7630,29 @@ pub(crate) async fn handle_create(
                 })
         });
         if let Some(locator) = learned_locator {
-            let operation_id = format!("term-create-late-{}", create.request_id);
-            let initiator = format!("ws-conn-{conn_id}");
             // b8ke ext r32 F1: the holder's OWN late claim — when the
-            // Adopt arm's attach guard is still held (the incumbent
-            // exited mid-window — the exit-during-guard race), the
-            // windowed claim names the armed guard's id so the
-            // coordinator's deferred-acquisition block exempts THIS
-            // create (continuous authority) while every competitor
-            // answers the typed Blocked outcome.
-            let claim = match _wire_adopt_guard.as_ref().map(|g| g.operation_id().to_string()) {
-                None => freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
-                    &state.ownership,
-                    &locator.provider,
-                    &locator.session_id,
-                    &operation_id,
-                    // No observed fence: the create holds no prior observation
-                    // to fence against (the Adopt arm claimed nothing).
-                    None,
-                    &initiator,
-                    now_ms().max(0) as u64,
-                ),
-                Some(window_op) => {
-                    freshell_freshagent::ownership_lane::begin_terminal_lane_claim_under_attach_window(
-                        &state.ownership,
-                        &locator.provider,
-                        &locator.session_id,
-                        &operation_id,
-                        None,
-                        &initiator,
-                        now_ms().max(0) as u64,
-                        &window_op,
-                    )
-                }
-            };
-            let refusal = match claim {
-                freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
-                    terminal_ownership = Some(TerminalOwnershipClaim {
-                        ticket,
-                        registry: state.registry.clone(),
-                        locator: locator.clone(),
-                    });
+            // Adopt arm's attach guard is still held (the incumbent exited
+            // mid-window — the exit-during-guard race), the windowed claim
+            // names the armed guard's id so the coordinator's
+            // deferred-acquisition block exempts THIS create (continuous
+            // authority) while every competitor answers the typed Blocked
+            // outcome.
+            let refusal = match claim_late_for_spawned_row(
+                state,
+                &locator,
+                &create.request_id,
+                conn_id,
+                _wire_adopt_guard
+                    .as_ref()
+                    .map(|g| g.operation_id().to_string()),
+                &terminal_id,
+                codex_scope.as_ref(),
+            ) {
+                Ok(claim) => {
+                    terminal_ownership = claim;
                     None
                 }
-                freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => None,
-                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
-                    Some("a live terminal owner holds the key the create settled under".to_string())
-                }
-                freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(outcome) => Some(
-                    format!("the coordinator refused the late claim: {outcome:?}"),
-                ),
+                Err(reason) => Some(reason),
             };
             if let Some(reason) = refusal {
                 tracing::error!(target: "invariant",
@@ -7539,6 +7673,7 @@ pub(crate) async fn handle_create(
                     ),
                     &locator,
                     &terminal_id,
+                    &create.request_id,
                 )
                 .await;
                 return send_create_error(
@@ -7623,6 +7758,7 @@ pub(crate) async fn handle_create(
                     ),
                     &locator,
                     &terminal_id,
+                    &create.request_id,
                 )
                 .await;
                 return send_create_error(
@@ -8844,6 +8980,47 @@ pub(crate) async fn send_create_error(
     request_id: &str,
 ) -> bool {
     send_create_error_with_live_terminal(out, code, message, request_id, None).await
+}
+
+/// The answer to a create whose pane a kill already stopped (Stage 2:
+/// LB-16): a device that comes back late (or a create held while its pane
+/// was Shift-X'd) never re-creates the killed pane.
+pub(crate) const PANE_STOPPED_MESSAGE: &str = "this pane was stopped";
+
+/// The spawn "failure" of a managed pane killed while it started (its soul
+/// stopped, or never launched): the create's failure cleanup runs, and the
+/// create is answered as stopped.
+fn pane_stopped_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, PANE_STOPPED_MESSAGE)
+}
+
+fn is_pane_stopped_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::Interrupted && err.to_string() == PANE_STOPPED_MESSAGE
+}
+
+/// `Some(answer)` when `request_id` names a pane a kill stopped: the create
+/// is refused with the correlated `INVALID_TERMINAL_ID` and spawns nothing.
+pub(crate) async fn refuse_killed_create(
+    state: &WsState,
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    request_id: &str,
+) -> Option<bool> {
+    if !state.units.killed_start(request_id) {
+        return None;
+    }
+    tracing::info!(target: "freshell_ws::terminal",
+        create_request_id = %request_id,
+        event = "terminal.create.refused_stopped",
+        "a create for a pane a kill stopped is refused; nothing spawns");
+    Some(
+        send_create_error(
+            out,
+            ErrorCode::InvalidTerminalId,
+            PANE_STOPPED_MESSAGE.to_string(),
+            request_id,
+        )
+        .await,
+    )
 }
 
 /// `send_create_error` + the D7 live-owner hint (`live_terminal_id`): the
@@ -10142,161 +10319,519 @@ fn stale_claim_owner_kind(state: &freshell_ownership::OwnershipState) -> Option<
     })
 }
 
-async fn handle_kill(
-    kill: TerminalKill,
-    ws_tx: &mut WsSink,
-    state: &WsState,
-    initiator: &str,
-) -> bool {
-    let unknown_terminal_error = |terminal_id: String| {
-        ServerMessage::Error(ErrorMsg {
-            owner_kind: None,
-            owner_generation: None,
-            owner_epoch: None,
-            code: ErrorCode::InvalidTerminalId,
-            message: "Unknown terminalId".to_string(),
-            timestamp: crate::now_iso(),
-            actual_session_ref: None,
-            expected_session_ref: None,
-            request_id: None,
-            retry_after_ms: None,
-            terminal_id: Some(terminal_id),
-            terminal_exit_code: None,
-            live_terminal_id: None,
-        })
-    };
-    // P1.8 trigger (e): explicit user close — THE durable close
-    // (focused-episode-6 round 1, delta-r6-r2 Findings 1+2+6): ONE
-    // `PaneLedger::close_pane` call, under the ledger's own serialization,
-    // BEFORE the process and the in-memory identity are destroyed. It
-    // retires every identity the pane owns — the in-memory `session_ref_for`
-    // capture AND any binding row keyed by this terminal (a resolution that
-    // beat the capture but not the ledger turn retires under the guard;
-    // one resolving LATER consults the pane close record and lands Retired,
-    // never Bound — `resolve_pending`'s consult) — deletes the pending
-    // marker, and persists the pane close record the recovery verdict joins
-    // on. Destroying first (the pre-delta-r6 shape) lost the close entirely
-    // when the blocking write was cancelled or failed; retiring only the
-    // captured sessionRef (the delta-r6 shape) missed the
-    // resolver-racing/pre-resolution window this pane close covers.
-    //
-    // Delta-r6-r3 (focused-episode-6 round 2, Findings 5+7): the envelope is
-    // written UNCONDITIONALLY — FIRST — even when the registry no longer
-    // holds the id. A reaper that just removed the row (the terminal exited
-    // as the user closed the pane) or a stale pane after a server restart
-    // made the pre-r3 arms return `INVALID_TERMINAL_ID` without recording
-    // anything: the stale snapshot then received NO closed verdict and could
-    // be offered/rebuilt. The pane close is real regardless of registry
-    // presence; the record keys by the terminal id the close knows, with the
-    // createRequestId taken from the registry when its row stands, else from
-    // the kill message itself (the pane carries it and the registry probe can
-    // no longer answer).
-    //
-    // Failure propagation (delta-r6, envelope-atomic delta-r6-r3): a FAILED
-    // durable close FAILS the kill — the process is left running, the
-    // identity stands, the client is answered a failure instead of a silent
-    // success, and `close_pane`'s rollback guarantees no retired row or
-    // standing tombstone mis-reads the still-live terminal as closed. A
-    // MISSING registry entry is not a close failure (the terminal is already
-    // gone) — but the envelope write failing IS.
-    //
-    // The correlated answer (Finding 7): a kill carrying `requestId` gets ONE
-    // `terminal.killed{requestId, terminalId, success, error?}` reply — the
-    // close flows await it before dropping the pane; the legacy error frames
-    // (`INTERNAL_ERROR` / `INVALID_TERMINAL_ID`) remain for requestId-less
-    // kills (older clients). (DETACH stays non-retiring, unchanged.)
-    //
-    // Wedge-backstop Task 3 exception: a kill whose `reason` is
-    // `"stuck-recovery"` (the "Agent appears stuck" card's restart
-    // action) is a PROCESS-ONLY kill — it skips the durable
-    // close (and the identity retirement/tombstone consult inside it) so
-    // the pane's session stays resumable for the follow-up restore:create
-    // respawn; see the stuck_recovery branch below. Everything else about
-    // the kill is unchanged.
-    let sref = state.identity.session_ref_for(&kill.terminal_id);
+/// The owner trio a stale-claim refusal teaches the client: the incumbent's
+/// kind, the emitting server's boot epoch and the coordinator's current
+/// generation (b8ke fence-heal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnerTrio {
+    pub(crate) kind: Option<String>,
+    pub(crate) epoch: u64,
+    pub(crate) generation: u64,
+}
 
-    // kata b8ke Task 4 (round-3 carried finding F3 — the binding requirement):
-    // the terminal EXPLICIT KILL runs the FULL fenced stop sequence, NOT a
-    // release-only path — begin_stop(fenced StopClaim: the observed (epoch,
-    // generation) the wire carried, else the retained stamp, plus the expected
-    // runtime kind/identity) → Stopping (competing starts/handoffs blocked) →
-    // kill → confirmed reap (this port's registry kill is an immediate
-    // SIGKILL-and-reap, so its return point IS the confirmation) →
-    // commit_stop. The stop attempt runs BEFORE the durable ledger close
-    // below so a typed refusal strands NO state (Task 3's I-1 lesson: a
-    // pre-kill gate the handler ran must roll back — here nothing has run
-    // yet). Terminals without a retained coordinator claim (shell panes,
-    // pre-coordinator-era rows) keep the plain kill path.
-    let mut stop_commit: Option<(String, String, String, u64)> = None;
-    // b8ke d4 F3: the granted stop's settlement guard (held to the
-    // handler's scope end — fires on completion, unwind, OR panic).
-    let mut _stop_settlement: Option<freshell_freshagent::ownership_lane::StopSettlementGuard> =
-        None;
-    // A unit row's conversation keys move to Stopping and are committed
-    // Vacant by its unit's own stop at Gone (`kill_and_broadcast` below
-    // routes it through `unit_lifecycle::stop_terminal_unit`), never by this
-    // legacy fenced stop.
-    let unit_row = state.units.by_terminal(&kill.terminal_id).is_some();
-    if let (false, Some(ownership), Some(retained)) = (
-        unit_row,
-        state.ownership.as_ref(),
-        state.registry.retained_ownership_claim(&kill.terminal_id),
+/// What one `terminal.kill` is answered. A kill carrying `requestId` gets
+/// ONE `terminal.killed{requestId, terminalId, success, error?, owner trio?}`
+/// (the close flows await it); a requestId-less kill (an older client) gets
+/// the legacy frame in `legacy`, if any.
+#[derive(Debug, Clone)]
+pub(crate) struct KillAnswer {
+    success: bool,
+    error: Option<String>,
+    owner: Option<OwnerTrio>,
+    legacy: Option<LegacyKillError>,
+}
+
+/// The error frame a requestId-less kill gets instead of `terminal.killed`.
+#[derive(Debug, Clone)]
+struct LegacyKillError {
+    code: ErrorCode,
+    message: String,
+    /// The frame names the kill's terminal.
+    names_terminal: bool,
+}
+
+/// The durable close was recorded but the ledger reported an error: the kill
+/// proceeds (keeping the terminal alive would misclassify it at recovery)
+/// and the answer reports the failure.
+const PERSISTED_CLOSE_COPY: &str =
+    "the terminal close is recorded durably, but the ledger reported an error; \
+     the terminal was closed to keep state consistent";
+/// The durable close failed cleanly: nothing is durable, so the kill is
+/// abandoned and the terminal left running.
+const CLOSE_FAILURE_COPY: &str =
+    "the terminal close could not be recorded durably; the terminal was left running";
+
+impl KillAnswer {
+    /// The kill is done: the pane's agent is confirmed Gone (a unit), its
+    /// managed runtime verified stopped, or its legacy row killed and
+    /// reaped. A requestId-less kill gets nothing.
+    pub(crate) fn done() -> Self {
+        Self {
+            success: true,
+            error: None,
+            owner: None,
+            legacy: None,
+        }
+    }
+
+    /// Done, but the durable close reported a persisted error.
+    pub(crate) fn done_after_close(persisted_despite_error: bool) -> Self {
+        if persisted_despite_error {
+            Self::failed(PERSISTED_CLOSE_COPY, ErrorCode::InternalError)
+        } else {
+            Self::done()
+        }
+    }
+
+    /// Nothing runs for the terminal and the owner registry confirms
+    /// nothing holds a conversation for it: success, the only way "not
+    /// found" counts as a kill. A requestId-less kill of a terminal keeps
+    /// the legacy `INVALID_TERMINAL_ID`.
+    fn unknown(names_terminal: bool) -> Self {
+        Self {
+            legacy: names_terminal.then(unknown_terminal_legacy),
+            ..Self::done()
+        }
+    }
+
+    /// The terminal is unknown, but a conversation is still held Live under
+    /// it: the kill cannot be confirmed.
+    fn owner_without_runtime() -> Self {
+        Self {
+            success: false,
+            error: Some("OWNER_WITHOUT_RUNTIME".to_string()),
+            owner: None,
+            legacy: Some(unknown_terminal_legacy()),
+        }
+    }
+
+    /// A failed kill: `error` on `terminal.killed`, the legacy `code` frame
+    /// (naming the kill's terminal) otherwise.
+    pub(crate) fn failed(error: &str, code: ErrorCode) -> Self {
+        Self {
+            success: false,
+            error: Some(error.to_string()),
+            owner: None,
+            legacy: Some(LegacyKillError {
+                code,
+                message: error.to_string(),
+                names_terminal: true,
+            }),
+        }
+    }
+
+    /// The durable close failed cleanly: nothing was stopped.
+    pub(crate) fn close_failed() -> Self {
+        Self::failed(CLOSE_FAILURE_COPY, ErrorCode::InternalError)
+    }
+}
+
+fn unknown_terminal_legacy() -> LegacyKillError {
+    LegacyKillError {
+        code: ErrorCode::InvalidTerminalId,
+        message: "Unknown terminalId".to_string(),
+        names_terminal: true,
+    }
+}
+
+/// Why a kill was refused before anything was stopped (the observed fence
+/// of the fenced stop claim, or the owner registry's refusal).
+#[derive(Debug, Clone)]
+pub(crate) struct KillRefusal {
+    reason: String,
+    /// A half-sent observed pair: no owner trio, and the legacy answer is
+    /// `INVALID_CREATE_REQUEST` (not `SESSION_RESERVED`).
+    invalid_fence: bool,
+    owner: Option<OwnerTrio>,
+}
+
+impl KillRefusal {
+    /// Why the kill was refused (its answer's `error`).
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl From<KillRefusal> for KillAnswer {
+    fn from(refusal: KillRefusal) -> Self {
+        let legacy = if refusal.invalid_fence {
+            LegacyKillError {
+                code: ErrorCode::InvalidCreateRequest,
+                message: refusal.reason.clone(),
+                names_terminal: false,
+            }
+        } else {
+            LegacyKillError {
+                code: ErrorCode::SessionReserved,
+                message: refusal.reason.clone(),
+                names_terminal: true,
+            }
+        };
+        Self {
+            success: false,
+            error: Some(refusal.reason),
+            owner: refusal.owner,
+            legacy: Some(legacy),
+        }
+    }
+}
+
+/// The stale-claim refusal (b8ke fence-heal): it carries the coordinator's
+/// CURRENT pair and the state's owner kind, so the client's next attempt is
+/// born fresh.
+pub(crate) fn stale_kill_refusal(
+    state: &freshell_ownership::OwnershipState,
+    epoch: u64,
+    generation: u64,
+) -> KillRefusal {
+    KillRefusal {
+        reason: "ownership moved to a newer runtime; refresh and retry".to_string(),
+        invalid_fence: false,
+        owner: Some(OwnerTrio {
+            kind: stale_claim_owner_kind(state).map(str::to_string),
+            epoch,
+            generation,
+        }),
+    }
+}
+
+/// The observed `(epoch, generation)` a kill is fenced with: the pair the
+/// wire carried, else the retained claim's stamp (legacy-unfenced). A
+/// half-sent pair is the typed invalid-fence refusal — never silently
+/// downgraded to the retained stamp (b8ke delta review F7).
+pub(crate) fn kill_observed_fence(
+    kill: &TerminalKill,
+    ownership: &freshell_ownership::RuntimeOwnershipRegistry,
+    retained: &freshell_terminal::registry::RetainedSessionRefOwnership,
+) -> Result<freshell_ownership::ObservedFence, KillRefusal> {
+    match freshell_freshagent::ownership_lane::wire_fence(
+        kill.observed_epoch,
+        kill.observed_generation,
     ) {
-        let stop_op_id = format!("term-kill-{}", uuid::Uuid::new_v4());
-        // b8ke delta review F7: a half-sent observed pair (exactly one of
-        // epoch/generation) is a typed invalid-fence refusal — the kill
-        // does NOT fall back to the retained-claim fence (that would be
-        // the silent downgrade) and nothing is killed. Nothing has run
-        // yet, so the refusal strands no state.
-        let observed = match freshell_freshagent::ownership_lane::wire_fence(
-            kill.observed_epoch,
-            kill.observed_generation,
-        ) {
-            Ok(Some(fence)) => fence,
-            Ok(None) => freshell_ownership::ObservedFence {
-                epoch: ownership.boot_epoch(),
-                generation: retained.generation,
-            },
-            Err(err) => {
-                tracing::warn!(
-                    target: "freshell_ws::terminal",
-                    terminal_id = %kill.terminal_id,
-                    provider = %retained.locator.provider,
-                    session_id = %retained.locator.session_id,
-                    "terminal_kill_refused: the observed fence is half-sent (invalid) — \
-                     nothing is killed, no durable close is recorded"
-                );
-                let reason = err.message().to_string();
-                if let Some(request_id) = &kill.request_id {
-                    let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
-                        request_id: request_id.clone(),
-                        terminal_id: kill.terminal_id,
-                        success: false,
-                        error: Some(reason),
-                        // No owner trio: the fence was INVALID (half-sent),
-                        // not stale — there is no current pair to teach.
-                        owner_kind: None,
-                        owner_generation: None,
-                        owner_epoch: None,
-                    });
-                    return send(ws_tx, &msg).await;
-                }
-                let msg = ServerMessage::Error(ErrorMsg {
-                    owner_kind: None,
-                    owner_generation: None,
-                    owner_epoch: None,
-                    code: ErrorCode::InvalidCreateRequest,
-                    message: reason,
+        Ok(Some(fence)) => Ok(fence),
+        Ok(None) => Ok(freshell_ownership::ObservedFence {
+            epoch: ownership.boot_epoch(),
+            generation: retained.generation,
+        }),
+        Err(err) => Err(KillRefusal {
+            reason: err.message().to_string(),
+            invalid_fence: true,
+            owner: None,
+        }),
+    }
+}
+
+/// Where one `terminal.kill` is answered: the connection's outbox (inline
+/// answers and the spawned per-kill tasks alike) and its close signal. A
+/// spawned answer is abandoned when the connection closes; a stop the kill
+/// already began runs on regardless.
+#[derive(Clone)]
+pub(crate) struct KillReply {
+    out: FrameSink,
+    closed: tokio::sync::watch::Receiver<bool>,
+    request_id: Option<String>,
+    /// The terminal the answer names (the kill's, else the one it
+    /// resolved, else empty).
+    terminal_id: String,
+}
+
+impl KillReply {
+    fn new(
+        out: &FrameSink,
+        closed: &tokio::sync::watch::Receiver<bool>,
+        kill: &TerminalKill,
+    ) -> Self {
+        Self {
+            out: Arc::clone(out),
+            closed: closed.clone(),
+            request_id: kill.request_id.clone(),
+            terminal_id: kill.terminal_id.clone().unwrap_or_default(),
+        }
+    }
+
+    /// The same reply naming `terminal_id` when the kill named none.
+    pub(crate) fn naming(mut self, terminal_id: Option<&str>) -> Self {
+        if self.terminal_id.is_empty() {
+            if let Some(terminal_id) = terminal_id {
+                self.terminal_id = terminal_id.to_string();
+            }
+        }
+        self
+    }
+
+    pub(crate) fn has_request_id(&self) -> bool {
+        self.request_id.is_some()
+    }
+
+    /// Sends `answer` now (never awaits the socket).
+    pub(crate) fn send(&self, answer: KillAnswer) -> bool {
+        let msg = match &self.request_id {
+            Some(request_id) => ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
+                request_id: request_id.clone(),
+                terminal_id: self.terminal_id.clone(),
+                success: answer.success,
+                error: answer.error,
+                owner_kind: answer.owner.as_ref().and_then(|owner| owner.kind.clone()),
+                owner_generation: answer.owner.as_ref().map(|owner| owner.generation),
+                owner_epoch: answer.owner.as_ref().map(|owner| owner.epoch),
+            }),
+            None => {
+                let Some(legacy) = answer.legacy else {
+                    return true;
+                };
+                ServerMessage::Error(ErrorMsg {
+                    owner_kind: answer.owner.as_ref().and_then(|owner| owner.kind.clone()),
+                    owner_generation: answer.owner.as_ref().map(|owner| owner.generation),
+                    owner_epoch: answer.owner.as_ref().map(|owner| owner.epoch),
+                    code: legacy.code,
+                    message: legacy.message,
                     timestamp: crate::now_iso(),
                     actual_session_ref: None,
                     expected_session_ref: None,
                     request_id: None,
                     retry_after_ms: None,
+                    terminal_id: (legacy.names_terminal && !self.terminal_id.is_empty())
+                        .then(|| self.terminal_id.clone()),
                     terminal_exit_code: None,
-                    terminal_id: None,
                     live_terminal_id: None,
-                });
-                return send(ws_tx, &msg).await;
+                })
+            }
+        };
+        (self.out)(msg);
+        true
+    }
+
+    /// Answers with what `wait` resolves to, from a spawned task (the
+    /// connection loop never awaits it); the task is dropped, and nothing
+    /// sent, when the connection closes first. `wait` must have no effect
+    /// that has to complete: it is cancelled with the connection.
+    pub(crate) fn answer_when(
+        self,
+        wait: impl std::future::Future<Output = KillAnswer> + Send + 'static,
+    ) {
+        let mut closed = self.closed.clone();
+        tokio::spawn(
+            async move {
+                tokio::select! {
+                    // Closed (or its sender dropped with the connection).
+                    _ = closed.wait_for(|closed| *closed) => {}
+                    answer = wait => {
+                        self.send(answer);
+                    }
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
+    }
+
+    /// Resolves with `wait`'s output, or `None` when the connection closed
+    /// first (`wait` is then dropped: it must have no effect that has to
+    /// complete).
+    pub(crate) async fn until_closed<T>(
+        &self,
+        wait: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
+        let mut closed = self.closed.clone();
+        tokio::select! {
+            _ = closed.wait_for(|closed| *closed) => None,
+            value = wait => Some(value),
+        }
+    }
+
+    /// Runs `work` to completion in its own task — a stop it begins is never
+    /// abandoned, even when the connection closes — and answers with its
+    /// result (a closed connection's outbox drops the answer).
+    pub(crate) fn spawn_answering(
+        self,
+        work: impl std::future::Future<Output = KillAnswer> + Send + 'static,
+    ) {
+        tokio::spawn(
+            async move {
+                let answer = work.await;
+                self.send(answer);
+            }
+            .instrument(tracing::Span::current()),
+        );
+    }
+}
+
+/// What the durable pane close (P1.8 trigger (e)) recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneClose {
+    /// The close is durable.
+    Recorded,
+    /// The close is durable, but the ledger reported an error.
+    PersistedDespiteError,
+    /// Nothing is durable: the kill must leave the pane running.
+    Failed,
+}
+
+/// The durable close of a pane the user is closing (P1.8 trigger (e),
+/// focused-episode-6): ONE `PaneLedger::close_pane` call, under the ledger's
+/// own serialization, BEFORE the process and the in-memory identity are
+/// destroyed. It retires every identity the pane owns (the in-memory
+/// `session_ref_for` capture AND any binding row keyed by this terminal),
+/// deletes the pending marker, and persists the pane close record the
+/// recovery verdict joins on. It is written even when the registry no longer
+/// holds the id (a reaper won, or a stale pane after a restart): the pane
+/// close is real regardless. The record is keyed by the terminal, with the
+/// createRequestId taken from the registry when its row stands, else from
+/// the kill. A bounded blocking write; the error is CLASSED, never
+/// flattened (delta-r6-r4).
+pub(crate) async fn durable_pane_close(
+    state: &WsState,
+    terminal_id: &str,
+    create_request_id: Option<&str>,
+) -> PaneClose {
+    let sref = state.identity.session_ref_for(terminal_id);
+    let create_request_id = state
+        .registry
+        .probe_create_request_id(terminal_id)
+        .or_else(|| create_request_id.map(str::to_string));
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let tid = terminal_id.to_string();
+    let now = now_ms();
+    let close_outcome = spawn_blocking_in_span(move || {
+        ledger.close_pane(&crate::pane_ledger::PaneCloseWrite {
+            terminal_id: tid.clone(),
+            create_request_id,
+            resolved: sref.into_iter().collect(),
+            now_ms: now,
+        })
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!(terminal_id = %terminal_id, error = %err, "pane_ledger_close_join_failed_on_kill");
+        Err(crate::pane_ledger::CloseEnvelopeError::Clean(
+            std::io::Error::other(format!("close task join failed: {err}")),
+        ))
+    });
+    match &close_outcome {
+        Ok(()) => PaneClose::Recorded,
+        Err(err) if err.is_persisted() => {
+            tracing::error!(terminal_id = %terminal_id, error = %err,
+                "pane_ledger_close_persisted_despite_error_on_kill: the close is durable; \
+                 the terminal ends consistently and the answer reports the failure");
+            PaneClose::PersistedDespiteError
+        }
+        Err(err) => {
+            tracing::warn!(terminal_id = %terminal_id, error = %err, "pane_ledger_close_pane_failed_on_kill");
+            PaneClose::Failed
+        }
+    }
+}
+
+/// `terminal.kill`. Resolution runs synchronously, in this order; the
+/// connection loop never awaits a Gone wait (every wait for Gone, for a
+/// managed stop or for a managed launch runs in a spawned per-kill task,
+/// Stage 2: LB-20):
+///
+/// - Step 1: a coding-agent pane's unit — by terminal, by create-request
+///   id (a starting pane, or the pane's replacement after auto-resume), or
+///   by the row the create-request id names →
+///   [`crate::unit_lifecycle::kill_unit`] (the unit is stopped and the kill
+///   is answered only at Gone).
+/// - Steps 2 and 4: a managed facade, or any other row (plain shells, agent
+///   rows not yet contained) → the fenced legacy path ([`kill_row`]).
+/// - Steps 3 and 5: nothing found → [`kill_not_found`]: a managed launch in
+///   flight is waited for, a soul the supervisor still runs is stopped, and
+///   "not found" is success only when the owner registry confirms nothing
+///   holds a conversation for the terminal.
+async fn handle_kill(
+    kill: TerminalKill,
+    out: &FrameSink,
+    closed: &tokio::sync::watch::Receiver<bool>,
+    state: &WsState,
+    initiator: &str,
+) -> bool {
+    let reply = KillReply::new(out, closed, &kill);
+    if let Some(entry) = resolve_kill_unit(state, &kill) {
+        return crate::unit_lifecycle::kill_unit(kill, entry, reply, state, initiator).await;
+    }
+    let row = kill.terminal_id.clone().or_else(|| {
+        kill.create_request_id
+            .as_deref()
+            .and_then(|crq| state.registry.terminal_for_create_request(crq))
+    });
+    match row {
+        Some(terminal_id) => {
+            let reply = reply.naming(Some(&terminal_id));
+            kill_row(kill, terminal_id, reply, state, initiator).await
+        }
+        None => {
+            spawn_kill_not_found(state, kill, None, initiator, reply);
+            true
+        }
+    }
+}
+
+/// Step 1: the unit of the pane a kill names: by terminal (the directory's,
+/// else the unit the row was spawned into, which the directory knows from
+/// before the row existed), by create-request id, or by the row that id
+/// names.
+fn resolve_kill_unit(
+    state: &WsState,
+    kill: &TerminalKill,
+) -> Option<freshell_containment::UnitEntry> {
+    let by_row = |tid: &str| {
+        state.units.by_terminal(tid).or_else(|| {
+            let unit_id = freshell_containment::UnitId::parse(&state.registry.unit_id_for(tid)?)?;
+            let entry = state.units.get(&unit_id)?;
+            Some(freshell_containment::UnitEntry {
+                terminal_id: Some(tid.to_string()),
+                ..entry
+            })
+        })
+    };
+    kill.terminal_id.as_deref().and_then(by_row).or_else(|| {
+        let crq = kill.create_request_id.as_deref()?;
+        state.units.by_create_request(crq).or_else(|| {
+            state
+                .registry
+                .terminal_for_create_request(crq)
+                .and_then(|tid| by_row(&tid))
+        })
+    })
+}
+
+/// Steps 2 and 4: a row the registry may hold (a managed facade, a plain
+/// shell, an agent row not yet in a unit), killed through the fenced stop
+/// sequence (kata b8ke Task 4): `begin_stop` with the observed fence (the
+/// wire pair, else the retained stamp) and the expected runtime → the
+/// durable pane close (skipped for a stuck-recovery kill) → the kill → the
+/// confirmed reap → `commit_stop`. A typed refusal strands no state (the
+/// stop attempt runs before the durable close). A managed facade's stop
+/// runs in a spawned task; a row the registry does not hold goes to
+/// [`kill_not_found`].
+async fn kill_row(
+    kill: TerminalKill,
+    terminal_id: String,
+    reply: KillReply,
+    state: &WsState,
+    initiator: &str,
+) -> bool {
+    let mut stop_commit: Option<(String, String, String, u64)> = None;
+    // b8ke d4 F3: the granted stop's settlement guard, held until the stop
+    // settles (completion, unwind, OR panic).
+    let mut stop_settlement: Option<freshell_freshagent::ownership_lane::StopSettlementGuard> =
+        None;
+    if let (Some(ownership), Some(retained)) = (
+        state.ownership.as_ref(),
+        state.registry.retained_ownership_claim(&terminal_id),
+    ) {
+        let stop_op_id = format!("term-kill-{}", uuid::Uuid::new_v4());
+        let observed = match kill_observed_fence(&kill, ownership, &retained) {
+            Ok(observed) => observed,
+            Err(refusal) => {
+                tracing::warn!(
+                    target: "freshell_ws::terminal",
+                    terminal_id = %terminal_id,
+                    provider = %retained.locator.provider,
+                    session_id = %retained.locator.session_id,
+                    "terminal_kill_refused: the observed fence is half-sent (invalid) — \
+                     nothing is killed, no durable close is recorded"
+                );
+                return reply.send(refusal.into());
             }
         };
         let claim = freshell_ownership::StopClaim {
@@ -10317,23 +10852,11 @@ async fn handle_kill(
             &retained.locator.session_id,
             &stop_op_id,
             &claim,
-            // b8ke ext r24 F2: the connection's real device/client
-            // identity (the caller threads the composed initiator) —
-            // never the target terminal id as a pseudo-initiator.
+            // b8ke ext r24 F2: the connection's real device/client identity.
             initiator,
             now_ms().max(0) as u64,
         );
-        // b8ke fence-heal (fix b): the typed stale-claim refusal carries
-        // the coordinator's CURRENT (epoch, generation) — the pair the
-        // client folds into its runtimeOwners fence so its next attempt is
-        // born fresh instead of looping on the same stale pair. Only the
-        // StaleClaim arm knows the pair (and the state's owner kind); every
-        // other refusal keeps the fields absent (byte-identical legacy
-        // frames, frozen-client parity).
-        let mut refused_owner_kind: Option<String> = None;
-        let mut refused_owner_epoch: Option<u64> = None;
-        let mut refused_owner_generation: Option<u64> = None;
-        let refused_reason: Option<String> = match &outcome {
+        let refusal: Option<KillRefusal> = match &outcome {
             freshell_ownership::StopOutcome::Granted { generation } => {
                 stop_commit = Some((
                     retained.locator.provider.clone(),
@@ -10341,327 +10864,316 @@ async fn handle_kill(
                     stop_op_id.clone(),
                     *generation,
                 ));
-                // b8ke d4 F3: the granted terminal stop registers its
-                // SETTLEMENT GUARD (parity with the Fresh Agent kill
-                // lanes) — the stale-Stopping watchdog consults the flag
-                // before fencing on age, so a legitimate kill blocked on a
-                // slow pane-ledger close (>30s) is NEVER fenced as
-                // abandoned while its handler still runs (its eventual
-                // abort_stop/commit_stop would then be rejected as
-                // foreign — a clean ledger failure left the live terminal
-                // permanently fenced).
-                _stop_settlement =
-                    Some(freshell_freshagent::ownership_lane::register_stop_settlement_for_claim(
+                // b8ke d4 F3: the stale-Stopping watchdog consults the flag
+                // before fencing on age, so a kill blocked on a slow ledger
+                // close is never fenced as abandoned while it runs.
+                stop_settlement = Some(
+                    freshell_freshagent::ownership_lane::register_stop_settlement_for_claim(
                         &Some(Arc::clone(ownership)),
                         &retained.locator.provider,
                         &retained.locator.session_id,
                         &stop_op_id,
                         *generation,
-                    ));
+                    ),
+                );
                 None
             }
             // Not Live and VACANT: the kill proceeds (idempotent lane
-            // cleanup — a leftover child the coordinator never knew) and
-            // skips the commit.
+            // cleanup) and skips the commit.
             freshell_ownership::StopOutcome::NotLive {
                 state: freshell_ownership::OwnershipState::Vacant,
             } => None,
-            freshell_ownership::StopOutcome::NotLive { state } => Some(format!(
-                "a lifecycle operation is in flight for this session ({state:?}); retry after it settles"
-            )),
-            // A stop is already in flight: refused exactly as the in-flight
-            // `NotLive{Stopping}` answer was (terminal units join the
-            // in-flight stop through the unit lifecycle from Task 12 on).
-            freshell_ownership::StopOutcome::AlreadyStopping { operation_id, .. } => Some(format!(
-                "a lifecycle operation is in flight for this session (Stopping under \
-                 {operation_id}); retry after it settles"
-            )),
-            freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some(
-                "a handoff owns this session's transition; retry after it settles".to_string(),
-            ),
+            freshell_ownership::StopOutcome::NotLive { state } => Some(KillRefusal {
+                reason: format!(
+                    "a lifecycle operation is in flight for this session ({state:?}); retry after it settles"
+                ),
+                invalid_fence: false,
+                owner: None,
+            }),
+            // Only rows outside a unit come here: a unit's kill joins the
+            // stop in flight through the unit lifecycle instead.
+            freshell_ownership::StopOutcome::AlreadyStopping { operation_id, .. } => {
+                Some(KillRefusal {
+                    reason: format!(
+                        "a lifecycle operation is in flight for this session (Stopping under \
+                         {operation_id}); retry after it settles"
+                    ),
+                    invalid_fence: false,
+                    owner: None,
+                })
+            }
+            freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some(KillRefusal {
+                reason: "a handoff owns this session's transition; retry after it settles"
+                    .to_string(),
+                invalid_fence: false,
+                owner: None,
+            }),
             freshell_ownership::StopOutcome::StaleClaim {
                 current_epoch,
                 current_generation,
                 state,
-            } => {
-                refused_owner_kind =
-                    stale_claim_owner_kind(state).map(|kind| kind.to_string());
-                refused_owner_epoch = Some(*current_epoch);
-                refused_owner_generation = Some(*current_generation);
-                Some("ownership moved to a newer runtime; refresh and retry".to_string())
-            }
+            } => Some(stale_kill_refusal(state, *current_epoch, *current_generation)),
         };
-        if let Some(reason) = refused_reason {
+        if let Some(refusal) = refusal {
             tracing::warn!(
                 target: "freshell_ws::terminal",
-                terminal_id = %kill.terminal_id,
+                terminal_id = %terminal_id,
                 provider = %retained.locator.provider,
                 session_id = %retained.locator.session_id,
                 outcome = ?outcome,
                 "terminal_kill_refused: the ownership coordinator refused the stop \
                  (kata b8ke) — nothing is killed, no durable close is recorded"
             );
-            if let Some(request_id) = &kill.request_id {
-                let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
-                    request_id: request_id.clone(),
-                    terminal_id: kill.terminal_id,
-                    success: false,
-                    error: Some(reason),
-                    // b8ke fence-heal: the refusal trio (additive, skip-None
-                    // — absent on every non-stale kill answer).
-                    owner_kind: refused_owner_kind,
-                    owner_generation: refused_owner_generation,
-                    owner_epoch: refused_owner_epoch,
-                });
-                return send(ws_tx, &msg).await;
-            }
-            let msg = ServerMessage::Error(ErrorMsg {
-                owner_kind: refused_owner_kind,
-                owner_generation: refused_owner_generation,
-                owner_epoch: refused_owner_epoch,
-                code: ErrorCode::SessionReserved,
-                message: reason,
-                timestamp: crate::now_iso(),
-                actual_session_ref: None,
-                expected_session_ref: None,
-                request_id: None,
-                retry_after_ms: None,
-                terminal_id: Some(kill.terminal_id),
-                terminal_exit_code: None,
-                live_terminal_id: None,
-            });
-            return send(ws_tx, &msg).await;
+            return reply.send(refusal.into());
         }
     }
-    // The stop's second half (commit_stop after the confirmed reap — or the
-    // abort rollback on the clean-close failure below) runs at every exit
-    // past this point: a granted stop never strands `Stopping` (Task 4
-    // review F1).
 
-    // Wedge-backstop Task 3 (round-1 review Major): the reason
-    // discriminator. `Some("stuck-recovery")` ⇒ a PROCESS-ONLY kill — the
-    // durable close block below (the `close_pane` envelope write AND the
-    // session-identity retirement/tombstone consult it performs, which is
-    // what makes recovery suppress this session as deliberately closed)
-    // is skipped entirely, mirroring the idle reaper's server-initiated
-    // kill (no close envelope; reaped rows converge to respawn, not
-    // suppression — pane_reconcile). The pane's durable session must
-    // survive so the `restore:create` respawn the client dispatches next
-    // can resume it. Any other reason value (or absent) keeps today's
-    // full pane-close semantics byte-for-byte.
+    // Wedge-backstop Task 3: `reason: "stuck-recovery"` (the "Agent appears
+    // stuck" card's restart action) is a PROCESS-ONLY kill — it skips the
+    // durable close (and the identity retirement inside it), so the pane's
+    // session stays resumable for the follow-up `restore:create` respawn.
     let stuck_recovery = kill.reason.as_deref() == Some("stuck-recovery");
     let mut persisted_despite_error = false;
     if stuck_recovery {
         tracing::info!(
-            terminal_id = %kill.terminal_id,
+            terminal_id = %terminal_id,
             "terminal_kill_stuck_recovery: process-only kill; session left resumable"
         );
     } else {
-        let create_request_id = state
-            .registry
-            .probe_create_request_id(&kill.terminal_id)
-            .or_else(|| kill.create_request_id.clone());
-        let ledger = std::sync::Arc::clone(&state.pane_ledger);
-        let tid = kill.terminal_id.clone();
-        let now = now_ms();
-        // Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the close's
-        // error is CLASSED, never flattened — `Clean` means nothing is
-        // durable (leave the terminal running, answer failure);
-        // `Persisted` means the journal record stands despite the reported
-        // error, so the kill PROCEEDS (the live terminal ends, consistent
-        // with the durable close) while the answer still reports failure
-        // visibly.
-        let close_outcome = spawn_blocking_in_span(move || {
-            ledger.close_pane(&crate::pane_ledger::PaneCloseWrite {
-                terminal_id: tid.clone(),
-                create_request_id,
-                resolved: sref.into_iter().collect(),
-                now_ms: now,
-            })
-        })
-        .await
-        .unwrap_or_else(|err| {
-            tracing::warn!(terminal_id = %kill.terminal_id, error = %err, "pane_ledger_close_join_failed_on_kill");
-            Err(crate::pane_ledger::CloseEnvelopeError::Clean(
-                std::io::Error::other(format!("close task join failed: {err}")),
-            ))
-        });
-        persisted_despite_error = match &close_outcome {
-            Ok(()) => false,
-            Err(err) => {
-                if err.is_persisted() {
-                    tracing::error!(terminal_id = %kill.terminal_id, error = %err,
-                        "pane_ledger_close_persisted_despite_error_on_kill: the close is durable; \
-                         the terminal ends consistently and the answer reports the failure");
-                    true
-                } else {
-                    tracing::warn!(terminal_id = %kill.terminal_id, error = %err, "pane_ledger_close_pane_failed_on_kill");
-                    false
-                }
+        match durable_pane_close(state, &terminal_id, kill.create_request_id.as_deref()).await {
+            PaneClose::Recorded => {}
+            PaneClose::PersistedDespiteError => persisted_despite_error = true,
+            PaneClose::Failed => {
+                // Task 4 review F1: the clean failure leaves the terminal
+                // RUNNING, so the granted stop rolls back to Live here (or
+                // the key would wedge Stopping forever).
+                abort_terminal_stop(state, &mut stop_commit);
+                return reply.send(KillAnswer::close_failed());
             }
-        };
-        if close_outcome_is_clean_failure(&close_outcome) {
-            // Task 4 review F1: the clean failure leaves the terminal RUNNING
-            // (the close contract) — the granted stop must roll back to Live
-            // HERE, or the key wedges `Stopping` forever (every later kill is
-            // typed-refused `NotLive{Stopping}`, every create Blocked, and
-            // nothing recovers it: the watchdog sweeps `Starting` only, the
-            // fenced exit-watcher release matches `Live` only).
-            abort_terminal_stop(state, &mut stop_commit);
-            const CLOSE_FAILURE_COPY: &str =
-                "the terminal close could not be recorded durably; the terminal was left running";
-            if let Some(request_id) = &kill.request_id {
-                let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
-                    request_id: request_id.clone(),
-                    terminal_id: kill.terminal_id,
-                    success: false,
-                    error: Some(CLOSE_FAILURE_COPY.to_string()),
-                    // No owner trio: a ledger close failure is not an ownership
-                    // refusal (the granted stop already rolled back above).
-                    owner_kind: None,
-                    owner_generation: None,
-                    owner_epoch: None,
-                });
-                return send(ws_tx, &msg).await;
-            }
-            let msg = ServerMessage::Error(ErrorMsg {
-                owner_kind: None,
-                owner_generation: None,
-                owner_epoch: None,
-                code: ErrorCode::InternalError,
-                message: CLOSE_FAILURE_COPY.to_string(),
-                timestamp: crate::now_iso(),
-                actual_session_ref: None,
-                expected_session_ref: None,
-                request_id: None,
-                retry_after_ms: None,
-                terminal_id: Some(kill.terminal_id),
-                terminal_exit_code: None,
-                live_terminal_id: None,
-            });
-            return send(ws_tx, &msg).await;
         }
     }
-    // Stuck-recovery arrives here with NO durable close attempted: there is
-    // no close outcome to class, so the answer below reports plain success
-    // (persisted_despite_error stays false) and the kill core runs
-    // unchanged — the session identity, binding row, and recovery verdict
-    // all still stand for the respawn.
-    // The durable close stands (cleanly, or persisted-despite-error). The
-    // correlated answer reports success regardless of whether a reaper beat
-    // the process kill (a missing registry row means the terminal is already
-    // gone — not a close failure); the requestId-less arms keep their legacy
-    // shapes. The persisted-despite-error arm answers success:false — the
-    // kill visibly failed — but still ends the terminal (the close IS
-    // durable; keeping it live would misclassify it at recovery).
-    const PERSISTED_CLOSE_COPY: &str =
-        "the terminal close is recorded durably, but the ledger reported an error; \
-         the terminal was closed to keep state consistent";
-    // Task 4 review F1: the stop's second half runs at EVERY exit that
-    // reaches the kill core — including the already-reaped arm (the registry
-    // kill returning false: the natural-exit race removed the row after the
-    // retained claim was read; the runtime is dead and the pending
-    // (operation_id, generation) matches the record exactly, while
-    // `commit_stop`'s own fence keeps a key that moved on a typed no-op).
-    // The clean-close-failure arm above rolled back via `abort_terminal_stop`
-    // instead — that terminal was left RUNNING, so its key must return to
-    // Live, never Vacant.
-    let existed = if state.registry.is_managed(&kill.terminal_id) {
-        match state.registry.managed_stop(&kill.terminal_id).await {
-            Ok(()) => remove_managed_after_stop_and_broadcast(state, &kill.terminal_id),
-            Err(error) => {
-                tracing::error!(terminal_id = %kill.terminal_id, error = %error,
-                    "managed_runtime.stop_failed_after_durable_close");
-                let copy = format!(
-                    "the terminal close is recorded durably, but the managed runtime could not be verified stopped: {error}"
-                );
-                if let Some(request_id) = &kill.request_id {
-                    return send(
-                        ws_tx,
-                        &ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
-                            request_id: request_id.clone(),
-                            terminal_id: kill.terminal_id,
-                            success: false,
-                            error: Some(copy),
-                            owner_kind: None,
-                            owner_generation: None,
-                            owner_epoch: None,
-                        }),
-                    )
-                    .await;
-                }
-                return send(
-                    ws_tx,
-                    &ServerMessage::Error(ErrorMsg {
-                        owner_kind: None,
-                        owner_generation: None,
-                        owner_epoch: None,
-                        code: ErrorCode::InternalError,
-                        message: copy,
-                        timestamp: crate::now_iso(),
-                        actual_session_ref: None,
-                        expected_session_ref: None,
-                        request_id: None,
-                        retry_after_ms: None,
-                        terminal_id: Some(kill.terminal_id),
-                        terminal_exit_code: None,
-                        live_terminal_id: None,
-                    }),
-                )
-                .await;
-            }
-        }
-    } else {
-        kill_and_broadcast(state, &kill.terminal_id, stuck_recovery)
-    };
+
     // The supervisor's verified stop is the managed equivalent of the local
-    // PTY's confirmed reap. Never publish Vacant after an unverified stop.
-    commit_terminal_stop(state, &mut stop_commit);
-    if let Some(request_id) = &kill.request_id {
-        let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
-            request_id: request_id.clone(),
-            terminal_id: kill.terminal_id,
-            success: !persisted_despite_error,
-            error: persisted_despite_error.then(|| PERSISTED_CLOSE_COPY.to_string()),
-            // No owner trio: the kill SUCCEEDED the ownership sequence —
-            // the trio rides refusals only.
-            owner_kind: None,
-            owner_generation: None,
-            owner_epoch: None,
+    // PTY's confirmed reap: its wait runs in a spawned task, and the row is
+    // reported stopping meanwhile.
+    if state.registry.is_managed(&terminal_id) {
+        state
+            .registry
+            .mark_ending(&terminal_id, freshell_terminal::UnitEnding::Requested);
+        let state = state.clone();
+        reply.spawn_answering(async move {
+            let _stop_settlement = stop_settlement;
+            stop_managed_row(
+                &state,
+                &terminal_id,
+                &mut stop_commit,
+                persisted_despite_error,
+            )
+            .await
         });
-        return send(ws_tx, &msg).await;
-    }
-    if existed {
-        if persisted_despite_error {
-            let msg = ServerMessage::Error(ErrorMsg {
-                owner_kind: None,
-                owner_generation: None,
-                owner_epoch: None,
-                code: ErrorCode::InternalError,
-                message: PERSISTED_CLOSE_COPY.to_string(),
-                timestamp: crate::now_iso(),
-                actual_session_ref: None,
-                expected_session_ref: None,
-                request_id: None,
-                retry_after_ms: None,
-                terminal_id: Some(kill.terminal_id.clone()),
-                terminal_exit_code: None,
-                live_terminal_id: None,
-            });
-            return send(ws_tx, &msg).await;
-        }
         return true;
     }
-    send(ws_tx, &unknown_terminal_error(kill.terminal_id)).await
+
+    // Task 4 review F1: the stop's second half runs at EVERY exit that
+    // reaches the kill core (the registry kill returning false — the
+    // natural-exit race removed the row — still commits: the runtime is
+    // dead and the pending stop matches the record; `commit_stop`'s own
+    // fence keeps a key that moved on a typed no-op).
+    let existed = kill_and_broadcast(state, &terminal_id);
+    commit_terminal_stop(state, &mut stop_commit);
+    drop(stop_settlement);
+    if existed {
+        return reply.send(KillAnswer::done_after_close(persisted_despite_error));
+    }
+    if persisted_despite_error {
+        return reply.send(KillAnswer::done_after_close(true));
+    }
+    spawn_kill_not_found(state, kill, Some(terminal_id), initiator, reply);
+    true
 }
 
-/// True iff the close envelope reported a CLEAN failure (nothing durable —
-/// the kill must leave the terminal running). `Ok` and `Persisted` both
-/// mean the close is durable.
-fn close_outcome_is_clean_failure(
-    outcome: &Result<(), crate::pane_ledger::CloseEnvelopeError>,
-) -> bool {
-    matches!(outcome, Err(err) if !err.is_persisted())
+/// Runs [`kill_not_found`] in its own task. A plain function, so the type of
+/// [`kill_row`] (which `kill_not_found` may await) never depends on the type
+/// of `kill_not_found` (which `kill_row` spawns).
+fn spawn_kill_not_found(
+    state: &WsState,
+    kill: TerminalKill,
+    terminal_id: Option<String>,
+    initiator: &str,
+    reply: KillReply,
+) {
+    tokio::spawn(
+        kill_not_found(
+            state.clone(),
+            kill,
+            terminal_id,
+            initiator.to_string(),
+            reply,
+        )
+        .instrument(tracing::Span::current()),
+    );
+}
+
+/// A managed facade's stop through its supervisor (its kill already marked
+/// the row stopping): on the verified stop the facade is removed, the
+/// granted fenced stop committed, and the kill answered done; a failed stop
+/// leaves the facade registered and running (no longer reported stopping)
+/// and answers the failure.
+async fn stop_managed_row(
+    state: &WsState,
+    terminal_id: &str,
+    stop_commit: &mut Option<(String, String, String, u64)>,
+    persisted_despite_error: bool,
+) -> KillAnswer {
+    match state.registry.managed_stop(terminal_id).await {
+        Ok(()) => {
+            let existed = remove_managed_after_stop_and_broadcast(state, terminal_id);
+            commit_terminal_stop(state, stop_commit);
+            if existed || persisted_despite_error {
+                KillAnswer::done_after_close(persisted_despite_error)
+            } else {
+                // The facade went meanwhile: a requestId-less kill keeps the
+                // legacy unknown-terminal answer.
+                KillAnswer::unknown(true)
+            }
+        }
+        Err(error) => {
+            tracing::error!(terminal_id = %terminal_id, error = %error,
+                "managed_runtime.stop_failed_after_durable_close");
+            state.registry.clear_ending(terminal_id);
+            KillAnswer::failed(
+                &format!(
+                    "the terminal close is recorded durably, but the managed runtime could not be verified stopped: {error}"
+                ),
+                ErrorCode::InternalError,
+            )
+        }
+    }
+}
+
+/// Steps 3 and 5: nothing the kill names is running here. Runs in its own
+/// spawned task; its pure waits end with the connection, a stop it begins
+/// never does.
+///
+/// - A create-request id is remembered as killed first, so a create that
+///   arrives (or a managed launch that returns) later is refused as
+///   stopped; then a managed launch in flight for it is waited for, and a
+///   pane that started meanwhile (a unit, a facade) is stopped as such. A
+///   stuck restart's kill skips all of this: its respawn reuses the id, so
+///   a start under it is that respawn.
+/// - With a terminal id, a soul the supervisor still runs whose facade was
+///   not re-adopted (a web-server restart) is registered and stopped.
+/// - Otherwise "not found" is success only when the owner registry confirms
+///   nothing holds a conversation for the terminal
+///   ([`crate::unit_lifecycle::confirm_gone_for_unknown`]).
+async fn kill_not_found(
+    state: WsState,
+    kill: TerminalKill,
+    terminal_id: Option<String>,
+    initiator: String,
+    reply: KillReply,
+) {
+    let stuck_recovery = kill.reason.as_deref() == Some("stuck-recovery");
+    if let Some(crq) = kill.create_request_id.clone().filter(|_| !stuck_recovery) {
+        state.units.remember_killed_start(&crq);
+        if let Some(launch) = state.units.managed_starts().settled(&crq) {
+            let Some(outcome) = reply.until_closed(launch).await else {
+                return;
+            };
+            match outcome {
+                freshell_containment::ManagedStartOutcome::StoppedVerified => {
+                    reply.send(KillAnswer::done());
+                    return;
+                }
+                freshell_containment::ManagedStartOutcome::StopFailed(error) => {
+                    reply.send(KillAnswer::failed(
+                        &format!("the managed runtime could not be verified stopped: {error}"),
+                        ErrorCode::InternalError,
+                    ));
+                    return;
+                }
+                // The launch registered its facade before the kill was
+                // remembered: it is stopped below as the running pane it is.
+                freshell_containment::ManagedStartOutcome::Registered => {}
+            }
+        }
+        // A pane whose start began after the kill first looked is stopped
+        // through its own path (a start registered after the memory was
+        // written refuses itself).
+        if let Some(entry) = state.units.by_create_request(&crq) {
+            crate::unit_lifecycle::kill_unit(kill, entry, reply, &state, &initiator).await;
+            return;
+        }
+        if let Some(tid) = state
+            .registry
+            .terminal_for_create_request(&crq)
+            .filter(|tid| state.registry.is_managed(tid))
+        {
+            let reply = reply.naming(Some(&tid));
+            // Boxed: `kill_row` itself spawns this function.
+            let row: futures_util::future::BoxFuture<'_, bool> =
+                Box::pin(kill_row(kill, tid, reply, &state, &initiator));
+            row.await;
+            return;
+        }
+    }
+    let Some(tid) = terminal_id else {
+        reply.send(KillAnswer::unknown(false));
+        return;
+    };
+    if state.registry.has_managed_controller() {
+        let lookup = state
+            .registry
+            .lookup_managed(&tid, kill.create_request_id.clone());
+        let Some(lookup) = reply.until_closed(lookup).await else {
+            return;
+        };
+        match lookup {
+            Ok(Some(descriptor)) => {
+                tracing::info!(terminal_id = %tid, soul_id = %descriptor.soul_id,
+                    event = "terminal.kill.unadopted_managed",
+                    "the supervisor still runs this terminal; its facade is registered and stopped");
+                state.registry.register_managed(descriptor);
+                state
+                    .registry
+                    .mark_ending(&tid, freshell_terminal::UnitEnding::Requested);
+                let answer = stop_managed_row(&state, &tid, &mut None, false).await;
+                reply.send(answer);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(terminal_id = %tid, error = %error,
+                event = "terminal.kill.managed_lookup_failed",
+                "the supervisor's inventory could not be read; the owner registry decides"),
+        }
+    }
+    let confirmed = reply
+        .until_closed(crate::unit_lifecycle::confirm_gone_for_unknown(
+            &state, &tid,
+        ))
+        .await;
+    match confirmed {
+        None => {}
+        Some(Ok(())) => {
+            reply.send(KillAnswer::unknown(true));
+        }
+        Some(Err(_)) => {
+            reply.send(KillAnswer::owner_without_runtime());
+        }
+    }
+}
+
+/// The kill core of a row outside any unit (plain shells, agent rows not yet
+/// contained, and a unit row its unit already left at Gone): `true` = the
+/// terminal existed, was killed and reaped (`registry.kill` is an immediate
+/// SIGKILL-and-reap), and `terminals.changed` was broadcast; `false` =
+/// unknown id, nothing broadcast.
+fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
+    if state.registry.kill(terminal_id) {
+        after_terminal_removed(state, terminal_id);
+        return true;
+    }
+    false
 }
 
 /// kata b8ke Task 4: the explicit kill's stop-sequence SECOND HALF —
@@ -10735,35 +11247,6 @@ fn abort_terminal_stop(state: &WsState, stop_commit: &mut Option<(String, String
             "terminal_kill_stop_abort_foreign: the stop state moved on before the rollback"
         );
     }
-}
-
-/// The kill core, split from the socket reply for testability: `true` = the
-/// terminal existed, was killed/removed, and `terminals.changed` was broadcast
-/// (`ws:2988`); `false` = unknown id, nothing broadcast (the caller sends the
-/// `INVALID_TERMINAL_ID` error).
-fn kill_and_broadcast(state: &WsState, terminal_id: &str, stuck_recovery: bool) -> bool {
-    // A coding-agent pane in its unit is stopped through the unit (Force:
-    // SIGINT to the agent, then the whole unit); its row ends, and
-    // `terminal.exit`/`terminals.changed` are published, at Gone. A stuck
-    // restart keeps the pane resumable, so it is not remembered as killed.
-    let (reason, initiator) = if stuck_recovery {
-        (
-            freshell_containment::StopReason::StuckRestart,
-            "ws-terminal-kill-stuck-recovery",
-        )
-    } else {
-        (freshell_containment::StopReason::ShiftX, "ws-terminal-kill")
-    };
-    if crate::unit_lifecycle::stop_unit_row(state, terminal_id, reason, initiator, !stuck_recovery)
-        .is_some()
-    {
-        return true;
-    }
-    if state.registry.kill(terminal_id) {
-        after_terminal_removed(state, terminal_id);
-        return true;
-    }
-    false
 }
 
 fn remove_managed_after_stop_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
@@ -11895,7 +12378,7 @@ mod terminals_changed_tests {
     #[test]
     fn kill_of_unknown_terminal_does_not_broadcast() {
         let (state, mut rx) = state_with_bus();
-        assert!(!kill_and_broadcast(&state, "does-not-exist", false));
+        assert!(!kill_and_broadcast(&state, "does-not-exist"));
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -12055,9 +12538,20 @@ mod terminal_kill_stop_wedge_tests {
         sender
     }
 
+    /// Runs `handle_kill` answering into `sink` (the connection's outbox),
+    /// on a connection that stays open for the call.
+    async fn run_kill(kill: TerminalKill, sink: &WsSink, state: &WsState) {
+        let sender = sink.clone();
+        let out: FrameSink = Arc::new(move |msg| {
+            sender.push_server(msg);
+        });
+        let (_open, closed) = tokio::sync::watch::channel(false);
+        handle_kill(kill, &out, &closed, state, "ws-kill-conn-test").await;
+    }
+
     fn kill_for(terminal_id: &str) -> TerminalKill {
         TerminalKill {
-            terminal_id: terminal_id.to_string(),
+            terminal_id: Some(terminal_id.to_string()),
             request_id: Some("req-kill-wedge".to_string()),
             create_request_id: None,
             observed_epoch: None,
@@ -12075,14 +12569,7 @@ mod terminal_kill_stop_wedge_tests {
     async fn kill_whose_row_was_already_reaped_commits_the_granted_stop() {
         let (state, ownership, terminal_id) =
             state_with_live_terminal_owner(crate::pane_ledger::PaneLedger::disabled());
-        let mut ws_tx = test_sink();
-        handle_kill(
-            kill_for(&terminal_id),
-            &mut ws_tx,
-            &state,
-            "ws-kill-conn-test",
-        )
-        .await;
+        run_kill(kill_for(&terminal_id), &test_sink(), &state).await;
         assert!(
             matches!(
                 ownership.observe(KILL_PROVIDER, KILL_SESSION).state,
@@ -12123,14 +12610,7 @@ mod terminal_kill_stop_wedge_tests {
         let ledger = crate::pane_ledger::PaneLedger::new(Some(root.clone()));
         ledger.fail_next_close_envelope_writes(1);
         let (state, ownership, terminal_id) = state_with_live_terminal_owner(ledger);
-        let mut ws_tx = test_sink();
-        handle_kill(
-            kill_for(&terminal_id),
-            &mut ws_tx,
-            &state,
-            "ws-kill-conn-test",
-        )
-        .await;
+        run_kill(kill_for(&terminal_id), &test_sink(), &state).await;
         match ownership.observe(KILL_PROVIDER, KILL_SESSION).state {
             freshell_ownership::OwnershipState::Live {
                 owner, generation, ..
@@ -12151,14 +12631,7 @@ mod terminal_kill_stop_wedge_tests {
         }
         // The retry (the ledger's injected failure was one-shot) must be
         // granted and complete — the full unwedge, end to end.
-        let mut ws_tx = test_sink();
-        handle_kill(
-            kill_for(&terminal_id),
-            &mut ws_tx,
-            &state,
-            "ws-kill-conn-test",
-        )
-        .await;
+        run_kill(kill_for(&terminal_id), &test_sink(), &state).await;
         assert!(
             matches!(
                 ownership.observe(KILL_PROVIDER, KILL_SESSION).state,
@@ -12255,12 +12728,12 @@ mod terminal_kill_stop_wedge_tests {
     async fn kill_refused_on_a_stale_claim_carries_the_current_pair_on_the_killed_ack() {
         let (state, ownership, terminal_id) =
             state_with_live_terminal_owner(crate::pane_ledger::PaneLedger::disabled());
-        let (mut ws_tx, mut client) = kill_loopback_sink_and_client().await;
+        let (ws_tx, mut client) = kill_loopback_sink_and_client().await;
         let generation = committed_live_generation(&ownership);
         let mut kill = kill_for(&terminal_id);
         kill.observed_epoch = Some(ownership.boot_epoch());
         kill.observed_generation = Some(generation - 1);
-        handle_kill(kill, &mut ws_tx, &state, "ws-kill-conn-test").await;
+        run_kill(kill, &ws_tx, &state).await;
         let frame = kill_next_text_frame(&mut client).await;
         assert_eq!(frame["type"], "terminal.killed");
         assert_eq!(frame["requestId"], "req-kill-wedge");
@@ -12292,13 +12765,13 @@ mod terminal_kill_stop_wedge_tests {
     async fn kill_refused_on_a_stale_claim_carries_the_trio_on_the_error_arm() {
         let (state, ownership, terminal_id) =
             state_with_live_terminal_owner(crate::pane_ledger::PaneLedger::disabled());
-        let (mut ws_tx, mut client) = kill_loopback_sink_and_client().await;
+        let (ws_tx, mut client) = kill_loopback_sink_and_client().await;
         let generation = committed_live_generation(&ownership);
         let mut kill = kill_for(&terminal_id);
         kill.request_id = None;
         kill.observed_epoch = Some(ownership.boot_epoch());
         kill.observed_generation = Some(generation - 1);
-        handle_kill(kill, &mut ws_tx, &state, "ws-kill-conn-test").await;
+        run_kill(kill, &ws_tx, &state).await;
         let frame = kill_next_text_frame(&mut client).await;
         assert_eq!(frame["type"], "error");
         assert_eq!(frame["code"], "SESSION_RESERVED");

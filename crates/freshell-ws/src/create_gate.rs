@@ -84,6 +84,18 @@ pub(crate) fn spawn_gated_restore_create(
     // events (prepare/gate/spawn) keep the serving connection's `connection_id`.
     tokio::spawn(
         async move {
+            // A restore of a pane a kill stopped prepares (and so starts)
+            // nothing.
+            {
+                let mut out = CreateOutput::Channel(&sink);
+                if crate::terminal::refuse_killed_create(&state, &mut out, &create.request_id)
+                    .await
+                    .is_some()
+                {
+                    state.create_dedupe.clear_if_in_flight(&create.request_id);
+                    return;
+                }
+            }
             // P1 (graceful restore/resume S1): prepare — resume-identity
             // derivation + the codex managed plan — runs BEFORE the gate, so
             // permits only ever cover fast, mode-uniform PTY-spawn->settle work

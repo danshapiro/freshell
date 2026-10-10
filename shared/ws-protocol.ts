@@ -705,17 +705,22 @@ export const TerminalResizeSchema = z.object({
 
 export const TerminalKillSchema = z.object({
   type: z.literal('terminal.kill'),
-  terminalId: z.string().min(1),
+  /**
+   * The pane's terminal. Absent for a pane that is still starting (it has
+   * no terminal yet): the kill then names the pane by `createRequestId`
+   * alone, and the server cancels the start. At least one of the two is
+   * present (refined below).
+   */
+  terminalId: z.string().min(1).optional(),
   /**
    * Close-result correlation (delta-r6-r3 / focused-episode-6 round 2): when
-   * present, the server answers the kill with a `terminal.killed` frame
-   * carrying THIS id (`success:false` means the durable close failed and the
-   * terminal was left untouched; `success:true` covers the already-gone
-   * terminal too — missing registry entry is not a close failure). When
-   * absent, the legacy error-frame answers stand as-is. Additive optional:
-   * newer clients against older servers simply never get the frame (their
-   * wait falls back to `terminal.exit` / INVALID_TERMINAL_ID), older clients
-   * never send it — WS_PROTOCOL_VERSION deliberately not bumped.
+   * present, the server answers the kill with ONE `terminal.killed` frame
+   * carrying THIS id, sent only once the pane's agent is confirmed Gone (its
+   * processes dead and its conversation released). `success:true` means Gone
+   * was confirmed — never merely "not found": an unknown pane is answered
+   * success only when nothing holds a conversation for it. `success:false`
+   * means the kill was refused or the durable close failed, and the pane was
+   * left as it was. When absent, the legacy error-frame answers stand as-is.
    */
   requestId: z.string().min(1).optional(),
   /**
@@ -749,6 +754,8 @@ export const TerminalKillSchema = z.object({
    * WS_PROTOCOL_VERSION stays put (older servers accept-and-strip inbound).
    */
   reason: z.string().optional(),
+}).refine((m) => m.terminalId !== undefined || m.createRequestId !== undefined, {
+  message: 'terminal.kill needs terminalId or createRequestId',
 })
 
 export const CodexActivityListSchema = z.object({
@@ -1202,8 +1209,8 @@ export type TerminalInterestMessage = z.infer<typeof TerminalInterestSchema>
  * sent by a client whose hello negotiated `pacedTerminalReplayV1` after it
  * fully consumed an ordered replay page. `consumedSeq` is the last sequence
  * consumed in order; `attachRequestId` scopes the credit to one attach
- * generation. Additive optional — older servers accept-and-strip it and
- * protocol version stays 10.
+ * generation. Additive optional — older servers accept-and-strip it, so it
+ * needed no protocol version bump.
  */
 export const TerminalReplayCreditSchema = z.object({
   type: z.literal('terminal.replay.credit'),
@@ -1686,7 +1693,7 @@ export type SessionsChangedMessage = {
  * redirects + whether the accepted record changed); clients fold by record
  * and redirect revision, never arrival time. `sessions.changed` remains the
  * directory-invalidation signal and never orders names. Additive
- * server→client only; WS_PROTOCOL_VERSION deliberately stays 10 (the client
+ * server→client only; it needed no WS_PROTOCOL_VERSION bump (the client
  * never gates on it — pre-frame servers simply never send it).
  */
 export type SessionNameUpdatedMessage = SessionNameUpdate & {
@@ -1857,7 +1864,7 @@ export type FreshAgentServerMessage =
  * started/committed/failed, release) so every device holding a matching
  * sessionRef pane converges on the same owner — clients fold these
  * reactively (like `freshAgent.turn.complete`), nothing awaits an answer,
- * so the protocol version stays 10. `epoch` is the emitting server's boot
+ * so it needed no protocol version bump. `epoch` is the emitting server's boot
  * epoch: fenced comparisons use (epoch, generation), and a client that sees
  * a different epoch resets its generation state instead of ignoring newer
  * generations.
@@ -1933,7 +1940,12 @@ export type TerminalInventoryMessage = {
     createdAt: number
     lastActivityAt: number
     status: 'running' | 'exited'
-    runtimeStatus?: 'running' | 'recovering'
+    /** 'stopping': a requested stop of the row's unit is in flight (Gone not
+     *  confirmed yet); the client shows "Stopping…" from it, so it survives a
+     *  reload. */
+    runtimeStatus?: 'running' | 'recovering' | 'stopping'
+    /** When the stop of a 'stopping' row began (epoch ms). */
+    stoppingSince?: number
     cwd?: string
     codexDurability?: CodexDurabilityRef
     /** Server→client only, additive + optional: the terminal's resume target is an opencode subagent (child) session. */

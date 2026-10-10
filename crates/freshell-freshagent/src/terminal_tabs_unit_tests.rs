@@ -152,3 +152,40 @@ async fn a_dropped_rest_start_is_given_up() {
     start.commit();
     assert_eq!(recorder.abandons.lock().unwrap().len(), 1);
 }
+
+/// Task 12 re-review 3, m2: a given-up create's lease release (it runs at
+/// its unit's Gone) frees the conversation's sessionRef lease only while
+/// that create still holds it. A reopen that took the lease once the
+/// conversation went Vacant keeps it (before, the release removed the lease
+/// whoever held it, and the reopen's bind then failed with 409 "still
+/// running").
+#[test]
+fn a_given_up_creates_lease_release_leaves_a_lease_another_create_took() {
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let locator = SessionLocator {
+        provider: "codex".into(),
+        session_id: "t-m2".into(),
+    };
+    let release = |holder: &str| ReleaseLeaseAfterGone {
+        registry: registry.clone(),
+        locator: locator.clone(),
+        holder_create_request_id: holder.to_string(),
+    };
+    assert!(matches!(
+        registry.claim_session_ref(&locator, "crq-reopen", 2, 1_000),
+        freshell_terminal::registry::SessionRefClaim::Acquired
+    ));
+    drop(release("crq-given-up"));
+    assert!(
+        matches!(
+            registry.claim_session_ref(&locator, "crq-third", 3, 1_500),
+            freshell_terminal::registry::SessionRefClaim::Held { .. }
+        ),
+        "the reopen keeps its lease"
+    );
+    drop(release("crq-reopen"));
+    assert!(matches!(
+        registry.claim_session_ref(&locator, "crq-third", 3, 2_000),
+        freshell_terminal::registry::SessionRefClaim::Acquired
+    ));
+}

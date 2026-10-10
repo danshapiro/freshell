@@ -124,5 +124,5 @@
   },
   "source": "shared/ws-protocol.ts",
   "title": "freshell WebSocket message inventory — T0 conformance surface",
-  "wsProtocolVersion": 10
+  "wsProtocolVersion": 11
 }

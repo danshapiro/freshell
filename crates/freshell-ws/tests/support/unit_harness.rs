@@ -50,6 +50,10 @@ pub struct HarnessOpts {
     /// identity registry's); its `register_create_identity` runs after a
     /// REST create's bind and before its late claim and commit.
     pub rest_identity_binder: Option<Arc<dyn freshell_terminal::registry::PaneIdentityBinder>>,
+    /// Wire an `ActivityHub` as `main.rs` does (the hub plus the registry's
+    /// activity observer) and keep it in `WsState.activity`, so turn,
+    /// idle and attention edges are produced.
+    pub activity_hub: bool,
 }
 
 impl Default for HarnessOpts {
@@ -62,6 +66,7 @@ impl Default for HarnessOpts {
             rest_codex_tui_cmd: None,
             create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
             rest_identity_binder: None,
+            activity_hub: false,
         }
     }
 }
@@ -200,6 +205,12 @@ impl UnitHarness {
         let registry =
             freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
         let (auto_resume_tx, auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        // As `main.rs` wires it: the hub, then the registry's activity tap.
+        let activity = opts.activity_hub.then(|| {
+            let hub = freshell_ws::activity::ActivityHub::new(Arc::clone(&broadcast_tx), None);
+            registry.set_activity_observer(hub.registry_observer());
+            hub
+        });
 
         let state = freshell_ws::WsState {
             pane_ledger: Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
@@ -253,7 +264,7 @@ impl UnitHarness {
             config_fallback: None,
             opencode_locator: None,
             codex_locator: None,
-            activity: None,
+            activity,
             session_existence: Arc::new(freshell_ws::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms:
                 freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
@@ -356,6 +367,11 @@ impl UnitHarness {
     /// Connects and completes the hello/ready handshake (`paneReconcileV1`
     /// and `terminalLifetimeClaimV1` negotiated).
     pub async fn connect(&self) -> TestWs {
+        self.connect_with_inventory().await.0
+    }
+
+    /// [`Self::connect`], returning the handshake's `terminal.inventory`.
+    pub async fn connect_with_inventory(&self) -> (TestWs, serde_json::Value) {
         let (mut ws, _resp) = tokio_tungstenite::connect_async(&self.url)
             .await
             .expect("ws connect");
@@ -370,10 +386,11 @@ impl UnitHarness {
         ))
         .await
         .expect("send hello");
-        self.next_matching(&mut ws, FRAME_LIMIT, |f| f["type"] == "terminal.inventory")
+        let inventory = self
+            .next_matching(&mut ws, FRAME_LIMIT, |f| f["type"] == "terminal.inventory")
             .await
             .expect("the handshake ends with terminal.inventory");
-        ws
+        (ws, inventory)
     }
 
     /// Creates a Codex pane (a fresh one, or a restore of `resume`), attaches

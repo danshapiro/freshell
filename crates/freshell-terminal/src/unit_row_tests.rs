@@ -1260,3 +1260,146 @@ fn a_unit_rows_screen_records_its_start_time_at_spawn() {
     assert_eq!(reg.screen_start_time("T-plain"), None);
     reg.kill_all();
 }
+
+/// A row whose unit is being stopped (its ending marked `Requested`) reports
+/// `runtimeStatus: stopping` and when the stop began in every inventory, so
+/// "Stopping…" is derived from server state; a row with no ending, or one
+/// ending as an agent exit, keeps today's projection (Task 13, LB-34).
+/// `clear_ending` (a managed stop that failed) takes the row back.
+#[test]
+fn a_row_being_stopped_reports_stopping_in_the_inventory() {
+    let reg = TerminalRegistry::new();
+    let spawn = |tid: &str| {
+        let pid = reg
+            .create_in_unit(
+                &bash("sleep 30"),
+                &env(),
+                tid.into(),
+                format!("S-{tid}"),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+                placement(None),
+            )
+            .unwrap();
+        Own::pin(pid)
+    };
+    let _stopping = spawn("T-stop");
+    let _crashing = spawn("T-crash");
+    let _running = spawn("T-run");
+    let row = |tid: &str| {
+        reg.inventory()
+            .into_iter()
+            .find(|row| row.terminal_id == tid)
+            .unwrap_or_else(|| panic!("{tid} is in the inventory"))
+    };
+    assert_eq!(row("T-stop").runtime_status, None);
+
+    assert!(reg.mark_ending("T-stop", UnitEnding::Requested));
+    assert!(reg.mark_ending("T-crash", UnitEnding::AgentExited { exit_code: 1 }));
+    let since = reg.ending_since("T-stop").expect("marked when");
+    let stopping = row("T-stop");
+    assert_eq!(
+        stopping.runtime_status,
+        Some(freshell_protocol::RuntimeStatus::Stopping)
+    );
+    assert_eq!(stopping.stopping_since, Some(since));
+    for tid in ["T-crash", "T-run"] {
+        assert_eq!(row(tid).runtime_status, None, "{tid}");
+        assert_eq!(row(tid).stopping_since, None, "{tid}");
+    }
+
+    reg.clear_ending("T-stop");
+    assert_eq!(reg.ending("T-stop"), None);
+    assert_eq!(reg.ending_since("T-stop"), None);
+    assert_eq!(row("T-stop").runtime_status, None);
+    assert_eq!(row("T-stop").stopping_since, None);
+}
+
+/// A unit row's screen is signalled only while its pid still names the
+/// screen: here the screen exited and was reaped while a background job
+/// keeps the PTY slave open (so its reader never reached end of stream and
+/// the row still holds the PTY), and a later kill of the row's screen (the
+/// shutdown sweep) must not send anything to that pid or its group, which
+/// the OS may have given to another process (Task 11 re-review 2, Minor 1).
+#[test]
+fn a_unit_rows_screen_kill_never_reaches_a_reaped_screens_pid() {
+    let reg = TerminalRegistry::new();
+    let pid = reg
+        .create_in_unit(
+            &bash("trap '' HUP; sleep 30 & echo HOLDER=$!; exit 0"),
+            &env(),
+            "T-pin".into(),
+            "S-pin".into(),
+            "codex",
+            None,
+            None,
+            None,
+            None,
+            placement(None),
+        )
+        .unwrap();
+    let seen = attach_collector(&reg, "T-pin");
+    wait("holder pid printed", || {
+        output_text(&seen).contains("HOLDER=") && output_text(&seen).ends_with('\n')
+    });
+    let holder_pid: u32 = output_text(&seen)
+        .split("HOLDER=")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        })
+        .expect("the holder pid");
+    let holder = Own::pin(holder_pid);
+    // Reaped: the pid no longer names the screen at all.
+    wait("the screen was reaped", || stat(pid).is_none());
+    assert_eq!(
+        reg.pid_of("T-pin"),
+        Some(pid),
+        "the row still holds its PTY"
+    );
+
+    let _ = crate::pty::take_group_kill_log();
+    assert_eq!(reg.kill_all(), 1);
+    assert_eq!(
+        crate::pty::take_group_kill_log(),
+        Vec::<u32>::new(),
+        "nothing is sent to a reaped screen's pid or group"
+    );
+    assert!(
+        holder.alive(),
+        "the holder is the unit's to kill, not the PTY's"
+    );
+    holder.kill();
+}
+
+/// While the screen still runs (its pid unreaped), a kill of the unit row's
+/// screen still signals it and its process group.
+#[test]
+fn a_unit_rows_screen_kill_signals_a_running_screen() {
+    let reg = TerminalRegistry::new();
+    let pid = reg
+        .create_in_unit(
+            &bash("sleep 30"),
+            &env(),
+            "T-live".into(),
+            "S-live".into(),
+            "codex",
+            None,
+            None,
+            None,
+            None,
+            placement(None),
+        )
+        .unwrap();
+    let screen = Own::pin(pid);
+    let _ = crate::pty::take_group_kill_log();
+    assert_eq!(reg.kill_all(), 1);
+    assert_eq!(crate::pty::take_group_kill_log(), vec![pid]);
+    wait("the screen died", || !screen.alive());
+}

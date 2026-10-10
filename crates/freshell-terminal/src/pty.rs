@@ -127,6 +127,17 @@ pub struct PtyTerminal {
     /// [`ProcessStartReader`]) before its waiter thread can reap it, so
     /// `(pid, start)` names exactly the process this PTY spawned.
     start: Option<u64>,
+    /// Set by the waiter thread, under this lock, as it reaps the child:
+    /// while the lock is held and the flag is false the child is unreaped
+    /// (running or a zombie), so its pid cannot name another process.
+    /// (Windows kills through the process handle, which never names
+    /// another process.)
+    #[cfg_attr(not(unix), allow(dead_code))]
+    leader_reaped: Arc<Mutex<bool>>,
+    /// [`Self::signal_only_while_unreaped`]: `kill` signals the child and
+    /// its process group only while the child is unreaped.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pinned_kill: bool,
 }
 
 /// Reads a process's OS start time (`None` when unreadable). A unit row's
@@ -333,11 +344,25 @@ impl PtyTerminal {
             Arc::new(Mutex::new(Some(pair.master)));
         let waiter_master = Arc::clone(&master);
         let (code_tx, code_rx) = std::sync::mpsc::channel::<i64>();
+        let leader_reaped = Arc::new(Mutex::new(false));
+        let waiter_reaped = Arc::clone(&leader_reaped);
         let mut child = child;
         let waiter_thread = std::thread::spawn(move || {
-            let code = match child.wait() {
-                Ok(status) => status.exit_code() as i64,
-                Err(_) => 0,
+            // The exit is seen without reaping first, so the reap below runs
+            // under the lock a pinned kill holds while it signals: such a
+            // kill never reaches a pid the child no longer owns.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                wait_exited_unreaped(pid);
+            }
+            let code = {
+                let mut reaped = lock_ignoring_poison(&waiter_reaped);
+                let code = match child.wait() {
+                    Ok(status) => status.exit_code() as i64,
+                    Err(_) => 0,
+                };
+                *reaped = true;
+                code
             };
             let _ = code_tx.send(code);
             if cfg!(windows) {
@@ -365,7 +390,18 @@ impl PtyTerminal {
             reaped: false,
             pid,
             start,
+            leader_reaped,
+            pinned_kill: false,
         })
+    }
+
+    /// From now on [`Self::kill`] (and the kill in `Drop`) signals the child
+    /// and its process group only while the child is unreaped. A unit row's
+    /// screen uses it: a background job can keep its PTY open after the
+    /// screen exited and was reaped, and the screen's pid may by then name
+    /// another process. The unit stops whatever the screen left behind.
+    pub fn signal_only_while_unreaped(&mut self) {
+        self.pinned_kill = true;
     }
 
     /// Resize the PTY window (`terminal.resize` write path,
@@ -450,11 +486,31 @@ impl PtyTerminal {
     /// that gap: it reaches the shell AND every process it spawned into its
     /// own foreground group, deterministically, without depending on the
     /// pty's own hangup semantics.
+    ///
+    /// After [`Self::signal_only_while_unreaped`], both signals are sent only
+    /// while the child is unreaped, so neither reaches a pid the OS gave to
+    /// another process.
     pub fn kill(&mut self) {
         if self.reaped {
             return;
         }
         self.reaped = true;
+        #[cfg(unix)]
+        if self.pinned_kill {
+            // Held while signalling: the waiter cannot reap the child (and
+            // free its pid) between the check and the signals.
+            let leader = Arc::clone(&self.leader_reaped);
+            let reaped = lock_ignoring_poison(&leader);
+            if !*reaped {
+                self.signal_child_and_group();
+            }
+            return;
+        }
+        self.signal_child_and_group();
+    }
+
+    /// SIGHUP to the child (the killer), SIGKILL to its process group.
+    fn signal_child_and_group(&mut self) {
         let _ = self.killer.kill();
         #[cfg(unix)]
         if let Some(pid) = self.pid {
@@ -501,6 +557,34 @@ impl PtyTerminal {
         self.reaped = true;
         self.pid = None;
         self.start = None;
+    }
+}
+
+/// Locks ignoring poisoning: a panicked holder never makes a kill or a reap
+/// panic too.
+fn lock_ignoring_poison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Blocks until the child `pid` has exited, leaving it unreaped (`WNOWAIT`):
+/// its pid keeps naming it until the caller reaps it.
+#[cfg(unix)]
+fn wait_exited_unreaped(pid: u32) {
+    loop {
+        // SAFETY: a zeroed siginfo out-buffer for waitid.
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        // SAFETY: P_PID on our own child with a valid out-pointer.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return;
+        }
     }
 }
 

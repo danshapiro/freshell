@@ -35,7 +35,10 @@ pub use containment::{
     global_containment, global_or_fallback_containment, set_global_containment, Containment,
     SelectOptions, ShimCommand,
 };
-pub use directory::{AbandonedStart, UnitDirectory, UnitEntry, UnitLifecycle};
+pub use directory::{
+    AbandonedStart, ManagedStartGuard, ManagedStartOutcome, ManagedStarts, UnitDirectory,
+    UnitEntry, UnitLifecycle,
+};
 pub use listener::listening_socket_owner;
 pub use locks::{codex_thread_lock_path, lock_holders, lock_holders_among, LockHolder};
 pub use proc_watch::{ProcWatch, Sig};

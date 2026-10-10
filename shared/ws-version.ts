@@ -20,4 +20,15 @@
 // already-shipped state. The bump rule applies to answers the client AWAITS
 // (`pane.closed.result`, `panes.closed.result`): an awaited answer a
 // predated server silently drops must never ship unversioned.
-export const WS_PROTOCOL_VERSION = 10 as const
+//
+// Codex pane lifecycle (Task 13): bumped 10 → 11. `terminal.kill` may now
+// name a still-starting pane by its createRequestId alone (no terminalId),
+// and the server answers `terminal.killed` only once the pane's agent is
+// confirmed Gone. The client awaits that answer for a terminalId-less kill
+// with no deadline, and a version-10 server cannot parse a terminalId-less
+// kill and silently drops it, so a mixed pair would leave the close waiting
+// forever. The bump makes the mix fail LOUDLY instead: the strict hello check
+// answers PROTOCOL_MISMATCH and the client shows its version-mismatch overlay.
+// It therefore ships as server and client together in one full restart, never
+// as a client-only deploy.
+export const WS_PROTOCOL_VERSION = 11 as const

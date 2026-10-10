@@ -147,29 +147,79 @@ fn unit_keys(unit: &AgentUnit, operation_id: Option<&str>) -> UnitLogKeys {
 ///
 /// Must be called inside the tokio runtime.
 pub fn stop_terminal_unit(state: &WsState, entry: &UnitEntry, cmd: UnitStopCommand) -> StopHandle {
-    let unit = entry.unit.clone();
-    let unit_id = unit.id().as_str().to_string();
-    let current = state.units.get(unit.id());
-    let terminal_id = current
-        .as_ref()
-        .and_then(|e| e.terminal_id.clone())
-        .or_else(|| entry.terminal_id.clone());
-    let create_request_id = current
-        .as_ref()
-        .and_then(|e| e.create_request_id.clone())
-        .or_else(|| entry.create_request_id.clone());
+    start_unit_stop(state, entry, cmd).handle
+}
 
-    // 1. The join decision comes from the registry, not the unit's latch:
-    //    a key already Stopping names the unit's one stop operation. When
-    //    none is (the stop in flight began before any key was stamped with
-    //    the unit, so it moved none), the stop in flight names it: this
-    //    call joins that stop, whose Gone commits only its own operation.
-    let operation_id = state
+/// A stop request of a pane's unit, as [`start_unit_stop`] started it.
+pub(crate) struct UnitStop {
+    /// The unit's one stop (resolves at Gone).
+    pub(crate) handle: StopHandle,
+    /// Set once the keys THIS request moved to Stopping are released after
+    /// Gone (`None` when it moved none).
+    released: Option<watch::Receiver<bool>>,
+}
+
+impl UnitStop {
+    /// Resolves at Gone, once every key this request moved to Stopping is
+    /// released (never in the unconfirmed case).
+    pub(crate) async fn released(self) -> StopReport {
+        let report = self.handle.wait().await;
+        if let Some(mut released) = self.released {
+            let _ = released.wait_for(|released| *released).await;
+        }
+        report
+    }
+}
+
+/// The pane's ids as the directory knows them now (a terminal noted after
+/// `entry` was read is used).
+struct StopTarget {
+    unit_id: String,
+    terminal_id: Option<String>,
+    create_request_id: Option<String>,
+}
+
+fn stop_target(state: &WsState, entry: &UnitEntry) -> StopTarget {
+    let current = state.units.get(entry.unit.id());
+    StopTarget {
+        unit_id: entry.unit.id().as_str().to_string(),
+        terminal_id: current
+            .as_ref()
+            .and_then(|e| e.terminal_id.clone())
+            .or_else(|| entry.terminal_id.clone()),
+        create_request_id: current
+            .as_ref()
+            .and_then(|e| e.create_request_id.clone())
+            .or_else(|| entry.create_request_id.clone()),
+    }
+}
+
+/// [`stop_terminal_unit`], all six steps.
+pub(crate) fn start_unit_stop(
+    state: &WsState,
+    entry: &UnitEntry,
+    cmd: UnitStopCommand,
+) -> UnitStop {
+    let target = stop_target(state, entry);
+    let operation_id = stop_operation(state, &entry.unit, &cmd.operation_id);
+    let moved = move_unit_keys(state, &target, &operation_id, &cmd.initiator);
+    launch_unit_stop(state, entry, &target, cmd, operation_id, moved)
+}
+
+/// Step 1. The join decision comes from the registry, not the unit's
+/// latch: a key already Stopping names the unit's one stop operation. When
+/// none is (the stop in flight began before any key was stamped with the
+/// unit, so it moved none), the stop in flight names it: this call joins
+/// that stop, whose Gone commits only its own operation. Otherwise the
+/// caller's.
+fn stop_operation(state: &WsState, unit: &AgentUnit, requested: &str) -> String {
+    let unit_id = unit.id().as_str();
+    state
         .ownership
         .as_ref()
         .and_then(|ownership| {
             ownership
-                .keys_for_unit(&unit_id)
+                .keys_for_unit(unit_id)
                 .into_iter()
                 .find_map(|(_, state)| match state {
                     freshell_ownership::OwnershipState::Stopping { operation_id, .. } => {
@@ -179,36 +229,81 @@ pub fn stop_terminal_unit(state: &WsState, entry: &UnitEntry, cmd: UnitStopComma
                 })
         })
         .or_else(|| unit.stop_operation())
-        .unwrap_or_else(|| cmd.operation_id.clone());
+        .unwrap_or_else(|| requested.to_string())
+}
 
-    // 2. Every key the unit holds moves to Stopping; the live frame tells
-    //    every device (Decision 17).
-    if let Some(ownership) = state.ownership.as_ref() {
-        let moved = ownership.begin_unit_stop(&unit_id, &operation_id, &cmd.initiator, now_ms());
-        for key in moved.iter().filter(|key| !key.joined) {
-            // A start whose terminal is not known yet names none.
-            crate::identity_ownership::broadcast_terminal_owner_frame(
-                state,
-                &key.key.provider,
-                &key.key.session_id,
-                terminal_id.as_deref(),
-                &operation_id,
-                key.generation,
-                "stopping",
-            );
-        }
+/// Step 2. Every key the unit holds moves to Stopping; the live frame tells
+/// every device (Decision 17). Returns the operations the keys THIS call
+/// moved are Stopping under (the registry may have moved them under the
+/// operation of a stop another call began a moment earlier).
+fn move_unit_keys(
+    state: &WsState,
+    target: &StopTarget,
+    operation_id: &str,
+    initiator: &str,
+) -> std::collections::BTreeSet<String> {
+    let Some(ownership) = state.ownership.as_ref() else {
+        return Default::default();
+    };
+    let moved = ownership.begin_unit_stop(&target.unit_id, operation_id, initiator, now_ms());
+    let moved_keys: Vec<_> = moved.iter().filter(|key| !key.joined).collect();
+    let moved_ops = if moved_keys.is_empty() {
+        Default::default()
+    } else {
+        ownership
+            .keys_for_unit(&target.unit_id)
+            .into_iter()
+            .filter(|(key, _)| moved_keys.iter().any(|moved| &moved.key == key))
+            .filter_map(|(_, key_state)| match key_state {
+                freshell_ownership::OwnershipState::Stopping { operation_id, .. } => {
+                    Some(operation_id)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    for key in moved_keys {
+        // A start whose terminal is not known yet names none.
+        crate::identity_ownership::broadcast_terminal_owner_frame(
+            state,
+            &key.key.provider,
+            &key.key.session_id,
+            target.terminal_id.as_deref(),
+            operation_id,
+            key.generation,
+            "stopping",
+        );
     }
+    moved_ops
+}
+
+/// Steps 3 to 6, then the release of the keys this request moved: the
+/// stop's `on_gone` commits only the operation of the request that started
+/// the stop, so a request that moved keys under another operation (a key
+/// stamped with the unit after its stop's Gone commit, or two stops begun
+/// at the same moment) commits them itself once the unit is Gone
+/// (`commit_unit_stop` is idempotent: keys the Gone commit already released
+/// are not touched again).
+fn launch_unit_stop(
+    state: &WsState,
+    entry: &UnitEntry,
+    target: &StopTarget,
+    cmd: UnitStopCommand,
+    operation_id: String,
+    moved_ops: std::collections::BTreeSet<String>,
+) -> UnitStop {
+    let unit = entry.unit.clone();
 
     // 3. How the row ends (the first ending marked wins).
     let ending = cmd.ending();
-    if let Some(tid) = terminal_id.as_deref() {
+    if let Some(tid) = target.terminal_id.as_deref() {
         state.registry.mark_ending(tid, ending);
     }
 
     // 4. Stop-start silence (Stage 2: LB-37): a crash is never routed here
     //    before Gone and still rings at its exit.
     if !matches!(ending, UnitEnding::AgentExited { .. }) {
-        if let (Some(hub), Some(tid)) = (state.activity.as_ref(), terminal_id.as_deref()) {
+        if let (Some(hub), Some(tid)) = (state.activity.as_ref(), target.terminal_id.as_deref()) {
             hub.note_stop_requested(tid);
         }
     }
@@ -216,15 +311,15 @@ pub fn stop_terminal_unit(state: &WsState, entry: &UnitEntry, cmd: UnitStopComma
     // 5. A stopped start never settles as running.
     state.units.cancel_start(unit.id());
     if cmd.record_stopped_pane {
-        if let Some(crq) = create_request_id.as_deref() {
+        if let Some(crq) = target.create_request_id.as_deref() {
             state.units.remember_killed_start(crq);
         }
     }
 
     // 6. The one stop sequence.
     let gone_entry = UnitEntry {
-        terminal_id: terminal_id.clone(),
-        create_request_id: create_request_id.clone(),
+        terminal_id: target.terminal_id.clone(),
+        create_request_id: target.create_request_id.clone(),
         ..entry.clone()
     };
     let gone_state = state.clone();
@@ -239,11 +334,50 @@ pub fn stop_terminal_unit(state: &WsState, entry: &UnitEntry, cmd: UnitStopComma
             report,
         ))
     });
-    unit.stop(
+    let handle = unit.stop(
         StopRequest::new(cmd.mode, cmd.reason.clone(), cmd.initiator.clone())
             .operation(operation_id)
             .on_gone(on_gone),
-    )
+    );
+    let released = (!moved_ops.is_empty()).then(|| {
+        let (released_tx, released_rx) = watch::channel(false);
+        let state = state.clone();
+        let unit_id = unit.id().as_str().to_string();
+        let gone = handle.clone();
+        tokio::spawn(async move {
+            gone.wait().await;
+            for operation_id in &moved_ops {
+                release_unit_keys(&state, &unit_id, operation_id);
+            }
+            released_tx.send_replace(true);
+        });
+        released_rx
+    });
+    UnitStop { handle, released }
+}
+
+/// Commits Vacant every key of the unit Stopping under `operation_id` and
+/// broadcasts each release (only at Gone). Returns the keys released.
+fn release_unit_keys(
+    state: &WsState,
+    unit_id: &str,
+    operation_id: &str,
+) -> Vec<freshell_ownership::UnitStopKey> {
+    let Some(ownership) = state.ownership.as_ref() else {
+        return Vec::new();
+    };
+    let released = ownership.commit_unit_stop(unit_id, operation_id);
+    for key in &released {
+        crate::identity_ownership::broadcast_vacant_frame(
+            state,
+            &key.key.provider,
+            &key.key.session_id,
+            operation_id,
+            ownership.boot_epoch(),
+            key.generation,
+        );
+    }
+    released
 }
 
 /// Publishes a unit's Gone (its `on_gone`), in this order:
@@ -323,21 +457,14 @@ pub(crate) async fn publish_gone(
     state.units.note_gone(&unit_id);
     // f.
     let mut main_fence = None;
-    if let Some(ownership) = state.ownership.as_ref() {
-        for key in ownership.commit_unit_stop(unit_id.as_str(), &operation_id) {
-            crate::identity_ownership::broadcast_vacant_frame(
-                &state,
-                &key.key.provider,
-                &key.key.session_id,
-                &operation_id,
-                ownership.boot_epoch(),
-                key.generation,
-            );
-            if main_key.as_ref().is_some_and(|main| {
-                main.provider == key.key.provider && main.session_id == key.key.session_id
-            }) {
-                main_fence = Some((ownership.boot_epoch(), key.generation));
-            }
+    for key in release_unit_keys(&state, unit_id.as_str(), &operation_id) {
+        if main_key.as_ref().is_some_and(|main| {
+            main.provider == key.key.provider && main.session_id == key.key.session_id
+        }) {
+            main_fence = state
+                .ownership
+                .as_ref()
+                .map(|ownership| (ownership.boot_epoch(), key.generation));
         }
     }
     // g.
@@ -795,6 +922,12 @@ impl StartScope {
             create_request_id: Some(create_request_id.to_string()),
             terminal_id: None,
         });
+        // A kill of this pane that found no start yet (it remembered the
+        // create-request id first, then looked for a start) cancels the
+        // start registered just now, so it never mints an attempt.
+        if state.units.killed_start(create_request_id) {
+            state.units.cancel_start(base.id());
+        }
         Ok(StartScope {
             state: state.clone(),
             rt,
@@ -1090,6 +1223,197 @@ async fn end_row_of_gone_unit(state: &WsState, unit: &AgentUnit, terminal_id: &s
     .unwrap_or(false);
     if ended {
         crate::terminal::after_terminal_removed(state, terminal_id);
+    }
+}
+
+/// Shift-X (`terminal.kill`) of a coding-agent pane in its unit, found by
+/// terminal or by create-request id (a pane still starting, or the pane's
+/// replacement after auto-resume). Never awaits a Gone wait: the stop is
+/// begun synchronously and the acknowledgement runs in a spawned task.
+///
+/// 1. The observed fence of the fenced stop claim (Stage 2: LB-34): while
+///    the unit has no key Stopping yet and its row holds a retained claim,
+///    the fence the kill carries (else the retained stamp) and the retained
+///    terminal must match the main key's current Live pair and owner, or
+///    the kill is refused as stale and stops nothing (a delayed kill from
+///    another device cannot stop an auto-resumed replacement). A unit
+///    already stopping skips it: the kill joins (and escalates to Force).
+/// 2. The durable pane close, unless the kill is a stuck restart (the pane
+///    stays resumable); a failed close answers failure and stops nothing.
+/// 3. The unit's stop (Force; `ShiftX`, or `StuckRestart`), which cancels a
+///    start and remembers the pane's create-request id as killed.
+/// 4. With a `requestId`, `terminal.killed{success}` is sent only at Gone,
+///    after the keys the kill moved are released and the start settled
+///    (a cancelled start settles once its create released its claims), by
+///    a task dropped when the connection closes; the stop runs on.
+pub(crate) async fn kill_unit(
+    kill: freshell_protocol::TerminalKill,
+    entry: UnitEntry,
+    reply: crate::terminal::KillReply,
+    state: &WsState,
+    initiator: &str,
+) -> bool {
+    let reply = reply.naming(entry.terminal_id.as_deref());
+    let stuck_recovery = kill.reason.as_deref() == Some("stuck-recovery");
+
+    // 1.
+    if let Some(refusal) = unit_kill_fence(state, &kill, &entry) {
+        tracing::warn!(target: "freshell_unit",
+            event = "unit.kill_refused",
+            unit_id = %entry.unit.id(),
+            provider = %entry.provider,
+            session_id = %entry.unit.label().session_id.unwrap_or_default(),
+            terminal_id = %entry.terminal_id.as_deref().unwrap_or(""),
+            operation_id = "",
+            reason = %refusal.reason(),
+            "the kill names superseded ownership; nothing is stopped");
+        return reply.send(refusal.into());
+    }
+
+    // 2. A pane still starting is closed under the terminal it was
+    //    allocated.
+    let mut persisted_despite_error = false;
+    let close_terminal = entry
+        .terminal_id
+        .clone()
+        .or_else(|| kill.terminal_id.clone())
+        .or_else(|| entry.unit.label().terminal_id);
+    if let (false, Some(close_terminal)) = (stuck_recovery, close_terminal.as_deref()) {
+        let create_request_id = entry
+            .create_request_id
+            .as_deref()
+            .or(kill.create_request_id.as_deref());
+        match crate::terminal::durable_pane_close(state, close_terminal, create_request_id).await {
+            crate::terminal::PaneClose::Recorded => {}
+            crate::terminal::PaneClose::PersistedDespiteError => persisted_despite_error = true,
+            crate::terminal::PaneClose::Failed => {
+                return reply.send(crate::terminal::KillAnswer::close_failed());
+            }
+        }
+    }
+
+    // 3.
+    let settled = state.units.start_settled(entry.unit.id());
+    let (reason, initiator) = if stuck_recovery {
+        (
+            StopReason::StuckRestart,
+            format!("{initiator}-stuck-recovery"),
+        )
+    } else {
+        (StopReason::ShiftX, initiator.to_string())
+    };
+    let stop = start_unit_stop(
+        state,
+        &entry,
+        UnitStopCommand {
+            mode: StopMode::Force,
+            reason,
+            initiator,
+            operation_id: fresh_operation("term-kill"),
+            record_stopped_pane: !stuck_recovery,
+        },
+    );
+
+    // 4.
+    if reply.has_request_id() {
+        reply.answer_when(async move {
+            stop.released().await;
+            settled.await;
+            crate::terminal::KillAnswer::done_after_close(persisted_despite_error)
+        });
+    } else if persisted_despite_error {
+        reply.send(crate::terminal::KillAnswer::done_after_close(true));
+    }
+    true
+}
+
+/// Step 1 of [`kill_unit`]: `Some(refusal)` when the kill's observed fence
+/// (or the retained stamp) no longer names the pane's current Live owner.
+fn unit_kill_fence(
+    state: &WsState,
+    kill: &freshell_protocol::TerminalKill,
+    entry: &UnitEntry,
+) -> Option<crate::terminal::KillRefusal> {
+    let ownership = state.ownership.as_ref()?;
+    let terminal_id = entry.terminal_id.as_deref()?;
+    let retained = state.registry.retained_ownership_claim(terminal_id)?;
+    let stopping = ownership
+        .keys_for_unit(entry.unit.id().as_str())
+        .iter()
+        .any(|(_, key_state)| {
+            matches!(
+                key_state,
+                freshell_ownership::OwnershipState::Stopping { .. }
+            )
+        });
+    if stopping {
+        return None;
+    }
+    let observed = match crate::terminal::kill_observed_fence(kill, ownership, &retained) {
+        Ok(observed) => observed,
+        Err(refusal) => return Some(refusal),
+    };
+    let current = ownership.observe(&retained.locator.provider, &retained.locator.session_id);
+    match &current.state {
+        freshell_ownership::OwnershipState::Live {
+            owner, generation, ..
+        } => {
+            let stale = observed.epoch != ownership.boot_epoch()
+                || observed.generation != *generation
+                || owner.terminal_id.as_deref() != Some(retained.terminal_id.as_str());
+            stale.then(|| {
+                crate::terminal::stale_kill_refusal(
+                    &current.state,
+                    ownership.boot_epoch(),
+                    *generation,
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A kill named a terminal nothing runs for: `Ok(())` only when the owner
+/// registry confirms nothing holds a conversation for it. A key held under
+/// the terminal that is still settling (Stopping) is waited for (event
+/// driven, `wait_settled`) and the check repeated; a key still Live under
+/// it answers `Err("OWNER_WITHOUT_RUNTIME")` with ERROR
+/// `unit.kill_inconsistent`. Without an owner registry, `Ok(())`. Only ever
+/// awaited in a kill's spawned task.
+pub async fn confirm_gone_for_unknown(state: &WsState, terminal_id: &str) -> Result<(), String> {
+    let Some(ownership) = state.ownership.clone() else {
+        return Ok(());
+    };
+    loop {
+        let mut settling = None;
+        for (key, key_state) in ownership.states_for_terminal(terminal_id) {
+            match key_state {
+                freshell_ownership::OwnershipState::Live { .. } => {
+                    tracing::error!(target: "freshell_unit",
+                        event = "unit.kill_inconsistent",
+                        unit_id = "",
+                        provider = %key.provider,
+                        session_id = %key.session_id,
+                        terminal_id = %terminal_id,
+                        operation_id = "",
+                        "a kill found no runtime for this terminal, but a conversation is still held Live under it");
+                    return Err("OWNER_WITHOUT_RUNTIME".to_string());
+                }
+                freshell_ownership::OwnershipState::Stopping { .. }
+                | freshell_ownership::OwnershipState::Starting { .. }
+                | freshell_ownership::OwnershipState::Handoff { .. } => {
+                    settling = Some(key);
+                    break;
+                }
+                // Aliased keys hold no runtime; Vacant and Fenced keys are
+                // settled.
+                _ => {}
+            }
+        }
+        let Some(key) = settling else {
+            return Ok(());
+        };
+        ownership.wait_settled(&key.provider, &key.session_id).await;
     }
 }
 

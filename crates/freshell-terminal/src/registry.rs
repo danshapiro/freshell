@@ -879,6 +879,11 @@ impl TerminalShared {
     /// SPA reads `terminalId` + `status==='running'` to keep a persisted terminal
     /// (else `clearDeadTerminals` recreates it, losing scrollback).
     fn inventory(&self) -> InventoryTerminal {
+        // A requested stop in flight (a unit row's stop until its Gone, a
+        // managed row's until its verified stop) is reported, with when it
+        // began, so clients show "Stopping…" from server state.
+        let stopping =
+            self.status == TerminalRunStatus::Running && self.ending == Some(UnitEnding::Requested);
         InventoryTerminal {
             created_at: self.created_at,
             last_activity_at: self.last_activity_at,
@@ -889,7 +894,8 @@ impl TerminalShared {
             codex_durability: None,
             cwd: self.cwd.clone(),
             description: self.description.clone(),
-            runtime_status: None,
+            runtime_status: stopping.then_some(freshell_protocol::RuntimeStatus::Stopping),
+            stopping_since: if stopping { self.ending_since_ms } else { None },
             session_ref: None,
             session_name: self.session_name.clone(),
             name_ref: self.name_ref.clone(),
@@ -2672,7 +2678,14 @@ impl TerminalRegistry {
             1,
             start_reader.as_ref(),
         ) {
-            Ok(pty) => pty,
+            Ok(mut pty) => {
+                // A unit row's screen is signalled only while its pid still
+                // names it (a job can hold the PTY open after it was reaped).
+                if placement.is_some() {
+                    pty.signal_only_while_unreaped();
+                }
+                pty
+            }
             Err(err) => {
                 // Spawn failed: release the resume reservation so a retry
                 // isn't wedged behind a leaked claim (release-on-failure).
@@ -4460,6 +4473,17 @@ impl TerminalRegistry {
         true
     }
 
+    /// Unmarks a row's ending (a managed facade whose stop failed: it is
+    /// still registered and running, so it is no longer reported stopping).
+    pub fn clear_ending(&self, terminal_id: &str) {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return;
+        };
+        let mut s = shared.lock().expect("terminal lock");
+        s.ending = None;
+        s.ending_since_ms = None;
+    }
+
     /// The row's marked ending, if any.
     pub fn ending(&self, terminal_id: &str) -> Option<UnitEnding> {
         let shared = self.shared_for(terminal_id)?;
@@ -4638,7 +4662,11 @@ impl TerminalRegistry {
             Some(self.unit_row_exit_hook(terminal_id, generation)),
             first_seq,
             self.process_start_reader().as_ref(),
-        );
+        )
+        .map(|mut pty| {
+            pty.signal_only_while_unreaped();
+            pty
+        });
         #[cfg(test)]
         REPLACE_SCREEN_INTERLOCK.wait_if_targeted(terminal_id);
         // Install the new screen's PTY. Its exit may already have been
@@ -5526,13 +5554,38 @@ impl TerminalRegistry {
         let terminal = self
             .managed_descriptor(terminal_id)
             .ok_or_else(|| "managed terminal not found".to_string())?;
-        let controller = self
-            .managed_controller
+        self.managed_stop_descriptor(terminal).await
+    }
+
+    /// The supervisor's per-soul stop of `descriptor`, whether or not a
+    /// facade is registered for it (a soul whose launch returned after its
+    /// pane was killed). `Ok` only on the supervisor's verified stop.
+    pub async fn managed_stop_descriptor(
+        &self,
+        descriptor: ManagedTerminalDescriptor,
+    ) -> Result<(), String> {
+        self.managed_controller()?.stop(descriptor).await
+    }
+
+    /// The supervisor's own inventory answer for a terminal (by id, else by
+    /// its create-request id): a live soul whose facade this registry does
+    /// not hold (not re-adopted after a web-server restart) is found here.
+    pub async fn lookup_managed(
+        &self,
+        terminal_id: &str,
+        create_request_id: Option<String>,
+    ) -> Result<Option<ManagedTerminalDescriptor>, String> {
+        self.managed_controller()?
+            .lookup_terminal(terminal_id, create_request_id)
+            .await
+    }
+
+    fn managed_controller(&self) -> Result<Arc<dyn ManagedTerminalController>, String> {
+        self.managed_controller
             .read()
             .expect("managed controller lock")
             .clone()
-            .ok_or_else(|| "managed runtime controller unavailable".to_string())?;
-        controller.stop(terminal).await
+            .ok_or_else(|| "managed runtime controller unavailable".to_string())
     }
 
     /// Pull bounded host-spooled output and merge it into the ordinary
@@ -6281,6 +6334,36 @@ impl TerminalRegistry {
             .lock()
             .expect("session-ref lease lock")
             .remove(&session_ref_key(locator));
+        self.force_release_retained_after_confirmed_kill(locator);
+    }
+
+    /// [`Self::force_release_after_confirmed_kill`] for one create's own
+    /// lease: released only while `holder_create_request_id` still holds it.
+    /// A create given up after its unit's Gone releases this way, so a
+    /// reopen that took the conversation's lease meanwhile keeps it.
+    pub fn force_release_after_confirmed_kill_for_holder(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+    ) {
+        {
+            let mut leases = self
+                .session_ref_leases
+                .lock()
+                .expect("session-ref lease lock");
+            let key = session_ref_key(locator);
+            if leases
+                .get(&key)
+                .is_some_and(|lease| lease.holder_create_request_id == holder_create_request_id)
+            {
+                leases.remove(&key);
+            }
+        }
+        self.force_release_retained_after_confirmed_kill(locator);
+    }
+
+    /// The coordinator half of a confirmed-kill release (kata b8ke Task 4).
+    fn force_release_retained_after_confirmed_kill(&self, locator: &SessionLocator) {
         let Some(ownership) = self.ownership.as_ref() else {
             return;
         };
@@ -15683,6 +15766,35 @@ mod tests {
             reg.claim_session_ref(&s, "cr-B", 2, late + 1),
             SessionRefClaim::Acquired
         ));
+    }
+
+    /// Task 12 re-review 3, m2: a given-up create releases its conversation's
+    /// sessionRef lease only while that create still holds it — never a
+    /// lease another create (a reopen of the conversation) took meanwhile.
+    #[test]
+    fn a_confirmed_kill_release_for_one_holder_leaves_another_holders_lease() {
+        let reg = test_registry();
+        let s = locator("codex", "s1");
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-reopen", 2, 1000),
+            SessionRefClaim::Acquired
+        ));
+        reg.force_release_after_confirmed_kill_for_holder(&s, "cr-given-up");
+        assert!(
+            matches!(
+                reg.claim_session_ref(&s, "cr-other", 3, 1500),
+                SessionRefClaim::Held { .. }
+            ),
+            "the reopen's lease stands"
+        );
+        reg.force_release_after_confirmed_kill_for_holder(&s, "cr-reopen");
+        assert!(
+            matches!(
+                reg.claim_session_ref(&s, "cr-other", 3, 2000),
+                SessionRefClaim::Acquired
+            ),
+            "the holder's own release frees it"
+        );
     }
 
     #[test]

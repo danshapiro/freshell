@@ -38,7 +38,7 @@ pub use settings::*;
 
 /// The frozen WebSocket protocol version. Asserted equal to the committed
 /// contract (`shared/ws-version.ts`, `ws-message-inventory.json`) by the tests.
-pub const WS_PROTOCOL_VERSION: u32 = 10;
+pub const WS_PROTOCOL_VERSION: u32 = 11;
 
 /// Every `type` discriminant the protocol speaks, both directions, sorted.
 /// (42 client→server + 67 server→client = 109.)

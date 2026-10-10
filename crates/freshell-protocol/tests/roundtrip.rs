@@ -198,7 +198,7 @@ fn hello_roundtrips_paced_terminal_replay_v1_opt_in() {
     // Workstream 1 (responsive terminal restore) negotiation: the client opt-in
     // rides `hello.capabilities.pacedTerminalReplayV1`. Additive optional — a
     // negotiating hello round-trips byte-identically...
-    let wire = r#"{"type":"hello","protocolVersion":10,"token":"t","capabilities":{"terminalOutputBatchV1":true,"pacedTerminalReplayV1":true}}"#;
+    let wire = r#"{"type":"hello","protocolVersion":11,"token":"t","capabilities":{"terminalOutputBatchV1":true,"pacedTerminalReplayV1":true}}"#;
     match client_roundtrip(wire, "hello") {
         ClientMessage::Hello(h) => {
             assert_eq!(
@@ -212,7 +212,7 @@ fn hello_roundtrips_paced_terminal_replay_v1_opt_in() {
 
     // ...and a non-negotiating hello never invents the key (the frozen
     // client's wire shape is unchanged).
-    let wire = r#"{"type":"hello","protocolVersion":10,"token":"t","capabilities":{"terminalOutputBatchV1":true}}"#;
+    let wire = r#"{"type":"hello","protocolVersion":11,"token":"t","capabilities":{"terminalOutputBatchV1":true}}"#;
     match client_roundtrip(wire, "hello") {
         ClientMessage::Hello(h) => {
             assert_eq!(
@@ -877,5 +877,37 @@ fn session_name_updated_broadcast_roundtrips_and_conforms() {
             );
         }
         other => panic!("expected SessionNameUpdated, got {other:?}"),
+    }
+}
+
+#[test]
+fn terminal_inventory_row_roundtrips_a_stopping_unit() {
+    // Task 13 (Stage 2: LB-34): a row whose unit is being stopped reports
+    // `runtimeStatus: "stopping"` and when the stop began, so "Stopping…" is
+    // derived from server state (it survives a reload).
+    let wire = r#"{"type":"terminal.inventory","bootId":"b1","terminals":[{"terminalId":"t1","createdAt":1,"lastActivityAt":2,"mode":"codex","status":"running","title":"Codex","runtimeStatus":"stopping","stoppingSince":5}],"terminalMeta":[]}"#;
+    match server_roundtrip(wire, "terminal.inventory") {
+        ServerMessage::TerminalInventory(inv) => {
+            assert_eq!(
+                inv.terminals[0].runtime_status,
+                Some(RuntimeStatus::Stopping)
+            );
+            assert_eq!(inv.terminals[0].stopping_since, Some(5));
+        }
+        other => panic!("expected TerminalInventory, got {other:?}"),
+    }
+}
+
+#[test]
+fn terminal_kill_names_a_starting_pane_by_its_create_request_id_alone() {
+    // Task 13: Shift-X reaches a pane that has no terminal yet, so a kill
+    // may carry only the pane's createRequestId.
+    let wire = r#"{"type":"terminal.kill","requestId":"r1","createRequestId":"crq-1"}"#;
+    match client_roundtrip(wire, "terminal.kill") {
+        ClientMessage::TerminalKill(kill) => {
+            assert_eq!(kill.terminal_id, None);
+            assert_eq!(kill.create_request_id.as_deref(), Some("crq-1"));
+        }
+        other => panic!("expected TerminalKill, got {other:?}"),
     }
 }

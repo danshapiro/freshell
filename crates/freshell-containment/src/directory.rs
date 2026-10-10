@@ -112,6 +112,105 @@ struct Slot {
 
 type BindHook = Arc<dyn Fn(UnitEntry) + Send + Sync>;
 
+/// How a managed (supervisor-owned) pane's launch ended, as a kill that
+/// waited for it sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedStartOutcome {
+    /// The launch registered its facade: the pane runs (a kill stops it as
+    /// a running managed pane).
+    Registered,
+    /// The pane was killed while it launched: what the launch started was
+    /// stopped, and the supervisor verified it.
+    StoppedVerified,
+    /// The start ended with nothing verified stopped (the supervisor's error,
+    /// or "create abandoned" for a start dropped unfinished).
+    StopFailed(String),
+}
+
+type ManagedStartMap = HashMap<String, watch::Sender<Option<ManagedStartOutcome>>>;
+
+/// The managed panes whose launch is in flight, by create-request id. A
+/// managed launch is a supervisor call, not a unit: a kill that names such a
+/// pane (it has no terminal yet) waits here for how the launch ended instead
+/// of answering "not found" while a soul may be starting (Stage 2: LB-13).
+/// Shared by every lane through the [`UnitDirectory`].
+#[derive(Default)]
+pub struct ManagedStarts {
+    starts: Arc<Mutex<ManagedStartMap>>,
+}
+
+impl ManagedStarts {
+    /// Records the launch of `create_request_id` as in flight until the
+    /// returned guard is finished or dropped.
+    pub fn begin(&self, create_request_id: &str) -> ManagedStartGuard {
+        let (tx, _) = watch::channel(None);
+        lock(&self.starts).insert(create_request_id.to_string(), tx.clone());
+        ManagedStartGuard {
+            starts: self.starts.clone(),
+            create_request_id: create_request_id.to_string(),
+            tx,
+            finished: false,
+        }
+    }
+
+    /// Resolves with how the in-flight launch of `create_request_id` ended;
+    /// `None` when no managed launch is in flight for it.
+    pub fn settled(
+        &self,
+        create_request_id: &str,
+    ) -> Option<BoxFuture<'static, ManagedStartOutcome>> {
+        let mut rx = lock(&self.starts).get(create_request_id)?.subscribe();
+        Some(Box::pin(async move {
+            match rx.wait_for(Option::is_some).await {
+                Ok(outcome) => outcome.clone().expect("waited for an outcome"),
+                // Unreachable: a guard sends before it lets go of the sender.
+                Err(_) => ManagedStartOutcome::StopFailed("create abandoned".to_string()),
+            }
+        }))
+    }
+}
+
+/// One managed launch in flight ([`ManagedStarts::begin`]). Dropped
+/// unfinished, it ends the start as `StopFailed("create abandoned")`.
+pub struct ManagedStartGuard {
+    starts: Arc<Mutex<ManagedStartMap>>,
+    create_request_id: String,
+    tx: watch::Sender<Option<ManagedStartOutcome>>,
+    finished: bool,
+}
+
+impl ManagedStartGuard {
+    /// Ends the start: every waiting kill gets `outcome`, and the launch is
+    /// no longer in flight.
+    pub fn finish(mut self, outcome: ManagedStartOutcome) {
+        self.finish_inner(outcome);
+    }
+
+    fn finish_inner(&mut self, outcome: ManagedStartOutcome) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.tx.send_replace(Some(outcome));
+        let mut starts = lock(&self.starts);
+        // A later start under the same id keeps its own entry.
+        if starts
+            .get(&self.create_request_id)
+            .is_some_and(|tx| tx.same_channel(&self.tx))
+        {
+            starts.remove(&self.create_request_id);
+        }
+    }
+}
+
+impl Drop for ManagedStartGuard {
+    fn drop(&mut self) {
+        self.finish_inner(ManagedStartOutcome::StopFailed(
+            "create abandoned".to_string(),
+        ));
+    }
+}
+
 /// Which unit is which pane; see the module docs.
 #[derive(Default)]
 pub struct UnitDirectory {
@@ -120,6 +219,7 @@ pub struct UnitDirectory {
     /// Create-request ids whose start a kill ended, for the server's
     /// lifetime (Reopen mints a new id, so a killed id is never reused).
     killed: Mutex<HashSet<String>>,
+    managed_starts: ManagedStarts,
     lifecycle: RwLock<Option<Arc<dyn UnitLifecycle>>>,
 }
 
@@ -315,6 +415,11 @@ impl UnitDirectory {
 
     pub fn killed_start(&self, create_request_id: &str) -> bool {
         lock(&self.killed).contains(create_request_id)
+    }
+
+    /// The managed panes whose launch is in flight.
+    pub fn managed_starts(&self) -> &ManagedStarts {
+        &self.managed_starts
     }
 
     /// Installs the single stop path (the WebSocket layer's).

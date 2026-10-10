@@ -87,7 +87,9 @@ export interface BackgroundTerminal {
   lastActivityAt: number
   cwd?: string
   status: 'running' | 'exited'
-  runtimeStatus?: 'running' | 'recovering'
+  runtimeStatus?: 'running' | 'recovering' | 'stopping'
+  /** When the stop of a 'stopping' terminal began (epoch ms). */
+  stoppingSince?: number
   hasClients: boolean
   mode?: TabMode
   sessionRef?: SessionLocator

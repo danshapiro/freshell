@@ -624,7 +624,13 @@ pub struct TerminalResize {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalKill {
-    pub terminal_id: String,
+    /// The pane's terminal. Absent for a pane that is still starting (it
+    /// has no terminal yet): the kill then names it by `create_request_id`
+    /// alone. At least one of the two is present (the client schema
+    /// refines it); `terminal.killed{success:true}` means the pane's unit
+    /// was confirmed Gone, never merely "not found".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
     /// Close-result correlation (delta-r6-r3): present ⇒ the server answers
     /// with `terminal.killed{requestId,…}`; absent ⇒ legacy error frames.
     #[serde(skip_serializing_if = "Option::is_none")]

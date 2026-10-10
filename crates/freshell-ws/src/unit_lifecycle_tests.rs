@@ -880,3 +880,234 @@ async fn a_relayed_claim_is_dropped_only_at_gone() {
     })
     .await;
 }
+
+/// A kill named a terminal nothing runs for, while its conversation is
+/// still Stopping (a stop of the terminal's unit is in flight): "not found"
+/// is not success until the registry confirms Gone (Task 13, LB-34).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_terminal_whose_conversation_is_stopping_waits_for_gone() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, _crashes) = unit_state(root.path());
+    let ownership = state.ownership.clone().unwrap();
+    let owner = freshell_ownership::OwnerIdentity {
+        terminal_id: Some("T-gone".into()),
+        unit_id: Some("u-g".into()),
+        ..Default::default()
+    };
+    assert!(ownership.restore_stopping("codex", "t-g", owner, "op", "test", 1));
+    let wait = tokio::spawn({
+        let state = state.clone();
+        async move { confirm_gone_for_unknown(&state, "T-gone").await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!wait.is_finished(), "a Stopping conversation is not Gone");
+    ownership.commit_unit_stop("u-g", "op");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(500), wait)
+            .await
+            .unwrap()
+            .unwrap(),
+        Ok(())
+    );
+}
+
+/// A conversation still Live under a terminal nothing runs for cannot be
+/// confirmed Gone: `OWNER_WITHOUT_RUNTIME`, with an ERROR line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_terminal_still_owning_a_live_conversation_is_not_gone() {
+    let logs = crate::invariants::capture::capture();
+    let root = tempfile::tempdir().unwrap();
+    let (state, _crashes) = unit_state(root.path());
+    let ownership = state.ownership.clone().unwrap();
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+        "codex",
+        "t-live",
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        "op-start",
+        None,
+        "test",
+        1,
+    ) else {
+        panic!("granted")
+    };
+    ownership.commit_live(
+        "codex",
+        "t-live",
+        "op-start",
+        generation,
+        freshell_ownership::OwnerIdentity {
+            terminal_id: Some("T-orphan".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        confirm_gone_for_unknown(&state, "T-orphan").await,
+        Err("OWNER_WITHOUT_RUNTIME".to_string())
+    );
+    let logged = logs
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|e| {
+            e.fields.get("event").map(String::as_str) == Some("unit.kill_inconsistent")
+                && e.fields.get("terminal_id").map(String::as_str) == Some("T-orphan")
+        });
+    assert!(logged, "unit.kill_inconsistent is logged");
+    assert_eq!(confirm_gone_for_unknown(&state, "T-nothing").await, Ok(()));
+}
+
+/// Task 12 re-review 3, m1 window 1: a key stamped with the unit after the
+/// unit's stop already committed its keys at Gone (a create stamped its
+/// claim between its cancellation check and the stamp). The stop call that
+/// moves it (the create's give-up, joining the finished stop) releases it
+/// itself once the unit is Gone; before, it stayed Stopping until a server
+/// restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_stamped_after_its_units_gone_is_released_by_the_stop_that_moves_it() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, _crashes) = unit_state(root.path());
+    let entry = running_pane(&state, "T-w1", "crq-w1", "sleep 30").await;
+    let ownership = state.ownership.clone().unwrap();
+    let command = |operation_id: &str| UnitStopCommand {
+        mode: StopMode::Force,
+        reason: StopReason::ShiftX,
+        initiator: "test".into(),
+        operation_id: operation_id.into(),
+        record_stopped_pane: false,
+    };
+    stop_terminal_unit(&state, &entry, command("op-kill"))
+        .wait_for(LIMIT)
+        .await
+        .expect("Gone");
+
+    // The create's stamp lands after that Gone.
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+        "codex",
+        "s-w1",
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        "op-start",
+        None,
+        "test",
+        1,
+    ) else {
+        panic!("granted")
+    };
+    ownership.register_partial_runtime(
+        "codex",
+        "s-w1",
+        "op-start",
+        generation,
+        freshell_ownership::OwnerIdentity {
+            terminal_id: Some("T-w1".into()),
+            unit_id: Some(entry.unit.id().to_string()),
+            ..Default::default()
+        },
+    );
+    // The create gives its start up: its stop joins the finished one.
+    let moving = start_unit_stop(&state, &entry, command("op-give-up"));
+    assert!(matches!(
+        ownership.observe("codex", "s-w1").state,
+        freshell_ownership::OwnershipState::Stopping { .. }
+    ));
+    tokio::time::timeout(LIMIT, moving.released())
+        .await
+        .expect("the moved key is released once the unit is Gone");
+    assert_eq!(
+        ownership.observe("codex", "s-w1").state,
+        freshell_ownership::OwnershipState::Vacant
+    );
+}
+
+/// Task 12 re-review 3, m1 window 2: two stops begun at almost the same
+/// moment. B picks its operation (no key Stopping, no stop yet), A then
+/// moves the unit's key under A's operation, and B's containment stop
+/// starts first, so the only `on_gone` that runs commits B's operation.
+/// A releases the key it moved itself once the unit is Gone; before, it
+/// stayed Stopping until a server restart.
+#[test]
+fn two_stops_begun_at_once_release_every_key_at_gone() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = tempfile::tempdir().unwrap();
+        let (state, _crashes) = unit_state(root.path());
+        let entry = running_pane(&state, "T-w2", "crq-w2", "sleep 30").await;
+        let ownership = state.ownership.clone().unwrap();
+        let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+            "codex",
+            "s-w2",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-start",
+            None,
+            "test",
+            1,
+        ) else {
+            panic!("granted")
+        };
+        ownership.commit_live(
+            "codex",
+            "s-w2",
+            "op-start",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                terminal_id: Some("T-w2".into()),
+                unit_id: Some(entry.unit.id().to_string()),
+                ..Default::default()
+            },
+        );
+        let command = |operation_id: &str| UnitStopCommand {
+            mode: StopMode::Force,
+            reason: StopReason::ShiftX,
+            initiator: "test".into(),
+            operation_id: operation_id.into(),
+            record_stopped_pane: false,
+        };
+        let target = stop_target(&state, &entry);
+
+        // B: step 1 only.
+        let op_b = stop_operation(&state, &entry.unit, "op-b");
+        assert_eq!(op_b, "op-b");
+        // A: steps 1 and 2 (the key moves under A's operation).
+        let op_a = stop_operation(&state, &entry.unit, "op-a");
+        let moved_a = move_unit_keys(&state, &target, &op_a, "a");
+        // B: step 2 (the key is already Stopping: B moves none), then its
+        // containment stop starts first.
+        let moved_b = move_unit_keys(&state, &target, &op_b, "b");
+        assert!(moved_b.is_empty());
+        let stop_b = launch_unit_stop(&state, &entry, &target, command("op-b"), op_b, moved_b);
+        let stop_a = launch_unit_stop(&state, &entry, &target, command("op-a"), op_a, moved_a);
+
+        let report = tokio::time::timeout(LIMIT, stop_b.released())
+            .await
+            .expect("Gone");
+        assert_eq!(
+            tokio::time::timeout(LIMIT, stop_a.released()).await.ok(),
+            Some(report)
+        );
+        assert_eq!(
+            ownership.observe("codex", "s-w2").state,
+            freshell_ownership::OwnershipState::Vacant,
+            "the key A moved is released at Gone"
+        );
+    });
+}
+
+/// A kill of a pane that found no start yet remembers the pane's
+/// create-request id and then looks for its start; a start registered just
+/// after that is cancelled at once, so it never mints an attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_registered_after_its_pane_was_killed_is_cancelled() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, _crashes) = unit_state(root.path());
+    state.units.remember_killed_start("crq-killed");
+    let scope =
+        StartScope::begin(&state, "codex", "codex", "crq-killed", "T-killed", None).expect("start");
+    assert!(scope.cancelled(), "the start is cancelled as it registers");
+    scope.abandon(None);
+    let scope =
+        StartScope::begin(&state, "codex", "codex", "crq-live", "T-live", None).expect("start");
+    assert!(!scope.cancelled());
+    scope.abandon(None);
+}

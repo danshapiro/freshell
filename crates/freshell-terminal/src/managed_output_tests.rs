@@ -260,3 +260,161 @@ fn managed_opencode_same_runtime_accepts_a_signaled_session_switch() {
     );
     assert_eq!(registry.managed_output_cursor("terminal-stable"), Some(206));
 }
+
+/// Records what the WebSocket kill path hands the supervisor: the lookup of
+/// a terminal (by id and create-request id) and the per-soul stop.
+#[derive(Default)]
+struct StopRecorder {
+    found: Mutex<Option<ManagedTerminalDescriptor>>,
+    lookups: Mutex<Vec<(String, Option<String>)>>,
+    stopped: Mutex<Vec<ManagedTerminalDescriptor>>,
+    fail_stop: AtomicBool,
+}
+impl ManagedTerminalController for StopRecorder {
+    fn lookup_terminal<'a>(
+        &'a self,
+        terminal_id: &'a str,
+        create_request_id: Option<String>,
+    ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+        self.lookups
+            .lock()
+            .unwrap()
+            .push((terminal_id.to_string(), create_request_id));
+        Box::pin(std::future::ready(Ok(self.found.lock().unwrap().clone())))
+    }
+    fn launch<'a>(
+        &'a self,
+        _: ManagedTerminalLaunch,
+    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+        panic!("a kill never launches")
+    }
+    fn input<'a>(
+        &'a self,
+        _: ManagedTerminalDescriptor,
+        _: String,
+    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        panic!("a kill never writes input")
+    }
+    fn resize<'a>(
+        &'a self,
+        _: ManagedTerminalDescriptor,
+        _: u16,
+        _: u16,
+    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        panic!("a kill never resizes")
+    }
+    fn stop<'a>(
+        &'a self,
+        terminal: ManagedTerminalDescriptor,
+    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        self.stopped.lock().unwrap().push(terminal);
+        let result = if self.fail_stop.load(Ordering::SeqCst) {
+            Err("supervisor could not verify the stop".to_string())
+        } else {
+            Ok(())
+        };
+        Box::pin(std::future::ready(result))
+    }
+    fn read_output<'a>(
+        &'a self,
+        _: ManagedTerminalDescriptor,
+        _: i64,
+        _: u64,
+    ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+        panic!("a kill never reads output")
+    }
+}
+
+fn soul(terminal_id: &str) -> ManagedTerminalDescriptor {
+    ManagedTerminalDescriptor {
+        soul_id: format!("soul-{terminal_id}"),
+        incarnation_id: "incarnation-1".into(),
+        terminal_id: terminal_id.into(),
+        stream_id: "stream-1".into(),
+        mode: "shell".into(),
+        cwd: "/workspace".into(),
+        resume_session_id: None,
+        create_request_id: Some(format!("crq-{terminal_id}")),
+    }
+}
+
+/// The kill path's supervisor seams (Task 13, LB-13): the inventory lookup
+/// of a terminal the registry no longer holds, and the per-soul stop of a
+/// descriptor no facade was registered for (a soul whose launch returned
+/// after its pane was killed). `Ok` only on the supervisor's verified stop;
+/// without a controller both answer the managed stop's own error.
+#[test]
+fn the_kill_path_reaches_the_supervisor_by_descriptor() {
+    let registry = TerminalRegistry::new();
+    assert_eq!(
+        immediate(registry.lookup_managed("T-gone", None)),
+        Err("managed runtime controller unavailable".to_string())
+    );
+    assert_eq!(
+        immediate(registry.managed_stop_descriptor(soul("T-gone"))),
+        Err("managed runtime controller unavailable".to_string())
+    );
+
+    let controller = Arc::new(StopRecorder::default());
+    registry.set_managed_controller(Some(controller.clone()));
+    assert_eq!(
+        immediate(registry.lookup_managed("T-gone", Some("crq-x".into()))),
+        Ok(None)
+    );
+    *controller.found.lock().unwrap() = Some(soul("T-gone"));
+    assert_eq!(
+        immediate(registry.lookup_managed("T-gone", None)),
+        Ok(Some(soul("T-gone")))
+    );
+    assert_eq!(
+        *controller.lookups.lock().unwrap(),
+        vec![
+            ("T-gone".to_string(), Some("crq-x".to_string())),
+            ("T-gone".to_string(), None)
+        ]
+    );
+
+    assert_eq!(
+        immediate(registry.managed_stop_descriptor(soul("T-launched"))),
+        Ok(())
+    );
+    controller.fail_stop.store(true, Ordering::SeqCst);
+    assert_eq!(
+        immediate(registry.managed_stop_descriptor(soul("T-launched"))),
+        Err("supervisor could not verify the stop".to_string())
+    );
+    assert_eq!(
+        *controller.stopped.lock().unwrap(),
+        vec![soul("T-launched"), soul("T-launched")]
+    );
+    assert!(
+        !registry.is_managed("T-launched"),
+        "stopping a descriptor never registers a facade"
+    );
+}
+
+/// A managed facade whose kill marked it `Requested` reports `stopping` in
+/// the inventory until its stop is verified (or `clear_ending` takes it
+/// back when the stop failed).
+#[test]
+fn a_managed_row_being_stopped_reports_stopping() {
+    let registry = TerminalRegistry::new();
+    registry.register_managed(soul("T-m"));
+    assert!(registry.mark_ending("T-m", UnitEnding::Requested));
+    let row = registry
+        .inventory()
+        .into_iter()
+        .find(|row| row.terminal_id == "T-m")
+        .expect("the facade's row");
+    assert_eq!(
+        row.runtime_status,
+        Some(freshell_protocol::RuntimeStatus::Stopping)
+    );
+    registry.clear_ending("T-m");
+    let row = registry
+        .inventory()
+        .into_iter()
+        .find(|row| row.terminal_id == "T-m")
+        .expect("the facade's row");
+    assert_eq!(row.runtime_status, None);
+}

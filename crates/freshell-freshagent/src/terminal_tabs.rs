@@ -1081,6 +1081,12 @@ impl RestUnitStart {
             create_request_id: Some(create_request_id.to_string()),
             terminal_id: None,
         });
+        // A kill of this pane that found no start yet (it remembered the
+        // create-request id first, then looked for a start) cancels the
+        // start registered just now, so it never mints an attempt.
+        if state.units.killed_start(create_request_id) {
+            state.units.cancel_start(base.id());
+        }
         Ok(Some(Self {
             lifecycle: freshell_codex::launch_plan::DirectoryUnitLifecycle::new(
                 state.units.clone(),
@@ -1287,19 +1293,48 @@ fn stamp_claim_with_unit(
     }
 }
 
+/// The spawn "failure" of a managed pane killed while it started (its soul
+/// stopped, or never launched): the create's failure cleanup runs, then it
+/// is answered as stopped ([`pane_stopped_response`]).
+fn pane_stopped_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, PANE_STOPPED_MESSAGE)
+}
+
+fn is_pane_stopped_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::Interrupted && err.to_string() == PANE_STOPPED_MESSAGE
+}
+
+/// The answer to a create of a pane a kill stopped (the WebSocket create's
+/// `INVALID_TERMINAL_ID` refusal, as a REST response).
+const PANE_STOPPED_MESSAGE: &str = "this pane was stopped";
+
+fn pane_stopped_response() -> Response {
+    fail_json_code(
+        StatusCode::CONFLICT,
+        "INVALID_TERMINAL_ID",
+        PANE_STOPPED_MESSAGE.to_string(),
+    )
+}
+
 /// Releases a disarmed sessionRef lease (and its retained coordinator
 /// claim) when dropped: carried by a given-up start, it runs after the
 /// unit's Gone — the confirmed death `force_release_after_confirmed_kill`
-/// requires.
+/// requires. The lease is released only while this create still holds it:
+/// a reopen that took the conversation's lease once it went Vacant keeps it
+/// (Task 12 re-review 3, m2).
 struct ReleaseLeaseAfterGone {
     registry: freshell_terminal::TerminalRegistry,
     locator: SessionLocator,
+    /// The create the lease belongs to.
+    holder_create_request_id: String,
 }
 
 impl Drop for ReleaseLeaseAfterGone {
     fn drop(&mut self) {
-        self.registry
-            .force_release_after_confirmed_kill(&self.locator);
+        self.registry.force_release_after_confirmed_kill_for_holder(
+            &self.locator,
+            &self.holder_create_request_id,
+        );
     }
 }
 
@@ -3271,6 +3306,10 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // door (`crates/freshell-ws/src/terminal.rs`). Values consumed by the
     // call and unused afterwards (`child_env`, `stream_id`, `on_exit`)
     // move in without cloning.
+    let mut killed_managed_start: Option<(
+        freshell_containment::ManagedStartGuard,
+        freshell_containment::ManagedStartOutcome,
+    )> = None;
     let create_result = if use_managed_runtime {
         let managed = ManagedTerminalLaunch {
             spec: spec.clone(),
@@ -3287,14 +3326,56 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             view_pane_id: Some(pane_id.clone()),
             create_request_id: Some(create_request_id.clone()),
         };
-        match registry.launch_managed(managed).await {
-            Ok(descriptor) => {
-                registry.register_managed(descriptor);
-                Ok(None)
+        // As the WebSocket create: the launch is in flight under the pane's
+        // create-request id until it is registered or stopped, so a kill of
+        // the starting pane waits for it; a pane killed before or while it
+        // launched is stopped (never registered) and answered as stopped,
+        // and its outcome reaches the waiting kill once that answer is
+        // decided (Stage 2: LB-13).
+        let start = state.units.managed_starts().begin(&create_request_id);
+        if state.units.killed_start(&create_request_id) {
+            killed_managed_start = Some((
+                start,
+                freshell_containment::ManagedStartOutcome::StoppedVerified,
+            ));
+            Err(pane_stopped_error())
+        } else {
+            match registry.launch_managed(managed).await {
+                Ok(descriptor) if state.units.killed_start(&create_request_id) => {
+                    let stopped = registry.managed_stop_descriptor(descriptor).await;
+                    tracing::info!(
+                        target: "freshell_freshagent::terminal_tabs",
+                        terminal_id = %terminal_id,
+                        mode = %mode,
+                        stopped = stopped.is_ok(),
+                        event = "terminal.create.managed_killed_while_launching",
+                        "a managed pane killed while it launched is stopped, not registered"
+                    );
+                    killed_managed_start = Some((
+                        start,
+                        match stopped {
+                            Ok(()) => freshell_containment::ManagedStartOutcome::StoppedVerified,
+                            Err(error) => {
+                                freshell_containment::ManagedStartOutcome::StopFailed(error)
+                            }
+                        },
+                    ));
+                    Err(pane_stopped_error())
+                }
+                Ok(descriptor) => {
+                    registry.register_managed(descriptor);
+                    start.finish(freshell_containment::ManagedStartOutcome::Registered);
+                    Ok(None)
+                }
+                Err(error) => {
+                    start.finish(freshell_containment::ManagedStartOutcome::StopFailed(
+                        format!("managed runtime launch failed: {error}"),
+                    ));
+                    Err(std::io::Error::other(format!(
+                        "managed runtime launch failed: {error}"
+                    )))
+                }
             }
-            Err(error) => Err(std::io::Error::other(format!(
-                "managed runtime launch failed: {error}"
-            ))),
         }
     } else {
         // A Codex pane's TUI starts in the pane's unit (its screen); a unit
@@ -3459,6 +3540,15 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 }
                 None => manager.discard(launch).await,
             }
+        }
+        // A managed pane killed while it started is answered as stopped;
+        // only then is the kill that waited for it told how it ended.
+        if is_pane_stopped_error(&err) {
+            let answer = pane_stopped_response();
+            if let Some((start, outcome)) = killed_managed_start.take() {
+                start.finish(outcome);
+            }
+            return Err(answer);
         }
         let label = mode_label(&mode, cli.as_ref());
         let env_var = state
@@ -3705,6 +3795,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                             ReleaseLeaseAfterGone {
                                 registry: registry.clone(),
                                 locator: locator.clone(),
+                                holder_create_request_id: create_request_id.clone(),
                             },
                         ))),
                     );
@@ -3838,6 +3929,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                             ReleaseLeaseAfterGone {
                                 registry: registry.clone(),
                                 locator: locator.clone(),
+                                holder_create_request_id: create_request_id.clone(),
                             },
                         ))),
                     ),
@@ -3876,6 +3968,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     ReleaseLeaseAfterGone {
                         registry: registry.clone(),
                         locator,
+                        holder_create_request_id: create_request_id.clone(),
                     },
                 )),
                 None => claims,
@@ -3985,6 +4078,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                                 ReleaseLeaseAfterGone {
                                     registry: registry.clone(),
                                     locator: locator.clone(),
+                                    holder_create_request_id: create_request_id.clone(),
                                 },
                             ))),
                         ),
@@ -7768,6 +7862,151 @@ if (args.includes('app-server')) {{
         > {
             Box::pin(async { Err("unexpected managed output read".into()) })
         }
+    }
+
+    /// A supervisor whose `launch` waits on a gate (and records the launch)
+    /// and whose `stop` records what it was asked to stop.
+    #[derive(Default)]
+    struct GatedSupervisor {
+        gate: tokio::sync::Notify,
+        launched: std::sync::Mutex<Vec<String>>,
+        stopped: std::sync::Mutex<Vec<freshell_terminal::registry::ManagedTerminalDescriptor>>,
+    }
+
+    impl freshell_terminal::registry::ManagedTerminalController for GatedSupervisor {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<Option<freshell_terminal::registry::ManagedTerminalDescriptor>, String>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            request: freshell_terminal::registry::ManagedTerminalLaunch,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<freshell_terminal::registry::ManagedTerminalDescriptor, String>,
+        > {
+            Box::pin(async move {
+                self.launched
+                    .lock()
+                    .unwrap()
+                    .push(request.terminal_id.clone());
+                self.gate.notified().await;
+                Ok(freshell_terminal::registry::ManagedTerminalDescriptor {
+                    soul_id: "soul-rest".into(),
+                    incarnation_id: "incarnation-1".into(),
+                    terminal_id: request.terminal_id,
+                    stream_id: request.stream_id,
+                    mode: request.mode,
+                    cwd: "/workspace".into(),
+                    resume_session_id: None,
+                    create_request_id: request.create_request_id,
+                })
+            })
+        }
+
+        fn input<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: String,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn resize<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: u16,
+            _: u16,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            terminal: freshell_terminal::registry::ManagedTerminalDescriptor,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            self.stopped.lock().unwrap().push(terminal);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: i64,
+            _: u64,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<freshell_terminal::registry::ManagedOutputRead, String>,
+        > {
+            Box::pin(async { Err("not needed".into()) })
+        }
+    }
+
+    /// The REST lane's managed launch follows the WebSocket create's rule
+    /// (Task 13, LB-13): while it launches it is in flight under its
+    /// create-request id (a kill waits for it); a pane killed while it
+    /// launched is stopped through the supervisor and never registered, the
+    /// create is answered as stopped, and the waiting kill learns the stop
+    /// was verified.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rest_managed_pane_killed_while_it_launches_is_stopped_not_registered() {
+        let state = state_with_registry();
+        let registry = state.terminal_registry.clone().expect("registry wired");
+        let supervisor = Arc::new(GatedSupervisor::default());
+        registry.set_managed_controller(Some(supervisor.clone()));
+        let units = state.units.clone();
+
+        let creating = tokio::spawn(post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "shell",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "createRequestId": "crq-rest-m",
+            }),
+            true,
+        ));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while units.managed_starts().settled("crq-rest-m").is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the managed launch is in flight"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let waiting_kill = units
+            .managed_starts()
+            .settled("crq-rest-m")
+            .expect("in flight");
+        // The kill: the pane's create-request id is remembered as killed.
+        units.remember_killed_start("crq-rest-m");
+        supervisor.gate.notify_one();
+
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(10), creating)
+            .await
+            .expect("the create answers")
+            .unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("INVALID_TERMINAL_ID"), "{body}");
+        assert_eq!(
+            waiting_kill.await,
+            freshell_containment::ManagedStartOutcome::StoppedVerified
+        );
+        let launched = supervisor.launched.lock().unwrap().clone();
+        let stopped = supervisor.stopped.lock().unwrap().clone();
+        assert_eq!(stopped.len(), 1, "the launched soul was stopped");
+        assert_eq!(launched, vec![stopped[0].terminal_id.clone()]);
+        assert!(
+            !registry.is_managed(&stopped[0].terminal_id),
+            "no facade was registered"
+        );
     }
 
     #[tokio::test]

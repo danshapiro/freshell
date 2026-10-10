@@ -1,8 +1,9 @@
 //! Deliverable #3 — `WS_PROTOCOL_VERSION` parity.
 //!
 //! The Rust constant must equal the version pinned in every committed contract
-//! artifact and in `shared/ws-version.ts`. This is the compile-time half of the
-//! T0 gate ("`WS_PROTOCOL_VERSION == 10`").
+//! artifact and in `shared/ws-version.ts`, so a client and a server built from
+//! the same tree always agree on the version their hellos carry. This is the
+//! compile-time half of the T0 gate.
 
 use std::path::PathBuf;
 
@@ -19,11 +20,6 @@ fn read_json(rel: &str) -> serde_json::Value {
     let text =
         std::fs::read_to_string(repo_path(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
-}
-
-#[test]
-fn rust_const_is_ten() {
-    assert_eq!(WS_PROTOCOL_VERSION, 10);
 }
 
 #[test]

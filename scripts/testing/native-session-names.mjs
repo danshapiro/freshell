@@ -646,7 +646,7 @@ class RustServer {
     ws.addEventListener('error', () => {
       frames.push({ type: '__ws_error' })
     })
-    ws.send(JSON.stringify({ type: 'hello', token: this.token, protocolVersion: 10 }))
+    ws.send(JSON.stringify({ type: 'hello', token: this.token, protocolVersion: 11 }))
     await withTimeout(new Promise((resolve, reject) => {
       const deadline = setTimeout(() => reject(new Error('ready frame timeout')), 15_000)
       const check = () => {

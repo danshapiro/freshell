@@ -402,12 +402,16 @@ pub enum SessionRepairEvent {
     Repaired,
 }
 
-/// Live terminal runtime status (`running | recovering`).
+/// Live terminal runtime status (`running | recovering | stopping`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeStatus {
     Running,
     Recovering,
+    /// A requested stop of the row's unit is in flight (Gone not confirmed
+    /// yet): an inventory row reports it, with `stoppingSince`, so clients
+    /// derive "Stopping…" from server state.
+    Stopping,
     /// The auto-resume SETTLE frame (kata znhn item 3): broadcast with the
     /// OLD terminal id whenever a planned auto-resume settles without a
     /// replacement (guard-abort, retries exhausted, flap circuit breaker,
@@ -1534,6 +1538,9 @@ pub struct InventoryTerminal {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<RuntimeStatus>,
+    /// When the stop of a `stopping` row began (epoch ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopping_since: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
     /// Unified agent names (Task 1 wire / Task 2 Rust side): canonical

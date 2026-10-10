@@ -338,3 +338,46 @@ async fn stop_unit_routes_through_the_installed_lifecycle() {
         vec![(u.id().to_string(), 42)]
     );
 }
+
+/// A managed (supervisor-owned) pane's launch in flight, by create-request
+/// id: a kill that arrives while the launch runs waits for how the start
+/// ended (Task 13, LB-13). A finished or dropped start is no longer in
+/// flight; a start dropped unfinished counts as a failed stop.
+#[tokio::test]
+async fn a_managed_start_in_flight_tells_a_waiting_kill_how_it_ended() {
+    let dir = UnitDirectory::new();
+    let starts = dir.managed_starts();
+    assert!(starts.settled("crq-m").is_none(), "nothing in flight");
+
+    let guard = starts.begin("crq-m");
+    let waiting = starts.settled("crq-m").expect("a launch is in flight");
+    let early = tokio::spawn(waiting);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!early.is_finished(), "the kill waits for the launch");
+    guard.finish(ManagedStartOutcome::StoppedVerified);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(200), early)
+            .await
+            .expect("woken")
+            .unwrap(),
+        ManagedStartOutcome::StoppedVerified
+    );
+    assert!(
+        starts.settled("crq-m").is_none(),
+        "a finished start is gone"
+    );
+
+    let guard = starts.begin("crq-r");
+    let waiting = starts.settled("crq-r").expect("in flight");
+    guard.finish(ManagedStartOutcome::Registered);
+    assert_eq!(waiting.await, ManagedStartOutcome::Registered);
+
+    let guard = starts.begin("crq-d");
+    let waiting = starts.settled("crq-d").expect("in flight");
+    drop(guard);
+    assert_eq!(
+        waiting.await,
+        ManagedStartOutcome::StopFailed("create abandoned".into())
+    );
+    assert!(starts.settled("crq-d").is_none());
+}
