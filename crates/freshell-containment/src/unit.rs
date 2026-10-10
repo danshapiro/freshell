@@ -2118,20 +2118,22 @@ sleep 600;"#;
             assert!(released, "the lock is released");
         }
 
-        /// A process stuck in its exit: a session leader whose terminal
-        /// output nobody reads. The kernel drains a session leader's
-        /// controlling terminal before it posts the exit, with no timeout,
-        /// after it closed the process's descriptors; meanwhile the process
-        /// is neither a zombie nor visible to a lookup that skips exiting
-        /// processes. Closing the terminal's master side lets it finish.
-        struct StalledExit {
+        /// A process in the middle of its exit: a session leader whose
+        /// terminal output nobody reads, killed while its write is blocked.
+        /// On both hosted runners it stays exiting (descriptors closed, no
+        /// exit event yet, not a zombie, invisible to a lookup that skips
+        /// exiting processes) for about a second after the kill, then
+        /// finishes (diagnosis run 38032748496); the test acts inside that
+        /// window. Closing the terminal's master side lets the exit finish,
+        /// should a kernel make it wait longer.
+        struct ExitingLeader {
             /// Reaped when the fixture is dropped, after the master closed.
             _child: Reaped,
             master: Option<OwnedFd>,
             pin: ProcWatch,
         }
 
-        impl StalledExit {
+        impl ExitingLeader {
             fn start() -> Self {
                 let (mut master, mut slave) = (-1, -1);
                 // SAFETY: out-pointers to two ints; no name, termios or size.
@@ -2183,18 +2185,24 @@ sleep 600;"#;
                     .unwrap();
                 std::thread::sleep(Duration::from_millis(500));
                 fixture.pin.signal(Sig::Kill).unwrap();
-                std::thread::sleep(Duration::from_millis(500));
                 let pid = fixture.pin.pid();
-                assert!(
+                let exiting = || {
                     !fixture.pin.has_exited()
                         && crate::darwin::fds(pid).is_err()
-                        && crate::darwin::bsdinfo(pid).is_ok_and(|i| !crate::darwin::is_zombie(&i)),
-                    "fixture: the killed session leader did not stall in its exit"
-                );
+                        && crate::darwin::bsdinfo(pid).is_ok_and(|i| !crate::darwin::is_zombie(&i))
+                };
+                let deadline = Instant::now() + Duration::from_millis(400);
+                while !exiting() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture: the killed session leader was never seen exiting"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 fixture
             }
 
-            /// Closes the terminal's master side: the exit completes.
+            /// Closes the terminal's master side: the exit can finish.
             fn release(&mut self) {
                 self.master.take();
             }
@@ -2202,7 +2210,7 @@ sleep 600;"#;
 
         /// The master closes first, so the child's exit can complete before
         /// it is reaped (field drop).
-        impl Drop for StalledExit {
+        impl Drop for ExitingLeader {
             fn drop(&mut self) {
                 self.master.take();
                 let _ = self.pin.signal(Sig::Kill);
@@ -2213,36 +2221,38 @@ sleep 600;"#;
         /// cannot tell whether it still holds a lock. With no exit watch of
         /// the unit's registered before its exit, the check opens one now
         /// (such a watch proves the exit only from the zombie or reaped
-        /// state) and waits for it before the lock counts as released.
+        /// state) and waits for it: when the check says the lock is
+        /// released, the member's exit is proven (its own exit event, on a
+        /// watch the test opened before the kill, has arrived).
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn an_exiting_member_with_no_exit_watch_is_awaited_before_the_lock_counts_as_released(
         ) {
             let dir = tempfile::tempdir().unwrap();
             let lock = dir.path().join("t.lock");
             std::fs::write(&lock, b"").unwrap();
-            let mut stalled = StalledExit::start();
-            let unit = unit_on(Arc::new(Listed(vec![stalled.pin.identity().clone()])));
+            let mut exiting = ExitingLeader::start();
+            let unit = unit_on(Arc::new(Listed(vec![exiting.pin.identity().clone()])));
             unit.set_lock_paths(vec![lock]);
-            let check = tokio::spawn({
+            let mut check = tokio::spawn({
                 let unit = unit.clone();
-                async move { unit.check_locks(&[]).await }
+                let pin = exiting.pin.clone();
+                async move {
+                    let released = unit.check_locks(&[]).await;
+                    (released, pin.has_exited())
+                }
             });
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            assert!(
-                !check.is_finished(),
-                "the check ended while a member was still exiting"
-            );
-            stalled.release();
-            let released = tokio::time::timeout(Duration::from_secs(15), check)
-                .await
-                .expect("the member's exit was proven")
-                .unwrap()
-                .unwrap();
-            assert!(released, "the lock is released");
-            assert!(
-                stalled.pin.has_exited(),
-                "the check ended before the member had exited"
-            );
+            let outcome = match tokio::time::timeout(Duration::from_secs(2), &mut check).await {
+                Ok(done) => done,
+                Err(_) => {
+                    exiting.release();
+                    tokio::time::timeout(Duration::from_secs(15), check)
+                        .await
+                        .expect("the member's exit was proven")
+                }
+            };
+            let (released, proven) = outcome.unwrap();
+            assert!(released.unwrap(), "the lock is released");
+            assert!(proven, "the check ended while the member was still exiting");
         }
     }
 }
