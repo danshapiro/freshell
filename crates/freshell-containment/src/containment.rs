@@ -84,11 +84,12 @@ impl Containment {
         }
         #[cfg(windows)]
         {
-            Self::roots(opts)
+            Self::job_backend(opts)
         }
     }
 
-    /// The degraded tag backend, forced (tests; the sandbox).
+    /// The degraded tag backend, forced (tests; the sandbox). Windows has no
+    /// tag backend: its Job Object backend is used.
     pub fn tag_backend(opts: SelectOptions) -> Self {
         #[cfg(target_os = "macos")]
         {
@@ -100,7 +101,7 @@ impl Containment {
         }
         #[cfg(windows)]
         {
-            Self::roots(&opts)
+            Self::job_backend(&opts)
         }
     }
 
@@ -132,9 +133,11 @@ impl Containment {
     }
 
     #[cfg(windows)]
-    fn roots(opts: &SelectOptions) -> Self {
+    fn job_backend(opts: &SelectOptions) -> Self {
         Self {
-            backend: Arc::new(crate::backend::roots::RootsBackend),
+            backend: Arc::new(crate::backend::windows_job::JobBackend::new(
+                opts.shim.as_ref(),
+            )),
             store: Arc::new(RecordStore::open(&opts.state_root)),
         }
     }
@@ -265,10 +268,12 @@ fn legacy_backend(tag_key: &str, tag_value: &str, id: &UnitId) -> Arc<dyn UnitBa
     ))
 }
 
-/// Task 6 gives Windows its own legacy form.
+/// Windows never retains a sidecar across a restart, so a legacy unit has
+/// no job: its stop reaches its identity-verified roots and their
+/// descendants by handle.
 #[cfg(windows)]
-fn legacy_backend(_tag_key: &str, _tag_value: &str, id: &UnitId) -> Arc<dyn UnitBackend> {
-    Arc::new(crate::backend::roots::RootsUnit::new(id))
+fn legacy_backend(_tag_key: &str, _tag_value: &str, _id: &UnitId) -> Arc<dyn UnitBackend> {
+    Arc::new(crate::backend::windows_job::RecordedUnit)
 }
 
 static GLOBAL: OnceLock<Containment> = OnceLock::new();

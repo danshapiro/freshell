@@ -36,7 +36,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{inotify, Backend, BackendKind, Capability, KillSummary, MemberList, UnitBackend};
+use super::{
+    inotify, spared_closure, Backend, BackendKind, Capability, KillSummary, MemberList, UnitBackend,
+};
 use crate::containment::SelectOptions;
 use crate::proc_watch::{ProcWatch, Sig};
 use crate::process::{
@@ -343,7 +345,7 @@ impl SystemdUnit {
     /// confirmed so: one snapshot, the spared set, the kill, and the thaw.
     fn kill_frozen(&self, thaw: Option<Thaw>, frozen: bool) -> io::Result<KillSummary> {
         let pids = self.pids();
-        let spared = spared_within(&pids);
+        let spared = spared_closure(pids.iter().copied());
         let killed = self.kill_all_but(&pids, &spared, frozen);
         // Thawed whatever the kill did, so spared processes resume in place.
         let thawed = thaw.map_or(Ok(()), Thaw::now);
@@ -459,35 +461,6 @@ fn cgroup_of(pid: u32) -> Option<String> {
     )
 }
 
-/// The daemon-family processes among `pids` (each judged by its own argv)
-/// plus every process of `pids` whose parent is spared, iterating to a fixed
-/// point over the snapshot. It can only spare a process, never select one.
-fn spared_within(pids: &BTreeSet<u32>) -> BTreeSet<u32> {
-    let mut spared: BTreeSet<u32> = pids
-        .iter()
-        .copied()
-        .filter(|pid| process::argv(*pid).is_ok_and(|argv| is_codex_daemon_family(&argv)))
-        .collect();
-    if spared.is_empty() {
-        return spared;
-    }
-    let parents: Vec<(u32, Option<u32>)> = pids
-        .iter()
-        .map(|pid| (*pid, process::parent(*pid)))
-        .collect();
-    loop {
-        let before = spared.len();
-        for (pid, parent) in &parents {
-            if parent.is_some_and(|pp| spared.contains(&pp)) {
-                spared.insert(*pid);
-            }
-        }
-        if spared.len() == before {
-            return spared;
-        }
-    }
-}
-
 impl UnitBackend for SystemdUnit {
     fn placement(&self, role: MemberRole, seq: u32) -> io::Result<Placement> {
         let role = match role {
@@ -553,7 +526,7 @@ impl UnitBackend for SystemdUnit {
 
     fn members(&self, _roots: &[(u32, u64)]) -> io::Result<MemberList> {
         let pids = self.pids();
-        let spared = spared_within(&pids);
+        let spared = spared_closure(pids.iter().copied());
         Ok(MemberList {
             members: pids
                 .difference(&spared)

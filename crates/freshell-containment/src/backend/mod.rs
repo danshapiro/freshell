@@ -12,12 +12,12 @@ use crate::{BoxFuture, UnitId};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod inotify;
-#[cfg(windows)]
-pub(crate) mod roots;
 #[cfg(target_os = "linux")]
 pub(crate) mod systemd;
 #[cfg(unix)]
 pub(crate) mod tag;
+#[cfg(windows)]
+pub(crate) mod windows_job;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -45,6 +45,43 @@ pub struct Capability {
     /// true = membership is kernel-tracked (cgroup / job); false = tag + tree.
     pub full: bool,
     pub reason: Option<String>,
+}
+
+/// The Codex daemon-family processes among `pids`, each judged by its OWN
+/// command line (`is_codex_daemon_family`), plus every process of `pids`
+/// whose parent is spared, to a fixed point over this one snapshot
+/// (siblings are covered because each family member matches on its own
+/// argv). It can only spare a process, never select one for a signal. The
+/// tag backend keeps its own, because it builds membership from the tag.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn spared_closure(
+    pids: impl IntoIterator<Item = u32>,
+) -> std::collections::BTreeSet<u32> {
+    use crate::process;
+    let pids: Vec<u32> = pids.into_iter().collect();
+    let mut spared: std::collections::BTreeSet<u32> = pids
+        .iter()
+        .copied()
+        .filter(|pid| process::argv(*pid).is_ok_and(|argv| process::is_codex_daemon_family(&argv)))
+        .collect();
+    if spared.is_empty() {
+        return spared;
+    }
+    let parents: Vec<(u32, Option<u32>)> = pids
+        .iter()
+        .map(|pid| (*pid, process::parent(*pid)))
+        .collect();
+    loop {
+        let before = spared.len();
+        for (pid, parent) in &parents {
+            if parent.is_some_and(|pp| spared.contains(&pp)) {
+                spared.insert(*pid);
+            }
+        }
+        if spared.len() == before {
+            return spared;
+        }
+    }
 }
 
 /// What one whole-unit kill did. `spared` lists the Codex daemon-family
@@ -75,6 +112,18 @@ pub(crate) struct MemberList {
     /// members as a root's descendants. The unit logs the count with its keys
     /// (`unit.members.environ_withheld`); backends never log it.
     pub withheld: u64,
+}
+
+/// What a backend reports back to its unit, which owns the unit record. A
+/// backend whose container no longer ends its members when the server dies
+/// (Windows: kill-on-close cleared) has each member recorded as a root, so a
+/// restarted server can reach it by identity.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows backend records today
+pub(crate) trait UnitObserver: Send + Sync {
+    /// Adds `(pid, start)` to the record's roots (nothing when present).
+    fn record_root(&self, pid: u32, start: u64);
+    /// Drops every recorded root with `pid` (that process exited).
+    fn forget_root(&self, pid: u32);
 }
 
 /// One containment mechanism (selected once per server).
@@ -114,4 +163,7 @@ pub(crate) trait UnitBackend: Send + Sync {
     /// Release the unit's OS container after the post-Gone sweep;
     /// `emptied` says whether the emptiness event arrived.
     fn remove(&self, emptied: bool) -> io::Result<()>;
+    /// The unit's observer, given once when the unit is built. Backends that
+    /// never record members ignore it.
+    fn set_observer(&self, _observer: Arc<dyn UnitObserver>) {}
 }

@@ -1,8 +1,9 @@
-//! Who holds a lock file, attributed by file descriptor.
+//! Who holds a lock file.
 //!
-//! A process holds a lock file when one of its descriptors refers to that
-//! file (same device and inode as `stat` of the path) and the kernel lists a
-//! lock on that descriptor (a `lock:` line in `/proc/<pid>/fdinfo/<fd>`).
+//! Linux attributes holders by file descriptor. A process holds a lock file
+//! when one of its descriptors refers to that file (same device and inode
+//! as `stat` of the path) and the kernel lists a lock on that descriptor (a
+//! `lock:` line in `/proc/<pid>/fdinfo/<fd>`).
 //! The lock table's pid column (`/proc/locks`) is never used: it names the
 //! process that TOOK the lock, which may have exited while a child or an
 //! inheriting process keeps the descriptor (a `flock(1)` helper), it reads 0
@@ -10,10 +11,14 @@
 //! btrfs or on overlayfs over mixed filesystems. A lock file's existence
 //! proves nothing either: only current holders are reported.
 //!
+//! Windows asks the Restart Manager which processes have the file open:
+//! Codex's `LockFileEx` lock lives on a handle that is never inherited and
+//! ends only when that handle closes.
+//!
 //! One-shot reads only; nothing here waits or polls. Holders are named by
-//! process name, never by command line (argv can carry secrets). File
-//! identities are read without a server round trip (except as noted on
-//! [`file_id`]), so a lookup does not wait on a slow or unreachable network
+//! process name, never by command line (argv can carry secrets). On Linux,
+//! file identities are read without a server round trip (except as noted on
+//! `file_id`), so a lookup does not wait on a slow or unreachable network
 //! mount.
 
 use std::path::{Path, PathBuf};
@@ -21,7 +26,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LockHolder {
     pub pid: u32,
-    /// The process name (Linux `comm`), never its arguments.
+    /// The process name (Linux `comm`, Windows the image name), never its
+    /// arguments.
     pub name: String,
     /// The lock file, as the caller named it.
     pub path: PathBuf,
@@ -196,16 +202,173 @@ fn fdinfo_has_lock(fdinfo: &str) -> bool {
     fdinfo.lines().any(|line| line.starts_with("lock:"))
 }
 
-/// Not implemented on this OS yet: no visible holder (Windows: Task 6,
-/// Restart Manager; macOS: Task 7, libproc `FHASLOCK`).
-#[cfg(not(target_os = "linux"))]
+/// Windows: every process that has one of `paths` open, as the Restart
+/// Manager reports it. Codex holds its thread-writer lock with `LockFileEx`
+/// on a handle that is never inherited and releases it only by closing that
+/// handle, so the processes with the file open are its holders. Each holder
+/// is named by its image name (falling back to the Restart Manager's
+/// application name), never by its command line. An entry whose pid now
+/// names a different process (started at another time) is dropped. A path
+/// that does not exist, or that the Restart Manager cannot be asked about,
+/// yields nothing.
+#[cfg(windows)]
+pub fn lock_holders(paths: &[PathBuf]) -> Vec<LockHolder> {
+    let mut out: Vec<LockHolder> = Vec::new();
+    let mut seen: Vec<&PathBuf> = Vec::new();
+    for path in paths {
+        if seen.contains(&path) || !path.exists() {
+            continue;
+        }
+        seen.push(path);
+        for (pid, start, app_name) in restart_manager::processes_using(path) {
+            if crate::process::start_time(pid).ok() != Some(start) {
+                continue; // exited since; the pid may name another process
+            }
+            let name = crate::process::name(pid)
+                .ok()
+                .filter(|n| !n.is_empty())
+                .unwrap_or(app_name);
+            out.push(LockHolder {
+                pid,
+                name,
+                path: path.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Windows: [`lock_holders`] restricted to `pids` (a unit's members), one
+/// entry per (pid, path).
+#[cfg(windows)]
+pub fn lock_holders_among(paths: &[PathBuf], pids: &[u32]) -> Vec<LockHolder> {
+    let mut out: Vec<LockHolder> = Vec::new();
+    for holder in lock_holders(paths) {
+        if pids.contains(&holder.pid)
+            && !out
+                .iter()
+                .any(|h| h.pid == holder.pid && h.path == holder.path)
+        {
+            out.push(holder);
+        }
+    }
+    out
+}
+
+/// Windows: one Restart Manager session per path (one session cannot tell
+/// which of its registered files a process has open).
+#[cfg(windows)]
+mod restart_manager {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::RestartManager::{
+        RmEndSession, RmGetList, RmRegisterResources, RmStartSession, CCH_RM_SESSION_KEY,
+        RM_PROCESS_INFO,
+    };
+
+    /// How many times a list that grew between the size query and the read
+    /// is asked for again.
+    const LIST_ATTEMPTS: usize = 4;
+
+    /// An open Restart Manager session, always ended.
+    struct Session(u32);
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            // SAFETY: a session this process started, ended once.
+            unsafe { RmEndSession(self.0) };
+        }
+    }
+
+    /// `(pid, start time, application name)` of every process that has
+    /// `path` open (empty when the Restart Manager cannot be asked).
+    pub(super) fn processes_using(path: &Path) -> Vec<(u32, u64, String)> {
+        let mut handle = 0u32;
+        let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
+        // SAFETY: valid out-pointers; the key buffer has room for the key.
+        if unsafe { RmStartSession(&mut handle, 0, key.as_mut_ptr()) } != ERROR_SUCCESS {
+            return Vec::new();
+        }
+        let session = Session(handle);
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let files = [wide.as_ptr()];
+        // SAFETY: one NUL-terminated path; no applications or services.
+        let registered = unsafe {
+            RmRegisterResources(
+                session.0,
+                1,
+                files.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if registered != ERROR_SUCCESS {
+            return Vec::new();
+        }
+        let mut capacity = 16usize;
+        for _ in 0..LIST_ATTEMPTS {
+            // SAFETY: an all-zero RM_PROCESS_INFO is valid.
+            let mut list: Vec<RM_PROCESS_INFO> = vec![unsafe { std::mem::zeroed() }; capacity];
+            let mut needed = 0u32;
+            let mut count = capacity as u32;
+            let mut reasons = 0u32;
+            // SAFETY: `list` has room for `count` entries.
+            let rc = unsafe {
+                RmGetList(
+                    session.0,
+                    &mut needed,
+                    &mut count,
+                    list.as_mut_ptr(),
+                    &mut reasons,
+                )
+            };
+            if rc == ERROR_MORE_DATA {
+                capacity = (needed as usize).max(capacity * 2);
+                continue;
+            }
+            if rc != ERROR_SUCCESS {
+                return Vec::new();
+            }
+            list.truncate(count as usize);
+            return list
+                .iter()
+                .map(|info| {
+                    let start = (u64::from(info.Process.ProcessStartTime.dwHighDateTime) << 32)
+                        | u64::from(info.Process.ProcessStartTime.dwLowDateTime);
+                    let len = info
+                        .strAppName
+                        .iter()
+                        .position(|c| *c == 0)
+                        .unwrap_or(info.strAppName.len());
+                    (
+                        info.Process.dwProcessId,
+                        start,
+                        String::from_utf16_lossy(&info.strAppName[..len]),
+                    )
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+}
+
+/// Not implemented on this OS yet: no visible holder (macOS: Task 7,
+/// libproc `FHASLOCK`).
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn lock_holders(_paths: &[PathBuf]) -> Vec<LockHolder> {
     Vec::new()
 }
 
-/// Not implemented on this OS yet: no visible holder (Windows: Task 6;
-/// macOS: Task 7).
-#[cfg(not(target_os = "linux"))]
+/// Not implemented on this OS yet: no visible holder (macOS: Task 7).
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn lock_holders_among(_paths: &[PathBuf], _pids: &[u32]) -> Vec<LockHolder> {
     Vec::new()
 }

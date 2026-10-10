@@ -16,12 +16,12 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
-use crate::backend::{Capability, UnitBackend};
+use crate::backend::{Capability, UnitBackend, UnitObserver};
 use crate::events::{self, UnitLogKeys};
 use crate::proc_watch::{ProcWatch, Sig};
 use crate::process::ProcIdentity;
@@ -323,20 +323,22 @@ impl AgentUnit {
         label: UnitLabel,
         record: Option<UnitRecord>,
     ) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                id,
-                backend,
-                capability,
-                store,
-                label: Mutex::new(label),
-                members: Mutex::new(Members::default()),
-                lock_paths: Mutex::new(Vec::new()),
-                seq: AtomicU32::new(0),
-                record: Mutex::new(record),
-                stop: Mutex::new(None),
-            }),
-        }
+        let inner = Arc::new(Inner {
+            id,
+            backend,
+            capability,
+            store,
+            label: Mutex::new(label),
+            members: Mutex::new(Members::default()),
+            lock_paths: Mutex::new(Vec::new()),
+            seq: AtomicU32::new(0),
+            record: Mutex::new(record),
+            stop: Mutex::new(None),
+        });
+        inner
+            .backend
+            .set_observer(Arc::new(RecordRoots(Arc::downgrade(&inner))));
+        Self { inner }
     }
 
     pub fn id(&self) -> &UnitId {
@@ -1175,6 +1177,44 @@ impl AgentUnit {
     }
 }
 
+/// The unit's side of [`UnitObserver`]: members a backend reports are kept
+/// as roots in the unit record. It holds the unit weakly, so a backend never
+/// keeps its unit alive.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows backend records today
+struct RecordRoots(Weak<Inner>);
+
+impl UnitObserver for RecordRoots {
+    fn record_root(&self, pid: u32, start: u64) {
+        let Some(inner) = self.0.upgrade() else {
+            return;
+        };
+        let unit = AgentUnit { inner };
+        let present = lock(&unit.inner.record)
+            .as_ref()
+            .is_none_or(|r| r.roots.contains(&(pid, start)));
+        if !present {
+            unit.update_record(|r| {
+                if !r.roots.contains(&(pid, start)) {
+                    r.roots.push((pid, start));
+                }
+            });
+        }
+    }
+
+    fn forget_root(&self, pid: u32) {
+        let Some(inner) = self.0.upgrade() else {
+            return;
+        };
+        let unit = AgentUnit { inner };
+        let present = lock(&unit.inner.record)
+            .as_ref()
+            .is_some_and(|r| r.roots.iter().any(|(p, _)| *p == pid));
+        if present {
+            unit.update_record(|r| r.roots.retain(|(p, _)| *p != pid));
+        }
+    }
+}
+
 /// Logs the same-uid processes a member scan could not read, with the
 /// unit's keys (nothing when there are none).
 fn log_withheld(keys: &UnitLogKeys, withheld: u64) {
@@ -1323,6 +1363,81 @@ mod tests {
             },
             None,
         )
+    }
+
+    /// A backend that keeps the observer its unit gives it.
+    #[derive(Default)]
+    struct Observed(Mutex<Option<Arc<dyn crate::backend::UnitObserver>>>);
+
+    impl UnitBackend for Observed {
+        fn placement(&self, role: MemberRole, seq: u32) -> io::Result<Placement> {
+            NoProcesses.placement(role, seq)
+        }
+        fn kill_all(
+            self: Arc<Self>,
+            _roots: Vec<(u32, u64)>,
+        ) -> BoxFuture<'static, io::Result<KillSummary>> {
+            Box::pin(async { Ok(KillSummary::default()) })
+        }
+        fn members(&self, roots: &[(u32, u64)]) -> io::Result<MemberList> {
+            NoProcesses.members(roots)
+        }
+        fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {
+            NoProcesses.confirm_placement(pid, roots)
+        }
+        fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
+            None
+        }
+        fn remove(&self, emptied: bool) -> io::Result<()> {
+            NoProcesses.remove(emptied)
+        }
+        fn set_observer(&self, observer: Arc<dyn crate::backend::UnitObserver>) {
+            *lock(&self.0) = Some(observer);
+        }
+    }
+
+    /// A backend that can no longer rely on its container to end its members
+    /// (Windows kill-on-close cleared) has each one recorded as a root in the
+    /// unit record, and dropped again when it exits.
+    #[test]
+    fn members_a_backend_reports_are_recorded_and_forgotten_as_roots() {
+        let backend = Arc::new(Observed::default());
+        let id = UnitId::mint();
+        let record = UnitRecord {
+            unit_id: id.clone(),
+            provider: "codex".into(),
+            mode: "codex".into(),
+            terminal_id: Some("t-1".into()),
+            create_request_id: None,
+            conversation_keys: Vec::new(),
+            roots: vec![(10, 100)],
+            state: UnitRecordState::Running,
+        };
+        let unit = AgentUnit::new(
+            id,
+            backend.clone(),
+            Capability {
+                kind: BackendKind::WindowsJob,
+                full: true,
+                reason: None,
+            },
+            Arc::new(RecordStore::open(std::path::Path::new(""))),
+            UnitLabel::default(),
+            Some(record),
+        );
+        let observer = lock(&backend.0)
+            .clone()
+            .expect("the unit gave its backend an observer");
+        let roots = || lock(&unit.inner.record).as_ref().unwrap().roots.clone();
+        observer.record_root(42, 7);
+        observer.record_root(42, 7);
+        observer.record_root(43, 8);
+        assert_eq!(roots(), [(10, 100), (42, 7), (43, 8)]);
+        observer.forget_root(42);
+        assert_eq!(roots(), [(10, 100), (43, 8)]);
+        // The observer never keeps the unit alive.
+        drop(unit);
+        observer.record_root(44, 9);
     }
 
     /// Every event `f` emits on this thread, `f` running on a current-thread

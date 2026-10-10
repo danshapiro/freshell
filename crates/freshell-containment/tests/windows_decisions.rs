@@ -24,45 +24,27 @@
 //! everything it opened that is still running when it ends (a process that
 //! escapes the unit job also escapes cargo's own job on the runner).
 
+mod windows_support;
+
 use std::ffi::c_void;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use freshell_containment::process;
-use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_support::{child_named, js, wide, Lines, Proc, EXIT_WAIT, HELPER, LINE_WAIT, SHIM};
+use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JobObjectBasicProcessIdList,
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     TerminateJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-};
 
-const SHIM: &str = env!("CARGO_BIN_EXE_freshell-unit-exec");
-const HELPER: &str = env!("CARGO_BIN_EXE_freshell-test-helper");
-/// How long a child may take to print an expected line (a cold runner
-/// starts Node slowly).
-const LINE_WAIT: Duration = Duration::from_secs(60);
-/// How long a terminated process may take to be signalled.
-const EXIT_WAIT: Duration = Duration::from_secs(10);
 const KILL_ON_CLOSE: u32 = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 const KILL_ON_CLOSE_BREAKAWAY_OK: u32 =
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// A JavaScript string literal for `s` (JSON strings are valid JS).
-fn js(s: &str) -> String {
-    serde_json::to_string(s).unwrap()
-}
 
 /// A named job the test creates and holds; closing it (drop) ends every
 /// member still in it (each job here has `KILL_ON_JOB_CLOSE`).
@@ -163,135 +145,6 @@ impl Drop for Job {
     }
 }
 
-/// A handle to one process the test started (directly or as a
-/// descendant). The handle pins that process, so it never reaches a
-/// recycled pid; a process still running when the test drops it is
-/// terminated through it.
-struct Proc {
-    handle: HANDLE,
-    pid: u32,
-}
-
-impl Proc {
-    fn open(pid: u32) -> Self {
-        // SAFETY: plain OpenProcess; the result is checked.
-        let handle = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
-                0,
-                pid,
-            )
-        };
-        assert!(
-            !handle.is_null(),
-            "OpenProcess({pid}): {}",
-            std::io::Error::last_os_error()
-        );
-        Self { handle, pid }
-    }
-
-    /// True once the process has exited within `limit`.
-    fn wait(&self, limit: Duration) -> bool {
-        // SAFETY: a live handle with SYNCHRONIZE.
-        let rc = unsafe { WaitForSingleObject(self.handle, limit.as_millis() as u32) };
-        assert!(
-            rc == WAIT_OBJECT_0 || rc == WAIT_TIMEOUT,
-            "WaitForSingleObject({}): {rc}",
-            self.pid
-        );
-        rc == WAIT_OBJECT_0
-    }
-
-    fn running(&self) -> bool {
-        !self.wait(Duration::ZERO)
-    }
-
-    fn terminate(&self) {
-        // SAFETY: a live handle with PROCESS_TERMINATE.
-        let ok = unsafe { TerminateProcess(self.handle, 1) };
-        assert!(
-            ok != 0 || !self.running(),
-            "TerminateProcess({}): {}",
-            self.pid,
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
-impl Drop for Proc {
-    fn drop(&mut self) {
-        // SAFETY: the handle is ours and closed once; terminating an exited
-        // process is a harmless error.
-        unsafe {
-            if WaitForSingleObject(self.handle, 0) == WAIT_TIMEOUT {
-                TerminateProcess(self.handle, 1);
-            }
-            CloseHandle(self.handle);
-        }
-    }
-}
-
-/// The lines a child prints, read on their own thread.
-struct Lines {
-    rx: mpsc::Receiver<String>,
-    seen: Vec<String>,
-}
-
-impl Lines {
-    fn new(out: impl Read + Send + 'static) -> Self {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(out).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line.trim_end().to_string()).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
-            rx,
-            seen: Vec::new(),
-        }
-    }
-
-    /// The first new line that `matches`; `None` when the output ends
-    /// first. Panics at `LINE_WAIT`.
-    fn next_matching(&mut self, what: &str, matches: impl Fn(&str) -> bool) -> Option<String> {
-        let deadline = Instant::now() + LINE_WAIT;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.rx.recv_timeout(left) {
-                Ok(line) => {
-                    self.seen.push(line.clone());
-                    if matches(&line) {
-                        return Some(line);
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    panic!("no {what} line within {LINE_WAIT:?}; seen: {:?}", self.seen)
-                }
-            }
-        }
-    }
-
-    fn expect(&mut self, what: &str, matches: impl Fn(&str) -> bool) -> String {
-        match self.next_matching(what, matches) {
-            Some(line) => line,
-            None => panic!("output ended before a {what} line; seen: {:?}", self.seen),
-        }
-    }
-
-    /// The pid after `prefix` on the first line starting with it.
-    fn expect_pid(&mut self, prefix: &str) -> u32 {
-        let line = self.expect(prefix, |l| l.starts_with(prefix));
-        line[prefix.len()..]
-            .trim()
-            .parse()
-            .unwrap_or_else(|_| panic!("malformed line {line:?}"))
-    }
-}
-
 /// A process the test started through the shim, with its stdout read as
 /// lines. Dropping it terminates the shim (and the job's kill-on-close
 /// takes the rest when the job is dropped).
@@ -341,13 +194,6 @@ impl Drop for Started {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-/// The first direct child of `parent` whose image is `name`.
-fn child_named(parent: u32, name: &str) -> Option<u32> {
-    process::children(parent)
-        .into_iter()
-        .find(|pid| process::name(*pid).is_ok_and(|n| n.eq_ignore_ascii_case(name)))
 }
 
 /// Node code that starts `cmd.exe /d /c ping -n 600 127.0.0.1` as a

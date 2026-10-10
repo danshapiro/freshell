@@ -442,6 +442,15 @@ fn snapshot() -> Vec<(u32, u32, String)> {
     out
 }
 
+/// Windows: `(pid, parent pid)` of every process, from one snapshot.
+#[cfg(windows)]
+pub(crate) fn parent_links() -> Vec<(u32, u32)> {
+    snapshot()
+        .into_iter()
+        .map(|(pid, parent, _)| (pid, parent))
+        .collect()
+}
+
 /// Windows: the creation time of `pid` (see [`start_time_of`]).
 #[cfg(windows)]
 pub fn start_time(pid: u32) -> io::Result<u64> {
