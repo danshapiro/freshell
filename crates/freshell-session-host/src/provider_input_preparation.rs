@@ -30,9 +30,13 @@ pub(crate) fn read_private(root: &Path, relative: &str, limit: usize) -> Result<
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options
+    let file = options
         .open(&path)
         .map_err(|_| "prepared private source unreadable")?;
+    #[cfg(not(test))]
+    let mut file = file;
+    #[cfg(test)]
+    let mut file = private_read_observation::ObservedFile::new(file, &path);
     let opened = file
         .metadata()
         .map_err(|_| "prepared private source unavailable")?;
@@ -102,6 +106,87 @@ pub(crate) fn read_private(root: &Path, relative: &str, limit: usize) -> Result<
         }
     }
     Ok(bytes)
+}
+
+// Observe the actual Read boundary in tests, independently of filesystem
+// access-time policy. Production continues to read the same physical File.
+#[cfg(test)]
+pub(crate) mod private_read_observation {
+    use std::{
+        cell::{Cell, RefCell},
+        fs::File,
+        io::Read,
+        path::{Path, PathBuf},
+        rc::Rc,
+    };
+
+    struct Reads {
+        path: PathBuf,
+        calls: Cell<usize>,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Rc<Reads>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Observation {
+        reads: Rc<Reads>,
+        previous: Option<Rc<Reads>>,
+    }
+
+    impl Observation {
+        pub(crate) fn start(path: &Path) -> Self {
+            let reads = Rc::new(Reads {
+                path: path.to_owned(),
+                calls: Cell::new(0),
+            });
+            let previous = ACTIVE.with(|active| active.replace(Some(reads.clone())));
+            Self { reads, previous }
+        }
+
+        pub(crate) fn calls(&self) -> usize {
+            self.reads.calls.get()
+        }
+    }
+
+    impl Drop for Observation {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.replace(self.previous.take()));
+        }
+    }
+
+    pub(super) struct ObservedFile {
+        file: File,
+        path: PathBuf,
+    }
+
+    impl ObservedFile {
+        pub(super) fn new(file: File, path: &Path) -> Self {
+            Self {
+                file,
+                path: path.to_owned(),
+            }
+        }
+
+        pub(super) fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+            self.file.metadata()
+        }
+    }
+
+    impl Read for ObservedFile {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            ACTIVE.with(|active| {
+                if let Some(reads) = active
+                    .borrow()
+                    .as_ref()
+                    .filter(|reads| reads.path == self.path)
+                {
+                    reads.calls.set(reads.calls.get() + 1);
+                }
+            });
+            self.file.read(buffer)
+        }
+    }
 }
 
 pub(crate) fn final_claude_source_request(
@@ -483,18 +568,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn provider_secret_private_reader_rejects_oversize_before_payload_read() {
-        use std::io::Read;
+        use private_read_observation::Observation;
         let owned = tempfile::tempdir().unwrap();
         let private = owned.path().join("metadata");
         let native = owned.path().join("native-history.jsonl");
         std::fs::write(&native, b"synthetic-native-store-preserved").unwrap();
-        let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
         for limit in [
             freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
             freshell_platform::claude_inputs::MAX_NATIVE_SETTINGS_BYTES,
             64 * 1024 * 1024,
         ] {
-            let mut file = std::fs::OpenOptions::new()
+            let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
@@ -502,28 +586,22 @@ mod tests {
                 .open(&private)
                 .unwrap();
             file.set_len(limit as u64).unwrap();
+            let reads = Observation::start(&private);
             let accepted = read_private(owned.path(), "metadata", limit).unwrap();
             assert_eq!(
                 accepted.len(),
                 limit,
                 "inclusive physical file limit must remain supported"
             );
+            assert!(reads.calls() > 0, "accepted payload must actually be read");
             drop(accepted);
+            drop(reads);
             file.set_len(limit as u64 + 1).unwrap();
-            file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-                .unwrap();
-            file.read_exact(&mut [0u8; 1]).unwrap();
-            assert_ne!(
-                std::fs::metadata(&private).unwrap().accessed().unwrap(),
-                old_access,
-                "fixture must report actual reads"
-            );
-            file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-                .unwrap();
+            let reads = Observation::start(&private);
             assert!(read_private(owned.path(), "metadata", limit).is_err());
             assert_eq!(
-                std::fs::metadata(&private).unwrap().accessed().unwrap(),
-                old_access,
+                reads.calls(),
+                0,
                 "host must reject oversized private metadata before reading its payload"
             );
             assert_eq!(

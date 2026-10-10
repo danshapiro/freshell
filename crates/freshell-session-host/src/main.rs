@@ -4278,7 +4278,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn provider_config_projection_metadata_rejects_oversize_before_read_and_publication() {
-        use std::io::Read;
+        use crate::provider_input_preparation::{
+            private_read_observation::Observation, read_private,
+        };
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
         let stage = owned.path().join("stage");
@@ -4309,28 +4311,33 @@ mod tests {
         )
         .unwrap();
         for (path, original) in &fixtures {
-            let mut file = std::fs::OpenOptions::new()
+            let reads = Observation::start(path);
+            assert_eq!(
+                read_private(
+                    path.parent().unwrap(),
+                    path.file_name().unwrap().to_str().unwrap(),
+                    MAX_PROJECTION_METADATA_BYTES,
+                )
+                .unwrap(),
+                *original
+            );
+            assert!(
+                reads.calls() > 0,
+                "fixture must observe actual payload reads"
+            );
+            drop(reads);
+            let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(path)
                 .unwrap();
             file.set_len(64 * 1024 * 1024 + 1).unwrap();
-            let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-            file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-                .unwrap();
-            file.read_exact(&mut [0]).unwrap();
-            assert_ne!(
-                file.metadata().unwrap().accessed().unwrap(),
-                old_access,
-                "fixture filesystem must observe payload reads"
-            );
-            file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-                .unwrap();
             drop(file);
+            let reads = Observation::start(path);
             assert!(apply_staged_provider_config(&stage, &home).is_err());
             assert_eq!(
-                std::fs::metadata(path).unwrap().accessed().unwrap(),
-                old_access,
+                reads.calls(),
+                0,
                 "oversized ordinary metadata payload was read: {}",
                 path.display()
             );
