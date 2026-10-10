@@ -5894,6 +5894,7 @@ mod interrupted_transaction_tests {
             let lock = supervisor.lifecycle_lock(&id).await;
             let mut stopping = {
                 let supervisor = supervisor.clone();
+                let id = id.clone();
                 tokio::spawn(async move { supervisor.stop(id, Some(1)).await })
             };
             // Measure the backend budget from an actual accepted inspection.
@@ -5918,11 +5919,87 @@ mod interrupted_transaction_tests {
             if result.is_err() {
                 // The timeout does not own/cancel the foreground Stop. Prove
                 // that it is still the old lock holder, then reap our task.
-                assert!(lock.try_lock().is_err());
+                let lock_held = lock.try_lock().is_err();
+                assert!(lock_held);
+                let (accepted_at, transport) = {
+                    let state = fixture.state.lock().unwrap();
+                    let sampled_at = std::time::Instant::now();
+                    let accepted_at = state.first_inspection_at;
+                    (
+                        accepted_at,
+                        serde_json::json!({
+                            "acceptedInspectionElapsedMs": accepted_at.map(|at| sampled_at.duration_since(at).as_secs_f64() * 1000.0),
+                            "firstSilentEofElapsedMs": state.first_silent_eof_at.zip(accepted_at).map(|(eof, accepted)| eof.duration_since(accepted).as_secs_f64() * 1000.0),
+                            "disconnected": state.disconnected,
+                            "lifecycleLockHeld": lock_held,
+                        }),
+                    )
+                };
+                // This independent reader never uses the Registry's writable
+                // connection setup or extends the original Stop deadline.
+                // Its snapshot can be later than the transport/lock sample.
+                let database = supervisor.registry.database_path().to_path_buf();
+                let soul = id.as_str().to_owned();
+                let mut reader = tokio::task::spawn_blocking(move || {
+                    let started_at = std::time::Instant::now();
+                    let projection = (|| -> rusqlite::Result<serde_json::Value> {
+                        let connection = Connection::open_with_flags(
+                            database,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        )?;
+                        connection.busy_timeout(Duration::from_millis(25))?;
+                        connection.pragma_update(None, "query_only", true)?;
+                        connection.query_row(
+                            "SELECT p.incarnation_id,p.outcome,p.settled,p.intent_revision,p.execution_generation,w.count \
+                             FROM (SELECT count(*) AS count FROM writer_claims WHERE soul_id=?1) w \
+                             LEFT JOIN ordinary_stops p ON p.soul_id=?1 AND p.intent_revision=2",
+                            [soul],
+                            |row| {
+                                let incarnation: Option<String> = row.get(0)?;
+                                Ok(serde_json::json!({
+                                    "status":"observed", "rowPresent":incarnation.is_some(),
+                                    "incarnationId":incarnation,
+                                    "outcome":row.get::<_, Option<String>>(1)?,
+                                    "settled":row.get::<_, Option<bool>>(2)?,
+                                    "intentRevision":row.get::<_, Option<u64>>(3)?,
+                                    "executionGeneration":row.get::<_, Option<u64>>(4)?,
+                                    "writerCount":row.get::<_, u64>(5)?,
+                                }))
+                            },
+                        )
+                    })();
+                    serde_json::json!({
+                        "readStartedElapsedMs":accepted_at.map(|at| started_at.duration_since(at).as_secs_f64() * 1000.0),
+                        "readFinishedElapsedMs":accepted_at.map(|at| at.elapsed().as_secs_f64() * 1000.0),
+                        "projection":projection.unwrap_or_else(|_| serde_json::json!({"status":"unknown","reason":"query_error"})),
+                    })
+                });
+                let read = tokio::time::timeout(Duration::from_millis(100), &mut reader).await;
+                let reader_pending = read.is_err();
+                let registry = match read {
+                    Ok(Ok(snapshot)) => snapshot,
+                    Ok(Err(_)) => {
+                        serde_json::json!({"status":"unknown","reason":"reader_join_error"})
+                    }
+                    Err(_) => serde_json::json!({"status":"unknown","reason":"read_timeout"}),
+                };
                 stopping.abort();
                 let _ = stopping.await;
                 close(fixture_host).await;
                 fixture.close().await;
+                // A timed-out blocking read remains owned: join it before the
+                // fixture directory is dropped, but keep its snapshot UNKNOWN.
+                if reader_pending {
+                    let _ = reader.await;
+                }
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "severity":"error", "event":"test.ordinary_stop.failure_stage",
+                        "soulId":id, "phase":point, "resultDeadlineMs":limit.as_millis(),
+                        "registryReadDeadlineMs":100, "transport":transport, "registry":registry,
+                    })
+                );
                 failures.push(format!(
                     "{point}: foreground Stop retained its lifecycle lock beyond {limit:?}"
                 ));

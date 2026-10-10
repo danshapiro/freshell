@@ -1768,6 +1768,8 @@ pub(crate) mod tests {
         pub(crate) requests: Vec<String>,
         pub(crate) silence: Option<&'static str>,
         pub(crate) disconnected: usize,
+        pub(crate) first_inspection_at: Option<std::time::Instant>,
+        pub(crate) first_silent_eof_at: Option<std::time::Instant>,
     }
 
     impl StopDockerFixture {
@@ -1823,6 +1825,8 @@ pub(crate) mod tests {
                 requests: vec![],
                 silence: None,
                 disconnected: 0,
+                first_inspection_at: None,
+                first_silent_eof_at: None,
             }));
             let socket = root.join("docker-stop.sock");
             let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -1851,6 +1855,9 @@ pub(crate) mod tests {
                                 let (silent, status, response) = {
                                     let mut state = state.lock().unwrap();
                                     let inspect = request == format!("GET {DOCKER_API}/containers/{container}/json HTTP/1.1");
+                                    if inspect {
+                                        state.first_inspection_at.get_or_insert_with(std::time::Instant::now);
+                                    }
                                     let stop = request == format!("POST {DOCKER_API}/containers/{container}/stop?t=2 HTTP/1.1");
                                     let force = request == format!("POST {DOCKER_API}/containers/{container}/kill?signal=KILL HTTP/1.1");
                                     let after_stop = state.requests.iter().any(|r| r.contains("/stop?"));
@@ -1890,7 +1897,9 @@ pub(crate) mod tests {
                                     // the real transport instead of completing a fake future.
                                     let mut bytes = Vec::new();
                                     stream.read_to_end(&mut bytes).await.unwrap();
-                                    state.lock().unwrap().disconnected += 1;
+                                    let mut state = state.lock().unwrap();
+                                    state.disconnected += 1;
+                                    state.first_silent_eof_at.get_or_insert_with(std::time::Instant::now);
                                 } else {
                                     let body = serde_json::to_vec(&response).unwrap();
                                     stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
