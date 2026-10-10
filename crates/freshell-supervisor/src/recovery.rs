@@ -3108,6 +3108,17 @@ impl Supervisor {
         };
 
         verdict_fence = verdict_fence.for_incarnation(prepared.prepared.incarnation_id.clone());
+        if prepared.resume_spec.is_some() {
+            crate::service::append_event(
+                &self.config.lifecycle_log,
+                "supervisor.recovery.replacement_writer_prepared",
+                serde_json::json!({"severity":"info", "soulId":soul_id,
+                    "priorIncarnationId":prior_incarnation_id, "incarnationId":prepared.prepared.incarnation_id,
+                    "provider":start.context.provider, "providerStoreId":start.context.provider_store_id,
+                    "nativeSessionId":start.context.native_session_id, "attemptId":attempt_id,
+                    "intentRevision":start.context.intent_revision, "writerState":"prepared"}),
+            );
+        }
         let workload = LaunchWorkload {
             soul_id: soul_id.clone(),
             fixture: prepared.fixture,
@@ -4691,6 +4702,7 @@ impl Supervisor {
                 .mark_stop_outcome(handle.incarnation_id().clone(), StopOutcome::VerifiedEmpty)
                 .await
                 .map_err(map_registry)?;
+            self.record_recovery_writer_release(handle);
             return Ok(StopOutcome::VerifiedEmpty);
         }
         if let Ok(host) = self
@@ -4731,7 +4743,21 @@ impl Supervisor {
             .mark_stop_outcome(handle.incarnation_id().clone(), outcome)
             .await
             .map_err(map_registry)?;
+        if outcome == StopOutcome::VerifiedEmpty {
+            self.record_recovery_writer_release(handle);
+        }
         Ok(outcome)
+    }
+
+    fn record_recovery_writer_release(&self, handle: &OwnedRuntimeHandle) {
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery.old_writer_released",
+            serde_json::json!({"severity":"info", "soulId":handle.soul_id(),
+                "incarnationId":handle.incarnation_id(), "containerId":handle.container_id(),
+                "providerStoreId":handle.provider_store_id(), "launchNonce":handle.launch_nonce(),
+                "outcome":"verified_empty", "writerState":"released"}),
+        );
     }
 
     pub(crate) async fn wait_for_native_identity(
@@ -7992,6 +8018,9 @@ mod automatic_retry_tests {
         let soul = seed(&supervisor).await;
         backend.unavailable(true);
         supervisor.reconcile_startup().await.unwrap();
+        let failed_events = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
+        assert!(!failed_events.contains("supervisor.recovery.old_writer_released"));
+        assert!(!failed_events.contains("supervisor.recovery.replacement_writer_prepared"));
         backend.unavailable(false);
         clock.store(2_000, Ordering::SeqCst);
         let report = supervisor.reconcile_startup().await.unwrap();
@@ -8047,6 +8076,30 @@ mod automatic_retry_tests {
         assert_eq!(settled["intentRevision"], view.intent_revision);
         assert_eq!(settled["reason"], "recovered");
         assert_eq!(settled["severity"], "info");
+        let released = events
+            .iter()
+            .position(|event| event["event"] == "supervisor.recovery.old_writer_released")
+            .unwrap();
+        let prepared = events
+            .iter()
+            .position(|event| event["event"] == "supervisor.recovery.replacement_writer_prepared")
+            .unwrap();
+        let running = events
+            .iter()
+            .position(|event| event["event"] == "supervisor.launch_running")
+            .unwrap();
+        assert!(released < prepared && prepared < running);
+        assert_eq!(events[released]["data"]["soulId"], soul.as_str());
+        assert_eq!(events[released]["data"]["outcome"], "verified_empty");
+        assert_eq!(
+            events[prepared]["data"]["priorIncarnationId"],
+            events[released]["data"]["incarnationId"]
+        );
+        assert_eq!(
+            events[prepared]["data"]["incarnationId"],
+            view.incarnation_id.as_str()
+        );
+        assert_eq!(events[prepared]["data"]["writerState"], "prepared");
     }
 
     #[tokio::test]
