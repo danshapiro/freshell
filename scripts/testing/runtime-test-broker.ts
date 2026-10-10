@@ -242,16 +242,23 @@ export class RestrictedDockerBroker {
       return
     }
 
-    const helperTarget = url.match(/^\/v1\.47\/containers\/([^/?]+)(?:\/(start|wait|logs))?(?:\?.*)?$/)
+    const helperTarget = url.match(/^\/v1\.47\/containers\/([^/?]+)(?:\/(start|wait|logs|json))?(?:\?.*)?$/)
     const helperEntry = helperTarget && [...this.historyHelpers].find(([name, helper]) => (
       helperTarget[1] === name || helperTarget[1] === helper.containerId
     ))
     if (helperEntry) {
       const [name, helper] = helperEntry
       const exactId = helperTarget![1] === helper.containerId
-      const allowed = (method === 'POST' && exactId && url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/start`)
-        || (method === 'POST' && exactId && url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/wait?condition=not-running`)
-        || (method === 'GET' && exactId && [0, 1].some((stderr) => url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/logs?stdout=1&stderr=${stderr}`))
+      const helperPath = `${DOCKER_API_PREFIX}/containers/${helper.containerId}`
+      // API1.47 omitted wait condition is not-running. Docker logs first
+      // inspects Tty, then serializes the same stdout/stderr flags stderr-first.
+      const allowed = (method === 'POST' && exactId && [
+        `${helperPath}/start`, `${helperPath}/wait`, `${helperPath}/wait?condition=not-running`,
+      ].includes(url))
+        || (method === 'GET' && exactId && [
+          `${helperPath}/json`, `${helperPath}/logs?stdout=1&stderr=0`,
+          `${helperPath}/logs?stdout=1&stderr=1`, `${helperPath}/logs?stderr=1&stdout=1`,
+        ].includes(url))
         || (method === 'DELETE' && url === `${DOCKER_API_PREFIX}/containers/${helperTarget![1]}?force=1`)
       if (allowed) {
         const forwarded = await this.forward(request, body)
