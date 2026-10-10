@@ -279,13 +279,54 @@ asyncio.run(main())
   })
 }
 
-async function controlledOpenCodeTui() {
+const opencodePinnedMigrations = [
+  "20260127222353_familiar_lady_ursula",
+  "20260211171708_add_project_commands",
+  "20260213144116_wakeful_the_professor",
+  "20260225215848_workspace",
+  "20260227213759_add_session_workspace_id",
+  "20260228203230_blue_harpoon",
+  "20260303231226_add_workspace_fields",
+  "20260309230000_move_org_to_state",
+  "20260312043431_session_message_cursor",
+  "20260323234822_events",
+  "20260410174513_workspace-name",
+  "20260413175956_chief_energizer",
+  "20260423070820_add_icon_url_override",
+  "20260427172553_slow_nightmare",
+  "20260428004200_add_session_path",
+  "20260501142318_next_venus",
+  "20260504145000_add_sync_owner",
+  "20260507164347_add_workspace_time",
+  "20260510033149_session_usage",
+  "20260511000411_data_migration_state",
+  "20260511173437_session-metadata",
+  "20260601010001_normalize_storage_paths",
+  "20260601202201_amazing_prowler",
+  "20260602002951_lowly_union_jack",
+  "20260602182828_add_project_directories",
+  "20260603001617_session_message_projection_indexes",
+  "20260603040000_session_message_projection_order",
+  "20260603141458_session_input_inbox",
+  "20260603160727_jittery_ezekiel_stane",
+  "20260604172448_event_sourced_session_input",
+  "20260605003541_add_session_context_snapshot",
+  "20260605042240_add_context_epoch_agent",
+  "20260611035744_credential",
+  "20260611192811_lush_chimera",
+  "20260612174303_project_dir_strategy",
+  "20260622142730_simplify_session_context_epoch",
+  "20260622170816_reset_v2_session_state",
+  "20260622202450_simplify_session_input"
+]
+
+async function controlledOpenCodeTui(schemaPath, migrations) {
   // This function runs in a child with Node's TypeScript transform enabled:
   // the installed TUI plugin contains parameter properties. All native and
   // hydrated reads below come from the same real controlled SQLite store.
   const fs = await import('node:fs')
   const path = await import('node:path')
-  const { randomUUID } = await import('node:crypto')
+  const { randomUUID, createHash } = await import('node:crypto')
   const { DatabaseSync } = await import('node:sqlite')
   const config = JSON.parse(fs.readFileSync(process.env.OPENCODE_TUI_CONFIG, 'utf8'))
   const pluginPath = config.plugin.find(value => value.endsWith('/freshell-rebind-plugin.ts'))
@@ -294,25 +335,14 @@ async function controlledOpenCodeTui() {
   const dataHome = path.join(process.env.HOME, '.local/share/opencode')
   fs.mkdirSync(dataHome, { recursive: true })
   const db = new DatabaseSync(path.join(dataHome, 'opencode.db'))
-  db.exec(`
-    PRAGMA busy_timeout = 5000;
-    CREATE TABLE IF NOT EXISTS project (id text PRIMARY KEY, worktree text);
-    CREATE TABLE IF NOT EXISTS session (
-      id text PRIMARY KEY, project_id text NOT NULL, workspace_id text, parent_id text,
-      slug text NOT NULL, directory text NOT NULL, path text, title text NOT NULL,
-      version text NOT NULL, share_url text, summary_additions integer, summary_deletions integer,
-      summary_files integer, summary_diffs text, metadata text, cost real NOT NULL DEFAULT 0,
-      tokens_input integer NOT NULL DEFAULT 0, tokens_output integer NOT NULL DEFAULT 0,
-      tokens_reasoning integer NOT NULL DEFAULT 0, tokens_cache_read integer NOT NULL DEFAULT 0,
-      tokens_cache_write integer NOT NULL DEFAULT 0, revert text, permission text, agent text,
-      model text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL,
-      time_compacting integer, time_archived integer);
-    CREATE TABLE IF NOT EXISTS message (id text PRIMARY KEY, session_id text NOT NULL,
-      time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
-    CREATE TABLE IF NOT EXISTS part (id text PRIMARY KEY, message_id text NOT NULL,
-      session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
-    CREATE TABLE IF NOT EXISTS message_seq (session_id text PRIMARY KEY, next integer NOT NULL);
-  `)
+  db.exec('PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;')
+  if (!db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").get()) {
+    // Reuse the accepted pinned fixture schema, including its relationships
+    // and migration journal, so the real retained-store qualifier can inspect it.
+    db.exec(fs.readFileSync(schemaPath, 'utf8'))
+    const insertMigration = db.prepare('INSERT INTO migration (id, time_completed) VALUES (?, ?)')
+    migrations.forEach((migration, index) => insertMigration.run(migration, index + 100))
+  }
   const get = id => {
     const row = db.prepare('SELECT * FROM session WHERE id = ?').get(id)
     if (!row) throw new Error('native root not found')
@@ -334,11 +364,16 @@ async function controlledOpenCodeTui() {
       async create() {
         const id = 'ses_' + randomUUID().replaceAll('-', '')
         const now = Date.now()
-        db.prepare('INSERT INTO project (id, worktree) VALUES (?, ?)').run(id, process.cwd())
+        const projectId = createHash('sha1').update('git-remote:fixture.invalid/freshell/provider-parity').digest('hex')
+        db.prepare(`INSERT OR IGNORE INTO project
+          (id, worktree, time_created, time_updated, sandboxes, vcs) VALUES (?, ?, ?, ?, '[]', 'git')`)
+          .run(projectId, process.cwd(), now, now)
+        db.prepare('INSERT OR IGNORE INTO project_directory (project_id, directory, time_created) VALUES (?, ?, ?)')
+          .run(projectId, process.cwd(), now)
         db.prepare(`INSERT INTO session
           (id, project_id, parent_id, slug, directory, title, version, model, time_created, time_updated)
-          VALUES (?, ?, NULL, ?, ?, ?, 'controlled-parity', 'controlled-model', ?, ?)`)
-          .run(id, id, id, process.cwd(), id, now, now)
+          VALUES (?, ?, NULL, ?, ?, ?, '1.18.21', 'controlled-model', ?, ?)`)
+          .run(id, projectId, id, process.cwd(), id, now, now)
         return { data: get(id) }
       },
       async get({ sessionID }) { return { data: get(sessionID) } },
@@ -384,8 +419,13 @@ async function controlledOpenCodeTui() {
 
 if (provider === 'amplifier') await configuredAmplifierStartup()
 if (provider === 'opencode' && process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) {
+  // The parity harness copies this fixture into a workspace directly under
+  // its worktree, which is also the source mount available to the child.
+  const schemaPath = path.resolve(import.meta.dirname, '../crates/freshell-sessions/src/opencode_schema_v1_18_21.sql')
   const terminal = spawn(process.execPath, ['--experimental-transform-types', '--input-type=module', '-e',
-    `const argv = process.argv.slice(1); await (${controlledOpenCodeTui.toString()})()`, '--', ...argv],
+    `const argv = process.argv.slice(1); await (${controlledOpenCodeTui.toString()})(
+      ${JSON.stringify(schemaPath)},
+      ${JSON.stringify(opencodePinnedMigrations)})`, '--', ...argv],
   { env: process.env, cwd, stdio: 'inherit' })
   terminal.once('exit', code => { process.exitCode = code ?? 1 })
 } else if (provider === 'codex' || provider === 'opencode') {
