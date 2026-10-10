@@ -389,14 +389,18 @@ function validateNativeProfiles(repoRoot: string, evidenceDir: string, rows: Fre
   }
 }
 
+export function nativeCompletedTurnProofs(conversation: ObservedNativeConversation): NativeTurnProof[] {
+  return conversation.stages.map(stage => {
+    if (stage.nativeEvidence.kind !== 'identified_message') throw new Error('fresh native completion requires actual native message IDs')
+    return { turnId: stage.nativeEvidence.turnId, assistantMessageId: stage.nativeEvidence.messageId, completionKind: 'provider_native_completed' }
+  })
+}
+
 function validateDerivedNativeRows(rows: FreshAgentQualificationRow[], observed: ObservedNativeConversation[]): void {
   for (const [index, row] of rows.entries()) {
     const conversation = observed[index]!
     for (const field of ['mode', 'soulId', 'providerStoreId', 'nativeSessionId'] as const) stringEqual(conversation[field], row[field], `native ${field}`)
-    const derived = conversation.stages.map(stage => {
-      if (stage.nativeEvidence.kind !== 'identified_message') throw new Error('fresh native completion requires actual native message IDs')
-      return { turnId: stage.nativeEvidence.turnId, assistantMessageId: stage.nativeEvidence.messageId, completionKind: 'provider_native_completed' }
-    })
+    const derived = nativeCompletedTurnProofs(conversation)
     if (stableJson(derived) !== stableJson(row.completedNativeTurns)) throw new Error('native completed turns differ from declared receipt turns')
   }
 }

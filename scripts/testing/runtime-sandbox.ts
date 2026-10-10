@@ -16,7 +16,7 @@ import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchem
 import fsp from 'node:fs/promises'
 import { defaultReceiptFileName } from './runtime-receipts.js'
 import { buildProviderQualificationReceipt, type ProviderQualificationReceiptV2, type ProviderQualificationRow } from './provider-qualification-receipt.js'
-import { buildFreshAgentQualificationReceipt, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
+import { buildFreshAgentQualificationReceipt, nativeCompletedTurnProofs, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
 import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
 import type { NativeHistory } from './provider-native-history.js'
@@ -732,13 +732,20 @@ print(json.dumps(dict(provider=provider,version=version,native=native,sdk=sdk,si
 `
 
 export const FreshNativeCollectionResultSchema = z.object({ collectionId: z.string().uuid(),
-  completedStages: z.number().int().min(0).max(3), closed: z.boolean() }).strict()
+  completedStages: z.number().int().min(0).max(3), closed: z.boolean(),
+  providerStoreId: z.string().min(1).optional(),
+  completedNativeTurns: z.array(z.object({ turnId: z.string().min(1), assistantMessageId: z.string().min(1),
+    completionKind: z.literal('provider_native_completed') }).strict()).length(3).optional(),
+}).strict().refine(value => (value.providerStoreId === undefined && value.completedNativeTurns === undefined)
+  || (value.closed && value.completedStages === 3 && value.providerStoreId !== undefined && value.completedNativeTurns !== undefined),
+'native IDs require the successful closed three-stage collection')
 export type FreshNativeCollectionResult = z.infer<typeof FreshNativeCollectionResultSchema>
 type FreshNativeCollection = {
   collectionId: string; mode: string; provider: string; soulId: string; providerStoreId: string; nativeSessionId: string
   nonce: string; stages: Record<string, unknown>[]; lastHandle: ExactRuntimeHandle; closed: boolean; failed: boolean
   crash?: Record<string, unknown>
   stopped?: NativeOriginalReference
+  completedNativeTurns?: FreshAgentQualificationRow['completedNativeTurns']
 }
 const NativeDigest = z.string().regex(/^[a-f0-9]{64}$/)
 const FreshNativeProcessSchema = z.object({ provider: z.enum(['claude', 'codex', 'opencode']), version: z.string(),
@@ -5683,7 +5690,8 @@ export class ManagedRuntimeOwner {
   }
 
   private nativeCollectionResult(collection: FreshNativeCollection): FreshNativeCollectionResult {
-    return { collectionId: collection.collectionId, completedStages: collection.stages.length, closed: collection.closed }
+    return { collectionId: collection.collectionId, completedStages: collection.stages.length, closed: collection.closed,
+      ...(collection.closed && collection.completedNativeTurns ? { providerStoreId: collection.providerStoreId, completedNativeTurns: collection.completedNativeTurns } : {}) }
   }
 
   private async currentFreshCollection(handle: ExactRuntimeHandle, collectionId: string): Promise<FreshNativeCollection> {
@@ -5922,6 +5930,11 @@ export class ManagedRuntimeOwner {
         if (collection.provider !== 'opencode' && !finalBytes.subarray(0, lastBytes.length).equals(lastBytes)) throw new Error('stopped native retained prefix changed')
         collection.stopped = await this.retainNativeOriginal(`${prefix}/read.json`, { nativeFile, store, stopResult: result, stoppedView: row, writer,
           stopCompletedAt, stoppedObservedAt, writerObservedAt, readStartedAt, readCompletedAt, completedTurnCount: captured.turns.length })
+        const observed = deriveNativeRecoveryOriginals({ evidenceDir: this.runtime.evidenceDir, candidateSha: this.runtime.candidateSha,
+          runId: this.runtime.runId, runtimeImage: this.runtime.imageRef, selected: [collection.mode],
+          originalReference: { path: `fresh-native-${collectionId}/manifest.json`,
+            sha256: createHash('sha256').update(await fsp.readFile(path.join(this.runtime.evidenceDir, `fresh-native-${collectionId}/manifest.json`))).digest('hex') } })
+        collection.completedNativeTurns = nativeCompletedTurnProofs(observed[0]!)
         collection.closed = true
         if ([...this.freshNativeCollections.values()].every(value => value.closed && !value.failed)
           && this.freshAgentModes.every(mode => [...this.freshNativeCollections.values()].some(value => value.mode === mode))) {

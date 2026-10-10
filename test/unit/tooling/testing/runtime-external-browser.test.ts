@@ -3301,7 +3301,9 @@ describe('closed external owner control', () => {
       await new Promise(resolve => setTimeout(resolve, 10))
       return { collectionId, completedStages: 1, closed: false }
     })
-    const closed = vi.spyOn(owned, 'finishFreshNativeCollection').mockResolvedValue({ collectionId, completedStages: 3, closed: true })
+    const nativeResult = { collectionId, completedStages: 3, closed: true, providerStoreId: 'observed-store',
+      completedNativeTurns: [1, 2, 3].map(index => ({ turnId: `native-turn-${index}`, assistantMessageId: `native-message-${index}`, completionKind: 'provider_native_completed' as const })) }
+    const closed = vi.spyOn(owned, 'finishFreshNativeCollection').mockResolvedValue(nativeResult)
     const control = runner.createExternalRuntimeControl(owned, context)
     let lost = false
     const requests: Record<string, any>[] = []
@@ -3321,7 +3323,7 @@ describe('closed external owner control', () => {
     await expect(control({ ...original, nativeCollectionId: '22222222-2222-4222-8222-222222222222' })).rejects.toThrow(/reused/)
     await expect(control({ ...request, action: 'fresh-native-stage', handle, nativeCollectionId: collectionId, path: '/source' })).rejects.toThrow(/operation/)
     await expect(control({ ...request, action: 'fresh-native-stage', handle })).rejects.toThrow(/collection/)
-    await expect(rig.finishFreshNativeCollection(handle, collectionId)).resolves.toMatchObject({ closed: true })
+    await expect(rig.finishFreshNativeCollection(handle, collectionId)).resolves.toEqual(nativeResult)
     expect(registered).toHaveBeenCalledExactlyOnceWith(handle, nonce)
     expect(capture).toHaveBeenCalledExactlyOnceWith(handle, collectionId)
     expect(closed).toHaveBeenCalledExactlyOnceWith(handle, collectionId)
