@@ -984,7 +984,7 @@ impl AgentUnit {
             // Judged by its own argv, as the backends' per-process kills
             // judge each process: a root pinned from a record written
             // before the daemon family was kept out of the roots.
-            if process::argv(watch.pid()).is_ok_and(|argv| process::is_codex_daemon_family(&argv)) {
+            if own_argv_is_daemon_family(watch.pid()) {
                 spared.push(watch.identity().clone());
                 continue;
             }
@@ -1045,7 +1045,10 @@ impl AgentUnit {
     /// The lock check runs after the whole-unit kill (a lock is released at
     /// the main's exit only when no other live process shares its open file
     /// description): every member still holding a lock path is killed
-    /// through a pinned watch, then the holders are checked once more.
+    /// through a pinned watch, then the holders are checked once more. A
+    /// holder whose own argv is Codex's daemon family (a snapshot member
+    /// that exec'd into it after the snapshot) is neither signalled nor
+    /// waited for, so its lock still counts as held.
     #[cfg(not(target_os = "macos"))]
     async fn check_locks(&self, snapshot: &[ProcWatch]) -> io::Result<bool> {
         let paths = lock(&self.inner.lock_paths).clone();
@@ -1058,6 +1061,9 @@ impl AgentUnit {
         }
         for holder in first {
             if let Ok(watch) = ProcWatch::open_expecting(holder.pid, holder.start) {
+                if own_argv_is_daemon_family(watch.pid()) {
+                    continue;
+                }
                 let _ = watch.signal(Sig::Kill);
                 watch.exited().await?;
             }
@@ -1098,7 +1104,10 @@ impl AgentUnit {
     /// (never while it may still hold the lock), and is awaited too. A
     /// holder found after the kill with no such watch is killed, and its
     /// lock file's unlock (`NOTE_FUNLOCK`, registered before the scan that
-    /// found it) is awaited. Then the holders are checked once more.
+    /// found it) is awaited. Then the holders are checked once more. A
+    /// holder or member whose own argv is Codex's daemon family (a snapshot
+    /// member that exec'd into it after the snapshot) is neither signalled
+    /// nor waited for, so its lock still counts as held.
     #[cfg(target_os = "macos")]
     async fn check_locks(&self, snapshot: &[ProcWatch]) -> io::Result<bool> {
         let paths = lock(&self.inner.lock_paths).clone();
@@ -1127,6 +1136,9 @@ impl AgentUnit {
                     // Pinned only to deliver the kill: its exit proves
                     // nothing here, the unlock does.
                     if let Ok(watch) = ProcWatch::open_expecting(who.pid, who.start) {
+                        if own_argv_is_daemon_family(watch.pid()) {
+                            continue;
+                        }
                         let _ = watch.signal(Sig::Kill);
                     }
                     // A file created after the watch began has no unlock
@@ -1159,6 +1171,9 @@ impl AgentUnit {
             .await?;
         }
         for watch in &awaited {
+            if own_argv_is_daemon_family(watch.pid()) {
+                continue;
+            }
             let _ = watch.signal(Sig::Kill);
             watch.exited().await?;
         }
@@ -1430,6 +1445,14 @@ fn live_identities(watches: &[ProcWatch]) -> Vec<(u32, u64)> {
     roots.sort_unstable();
     roots.dedup();
     roots
+}
+
+/// Whether `pid`'s own argv is Codex's daemon family right now
+/// (`process::is_codex_daemon_family`): the unit's own kills (the pinned
+/// processes after the whole-unit kill, the Gone lock check) never signal
+/// such a process. Checked right before each signal, on a pinned watch.
+fn own_argv_is_daemon_family(pid: u32) -> bool {
+    process::argv(pid).is_ok_and(|argv| process::is_codex_daemon_family(&argv))
 }
 
 fn is_spared(watch: &ProcWatch, spared: &[ProcIdentity]) -> bool {
