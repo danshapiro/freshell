@@ -560,7 +560,11 @@ exec sleep 600"#;
         .iter()
         .map(|pid| KillOnDrop(ProcWatch::open(*pid).unwrap()))
         .collect();
-    assert_eq!(shell, root.id(), "the shim execs its command in place");
+    assert_eq!(
+        shell,
+        root.id(),
+        "the test helper's disclaim-exec execs its command in place"
+    );
     assert_eq!(
         responsible_pid(root.id()),
         Some(root.id()),
