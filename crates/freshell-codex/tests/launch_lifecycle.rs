@@ -2535,8 +2535,12 @@ mod unit_sidecar {
         .await;
     }
 
+    /// Shift-X on a seeded sidecar: SIGINT goes straight to the native main
+    /// (not the launcher), the lock is released at Gone, and every process
+    /// the native started is dead after the sweep. The launcher-last order
+    /// itself is containment's (its own tests cover it).
     #[tokio::test(flavor = "multi_thread")]
-    async fn force_stop_signals_native_first_and_kills_launcher_last() {
+    async fn force_stop_sends_sigint_to_the_native_main_and_kills_what_it_started() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
         let seed = tag_seed("t-shiftx");
