@@ -1,18 +1,22 @@
-//! Captures `freshell_unit` events (level, `event` field and every other
-//! field as text) for assertions.
+//! Captures `freshell_unit` events (level, `event` field, every other field
+//! as text, and when each was logged) for assertions.
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 
-/// One captured event: its level, its `event` name and every field as text.
+/// One captured event: its level, its `event` name, every field as text, and
+/// `at`, when it was logged (a layer sees each event synchronously, in the
+/// logging thread, as it is logged).
 #[derive(Clone, Debug)]
 pub struct Event {
     pub level: tracing::Level,
     pub event: String,
     pub fields: BTreeMap<String, String>,
+    pub at: Instant,
 }
 
 #[derive(Clone, Default)]
@@ -34,6 +38,7 @@ impl Visit for Fields {
 
 impl<S: tracing::Subscriber> Layer<S> for Captured {
     fn on_event(&self, e: &tracing::Event<'_>, _: Context<'_, S>) {
+        let at = Instant::now();
         let mut fields = Fields::default();
         e.record(&mut fields);
         if let Some(name) = fields.0.remove("event") {
@@ -41,6 +46,7 @@ impl<S: tracing::Subscriber> Layer<S> for Captured {
                 level: *e.metadata().level(),
                 event: name,
                 fields: fields.0,
+                at,
             });
         }
     }
@@ -61,13 +67,28 @@ impl Captured {
     /// An event of this level and name whose fields include every
     /// `(key, value)` pair given (values as text).
     pub fn has_with(&self, level: tracing::Level, event: &str, fields: &[(&str, &str)]) -> bool {
-        self.0.lock().unwrap().iter().any(|e| {
-            e.level == level
-                && e.event == event
-                && fields
-                    .iter()
-                    .all(|(k, v)| e.fields.get(*k).map(String::as_str) == Some(*v))
-        })
+        self.first(level, event, fields).is_some()
+    }
+
+    /// The first such event (as [`Captured::has_with`] matches them).
+    pub fn first(
+        &self,
+        level: tracing::Level,
+        event: &str,
+        fields: &[(&str, &str)],
+    ) -> Option<Event> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| {
+                e.level == level
+                    && e.event == event
+                    && fields
+                        .iter()
+                        .all(|(k, v)| e.fields.get(*k).map(String::as_str) == Some(*v))
+            })
+            .cloned()
     }
 }
 
