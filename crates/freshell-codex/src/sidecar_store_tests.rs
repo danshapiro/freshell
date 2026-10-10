@@ -397,6 +397,41 @@ fn v1_rows_load_and_v2_rows_round_trip() {
 }
 
 #[test]
+fn a_loaded_v1_row_is_upgraded_to_v2_and_rewritten_as_v2() {
+    // Review M2: the upgrade happens in `load_all`, not at each writer, so a
+    // v1 row written back unchanged must already be a v2 row.
+    let dir = tempfile::tempdir().unwrap();
+    let store = CodexSidecarStore::new(dir.path().to_path_buf());
+    let v1 = serde_json::json!({
+        "recordVersion": 1, "ownershipId": "codex-sidecar-v1", "pid": 4242, "starttime": 7,
+        "cmdline": ["node", "codex"], "wsUrl": "ws://127.0.0.1:1", "sessionId": "t-root",
+        "serverInstanceId": "srv", "createdAt": 1, "updatedAt": 1, "state": {"kind": "active"}
+    });
+    std::fs::write(dir.path().join("codex-sidecar-v1.json"), v1.to_string()).unwrap();
+
+    let loaded = store.load_all();
+    assert_eq!(loaded.len(), 1, "a v1 row is not quarantined");
+    assert_eq!(
+        loaded[0].record_version, SIDECAR_RECORD_VERSION,
+        "a v1 row loads as a v2 row"
+    );
+
+    store.write(&loaded[0]).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("codex-sidecar-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        json["recordVersion"], 2,
+        "its next write is a v2 row, with no field changed by the writer"
+    );
+    assert_eq!(
+        store.load_all(),
+        loaded,
+        "the rewritten row reads back the same"
+    );
+}
+
+#[test]
 fn rows_of_an_unknown_version_are_still_quarantined() {
     let dir = tempfile::tempdir().unwrap();
     let store = CodexSidecarStore::new(dir.path().to_path_buf());
