@@ -9,6 +9,8 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
+import WebSocket from 'ws'
+import { WS_PROTOCOL_VERSION } from '../../../../shared/ws-protocol.js'
 
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
@@ -32,7 +34,7 @@ import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../..
 import * as retainedDriver from '../../../../scripts/testing/task002-retained-fixture.js'
 import { stopManagedRuntimeSoul, createManagedOpenCodeRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { structuredChaosLog, bindInterruptedOrdinaryStopFailedAck, reportInterruptedOrdinaryStopAckFailure } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
-import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
+import { RustServer, ensureRustServerBuilt } from '../../../e2e-browser/helpers/rust-server.js'
 import type { BrokerReceipt } from '../../../../scripts/testing/runtime-test-broker.js'
 import type { ProviderQualificationRow } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import type { FreshAgentQualificationRow } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
@@ -243,6 +245,103 @@ const descriptor = {
 const smokeSpec = 'test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts'
 
 describe('selected production owner registration', () => {
+  it.each([
+    { provider: 'claude' as const, selected: true, retained: false },
+    { provider: 'codex' as const, selected: true, retained: false },
+    { provider: 'claude' as const, selected: false, retained: false },
+    { provider: 'claude' as const, selected: true, retained: true },
+    { provider: 'codex' as const, selected: false, retained: false },
+    { provider: 'codex' as const, selected: true, retained: true },
+    { provider: 'opencode' as const, selected: true, retained: false },
+  ])('launches the actual $provider consumer with only its selected external qualification profile ($selected/$retained)', async ({ provider, selected, retained }) => {
+    const home = path.join(fixtureRepoRoot, 'launch-home')
+    const argvFile = path.join(fixtureRepoRoot, 'launch-argv.json')
+    const processesFile = path.join(fixtureRepoRoot, 'launch-processes.jsonl')
+    const command = path.join(fixtureRepoRoot, 'profile-provider')
+    const serverBinary = ensureRustServerBuilt(sourceRoot)
+    await fsp.writeFile(command, `#!${process.execPath}
+const fs = require('node:fs');
+const argv = process.argv.slice(2);
+if (argv.includes('--version')) { process.stdout.write('fixture-only\\n'); process.exit(0); }
+fs.appendFileSync(${JSON.stringify(processesFile)}, JSON.stringify({ pid: process.pid })+'\\n', { mode: 0o600 });
+if (argv.includes('app-server')) {
+  void import(${JSON.stringify(path.join(sourceRoot, 'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs'))});
+} else {
+  fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify({ pid: process.pid, argv }), { mode: 0o600 });
+  process.stdin.resume();
+}
+`, { mode: 0o700 })
+    let web!: RustServer
+    const owner = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
+      spec: selected ? 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts'
+        : 'test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts', provider,
+    }, {}, options => {
+      // Keep the actual owner home writer and production settings/WS/argv path.
+      // Only runtime builds and Docker allocation below are outside this test.
+      web = new RustServer({ homeDir: home, setupHome: options.setupHome, providerFreeFixture: true,
+        stripEnvPrefixes: ['FRESHELL_RUNTIME_', 'FRESHELL_MANAGED_', 'NODE_OPTIONS'],
+        env: { CLAUDE_CMD: command, CODEX_CMD: command, OPENCODE_CMD: command, FRESHELL_BIND_HOST: '127.0.0.1' } })
+      return web as any
+    }, retained)
+    const prepare = vi.spyOn(owner.runtime, 'prepare').mockResolvedValue(undefined)
+    const buildServer = vi.spyOn(owner as any, 'buildManagedServer').mockReturnValue(serverBinary)
+    const buildSupervisor = vi.spyOn(owner as any, 'buildQualificationSupervisor').mockReturnValue(undefined)
+    const recordBuild = vi.spyOn(owner.runtime, 'recordProviderQualificationBuild').mockReturnValue(undefined)
+    const startSupervisor = vi.spyOn(owner.runtime, 'startSupervisor').mockResolvedValue({
+      controlSocket: '/unused/profile-control.sock', controlSecretFile: '/unused/profile-secret',
+    } as SupervisorInstance)
+    let socket: WebSocket | undefined
+    let webPid: number | undefined
+    try {
+      const info = await owner.start()
+      webPid = info.pid
+      socket = new WebSocket(info.wsUrl)
+      const frames: Array<Record<string, any>> = []
+      socket.on('message', data => frames.push(JSON.parse(String(data))))
+      await new Promise<void>((resolve, reject) => { socket!.once('open', resolve); socket!.once('error', reject) })
+      socket.send(JSON.stringify({ type: 'hello', token: info.token, protocolVersion: WS_PROTOCOL_VERSION }))
+      await vi.waitFor(() => expect(frames.some(frame => frame.type === 'ready')).toBe(true))
+      socket.send(JSON.stringify({ type: 'terminal.create', requestId: 'external-profile-launch', mode: provider,
+        shell: 'system', cwd: fixtureRepoRoot, tabId: 'profile-tab', paneId: 'profile-pane' }))
+      await vi.waitFor(() => {
+        const error = frames.find(frame => frame.type === 'error')
+        if (error) throw new Error(`owned profile launch failed: ${error.code}`)
+        expect(fs.existsSync(argvFile)).toBe(true)
+      }, { timeout: 15_000 })
+      const launch = JSON.parse(await fsp.readFile(argvFile, 'utf8')) as { pid: number; argv: string[] }
+      if (provider === 'claude') {
+        expect(launch.argv.includes('--model')).toBe(selected && !retained)
+        expect(launch.argv.includes('--effort')).toBe(selected && !retained)
+        if (selected && !retained) {
+          expect(launch.argv[launch.argv.indexOf('--model') + 1]).toBe('haiku')
+          expect(launch.argv[launch.argv.indexOf('--effort') + 1]).toBe('low')
+        }
+      } else if (provider === 'codex') {
+        expect(launch.argv.includes('model_reasoning_effort="low"')).toBe(selected && !retained)
+        // Codex's model is loaded into the launch plan separately from TUI argv.
+        // This direct-route test does not certify a native managed Codex model.
+        const response = await fetch(`${info.baseUrl}/api/settings`, { headers: { 'x-auth-token': info.token } })
+        expect(response.ok).toBe(true)
+        expect((await response.json()).codingCli.providers.codex?.model ?? null).toBe(selected && !retained ? 'gpt-5.6-luna' : null)
+      } else {
+        expect(launch.argv[launch.argv.indexOf('--model') + 1]).toBe('openai/gpt-5.6-luna')
+        expect(launch.argv.includes('--effort')).toBe(false)
+      }
+    } finally {
+      try {
+        socket?.terminate()
+        await web?.stop()
+        const children = fs.existsSync(processesFile) ? (await fsp.readFile(processesFile, 'utf8')).trim().split('\n')
+          .map(line => (JSON.parse(line) as { pid: number }).pid) : []
+        for (const pid of new Set([...children, webPid].filter((pid): pid is number => pid !== undefined))) {
+          await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
+        }
+      } finally {
+        for (const mock of [prepare, buildServer, buildSupervisor, recordBuild, startSupervisor]) mock.mockRestore()
+      }
+    }
+  }, 30_000)
+
   it('prepares ordinary terminal Claude onboarding and workspace trust in the selected owned home', async () => {
     const home = path.join(fixtureRepoRoot, 'owned-claude-web-home')
     let captured!: RuntimeWebConstructOptions

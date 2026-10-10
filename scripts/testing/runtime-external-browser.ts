@@ -2453,6 +2453,11 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
   const sourceSelection = selectsSyntheticSource(selection, environment)
   const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : smoke ? ['freshopencode'] : history || interruptedStop ? ['freshcodex'] : selection.mode ? [selection.mode] : []
   const providers = deterministic || selection.mode ? [] : selection.provider ? [selection.provider] : ['opencode']
+  const qualificationProfile = !retainedArtifacts && !selection.mode
+    && path.basename(selection.spec) === 'runtime-managed-provider-qualification-rust.spec.ts'
+    ? selection.provider === 'claude' ? { model: 'haiku', effort: 'low' }
+      : selection.provider === 'codex' ? { model: 'gpt-5.6-luna', effort: 'low' } : undefined
+    : undefined
   const phase = deterministic ? 3 : selection.provider || selection.mode ? 5
     : path.basename(selection.spec).includes('resurrection') ? 3
       : path.basename(selection.spec).includes('rehydrate') ? 4
@@ -2464,6 +2469,7 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
   if (!deterministic && !retainedArtifacts && providers.includes('amplifier')) requireAmplifierOnecliBootstrap(environment)
   return new ManagedRuntimeOwner(createExternalManagedWebFactory(selection, environment, webFactory, retainedArtifacts), root, phase,
     {}, supervisorEnv, deterministic || tabs || sourceSelection || selectsPhase3Approval(selection, environment) ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
+      ...(qualificationProfile && selection.provider ? { providerSettings: { [selection.provider]: qualificationProfile } } : {}),
       fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
       bootstrapProviders: deterministic || retainedArtifacts ? [] : sourceSelection ? ['opencode']
         : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
