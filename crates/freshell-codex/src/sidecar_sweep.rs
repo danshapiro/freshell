@@ -543,44 +543,55 @@ impl KillTreeOutcome {
 ///
 /// [`ReattachedCodexAppServerRuntime`]: crate::sidecar_reconcile::ReattachedCodexAppServerRuntime
 pub async fn kill_verified_sidecar_tree(record: &CodexSidecarRecord) -> KillTreeOutcome {
-    let verdict = verify_sidecar_identity(record);
-    match verdict {
-        IdentityVerdict::Dead => KillTreeOutcome {
-            outcomes: vec![(record.pid, KillOutcome::AlreadyDead)],
-        },
-        IdentityVerdict::Mismatch | IdentityVerdict::Unverifiable => {
-            tracing::warn!(
-                target: "freshell_codex::sidecar_sweep",
-                ownership_id = %record.ownership_id,
-                pid = record.pid,
-                verdict = ?verdict,
-                "sidecar_tree_kill_skipped: identity not provably ours; NEVER signalled"
-            );
-            let outcome = if verdict == IdentityVerdict::Mismatch {
-                KillOutcome::SkippedIdentityMismatch
-            } else {
-                KillOutcome::SkippedUnverifiable
-            };
-            KillTreeOutcome {
-                outcomes: vec![(record.pid, outcome)],
-            }
-        }
-        IdentityVerdict::Verified => {
-            #[cfg(target_os = "linux")]
-            {
-                kill_verified_tree_linux(record).await
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                // Structurally unreachable: non-Linux identity is always
-                // Unverifiable (never Verified). Kept as the conservative
-                // never-signal posture should that ever change.
-                KillTreeOutcome {
-                    outcomes: vec![(record.pid, KillOutcome::SkippedUnverifiable)],
-                }
-            }
+    if let Some(refused) =
+        refuse_unless_verified(record, &verify_sidecar_identity(record), "sidecar")
+    {
+        return refused;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        kill_verified_tree_linux(record).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Structurally unreachable: non-Linux identity is always
+        // Unverifiable (never Verified). Kept as the conservative
+        // never-signal posture should that ever change.
+        KillTreeOutcome {
+            outcomes: vec![(record.pid, KillOutcome::SkippedUnverifiable)],
         }
     }
+}
+
+/// A tree kill that stops before anything is captured or signalled, judged
+/// by `verdict` on what was `checked` (the sidecar, or its launcher): `None`
+/// for [`IdentityVerdict::Verified`] (go on); otherwise only the root is
+/// reported — `AlreadyDead` for a gone pid, else a WARN and the `Skipped*`
+/// outcome (NEVER signalled).
+fn refuse_unless_verified(
+    record: &CodexSidecarRecord,
+    verdict: &IdentityVerdict,
+    checked: &'static str,
+) -> Option<KillTreeOutcome> {
+    let outcome = match verdict {
+        IdentityVerdict::Verified => return None,
+        IdentityVerdict::Dead => KillOutcome::AlreadyDead,
+        IdentityVerdict::Mismatch => KillOutcome::SkippedIdentityMismatch,
+        IdentityVerdict::Unverifiable => KillOutcome::SkippedUnverifiable,
+    };
+    if outcome != KillOutcome::AlreadyDead {
+        tracing::warn!(
+            target: "freshell_codex::sidecar_sweep",
+            ownership_id = %record.ownership_id,
+            pid = record.pid,
+            checked,
+            verdict = ?verdict,
+            "sidecar_tree_kill_skipped: identity not provably ours; NEVER signalled"
+        );
+    }
+    Some(KillTreeOutcome {
+        outcomes: vec![(record.pid, outcome)],
+    })
 }
 
 /// One captured descendant's OWN identity evidence, snapshotted at capture
@@ -621,24 +632,44 @@ fn verify_snapshot(snapshot: &PidSnapshot) -> SnapshotVerdict {
     }
 }
 
-/// The Verified arm of [`kill_verified_sidecar_tree`]: capture, then the
-/// root and per-descendant SIGTERM→poll→SIGKILL sequences, each signal
-/// preceded by its own fresh verification.
+/// The Verified arm of [`kill_verified_sidecar_tree`]: check the launcher's
+/// own evidence, capture its descendants, then the root and per-descendant
+/// SIGTERM→poll→SIGKILL sequences, each signal preceded by its own fresh
+/// verification.
 #[cfg(target_os = "linux")]
 async fn kill_verified_tree_linux(record: &CodexSidecarRecord) -> KillTreeOutcome {
+    kill_verified_tree_linux_with(record, capture_descendants).await
+}
+
+/// [`kill_verified_tree_linux`] with the descendant capture passed in
+/// (production passes [`capture_descendants`]), so a test can play a race
+/// inside the `/proc` walk.
+#[cfg(target_os = "linux")]
+async fn kill_verified_tree_linux_with(
+    record: &CodexSidecarRecord,
+    capture: impl FnOnce(i32) -> Vec<PidSnapshot>,
+) -> KillTreeOutcome {
     let root_pid = record.pid as i32;
+    // The root is the LAUNCHER (`record.pid`), so it is checked by its own
+    // evidence — a v2 record verifies by its native main, which says nothing
+    // about the launcher's pid — and BEFORE its descendants are captured. A
+    // reused launcher pid's children are never captured, so never signalled,
+    // even when that process exits during the walk (its later re-check would
+    // answer Dead, which refuses nothing).
+    if let Some(refused) =
+        refuse_unless_verified(record, &verify_launcher_identity(record), "launcher")
+    {
+        return refused;
+    }
     // Capture the descendants BEFORE the root is signalled: codex's SIGTERM
     // drain tears down (some of) its children in userspace and a SIGKILLed
     // root orphans them — either way the parent links that let /proc find
     // them are gone once the root dies (reports/V2.md).
-    let descendants = capture_descendants(root_pid);
+    let descendants = capture(root_pid);
     let mut outcomes = Vec::with_capacity(1 + descendants.len());
 
-    // The caller's verify dispatched here, but re-verify immediately before
-    // the signal — nothing is ever signalled on a stale pid. The root is the
-    // LAUNCHER (`record.pid`), so it is checked by its own evidence: a v2
-    // record verifies by its native main, which says nothing about the
-    // launcher's pid.
+    // Re-verify the launcher immediately before the signal too — nothing is
+    // ever signalled on a stale pid.
     let root_outcome = match verify_launcher_identity(record) {
         IdentityVerdict::Verified => {
             signal_pid(root_pid, libc::SIGTERM);

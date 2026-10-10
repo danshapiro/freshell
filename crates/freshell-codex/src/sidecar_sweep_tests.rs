@@ -831,26 +831,39 @@ async fn kill_tree_root_refusal_skips_captured_descendants() {
     // Final-review H3b: when the root's PRE-signal re-verify refuses
     // (Mismatch/Unverifiable), the captured descendants' provenance is in
     // doubt (they were snapshotted as children of an unproven root) — the
-    // descendant loop must be skipped entirely, nothing signalled. Driven
-    // through the private linux arm directly: the public entry refuses a
-    // Mismatch before ever capturing, so the inner re-verify refusal is the
-    // only reachable shape for this guard.
-    let script = "sleep 300 & sleep 300 & wait";
+    // descendant loop must be skipped entirely, nothing signalled. The
+    // launcher is also checked BEFORE the capture (review M1), so this
+    // refusal is reached only when the root's identity decays DURING the
+    // capture: here the root re-execs a new argv (same pid, same start time)
+    // inside the capture step, after its children were captured.
+    let script = "trap 'exec sleep 301' USR1; sleep 300 & sleep 300 & wait";
     let root = spawn_own_shell_child("bash", &["-c", script], &["bash", "-c", script]);
     let root_pid = root.0.id() as i32;
     let children = wait_for_sleep_children(root_pid, 2);
     let _orphan_guard = OrphanSnapshotGuard(children.clone());
-    // The pid-reuse shape: live pid + starttime, WRONG cmdline.
-    let record = CodexSidecarRecord {
-        cmdline: vec!["codex".to_string(), "app-server".to_string()],
-        ..record_for_child(
-            "codex-sidecar-b3000001-cccc-4ccc-8ccc-cccccccccccc",
-            root.0.id(),
-            Some(SESSION),
-        )
-    };
+    let record = record_for_child(
+        "codex-sidecar-b3000001-cccc-4ccc-8ccc-cccccccccccc",
+        root.0.id(),
+        Some(SESSION),
+    );
 
-    let outcome = kill_verified_tree_linux(&record).await;
+    let outcome = kill_verified_tree_linux_with(&record, |root| {
+        let captured = capture_descendants(root);
+        assert_eq!(captured.len(), 2, "both children are captured");
+        // This test's own root re-execs on USR1: the pid-identity decays.
+        signal_pid(root, libc::SIGUSR1);
+        let decayed = vec!["sleep".to_string(), "301".to_string()];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while proc_cmdline(root).as_ref() != Some(&decayed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the test root never re-exec'd"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        captured
+    })
+    .await;
     assert_eq!(
         outcome.outcomes,
         vec![(record.pid, KillOutcome::SkippedIdentityMismatch)],
@@ -924,6 +937,63 @@ async fn kill_tree_never_signals_a_launcher_whose_own_evidence_mismatches() {
         "a launcher pid whose own evidence mismatches is NEVER signalled"
     );
     assert_eq!(main.0.try_wait().expect("try_wait main"), None);
+}
+
+#[tokio::test]
+async fn kill_tree_never_collects_the_children_of_an_unproven_launcher() {
+    // Review M1: a v2 row verifies by its native main, so nothing has checked
+    // the launcher pid when the tree kill starts. If that pid now belongs to
+    // an unrelated process P, P's children must never be collected: should P
+    // exit during the `/proc` walk, the re-check before the signal answers
+    // Dead (no refusal), and every collected child would be signalled.
+    // The capture step plays exactly that race: it "finds" P's child (this
+    // test's own `sleep`) and P exits inside the walk.
+    let main = spawn_own_sleep_child();
+    let mut launcher = spawn_own_sleep_child(); // P, on the launcher pid
+    let mut bystander = spawn_own_sleep_child(); // P's child, as the walk finds it
+    let record = v2_record_with_mismatched_launcher(&main, &launcher);
+    assert_eq!(
+        verify_sidecar_identity(&record),
+        IdentityVerdict::Verified,
+        "the row itself verifies by its live native main"
+    );
+    let bystander_pid = bystander.0.id() as i32;
+    let bystander_snapshot = PidSnapshot {
+        pid: bystander_pid,
+        starttime: proc_starttime(bystander_pid).expect("live bystander"),
+        cmdline: proc_cmdline(bystander_pid).expect("live bystander"),
+    };
+
+    let mut collected = false;
+    let outcome = kill_verified_tree_linux_with(&record, |_root| {
+        collected = true;
+        // P exits (and is reaped) while its children are being collected.
+        let _ = launcher.0.kill();
+        let _ = launcher.0.wait();
+        vec![bystander_snapshot]
+    })
+    .await;
+
+    assert_eq!(
+        outcome.outcomes,
+        vec![(record.pid, KillOutcome::SkippedIdentityMismatch)],
+        "an unproven launcher is refused before anything is collected or signalled"
+    );
+    tokio::time::sleep(NEVER_SIGNALLED_GRACE).await;
+    assert_eq!(
+        bystander.0.try_wait().expect("try_wait bystander"),
+        None,
+        "a child of a reused launcher pid is NEVER signalled"
+    );
+    assert!(
+        !collected,
+        "the children of an unproven launcher are never collected"
+    );
+    assert_eq!(
+        launcher.0.try_wait().expect("try_wait launcher"),
+        None,
+        "the unproven launcher is never signalled"
+    );
 }
 
 #[tokio::test]
