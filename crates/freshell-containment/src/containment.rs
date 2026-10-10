@@ -8,9 +8,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-#[cfg(unix)]
-use crate::backend::BackendKind;
-use crate::backend::{Backend, Capability, UnitBackend};
+use crate::backend::{Backend, BackendKind, Capability, UnitBackend};
 use crate::proc_watch::ProcWatch;
 use crate::record::{RecordStore, UnitRecord, UnitRecordState};
 use crate::unit::{AgentUnit, UnitLabel};
@@ -189,16 +187,17 @@ impl Containment {
     /// keys. Every recorded root still alive with its recorded start time is
     /// pinned; any other is never signalled and is logged at WARN
     /// `unit.root.not_pinned`. A legacy unit (`record.legacy_tag`) finds its
-    /// members by that tag again, as its adoption did.
+    /// members by that tag again, with the capability of that finder, as its
+    /// adoption did.
     pub fn reopen_unit(&self, record: &UnitRecord, label: UnitLabel) -> std::io::Result<AgentUnit> {
-        let backend = match &record.legacy_tag {
+        let (backend, capability) = match &record.legacy_tag {
             Some((key, value)) => legacy_backend(key, value, &record.unit_id),
-            None => self.backend.reopen(&record.unit_id)?,
+            None => (self.backend.reopen(&record.unit_id)?, self.capability()),
         };
         let unit = AgentUnit::new(
             record.unit_id.clone(),
             backend,
-            self.capability(),
+            capability,
             self.store.clone(),
             label,
             Some(record.clone()),
@@ -211,7 +210,8 @@ impl Containment {
     /// legacy tag, its pinned roots and their descendants (it was started
     /// without a reaper shim). It gets a freshly minted unit id with a
     /// Running record holding the roots that could be pinned and the legacy
-    /// tag, so a later reopen finds the same members.
+    /// tag, so a later reopen finds the same members. Its capability is the
+    /// legacy finder's (never full), whatever this server's backend is.
     pub fn adopt_legacy(
         &self,
         tag_key: &str,
@@ -220,7 +220,7 @@ impl Containment {
         label: UnitLabel,
     ) -> AgentUnit {
         let id = UnitId::mint();
-        let backend = legacy_backend(tag_key, tag_value, &id);
+        let (backend, capability) = legacy_backend(tag_key, tag_value, &id);
         let record = UnitRecord {
             unit_id: id.clone(),
             provider: label.provider.clone(),
@@ -236,14 +236,7 @@ impl Containment {
             state: UnitRecordState::Running,
             legacy_tag: Some((tag_key.to_string(), tag_value.to_string())),
         };
-        let unit = AgentUnit::new(
-            id,
-            backend,
-            self.capability(),
-            self.store.clone(),
-            label,
-            None,
-        );
+        let unit = AgentUnit::new(id, backend, capability, self.store.clone(), label, None);
         let mut pinned = Vec::new();
         for (pid, start) in roots {
             match ProcWatch::open_expecting(*pid, *start) {
@@ -272,17 +265,49 @@ impl Containment {
     }
 }
 
+/// A legacy unit's member finder and its capability. The finder is never a
+/// kernel container (full: false), whatever this server's backend is, so
+/// the unit's stop pins every member before the soft signal: a member that
+/// carries no tag and whose parent root exits during the grace is still
+/// killed.
 #[cfg(unix)]
-fn legacy_backend(tag_key: &str, tag_value: &str, id: &UnitId) -> Arc<dyn UnitBackend> {
-    Arc::new(crate::backend::tag::TagUnit::legacy(tag_key, tag_value, id))
+fn legacy_backend(
+    tag_key: &str,
+    tag_value: &str,
+    id: &UnitId,
+) -> (Arc<dyn UnitBackend>, Capability) {
+    let kind = if cfg!(target_os = "macos") {
+        BackendKind::MacosTag
+    } else {
+        BackendKind::LinuxTag
+    };
+    (
+        Arc::new(crate::backend::tag::TagUnit::legacy(tag_key, tag_value, id)),
+        Capability {
+            kind,
+            full: false,
+            reason: Some("legacy sidecar: found by its tag, roots and their descendants".into()),
+        },
+    )
 }
 
 /// Windows never retains a sidecar across a restart, so a legacy unit has
 /// no job: its stop reaches its identity-verified roots and their
 /// descendants by handle.
 #[cfg(windows)]
-fn legacy_backend(_tag_key: &str, _tag_value: &str, _id: &UnitId) -> Arc<dyn UnitBackend> {
-    Arc::new(crate::backend::windows_job::RecordedUnit)
+fn legacy_backend(
+    _tag_key: &str,
+    _tag_value: &str,
+    _id: &UnitId,
+) -> (Arc<dyn UnitBackend>, Capability) {
+    (
+        Arc::new(crate::backend::windows_job::RecordedUnit),
+        Capability {
+            kind: BackendKind::WindowsJob,
+            full: false,
+            reason: Some("legacy sidecar: no job; found by its roots and their descendants".into()),
+        },
+    )
 }
 
 static GLOBAL: OnceLock<Containment> = OnceLock::new();

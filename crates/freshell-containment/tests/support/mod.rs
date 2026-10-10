@@ -93,8 +93,9 @@ pub struct AgentOpts {
     /// plain `sleep` child (the installer stand-in), and a legacy launch
     /// stand-in (`… app-server --listen unix://`).
     pub daemon_family: bool,
-    /// A child that ignores SIGINT and runs without the unit tag (an MCP
-    /// server Codex starts with an environment allow-list).
+    /// A child that ignores SIGINT and runs without the unit tag or the
+    /// legacy Codex sidecar tag (an MCP server Codex starts with an
+    /// environment allow-list).
     pub untagged_child: bool,
     /// The INT trap first copies this file to `<dir>/at-signal.json`.
     pub on_int_copy: Option<PathBuf>,
@@ -240,7 +241,7 @@ if [ "{family}" = 1 ]; then
   while [ ! -s "{dir}/installer.pid" ]; do sleep 0.05; done
   I=$(cat "{dir}/installer.pid")
 fi
-N=0; [ "{untagged}" = 1 ] && {{ env -u FRESHELL_UNIT_ID perl -e '$SIG{{INT}} = "IGNORE"; sleep 600' & N=$!; }}
+N=0; [ "{untagged}" = 1 ] && {{ env -u FRESHELL_UNIT_ID -u FRESHELL_CODEX_SIDECAR_ID perl -e '$SIG{{INT}} = "IGNORE"; sleep 600' & N=$!; }}
 E=0; EI=0
 if [ "{envless}" = 1 ]; then
   perl -e 'use POSIX; POSIX::setsid() or die "setsid: $!"; exec "/bin/sh", "-c", @ARGV' 'echo $$ > "$0/envless-intermediate.pid"; p=$$; sh -c "while kill -0 $p 2>/dev/null; do sleep 0.05; done; exec env -i /bin/sleep 600" & echo $! > "$0/envless.pid.tmp"; mv "$0/envless.pid.tmp" "$0/envless.pid"; exit 0' "{dir}"
@@ -291,6 +292,29 @@ pub async fn spawn_main(unit: &AgentUnit, s: &AgentScript) -> tokio::process::Ch
     unit.set_main(main.clone());
     s.pin_agent(&main).await;
     child
+}
+
+/// Starts the script as the test's own child, outside any unit, carrying
+/// `key=value` in its environment (and not the unit tag), as a
+/// pre-containment (v1) Codex sidecar was started. Returns the child and its
+/// pin: the main a test adopts.
+pub async fn spawn_tagged_main(
+    s: &AgentScript,
+    key: &str,
+    value: &str,
+) -> (tokio::process::Child, ProcWatch) {
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg(&s.script)
+        .env(key, value)
+        .env_remove(freshell_containment::UNIT_ENV)
+        .kill_on_drop(false)
+        .stdin(std::process::Stdio::null());
+    let child = cmd.spawn().unwrap();
+    // The test's own unreaped child: its pid names it until it is reaped.
+    let main = ProcWatch::open(child.id().unwrap()).unwrap();
+    *s.main.lock().unwrap() = Some(main.clone());
+    s.pin_agent(&main).await;
+    (child, main)
 }
 
 pub async fn read_pids(s: &AgentScript) -> Pids {

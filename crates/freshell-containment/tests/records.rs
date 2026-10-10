@@ -393,6 +393,99 @@ async fn a_reopened_legacy_unit_still_finds_its_members_by_the_legacy_tag() {
     }
 }
 
+/// A legacy unit finds its members by its tag, its roots and their
+/// descendants, never through a kernel container, whatever backend the
+/// server selected. So its stop pins every member before the soft signal, as
+/// the tag backend's units do: a child that carries no tag (an MCP server
+/// Codex starts with an environment allow-list), a member only as the main's
+/// child, is still killed after the main exits on SIGINT during the grace
+/// and the child is reparented away from every root. Checked for the
+/// adoption's own stop and for the stop of the unit reopened after a
+/// restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_unit_pins_its_members_before_the_soft_signal() {
+    let root = StateRoot::new();
+    for (name, mut c) in backends_with_state(root.path()) {
+        for reopened in [false, true] {
+            let case = if reopened { "reopened" } else { "adopted" };
+            let tag_value = format!("codex-sidecar-{}", UnitId::mint().as_str());
+            let s = agent_script(&AgentOpts {
+                untagged_child: true,
+                exit_on_int: true,
+                ..Default::default()
+            });
+            let (mut child, main) = spawn_tagged_main(&s, LEGACY_CODEX_TAG_ENV, &tag_value).await;
+            let p = read_pids(&s).await;
+            let mut unit = c.adopt_legacy(
+                LEGACY_CODEX_TAG_ENV,
+                &tag_value,
+                &[(main.pid(), main.identity().start)],
+                label(),
+            );
+            if reopened {
+                // The restart: the unit and its containment go away without
+                // a stop.
+                let unit_id = unit.id().clone();
+                drop(unit);
+                drop(c);
+                c = rebuild(name, root.path());
+                let record = c
+                    .recorded_units()
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.unit_id == unit_id)
+                    .expect("the adopted unit's record");
+                unit = c.reopen_unit(&record, label()).unwrap();
+            }
+            unit.set_main(main.clone());
+            assert!(
+                !unit.capability().full,
+                "{name}/{case}: a legacy unit is not kernel-tracked: {:?}",
+                unit.capability()
+            );
+            assert_eq!(
+                process::environ_read(p.untagged, LEGACY_CODEX_TAG_ENV),
+                process::EnvRead::Absent,
+                "{name}/{case}: the child carries no tag"
+            );
+            assert_eq!(process::parent(p.untagged), Some(main.pid()));
+            let members: Vec<u32> = unit.members().unwrap().iter().map(|m| m.pid).collect();
+            assert!(
+                members.contains(&p.untagged),
+                "{name}/{case}: the untagged child is a member as the main's child: {members:?}"
+            );
+
+            unit.stop(StopRequest::new(
+                StopMode::Force,
+                StopReason::ShiftX,
+                "test",
+            ))
+            .wait()
+            .await;
+            unit.stop_in_flight().unwrap().wait_swept().await;
+            let status = child.wait().await.unwrap();
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "{name}/{case}: the main exited on SIGINT during the grace"
+            );
+            for (what, pid) in [("setsid", p.setsid), ("pgrp", p.pgrp), ("nohup", p.nohup)] {
+                assert!(
+                    !alive(pid),
+                    "{name}/{case}: the tagged {what} member survived"
+                );
+            }
+            eventually(
+                Duration::from_secs(5),
+                &format!("{name}/{case}: the untagged child {} is killed", p.untagged),
+                || !alive(p.untagged),
+            )
+            .await;
+            assert!(c.recorded_units().unwrap().is_empty(), "{name}/{case}");
+        }
+    }
+}
+
 /// A child of the test, forked without exec, that only waits in pause(2):
 /// pinned while it is the test's own unreaped child, killed through that pin
 /// and reaped when dropped.
