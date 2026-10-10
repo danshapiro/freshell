@@ -705,8 +705,13 @@ pub mod ownership_lane {
     /// reap. `BlockedHandoff`: the caller must NOT kill (an in-flight
     /// handoff owns the transition). `StaleClaim`: the caller must NOT kill
     /// (the current owner does not match the lane's believed runtime/fence —
-    /// round-2 review). `NotLive` during another transition: the caller may
-    /// still kill its own runtime but skips the commit.
+    /// round-2 review). `AlreadyStopping`: another stop is already in flight
+    /// for the key; the caller must NOT kill and refuses
+    /// `LIFECYCLE_IN_FLIGHT` naming that stop's operation (Task 23 makes the
+    /// lanes join it instead). `NotLive` on a `Vacant` key: the caller may
+    /// still kill its own runtime (idempotent cleanup) but skips the commit;
+    /// `NotLive` during another transition (`Starting`, `Handoff`, ...):
+    /// the caller must NOT kill and refuses `LIFECYCLE_IN_FLIGHT`.
     pub fn begin_fresh_agent_stop(
         registry: &Arc<RuntimeOwnershipRegistry>,
         provider: &str,
