@@ -19,21 +19,26 @@
 //! `--setsid` shim), so a descendant that never calls `setsid` stays
 //! linked to it by its session after its parent exits.
 //!
-//! Codex's daemon family (judged by its own argv or an ancestor's) is never
-//! tracked, and so never recorded as a root: a tracked process that execs
-//! into it is dropped at its exec event.
+//! A process in Codex's daemon family (judged by its own argv or an
+//! ancestor's, read after the process is registered) is never tracked, and
+//! so never recorded as a root. A tracked process that execs into the
+//! family is dropped at its exec event, before the scan of that batch, so
+//! a child it started before the tracker collected the exec is judged
+//! through it and refused too. Only the processes it started that the
+//! tracker already followed before it collected the exec were judged
+//! outside the family; they stay tracked until they exit.
 //!
 //! The contract: a process is tracked when, at the scan that follows its
 //! parent's fork event, its parent, its process-group leader or its session
 //! leader is tracked; once tracked it stays a member until it exits. Within
-//! a batch, the scan runs before exits are applied, so a parent that forks
-//! and exits at once still links its child. Residual (the platform's limit:
-//! kqueue refuses `NOTE_TRACK` with ENOTSUP, and Endpoint Security needs a
-//! restricted entitlement and root): a session leader inside the unit (a
-//! `setsid` intermediate, or a command run in its own terminal session)
-//! that exits before the scan following its own creation leaves its
-//! session's processes linked to nothing tracked, so they are found only by
-//! their tag, which a restricted program withholds.
+//! a batch, the exec drops come first, then the scan, then the exits, so a
+//! parent that forks and exits at once still links its child. Residual (the
+//! platform's limit: kqueue refuses `NOTE_TRACK` with ENOTSUP, and
+//! Endpoint Security needs a restricted entitlement and root): a session
+//! leader inside the unit (a `setsid` intermediate, or a command run in its
+//! own terminal session) that exits before the scan following its own
+//! creation leaves its session's processes linked to nothing tracked, so
+//! they are found only by their tag, which a restricted program withholds.
 //!
 //! No polling: the thread blocks in `kevent` until an event or its drop.
 
@@ -233,23 +238,17 @@ impl Drop for ForkTracker {
 
 impl Shared {
     /// Registers `(pid, start)` for its fork, exec and exit events. False
-    /// when it is already tracked, in Codex's daemon family, gone, exiting,
-    /// or no longer that incarnation.
+    /// when it is already tracked, gone, exiting, no longer that
+    /// incarnation, or in Codex's daemon family.
     fn track(&self, pid: u32, start: u64) -> bool {
-        let already = lock(&self.tracked).contains_key(&pid);
-        if already
-            || process::in_codex_daemon_family_unless(pid, |up, start| {
-                lock(&self.tracked).get(&up) == Some(&start)
-            })
-        {
-            return false;
-        }
         let mut tracked = lock(&self.tracked);
         if tracked.contains_key(&pid) {
             return false;
         }
         // Registered first, then checked: the registration attaches to the
-        // process the pid names now.
+        // process the pid names now, and an exec into the daemon family
+        // either precedes the family check (which sees it) or raises an
+        // exec event (which drops the process).
         let registered = self.kq.change(
             pid as usize,
             libc::EVFILT_PROC,
@@ -259,12 +258,15 @@ impl Shared {
         if registered.is_err() {
             return false; // gone, or already exiting
         }
-        match darwin::bsdinfo(pid) {
-            Ok(info) if darwin::start_of(&info) == start && !darwin::is_zombie(&info) => {}
-            _ => {
-                self.unregister(pid);
-                return false;
-            }
+        let same = matches!(darwin::bsdinfo(pid),
+            Ok(info) if darwin::start_of(&info) == start && !darwin::is_zombie(&info));
+        if !same
+            || process::in_codex_daemon_family_unless(pid, |up, start| {
+                tracked.get(&up) == Some(&start)
+            })
+        {
+            self.unregister(pid);
+            return false;
         }
         tracked.insert(pid, start);
         true
@@ -291,10 +293,10 @@ impl Shared {
         }
     }
 
-    /// The thread: each batch of events runs one scan when a tracked
-    /// process forked (or a root was added), drops a tracked process that
-    /// exec'd into Codex's daemon family, applies the exits, and records
-    /// the batch's changes at once.
+    /// The thread: each batch of events first drops every tracked process
+    /// that exec'd into Codex's daemon family, then runs one scan when a
+    /// tracked process forked (or a root was added), then applies the
+    /// exits, and records the batch's changes at once.
     fn run(&self) {
         loop {
             #[cfg(test)]
@@ -317,23 +319,32 @@ impl Shared {
                 return;
             }
             let proc_events = || events.iter().filter(|e| e.filter == libc::EVFILT_PROC);
+            let mut removed = Vec::new();
+            // Before the scan, so it neither links a child through such a
+            // process nor ends a child's ancestor walk at it (the walk then
+            // reaches its argv and refuses the child).
+            for event in proc_events() {
+                let pid = event.ident as u32;
+                let joined_daemon = event.fflags & libc::NOTE_EXEC != 0
+                    && event.fflags & libc::NOTE_EXIT == 0
+                    && process::argv(pid).is_ok_and(|argv| process::is_codex_daemon_family(&argv));
+                if joined_daemon {
+                    self.unregister(pid);
+                    if self.untrack(pid) {
+                        removed.push(pid);
+                    }
+                }
+            }
             let forked = proc_events().any(|e| e.fflags & libc::NOTE_FORK != 0);
             let mut added = Vec::new();
             if self.scan_requested.swap(false, Ordering::SeqCst) || forked {
                 added = self.scan();
             }
-            let mut removed = Vec::new();
-            for event in proc_events() {
-                let pid = event.ident as u32;
-                let exited = event.fflags & libc::NOTE_EXIT != 0;
-                let joined_daemon = !exited
-                    && event.fflags & libc::NOTE_EXEC != 0
-                    && process::argv(pid).is_ok_and(|argv| process::is_codex_daemon_family(&argv));
-                if joined_daemon {
-                    self.unregister(pid);
-                }
-                if (exited || joined_daemon) && self.untrack(pid) {
-                    removed.push(pid);
+            // After the scan, so a parent that forks and exits at once still
+            // links its child.
+            for event in proc_events().filter(|e| e.fflags & libc::NOTE_EXIT != 0) {
+                if self.untrack(event.ident as u32) {
+                    removed.push(event.ident as u32);
                 }
             }
             added.retain(|(pid, _)| !removed.contains(pid));
