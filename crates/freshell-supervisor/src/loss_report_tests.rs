@@ -1304,7 +1304,21 @@ async fn task007_run_stopped_crash_parent(point: &str) {
         })
         .await
         .unwrap();
-    assert_eq!(result.status, SoulRepairStatus::Complete);
+    assert_eq!(
+        result.status,
+        SoulRepairStatus::Complete,
+        "operation {} root progress {:?}",
+        operation_id,
+        result
+            .roots
+            .iter()
+            .map(|root| (
+                &root.root_session_id,
+                &root.import_status,
+                &root.reason_code,
+            ))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(result.repaired_target_count, 9);
     assert_eq!(result.roots.len(), 7);
     assert_eq!(

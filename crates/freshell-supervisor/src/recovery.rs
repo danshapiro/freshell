@@ -592,14 +592,37 @@ fn stage_snapshot_payload(
     descriptor: &OpenCodeTransferDescriptor,
     attempt_id: &str,
     staging: &crate::opencode_transfer::OpenCodeTransferStaging,
+    progress: &crate::opencode_transfer::StagingStart,
 ) -> Result<(), String> {
     let file = descriptor
         .files
         .first()
         .ok_or_else(|| "stopped repair has no payload file".to_string())?;
+    let crate::opencode_transfer::StagingStart::Started {
+        next_sequence,
+        file_offsets,
+    } = progress
+    else {
+        return Err("stopped repair staging has not started".into());
+    };
+    let [position] = file_offsets.as_slice() else {
+        return Err("stopped repair staging has invalid payload offsets".into());
+    };
+    let chunk_bytes = MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64;
+    if descriptor.files.len() != 1
+        || position.file_index != file.index
+        || position.next_offset > file.size_bytes
+        || (position.next_offset < file.size_bytes && position.next_offset % chunk_bytes != 0)
+        || *next_sequence != position.next_offset.div_ceil(chunk_bytes)
+    {
+        return Err("stopped repair staging has invalid payload progress".into());
+    }
     let mut payload = snapshot
         .open_payload()
         .map_err(|_| "source payload cannot be reopened".to_string())?;
+    // Read and verify the whole immutable source, but send only chunks after
+    // the durable cursor. A retained prefix is not authority for changed bytes.
+    let mut payload_digest = Sha256::new();
     let mut offset = 0_u64;
     let mut sequence = 0_u64;
     while offset < file.size_bytes {
@@ -609,19 +632,22 @@ fn stage_snapshot_payload(
         payload
             .read_exact(&mut data)
             .map_err(|_| "source payload ended before its manifest size".to_string())?;
-        let sha256 = format!("{:x}", Sha256::digest(&data));
-        let chunk = OpenCodeTransferChunk {
-            transfer_id: descriptor.transfer_id.clone(),
-            attempt_id: attempt_id.into(),
-            sequence,
-            file_index: file.index,
-            offset,
-            sha256,
-            data,
-        };
-        staging
-            .write_chunk(&chunk)
-            .map_err(|_| "stopped repair staging rejected a payload chunk".to_string())?;
+        payload_digest.update(&data);
+        if sequence >= *next_sequence {
+            let sha256 = format!("{:x}", Sha256::digest(&data));
+            let chunk = OpenCodeTransferChunk {
+                transfer_id: descriptor.transfer_id.clone(),
+                attempt_id: attempt_id.into(),
+                sequence,
+                file_index: file.index,
+                offset,
+                sha256,
+                data,
+            };
+            staging
+                .write_chunk(&chunk)
+                .map_err(|_| "stopped repair staging rejected a payload chunk".to_string())?;
+        }
         offset += chunk_size as u64;
         sequence += 1;
     }
@@ -632,6 +658,9 @@ fn stage_snapshot_payload(
         != 0
     {
         return Err("source payload exceeds its manifest size".into());
+    }
+    if format!("{:x}", payload_digest.finalize()) != file.sha256 {
+        return Err("source payload differs from its manifest hash".into());
     }
     Ok(())
 }
@@ -1492,26 +1521,27 @@ impl Supervisor {
         let begin = staging
             .begin_from_filesystem(&descriptor, &attempt_id)
             .map_err(|_| stopped_repair_blocked("staging_capacity_or_state"))?;
-        if matches!(begin, crate::opencode_transfer::StagingStart::Queued) {
-            drop(lifecycle_guard.take());
-            match staging
-                .wait_for_capacity(&transfer_id, &attempt_id)
-                .await
-                .map_err(|_| stopped_repair_blocked("staging_capacity_or_state"))?
-            {
-                crate::opencode_transfer::StagingStart::Started { .. } => {
-                    lifecycle_guard = Some(
-                        Arc::clone(&self.opencode_transfer_lifecycle_lock)
-                            .lock_owned()
-                            .await,
-                    );
-                }
-                crate::opencode_transfer::StagingStart::Queued => {
+        let progress = match begin {
+            crate::opencode_transfer::StagingStart::Queued => {
+                drop(lifecycle_guard.take());
+                let progress = staging
+                    .wait_for_capacity(&transfer_id, &attempt_id)
+                    .await
+                    .map_err(|_| stopped_repair_blocked("staging_capacity_or_state"))?;
+                if matches!(progress, crate::opencode_transfer::StagingStart::Queued) {
                     return Err(stopped_repair_blocked("staging_capacity_or_state"));
                 }
+                lifecycle_guard = Some(
+                    Arc::clone(&self.opencode_transfer_lifecycle_lock)
+                        .lock_owned()
+                        .await,
+                );
+                progress
             }
-        }
-        if stage_snapshot_payload(&snapshot, &descriptor, &attempt_id, staging).is_err() {
+            progress => progress,
+        };
+        if stage_snapshot_payload(&snapshot, &descriptor, &attempt_id, staging, &progress).is_err()
+        {
             if let Some(_guard) = lifecycle_guard.take() {
                 let _ = staging.abort(&transfer_id, &attempt_id);
             }
@@ -5321,6 +5351,326 @@ pub(crate) mod tests {
     use freshell_runtime_protocol::{
         FreshAgentLaunchSpec, FreshProvider, IncarnationId, RequestId,
     };
+
+    fn stopped_payload_fixture(
+        directory: &Path,
+    ) -> (OpenCodeNativeSnapshot, OpenCodeTransferDescriptor) {
+        use freshell_sessions::opencode_transfer::{
+            pinned_destination_migration_ids, pinned_destination_schema_sql,
+        };
+        let workspace = directory.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let database = directory.join("source.sqlite");
+        let source = rusqlite::Connection::open(&database).unwrap();
+        source
+            .execute_batch(pinned_destination_schema_sql())
+            .unwrap();
+        for migration in pinned_destination_migration_ids() {
+            source
+                .execute(
+                    "INSERT INTO migration(id,time_completed) VALUES (?1,1)",
+                    [migration],
+                )
+                .unwrap();
+        }
+        source.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('fixture-project',?1,1,1,'[]')", [workspace.to_string_lossy().as_ref()]).unwrap();
+        source.execute("INSERT INTO project_directory(project_id,directory,time_created) VALUES ('fixture-project',?1,1)", [workspace.to_string_lossy().as_ref()]).unwrap();
+        source.execute("INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated) VALUES ('ses_staging_restart','fixture-project','fixture',?1,?2,'1.18.21',1,1)", rusqlite::params![workspace.to_string_lossy().as_ref(), "synthetic".repeat(MAX_OPENCODE_TRANSFER_CHUNK_BYTES / 4)]).unwrap();
+        drop(source);
+        let snapshot = export_exact_session(
+            &HostOpenCodeInventory::new(database)
+                .with_trusted_mount_for_selected_session(workspace),
+            "ses_staging_restart",
+            ExportOptions::new(directory.join("extractions")),
+        )
+        .unwrap();
+        let manifest = snapshot.manifest();
+        assert!(manifest.payload_bytes > MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64);
+        let image = format!("sha256:{}", "e".repeat(64));
+        let manifest_json = serde_json::to_string(manifest).unwrap();
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: manifest.payload_bytes,
+            sha256: manifest.payload_sha256.clone(),
+        }];
+        let descriptor = OpenCodeTransferDescriptor {
+            transfer_id: "stopped-staging-restart".into(),
+            provider: "opencode".into(),
+            source_store_id: manifest.source_store_id.clone(),
+            root_session_id: manifest.root_session_id.clone(),
+            source_generation: manifest.generation.clone(),
+            provider_schema: manifest.provider_schema.clone(),
+            source_schema_fingerprint: manifest.source_schema_fingerprint.clone(),
+            migration_journal_fingerprint: manifest.migration_journal_fingerprint.clone(),
+            destination_store_id: "fixture-destination".into(),
+            destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
+            target_build_receipt: opencode_target_build_receipt(&image, &manifest.provider_schema),
+            target_image_ref: image,
+            incarnation_id: IncarnationId::new().to_string(),
+            bundle_sha256: opencode_transfer_bundle_digest(&manifest_json, &files),
+            manifest_json,
+            total_bytes: manifest.payload_bytes,
+            files,
+        };
+        descriptor.validate().unwrap();
+        (snapshot, descriptor)
+    }
+
+    #[test]
+    fn stopped_payload_completed_stage_reopens_and_finalizes() {
+        use crate::opencode_transfer::{OpenCodeTransferStaging, StagingLimits, StagingStart};
+        let directory = tempfile::Builder::new()
+            .prefix("task007-staging-restart-")
+            .tempdir()
+            .unwrap();
+        let (snapshot, descriptor) = stopped_payload_fixture(directory.path());
+        let staging_root = directory.path().join("staging");
+        let staging =
+            OpenCodeTransferStaging::new(&staging_root, StagingLimits::production()).unwrap();
+        let initial = uuid::Uuid::new_v4().simple().to_string();
+        let reopened = uuid::Uuid::new_v4().simple().to_string();
+        let progress = staging
+            .begin_from_filesystem(&descriptor, &initial)
+            .unwrap();
+        stage_snapshot_payload(&snapshot, &descriptor, &initial, &staging, &progress).unwrap();
+        let ready = staging.finalize(&descriptor.transfer_id, &initial).unwrap();
+        drop(staging);
+        let staging =
+            OpenCodeTransferStaging::new(&staging_root, StagingLimits::production()).unwrap();
+        let progress = staging
+            .begin_from_filesystem(&descriptor, &reopened)
+            .unwrap();
+        assert!(
+            matches!(progress, StagingStart::Started { next_sequence, ref file_offsets }
+            if next_sequence > 1 && file_offsets[0].next_offset == descriptor.total_bytes)
+        );
+        stage_snapshot_payload(&snapshot, &descriptor, &reopened, &staging, &progress).unwrap();
+        assert_eq!(
+            staging
+                .finalize(&descriptor.transfer_id, &reopened)
+                .unwrap(),
+            ready
+        );
+        assert_eq!(staging.verify_ready(&descriptor).unwrap(), ready);
+        assert_stopped_payload_bytes(&snapshot, &ready);
+    }
+
+    fn assert_stopped_payload_bytes(snapshot: &OpenCodeNativeSnapshot, ready: &Path) {
+        let mut original = Vec::new();
+        snapshot
+            .open_payload()
+            .unwrap()
+            .read_to_end(&mut original)
+            .unwrap();
+        let staged = std::fs::read(ready.join("entry-0000.bin")).unwrap();
+        assert_eq!(staged, original);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&staged)),
+            snapshot.manifest().payload_sha256
+        );
+    }
+
+    #[test]
+    fn stopped_payload_partial_stage_resumes_nonzero_progress() {
+        use crate::opencode_transfer::{OpenCodeTransferStaging, StagingLimits, StagingStart};
+        let directory = tempfile::Builder::new()
+            .prefix("task007-staging-restart-")
+            .tempdir()
+            .unwrap();
+        let (snapshot, descriptor) = stopped_payload_fixture(directory.path());
+        let staging_root = directory.path().join("staging");
+        let staging =
+            OpenCodeTransferStaging::new(&staging_root, StagingLimits::production()).unwrap();
+        let initial = uuid::Uuid::new_v4().simple().to_string();
+        staging
+            .begin_from_filesystem(&descriptor, &initial)
+            .unwrap();
+        write_stopped_payload_first_chunk(&snapshot, &descriptor, &initial, &staging);
+        drop(staging);
+        let staging =
+            OpenCodeTransferStaging::new(&staging_root, StagingLimits::production()).unwrap();
+        let reopened = uuid::Uuid::new_v4().simple().to_string();
+        let progress = staging
+            .begin_from_filesystem(&descriptor, &reopened)
+            .unwrap();
+        assert!(
+            matches!(progress, StagingStart::Started { next_sequence: 1, ref file_offsets }
+            if file_offsets[0].next_offset == MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64)
+        );
+        assert!(
+            stage_snapshot_payload(&snapshot, &descriptor, &initial, &staging, &progress).is_err(),
+            "the old attempt cannot append after ownership transfers"
+        );
+        stage_snapshot_payload(&snapshot, &descriptor, &reopened, &staging, &progress).unwrap();
+        let ready = staging
+            .finalize(&descriptor.transfer_id, &reopened)
+            .unwrap();
+        assert_eq!(staging.verify_ready(&descriptor).unwrap(), ready);
+        assert_stopped_payload_bytes(&snapshot, &ready);
+    }
+
+    fn write_stopped_payload_first_chunk(
+        snapshot: &OpenCodeNativeSnapshot,
+        descriptor: &OpenCodeTransferDescriptor,
+        attempt: &str,
+        staging: &crate::opencode_transfer::OpenCodeTransferStaging,
+    ) {
+        let mut data = vec![0; MAX_OPENCODE_TRANSFER_CHUNK_BYTES];
+        snapshot
+            .open_payload()
+            .unwrap()
+            .read_exact(&mut data)
+            .unwrap();
+        staging
+            .write_chunk(&OpenCodeTransferChunk {
+                transfer_id: descriptor.transfer_id.clone(),
+                attempt_id: attempt.into(),
+                sequence: 0,
+                file_index: 0,
+                offset: 0,
+                sha256: format!("{:x}", Sha256::digest(&data)),
+                data,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn stopped_payload_resumed_stage_refuses_changed_source_prefix() {
+        use crate::opencode_transfer::{OpenCodeTransferStaging, StagingLimits};
+        use std::{io::Write, os::fd::AsRawFd};
+        let directory = tempfile::Builder::new()
+            .prefix("task007-staging-restart-")
+            .tempdir()
+            .unwrap();
+        let (snapshot, descriptor) = stopped_payload_fixture(directory.path());
+        let staging_root = directory.path().join("staging");
+        let staging =
+            OpenCodeTransferStaging::new(&staging_root, StagingLimits::production()).unwrap();
+        let initial = uuid::Uuid::new_v4().simple().to_string();
+        staging
+            .begin_from_filesystem(&descriptor, &initial)
+            .unwrap();
+        write_stopped_payload_first_chunk(&snapshot, &descriptor, &initial, &staging);
+        drop(staging);
+        let staging =
+            OpenCodeTransferStaging::new(&staging_root, StagingLimits::production()).unwrap();
+        let reopened = uuid::Uuid::new_v4().simple().to_string();
+        let progress = staging
+            .begin_from_filesystem(&descriptor, &reopened)
+            .unwrap();
+        // Corrupt only this test-owned exported snapshot, after the original
+        // prefix is durably staged. Skipping writes must not trust changed data.
+        let payload = snapshot.open_payload().unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", payload.as_raw_fd()))
+            .unwrap();
+        writer.write_all(b"!").unwrap();
+        writer.sync_all().unwrap();
+        assert!(
+            stage_snapshot_payload(&snapshot, &descriptor, &reopened, &staging, &progress).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_payload_queued_stage_uses_wait_progress() {
+        use crate::opencode_transfer::{OpenCodeTransferStaging, StagingLimits, StagingStart};
+        let directory = tempfile::Builder::new()
+            .prefix("task007-staging-restart-")
+            .tempdir()
+            .unwrap();
+        let (snapshot, descriptor) = stopped_payload_fixture(directory.path());
+        let staging = OpenCodeTransferStaging::new(
+            directory.path().join("staging"),
+            StagingLimits::for_test(descriptor.total_bytes, descriptor.total_bytes),
+        )
+        .unwrap();
+        let initial = uuid::Uuid::new_v4().simple().to_string();
+        staging
+            .begin_from_filesystem(&descriptor, &initial)
+            .unwrap();
+        let mut queued_descriptor = descriptor.clone();
+        queued_descriptor.transfer_id = "stopped-staging-queued".into();
+        let queued_attempt = uuid::Uuid::new_v4().simple().to_string();
+        assert_eq!(
+            staging
+                .begin_from_filesystem(&queued_descriptor, &queued_attempt)
+                .unwrap(),
+            StagingStart::Queued
+        );
+        staging.abort(&descriptor.transfer_id, &initial).unwrap();
+        let progress = tokio::time::timeout(
+            Duration::from_secs(2),
+            staging.wait_for_capacity(&queued_descriptor.transfer_id, &queued_attempt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(progress, StagingStart::Started { next_sequence: 0, ref file_offsets }
+            if file_offsets[0].next_offset == 0)
+        );
+        stage_snapshot_payload(
+            &snapshot,
+            &queued_descriptor,
+            &queued_attempt,
+            &staging,
+            &progress,
+        )
+        .unwrap();
+        let ready = staging
+            .finalize(&queued_descriptor.transfer_id, &queued_attempt)
+            .unwrap();
+        assert_eq!(staging.verify_ready(&queued_descriptor).unwrap(), ready);
+        assert_stopped_payload_bytes(&snapshot, &ready);
+    }
+
+    #[test]
+    fn stopped_payload_fresh_stage_rejects_malformed_progress() {
+        use crate::opencode_transfer::{OpenCodeTransferStaging, StagingLimits, StagingStart};
+        let directory = tempfile::Builder::new()
+            .prefix("task007-staging-restart-")
+            .tempdir()
+            .unwrap();
+        let (snapshot, descriptor) = stopped_payload_fixture(directory.path());
+        let staging = OpenCodeTransferStaging::new(
+            directory.path().join("staging"),
+            StagingLimits::production(),
+        )
+        .unwrap();
+        let attempt = uuid::Uuid::new_v4().simple().to_string();
+        let progress = staging
+            .begin_from_filesystem(&descriptor, &attempt)
+            .unwrap();
+        for malformed in ["sequence", "offset", "index", "missing", "extra"] {
+            let mut bad_progress = progress.clone();
+            let StagingStart::Started {
+                next_sequence,
+                file_offsets,
+            } = &mut bad_progress
+            else {
+                panic!("fresh stage queued");
+            };
+            match malformed {
+                "sequence" => *next_sequence = 1,
+                "offset" => file_offsets[0].next_offset = 1,
+                "index" => file_offsets[0].file_index = 1,
+                "missing" => file_offsets.clear(),
+                "extra" => file_offsets.push(file_offsets[0].clone()),
+                _ => unreachable!(),
+            }
+            assert!(
+                stage_snapshot_payload(&snapshot, &descriptor, &attempt, &staging, &bad_progress)
+                    .is_err(),
+                "{malformed}"
+            );
+        }
+        stage_snapshot_payload(&snapshot, &descriptor, &attempt, &staging, &progress).unwrap();
+        let ready = staging.finalize(&descriptor.transfer_id, &attempt).unwrap();
+        assert_eq!(staging.verify_ready(&descriptor).unwrap(), ready);
+        assert_stopped_payload_bytes(&snapshot, &ready);
+    }
 
     #[tokio::test]
     async fn stopped_repair_resume_observation_fault_requires_current_saved_baseline() {
