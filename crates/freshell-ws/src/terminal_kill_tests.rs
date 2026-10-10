@@ -1,10 +1,10 @@
 //! Lib tests of `terminal.kill` for panes outside a coding-agent unit
 //! (managed, supervisor-owned panes: a kill never answers before their stop
-//! is verified, Stage 2: LB-13), of the not-found rule (an unknown terminal
-//! counts as killed only when the owner registry confirms nothing holds a
-//! conversation under it), of a kill that names no pane, and of the create
-//! side's holds that a kill releases (the given-up create's lease release,
-//! the late claim's unit stamp).
+//! is verified, Stage 2: LB-13; plain panes still starting), of the
+//! not-found rule (an unknown terminal counts as killed only when the owner
+//! registry confirms nothing holds a conversation under it), of a kill that
+//! names no pane, and of the create side's holds that a kill releases (the
+//! given-up create's lease release, the late claim's unit stamp).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -308,6 +308,184 @@ async fn a_kill_naming_no_pane_is_refused_as_invalid() {
                 && e.terminal_id.is_none()
                 && e.message == "terminal.kill needs terminalId or createRequestId")),
         "the requestId-less kill gets the legacy INVALID_MESSAGE frame: {frames:?}"
+    );
+}
+
+/// Installs the terminal-create pause seam: the next `terminal.create`
+/// parks after its killed-pane check, before anything is claimed or
+/// spawned, until the returned release is sent.
+fn pause_creates(
+    state: &WsState,
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (release, parked) = tokio::sync::oneshot::channel::<()>();
+    let parked = Mutex::new(Some(parked));
+    state
+        .registry
+        .set_terminal_create_pause_for_tests(Arc::new({
+            let entered = Arc::clone(&entered);
+            move |_request_id: &str| {
+                let entered = Arc::clone(&entered);
+                let parked = parked.lock().unwrap().take();
+                Box::pin(async move {
+                    entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(parked) = parked {
+                        let _ = parked.await;
+                    }
+                })
+            }
+        }));
+    (entered, release)
+}
+
+/// A plain pane (outside any unit) killed by its create-request id after
+/// its create passed the killed-pane check and before its row exists: the
+/// kill finds nothing and is remembered, so the create, once its row is
+/// registered, sees it, ends the row and is refused as stopped. Nothing is
+/// left running and the pane is never created (before, the create answered
+/// `terminal.created` and the shell ran on).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plain_pane_killed_while_it_spawns_is_stopped_not_created() {
+    let state = super::pane_reconcile_gate_tests::state();
+    let (entered, release) = pause_creates(&state);
+    let (sink, frames) = connection();
+    let create: TerminalCreate = serde_json::from_value(serde_json::json!({
+        "requestId": "crq-p",
+        "mode": "shell",
+        "shell": "system",
+    }))
+    .expect("terminal create");
+    let creating = tokio::spawn({
+        let state = state.clone();
+        let sink = sink.clone();
+        async move {
+            let mut out = crate::create_gate::CreateOutput::Channel(&sink);
+            let mut limiter = crate::create_limit::CreateRateLimiter::new(100, 1000);
+            handle_create(
+                create,
+                None,
+                &mut out,
+                &state,
+                7,
+                false,
+                &mut limiter,
+                &ConnectionIdentity::default(),
+                now_ms(),
+            )
+            .await
+        }
+    });
+    eventually("the create passed its killed-pane check", || {
+        entered.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+
+    let (_open, closed) = tokio::sync::watch::channel(false);
+    handle_kill(
+        kill_of(None, Some("crq-p"), Some("rk-p")),
+        &sink,
+        &closed,
+        &state,
+        "test-kill",
+    )
+    .await;
+    eventually("the kill is answered", || {
+        kill_answer(&frames, "rk-p").is_some()
+    })
+    .await;
+    assert_eq!(kill_answer(&frames, "rk-p").map(|(_, ok)| ok), Some(true));
+
+    release.send(()).expect("the create is parked");
+    tokio::time::timeout(LIMIT, creating)
+        .await
+        .expect("the create finishes")
+        .unwrap();
+    assert!(
+        position(&frames, |msg| matches!(msg, ServerMessage::Error(e)
+            if e.request_id.as_deref() == Some("crq-p")
+                && e.code == ErrorCode::InvalidTerminalId
+                && e.message == PANE_STOPPED_MESSAGE))
+        .is_some(),
+        "the create is refused as stopped: {:?}",
+        frames.lock().unwrap()
+    );
+    assert!(
+        position(&frames, |msg| matches!(
+            msg,
+            ServerMessage::TerminalCreated(_)
+        ))
+        .is_none(),
+        "the killed pane was never created"
+    );
+    assert_eq!(
+        state.registry.newest_by_create_request_id("crq-p"),
+        None,
+        "the row the create spawned was ended"
+    );
+}
+
+/// The other order of the same race: the create registered its row and
+/// passed its own check before the kill remembered the pane, so the kill
+/// (which found nothing when it first looked) finds the row now and stops
+/// it before answering.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_that_found_nothing_stops_the_row_its_create_registered_meanwhile() {
+    let state = super::pane_reconcile_gate_tests::state();
+    {
+        let registry = state.registry.clone();
+        tokio::task::spawn_blocking(move || {
+            registry.create(
+                &freshell_platform::SpawnSpec {
+                    program: "sleep".into(),
+                    args: vec!["30".into()],
+                    env_overrides: Default::default(),
+                    cwd: None,
+                    cols: 80,
+                    rows: 24,
+                },
+                &std::env::vars()
+                    .filter(|(k, _)| k == "PATH" || k == "HOME")
+                    .collect(),
+                "T-r".into(),
+                "S-r".into(),
+                "shell",
+                None,
+                Some("crq-r"),
+                None,
+                None,
+            )
+        })
+        .await
+        .unwrap()
+        .expect("row spawned");
+    }
+    let pid = state.registry.pid_of("T-r").expect("a running row");
+
+    let (sink, frames) = connection();
+    let (_open, closed) = tokio::sync::watch::channel(false);
+    let reply = KillReply::new(&sink, &closed, &kill_of(None, Some("crq-r"), Some("rk-r")));
+    kill_not_found(
+        state.clone(),
+        kill_of(None, Some("crq-r"), Some("rk-r")),
+        None,
+        "test-kill".into(),
+        reply,
+    )
+    .await;
+    assert_eq!(kill_answer(&frames, "rk-r").map(|(_, ok)| ok), Some(true));
+    assert_eq!(
+        state.registry.terminal_for_create_request("crq-r"),
+        None,
+        "the row the kill found is stopped"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the row's process is dead and reaped"
     );
 }
 

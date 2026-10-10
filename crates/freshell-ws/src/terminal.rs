@@ -7070,6 +7070,26 @@ pub(crate) async fn handle_create(
             ))),
         }
     };
+    // A pane outside any unit (a plain shell, an agent row not yet in a
+    // unit) killed while it spawned: the kill found no row and remembered
+    // the pane's create-request id before looking again, so either it finds
+    // this row, or this check (made only now that the row is registered)
+    // sees the memory. The row is ended and the create refused as stopped,
+    // below. A unit row's start checks the same memory through its scope,
+    // and a managed launch when it returns.
+    let create_result = match create_result {
+        Ok(None) if !use_managed_runtime && state.units.killed_start(&create.request_id) => {
+            tracing::info!(target: "freshell_ws::terminal",
+                terminal_id = %terminal_id,
+                create_request_id = %create.request_id,
+                mode = %mode,
+                event = "terminal.create.killed_while_spawning",
+                "a pane killed while it spawned is ended, not created");
+            kill_and_broadcast(state, &terminal_id);
+            Err(pane_stopped_error())
+        }
+        other => other,
+    };
     let unit_screen_pid = match &create_result {
         Ok(screen_pid) => *screen_pid,
         Err(_) => None,
@@ -7153,8 +7173,9 @@ pub(crate) async fn handle_create(
             )));
         }
         cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
-        // A managed pane killed while it started is answered as stopped;
-        // only then is the kill that waited for it told how it ended.
+        // A pane killed while it started (a managed launch, or a row
+        // outside any unit) is answered as stopped; only then is a kill
+        // that waited for a managed launch told how it ended.
         if is_pane_stopped_error(&err) {
             let answered = refuse_killed_create(state, out, &create.request_id)
                 .await
@@ -8987,9 +9008,10 @@ pub(crate) async fn send_create_error(
 /// was Shift-X'd) never re-creates the killed pane.
 pub(crate) const PANE_STOPPED_MESSAGE: &str = "this pane was stopped";
 
-/// The spawn "failure" of a managed pane killed while it started (its soul
-/// stopped, or never launched): the create's failure cleanup runs, and the
-/// create is answered as stopped.
+/// The spawn "failure" of a pane killed while it started (a managed soul
+/// stopped or never launched, or a row outside any unit ended right after
+/// it registered): the create's failure cleanup runs, and the create is
+/// answered as stopped.
 fn pane_stopped_error() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Interrupted, PANE_STOPPED_MESSAGE)
 }
@@ -11086,11 +11108,11 @@ async fn stop_managed_row(
 /// never does.
 ///
 /// - A create-request id is remembered as killed first, so a create that
-///   arrives (or a managed launch that returns) later is refused as
-///   stopped; then a managed launch in flight for it is waited for, and a
-///   pane that started meanwhile (a unit, a facade) is stopped as such. A
-///   stuck restart's kill skips all of this: its respawn reuses the id, so
-///   a start under it is that respawn.
+///   arrives (or a managed launch that returns, or a row that registers)
+///   later is refused as stopped; then a managed launch in flight for it is
+///   waited for, and a pane that started meanwhile (a unit, a facade, a
+///   plain row) is stopped as such. A stuck restart's kill skips all of
+///   this: its respawn reuses the id, so a start under it is that respawn.
 /// - With a terminal id, a soul the supervisor still runs whose facade was
 ///   not re-adopted (a web-server restart) is registered and stopped.
 /// - Otherwise "not found" is success only when the owner registry confirms
@@ -11128,17 +11150,15 @@ async fn kill_not_found(
             }
         }
         // A pane whose start began after the kill first looked is stopped
-        // through its own path (a start registered after the memory was
-        // written refuses itself).
+        // through its own path: a unit, or the row its create registered
+        // (a facade, a plain shell, an agent row not yet in a unit). A
+        // start or a row registered after the memory was written refuses
+        // itself instead.
         if let Some(entry) = state.units.by_create_request(&crq) {
             crate::unit_lifecycle::kill_unit(kill, entry, reply, &state, &initiator).await;
             return;
         }
-        if let Some(tid) = state
-            .registry
-            .terminal_for_create_request(&crq)
-            .filter(|tid| state.registry.is_managed(tid))
-        {
+        if let Some(tid) = state.registry.terminal_for_create_request(&crq) {
             let reply = reply.naming(Some(&tid));
             // Boxed: `kill_row` itself spawns this function.
             let row: futures_util::future::BoxFuture<'_, bool> =
