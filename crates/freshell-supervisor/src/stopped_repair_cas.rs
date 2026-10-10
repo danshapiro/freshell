@@ -1310,7 +1310,18 @@ fn finish_pending_withdrawal(
 ) -> Result<RestoreLostSoulsResult, RegistryError> {
     match try_finish_pending_withdrawal(conn, operation_id, marker, targets, roots, file_context)? {
         WithdrawalAttempt::Complete(result) => Ok(result),
-        WithdrawalAttempt::FilesPending(error) => Err(RegistryError::Io(error)),
+        WithdrawalAttempt::FilesPending(_) => {
+            let operation = load_operation(conn, operation_id)?;
+            // Import and repair CAS are durable; only incident-file withdrawal
+            // remains pending. Do not acknowledge its marker or persist completion.
+            repaired_result(
+                operation_id.clone(),
+                operation.scope.scope_id,
+                targets.len(),
+                roots,
+                SoulRepairStatus::Pending,
+            )
+        }
     }
 }
 
@@ -1385,8 +1396,8 @@ fn try_finish_pending_withdrawal(
         &file_context.lifecycle_log,
         &mut check_generation,
     ) {
-        // Only file classification/rewrite/sync failures are retryable at
-        // startup. A failed registry/generation fence remains fatal.
+        // Only file classification/rewrite/sync failures are retryable.
+        // A failed registry/generation fence remains fatal on every path.
         return if generation_check_failed.get() {
             Err(RegistryError::Io(error))
         } else {
@@ -1399,11 +1410,12 @@ fn try_finish_pending_withdrawal(
 
     let original = load_operation(conn, operation_id)?;
     validate_scope_receipts(&original.scope, &original.owner_choices, roots)?;
-    let result = complete_result(
+    let result = repaired_result(
         operation_id.clone(),
         original.scope.scope_id,
         targets.len(),
         roots,
+        SoulRepairStatus::Complete,
     )?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current = load_operation(&tx, operation_id)?;
@@ -1432,11 +1444,12 @@ fn try_finish_pending_withdrawal(
     Ok(WithdrawalAttempt::Complete(result))
 }
 
-fn complete_result(
+fn repaired_result(
     operation_id: RequestId,
     scope_id: String,
     target_count: usize,
     roots: &[StoppedRepairRootReceipt],
+    status: SoulRepairStatus,
 ) -> Result<RestoreLostSoulsResult, RegistryError> {
     if roots.is_empty() {
         return Err(RegistryError::Integrity(
@@ -1468,7 +1481,7 @@ fn complete_result(
     Ok(RestoreLostSoulsResult {
         operation_id,
         scope_id,
-        status: SoulRepairStatus::Complete,
+        status,
         repaired_target_count: target_count
             .try_into()
             .map_err(|_| RegistryError::RequestConflict)?,
@@ -2041,6 +2054,14 @@ mod tests {
             "{broken\n",
         )
         .unwrap();
+        let preserved_files = [
+            &false_export,
+            &unrelated_export,
+            &active_incident_log,
+            &rotated_incident_log,
+            &lifecycle_log,
+        ]
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()));
         let first = registry
             .finalize_stopped_repair_batch(
                 operation_id.clone(),
@@ -2049,11 +2070,58 @@ mod tests {
                 incident_root.clone(),
                 lifecycle_log.clone(),
             )
-            .await;
-        assert!(
-            first.is_err(),
-            "malformed JSONL must keep correction pending"
+            .await
+            .expect("file withdrawal obstruction must return retryable progress");
+        assert_eq!(first.status, SoulRepairStatus::Pending);
+        assert_eq!(first.operation_id, operation_id);
+        assert_eq!(
+            (first.repaired_target_count, first.total_target_count),
+            (9, 9)
         );
+        assert_eq!(first.roots.len(), 7);
+        for receipt in &roots {
+            let result = first
+                .roots
+                .iter()
+                .find(|root| root.root_session_id == receipt.root_session_id)
+                .unwrap();
+            assert_eq!(
+                result.canonical_soul_id.as_ref(),
+                Some(&receipt.canonical_soul_id)
+            );
+            assert_eq!(result.import_status, RootRepairImportStatus::Complete);
+            assert_eq!(
+                result.intent_revision,
+                Some(receipt.captured_intent_revision)
+            );
+            assert_eq!(
+                result.native_import_revision,
+                Some(receipt.captured_native_import_revision + 1)
+            );
+        }
+        assert_eq!(
+            first.scope_id,
+            registry
+                .stopped_repair_operation_scope(operation_id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .scope_id
+        );
+        let repeated = registry
+            .finalize_stopped_repair_batch(
+                operation_id.clone(),
+                targets.clone(),
+                roots.clone(),
+                incident_root.clone(),
+                lifecycle_log.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated, first);
+        for (path, bytes) in &preserved_files {
+            assert_eq!(std::fs::read(path).unwrap(), *bytes);
+        }
         assert_eq!(
             std::fs::read_to_string(&active_incident_log)
                 .unwrap()
@@ -2062,15 +2130,18 @@ mod tests {
             2
         );
         assert!(false_export.exists());
-        let pending: (String, i64) = Connection::open(registry.database_path())
+        let pending: (String, String, Option<String>) = Connection::open(registry.database_path())
             .unwrap()
             .query_row(
-                "SELECT o.status,(SELECT COUNT(*) FROM stopped_repair_withdrawals w WHERE w.operation_id=o.operation_id) FROM stopped_repair_operations o WHERE operation_id=?1",
+                "SELECT o.status,w.status,o.result_json FROM stopped_repair_operations o JOIN stopped_repair_withdrawals w USING(operation_id) WHERE operation_id=?1",
                 params![operation_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(pending, ("withdraw_pending".into(), 1));
+        assert_eq!(
+            pending,
+            ("withdraw_pending".into(), "files_pending".into(), None)
+        );
 
         let correct_generation = withdrawal_generation(&operation_id, &targets, &roots).unwrap();
         Connection::open(registry.database_path())
@@ -2083,6 +2154,16 @@ mod tests {
         std::fs::remove_file(lifecycle_log.parent().unwrap().join("lifecycle.jsonl.1")).unwrap();
         assert!(registry
             .resume_pending_stopped_repair_withdrawals(incident_root.clone(), lifecycle_log.clone())
+            .await
+            .is_err());
+        assert!(registry
+            .finalize_stopped_repair_batch(
+                operation_id.clone(),
+                targets.clone(),
+                roots.clone(),
+                incident_root.clone(),
+                lifecycle_log.clone()
+            )
             .await
             .is_err());
         assert!(
@@ -2101,10 +2182,18 @@ mod tests {
                 params![correct_generation, operation_id.as_str()],
             )
             .unwrap();
-        registry
-            .resume_pending_stopped_repair_withdrawals(incident_root.clone(), lifecycle_log.clone())
+        let completed = registry
+            .finalize_stopped_repair_batch(
+                operation_id.clone(),
+                targets.clone(),
+                roots.clone(),
+                incident_root.clone(),
+                lifecycle_log.clone(),
+            )
             .await
             .unwrap();
+        assert_eq!(completed.status, SoulRepairStatus::Complete);
+        assert_eq!(completed.roots, first.roots);
 
         assert!(!false_export.exists());
         assert!(unrelated_export.exists());
