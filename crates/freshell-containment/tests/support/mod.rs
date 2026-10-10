@@ -229,15 +229,23 @@ pub fn agent_script(opts: &AgentOpts) -> AgentScript {
 trap '{copy}echo INT >> "{marker}"; [ "{ei}" = 1 ] && exit 0' INT
 trap 'echo TERM >> "{marker}"; [ "{et}" = 1 ] && exit 0' TERM
 echo $$ > "{dir}/agent.pid.tmp" && mv "{dir}/agent.pid.tmp" "{dir}/agent.pid"
+# A stop judges a daemon-family stand-in by its argv, which is this script's
+# until the stand-in's exec has finished. So the daemon and the legacy launch
+# each write a line into a FIFO from their own program, and this reads it (end
+# of file if the stand-in ended first) before their pids are reported. The
+# updater's own program writes installer.pid, which is awaited below.
+wait_running() {{ local line; read -r line < "$1" && [ "$line" = running ] || {{ echo "agent.sh: the stand-in writing $1 ended before it ran" >&2; exit 1; }}; }}
 perl -e 'use POSIX; POSIX::setsid(); exec "sleep", "600"' & S=$!
 perl -e 'setpgrp(0,0); sleep 600' & P=$!
 nohup sh -c 'sleep 600 & echo $! > "{dir}/nohup.pid"' >/dev/null 2>&1 &
-D=0; [ "{daemon}" = 1 ] && {{ perl -e 'sleep 600' app-server --managed-daemon & D=$!; }}
+D=0; [ "{daemon}" = 1 ] && {{ mkfifo "{dir}/daemon.ready"; perl -e '$| = 1; print "running\n"; sleep 600' app-server --managed-daemon > "{dir}/daemon.ready" & D=$!; wait_running "{dir}/daemon.ready"; }}
 L=0; [ -n "{lock}" ] && {{ perl -e 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; sleep 600' "{lock}" & L=$!; }}
 U=0; I=0; G=0
 if [ "{family}" = 1 ]; then
   perl -e 'my $c = fork(); if ($c == 0) {{ exec "sleep", "600"; }} open(my $f, ">", "$ARGV[0].tmp") or die; print $f $c; close $f; rename("$ARGV[0].tmp", $ARGV[0]); sleep 600' "{dir}/installer.pid" app-server daemon pid-update-loop & U=$!
-  perl -e 'sleep 600' app-server --listen unix:// & G=$!
+  mkfifo "{dir}/legacy.ready"
+  perl -e '$| = 1; print "running\n"; sleep 600' app-server --listen unix:// > "{dir}/legacy.ready" & G=$!
+  wait_running "{dir}/legacy.ready"
   while [ ! -s "{dir}/installer.pid" ]; do sleep 0.05; done
   I=$(cat "{dir}/installer.pid")
 fi
