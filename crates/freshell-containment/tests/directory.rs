@@ -188,11 +188,11 @@ async fn killed_starts_are_remembered_after_the_unit_is_gone() {
     assert!(!dir.killed_start("crq-other"));
 }
 
-/// Records every call it receives; its `stop` stops the entry's unit for
-/// real (the tag backend), so the returned handle is a genuine one.
 /// An abandoned start as recorded: (unit id, base unit id, terminal id).
 type Abandoned = (String, Option<String>, Option<String>);
 
+/// Records every call it receives; its `stop` stops the entry's unit for
+/// real (the tag backend), so the returned handle is a genuine one.
 #[derive(Default)]
 struct RecordingLifecycle {
     stops: Mutex<Vec<(String, StopMode, String)>>,
