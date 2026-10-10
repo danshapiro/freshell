@@ -177,14 +177,32 @@ function fixture(missingHostCompletion = false) {
   return { input: { ...input, selectedModes: [...input.selectedModes] }, write, stages }
 }
 
-function claudeFixture() {
+function claudeFixture(generations?: readonly number[], mode = 'freshclaude') {
   const built = fixture(), { input, write, stages } = built
   const original = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, 'native-recovery-originals.json'), 'utf8'))
   const conversation = original.conversations[0], transcript: unknown[] = []
   for (const [index, stage] of stages.entries()) {
     const request = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.request.path), 'utf8'))
+    const prompt = request.request.params.text
+    if (mode === 'claude') {
+      const requests = [
+        { ...request, requestId: `paste-${index}`, request: { method: 'terminal_input', params: { soulId: conversation.soulId, data: `\x1b[200~${prompt}\x1b[201~` } }, reply: { data: {} } },
+        { ...request, request: { method: 'terminal_input', params: { soulId: conversation.soulId, data: '\r' } }, reply: { data: {} } },
+      ]
+      stage.request = write(stage.request.path, { requests })
+    }
+    const launch = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.launch.path), 'utf8')), view = launch.response.data.view
+    const namespace = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.namespace.path), 'utf8'))
+    view.executionGeneration = generations?.[index] ?? view.executionGeneration
+    view.nativeIdentityObservation.source = mode === 'claude' ? 'claude_native_event' : 'fresh_provider_handshake'
+    if (mode === 'claude') {
+      launch.request = { params: { providerStoreId: view.providerStoreId } }
+      delete view.providerStoreId
+    }
+    namespace.nativeLaunch.executionGeneration = view.executionGeneration
+    stage.launch = write(stage.launch.path, launch); stage.namespace = write(stage.namespace.path, namespace)
     const base = 1_780_000_000_000 + index * 10_000
-    transcript.push({ type: 'user', sessionId: conversation.nativeSessionId, uuid: `user-${index}`, message: { role: 'user', content: request.request.params.text } },
+    transcript.push({ type: 'user', sessionId: conversation.nativeSessionId, uuid: `user-${index}`, message: { role: 'user', content: prompt } },
       { type: 'attachment', sessionId: conversation.nativeSessionId, uuid: `attachment-${index}`, parentUuid: `user-${index}` },
       { type: 'assistant', sessionId: conversation.nativeSessionId, uuid: `thinking-${index}`, parentUuid: `attachment-${index}`, timestamp: new Date(base + 2_500).toISOString(),
         message: { id: `turn-${index}`, role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: 'private', signature: 'signed' }] } },
@@ -194,9 +212,9 @@ function claudeFixture() {
     const store = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.store.path), 'utf8')), bytes = fs.readFileSync(path.join(input.evidenceDir, stage.nativeFile.path))
     store.snapshot.bytesBase64 = bytes.toString('base64'); store.snapshot.sha256 = digest(bytes); stage.store = write(stage.store.path, store)
   }
-  original.selected = ['freshclaude']; conversation.mode = 'freshclaude'; conversation.provider = 'claude'; conversation.stages = stages
+  original.selected = [mode]; conversation.mode = mode; conversation.provider = 'claude'; conversation.stages = stages
   write('native-recovery-originals.json', original)
-  const derive = () => deriveNativeRecoveryOriginals({ evidenceDir: input.evidenceDir, candidateSha, runId: receiptRunId, runtimeImage, selected: ['freshclaude'] })
+  const derive = (requiredStages?: readonly ('initial' | 'after_session_host_crash' | 'after_provider_process_crash')[]) => deriveNativeRecoveryOriginals({ evidenceDir: input.evidenceDir, candidateSha, runId: receiptRunId, runtimeImage, selected: [mode], requiredStages })
   return { ...built, original, conversation, derive }
 }
 
@@ -236,6 +254,95 @@ function amplifierFixture(observed = false) {
 }
 
 describe('qualification from private native originals', () => {
+  it('derives terminal Claude seed and post-provider-crash recall with incarnation-local generation 1', () => {
+    const { input, stages, original, conversation, write, derive } = claudeFixture([1, 1, 1], 'claude')
+    const replacement = stages[1]!
+    replacement.stage = 'after_provider_process_crash'
+    const crash = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, replacement.crash!.path), 'utf8'))
+    crash.kind = 'provider_process_exit'; replacement.crash = write(replacement.crash!.path, crash)
+    conversation.stages = [stages[0], replacement]; write('native-recovery-originals.json', original)
+    const observed = derive(['initial', 'after_provider_process_crash'])[0]!
+    expect(observed.stages.map(stage => [stage.stage, stage.incarnationId, stage.executionGeneration, stage.recalledNonce, stage.noTools])).toEqual([
+      ['initial', 'inc-0', 1, false, true], ['after_provider_process_crash', 'inc-1', 1, true, true],
+    ])
+  })
+
+  it.each(['claude', 'freshclaude', 'kilroy'])('derives all three %s stages when each replacement starts generation 1', mode => {
+    const { derive } = claudeFixture([1, 1, 1], mode)
+    expect(derive()[0]!.stages.map(stage => [stage.incarnationId, stage.executionGeneration, stage.recalledNonce])).toEqual([
+      ['inc-0', 1, false], ['inc-1', 1, true], ['inc-2', 1, true],
+    ])
+  })
+
+  it('accepts a positive replacement generation lower than the prior incarnation counter', () => {
+    const { derive } = claudeFixture([4, 1, 2])
+    expect(derive()[0]!.stages.map(stage => stage.executionGeneration)).toEqual([4, 1, 2])
+  })
+
+  it('derives Amplifier recovery with a separately committed generation 1 in every incarnation', () => {
+    const { input, stages, original, write, derive } = amplifierFixture(true)
+    for (const stage of stages) {
+      const launch = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.launch.path), 'utf8'))
+      const namespace = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.namespace.path), 'utf8'))
+      launch.response.data.view.executionGeneration = 1; namespace.nativeLaunch.executionGeneration = 1
+      stage.launch = write(stage.launch.path, launch); stage.namespace = write(stage.namespace.path, namespace)
+    }
+    write('native-recovery-originals.json', original)
+    expect(derive()[0]!.stages.map(stage => [stage.executionGeneration, stage.recalledNonce])).toEqual([[1, false], [1, true], [1, true]])
+  })
+
+  it.each([
+    'zero-generation', 'negative-generation', 'fractional-generation', 'missing-generation', 'stale-child-generation',
+    'stale-child-incarnation', 'stale-child-nonce', 'stale-child-revision', 'observed-incarnation-disagreement',
+    'reused-container', 'reused-incarnation', 'reused-incarnation-increased-generation', 'reused-launch-nonce',
+    'unchanged-revision', 'backwards-revision', 'wrong-soul', 'wrong-store', 'wrong-root',
+    'changed-profile', 'changed-executable', 'changed-workspace', 'crash-before-completion', 'exit-before-request', 'capture-before-exit',
+  ] as const)('refuses invalid incarnation-local execution authority (%s)', fault => {
+    const { input, stages, original, write, derive } = claudeFixture([1, 1, 1], 'claude')
+    expect(derive()).toHaveLength(1)
+    const stage = stages[1]!
+    const launch = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.launch.path), 'utf8')), view = launch.response.data.view
+    const namespace = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.namespace.path), 'utf8'))
+    const crash = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.crash!.path), 'utf8'))
+    const store = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.store.path), 'utf8'))
+    if (fault === 'zero-generation') view.executionGeneration = namespace.nativeLaunch.executionGeneration = 0
+    if (fault === 'negative-generation') view.executionGeneration = namespace.nativeLaunch.executionGeneration = -1
+    if (fault === 'fractional-generation') view.executionGeneration = namespace.nativeLaunch.executionGeneration = 1.5
+    if (fault === 'missing-generation') { delete view.executionGeneration; delete namespace.nativeLaunch.executionGeneration }
+    if (fault === 'stale-child-generation') namespace.nativeLaunch.executionGeneration = 2
+    if (fault === 'stale-child-incarnation') namespace.nativeLaunch.incarnationId = 'inc-0'
+    if (fault === 'stale-child-nonce') namespace.nativeLaunch.launchNonce = 'launch-0'
+    if (fault === 'stale-child-revision') namespace.nativeLaunch.evidenceRevision = 0
+    if (fault === 'observed-incarnation-disagreement') view.nativeIdentityObservation.incarnationId = 'inc-0'
+    if (fault === 'reused-container') view.containerId = namespace.ownedProbe.containerId = store.containerId = 'container-0'
+    if (fault === 'reused-incarnation' || fault === 'reused-incarnation-increased-generation') {
+      view.incarnationId = view.nativeIdentityObservation.incarnationId = namespace.nativeLaunch.incarnationId = 'inc-0'
+      if (fault === 'reused-incarnation-increased-generation') view.executionGeneration = namespace.nativeLaunch.executionGeneration = 2
+    }
+    if (fault === 'reused-launch-nonce') view.nativeIdentityObservation.launchNonce = namespace.nativeLaunch.launchNonce = 'launch-0'
+    if (fault === 'unchanged-revision') view.nativeIdentityObservation.evidenceRevision = namespace.nativeLaunch.evidenceRevision = 0
+    if (fault === 'backwards-revision') {
+      const initial = stages[0]!
+      const initialLaunch = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, initial.launch.path), 'utf8'))
+      const initialNamespace = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, initial.namespace.path), 'utf8'))
+      initialLaunch.response.data.view.nativeIdentityObservation.evidenceRevision = initialNamespace.nativeLaunch.evidenceRevision = 2
+      initial.launch = write(initial.launch.path, initialLaunch); initial.namespace = write(initial.namespace.path, initialNamespace)
+    }
+    if (fault === 'wrong-soul') view.soulId = 'other-soul'
+    if (fault === 'wrong-store') launch.request.params.providerStoreId = 'other-store'
+    if (fault === 'wrong-root') view.nativeSessionId = view.nativeIdentityObservation.nativeSessionId = namespace.nativeRoot = 'other-root'
+    if (fault === 'changed-profile') namespace.profileSha256 = 'f'.repeat(64)
+    if (fault === 'changed-executable') namespace.executableSha256 = 'f'.repeat(64)
+    if (fault === 'changed-workspace') namespace.nativeCwd = '/other/workspace'
+    if (fault === 'crash-before-completion') crash.requestedAt -= 6_000
+    if (fault === 'exit-before-request') crash.exitedAt = crash.requestedAt - 1
+    if (fault === 'capture-before-exit') launch.capturedAt = crash.exitedAt - 1
+    stage.launch = write(stage.launch.path, launch); stage.namespace = write(stage.namespace.path, namespace)
+    stage.crash = write(stage.crash!.path, crash); stage.store = write(stage.store.path, store)
+    write('native-recovery-originals.json', original)
+    expect(derive).toThrow(/native/)
+  })
+
   it('derives one assembled Claude reply per request at every recovery stage from actual split rows', () => {
     const { derive } = claudeFixture()
     const stages = derive()[0]!.stages
@@ -245,7 +352,7 @@ describe('qualification from private native originals', () => {
     expect(stages.every(stage => stage.nativeEvidence.kind === 'identified_message' && stage.nativeEvidence.turnId.startsWith('turn-'))).toBe(true)
   })
 
-  it.each(['missing-nonce', 'tool', 'parent', 'duplicate-provider-id', 'changed-prior-component', 'root', 'cross-run'] as const)(
+  it.each(['missing-nonce', 'tool', 'parent', 'duplicate-provider-id', 'changed-prior-component', 'root', 'missing-model', 'cross-run'] as const)(
     'refuses mutated assembled Claude recovery originals (%s)', fault => {
       const { input, stages, original, write, derive } = claudeFixture()
       expect(derive()).toHaveLength(1)
@@ -256,6 +363,7 @@ describe('qualification from private native originals', () => {
       if (fault === 'duplicate-provider-id') for (const row of rows.slice(4)) if (row.type === 'assistant') row.message.id = 'turn-0'
       if (fault === 'changed-prior-component') rows[2].message.content[0].thinking = 'changed prior native component'
       if (fault === 'root') rows.at(-1).sessionId = 'other-root'
+      if (fault === 'missing-model') delete rows.at(-1).message.model
       stage.nativeFile = write(stage.nativeFile.path, rows.map(row => JSON.stringify(row)).join('\n') + '\n')
       const store = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.store.path), 'utf8')), bytes = fs.readFileSync(path.join(input.evidenceDir, stage.nativeFile.path))
       store.snapshot.bytesBase64 = bytes.toString('base64'); store.snapshot.sha256 = digest(bytes)

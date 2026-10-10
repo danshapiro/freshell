@@ -215,7 +215,9 @@ export function deriveNativeRecoveryOriginals(input: {
         equal(crash.containerId, previousView.containerId, 'native old container'); equal(crash.incarnationId, previousView.incarnationId, 'native old incarnation')
         const requestedAt = timestamp(crash.requestedAt, 'native crash request'), exitedAt = timestamp(crash.exitedAt, 'native owned exit')
         if (namespaceAt < exitedAt || timestamp(previousNamespace!.ownedProbe.capturedAt, 'previous native namespace capture') > requestedAt) throw new Error('native namespace probe precedes replacement or follows owned death')
-        if (!(previousCompletion <= requestedAt && requestedAt <= exitedAt && exitedAt <= launchAt) || view.containerId === previousView.containerId || view.executionGeneration <= previousView.executionGeneration || observation.evidenceRevision <= previousView.nativeIdentityObservation.evidenceRevision) throw new Error('native crash/exit/replacement order is invalid')
+        // Execution grants increment an incarnation-local counter. Recovery
+        // requires a new incarnation, whose committed generation may restart at 1.
+        if (!(previousCompletion <= requestedAt && requestedAt <= exitedAt && exitedAt <= launchAt) || view.containerId === previousView.containerId || incarnationId === previousView.incarnationId || observation.evidenceRevision <= previousView.nativeIdentityObservation.evidenceRevision) throw new Error('native crash/exit/replacement order is invalid')
       } else if (stage.crash !== undefined) throw new Error('initial native stage must precede recovery')
       const request = source(stage.request)
       const gestures: JsonObject[] = Array.isArray(request.requests) ? request.requests : [request]
