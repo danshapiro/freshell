@@ -8,7 +8,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { buildFreshAgentQualificationReceipt, validateFreshAgentQualificationReceipt, type FreshAgentQualificationRow } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
 import { FRESH_AGENT_INGRESS_INVENTORY } from '../../../../scripts/testing/fresh-agent-ingress-inventory.js'
-import { deriveNativeRecoveryOriginals } from '../../../../scripts/testing/qualification-observations.js'
+import { deriveNativeRecoveryOriginals, type NativeRecoveryStage } from '../../../../scripts/testing/qualification-observations.js'
 import { ManagedRuntimeOwner } from '../../../../scripts/testing/runtime-sandbox.js'
 
 const roots: string[] = []
@@ -218,7 +218,7 @@ function claudeFixture(generations?: readonly number[], mode = 'freshclaude') {
   return { ...built, original, conversation, derive }
 }
 
-function amplifierFixture(observed = false) {
+function amplifierFixture(observed = false, atomicSaves = false) {
   const built = fixture(), { input, write, stages } = built
   const original = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, 'native-recovery-originals.json'), 'utf8'))
   const conversation = original.conversations[0], transcript: unknown[] = [], events: unknown[] = []
@@ -243,6 +243,25 @@ function amplifierFixture(observed = false) {
     stage.request = write(stage.request.path, request)
     const store = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.store.path), 'utf8')), bytes = fs.readFileSync(path.join(input.evidenceDir, stage.nativeFile.path))
     const eventBytes = fs.readFileSync(path.join(input.evidenceDir, prefix, 'events.jsonl'))
+    if (atomicSaves) {
+      // The pinned SessionStore writes the complete transcript through
+      // write_with_backup: a same-directory temporary file replaces the target.
+      const target = path.join(input.repoRoot, 'owned-amplifier', 'sessions', conversation.nativeSessionId, 'transcript.jsonl')
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      if (fs.existsSync(target)) fs.copyFileSync(target, target + '.backup')
+      const temporary = path.join(path.dirname(target), `.transcript-${index}.tmp`)
+      fs.writeFileSync(temporary, bytes); fs.renameSync(temporary, target)
+      const descriptor = fs.openSync(target, 'r')
+      try {
+        const before = fs.fstatSync(descriptor, { bigint: true }), captured = fs.readFileSync(descriptor)
+        const after = fs.fstatSync(descriptor, { bigint: true })
+        const identity = (stat: fs.BigIntStats) => [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].map(String)
+        expect(identity(after)).toEqual(identity(before))
+        expect(identity(fs.statSync(target, { bigint: true }))).toEqual(identity(after))
+        expect(captured.equals(bytes)).toBe(true)
+        store.snapshot.path = target; store.snapshot.identity = identity(after)
+      } finally { fs.closeSync(descriptor) }
+    }
     store.snapshot.bytesBase64 = bytes.toString('base64'); store.snapshot.sha256 = digest(bytes)
     store.eventsSnapshot = { bytesBase64: eventBytes.toString('base64'), sha256: digest(eventBytes) }
     stage.store = write(stage.store.path, store)
@@ -254,6 +273,87 @@ function amplifierFixture(observed = false) {
 }
 
 describe('qualification from private native originals', () => {
+  it.each([2, 3])('derives %i Amplifier atomic-save recovery stages with complete prior history', count => {
+    const { input, stages, original, conversation, write, derive } = amplifierFixture(true, true)
+    const snapshots = stages.map(stage => JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.store.path), 'utf8')).snapshot)
+    expect(new Set(snapshots.map(snapshot => snapshot.identity[0])).size).toBe(1)
+    for (let index = 1; index < snapshots.length; index++) expect(snapshots[index].identity[1]).not.toBe(snapshots[index - 1].identity[1])
+    if (count === 2) {
+      const replacement = stages[1]!
+      replacement.stage = 'after_provider_process_crash'
+      const crash = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, replacement.crash!.path), 'utf8'))
+      crash.kind = 'provider_process_exit'; replacement.crash = write(replacement.crash!.path, crash)
+      conversation.stages = [stages[0], replacement]; write('native-recovery-originals.json', original)
+    }
+    const requiredStages: NativeRecoveryStage[] = count === 2 ? ['initial', 'after_provider_process_crash'] : ['initial', 'after_session_host_crash', 'after_provider_process_crash']
+    expect(derive(requiredStages)[0]!.stages.map(stage => [stage.stage, stage.recalledNonce, stage.noTools, stage.profile.observedModel])).toEqual(
+      requiredStages.map((stage: string, index: number) => [stage, index !== 0, true, 'glm-5.3']),
+    )
+  })
+
+  it.each([false, true])('requires the full persisted Amplifier prefix, including records outside completed turns (atomic saves: %s)', atomicSaves => {
+    const { input, stages, original, write, derive } = amplifierFixture(true, atomicSaves)
+    const initial = stages[0]!, bytes = Buffer.concat([fs.readFileSync(path.join(input.evidenceDir, initial.nativeFile.path)), Buffer.from(JSON.stringify({ role: 'system', content: 'persisted context' }) + '\n')])
+    initial.nativeFile = write(initial.nativeFile.path, bytes.toString('utf8'))
+    const store = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, initial.store.path), 'utf8'))
+    Object.assign(store.snapshot, { bytesBase64: bytes.toString('base64'), sha256: digest(bytes) })
+    initial.store = write(initial.store.path, store); write('native-recovery-originals.json', original)
+    expect(derive).toThrow(/prefix/)
+  })
+
+  it.each(['device', 'volume', 'path', 'truncated', 'copy', 'lost-prefix', 'missing-completion', 'missing-nonce', 'tool', 'wrong-root', 'wrong-store', 'wrong-soul', 'profile', 'executable', 'workspace', 'stale-launch', 'stale-revision', 'reused-incarnation', 'nonce-input', 'crash-order', 'completion-event'] as const)(
+    'refuses invalid Amplifier atomic-save recovery authority (%s)', fault => {
+      const { input, stages, original, write, derive } = amplifierFixture(true, true)
+      expect(derive()).toHaveLength(1)
+      const stage = stages[1]!
+      const store = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.store.path), 'utf8'))
+      const namespace = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.namespace.path), 'utf8'))
+      const launch = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.launch.path), 'utf8')), view = launch.response.data.view
+      if (fault === 'device') store.snapshot.identity[0] = 'other-device'
+      if (fault === 'volume') store.providerVolumeName = 'other-volume'
+      if (fault === 'path') store.snapshot.path += '.other'
+      if (fault === 'truncated') store.snapshot.completeEof = false
+      if (fault === 'copy') store.snapshot.bytesBase64 = Buffer.from('unrelated\n').toString('base64')
+      if (fault === 'wrong-root') view.nativeSessionId = view.nativeIdentityObservation.nativeSessionId = namespace.nativeRoot = 'other-root'
+      if (fault === 'wrong-store') view.providerStoreId = 'other-store'
+      if (fault === 'wrong-soul') view.soulId = 'other-soul'
+      if (fault === 'profile') namespace.profileSha256 = 'f'.repeat(64)
+      if (fault === 'executable') namespace.executableSha256 = 'f'.repeat(64)
+      if (fault === 'workspace') namespace.nativeCwd = '/other/workspace'
+      if (fault === 'stale-launch') namespace.nativeLaunch.launchNonce = 'launch-0'
+      if (fault === 'stale-revision') view.nativeIdentityObservation.evidenceRevision = namespace.nativeLaunch.evidenceRevision = 0
+      if (fault === 'reused-incarnation') view.incarnationId = view.nativeIdentityObservation.incarnationId = namespace.nativeLaunch.incarnationId = 'inc-0'
+      if (fault === 'nonce-input') {
+        const request = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.request.path), 'utf8'))
+        request.request.params.data = original.conversations[0].nonce + '\r'; stage.request = write(stage.request.path, request)
+      }
+      if (fault === 'crash-order') {
+        const crash = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.crash!.path), 'utf8'))
+        crash.requestedAt -= 6_000; stage.crash = write(stage.crash!.path, crash)
+      }
+      if (['lost-prefix', 'missing-completion', 'missing-nonce', 'tool'].includes(fault)) {
+        const rows = fs.readFileSync(path.join(input.evidenceDir, stage.nativeFile.path), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+        if (fault === 'lost-prefix') rows.splice(0, 2)
+        if (fault === 'missing-completion') rows.pop()
+        if (fault === 'missing-nonce') rows.at(-1).content = 'not recalled'
+        if (fault === 'tool') rows.at(-1).tool_calls = [{ function: { name: 'read_file' } }]
+        const bytes = Buffer.from(rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+        stage.nativeFile = write(stage.nativeFile.path, bytes.toString('utf8'))
+        Object.assign(store.snapshot, { bytesBase64: bytes.toString('base64'), sha256: digest(bytes) })
+      }
+      if (fault === 'completion-event') {
+        const events = fs.readFileSync(path.join(input.evidenceDir, (stage as any).nativeEvents.path), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+        events.pop()
+        const bytes = Buffer.from(events.map(event => JSON.stringify(event)).join('\n') + '\n')
+        Object.assign(stage, { nativeEvents: write((stage as any).nativeEvents.path, bytes.toString('utf8')) })
+        Object.assign(store.eventsSnapshot, { bytesBase64: bytes.toString('base64'), sha256: digest(bytes) })
+      }
+      stage.store = write(stage.store.path, store); stage.namespace = write(stage.namespace.path, namespace); stage.launch = write(stage.launch.path, launch)
+      write('native-recovery-originals.json', original)
+      expect(derive).toThrow(/native|Amplifier/)
+    },
+  )
+
   it('derives terminal Claude seed and post-provider-crash recall with incarnation-local generation 1', () => {
     const { input, stages, original, conversation, write, derive } = claudeFixture([1, 1, 1], 'claude')
     const replacement = stages[1]!
