@@ -31,7 +31,9 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows_sys::Win32::System::SystemServices::JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO;
+use windows_sys::Win32::System::SystemServices::{
+    JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, JOB_OBJECT_MSG_EXIT_PROCESS,
+};
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
 };
@@ -404,62 +406,71 @@ impl Drop for PortJob {
     }
 }
 
-/// LB-08 (V5 §3.7): nested jobs post their zero messages under the unit's
-/// own key, so the unit's empty wait must confirm each one against the unit
-/// job's active process count. The member runs a child in a nested
-/// kill-on-close job that has its own completion port; when that child
-/// exits, the nested job empties while the member still runs. (On the
-/// runner, neither a Node grandchild's libuv job nor a nested job without a
-/// port of its own posted a zero message to the parent's port: runs
-/// 38014321238 and 38015212020.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_unit_empty_wait_ignores_nested_job_zero_messages() {
-    // Precondition: this scenario really posts a nested zero message while
-    // its job still has members (shown on a job and port the test owns),
-    // and that port does receive its own job's zero message.
-    {
-        let job = PortJob::new();
-        let mut child = std::process::Command::new(SHIM)
-            .args(["--job", &job.name, "--", HELPER, "job-child"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let shim = Proc::open(child.id());
-        let mut lines = windows_support::Lines::new(child.stdout.take().unwrap());
-        lines.expect_pid("job-child ");
-        let zero = |msg: u32, _key: usize| msg == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO;
-        let before = job.messages(Duration::from_millis(200), zero);
-        drop(child.stdin.take());
-        lines.expect("child-exited", |l| l == "child-exited");
-        let nested = job.messages(Duration::from_secs(5), zero);
-        let active = job.active_processes();
-        job.terminate();
-        let own = job.messages(Duration::from_secs(10), |msg, key| {
-            msg == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO && key == 7
-        });
-        let report = format!(
-            "(message, key, pid) before: {before:?}; after the nested job emptied: {nested:?} \
-             (active processes then: {active}); after the test job ended: {own:?}"
-        );
-        assert!(
-            own.iter()
-                .any(|(m, k, _)| *m == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO && *k == 7),
-            "precondition: the test port never got its own job's zero message: {report}"
-        );
-        assert!(
-            !before.iter().any(|(m, _, _)| zero(*m, 0)) && active > 0,
-            "precondition: {report}"
-        );
-        assert!(
-            nested.iter().any(|(m, _, _)| zero(*m, 0)),
-            "precondition: no zero message after the nested job emptied: {report}"
-        );
-        drop(shim);
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+/// V5 §3.7 expected nested jobs to post their zero messages to every port up
+/// their job chain, under the unit's own key. On the runner they do not:
+/// when a nested kill-on-close job empties while its parent job still has
+/// members, the parent's port gets the child's exit message and no zero
+/// message, even when the nested job has a completion port of its own
+/// (runs 38015212020, 38015981113, 38016382312); the same port does get its
+/// own job's zero message. The job backend still confirms every zero
+/// message against the unit job's own active process count (Microsoft's
+/// documentation allows them), and this test fails if Windows starts
+/// posting them, so `the_unit_empty_wait_completes_only_when_the_unit_is_empty`
+/// can then be made to see one.
+#[test]
+fn a_nested_job_posts_no_zero_message_to_its_parent_jobs_port() {
+    let job = PortJob::new();
+    let mut child = std::process::Command::new(SHIM)
+        .args(["--job", &job.name, "--", HELPER, "job-child"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let shim = Proc::open(child.id());
+    let mut lines = windows_support::Lines::new(child.stdout.take().unwrap());
+    let nested_child = lines.expect_pid("job-child ");
+    let zero = |msg: u32, _key: usize| msg == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO;
+    drop(child.stdin.take());
+    lines.expect("child-exited", |l| l == "child-exited");
+    let nested = job.messages(Duration::from_secs(5), zero);
+    let active = job.active_processes();
+    job.terminate();
+    let own = job.messages(Duration::from_secs(10), |msg, key| {
+        msg == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO && key == 7
+    });
+    let report = format!(
+        "(message, key, pid) after the nested job emptied: {nested:?} \
+         (active processes then: {active}); after the test job ended: {own:?}"
+    );
+    assert!(
+        own.iter()
+            .any(|(m, k, _)| *m == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO && *k == 7),
+        "the test port never got its own job's zero message: {report}"
+    );
+    assert!(
+        nested
+            .iter()
+            .any(|(m, _, pid)| *m == JOB_OBJECT_MSG_EXIT_PROCESS && *pid == nested_child),
+        "the nested job's child exit never reached the parent's port: {report}"
+    );
+    assert!(active > 0, "the test job itself emptied: {report}");
+    assert!(
+        !nested.iter().any(|(m, _, _)| zero(*m, 0)),
+        "a nested job's zero message reached its parent's port: {report}"
+    );
+    drop(shim);
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
+/// LB-08 (V5 §3.7): the unit's empty wait completes only when the unit job
+/// itself is empty: not while its members run after a nested job inside it
+/// emptied (the member runs a child in a nested kill-on-close job of its
+/// own, as Codex runs each shell command), and as soon as the stop has
+/// emptied it (the port thread's confirmed zero message, since the wait
+/// began while the unit had members).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_unit_empty_wait_completes_only_when_the_unit_is_empty() {
     let state = tempfile::tempdir().unwrap();
     let containment = containment(state.path());
     let unit = containment.create_unit(UnitId::mint(), label()).unwrap();

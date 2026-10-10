@@ -4,23 +4,44 @@
 mod windows_support;
 
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use freshell_containment::{
     process, Containment, MemberRole, ProcWatch, SelectOptions, StopMode, StopReason, StopRequest,
     UnitId, UnitLabel, UnitRecord, UnitRecordState,
 };
-use windows_support::{child_named, test_shim, AsyncLines, Proc, EXIT_WAIT, HELPER};
+use windows_support::{test_shim, wide, AsyncLines, Lines, Proc, EXIT_WAIT, HELPER};
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, OpenJobObjectW};
+use windows_sys::Win32::System::SystemServices::JOB_OBJECT_ASSIGN_PROCESS;
 
-/// A stop that spares a daemon-family member clears kill-on-close, so a
-/// server that crashed before Gone would leave the other members running:
-/// before ending them, the backend records each one in the unit record as
-/// a root (here the plain member's shim, which nothing else pins), and never
-/// a spared one, so the next boot reaches them by identity.
+/// The record on disk, once `ok` holds for it (bounded retry: the port
+/// thread records asynchronously, and a read can meet the atomic rename).
+fn record_once(path: &std::path::Path, what: &str, ok: impl Fn(&UnitRecord) -> bool) -> UnitRecord {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let read = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<UnitRecord>(&bytes).ok());
+        if let Some(record) = &read {
+            if ok(record) {
+                return record.clone();
+            }
+        }
+        assert!(Instant::now() < deadline, "{what}: {read:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Once a stop that spares a daemon-family member has cleared
+/// kill-on-close, the unit's members would outlive a crashed server, so
+/// every process that joins the unit's job from then on is recorded in the
+/// unit record as a root (the next boot reaches it by identity), and its
+/// root is dropped again when it exits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stop_that_spares_members_records_the_others_as_roots_before_ending_them() {
+async fn a_process_joining_after_kill_on_close_is_cleared_is_recorded_until_it_exits() {
     std::env::set_var("FRESHELL_TEST_HOOKS", "1");
-    std::env::set_var("FRESHELL_TEST_UNIT_GONE_DELAY_MS", "3000");
+    std::env::set_var("FRESHELL_TEST_UNIT_GONE_DELAY_MS", "15000");
     let state = tempfile::tempdir().unwrap();
     let containment = Containment::select(SelectOptions {
         shim: Some(test_shim()),
@@ -56,13 +77,8 @@ async fn a_stop_that_spares_members_records_the_others_as_roots_before_ending_th
         let helper = Proc::open(lines.expect_pid("idle ").await);
         started.push((child, shim, helper));
     }
-    let (family_shim, family) = (&started[0].1, &started[0].2);
-    let (plain_shim, plain) = (&started[1].1, &started[1].2);
-    assert_eq!(
-        child_named(plain_shim.pid, "freshell-test-helper.exe"),
-        Some(plain.pid)
-    );
-    let plain_shim_start = process::start_time(plain_shim.pid).unwrap();
+    let family = &started[0].2;
+    let plain = &started[1].2;
     unit.set_main(ProcWatch::open(plain.pid).unwrap());
 
     let handle = unit.stop(StopRequest::new(
@@ -71,23 +87,48 @@ async fn a_stop_that_spares_members_records_the_others_as_roots_before_ending_th
         "test",
     ));
     assert!(plain.wait(EXIT_WAIT), "the plain member outlived the kill");
-    // Gone is held for 3 s after the exits are confirmed: the record is
-    // still there, Stopping.
-    let record: UnitRecord = serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
-    assert!(
-        matches!(record.state, UnitRecordState::Stopping { .. }),
-        "{record:?}"
-    );
-    assert!(
-        record.roots.contains(&(plain_shim.pid, plain_shim_start)),
-        "the plain member's shim is not recorded: {record:?}"
-    );
-    for spared in [family_shim.pid, family.pid] {
+    // Gone is held: kill-on-close is cleared (a member was spared) and the
+    // record is still there, Stopping.
+    record_once(&record_path, "a Stopping record", |r| {
+        matches!(r.state, UnitRecordState::Stopping { .. })
+    });
+
+    // A process joins the unit's job now.
+    let mut late = std::process::Command::new(HELPER)
+        .arg("idle")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let late_proc = Proc::open(late.id());
+    Lines::new(late.stdout.take().unwrap()).expect_pid("idle ");
+    let late_start = process::start_time(late_proc.pid).unwrap();
+    let name = wide(&format!("Local\\freshell-unit-{}", unit.id().as_str()));
+    // SAFETY: a NUL-terminated name; the handle is checked and closed.
+    unsafe {
+        let job = OpenJobObjectW(JOB_OBJECT_ASSIGN_PROCESS, 0, name.as_ptr());
         assert!(
-            record.roots.iter().all(|(pid, _)| *pid != spared),
-            "the spared {spared} is recorded: {record:?}"
+            !job.is_null(),
+            "open the unit's job: {}",
+            std::io::Error::last_os_error()
         );
+        let joined = AssignProcessToJobObject(job, late_proc.handle);
+        let err = std::io::Error::last_os_error();
+        CloseHandle(job);
+        assert_ne!(joined, 0, "assign to the unit's job: {err}");
     }
+    record_once(
+        &record_path,
+        "the joining process recorded as a root",
+        |r| r.roots.contains(&(late_proc.pid, late_start)),
+    );
+    late_proc.terminate();
+    assert!(late_proc.wait(EXIT_WAIT));
+    record_once(&record_path, "the exited process's root dropped", |r| {
+        r.roots.iter().all(|(pid, _)| *pid != late_proc.pid)
+    });
+    let _ = late.wait();
+
     handle
         .wait_for(Duration::from_secs(30))
         .await

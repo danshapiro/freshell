@@ -14,10 +14,12 @@
 //! One completion port serves every unit, read by one `freshell-job-port`
 //! thread blocked in `GetQueuedCompletionStatus` (event-driven, no polling).
 //! Its messages are hints whose delivery is not guaranteed, so Gone rests on
-//! the screen and main process handles. Nested jobs (libuv's per-`node.exe`
-//! job, Codex's per-command jobs) post their zero messages under the unit's
-//! own key, so a zero message counts as "unit empty" only when the unit
-//! job's own active process count reads 0.
+//! the screen and main process handles. Microsoft documents that nested jobs
+//! (libuv's per-`node.exe` job, Codex's per-command jobs) post their zero
+//! messages to every port up their job chain, under the unit's own key
+//! (the `windows-2022` runner showed none, see
+//! `tests/windows_job.rs`), so a zero message counts as "unit empty" only
+//! when the unit job's own active process count reads 0.
 //!
 //! A stop that spares Codex daemon-family members (each judged by its own
 //! command line, plus their descendants) clears kill-on-close, so the spared
