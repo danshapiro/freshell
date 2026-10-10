@@ -610,26 +610,36 @@ mod tests {
     }
 
     impl Own {
-        fn spawn(program: &str, args: &[&str]) -> Self {
-            let child = std::process::Command::new(program)
-                .args(args)
-                .stdin(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
+        fn start(command: &mut std::process::Command) -> Self {
+            let child = command.stdin(std::process::Stdio::null()).spawn().unwrap();
             let watch = ProcWatch::open(child.id()).unwrap();
             Self { child, watch }
         }
 
-        /// A stand-in for Codex's managed daemon (judged by its argv).
+        /// A stand-in for Codex's managed daemon (judged by its argv),
+        /// returned once it runs as one. `spawn` returns before the child's
+        /// exec has finished: until then its `/proc/<pid>/cmdline` reads this
+        /// test's own argv, then nothing, and neither is the daemon family.
+        /// So the stand-in prints a line from its own program, and this
+        /// waits for that line.
         fn daemon() -> Self {
-            Self::spawn(
-                "perl",
-                &["-e", "sleep 600", "app-server", "--managed-daemon"],
-            )
+            use std::io::{BufRead, BufReader};
+            let mut own = Self::start(
+                std::process::Command::new("perl")
+                    .args(["-e", r#"$| = 1; print "running\n"; sleep 600"#])
+                    .args(["app-server", "--managed-daemon"])
+                    .stdout(std::process::Stdio::piped()),
+            );
+            let mut line = String::new();
+            BufReader::new(own.child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "running\n", "the daemon stand-in did not start");
+            own
         }
 
         fn sleep() -> Self {
-            Self::spawn("sleep", &["600"])
+            Self::start(std::process::Command::new("sleep").arg("600"))
         }
 
         fn pid(&self) -> u32 {
