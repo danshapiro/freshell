@@ -242,7 +242,193 @@ if (provider === 'claude') {
   try { await configuredClaudeStartup() }
   catch (error) { append({ kind: 'native-startup', result: 'refused', errorKind: error?.name ?? 'Error' }); process.exitCode = 1 }
 }
-if (provider === 'codex' || provider === 'opencode') {
+async function configuredAmplifierStartup() {
+  if (!nativeId || !process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) return
+  // Load the actual installed CLI store and restore the controlled context.
+  // Its unchanged producer captures the native files and publishes the ACK.
+  const code = `
+import asyncio, sys
+from types import SimpleNamespace
+from amplifier_app_cli.session_store import SessionStore
+from amplifier_app_cli.freshell_native_resume import publish_initialized
+
+class ControlledContext:
+    async def set_messages(self, messages):
+        self.messages = list(messages)
+    async def get_messages(self):
+        return self.messages
+
+async def main():
+    loaded, metadata = SessionStore().load(sys.argv[1])
+    context = ControlledContext()
+    await context.set_messages(loaded)
+    async def cleanup():
+        pass
+    session = SimpleNamespace(session_id=sys.argv[1], parent_id=metadata.get('parent_id'),
+                              coordinator={'context': context}, cleanup=cleanup)
+    config = SimpleNamespace(is_resume=True, initial_transcript=loaded)
+    await publish_initialized(session, config)
+
+asyncio.run(main())
+`
+  await new Promise((resolve, reject) => {
+    const child = spawn('/opt/amplifier-src/.venv/bin/python', ['-c', code, nativeId],
+      { env: process.env, cwd, stdio: ['ignore', 'inherit', 'inherit'] })
+    child.once('error', reject)
+    child.once('exit', code => code === 0 ? resolve() : reject(new Error('installed Amplifier startup producer refused')))
+  })
+}
+
+const opencodePinnedMigrations = [
+  "20260127222353_familiar_lady_ursula",
+  "20260211171708_add_project_commands",
+  "20260213144116_wakeful_the_professor",
+  "20260225215848_workspace",
+  "20260227213759_add_session_workspace_id",
+  "20260228203230_blue_harpoon",
+  "20260303231226_add_workspace_fields",
+  "20260309230000_move_org_to_state",
+  "20260312043431_session_message_cursor",
+  "20260323234822_events",
+  "20260410174513_workspace-name",
+  "20260413175956_chief_energizer",
+  "20260423070820_add_icon_url_override",
+  "20260427172553_slow_nightmare",
+  "20260428004200_add_session_path",
+  "20260501142318_next_venus",
+  "20260504145000_add_sync_owner",
+  "20260507164347_add_workspace_time",
+  "20260510033149_session_usage",
+  "20260511000411_data_migration_state",
+  "20260511173437_session-metadata",
+  "20260601010001_normalize_storage_paths",
+  "20260601202201_amazing_prowler",
+  "20260602002951_lowly_union_jack",
+  "20260602182828_add_project_directories",
+  "20260603001617_session_message_projection_indexes",
+  "20260603040000_session_message_projection_order",
+  "20260603141458_session_input_inbox",
+  "20260603160727_jittery_ezekiel_stane",
+  "20260604172448_event_sourced_session_input",
+  "20260605003541_add_session_context_snapshot",
+  "20260605042240_add_context_epoch_agent",
+  "20260611035744_credential",
+  "20260611192811_lush_chimera",
+  "20260612174303_project_dir_strategy",
+  "20260622142730_simplify_session_context_epoch",
+  "20260622170816_reset_v2_session_state",
+  "20260622202450_simplify_session_input"
+]
+
+async function controlledOpenCodeTui(schemaPath, migrations) {
+  // This function runs in a child with Node's TypeScript transform enabled:
+  // the installed TUI plugin contains parameter properties. All native and
+  // hydrated reads below come from the same real controlled SQLite store.
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const { randomUUID, createHash } = await import('node:crypto')
+  const { DatabaseSync } = await import('node:sqlite')
+  const config = JSON.parse(fs.readFileSync(process.env.OPENCODE_TUI_CONFIG, 'utf8'))
+  const pluginPath = config.plugin.find(value => value.endsWith('/freshell-rebind-plugin.ts'))
+  if (!pluginPath) throw new Error('configured native TUI plugin missing')
+  const plugin = (await import(pluginPath)).default
+  const dataHome = path.join(process.env.HOME, '.local/share/opencode')
+  fs.mkdirSync(dataHome, { recursive: true })
+  const db = new DatabaseSync(path.join(dataHome, 'opencode.db'))
+  db.exec('PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;')
+  if (!db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").get()) {
+    // Reuse the accepted pinned fixture schema, including its relationships
+    // and migration journal, so the real retained-store qualifier can inspect it.
+    db.exec(fs.readFileSync(schemaPath, 'utf8'))
+    const insertMigration = db.prepare('INSERT INTO migration (id, time_completed) VALUES (?, ?)')
+    migrations.forEach((migration, index) => insertMigration.run(migration, index + 100))
+  }
+  const get = id => {
+    const row = db.prepare('SELECT * FROM session WHERE id = ?').get(id)
+    if (!row) throw new Error('native root not found')
+    return { id: row.id, parentID: row.parent_id, revert: row.revert ? JSON.parse(row.revert) : undefined }
+  }
+  const parts = id => db.prepare('SELECT * FROM part WHERE message_id = ? ORDER BY time_created, id')
+    .all(id).map(row => ({ ...JSON.parse(row.data), id: row.id, messageID: row.message_id, sessionID: row.session_id }))
+  const messages = id => db.prepare('SELECT * FROM message WHERE session_id = ? ORDER BY time_created, id')
+    .all(id).map(row => ({ info: { ...JSON.parse(row.data), id: row.id, sessionID: row.session_id }, parts: parts(row.id) }))
+  const resume = argv.indexOf('--session')
+  const selected = resume >= 0 ? argv[resume + 1] : null
+  const route = { current: selected ? { name: 'session', params: { sessionID: selected } } : { name: 'home' },
+    navigate(name, params) { this.current = { name, params } } }
+  const lifecycle = new AbortController()
+  const api = {
+    route, lifecycle: { signal: lifecycle.signal },
+    state: { ready: true, part: parts, session: { get, messages: id => messages(id).map(row => row.info) } },
+    client: { session: {
+      async create() {
+        const id = 'ses_' + randomUUID().replaceAll('-', '')
+        const now = Date.now()
+        const projectId = createHash('sha1').update('git-remote:fixture.invalid/freshell/provider-parity').digest('hex')
+        db.prepare(`INSERT OR IGNORE INTO project
+          (id, worktree, time_created, time_updated, sandboxes, vcs) VALUES (?, ?, ?, ?, '[]', 'git')`)
+          .run(projectId, process.cwd(), now, now)
+        db.prepare('INSERT OR IGNORE INTO project_directory (project_id, directory, time_created) VALUES (?, ?, ?)')
+          .run(projectId, process.cwd(), now)
+        db.prepare(`INSERT INTO session
+          (id, project_id, parent_id, slug, directory, title, version, model, time_created, time_updated)
+          VALUES (?, ?, NULL, ?, ?, ?, '1.18.21', 'controlled-model', ?, ?)`)
+          .run(id, projectId, id, process.cwd(), id, now, now)
+        return { data: get(id) }
+      },
+      async get({ sessionID }) { return { data: get(sessionID) } },
+      async messages({ sessionID }) { get(sessionID); return { data: messages(sessionID) } },
+    } },
+  }
+  plugin.tui(api)
+  // The native plugin creates/navigates the fresh root asynchronously. This
+  // marker observes its selected row; it never constructs an identity ACK.
+  let announced = false
+  const observation = setInterval(() => {
+    const id = route.current.params?.sessionID
+    if (!id || announced) return
+    get(id)
+    announced = true
+    process.stdout.write(`opencode: session ${id} started\n`)
+    process.stdout.write('FRESHELL_PROVIDER_PARITY_ROW:' + Buffer.from(JSON.stringify({
+      provider: 'opencode', kind: 'identity', terminalId: process.env.FRESHELL_TERMINAL_ID,
+      nativeSession: { source: 'provider-store', value: id },
+    })).toString('base64') + '\n')
+  }, 25)
+  process.stdin.on('data', chunk => {
+    const id = route.current.params?.sessionID
+    const prompt = String(chunk).trim()
+    if (prompt.startsWith('SELECT_SESSION ')) {
+      const selected = prompt.slice('SELECT_SESSION '.length)
+      get(selected)
+      route.navigate('session', { sessionID: selected })
+      return
+    }
+    if (!id || !prompt || messages(id).length) return
+    const now = Date.now()
+    const message = 'msg_' + randomUUID().replaceAll('-', '')
+    db.prepare('INSERT INTO message VALUES (?, ?, ?, ?, ?)')
+      .run(message, id, now, now, JSON.stringify({ role: 'user' }))
+    db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)')
+      .run('prt_' + randomUUID().replaceAll('-', ''), message, id, now, now, JSON.stringify({ type: 'text', text: prompt }))
+  })
+  process.stdin.resume()
+  const dispose = () => { lifecycle.abort(); clearInterval(observation); db.close() }
+  process.once('exit', dispose)
+}
+
+if (provider === 'amplifier') await configuredAmplifierStartup()
+if (provider === 'opencode' && process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) {
+  // The parity harness copies this fixture into a workspace directly under
+  // its worktree, which is also the source mount available to the child.
+  const schemaPath = path.resolve(import.meta.dirname, '../crates/freshell-sessions/src/opencode_schema_v1_18_21.sql')
+  const terminal = spawn(process.execPath, ['--experimental-transform-types', '--input-type=module', '-e',
+    `const argv = process.argv.slice(1); await (${controlledOpenCodeTui.toString()})(
+      ${JSON.stringify(schemaPath)},
+      ${JSON.stringify(opencodePinnedMigrations)})`, '--', ...argv],
+  { env: process.env, cwd, stdio: 'inherit' })
+  terminal.once('exit', code => { process.exitCode = code ?? 1 })
+} else if (provider === 'codex' || provider === 'opencode') {
   // Keep ordinary fake transcripts Enter-bound. Only this managed Codex
   // parity wrapper requests the current proxy handshake before input.
   const fake = path.join(import.meta.dirname,

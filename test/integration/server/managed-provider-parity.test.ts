@@ -117,10 +117,41 @@ class TerminalWire {
   }
 }
 
+const ordinaryClaudeSessionStart = [{ hooks: [{ type: 'command', command:
+  'sh -lc \'d="$HOME/.freshell/session-signals/claude"; n=$(date +%s%N 2>/dev/null); case "$n" in *[!0-9]*|"") n="$(date +%s)000000000";; esac; f="$d/${FRESHELL_TERMINAL_ID:-unknown}__$n-$$"; mkdir -p "$d" && cat > "$f.tmp" && mv "$f.tmp" "$f.json"\' 2>/dev/null || true',
+}] }]
+const managedClaudeSessionStart = [{ hooks: [{ type: 'command', command:
+  'node /opt/freshell-claude-sidecar/native-session-channel.mjs',
+}] }]
+const managedClaudeStatusLine = { type: 'command', command:
+  'node /opt/freshell-claude-sidecar/native-session-channel.mjs --status-line' }
+
+function ordinaryClaudeSettings(raw: string): string {
+  let settings
+  try { settings = JSON.parse(raw) } catch { return raw }
+  const startup = JSON.stringify(settings?.hooks?.SessionStart)
+  const ordinary = startup === JSON.stringify(ordinaryClaudeSessionStart)
+  const managed = startup === JSON.stringify(managedClaudeSessionStart)
+    && JSON.stringify(settings.statusLine) === JSON.stringify(managedClaudeStatusLine)
+  if (ordinary || managed) {
+    settings.hooks.SessionStart = '<owned-session-start>'
+    if (managed) delete settings.statusLine
+  }
+  return JSON.stringify(settings)
+}
+
 function ordinaryProviderArgs(argv: string[], provider: Provider): string[] {
   const result: string[] = []
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
+    if (provider === 'claude' && arg === '--settings' && typeof argv[index + 1] === 'string') {
+      result.push(arg, ordinaryClaudeSettings(argv[++index]))
+      continue
+    }
+    if (provider === 'codex' && arg === '-c' && argv[index + 1] === 'check_for_update_on_startup=false') {
+      index++
+      continue
+    }
     if (arg === '--mcp-config' || arg === '--mcp-config-file') {
       result.push(arg, '<managed-mcp-config>')
       index++
@@ -185,6 +216,43 @@ function normalized(record: RecordRow) {
 }
 
 describe('managed provider parity argv comparison', () => {
+  it('compares only the exact owned Claude startup producer policy and preserves other settings', () => {
+    const settings = (SessionStart: unknown, statusLine?: unknown) => ({
+      hooks: { SessionStart, Stop: [{ hooks: [{ type: 'command', command: 'controlled-stop' }] }] },
+      ...(statusLine ? { statusLine } : {}), userSetting: 'keep',
+    })
+    const ordinary = settings(ordinaryClaudeSessionStart)
+    const managed = settings(managedClaudeSessionStart, managedClaudeStatusLine)
+    const record = (value: unknown, rest = ['--model', 'haiku', '--effort', 'low']): RecordRow => ({
+      provider: 'claude', kind: 'launch', env: {}, argv: ['--settings', JSON.stringify(value), ...rest],
+    })
+    expect(normalized(record(managed))).toEqual(normalized(record(ordinary)))
+    for (const mutated of [
+      settings([{ hooks: [{ type: 'command', command: 'unexpected-startup' }] }], managedClaudeStatusLine),
+      settings(managedClaudeSessionStart),
+      settings(managedClaudeSessionStart, { ...managedClaudeStatusLine, command: 'unexpected-status' }),
+      settings([...managedClaudeSessionStart, { hooks: [{ type: 'command', command: 'extra-hook' }] }], managedClaudeStatusLine),
+      { ...managed, userSetting: 'changed' },
+      { ...managed, hooks: { ...managed.hooks, Stop: [] } },
+      { ...managed, hooks: { ...managed.hooks, PreToolUse: [{ hooks: [] }] } },
+      { ...managed, statusLine: { ...managedClaudeStatusLine, refreshInterval: 99 } },
+    ]) expect(normalized(record(mutated))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record(managed))).not.toEqual(normalized(record(settings([{ hooks: [] }]))))
+    expect(normalized(record(managed, ['--effort', 'low', '--model', 'haiku']))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record(managed, ['--model', 'changed', '--effort', 'low']))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record(managed, ['--model', 'haiku', '--effort', 'high']))).not.toEqual(normalized(record(ordinary)))
+  })
+
+  it('compares Codex arguments around the managed image update suppression without hiding other settings', () => {
+    const record = (argv: string[]): RecordRow => ({ provider: 'codex', kind: 'launch', argv, env: {} })
+    const ordinary = ['--model', 'gpt-5.6-luna', '--sandbox', 'workspace-write']
+    const suppression = ['-c', 'check_for_update_on_startup=false']
+    expect(normalized(record([...suppression, ...ordinary]))).toEqual(normalized(record(ordinary)))
+    expect(normalized(record(['-c', 'check_for_update_on_startup=true', ...ordinary]))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record([...suppression, '-c', 'other_setting=false', ...ordinary]))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record([...suppression, '--sandbox', 'workspace-write', '--model', 'gpt-5.6-luna']))).not.toEqual(normalized(record(ordinary)))
+  })
+
   it.each([
     {
       provider: 'claude' as const,
@@ -415,6 +483,20 @@ describe('ordinary and managed terminal provider parity', () => {
         )))
       }
     }
+    if (provider === 'claude') {
+      const settings = observed.map(row => JSON.parse(row.argv[row.argv.indexOf('--settings') + 1]))
+      expect(settings[0].hooks.SessionStart).toEqual(ordinaryClaudeSessionStart)
+      expect(settings[1].hooks.SessionStart).toEqual(managedClaudeSessionStart)
+      expect(settings[1].statusLine).toEqual(managedClaudeStatusLine)
+    }
+    if (provider === 'codex') {
+      // The managed image owns the pin and must not ask for updater input
+      // before the native create/resume acknowledgement. Verify that actual
+      // launch policy separately from the remaining provider-visible flags.
+      expect(observed[1].argv.slice(0, 2)).toEqual(['-c', 'check_for_update_on_startup=false'])
+      expect(observed[1].argv.filter((arg: string) => arg === 'check_for_update_on_startup=false')).toHaveLength(1)
+      expect(observed[0].argv).not.toContain('check_for_update_on_startup=false')
+    }
     expect(normalized(observed[1])).toEqual(normalized(observed[0]))
     if (provider === 'opencode') {
       const selected = JSON.parse(observed[1].tuiConfig)
@@ -601,28 +683,31 @@ describe('ordinary and managed terminal provider parity', () => {
     )))
     const before = await waitFor('managed OpenCode container before switch', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
-      return view?.containerId ? view : undefined
+      return view?.containerId && view.durabilityState === 'resume_captured' ? view : undefined
     })
     if (!before.containerId) throw new Error('managed OpenCode container missing')
     const switchedId = `ses_ParitySwitch${Date.now()}`
-    const writeSignal = `
-      const fs = require('node:fs')
+    const createSelectedRoot = `
       const path = require('node:path')
       const { DatabaseSync } = require('node:sqlite')
-      const [previous, next, terminal] = process.argv.slice(1)
+      const [previous, next] = process.argv.slice(1)
       const home = '/home/freshell/provider'
       const db = new DatabaseSync(path.join(home, '.local/share/opencode/opencode.db'))
-      const changed = db.prepare('UPDATE session SET id = ? WHERE id = ?').run(next, previous)
+      const oldMessages = db.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get(previous).count
+      const created = db.prepare(\`INSERT INTO session
+        (id, project_id, parent_id, slug, directory, title, version, model, time_created, time_updated)
+        SELECT ?, project_id, NULL, ?, directory, ?, version, model, ?, ? FROM session WHERE id = ?\`)
+        .run(next, next, next, Date.now(), Date.now(), previous)
+      if (created.changes !== 1) throw new Error('native session row was not available')
+      if (!db.prepare('SELECT id FROM session WHERE id = ?').get(previous)
+        || db.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get(previous).count !== oldMessages)
+        throw new Error('original native graph changed')
       db.close()
-      if (changed.changes !== 1) throw new Error('native session row was not available')
-      const signals = path.join(home, '.freshell/session-signals/opencode')
-      fs.mkdirSync(signals, { recursive: true })
-      fs.writeFileSync(path.join(signals, terminal + '__' + Date.now() + '.json'),
-        JSON.stringify({ session_id: next }))
     `
     await rig.ownedProviderExec(before.containerId, [
-      'node', '-e', writeSignal, initial.nativeSession.value, switchedId, terminalId,
+      'node', '-e', createSelectedRoot, initial.nativeSession.value, switchedId,
     ])
+    wire.send({ type: 'terminal.input', terminalId, data: `SELECT_SESSION ${switchedId}\r` })
     await wire.wait(frame => frame.type === 'terminal.session.associated'
       && frame.terminalId === terminalId && frame.sessionRef?.sessionId === switchedId, 30_000).catch(async error => {
       throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; web: ${Object.values(rig.web.capturedOutput()).join('\n').slice(-3000)}`)

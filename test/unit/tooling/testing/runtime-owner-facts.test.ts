@@ -844,7 +844,7 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       const original = await fsp.readFile(batch.sourceDatabaseFile)
       if (stage === 'restoration') {
         await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')
-        expect(await fsp.readFile(batch.sourceDatabaseFile)).not.toEqual(original)
+        expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(original)).toBe(false)
         launch.mockClear(); remove.mockClear()
       }
       const beforeRefusal = await fsp.readFile(batch.sourceDatabaseFile)
@@ -855,14 +855,17 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       }
       await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId,
         stage === 'activation' ? 'source_generation_change' : 'none')).rejects.toThrow(/inspection|state|stopped/)
-      expect(await fsp.readFile(batch.sourceDatabaseFile)).toEqual(beforeRefusal)
-      if (stage === 'activation') expect(beforeRefusal).toEqual(original)
+      // Compare every byte with Buffer's native comparison. Recursive object
+      // equality walks each SQLite byte as a property and can itself exhaust
+      // the test deadline after the actual refusal has already settled.
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(beforeRefusal)).toBe(true)
+      if (stage === 'activation') expect(beforeRefusal.equals(original)).toBe(true)
       expect(launch).not.toHaveBeenCalled(); expect(remove).not.toHaveBeenCalled()
       expect((await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line)[0])).not.toContain('create')
       if (stage === 'restoration') {
         await fsp.writeFile(state, 'stopped')
         await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
-        expect(await fsp.readFile(batch.sourceDatabaseFile)).toEqual(original)
+        expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(original)).toBe(true)
       }
     } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
   })

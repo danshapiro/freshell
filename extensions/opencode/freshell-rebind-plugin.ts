@@ -758,32 +758,41 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
         progress('native_create_settled')
         navigate.call(api.route, 'session', { sessionID: root })
       }
-      if (currentRouteSessionId(api.route?.current) !== root) return refuse('route_not_selected')
+      // A fresh native launch may select another existing root in the TUI.
+      // Selection chooses what to read; only the complete native/hydrated
+      // conjunction below can replace the observed identity. Resume pins
+      // continue to require the exact requested root.
+      const selectedRoot = currentRouteSessionId(api.route?.current)
+      const candidate = launch.requestedNativeSessionId === null ? selectedRoot : root
+      if (candidate === null || selectedRoot !== candidate) return refuse('route_not_selected')
+      // The old root is no longer selected while the candidate's reads wait.
+      if (candidate !== root) withdraw('route_not_selected')
       const get = api.state?.session?.get
       const messages = api.state?.session?.messages
       if (typeof get !== 'function' || typeof messages !== 'function') return refuse('tui_session_api_unavailable')
       // Read the exact native root while the TUI hydrates it. Publication
       // still requires the current selected root and complete history below.
       progress('native_read_pending')
-      const native = await readNativeHistory(api, root)
+      const native = await readNativeHistory(api, candidate)
       if (deps.signal?.aborted) return
       progress('native_read_settled')
       if ('failure' in native) return refuse(native.failure)
-      const selected = asRecord(get(root))
-      if (!sessionIsExactRoot(selected, root)) return refuse('tui_root_not_loaded')
-      if (api.state?.ready !== true || currentRouteSessionId(api.route?.current) !== root) return refuse('tui_context_changed')
+      const selected = asRecord(get(candidate))
+      if (!sessionIsExactRoot(selected, candidate)) return refuse('tui_root_not_loaded')
+      if (api.state?.ready !== true || currentRouteSessionId(api.route?.current) !== candidate) return refuse('tui_context_changed')
       if (revertReference(native.session.revert) !== revertReference(selected?.revert)) return refuse('revert_not_hydrated')
-      const active = activeMessages(native.messages.map(row => asRecord(row)?.info), root, native.session.revert)
-      const hydrated = activeMessages(messages(root), root, selected?.revert)
+      const active = activeMessages(native.messages.map(row => asRecord(row)?.info), candidate, native.session.revert)
+      const hydrated = activeMessages(messages(candidate), candidate, selected?.revert)
       if (!active || !hydrated) return refuse('history_not_hydrated')
-      const tail = lastActiveMessageId(active, root)
-      if (active.length === 0 ? hydrated.length !== 0 : lastActiveMessageId(hydrated, root) !== tail) {
+      const tail = lastActiveMessageId(active, candidate)
+      if (active.length === 0 ? hydrated.length !== 0 : lastActiveMessageId(hydrated, candidate) !== tail) {
         return refuse('tail_not_hydrated')
       }
       if (tail !== null && !nativeTailPartsHydrated(api, native.messages, native.session.revert, tail)) {
         return refuse('parts_not_hydrated')
       }
       if (deps.signal?.aborted) return
+      root = candidate
       const evidence = JSON.stringify({ launch, native: {
         source: 'opencode-tui-native-loader', session_id: root, parent_id: null, hydrated: true,
         messages_read: active.length === 0 ? 'empty_confirmed' : 'success',
