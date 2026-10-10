@@ -4349,7 +4349,7 @@ async fn import_stopped_fixture_root(
         &descriptor,
         snapshot.open_payload().unwrap(),
         &destination,
-        &workspace,
+        workspace,
     )
     .unwrap();
     #[cfg(unix)]
@@ -4360,13 +4360,13 @@ async fn import_stopped_fixture_root(
         &descriptor,
         &InstalledStoreReaderContext {
             database_path: &destination,
-            workspace_root: &workspace,
+            workspace_root: workspace,
             provider_uid: uid,
             provider_gid: gid,
             home: &home,
             xdg_data_home: &data,
             xdg_config_home: &config,
-            cwd: &workspace,
+            cwd: workspace,
         },
     )
     .unwrap();
