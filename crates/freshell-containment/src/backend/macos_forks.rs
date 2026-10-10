@@ -7,8 +7,8 @@
 //! unit tag) of restricted programs (Apple's own binaries among them), and
 //! the responsible process is reset when a separately signed program such
 //! as the official `node` is exec'd (Task 7's T5, run 38024127146). So each
-//! unit runs one kqueue thread with `EVFILT_PROC` `NOTE_FORK | NOTE_EXIT`
-//! registered on every tracked process. Each batch of fork
+//! unit runs one kqueue thread with `EVFILT_PROC` `NOTE_FORK | NOTE_EXEC |
+//! NOTE_EXIT` registered on every tracked process. Each batch of fork
 //! events triggers one one-shot scan (`proc_listallpids` plus the
 //! zombie-aware lookup) that tracks every process of this server's uid
 //! whose parent, process group or session is a tracked process (to a fixed
@@ -18,6 +18,10 @@
 //! until its exit event. Every root starts as its own session leader (the
 //! `--setsid` shim), so a descendant that never calls `setsid` stays
 //! linked to it by its session after its parent exits.
+//!
+//! Codex's daemon family (judged by its own argv or an ancestor's) is never
+//! tracked, and so never recorded as a root: a tracked process that execs
+//! into it is dropped at its exec event.
 //!
 //! The contract: a process is tracked when, at the scan that follows its
 //! parent's fork event, its parent, its process-group leader or its session
@@ -40,6 +44,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::UnitObserver;
 use crate::darwin::{self, Kqueue};
+use crate::process;
 
 /// The per-unit tracker; its thread stops when this is dropped.
 pub(crate) struct ForkTracker {
@@ -49,8 +54,8 @@ pub(crate) struct ForkTracker {
 struct Shared {
     kq: Kqueue,
     unit_id: String,
-    /// Tracked processes (pid to start time), each registered for its fork
-    /// and exit events.
+    /// Tracked processes (pid to start time), each registered for its fork,
+    /// exec and exit events.
     tracked: Mutex<BTreeMap<u32, u64>>,
     observer: Mutex<Option<Arc<dyn UnitObserver>>>,
     /// A root was tracked: the thread scans for what it started before its
@@ -96,8 +101,9 @@ impl ForkTracker {
     }
 
     /// Tracks a unit root, when it still runs as the incarnation that
-    /// started at `start`, records it, and has the thread scan for what it
-    /// started before this registration.
+    /// started at `start` (and is not in Codex's daemon family), records it,
+    /// and has the thread scan for what it started before this
+    /// registration.
     pub(crate) fn track_root(&self, pid: u32, start: u64) {
         if self.shared.track(pid, start) {
             self.shared.report(&[(pid, start)], &[]);
@@ -137,9 +143,18 @@ impl Drop for ForkTracker {
 }
 
 impl Shared {
-    /// Registers `(pid, start)` for its fork and exit events. False when it
-    /// is already tracked, gone, exiting, or no longer that incarnation.
+    /// Registers `(pid, start)` for its fork, exec and exit events. False
+    /// when it is already tracked, in Codex's daemon family, gone, exiting,
+    /// or no longer that incarnation.
     fn track(&self, pid: u32, start: u64) -> bool {
+        let already = lock(&self.tracked).contains_key(&pid);
+        if already
+            || process::in_codex_daemon_family_unless(pid, |up, start| {
+                lock(&self.tracked).get(&up) == Some(&start)
+            })
+        {
+            return false;
+        }
         let mut tracked = lock(&self.tracked);
         if tracked.contains_key(&pid) {
             return false;
@@ -150,7 +165,7 @@ impl Shared {
             pid as usize,
             libc::EVFILT_PROC,
             libc::EV_ADD | libc::EV_CLEAR,
-            libc::NOTE_FORK | libc::NOTE_EXIT,
+            libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT,
         );
         if registered.is_err() {
             return false; // gone, or already exiting
@@ -188,7 +203,8 @@ impl Shared {
     }
 
     /// The thread: each batch of events runs one scan when a tracked
-    /// process forked (or a root was added), applies the exits, and records
+    /// process forked (or a root was added), drops a tracked process that
+    /// exec'd into Codex's daemon family, applies the exits, and records
     /// the batch's changes at once.
     fn run(&self) {
         loop {
@@ -216,9 +232,16 @@ impl Shared {
                 added = self.scan();
             }
             let mut removed = Vec::new();
-            for event in proc_events().filter(|e| e.fflags & libc::NOTE_EXIT != 0) {
+            for event in proc_events() {
                 let pid = event.ident as u32;
-                if self.untrack(pid) {
+                let exited = event.fflags & libc::NOTE_EXIT != 0;
+                let joined_daemon = !exited
+                    && event.fflags & libc::NOTE_EXEC != 0
+                    && process::argv(pid).is_ok_and(|argv| process::is_codex_daemon_family(&argv));
+                if joined_daemon {
+                    self.unregister(pid);
+                }
+                if (exited || joined_daemon) && self.untrack(pid) {
                     removed.push(pid);
                 }
             }

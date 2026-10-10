@@ -24,7 +24,7 @@ use tokio::sync::watch;
 use crate::backend::{Capability, MemberList, UnitBackend, UnitObserver};
 use crate::events::{self, UnitLogKeys};
 use crate::proc_watch::{ProcWatch, Sig};
-use crate::process::ProcIdentity;
+use crate::process::{self, ProcIdentity};
 use crate::record::{RecordStore, UnitRecord, UnitRecordState};
 use crate::{locks, testing, BoxFuture, UnitId};
 
@@ -577,13 +577,19 @@ impl AgentUnit {
     }
 
     /// Pins recorded roots by (pid, start) without rewriting the record; a
-    /// root that cannot be pinned is never signalled (Stage 2: LB-02).
+    /// root that cannot be pinned is never signalled (Stage 2: LB-02), and
+    /// neither is one in Codex's daemon family (a record written before the
+    /// family was kept out of the roots can name one): it is logged as
+    /// spared and never pinned.
     pub(crate) fn pin_recorded_roots(&self, roots: &[(u32, u64)]) {
         for (pid, start) in roots {
             // Told to the backend even when it has exited (it then ignores
-            // it).
+            // it); the macOS fork tracker refuses the daemon family itself.
             self.inner.backend.root_pinned(*pid, *start);
             match ProcWatch::open_expecting(*pid, *start) {
+                Ok(watch) if process::in_codex_daemon_family(*pid) => {
+                    events::spared(&self.log_keys(None), &[watch.identity().clone()]);
+                }
                 Ok(watch) => {
                     watch.watch_lock_paths(&lock(&self.inner.lock_paths));
                     lock(&self.inner.members).roots.push(watch);
@@ -935,45 +941,56 @@ impl AgentUnit {
     /// pinned process directly, so a unit whose container does not exist yet
     /// is still stopped. The last signal of the sequence. Returns the spared.
     async fn kill_unit(&self, keys: &UnitLogKeys, snapshot: &[ProcWatch]) -> Vec<ProcIdentity> {
-        let spared = self.kill_whole_unit(keys, snapshot).await;
-        if let Some(spared) = &spared {
-            events::spared(keys, spared);
+        let (spared, whole_unit_killed) = self.kill_whole_unit(keys, snapshot).await;
+        events::spared(keys, &spared);
+        if whole_unit_killed {
             events::signal_sent(keys, "SIGKILL", "unit", None);
         }
-        spared.unwrap_or_default()
+        spared
     }
 
     /// The backend's whole-unit kill over every live pinned process (plus
     /// `extra`), then SIGKILL through each non-spared pinned watch. Returns
-    /// the spared processes, or `None` when the whole-unit kill failed
-    /// (logged; the pinned processes are still killed).
+    /// the spared processes (the backend's, plus any pinned process whose
+    /// own argv is Codex's daemon family, never signalled even when the
+    /// whole-unit kill failed) and whether the whole-unit kill ran (a
+    /// failure is logged; the pinned processes are still killed).
     async fn kill_whole_unit(
         &self,
         keys: &UnitLogKeys,
         extra: &[ProcWatch],
-    ) -> Option<Vec<ProcIdentity>> {
+    ) -> (Vec<ProcIdentity>, bool) {
         let mut pinned = self.pinned_watches();
         pinned.extend(extra.iter().cloned());
         let roots = live_identities(&pinned);
-        let spared = match self.inner.backend.clone().kill_all(roots).await {
+        let (mut spared, whole_unit_killed) = match self.inner.backend.clone().kill_all(roots).await
+        {
             Ok(summary) => {
                 self.note_withheld(keys, summary.withheld);
                 if let Some(detail) = &summary.not_frozen {
                     events::freeze_timeout(keys, detail);
                 }
-                Some(summary.spared)
+                (summary.spared, true)
             }
             Err(err) => {
                 events::kill_all_failed(keys, &err.to_string());
-                None
+                (Vec::new(), false)
             }
         };
-        let none = Vec::new();
-        let skip = spared.as_ref().unwrap_or(&none);
-        for watch in pinned.iter().filter(|w| !is_spared(w, skip)) {
+        for watch in &pinned {
+            if is_spared(watch, &spared) {
+                continue;
+            }
+            // Judged by its own argv, as the backends' per-process kills
+            // judge each process: a root pinned from a record written
+            // before the daemon family was kept out of the roots.
+            if process::argv(watch.pid()).is_ok_and(|argv| process::is_codex_daemon_family(&argv)) {
+                spared.push(watch.identity().clone());
+                continue;
+            }
             let _ = watch.signal(Sig::Kill);
         }
-        spared
+        (spared, whole_unit_killed)
     }
 
     /// Step e: wait (event-driven) for the main, the screen and every
@@ -1797,6 +1814,13 @@ mod tests {
         fn identity(&self) -> (u32, u64) {
             identity_of(&self.watch)
         }
+
+        /// Still running as the same process (a SIGKILL would have ended
+        /// it).
+        fn untouched(&self) -> bool {
+            !self.watch.has_exited()
+                && process::start_time(self.watch.pid()).ok() == Some(self.identity().1)
+        }
     }
 
     #[cfg(unix)]
@@ -1864,6 +1888,103 @@ mod tests {
             assert_eq!(store.writes() - before, 1, "{name}");
             assert_eq!(recorded_roots(&unit), [root.identity()], "{name}");
         }
+    }
+
+    /// A whole-unit kill that fails (as when a member cannot be pinned):
+    /// the unit then kills its pinned processes itself.
+    #[cfg(unix)]
+    struct KillFails;
+
+    #[cfg(unix)]
+    impl UnitBackend for KillFails {
+        fn placement(&self, role: MemberRole, seq: u32) -> io::Result<Placement> {
+            NoProcesses.placement(role, seq)
+        }
+        fn kill_all(
+            self: Arc<Self>,
+            _roots: Vec<(u32, u64)>,
+        ) -> BoxFuture<'static, io::Result<KillSummary>> {
+            Box::pin(async { Err(io::Error::other("injected whole-unit kill failure")) })
+        }
+        fn members(&self, roots: &[(u32, u64)]) -> io::Result<MemberList> {
+            NoProcesses.members(roots)
+        }
+        fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {
+            NoProcesses.confirm_placement(pid, roots)
+        }
+        fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
+            None
+        }
+        fn remove(&self, emptied: bool) -> io::Result<()> {
+            NoProcesses.remove(emptied)
+        }
+    }
+
+    /// The user's rule (never signal Codex's managed daemon) on the boot
+    /// path: a record written before the daemon family was kept out of the
+    /// roots can name one. Finishing that unit pins and kills its other
+    /// roots, also when the whole-unit kill fails, and never signals (or
+    /// waits for) the daemon-family root.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recorded_daemon_family_root_is_never_signalled_when_the_whole_unit_kill_fails() {
+        let daemon = Spawned::perl_sleep(&["app-server", "--managed-daemon"]);
+        let plain = Spawned::perl_sleep(&[]);
+        let (unit, _store) = unit_with_record(Arc::new(KillFails));
+        let events = capture(|| unit.pin_recorded_roots(&[daemon.identity(), plain.identity()]));
+        let spared: Vec<u64> = named(&events, "unit.stop.spared")
+            .iter()
+            .map(|e| e.u64("pid"))
+            .collect();
+        assert_eq!(
+            spared,
+            [u64::from(daemon.identity().0)],
+            "the boot pin leaves the daemon-family root out, and says so"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            unit.stop(StopRequest::new(
+                StopMode::Force,
+                StopReason::BootFinish,
+                "boot",
+            ))
+            .wait_swept(),
+        )
+        .await
+        .expect("Gone, without waiting for the daemon-family root");
+        tokio::time::timeout(Duration::from_secs(5), plain.watch.exited())
+            .await
+            .expect("the plain root was killed")
+            .unwrap();
+        assert!(daemon.untouched(), "the daemon-family root was signalled");
+    }
+
+    /// The same rule where the unit kills its pinned processes itself: a
+    /// pinned process whose own argv is the daemon family is spared, not
+    /// killed and not waited for, when the whole-unit kill fails.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_daemon_family_process_is_never_signalled_when_the_whole_unit_kill_fails() {
+        let daemon = Spawned::perl_sleep(&["app-server", "--managed-daemon"]);
+        let plain = Spawned::perl_sleep(&[]);
+        let (unit, _store) = unit_with_record(Arc::new(KillFails));
+        unit.add_root(daemon.watch.clone());
+        unit.add_root(plain.watch.clone());
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            unit.stop(StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws"))
+                .wait_swept(),
+        )
+        .await
+        .expect("Gone, without waiting for the daemon-family process");
+        tokio::time::timeout(Duration::from_secs(5), plain.watch.exited())
+            .await
+            .expect("the plain root was killed")
+            .unwrap();
+        assert!(
+            daemon.untouched(),
+            "the daemon-family process was signalled"
+        );
     }
 
     /// macOS: the Gone lock check, on a backend whose members are exactly

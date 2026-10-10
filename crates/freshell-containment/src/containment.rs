@@ -240,6 +240,10 @@ impl Containment {
         let mut pinned = Vec::new();
         for (pid, start) in roots {
             match ProcWatch::open_expecting(*pid, *start) {
+                // Never pinned, so never signalled (as `pin_recorded_roots`).
+                Ok(watch) if crate::process::in_codex_daemon_family(*pid) => {
+                    events::spared(&unit.log_keys(None), &[watch.identity().clone()]);
+                }
                 Ok(watch) => pinned.push(watch),
                 Err(err) => {
                     events::root_not_pinned(&unit.log_keys(None), *pid, *start, &err.to_string())

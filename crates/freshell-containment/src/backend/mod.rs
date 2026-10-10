@@ -120,7 +120,8 @@ pub(crate) struct MemberList {
 /// backend whose container no longer ends its members when the server dies
 /// (Windows: kill-on-close cleared; macOS: there is no container, so every
 /// process the fork tracker follows) has each member recorded as a root, so
-/// a restarted server can reach it by identity.
+/// a restarted server can reach it by identity. Codex's daemon family is
+/// never recorded (each backend spares it before it reports a member).
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) trait UnitObserver: Send + Sync {
     /// Adds `(pid, start)` to the record's roots (nothing when present).

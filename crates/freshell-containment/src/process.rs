@@ -195,6 +195,49 @@ pub fn is_codex_daemon_family(argv: &[String]) -> bool {
             .any(|w| w[0] == "--listen" && w[1] == "unix://")
 }
 
+/// Whether `pid` is in Codex's daemon family: its own argv is
+/// ([`is_codex_daemon_family`]), or an ancestor's is, since the family
+/// includes every descendant. The parent chain is read up to this server
+/// at most (whatever started the server is never judged), and only through
+/// parents that started no later than their child (on Windows a dead
+/// parent's pid can name a later process). One-shot reads, used only to
+/// spare a process: a unit never records it as a root nor pins it from a
+/// record.
+pub(crate) fn in_codex_daemon_family(pid: u32) -> bool {
+    in_codex_daemon_family_unless(pid, |_, _| false)
+}
+
+/// [`in_codex_daemon_family`], ending the walk (false) at an ancestor
+/// `(pid, start time)` that `cleared` already knows to be outside the
+/// family (the macOS fork tracker's tracked processes, each judged when it
+/// was tracked and dropped if it execs into the family).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn in_codex_daemon_family_unless(pid: u32, cleared: impl Fn(u32, u64) -> bool) -> bool {
+    let me = std::process::id();
+    let mut at = pid;
+    for _ in 0..4096 {
+        if argv(at).is_ok_and(|argv| is_codex_daemon_family(&argv)) {
+            return true;
+        }
+        let (Ok(started), Some(up)) = (start_time(at), parent(at)) else {
+            return false;
+        };
+        if up <= 1 || up == me || up == at {
+            return false;
+        }
+        match start_time(up) {
+            Ok(parent_started) if parent_started <= started => {
+                if cleared(up, parent_started) {
+                    return false;
+                }
+                at = up;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Linux: the fields of `/proc/<pid>/stat` after `pid (comm) `, so a process
 /// name holding spaces or parentheses cannot shift them.
 #[cfg(target_os = "linux")]
