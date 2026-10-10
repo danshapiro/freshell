@@ -1161,7 +1161,7 @@ fn runtime_tmpfs(mode: Option<&str>) -> std::collections::BTreeMap<String, Strin
     ) {
         mounts.insert(
             "/run/freshell-private".to_string(),
-            "rw,noexec,nosuid,nodev,size=16m,mode=0700".to_string(),
+            "rw,noexec,nosuid,nodev,size=16m,mode=0710".to_string(),
         );
     }
     mounts
@@ -1700,7 +1700,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn fresh_agent_ownership_requires_the_same_souls_private_actor_mount() {
+    fn provider_private_parent_mount_adoption_checks_topology_and_actor_ownership() {
         let root = tempfile::tempdir().unwrap();
         let runtime_dir = root.path().join("incarnation-one");
         let workspace = root.path().join("workspace");
@@ -1792,6 +1792,18 @@ mod tests {
             ],
         });
         assert!(verify_inspect_config(&handle, &inspected).is_ok());
+        for option in [
+            "rw,noexec,nosuid,nodev,size=16m,mode=0700",
+            "rw,noexec,nosuid,nodev,size=16m,mode=0750",
+            "rw,noexec,nosuid,nodev,size=16m,mode=0710,uid=65534",
+        ] {
+            inspected["HostConfig"]["Tmpfs"]["/run/freshell-private"] = serde_json::json!(option);
+            assert!(matches!(
+                verify_inspect_config(&handle, &inspected),
+                Err(BackendError::OwnershipMismatch(_))
+            ));
+        }
+        inspected["HostConfig"]["Tmpfs"] = serde_json::json!(runtime_tmpfs(Some("codex")));
 
         inspected["Mounts"][4]["Source"] = serde_json::json!(host_actor_state_dir(
             root.path(),
@@ -1825,7 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_gets_dedicated_bounded_exec_tmpfs_while_global_tmp_stays_noexec() {
+    fn provider_private_parent_mount_preserves_bounded_opencode_exec_topology() {
         let opencode = runtime_tmpfs(Some("opencode"));
         assert_eq!(
             opencode.get("/tmp").map(String::as_str),
@@ -1838,7 +1850,7 @@ mod tests {
         assert_eq!(opencode.len(), 3);
         assert_eq!(
             opencode.get("/run/freshell-private").map(String::as_str),
-            Some("rw,noexec,nosuid,nodev,size=16m,mode=0700")
+            Some("rw,noexec,nosuid,nodev,size=16m,mode=0710")
         );
 
         let shell = runtime_tmpfs(Some("shell"));

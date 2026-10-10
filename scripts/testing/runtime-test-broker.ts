@@ -841,7 +841,7 @@ export class RestrictedDockerBroker {
 
     const tmpfs = host.Tmpfs ?? {}
     if (tmpfs['/tmp'] !== 'rw,noexec,nosuid,nodev,size=128m') return { ok: false, reason: 'runtime /tmp must remain bounded and noexec' }
-    if (tmpfs['/run/freshell-private'] !== undefined && tmpfs['/run/freshell-private'] !== 'rw,noexec,nosuid,nodev,size=16m,mode=0700') {
+    if (tmpfs['/run/freshell-private'] !== undefined && tmpfs['/run/freshell-private'] !== 'rw,noexec,nosuid,nodev,size=16m,mode=0710') {
       return { ok: false, reason: 'provider private tmpfs must be bounded and noexec' }
     }
     const tmpfsKeys = Object.keys(tmpfs).sort()

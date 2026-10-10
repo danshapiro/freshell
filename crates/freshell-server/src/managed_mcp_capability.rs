@@ -11414,6 +11414,99 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
     }
 
     #[test]
+    fn managed_mcp_capability_publication_failure_cleans_new_stage_and_keeps_prior_grant() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("control/mcp-capabilities");
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&directory).unwrap();
+        fs::create_dir_all(home.join(".config/opencode/plugins")).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        fs::write(
+            home.join(".config/opencode/plugins/command"),
+            "#!/bin/sh\nprintf prior-usable",
+        )
+        .unwrap();
+        fs::set_permissions(
+            home.join(".config/opencode/plugins/command"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let references = provider_source_references("opencode", &home).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let first = store
+            .issue(
+                soul.clone(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &references)),
+                Default::default(),
+                None,
+            )
+            .unwrap();
+        let first_root = staged_provider_root_path(&directory, &first.grant_id).unwrap();
+        let first_file = grant_path(&directory, &first.grant_id).unwrap();
+        store
+            .activate(
+                &first.grant_id,
+                soul.clone(),
+                IncarnationId::new(),
+                &directory,
+                &first.endpoint,
+            )
+            .unwrap();
+        let before = fs::read(&first_file).unwrap();
+        let token = store
+            .grants
+            .lock()
+            .unwrap()
+            .get(&first.grant_id)
+            .unwrap()
+            .token
+            .clone();
+        assert!(store.authenticates(&token));
+        // Provider roots and ephemeral input staging remain writable; only the
+        // final capability publication is denied after staging has completed.
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
+        let inline = "{\"theme\":\"synthetic-new-ephemeral\"}";
+        let failed = store.issue_replacement_with_inputs(
+            soul,
+            &directory,
+            "http://host.docker.internal:4000".into(),
+            Some(("opencode", &home, &references)),
+            OpencodeEphemeralInput {
+                inline_config: Some(inline),
+                workspace: Some(&workspace),
+                cwd: Some(&workspace),
+                ..Default::default()
+            },
+        );
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.unwrap_err().contains("journal publication failed"));
+        assert!(
+            fs::read(&first_file).unwrap() == before,
+            "prior grant changed"
+        );
+        assert!(store.authenticates(&token));
+        assert_eq!(store.grants.lock().unwrap().len(), 1);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        let roots = root.path().join("control/provider-roots");
+        assert_eq!(
+            fs::read_dir(&roots).unwrap().count(),
+            1,
+            "failed capability publication left a staged root or temporary generation"
+        );
+        assert!(first_root.join("plugins/command").is_file());
+        assert!(!first_root.join("ephemeral/inline-config.json").exists());
+        assert_eq!(
+            fs::read(first_root.join("plugins/command")).unwrap(),
+            b"#!/bin/sh\nprintf prior-usable"
+        );
+    }
+
+    #[test]
     fn opencode_provider_home_tui_source_is_approved_and_reread_safely() {
         let control = tempfile::tempdir().unwrap();
         let capabilities = control.path().join("mcp-capabilities");

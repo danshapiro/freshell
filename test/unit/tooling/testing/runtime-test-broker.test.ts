@@ -192,18 +192,43 @@ describe('managed MCP mount', () => {
 })
 
 describe('managed provider tmpfs', () => {
+  it('dispatches exact 0710 private parents and refuses mode or authority changes before Docker', async () => {
+    await withHttpBroker(async ({ request, forwarded }) => {
+      const base = { '/tmp': 'rw,noexec,nosuid,nodev,size=128m' }
+      const privateParent = 'rw,noexec,nosuid,nodev,size=16m,mode=0710'
+      for (const option of [
+        privateParent.replace('0710', '0700'),
+        privateParent.replace('0710', '0750'),
+        `${privateParent},uid=65534`,
+        privateParent.replace('noexec', 'exec'),
+      ]) {
+        const before = forwarded.length
+        expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody(
+          [...ordinaryBinds, actorBind], { ...base, '/run/freshell-private': option },
+        ))).status).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody(
+        [...ordinaryBinds, actorBind], { ...base, '/run/freshell-private': privateParent },
+      ))).status).toBe(201)
+    })
+  })
   it('accepts the bounded private provider mount and the OpenCode exec mount', () => {
     const validate = (body: Buffer): { ok: boolean } => (
       broker() as unknown as { validateCreate(body: Buffer): { ok: boolean } }
     ).validateCreate(body)
     const base = { '/tmp': 'rw,noexec,nosuid,nodev,size=128m' }
-    const privateTmp = { '/run/freshell-private': 'rw,noexec,nosuid,nodev,size=16m,mode=0700' }
+    const privateTmp = { '/run/freshell-private': 'rw,noexec,nosuid,nodev,size=16m,mode=0710' }
     const opencodeTmp = { '/run/opencode-tmp': 'rw,exec,nosuid,nodev,size=64m,mode=1777' }
 
     const binds = [...ordinaryBinds, actorBind]
     expect(validate(createBody(binds, { ...base, ...privateTmp })).ok).toBe(true)
+    for (const mode of ['0700', '0750', '0711', '0777']) {
+      expect(validate(createBody(binds, { ...base, '/run/freshell-private': `rw,noexec,nosuid,nodev,size=16m,mode=${mode}` })).ok).toBe(false)
+    }
+    expect(validate(createBody(binds, { ...base, '/run/freshell-private': 'rw,noexec,nosuid,nodev,size=16m,mode=0710,uid=65534' })).ok).toBe(false)
     expect(validate(createBody(binds, { ...base, ...privateTmp, ...opencodeTmp })).ok).toBe(true)
-    expect(validate(createBody(binds, { ...base, '/run/freshell-private': 'rw,exec,nosuid,nodev,size=16m,mode=0700' })).ok).toBe(false)
+    expect(validate(createBody(binds, { ...base, '/run/freshell-private': 'rw,exec,nosuid,nodev,size=16m,mode=0710' })).ok).toBe(false)
     expect(validate(createBody(binds, { ...base, ...privateTmp, '/run/unapproved': 'rw' })).ok).toBe(false)
   })
 })

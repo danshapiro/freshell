@@ -1,9 +1,44 @@
 #[cfg(unix)]
+fn executable_fixture_root() -> tempfile::TempDir {
+    match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+        Some(directory) => tempfile::tempdir_in(directory),
+        None => tempfile::tempdir(),
+    }
+    .unwrap()
+}
+
+#[cfg(unix)]
+fn write_runnable_plugin(base: &std::path::Path, relative: &str, nonce: &str) -> Vec<String> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    let plugin = base.join(relative);
+    fs::create_dir_all(plugin.join("node_modules/selected")).unwrap();
+    fs::write(plugin.join("asset"), format!("{nonce}-resource")).unwrap();
+    fs::write(
+        plugin.join("node_modules/selected/index.js"),
+        format!("module.exports='{}-dependency'", nonce),
+    )
+    .unwrap();
+    fs::write(plugin.join("command"), "#!/usr/bin/env node\nprocess.stdout.write(require('selected')+':'+require('node:fs').readFileSync(__dirname+'/asset','utf8'));\n").unwrap();
+    fs::set_permissions(plugin.join("command"), fs::Permissions::from_mode(0o751)).unwrap();
+    [
+        "",
+        "/command",
+        "/asset",
+        "/node_modules",
+        "/node_modules/selected",
+        "/node_modules/selected/index.js",
+    ]
+    .into_iter()
+    .map(|suffix| format!("{relative}{suffix}"))
+    .collect()
+}
+
+#[cfg(unix)]
 #[test]
 fn provider_uid_refresh_helper_updates_projection_without_erasing_provider_state() {
     use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 
-    let root = tempfile::tempdir().unwrap();
+    let root = executable_fixture_root();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
     let home = root.path().join("provider-home");
     let stage = root.path().join("stage");
@@ -14,16 +49,37 @@ fn provider_uid_refresh_helper_updates_projection_without_erasing_provider_state
     fs::write(plugins.join("old.js"), b"old").unwrap();
     fs::write(plugins.join("provider-created.js"), b"durable").unwrap();
     fs::write(staged_plugins.join("new.js"), b"new").unwrap();
+    let mut previous = write_runnable_plugin(&home, ".claude/plugins/runtime", "old");
+    previous.extend([
+        ".claude".into(),
+        ".claude/plugins".into(),
+        ".claude/plugins/old.js".into(),
+    ]);
+    let mut current =
+        write_runnable_plugin(&stage.join("projection"), ".claude/plugins/runtime", "new");
+    current.extend([
+        ".claude".into(),
+        ".claude/plugins".into(),
+        ".claude/plugins/new.js".into(),
+    ]);
     fs::write(
         home.join(".freshell-config-projection.json"),
-        br#"[".claude",".claude/plugins",".claude/plugins/old.js"]"#,
+        serde_json::to_vec(&previous).unwrap(),
     )
     .unwrap();
     fs::write(
         stage.join("projection/.freshell-config-projection.json"),
-        br#"[".claude",".claude/plugins",".claude/plugins/new.js"]"#,
+        serde_json::to_vec(&current).unwrap(),
     )
     .unwrap();
+    let execute = || {
+        let output = Command::new(plugins.join("runtime/command"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        output.stdout
+    };
+    assert_eq!(execute(), b"old-dependency:old-resource");
     fs::write(stage.join("manifest.json"), br#"[".claude/plugins"]"#).unwrap();
 
     let uid = unsafe { libc::geteuid() };
@@ -48,6 +104,7 @@ fn provider_uid_refresh_helper_updates_projection_without_erasing_provider_state
         status.success(),
         "provider UID/GID refresh helper failed: {status}"
     );
+    assert_eq!(execute(), b"new-dependency:new-resource");
     assert!(!plugins.join("old.js").exists());
     assert_eq!(fs::read(plugins.join("new.js")).unwrap(), b"new");
     assert_eq!(
@@ -100,7 +157,11 @@ fn provider_config_spawned_helper_emits_safe_jsonl_for_success_and_typed_failure
             .collect()
     };
     let events = parse(&success.stderr);
-    assert_eq!(events.len(), 2, "copy logs must be per-operation");
+    assert_eq!(
+        events.len(),
+        4,
+        "copy and transaction logs must be per-operation"
+    );
     for event in &events {
         eprintln!("{event}");
     }
@@ -129,7 +190,11 @@ fn provider_config_spawned_helper_emits_safe_jsonl_for_success_and_typed_failure
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
     let events = parse(&failed.stderr);
-    assert_eq!(events.len(), 3, "start, typed failure and final fatal only");
+    assert_eq!(
+        events.len(),
+        5,
+        "bounded transaction/copy failure and final fatal only"
+    );
     for event in &events {
         eprintln!("{event}");
     }
@@ -305,4 +370,215 @@ fn provider_config_preparation_worker_consumes_bounded_private_control_and_clean
         fs::read(home.join(".config/opencode/plugin/command")).unwrap(),
         accepted
     );
+}
+#[cfg(unix)]
+#[test]
+fn provider_config_manifest_failure_preserves_runnable_previous_projection() {
+    use std::{
+        fs,
+        os::unix::{fs::PermissionsExt, process::CommandExt},
+        process::Command,
+    };
+    let root = executable_fixture_root();
+    let home = root.path().join("home");
+    let stage = root.path().join("stage");
+    write_runnable_plugin(&home, "plugin", "old");
+    write_runnable_plugin(&stage.join("projection"), "plugin", "new");
+    fs::write(home.join("plugin/stale"), "old-owned").unwrap();
+    fs::write(home.join("plugin/provider-created"), "native-state").unwrap();
+    let previous = [
+        "plugin",
+        "plugin/command",
+        "plugin/asset",
+        "plugin/stale",
+        "plugin/node_modules",
+        "plugin/node_modules/selected",
+        "plugin/node_modules/selected/index.js",
+    ];
+    let manifest = serde_json::to_vec(&previous).unwrap();
+    fs::write(home.join(".freshell-config-projection.json"), &manifest).unwrap();
+    let mut current = previous
+        .iter()
+        .filter(|path| **path != "plugin/stale")
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>();
+    for index in 0..40 {
+        let relative = format!("plugin/additional-resource-{index:03}");
+        fs::write(stage.join("projection").join(&relative), "new").unwrap();
+        current.push(relative);
+    }
+    fs::write(
+        stage.join("projection/.freshell-config-projection.json"),
+        serde_json::to_vec(&current).unwrap(),
+    )
+    .unwrap();
+    fs::write(stage.join("manifest.json"), br#"["plugin"]"#).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_freshell-session-host"));
+    command
+        .arg("refresh-provider-config")
+        .arg(&stage)
+        .arg(&home);
+    // A real filesystem write fault, scoped to the disposable child. Every
+    // resource fits; the complete new manifest does not. No production hook.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: 512,
+                rlim_max: 512,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "manifest fault must reject refresh"
+    );
+    let executed = Command::new(home.join("plugin/command")).output().unwrap();
+    assert!(executed.status.success());
+    assert_eq!(
+        executed.stdout, b"old-dependency:old-resource",
+        "failed refresh replaced the usable environment"
+    );
+    assert_eq!(
+        fs::read(home.join(".freshell-config-projection.json")).unwrap(),
+        manifest
+    );
+    assert_eq!(fs::read(home.join("plugin/stale")).unwrap(), b"old-owned");
+    assert_eq!(
+        fs::read(home.join("plugin/provider-created")).unwrap(),
+        b"native-state"
+    );
+    assert!(!home.join("plugin/additional-resource-000").exists());
+    // Fail after earlier manifest-owned leaves have moved into backup. The
+    // inaccessible stale leaf is ordered last, so this exercises rollback.
+    fs::create_dir(home.join("zzblocked")).unwrap();
+    fs::write(home.join("zzblocked/stale"), "retained-stale").unwrap();
+    let mut extended = previous
+        .iter()
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>();
+    extended.extend(["zzblocked".into(), "zzblocked/stale".into()]);
+    let extended_manifest = serde_json::to_vec(&extended).unwrap();
+    fs::write(
+        home.join(".freshell-config-projection.json"),
+        &extended_manifest,
+    )
+    .unwrap();
+    fs::set_permissions(home.join("zzblocked"), fs::Permissions::from_mode(0o500)).unwrap();
+    let denied = Command::new(env!("CARGO_BIN_EXE_freshell-session-host"))
+        .arg("refresh-provider-config")
+        .arg(&stage)
+        .arg(&home)
+        .output()
+        .unwrap();
+    fs::set_permissions(home.join("zzblocked"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !denied.status.success(),
+        "stale leaf permission failure must block refresh"
+    );
+    assert_eq!(
+        Command::new(home.join("plugin/command"))
+            .output()
+            .unwrap()
+            .stdout,
+        b"old-dependency:old-resource"
+    );
+    assert_eq!(
+        fs::read(home.join(".freshell-config-projection.json")).unwrap(),
+        extended_manifest
+    );
+    assert_eq!(
+        fs::read(home.join("zzblocked/stale")).unwrap(),
+        b"retained-stale"
+    );
+    let events = String::from_utf8(denied.stderr).unwrap();
+    assert!(events.contains("provider.projection.transaction.rollback"));
+    assert!(events.contains("\"successful\":true"));
+    // An unreadable selected file must fail during staging, with no mutation.
+    fs::set_permissions(
+        stage.join("projection/plugin/asset"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let unreadable = Command::new(env!("CARGO_BIN_EXE_freshell-session-host"))
+        .arg("refresh-provider-config")
+        .arg(&stage)
+        .arg(&home)
+        .output()
+        .unwrap();
+    fs::set_permissions(
+        stage.join("projection/plugin/asset"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    assert!(!unreadable.status.success());
+    assert_eq!(
+        Command::new(home.join("plugin/command"))
+            .output()
+            .unwrap()
+            .stdout,
+        b"old-dependency:old-resource"
+    );
+    assert_eq!(
+        fs::read(home.join(".freshell-config-projection.json")).unwrap(),
+        extended_manifest
+    );
+    let accepted = Command::new(env!("CARGO_BIN_EXE_freshell-session-host"))
+        .arg("refresh-provider-config")
+        .arg(&stage)
+        .arg(&home)
+        .output()
+        .unwrap();
+    assert!(accepted.status.success(), "{accepted:?}");
+    assert_eq!(
+        Command::new(home.join("plugin/command"))
+            .output()
+            .unwrap()
+            .stdout,
+        b"new-dependency:new-resource"
+    );
+    assert!(!home.join("plugin/stale").exists());
+    assert_eq!(
+        fs::read(home.join("plugin/provider-created")).unwrap(),
+        b"native-state"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_config_selected_collision_cannot_replace_provider_created_leaf() {
+    use std::{fs, process::Command};
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let stage = root.path().join("stage");
+    fs::create_dir_all(home.join("skills")).unwrap();
+    fs::create_dir_all(stage.join("projection/skills")).unwrap();
+    fs::write(home.join("skills/provider-created"), "native-state").unwrap();
+    fs::write(stage.join("projection/skills/provider-created"), "incoming").unwrap();
+    fs::write(stage.join("manifest.json"), br#"["skills"]"#).unwrap();
+    fs::write(
+        stage.join("projection/.freshell-config-projection.json"),
+        br#"["skills","skills/provider-created"]"#,
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_freshell-session-host"))
+        .arg("refresh-provider-config")
+        .arg(&stage)
+        .arg(&home)
+        .output()
+        .unwrap();
+    assert!(
+        !result.status.success(),
+        "unowned leaf collision must block before publication"
+    );
+    assert_eq!(
+        fs::read(home.join("skills/provider-created")).unwrap(),
+        b"native-state"
+    );
+    assert!(!home.join(".freshell-config-projection.json").exists());
 }

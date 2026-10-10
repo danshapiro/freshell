@@ -1010,14 +1010,40 @@ async fn grant_execution(
                     .map_err(|error| error.runtime_error())?,
                 None => terminal,
             };
+            let resolved_secrets = prepared_secrets.take().ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "prepared terminal credentials unavailable",
+                )
+            })?;
+            let prepare_files = |terminal: &TerminalLaunchSpec| {
+                prepare_provider_files(
+                    &terminal.mode,
+                    &resolved_secrets.provider_files,
+                    &resolved_secrets.configuration_files,
+                    terminal.run_as_uid,
+                    terminal.run_as_gid,
+                    terminal
+                        .provider_launch_context
+                        .as_ref()
+                        .and_then(|context| context.prepared_inputs.as_ref())
+                        .is_some_and(|inputs| inputs.indexed_files.is_some()),
+                )
+            };
             // First boot transfers the durable provider-home inode to the
             // unprivileged provider. An exact-resume host lacks FOWNER and
             // DAC_OVERRIDE, so it stages current approved config and asks a
             // provider-owned helper to refresh only that projection. Docker's
             // ownership proof pins the same soul-scoped volume on replacement.
             if !exact_resume {
-                prepare_provider_state_for_fresh_launch(&mut terminal)?;
+                prepare_provider_state_for_fresh_launch(&mut terminal, prepare_files)?;
             } else {
+                prepare_files(&terminal).map_err(|error| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        format!("prepare OneCLI provider files: {error}"),
+                    )
+                })?;
                 refresh_provider_context(
                     terminal.provider_launch_context.as_ref(),
                     &terminal.mode,
@@ -1028,30 +1054,6 @@ async fn grant_execution(
                 )
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
-            let resolved_secrets = prepared_secrets.take().ok_or_else(|| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    "prepared terminal credentials unavailable",
-                )
-            })?;
-            prepare_provider_files(
-                &terminal.mode,
-                &resolved_secrets.provider_files,
-                &resolved_secrets.configuration_files,
-                terminal.run_as_uid,
-                terminal.run_as_gid,
-                terminal
-                    .provider_launch_context
-                    .as_ref()
-                    .and_then(|context| context.prepared_inputs.as_ref())
-                    .is_some_and(|inputs| inputs.indexed_files.is_some()),
-            )
-            .map_err(|error| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("prepare OneCLI provider files: {error}"),
-                )
-            })?;
             let prepared = providers::prepare_terminal(
                 terminal,
                 &resolved_secrets.environment,
@@ -1133,6 +1135,33 @@ async fn grant_execution(
                 launch.permission_mode = resume.permission_mode.clone();
                 launch.cwd = resume.cwd.clone();
             }
+            let mut resolved_secrets = prepared_secrets.take().ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "prepared fresh-agent credentials unavailable",
+                )
+            })?;
+            let prepare_files = || {
+                prepare_provider_files(
+                    launch.provider.native_provider(),
+                    &resolved_secrets.provider_files,
+                    &resolved_secrets.configuration_files,
+                    launch.run_as_uid,
+                    launch.run_as_gid,
+                    launch
+                        .provider_launch_context
+                        .as_ref()
+                        .and_then(|context| context.prepared_inputs.as_ref())
+                        .is_some_and(|inputs| inputs.indexed_files.is_some()),
+                )
+                .map_err(|error| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        format!("prepare hosted OneCLI provider files: {error}"),
+                    )
+                })?;
+                Ok::<(), RuntimeError>(())
+            };
             if !exact_resume {
                 prepare_provider_bootstrap_files(
                     launch.provider.native_provider(),
@@ -1150,6 +1179,7 @@ async fn grant_execution(
                         format!("prepare hosted fresh-agent provider state failed: {error}"),
                     )
                 })?;
+                prepare_files()?;
                 prepare_provider_context(
                     launch.provider_launch_context.as_ref(),
                     launch.provider.native_provider(),
@@ -1164,6 +1194,7 @@ async fn grant_execution(
                     )
                 })?;
             } else {
+                prepare_files()?;
                 refresh_provider_context(
                     launch.provider_launch_context.as_ref(),
                     launch.provider.native_provider(),
@@ -1174,30 +1205,6 @@ async fn grant_execution(
                 )
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
-            let mut resolved_secrets = prepared_secrets.take().ok_or_else(|| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    "prepared fresh-agent credentials unavailable",
-                )
-            })?;
-            prepare_provider_files(
-                launch.provider.native_provider(),
-                &resolved_secrets.provider_files,
-                &resolved_secrets.configuration_files,
-                launch.run_as_uid,
-                launch.run_as_gid,
-                launch
-                    .provider_launch_context
-                    .as_ref()
-                    .and_then(|context| context.prepared_inputs.as_ref())
-                    .is_some_and(|inputs| inputs.indexed_files.is_some()),
-            )
-            .map_err(|error| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("prepare hosted OneCLI provider files: {error}"),
-                )
-            })?;
             providers::prepare_fresh_agent_child_environment(
                 &launch,
                 &mut resolved_secrets.environment,
@@ -1266,6 +1273,7 @@ async fn grant_execution(
 
 fn prepare_provider_state_for_fresh_launch(
     terminal: &mut TerminalLaunchSpec,
+    prepare_files: impl Fn(&TerminalLaunchSpec) -> Result<(), String>,
 ) -> Result<(), RuntimeError> {
     if terminal.mode == "amplifier"
         && terminal.provider_bootstrap_files.is_empty()
@@ -1282,6 +1290,7 @@ fn prepare_provider_state_for_fresh_launch(
             terminal.run_as_uid,
             terminal.run_as_gid,
         )
+        .and_then(|_| prepare_files(terminal))
         .and_then(|_| {
             prepare_provider_context_for_fresh_launch(terminal, &ProviderConfigPaths::default())
         })
@@ -1336,6 +1345,7 @@ fn prepare_provider_state_for_fresh_launch(
             )
         },
         |terminal| {
+            prepare_files(terminal)?;
             prepare_provider_context_for_fresh_launch(terminal, &ProviderConfigPaths::default())
         },
     )
@@ -2476,36 +2486,357 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     }) {
         return Err("resource mountpoint metadata has an invalid owned root".into());
     }
-    copy_environment_with_events_for_mounts(
-        "provider_publication",
-        &provider,
-        &selections,
-        provider_home,
-        &[],
-        &mounted,
-    )
-    .map_err(|error| error.to_string())?;
-    let mut stale = previous.difference(&current).collect::<Vec<_>>();
-    stale.sort_by_key(|path| std::cmp::Reverse(Path::new(path).components().count()));
-    for relative in stale {
-        if protected.contains(relative) {
-            continue;
+    publish_provider_projection(ProviderProjection {
+        provider: &provider,
+        selections: &selections,
+        home: provider_home,
+        previous: &previous,
+        current: &current,
+        protected: &protected,
+        mounted: &mounted,
+    })
+}
+
+struct ProviderProjection<'a> {
+    provider: &'a str,
+    selections: &'a [freshell_platform::provider_environment::CopySelection],
+    home: &'a Path,
+    previous: &'a std::collections::BTreeSet<String>,
+    current: &'a std::collections::BTreeSet<String>,
+    protected: &'a std::collections::BTreeSet<String>,
+    mounted: &'a [PathBuf],
+}
+
+// One provider-owned transaction covers replacement, stale removal and manifest
+// publication. Its private stage and backups live on HOME's filesystem; only
+// exact manifest leaves move, so shared directories keep native children.
+fn publish_provider_projection(projection: ProviderProjection<'_>) -> Result<(), String> {
+    publish_provider_projection_with_manifest(projection, |source, destination| {
+        std::fs::rename(source, destination)
+    })
+}
+
+fn publish_provider_projection_with_manifest(
+    projection: ProviderProjection<'_>,
+    publish_manifest: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let ProviderProjection {
+        provider,
+        selections,
+        home,
+        previous,
+        current,
+        protected,
+        mounted,
+    } = projection;
+    use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt};
+    emit_environment_event(
+        serde_json::json!({"severity":"info","event":"provider.projection.transaction.started","provider":provider,"stage":"stage","previous_entries":previous.len(),"desired_entries":current.len()}),
+    );
+    let transaction = tempfile::Builder::new()
+        .prefix(".freshell-provider-transaction-")
+        .tempdir_in(home)
+        .map_err(|error| format!("provider transaction stage: {error}"))?;
+    let desired = transaction.path().join("desired");
+    let backup = transaction.path().join("backup");
+    fs::create_dir(&backup).map_err(|error| error.to_string())?;
+    let staged = (|| {
+        let report = copy_environment_with_events(
+            "provider_publication",
+            provider,
+            selections,
+            &desired,
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+        let actual = report
+            .projected_paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        if &actual != current {
+            return Err(
+                "provider projection manifest does not describe the complete selected environment"
+                    .into(),
+            );
         }
-        let destination = provider_home.join(relative);
-        if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
-            if metadata.is_dir() {
-                match std::fs::remove_dir(&destination) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                    Err(error) => return Err(error.to_string()),
+        // Serialize, write and sync the complete manifest before changing HOME.
+        let manifest = write_projection_manifest(transaction.path(), current)?;
+        // Links crossing mounted resource boundaries must still resolve in the
+        // final HOME graph, not relative to the independent alias mount.
+        for relative in current {
+            let source = desired.join(relative);
+            if fs::symlink_metadata(&source)
+                .map_err(|error| error.to_string())?
+                .file_type()
+                .is_symlink()
+            {
+                let target = fs::read_link(&source).map_err(|error| error.to_string())?;
+                let physical = fs::canonicalize(&source).map_err(|error| error.to_string())?;
+                let target_relative = physical
+                    .strip_prefix(&desired)
+                    .map_err(|_| "staged resource link escapes its complete projection")?;
+                if mounted.iter().any(|root| {
+                    Path::new(relative).starts_with(root) && !target_relative.starts_with(root)
+                }) {
+                    fs::remove_file(&source).map_err(|error| error.to_string())?;
+                    std::os::unix::fs::symlink(home.join(target_relative), &source)
+                        .map_err(|error| error.to_string())?;
+                } else if target.is_absolute() {
+                    return Err(
+                        "staged resource link must resolve within the selected projection".into(),
+                    );
                 }
-            } else {
-                std::fs::remove_file(&destination).map_err(|error| error.to_string())?;
             }
         }
+        Ok(manifest)
+    })();
+    let manifest = match staged {
+        Ok(manifest) => manifest,
+        Err(cause) => {
+            emit_environment_event(
+                serde_json::json!({"severity":"error","event":"provider.projection.transaction.failed","provider":provider,"stage":"stage","cause":cause}),
+            );
+            return Err(cause);
+        }
+    };
+    let mut old = BTreeMap::new();
+    let mut incoming = BTreeMap::new();
+    let prepared: Result<(), String> = (|| {
+        for relative in previous.union(current) {
+            if protected.contains(relative) {
+                continue;
+            }
+            match fs::symlink_metadata(home.join(relative)) {
+                Ok(metadata) => {
+                    old.insert(relative.clone(), metadata);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("provider transaction inspect {relative}: {error}"))
+                }
+            }
+            if current.contains(relative) {
+                let metadata = fs::symlink_metadata(desired.join(relative))
+                    .map_err(|error| error.to_string())?;
+                if let Some(existing) = old.get(relative) {
+                    let shared_directory = existing.is_dir() && metadata.is_dir();
+                    if !shared_directory
+                        && !previous.contains(relative)
+                        && !mounted.contains(&PathBuf::from(relative))
+                    {
+                        return Err(format!("provider transaction destination {relative} is provider-created; retain it and repair the selected path"));
+                    }
+                    if existing.is_dir() && !metadata.is_dir() {
+                        validate_owned_projection_descendants(home, Path::new(relative), previous)?;
+                    }
+                }
+                incoming.insert(relative.clone(), metadata);
+            }
+        }
+        // Mounted files keep their inode. Back up their complete prior contents
+        // before any mutation, with the same shared copy byte profile.
+        let limits = freshell_platform::provider_environment::CopyLimits::default();
+        let mut bytes = 0u64;
+        for (relative, metadata) in &old {
+            if mounted.contains(&PathBuf::from(relative)) && metadata.is_file() {
+                bytes = bytes
+                    .checked_add(metadata.len())
+                    .ok_or("provider mounted backup byte accounting overflow")?;
+                if metadata.len() > limits.max_file_bytes || bytes > limits.max_total_bytes {
+                    return Err(format!(
+                        "provider mounted backup {relative} exceeds shared resource byte limits"
+                    ));
+                }
+                let saved = backup.join(relative);
+                fs::create_dir_all(saved.parent().ok_or("backup parent unavailable")?)
+                    .map_err(|error| error.to_string())?;
+                fs::copy(home.join(relative), &saved)
+                    .map_err(|error| format!("provider transaction backup {relative}: {error}"))?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(cause) = prepared {
+        emit_environment_event(
+            serde_json::json!({"severity":"error","event":"provider.projection.transaction.failed","provider":provider,"stage":"validate","cause":cause}),
+        );
+        return Err(cause);
     }
-    write_projection_manifest(provider_home, &current)?;
+    let mut moved = Vec::<String>::new();
+    let mut installed = Vec::<String>::new();
+    let mut created = Vec::<String>::new();
+    let mut removed = Vec::<(String, u32)>::new();
+    let mut touched_mounts = Vec::<String>::new();
+    let publication: Result<(), String> = (|| {
+        for (relative, metadata) in &old {
+            if metadata.is_dir() || !previous.contains(relative) || protected.contains(relative) {
+                continue;
+            }
+            if mounted.contains(&PathBuf::from(relative)) {
+                continue;
+            }
+            let saved = backup.join(relative);
+            fs::create_dir_all(saved.parent().ok_or("backup parent unavailable")?)
+                .map_err(|error| error.to_string())?;
+            fs::rename(home.join(relative), saved)
+                .map_err(|error| format!("provider transaction backup {relative}: {error}"))?;
+            moved.push(relative.clone());
+        }
+        let mut directories = old
+            .iter()
+            .filter(|(_, metadata)| metadata.is_dir())
+            .collect::<Vec<_>>();
+        directories
+            .sort_by_key(|(path, _)| std::cmp::Reverse(Path::new(path).components().count()));
+        for (relative, metadata) in directories {
+            if !previous.contains(relative)
+                || protected.contains(relative)
+                || incoming
+                    .get(relative)
+                    .is_some_and(|metadata| metadata.is_dir())
+                || mounted.contains(&PathBuf::from(relative))
+            {
+                continue;
+            }
+            match fs::remove_dir(home.join(relative)) {
+                Ok(()) => removed.push((relative.clone(), metadata.permissions().mode())),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                        && !incoming.contains_key(relative) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "provider transaction remove directory {relative}: {error}"
+                    ))
+                }
+            }
+        }
+        let mut nodes = incoming.iter().collect::<Vec<_>>();
+        nodes.sort_by_key(|(path, _)| Path::new(path).components().count());
+        for (relative, metadata) in nodes {
+            let destination = home.join(relative);
+            if metadata.is_dir() {
+                if !destination.exists() {
+                    fs::create_dir(&destination).map_err(|error| {
+                        format!("provider transaction create {relative}: {error}")
+                    })?;
+                    created.push(relative.clone());
+                    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
+                        .map_err(|error| error.to_string())?;
+                }
+            } else if mounted.contains(&PathBuf::from(relative)) {
+                if !metadata.is_file()
+                    || !old.get(relative).is_some_and(|metadata| metadata.is_file())
+                {
+                    return Err(format!(
+                        "provider transaction mounted file {relative} must retain a regular inode"
+                    ));
+                }
+                touched_mounts.push(relative.clone());
+                replace_mounted_projection_file(&desired.join(relative), &destination)?;
+            } else {
+                fs::rename(desired.join(relative), &destination)
+                    .map_err(|error| format!("provider transaction install {relative}: {error}"))?;
+                installed.push(relative.clone());
+            }
+        }
+        publish_manifest(&manifest, &home.join(PROVIDER_PROJECTION_MANIFEST))
+            .map_err(|error| format!("provider transaction publish manifest: {error}"))?;
+        Ok(())
+    })();
+    if let Err(cause) = publication {
+        let rollback: Result<(), String> = (|| {
+            for relative in installed.iter().rev() {
+                fs::remove_file(home.join(relative)).map_err(|error| error.to_string())?;
+            }
+            for relative in created.iter().rev() {
+                fs::remove_dir(home.join(relative)).map_err(|error| error.to_string())?;
+            }
+            for (relative, mode) in removed.iter().rev() {
+                fs::create_dir(home.join(relative)).map_err(|error| error.to_string())?;
+                fs::set_permissions(home.join(relative), fs::Permissions::from_mode(*mode))
+                    .map_err(|error| error.to_string())?;
+            }
+            for relative in moved.iter().rev() {
+                fs::rename(backup.join(relative), home.join(relative))
+                    .map_err(|error| error.to_string())?;
+            }
+            for relative in touched_mounts.iter().rev() {
+                replace_mounted_projection_file(&backup.join(relative), &home.join(relative))?;
+            }
+            Ok(())
+        })();
+        emit_environment_event(
+            serde_json::json!({"severity":if rollback.is_ok(){"info"}else{"error"},"event":"provider.projection.transaction.rollback","provider":provider,"stage":"rollback","restored":moved.len(),"removed":installed.len(),"successful":rollback.is_ok()}),
+        );
+        emit_environment_event(
+            serde_json::json!({"severity":"error","event":"provider.projection.transaction.failed","provider":provider,"stage":"publish","cause":cause}),
+        );
+        if let Err(rollback_cause) = rollback {
+            let retained = transaction.keep();
+            return Err(format!(
+                "{cause}; rollback failed: {rollback_cause}; retain backup {} and repair",
+                retained.display()
+            ));
+        }
+        return Err(cause);
+    }
+    emit_environment_event(
+        serde_json::json!({"severity":"info","event":"provider.projection.transaction.committed","provider":provider,"stage":"commit","installed":installed.len(),"retired":moved.len()}),
+    );
+    if let Err(error) = transaction.close() {
+        emit_environment_event(
+            serde_json::json!({"severity":"error","event":"provider.projection.transaction.cleanup_failed","provider":provider,"stage":"cleanup","cause":error.to_string()}),
+        );
+        // Publication has committed. Cleanup failure is observable but cannot
+        // retroactively turn the complete environment into a failed refresh.
+    }
     Ok(())
+}
+
+fn validate_owned_projection_descendants(
+    home: &Path,
+    relative: &Path,
+    previous: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    for entry in std::fs::read_dir(home.join(relative)).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let child = relative.join(entry.file_name());
+        if !previous.contains(
+            child
+                .to_str()
+                .ok_or("provider projection path is not UTF-8")?,
+        ) {
+            return Err(format!("provider transaction incompatible replacement {} contains provider-created descendants", relative.display()));
+        }
+        if std::fs::symlink_metadata(entry.path())
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            validate_owned_projection_descendants(home, &child, previous)?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_mounted_projection_file(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::{fs, io::Write};
+    let mut input = fs::File::open(source).map_err(|error| error.to_string())?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(destination)
+        .map_err(|error| error.to_string())?;
+    std::io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
+    output.flush().map_err(|error| error.to_string())?;
+    output.sync_all().map_err(|error| error.to_string())?;
+    fs::set_permissions(
+        destination,
+        fs::metadata(source)
+            .map_err(|error| error.to_string())?
+            .permissions(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn prepare_provider_context(
@@ -2639,44 +2970,26 @@ fn prepare_provider_files_at(
     // Retain native auth until a matching typed grant has been written and
     // owned. The final destination replacement occurs only for that grant.
     for (index, (relative, contents)) in provider_files.iter().enumerate() {
+        use std::io::Write;
         let destination = home.join(relative);
-        let target = auth_dir.join(format!("provider-{index}"));
-        let temporary = auth_dir.join(format!("provider-{index}-tmp-{}", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        use std::io::Write as _;
-        let mut file = options
-            .open(&temporary)
+        let mut target = tempfile::Builder::new()
+            .prefix(&format!("provider-{index}-"))
+            .tempfile_in(auth_dir)
             .map_err(|error| error.to_string())?;
-        file.write_all(contents)
+        target
+            .write_all(contents)
             .map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
-        std::fs::rename(&temporary, &target).map_err(|error| error.to_string())?;
-        set_mode(&target, 0o600)?;
-        set_owner(&target, run_as_uid, run_as_gid)?;
-        let parent = destination.parent().ok_or("auth file has no parent")?;
-        run_provider_path_command(
-            run_as_uid,
-            run_as_gid,
-            "/usr/bin/mkdir",
-            &["-p", "--", parent.to_str().ok_or("auth path is not UTF-8")?],
-        )?;
-        run_provider_path_command(
-            run_as_uid,
-            run_as_gid,
-            "/usr/bin/ln",
-            &[
-                "-sfnT",
-                "--",
-                target.to_str().ok_or("auth path is not UTF-8")?,
-                destination.to_str().ok_or("auth path is not UTF-8")?,
-            ],
-        )?;
+        target
+            .as_file()
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        set_mode(target.path(), 0o600)?;
+        set_owner(target.path(), run_as_uid, run_as_gid)?;
+        publish_configuration_link(&destination, target.path(), run_as_uid, run_as_gid)
+            .map_err(str::to_owned)?;
+        // The accepted link now owns this target for this host lifetime. A
+        // failed publication instead drops the unselected temporary target.
+        target.keep().map_err(|error| error.error.to_string())?;
     }
     let mut aggregate = 0u64;
     for (index, (relative, source)) in configuration_files.iter().enumerate() {
@@ -2819,22 +3132,42 @@ fn publish_configuration_link(
         ],
     )
     .map_err(|_| "configuration-file parent creation failed")?;
+    let temporary = parent.join(format!(".freshell-file-link-{}", uuid::Uuid::new_v4()));
+    let temporary_name = temporary
+        .to_str()
+        .ok_or("configuration-file temporary path is not UTF-8")?;
     run_provider_path_command(
         uid,
         gid,
         "/usr/bin/ln",
         &[
-            "-sfnT",
+            "-sT",
             "--",
             target
                 .to_str()
                 .ok_or("configuration-file target is not UTF-8")?,
+            temporary_name,
+        ],
+    )
+    .map_err(|_| "configuration-file link staging failed")?;
+    let published = run_provider_path_command(
+        uid,
+        gid,
+        "/usr/bin/mv",
+        &[
+            "-fT",
+            "--",
+            temporary_name,
             destination
                 .to_str()
                 .ok_or("configuration-file destination is not UTF-8")?,
         ],
-    )
-    .map_err(|_| "configuration-file link publication failed")
+    );
+    if published.is_err() {
+        run_provider_path_command(uid, gid, "/usr/bin/rm", &["-f", "--", temporary_name])
+            .map_err(|_| "configuration-file failed link cleanup failed")?;
+    }
+    published.map_err(|_| "configuration-file link publication failed")
 }
 
 fn run_provider_path_command(
@@ -3637,6 +3970,146 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn provider_config_manifest_rename_failure_restores_every_published_leaf() {
+        use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let selected = root.path().join("selected");
+        fs::create_dir_all(home.join("skills")).unwrap();
+        fs::create_dir(&selected).unwrap();
+        fs::write(
+            home.join("skills/command"),
+            "#!/bin/sh\nprintf old-resource",
+        )
+        .unwrap();
+        fs::set_permissions(
+            home.join("skills/command"),
+            fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+        fs::write(home.join("skills/stale"), "prior-owned").unwrap();
+        fs::write(home.join("skills/provider-created"), "native-state").unwrap();
+        fs::write(selected.join("command"), "#!/bin/sh\nprintf new-resource").unwrap();
+        fs::set_permissions(selected.join("command"), fs::Permissions::from_mode(0o751)).unwrap();
+        fs::write(selected.join("new"), "new-owned").unwrap();
+        let previous = BTreeSet::from([
+            "skills".into(),
+            "skills/command".into(),
+            "skills/stale".into(),
+        ]);
+        let current = BTreeSet::from([
+            "skills".into(),
+            "skills/command".into(),
+            "skills/new".into(),
+        ]);
+        write_projection_manifest(&home, &previous).unwrap();
+        let before = fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap();
+        let occupied = root.path().join("occupied");
+        fs::create_dir(&occupied).unwrap();
+        let selections = [freshell_platform::provider_environment::CopySelection {
+            source: selected,
+            destination_relative: "skills".into(),
+        }];
+        let result = publish_provider_projection_with_manifest(
+            ProviderProjection {
+                provider: "codex",
+                selections: &selections,
+                home: &home,
+                previous: &previous,
+                current: &current,
+                protected: &BTreeSet::new(),
+                mounted: &[],
+            },
+            |source, _destination| {
+                // This callback occupies only the final publication boundary. The
+                // preceding production filesystem operations all execute normally.
+                assert_eq!(
+                    fs::read(home.join("skills/command")).unwrap(),
+                    b"#!/bin/sh\nprintf new-resource"
+                );
+                assert!(!home.join("skills/stale").exists());
+                assert!(home.join("skills/new").exists());
+                fs::rename(source, &occupied)
+            },
+        );
+        assert!(result.unwrap_err().contains("publish manifest"));
+        assert_eq!(
+            fs::read(home.join("skills/command")).unwrap(),
+            b"#!/bin/sh\nprintf old-resource"
+        );
+        assert_eq!(
+            fs::metadata(home.join("skills/command"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        assert_eq!(fs::read(home.join("skills/stale")).unwrap(), b"prior-owned");
+        assert_eq!(
+            fs::read(home.join("skills/provider-created")).unwrap(),
+            b"native-state"
+        );
+        assert!(!home.join("skills/new").exists());
+        assert_eq!(
+            fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap(),
+            before
+        );
+        assert!(!fs::read_dir(&home).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".freshell-provider-transaction-")));
+    }
+
+    #[test]
+    fn provider_native_auth_failed_replacement_retains_prior_usable_destination() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let auth_dir = root.path().join("auth");
+        let relative = ".local/share/opencode/auth.json";
+        let auth = home.join(relative);
+        fs::create_dir_all(auth.parent().unwrap()).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        prepare_provider_files_at(
+            &home,
+            &auth_dir,
+            &[(relative, b"prior-typed-auth".to_vec())],
+            &[],
+            uid,
+            gid,
+            false,
+        )
+        .unwrap();
+        let prior_target = fs::read_link(&auth).unwrap();
+        fs::set_permissions(auth.parent().unwrap(), fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = prepare_provider_files_at(
+            &home,
+            &auth_dir,
+            &[(relative, b"replacement-auth".to_vec())],
+            &[],
+            uid,
+            gid,
+            false,
+        );
+        fs::set_permissions(auth.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err());
+        assert_eq!(
+            fs::read(&auth).unwrap(),
+            b"prior-typed-auth",
+            "failed selected auth publication changed the old destination's contents"
+        );
+        assert_eq!(fs::read_link(&auth).unwrap(), prior_target);
+        assert_eq!(
+            fs::read_dir(&auth_dir).unwrap().count(),
+            1,
+            "failed auth publication must remove its new resources"
+        );
     }
     use super::*;
 
