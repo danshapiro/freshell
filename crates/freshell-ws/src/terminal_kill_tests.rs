@@ -2,9 +2,9 @@
 //! (managed, supervisor-owned panes: a kill never answers before their stop
 //! is verified, Stage 2: LB-13), of the not-found rule (an unknown terminal
 //! counts as killed only when the owner registry confirms nothing holds a
-//! conversation under it), and of the create side's holds that a kill
-//! releases (the given-up create's lease release, the late claim's unit
-//! stamp).
+//! conversation under it), of a kill that names no pane, and of the create
+//! side's holds that a kill releases (the given-up create's lease release,
+//! the late claim's unit stamp).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -261,6 +261,54 @@ async fn a_kill_of_an_unknown_terminal_still_owning_a_live_conversation_fails() 
     let answer = killed(&frames, "rk-y").unwrap();
     assert!(!answer.success, "{answer:?}");
     assert_eq!(answer.error.as_deref(), Some("OWNER_WITHOUT_RUNTIME"));
+}
+
+/// A `terminal.kill` naming neither a terminal nor a create-request id
+/// names no pane: it is answered as an invalid message, never success
+/// (`success:true` means Gone was confirmed). A requestId-less one gets the
+/// legacy `INVALID_MESSAGE` error frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_naming_no_pane_is_refused_as_invalid() {
+    let (state, _ownership) = owned_state();
+    let (sink, frames) = connection();
+    let (_open, closed) = tokio::sync::watch::channel(false);
+    handle_kill(
+        kill_of(None, None, Some("rk-none")),
+        &sink,
+        &closed,
+        &state,
+        "test-kill",
+    )
+    .await;
+    handle_kill(
+        kill_of(None, None, None),
+        &sink,
+        &closed,
+        &state,
+        "test-kill",
+    )
+    .await;
+    eventually("both kills are answered", || {
+        frames.lock().unwrap().len() >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let answer = killed(&frames, "rk-none").expect("the correlated kill is answered");
+    assert!(!answer.success, "{answer:?}");
+    assert_eq!(
+        answer.error.as_deref(),
+        Some("terminal.kill needs terminalId or createRequestId")
+    );
+    let frames = frames.lock().unwrap().clone();
+    assert_eq!(frames.len(), 2, "one answer each: {frames:?}");
+    assert!(
+        frames.iter().any(|msg| matches!(msg,
+            ServerMessage::Error(e) if e.code == ErrorCode::InvalidMessage
+                && e.request_id.is_none()
+                && e.terminal_id.is_none()
+                && e.message == "terminal.kill needs terminalId or createRequestId")),
+        "the requestId-less kill gets the legacy INVALID_MESSAGE frame: {frames:?}"
+    );
 }
 
 /// A managed pane killed while its launch is in flight (the kill names it

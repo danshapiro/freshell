@@ -10424,7 +10424,26 @@ impl KillAnswer {
     pub(crate) fn close_failed() -> Self {
         Self::failed(CLOSE_FAILURE_COPY, ErrorCode::InternalError)
     }
+
+    /// The kill message itself is invalid (the protocol's invalid-message
+    /// answer): nothing was looked for or stopped.
+    fn invalid(error: &str) -> Self {
+        Self {
+            success: false,
+            error: Some(error.to_string()),
+            owner: None,
+            legacy: Some(LegacyKillError {
+                code: ErrorCode::InvalidMessage,
+                message: error.to_string(),
+                names_terminal: false,
+            }),
+        }
+    }
 }
+
+/// Why a `terminal.kill` naming neither a terminal nor a create-request id
+/// is refused (the client schema's own refinement message).
+const KILL_NAMES_NO_PANE: &str = "terminal.kill needs terminalId or createRequestId";
 
 fn unknown_terminal_legacy() -> LegacyKillError {
     LegacyKillError {
@@ -10737,6 +10756,10 @@ pub(crate) async fn durable_pane_close(
 ///   flight is waited for, a soul the supervisor still runs is stopped, and
 ///   "not found" is success only when the owner registry confirms nothing
 ///   holds a conversation for the terminal.
+///
+/// A kill naming neither a terminal nor a create-request id names no pane:
+/// it is answered as an invalid message (never success) and nothing is
+/// looked for.
 async fn handle_kill(
     kill: TerminalKill,
     out: &FrameSink,
@@ -10745,6 +10768,13 @@ async fn handle_kill(
     initiator: &str,
 ) -> bool {
     let reply = KillReply::new(out, closed, &kill);
+    if kill.terminal_id.is_none() && kill.create_request_id.is_none() {
+        tracing::warn!(target: "freshell_ws::terminal",
+            event = "terminal.kill.invalid",
+            request_id = %kill.request_id.as_deref().unwrap_or(""),
+            "a terminal.kill named neither a terminal nor a create-request id; nothing is stopped");
+        return reply.send(KillAnswer::invalid(KILL_NAMES_NO_PANE));
+    }
     if let Some(entry) = resolve_kill_unit(state, &kill) {
         return crate::unit_lifecycle::kill_unit(kill, entry, reply, state, initiator).await;
     }
