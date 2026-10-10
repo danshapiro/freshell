@@ -1,6 +1,8 @@
 //! Lib tests of `terminal.kill` for panes outside a coding-agent unit
 //! (managed, supervisor-owned panes: a kill never answers before their stop
-//! is verified, Stage 2: LB-13), and of the create side's holds that a kill
+//! is verified, Stage 2: LB-13), of the not-found rule (an unknown terminal
+//! counts as killed only when the owner registry confirms nothing holds a
+//! conversation under it), and of the create side's holds that a kill
 //! releases (the given-up create's lease release, the late claim's unit
 //! stamp).
 
@@ -137,6 +139,128 @@ fn kill_answer(frames: &Frames, request_id: &str) -> Option<(usize, bool)> {
         }
         _ => None,
     })
+}
+
+/// The `terminal.killed` answering `request_id`, if any.
+fn killed(frames: &Frames, request_id: &str) -> Option<freshell_protocol::TerminalKilled> {
+    frames.lock().unwrap().iter().find_map(|msg| match msg {
+        ServerMessage::TerminalKilled(killed) if killed.request_id == request_id => {
+            Some(killed.clone())
+        }
+        _ => None,
+    })
+}
+
+/// A test state whose terminal registry shares an enabled owner registry
+/// (as at boot).
+fn owned_state() -> (WsState, Arc<freshell_ownership::RuntimeOwnershipRegistry>) {
+    let mut state = super::pane_reconcile_gate_tests::state();
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    state.registry =
+        freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+    state.ownership = Some(Arc::clone(&ownership));
+    (state, ownership)
+}
+
+fn kill_of(
+    terminal_id: Option<&str>,
+    create_request_id: Option<&str>,
+    request_id: Option<&str>,
+) -> TerminalKill {
+    TerminalKill {
+        terminal_id: terminal_id.map(str::to_string),
+        request_id: request_id.map(str::to_string),
+        create_request_id: create_request_id.map(str::to_string),
+        observed_epoch: None,
+        observed_generation: None,
+        reason: None,
+    }
+}
+
+/// The not-found rule through `terminal.kill` (User Request defect 6): a
+/// kill naming a terminal nothing runs for, while a conversation is still
+/// Stopping under that terminal, is not answered until the owner registry
+/// confirms it Gone, and only then answered success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_of_an_unknown_terminal_waits_while_its_conversation_is_stopping() {
+    let (state, ownership) = owned_state();
+    let owner = freshell_ownership::OwnerIdentity {
+        terminal_id: Some("T-x".into()),
+        unit_id: Some("u-x".into()),
+        ..Default::default()
+    };
+    assert!(ownership.restore_stopping("codex", "t-x", owner, "op-x", "test", 1));
+    let (sink, frames) = connection();
+    let (_open, closed) = tokio::sync::watch::channel(false);
+    handle_kill(
+        kill_of(Some("T-x"), None, Some("rk-x")),
+        &sink,
+        &closed,
+        &state,
+        "test-kill",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        kill_answer(&frames, "rk-x"),
+        None,
+        "no answer while a conversation is still Stopping under the terminal"
+    );
+
+    ownership.commit_unit_stop("u-x", "op-x");
+    eventually("the kill is answered at Gone", || {
+        kill_answer(&frames, "rk-x").is_some()
+    })
+    .await;
+    let answer = killed(&frames, "rk-x").unwrap();
+    assert!(answer.success, "{answer:?}");
+    assert_eq!(answer.error, None);
+}
+
+/// The not-found rule through `terminal.kill`: a kill naming a terminal
+/// nothing runs for, while a conversation is still held Live under it, is
+/// not confirmed: `success:false, error:"OWNER_WITHOUT_RUNTIME"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_of_an_unknown_terminal_still_owning_a_live_conversation_fails() {
+    let (state, ownership) = owned_state();
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+        "codex",
+        "t-y",
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        "op-start",
+        None,
+        "test",
+        1,
+    ) else {
+        panic!("granted")
+    };
+    ownership.commit_live(
+        "codex",
+        "t-y",
+        "op-start",
+        generation,
+        freshell_ownership::OwnerIdentity {
+            terminal_id: Some("T-y".into()),
+            ..Default::default()
+        },
+    );
+    let (sink, frames) = connection();
+    let (_open, closed) = tokio::sync::watch::channel(false);
+    handle_kill(
+        kill_of(Some("T-y"), None, Some("rk-y")),
+        &sink,
+        &closed,
+        &state,
+        "test-kill",
+    )
+    .await;
+    eventually("the kill is answered", || {
+        kill_answer(&frames, "rk-y").is_some()
+    })
+    .await;
+    let answer = killed(&frames, "rk-y").unwrap();
+    assert!(!answer.success, "{answer:?}");
+    assert_eq!(answer.error.as_deref(), Some("OWNER_WITHOUT_RUNTIME"));
 }
 
 /// A managed pane killed while its launch is in flight (the kill names it
