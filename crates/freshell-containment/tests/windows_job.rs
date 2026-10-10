@@ -394,8 +394,11 @@ impl Drop for PortJob {
 /// LB-08 (V5 §3.7): nested jobs post their zero messages under the unit's
 /// own key, so the unit's empty wait must confirm each one against the unit
 /// job's active process count. The member runs a child in a nested
-/// kill-on-close job of its own, as Codex runs each shell command; when that
-/// child exits, the nested job empties while the member still runs.
+/// kill-on-close job that has its own completion port; when that child
+/// exits, the nested job empties while the member still runs. (On the
+/// runner, neither a Node grandchild's libuv job nor a nested job without a
+/// port of its own posted a zero message to the parent's port: runs
+/// 38014321238 and 38015212020.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_unit_empty_wait_ignores_nested_job_zero_messages() {
     // Precondition: this scenario really posts a nested zero message while
@@ -565,13 +568,17 @@ async fn a_writer_lock_holder_is_reported_by_name_and_released_at_gone() {
 
 /// R1, R3: a unit reopened from a record (a stop a crashed server left
 /// unfinished) has no job; its stop reaches the record's identity-verified
-/// roots and their descendants by handle, sparing the daemon family.
+/// roots and their descendants by handle, sparing the daemon family. The
+/// root's children are detached, so libuv's own kill-on-close job (which
+/// ends a node's non-detached children with it) never reaches them: only
+/// the stop can (run 38015596259 showed a non-detached daemon-shaped child
+/// dying with its node).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reopened_unit_stops_its_recorded_roots_and_their_descendants() {
     let code = format!(
         "const cp=require('child_process');\
-         const a=cp.spawn({h},['idle'],{{stdio:'inherit'}});\
-         const d=cp.spawn({h},['idle','app-server','--managed-daemon'],{{stdio:'inherit'}});\
+         const a=cp.spawn({h},['idle'],{{stdio:'inherit',detached:true}});\
+         const d=cp.spawn({h},['idle','app-server','--managed-daemon'],{{stdio:'inherit',detached:true}});\
          console.log('kids '+a.pid+' '+d.pid);setInterval(()=>{{}},1e9);",
         h = js(HELPER)
     );

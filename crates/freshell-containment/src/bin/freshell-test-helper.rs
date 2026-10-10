@@ -16,10 +16,13 @@
 //! - `until-eof`: prints `until-eof <pid>` and exits normally when its stdin
 //!   reaches end of file.
 //! - `job-child` (Windows only): runs an `until-eof` copy of itself in a
-//!   nested kill-on-close job of its own, as Codex runs each shell command
-//!   (prints `job-child <child pid>`); when its own stdin reaches end of
-//!   file it ends the child's stdin, waits for the child, prints
-//!   `child-exited` (the nested job is now empty) and sleeps until killed.
+//!   nested kill-on-close job of its own that has its own completion port,
+//!   as a program that watches the jobs it runs commands in does (prints
+//!   `job-child <child pid>`); when its own stdin reaches end of file it ends
+//!   the child's stdin, waits for the child, prints `child-exited` (the
+//!   nested job is now empty) and sleeps until killed. (On the runner a
+//!   nested job WITHOUT a port of its own posted no zero message to its
+//!   parent job's port.)
 //! - `breakaway-daemon` (Windows only): starts a copy of itself as
 //!   `idle app-server --managed-daemon` with
 //!   `DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB` (Codex 0.162's exact
@@ -142,11 +145,14 @@ fn until_eof() -> i32 {
 #[cfg(windows)]
 fn job_child() -> i32 {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectAssociateCompletionPortInformation,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
+    use windows_sys::Win32::System::IO::CreateIoCompletionPort;
 
     // SAFETY: an unnamed job with default security; checked below.
     let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -174,6 +180,37 @@ fn job_child() -> i32 {
     if limited == 0 {
         eprintln!(
             "freshell-test-helper job-child: SetInformationJobObject: {}",
+            std::io::Error::last_os_error()
+        );
+        return 1;
+    }
+    // SAFETY: a new completion port not tied to any file; checked below.
+    let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+    if port.is_null() {
+        eprintln!(
+            "freshell-test-helper job-child: CreateIoCompletionPort: {}",
+            std::io::Error::last_os_error()
+        );
+        return 1;
+    }
+    // SAFETY: a fresh handle this process owns; it lives as long as the job.
+    let port = unsafe { OwnedHandle::from_raw_handle(port) };
+    let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+        CompletionKey: std::ptr::null_mut(),
+        CompletionPort: port.as_raw_handle(),
+    };
+    // SAFETY: a live job and a correctly sized information block.
+    let associated = unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectAssociateCompletionPortInformation,
+            std::ptr::from_ref(&association).cast(),
+            std::mem::size_of_val(&association) as u32,
+        )
+    };
+    if associated == 0 {
+        eprintln!(
+            "freshell-test-helper job-child: associating the port: {}",
             std::io::Error::last_os_error()
         );
         return 1;
