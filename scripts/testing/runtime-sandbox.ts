@@ -2532,7 +2532,7 @@ export class RuntimeHarness {
       || !this.trackedVolumes.has(supervisor.volumeName) || this.imageRef !== batch.input.imageRef) {
       throw new Error('exact registered stopped Registry reader ownership required')
     }
-    if (this.isContainerRunning(supervisor.containerId)) throw new Error('stopped Registry reader refuses a running supervisor')
+    if (this.isContainerRunning(supervisor.containerId, true)) throw new Error('stopped Registry reader refuses a running supervisor')
     assertTask007PrivatePath(batch.metadataFile, false, 0o600)
     if (!batch.metadataFile.startsWith(`${fs.realpathSync(this.testRoot)}${path.sep}`)
       || fs.lstatSync(batch.metadataFile).nlink !== 1
@@ -2569,7 +2569,7 @@ export class RuntimeHarness {
       const stdout = await this.task007Docker(['logs', containerId])
       this.writeArtifact(`task007-registry-read-${randomUUID()}.json`, { fixtureId, operationId, containerId, exit, stdout })
       if (exit !== '0') throw new Error('current stopped Registry reader refused operation')
-      if (this.isContainerRunning(supervisor.containerId)) throw new Error('stopped Registry supervisor restarted during read')
+      if (this.isContainerRunning(supervisor.containerId, true)) throw new Error('stopped Registry supervisor restarted during read')
       return Task007RepairRecordsSchema.parse(JSON.parse(stdout))
     } catch (error) { failure = error; throw error }
     finally {
@@ -3852,10 +3852,14 @@ export class RuntimeHarness {
     return JSON.parse(output)[0]
   }
 
-  isContainerRunning(containerId: string): boolean {
+  isContainerRunning(containerId: string, requireObservation = false): boolean {
     const result = spawnSync('docker', ['inspect', '--format', '{{.State.Running}}', containerId], { encoding: 'utf8' })
+    const running = result.stdout?.trim()
+    if (requireObservation && (result.status !== 0 || !['true', 'false'].includes(running))) {
+      throw new Error('exact container running-state inspection is unavailable or malformed')
+    }
     if (result.status !== 0) return false
-    return result.stdout.trim() === 'true'
+    return running === 'true'
   }
 
   containerLogs(containerId: string): string {
@@ -3863,10 +3867,13 @@ export class RuntimeHarness {
     return `${result.stdout ?? ''}${result.stderr ?? ''}`.slice(-20_000)
   }
 
-  stopSupervisorExact(instance: SupervisorInstance): void {
-    if (this.isContainerRunning(instance.containerId)) {
+  stopSupervisorExact(instance: SupervisorInstance, requireObservation = false): void {
+    if (this.isContainerRunning(instance.containerId, requireObservation)) {
       const result = spawnSync('docker', ['stop', '-t', '2', instance.containerId], { encoding: 'utf8' })
       if (result.status !== 0) throw new Error(result.stderr || `docker stop failed for ${instance.containerId}`)
+    }
+    if (requireObservation && this.isContainerRunning(instance.containerId, true)) {
+      throw new Error('exact supervisor stopped state was not confirmed')
     }
   }
 
@@ -4501,7 +4508,7 @@ export class ManagedRuntimeOwner {
     Task007Id.parse(operationId)
     if (!this.supervisor || this.supervisor.volumeName !== batch.volumeName) throw new Error('registered batch supervisor required')
     const sourceStoreId = (await this.syntheticStoppedRepairBatchFacts()).sourceStoreId
-    const records = async () => this.runtime.isContainerRunning(this.supervisor.containerId)
+    const records = async () => this.runtime.isContainerRunning(this.supervisor.containerId, true)
       ? Task007RepairRecordsSchema.parse(JSON.parse(await this.ownedDockerProbe(
         this.supervisor.containerId, ['python3', '-I', '-c', TASK007_STOPPED_REPAIR_OBSERVATION,
           '/var/lib/freshell-supervisor/runtime.sqlite3', batch.metadataFile, operationId, '/var/lib/freshell-supervisor', sourceStoreId], false)))
@@ -5119,7 +5126,7 @@ export class ManagedRuntimeOwner {
   private async replaceSupervisor(mode: 'graceful' | 'abrupt', crashPoint?: 'ordinary_stop_after_intent', beforeStart?: () => void): Promise<SupervisorInstance> {
     const previous = this.supervisor
     if (mode === 'abrupt') this.runtime.killTrackedContainerExact(previous.containerId)
-    else this.runtime.stopSupervisorExact(previous)
+    else this.runtime.stopSupervisorExact(previous, Boolean(beforeStart))
     beforeStart?.()
     if (!beforeStart) this.runtime.removeContainerExact(previous.containerId)
     this.supervisor = await this.runtime.startSupervisor({

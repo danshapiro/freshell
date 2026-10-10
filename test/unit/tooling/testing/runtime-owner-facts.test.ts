@@ -542,6 +542,56 @@ describe('Task7 registered physical stopped fixture preparation', () => {
     } finally { vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
   })
 
+  it.each(['failed', 'malformed', 'stop-unconfirmed'] as const)(
+    'refuses unknown $0 supervisor state before reading, changing or restoring registered stores', async mode => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused inspection web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    const db = new DatabaseSync(batch.sourceDatabaseFile)
+    db.exec('PRAGMA journal_mode = DELETE'); db.close()
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const previous: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    const launch = vi.spyOn(rig.runtime, 'startSupervisor').mockResolvedValue(previous)
+    const remove = vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'waitForSupervisorHealth').mockResolvedValue({})
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
+    const state = path.join(batch.outputDir, 'inspect-mode'), calls = path.join(batch.outputDir, 'inspect-calls.jsonl')
+    await fsp.writeFile(state, 'stopped')
+    await fsp.writeFile(path.join(batch.outputDir, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),args=process.argv.slice(2),mode=fs.readFileSync(${JSON.stringify(state)},'utf8');fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='inspect'){if(mode==='failed')process.exit(9);process.stdout.write(mode==='malformed'?'unknown':mode==='stop-unconfirmed'?'true':'false')}else if(args[0]!=='stop')process.exit(8);\n`, { mode: 0o700 })
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch(); rig.supervisor = previous
+      Object.assign(rig.runtime, { imageRef: batch.input.imageRef, task007Fixtures: new Map([['browser', batch]]),
+        trackedSupervisorContainers: new Set([previous.containerId]), trackedVolumes: new Set([batch.volumeName]) })
+      vi.mocked(rig.runtime.isContainerRunning).mockRestore()
+      vi.stubEnv('PATH', `${batch.outputDir}${path.delimiter}${process.env.PATH}`)
+      const original = await fsp.readFile(batch.sourceDatabaseFile)
+      await fsp.writeFile(state, mode)
+      if (mode !== 'stop-unconfirmed') {
+        await expect(rig.runtime.readTask007StoppedRegistry(previous, batch.input.fixtureId, 'repair-current')).rejects.toThrow(/inspection|state/)
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/inspection|state/)
+      }
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')).rejects.toThrow(/inspection|state|stopped/)
+      expect(await fsp.readFile(batch.sourceDatabaseFile)).toEqual(original)
+      expect(launch).not.toHaveBeenCalled(); expect(remove).not.toHaveBeenCalled()
+      await fsp.writeFile(state, 'stopped')
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')
+      const changed = await fsp.readFile(batch.sourceDatabaseFile)
+      expect(changed).not.toEqual(original)
+      launch.mockClear(); remove.mockClear()
+      await fsp.writeFile(state, mode)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).rejects.toThrow(/inspection|state|stopped/)
+      expect(await fsp.readFile(batch.sourceDatabaseFile)).toEqual(changed)
+      expect(launch).not.toHaveBeenCalled(); expect(remove).not.toHaveBeenCalled()
+      expect((await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line)[0])).not.toContain('create')
+      await fsp.writeFile(state, 'stopped')
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+      expect(await fsp.readFile(batch.sourceDatabaseFile)).toEqual(original)
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
   it('changes only the registered fictional source generation and restores its exact original bytes', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused fault web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
@@ -748,7 +798,7 @@ describe('Task7 registered physical stopped fixture preparation', () => {
       expect(health).toHaveBeenCalledExactlyOnceWith(replacement)
       health.mockResolvedValue({})
       await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
-      expect(stop).toHaveBeenLastCalledWith(replacement)
+      expect(stop).toHaveBeenLastCalledWith(replacement, true)
       expect(launch.mock.calls[1][0]).toMatchObject({ volumeName: previous.volumeName, waitForHealth: false })
       health.mockRejectedValue(new Error('ordinary health failure'))
       await expect(rig.restartSupervisor()).rejects.toThrow(/ordinary health failure/)
