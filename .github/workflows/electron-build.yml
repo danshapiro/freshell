@@ -92,11 +92,12 @@ jobs:
 
       # Per-pane containment on Windows: Job Object units, the self-placing
       # exec shim, the process facts, and the design-decision tests that
-      # chose the unit job's flags. The macOS jobs join once the macOS
-      # process facts exist.
+      # chose the unit job's flags. `--no-fail-fast` runs every test binary,
+      # so one failure never hides another's result. The macOS jobs join
+      # once the macOS process facts exist.
       - name: Test containment (Windows)
         if: matrix.os == 'windows-2022'
-        run: cargo test --locked -p freshell-containment
+        run: cargo test --locked -p freshell-containment --no-fail-fast
 
       # Exercise the native Windows Claude profile lookup and the generated
       # terminal hook behavior. Keep this scoped to the two owning Rust crates.
