@@ -321,11 +321,23 @@ pub fn global_containment() -> Option<Containment> {
     GLOBAL.get().cloned()
 }
 
+/// The per-process state root of [`global_or_fallback_containment`].
+static FALLBACK_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Removes the fallback containment's state root when the process exits:
+/// no server ever reads it again (only a server's own state root is
+/// reconciled at boot), so nothing outlives the process that wrote it.
+extern "C" fn remove_fallback_root() {
+    if let Some(root) = FALLBACK_ROOT.get() {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 /// The process-global containment; where none was installed (tests, tools
 /// that never boot a server), one per-process tag-backend containment whose
 /// unit records live in a per-process directory under the system temp
 /// directory (never a relative path: creating a unit writes its record
-/// there).
+/// there). That directory is removed when the process exits.
 pub fn global_or_fallback_containment() -> Containment {
     if let Some(global) = global_containment() {
         return global;
@@ -333,10 +345,17 @@ pub fn global_or_fallback_containment() -> Containment {
     static FALLBACK: OnceLock<Containment> = OnceLock::new();
     FALLBACK
         .get_or_init(|| {
+            let root = FALLBACK_ROOT
+                .get_or_init(|| {
+                    // SAFETY: registers a plain `extern "C"` function with no
+                    // arguments; it only reads a set-once static.
+                    unsafe { libc::atexit(remove_fallback_root) };
+                    std::env::temp_dir().join(format!("freshell-units-{}", std::process::id()))
+                })
+                .clone();
             Containment::tag_backend(SelectOptions {
                 shim: None,
-                state_root: std::env::temp_dir()
-                    .join(format!("freshell-units-{}", std::process::id())),
+                state_root: root,
             })
         })
         .clone()
