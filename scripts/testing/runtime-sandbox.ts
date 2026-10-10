@@ -141,6 +141,9 @@ export function seedManagedOpenCodeSource(input: SyntheticSourceInput): Syntheti
     db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;')
     db.exec(fs.readFileSync(path.join(repoRoot, 'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'), 'utf8'))
     db.exec('CREATE TABLE message_seq (session_id TEXT PRIMARY KEY, next INTEGER NOT NULL); CREATE TABLE provider_config (id TEXT PRIMARY KEY, value TEXT);')
+    // Publish one complete fictional graph; close rolls back any failed seed.
+    // A single commit also avoids a synchronous WAL fsync for every fixture row.
+    db.exec('BEGIN IMMEDIATE')
     const insertMigration = db.prepare('INSERT INTO migration (id, time_completed) VALUES (?, ?)')
     MIGRATIONS.forEach((migration, index) => insertMigration.run(migration, index + 100))
     db.prepare("INSERT INTO project (id, worktree, time_created, time_updated, sandboxes, vcs) VALUES (?, ?, ?, ?, ?, 'git')")
@@ -274,6 +277,7 @@ export function seedManagedOpenCodeSource(input: SyntheticSourceInput): Syntheti
     db.prepare('INSERT INTO credential (id, label, value, time_created, time_updated) VALUES (?, ?, ?, ?, ?)')
       .run(nativeId('cred', 0), 'synthetic', 'CREDENTIAL_VALUE_SENTINEL', now, now)
     db.prepare('INSERT INTO provider_config (id, value) VALUES (?, ?)').run(`provider_${nonce}`, 'PROVIDER_CONFIG_SENTINEL')
+    db.exec('COMMIT')
     const source = { databasePath, unrelatedId, ...first }
     return families ? { ...source, families } : source
   } finally {

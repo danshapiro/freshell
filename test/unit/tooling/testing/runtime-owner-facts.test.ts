@@ -3290,6 +3290,50 @@ describe('owner-side synthetic OpenCode source preparation', () => {
     }
   })
 
+  it('rolls back a failed seven-root seed instead of publishing a partial historical graph', async () => {
+    const databasePath = path.join(fixtureRepoRoot, 'failed-seed.db')
+    const nonce = 'atomic-seven-root-seed'
+    const lastRoot = `ses_${createHash('sha256').update(`${nonce}:family:6`).digest('hex').slice(0, 16)}0000000000`
+    await fsp.appendFile(path.join(fixtureRepoRoot, 'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'),
+      `\nCREATE TRIGGER refuse_last_fixture_root BEFORE INSERT ON session WHEN NEW.id = '${lastRoot}' BEGIN SELECT RAISE(ABORT, 'controlled seed rejection'); END;\n`)
+    expect(() => owner.seedManagedOpenCodeSource({ repoRoot: fixtureRepoRoot, databasePath,
+      workspace: fixtureRepoRoot, nonce, batch: 'stopped-repair-seven-roots' })).toThrow('controlled seed rejection')
+    const db = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      for (const table of ['migration', 'project', 'session', 'message', 'part', 'event_sequence', 'event', 'account', 'provider_config']) {
+        expect(db.prepare(`SELECT count(*) AS count FROM ${table}`).get()).toEqual({ count: 0 })
+      }
+    } finally { db.close() }
+  })
+
+  it('seeds all seven complete default graphs with their exact message and part baselines', () => {
+    const databasePath = path.join(fixtureRepoRoot, 'seven-root-seed.db')
+    const started = performance.now()
+    const source = owner.seedManagedOpenCodeSource({ repoRoot: fixtureRepoRoot, databasePath,
+      workspace: fixtureRepoRoot, nonce: 'complete-seven-root-seed', batch: 'stopped-repair-seven-roots' })
+    const elapsedMs = performance.now() - started
+    const db = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      expect(source.families).toHaveLength(7)
+      expect(db.prepare('SELECT count(*) AS count FROM message').get()).toEqual({ count: 757 })
+      for (const family of source.families) {
+        expect(family.baselineMessages.size).toBe(108)
+        expect(family.baselineParts.size).toBe(214)
+        for (const [id, digest] of family.baselineMessages) {
+          const row = db.prepare('SELECT data FROM message WHERE id = ?').get(id)!
+          expect(createHash('sha256').update(String(row.data)).digest('hex')).toBe(digest)
+        }
+        for (const [id, digest] of family.baselineParts) {
+          const row = db.prepare('SELECT data FROM part WHERE id = ?').get(id)!
+          expect(createHash('sha256').update(String(row.data)).digest('hex')).toBe(digest)
+        }
+        expect(db.prepare('SELECT parent_id FROM session WHERE id = ?').get(family.childId)).toEqual({ parent_id: family.rootId })
+        expect(db.prepare('SELECT parent_id FROM session WHERE id = ?').get(family.grandchildId)).toEqual({ parent_id: family.childId })
+      }
+      console.info(JSON.stringify({ severity: 'info', event: 'synthetic_source.seed_measured', elapsedMs, families: 7, messages: 757 }))
+    } finally { db.close() }
+  })
+
   it('seeds the actual default conversation graph and keeps unrelated history outside its baselines', async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-source-owner-'))
     const databasePath = path.join(root, 'opencode.db')
