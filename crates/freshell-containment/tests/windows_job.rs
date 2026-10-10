@@ -510,24 +510,29 @@ impl Drop for OwnChild {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn lock_holders_and_listener_owner_are_found() {
+/// The two lookups find their process, each asked only after that process
+/// printed that the file is open or the socket listens (a cold runner starts
+/// Node slowly, so no fixed wait would do).
+#[test]
+fn lock_holders_and_listener_owner_are_found() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("t.lock");
     std::fs::write(&file, b"").unwrap();
-    let holder = OwnChild(
+    let mut holder = OwnChild(
         std::process::Command::new("node")
             .args([
                 "-e",
                 &format!(
-                    "require('fs').openSync({:?}, 'r+'); setTimeout(()=>{{}},600000)",
-                    file.display().to_string()
+                    "require('fs').openSync({}, 'r+'); console.log('open'); setTimeout(()=>{{}},600000)",
+                    js(file.to_str().unwrap())
                 ),
             ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    windows_support::Lines::new(holder.0.stdout.take().unwrap()).expect("open", |l| l == "open");
     assert!(lock_holders(std::slice::from_ref(&file))
         .iter()
         .any(|h| h.pid == holder.0.id()));
@@ -535,16 +540,21 @@ async fn lock_holders_and_listener_owner_are_found() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
-    let listener = OwnChild(
+    let mut listener = OwnChild(
         std::process::Command::new("node")
             .args([
                 "-e",
-                &format!("require('net').createServer().listen({port}, '127.0.0.1')"),
+                &format!(
+                    "require('net').createServer().listen({port}, '127.0.0.1', ()=>console.log('listening'))"
+                ),
             ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    windows_support::Lines::new(listener.0.stdout.take().unwrap())
+        .expect("listening", |l| l == "listening");
     assert_eq!(
         listening_socket_owner(port, &[listener.0.id()]),
         Some(listener.0.id())
