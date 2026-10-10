@@ -855,8 +855,8 @@ export class ExternalManagedRuntimeRig {
           && server === 'cloudflare' && contentType === 'text/html' && relayRequest === null
         if (!upstreamStatusFailure || attempt === 1) throw new Error(`closed owner operation refused: ${status}`)
       }
-      process.stderr.write(`${JSON.stringify({ severity: 'warn', event: 'managed_external_owner_transport_retry',
-        runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, operationId, action })}\n`)
+      emitExternalDiagnostic('client', () => process.stderr.write(`${JSON.stringify({ severity: 'warn', event: 'managed_external_owner_transport_retry',
+        runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, operationId, action })}\n`))
     }
     if (!response) throw new Error('closed owner transport produced no response')
     let body: unknown

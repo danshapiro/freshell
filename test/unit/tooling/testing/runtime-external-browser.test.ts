@@ -1064,6 +1064,64 @@ describe('diagnostic sink failure isolation', () => {
       expect(fallback).toHaveBeenCalled()
     } finally { write.mockRestore(); fallback.mockRestore() }
   })
+  it.each(['edge', 'fetch'] as const)('returns actual retained status after %s failure when both diagnostic sinks throw', async failure => {
+    const bound = runner.resolveManagedExternalDescriptor(descriptor)!
+    let attempts = 0
+    const stage = { kind: 'failed', sequence: 7 }
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      if (++attempts === 1) {
+        if (failure === 'fetch') throw new TypeError('private-fetch-sentinel')
+        return new Response('private-response-sentinel', { status: 502,
+          headers: { server: 'cloudflare', 'content-type': 'text/html' } })
+      }
+      const request = JSON.parse(String(init.body))
+      return new Response(JSON.stringify({ runId: request.runId, candidateSha: request.candidateSha,
+        operationId: request.operationId, result: stage }))
+    })
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => { throw new Error('private-stderr-error-sentinel') })
+    const fallback = vi.spyOn(fs, 'writeSync').mockImplementation(() => { throw new Error('private-stderr-descriptor-sentinel') })
+    const timeout = vi.spyOn(AbortSignal, 'timeout')
+    try {
+      const rig = new runner.ExternalManagedRuntimeRig(bound, transport)
+      await expect(rig.retainedFixtureStage()).resolves.toEqual(stage)
+      expect(transport).toHaveBeenCalledTimes(2)
+      expect(transport.mock.calls[1][0]).toBe(transport.mock.calls[0][0])
+      expect(transport.mock.calls[1][1].body).toBe(transport.mock.calls[0][1].body)
+      expect(timeout.mock.calls).toEqual([[90_000], [90_000]])
+      expect(write.mock.calls.map(([line]) => JSON.parse(String(line)))).toContainEqual({
+        severity: 'warn', event: 'managed_external_owner_transport_retry', runId: bound.runId, candidateSha: bound.candidateSha,
+        operationId: JSON.parse(String(transport.mock.calls[0][1].body)).operationId, action: 'retained-status',
+      })
+      expect(fallback).toHaveBeenCalledWith(2, expect.stringContaining('managed_external_diagnostic_write_failed'))
+      expect(JSON.stringify([write.mock.calls, fallback.mock.calls])).not.toContain('private-')
+    } finally { timeout.mockRestore(); write.mockRestore(); fallback.mockRestore() }
+  })
+  it.each([
+    ['edge', 'edge'], ['edge', 'fetch'], ['fetch', 'edge'], ['fetch', 'fetch'],
+  ] as const)('retains bounded %s then %s refusal when both diagnostic sinks throw', async (first, second) => {
+    const bound = runner.resolveManagedExternalDescriptor(descriptor)!
+    let attempts = 0
+    const transport = vi.fn(async (_url: string, _init: RequestInit) => {
+      if ([first, second][attempts++] === 'fetch') throw new TypeError('private-fetch-sentinel')
+      return new Response('private-response-sentinel', { status: 502,
+        headers: { server: 'cloudflare', 'content-type': 'text/html' } })
+    })
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => { throw new Error('private-stderr-error-sentinel') })
+    const fallback = vi.spyOn(fs, 'writeSync').mockImplementation(() => { throw new Error('private-stderr-descriptor-sentinel') })
+    const timeout = vi.spyOn(AbortSignal, 'timeout')
+    try {
+      const rig = new runner.ExternalManagedRuntimeRig(bound, transport)
+      await expect(rig.retainedFixtureStage()).rejects.toThrow(second === 'edge'
+        ? 'closed owner operation refused: 502' : 'closed owner retained-status transport did not settle')
+      expect(transport).toHaveBeenCalledTimes(2)
+      expect(transport.mock.calls[1][1].body).toBe(transport.mock.calls[0][1].body)
+      expect(timeout.mock.calls).toEqual([[90_000], [90_000]])
+      expect(write.mock.calls.map(([line]) => JSON.parse(String(line)).event)
+        .filter(event => event === 'managed_external_owner_transport_retry')).toHaveLength(1)
+      expect(fallback).toHaveBeenCalledWith(2, expect.stringContaining('managed_external_diagnostic_write_failed'))
+      expect(JSON.stringify([write.mock.calls, fallback.mock.calls])).not.toContain('private-')
+    } finally { timeout.mockRestore(); write.mockRestore(); fallback.mockRestore() }
+  })
   it.each([false, true])('removes the exact tunnel HOME and settles fields with a throwing sink (stderr failure=%s)', async stderrFails => {
     const home = await fsp.mkdtemp(path.join(fixtureRepoRoot, 'owned-tunnel-home-'))
     await fsp.chmod(home, 0o700)
