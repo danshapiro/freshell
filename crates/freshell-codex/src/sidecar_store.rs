@@ -325,11 +325,15 @@ impl CodexSidecarStore {
 
 // ---------------------------------------------------------------------------
 // Pid identity evidence + verification. A durable record is only ever
-// TRUSTED after its `(pid, starttime, cmdline)` evidence is re-verified
-// against live `/proc` — only [`IdentityVerdict::Verified`] may ever be
-// signalled. Environ tags are deliberately NOT required here: YAMA can hide
-// `/proc/<pid>/environ` for reparented orphans, while `stat` and `cmdline`
-// are world-readable.
+// TRUSTED after its identity evidence is re-verified against live `/proc`: a
+// record that carries its native main by that main's `(pid, starttime)`
+// alone, any other record by its launcher's `(pid, starttime, cmdline)`
+// ([`verify_sidecar_identity`]). Only [`IdentityVerdict::Verified`] may ever
+// be signalled, and a signal to the launcher pid first re-checks the
+// launcher's own evidence ([`verify_launcher_identity`]), whatever the
+// record's verdict. Environ tags are deliberately NOT required here: YAMA
+// can hide `/proc/<pid>/environ` for reparented orphans, while `stat` and
+// `cmdline` are world-readable.
 // ---------------------------------------------------------------------------
 
 /// /proc/<pid>/stat field 22; None for gone/zombie. (pid, starttime) is the
