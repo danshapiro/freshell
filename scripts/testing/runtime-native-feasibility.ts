@@ -672,6 +672,12 @@ export async function dispatchNativeFeasibility(input: {
   return originals
 }
 
+/** Ordinary preferences for newly owned terminal homes; no permission or model policy. */
+export function ownedClaudeStartupPreferences(workspaces: readonly string[]): string {
+  const projects = Object.fromEntries(workspaces.map(workspace => [workspace, { hasTrustDialogAccepted: true }]))
+  return JSON.stringify({ theme: 'dark', hasCompletedOnboarding: true, projects })
+}
+
 export async function runNativeFeasibility(args = process.argv.slice(2)): Promise<void> {
   const selection = parseNativeFeasibilityArguments(args)
   const manifestPath = process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
@@ -690,9 +696,8 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
     const directory = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'task004-terminal-native-profile-'))
     fs.chmodSync(directory, 0o700)
     const profilePath = path.join(directory, 'native-startup-user.json')
-    const projects = Object.fromEntries(nativeFeasibilityCases(selection).map((caseId) =>
-      [path.join(harness.testRoot, `claude-${caseId}-workspace`), { hasTrustDialogAccepted: true }]))
-    fs.writeFileSync(profilePath, JSON.stringify({ theme: 'dark', hasCompletedOnboarding: true, projects }), { mode: 0o600 })
+    fs.writeFileSync(profilePath, ownedClaudeStartupPreferences(nativeFeasibilityCases(selection).map(caseId =>
+      path.join(harness.testRoot, `claude-${caseId}-workspace`))), { mode: 0o600 })
     manifest.sourceFiles.push({ name: 'claude/profile/native-startup-user.json', path: profilePath,
       sha256: createHash('sha256').update(fs.readFileSync(profilePath)).digest('hex') })
   }

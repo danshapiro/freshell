@@ -2966,6 +2966,41 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
         expect(launch.mock.calls[0]![1].params.freshAgent.sessionType).toBe('freshclaude')
       } finally { fs.rmSync(directory, { recursive: true, force: true }) }
     })
+  it('actual terminal entrypoint prepares onboarding and exact owned workspace trust before native projection', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-claude-preferences-unit-'))
+    const fixtureCommit = createFixtureCheckout(directory)
+    const manifest = path.join(directory, 'artifacts.json')
+    fs.writeFileSync(manifest, JSON.stringify({ candidateSha: fixtureCommit, imageDigest,
+      artifacts: { supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
+        host: { path: '/fixture/host', sha256: 'd'.repeat(64) } }, sourceFiles: [] }), { mode: 0o600 })
+    vi.stubEnv('FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE', manifest)
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(directory)
+    let generatedPath: string | undefined
+    const prepare = vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function (input) {
+      const source = input.sourceFiles.find(file => file.name === 'claude/profile/native-startup-user.json')!
+      generatedPath = source.path
+      const bytes = fs.readFileSync(source.path)
+      expect(createHash('sha256').update(bytes).digest('hex')).toBe(source.sha256)
+      const preferences = JSON.parse(bytes.toString('utf8'))
+      expect(preferences.theme).toBe('dark')
+      expect(preferences.hasCompletedOnboarding).toBe(true)
+      expect(preferences.projects[path.join(this.testRoot, 'claude-create-workspace')].hasTrustDialogAccepted).toBe(true)
+      expect(Object.keys(preferences.projects).every(workspace => workspace.startsWith(this.testRoot + path.sep))).toBe(true)
+      expect(preferences.projects[directory]).toBeUndefined()
+      throw new Error('controlled preferences projection boundary')
+    })
+    const cleanup = vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    try {
+      await expect(runNativeFeasibility(['--provider', 'claude', '--case', 'startup']))
+        .rejects.toThrow('controlled preferences projection boundary')
+      expect(prepare).toHaveBeenCalledOnce()
+      expect(cleanup).toHaveBeenCalledOnce()
+    } finally {
+      prepare.mockRestore(); cleanup.mockRestore(); cwd.mockRestore(); vi.unstubAllEnvs()
+      if (generatedPath) fs.rmSync(path.dirname(generatedPath), { recursive: true, force: true })
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
   it('actual entrypoint prepares finite phase-one artifacts and joins cleanup on preparation failure', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-entry-unit-'))
     const fixtureCommit = createFixtureCheckout(directory)

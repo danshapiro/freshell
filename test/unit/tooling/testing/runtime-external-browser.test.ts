@@ -243,6 +243,49 @@ const descriptor = {
 const smokeSpec = 'test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts'
 
 describe('selected production owner registration', () => {
+  it('prepares ordinary terminal Claude onboarding and workspace trust in the selected owned home', async () => {
+    const home = path.join(fixtureRepoRoot, 'owned-claude-web-home')
+    let captured!: RuntimeWebConstructOptions
+    const factory = runner.createExternalManagedWebFactory({
+      spec: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts', provider: 'claude',
+    }, {}, value => { captured = value; return {} as any })
+    const setup = vi.fn(async (ownedHome: string) => {
+      await fsp.mkdir(path.join(ownedHome, '.freshell'), { recursive: true })
+      await fsp.writeFile(path.join(ownedHome, '.freshell/config.json'), JSON.stringify({ version: 1 }))
+    })
+    factory({ binary: process.execPath, repoRoot: fixtureRepoRoot, candidateSha: 'a'.repeat(40),
+      buildDirty: false, preserveHomeOnStop: true, env: {}, setupHome: setup })
+    await captured.setupHome!(home)
+    const preferencesPath = path.join(home, '.claude/.claude.json')
+    const preferences = JSON.parse(await fsp.readFile(preferencesPath, 'utf8'))
+    expect(preferences.theme).toBe('dark')
+    expect(preferences.hasCompletedOnboarding).toBe(true)
+    expect(preferences.projects[fixtureRepoRoot].hasTrustDialogAccepted).toBe(true)
+    expect(Object.keys(preferences.projects)).toEqual([fixtureRepoRoot])
+    expect((await fsp.stat(preferencesPath)).mode & 0o777).toBe(0o600)
+    expect(await fsp.readdir(path.join(home, '.claude'))).toEqual(['.claude.json'])
+    expect(setup).toHaveBeenCalledExactlyOnceWith(home)
+    expect(JSON.parse(await fsp.readFile(path.join(home, '.freshell/config.json'), 'utf8'))).toEqual({ version: 1 })
+  })
+  it.each([
+    { provider: 'codex' as const },
+    { mode: 'freshclaude' as const },
+    { provider: 'claude' as const, retained: true },
+  ])('leaves native preference preparation outside unrelated or retained selections ($provider/$mode/$retained)', async ({ provider, mode, retained }) => {
+    const home = path.join(fixtureRepoRoot, 'unselected-web-home')
+    let captured!: RuntimeWebConstructOptions
+    const setup = vi.fn(async () => undefined)
+    const factory = runner.createExternalManagedWebFactory({
+      spec: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+      ...(provider ? { provider } : {}), ...(mode ? { mode } : {}),
+    }, {}, value => { captured = value; return {} as any }, retained)
+    factory({ binary: process.execPath, repoRoot: fixtureRepoRoot, candidateSha: 'a'.repeat(40),
+      buildDirty: false, preserveHomeOnStop: true, env: {}, setupHome: setup })
+    await captured.setupHome!(home)
+    expect(fs.existsSync(path.join(home, '.claude'))).toBe(false)
+    expect(setup).toHaveBeenCalledExactlyOnceWith(home)
+  })
+
   it('projects only the selected ordinary Amplifier profile into the owned web home before native preparation', async () => {
     const selected = path.join(fixtureRepoRoot, 'selected-amplifier')
     const home = path.join(fixtureRepoRoot, 'owned-web-home')
