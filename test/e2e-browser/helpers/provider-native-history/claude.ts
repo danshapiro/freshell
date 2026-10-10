@@ -66,7 +66,9 @@ export function readClaudeNativeHistory(projectsRoot: string, exactSessionId: st
     messageIds.add(messageId)
     const turnId = requiredString(message.id, 'Claude provider assistant message id')
     const model = requiredString(message.model, 'Claude assistant model')
-    const effort = requiredString(row.effort ?? message.effort, 'Claude assistant reasoning effort')
+    const rawEffort = row.effort !== undefined ? row.effort : message.effort
+    const effort = rawEffort === undefined || rawEffort === null
+      ? 'unknown' : requiredString(rawEffort, 'Claude assistant reasoning effort')
     turns.push({
       nativeEvidence: { kind: 'identified_message', turnId, messageId, parentMessageId: optionalString(row.parentUuid) },
       turnId,
@@ -80,7 +82,7 @@ export function readClaudeNativeHistory(projectsRoot: string, exactSessionId: st
       resolvedReasoningEffort: effort,
       providerProvenance: 'claude-assistant-message',
       modelProvenance: 'claude-assistant-message.model',
-      reasoningEffortProvenance: row.effort !== undefined
+      reasoningEffortProvenance: effort === 'unknown' ? 'unsupported-native-telemetry' : row.effort !== undefined
         ? 'claude-transcript.effort'
         : 'claude-assistant-message.effort',
     })

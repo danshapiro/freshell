@@ -3289,6 +3289,49 @@ describe('closed external owner control', () => {
       path: '/arbitrary' })).rejects.toThrow(/operation/)
     expect(reset).toHaveBeenCalledOnce()
   })
+  it('awaits finite native collection and retries a lost reply without repeating capture', async () => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-soul', incarnationId: 'owned-inc',
+      containerId: 'b'.repeat(64), hostBootId: 'owned-boot', nativeSessionId: 'owned-root' }
+    const collectionId = '11111111-1111-4111-8111-111111111111'
+    const registered = vi.spyOn(owned, 'registerFreshNativeCollection').mockResolvedValue({ collectionId, completedStages: 0, closed: false })
+    let captures = 0
+    const capture = vi.spyOn(owned, 'captureFreshNativeStage').mockImplementation(async () => {
+      captures++
+      await new Promise(resolve => setTimeout(resolve, 10))
+      return { collectionId, completedStages: 1, closed: false }
+    })
+    const closed = vi.spyOn(owned, 'finishFreshNativeCollection').mockResolvedValue({ collectionId, completedStages: 3, closed: true })
+    const control = runner.createExternalRuntimeControl(owned, context)
+    let lost = false
+    const requests: Record<string, any>[] = []
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)); requests.push(body)
+      let result
+      try { result = await control(body) } catch { return new Response('{}', { status: 409 }) }
+      if (body.action === 'fresh-native-stage' && !lost) { lost = true; throw new Error('lost settled reply') }
+      return new Response(JSON.stringify(result), { status: 200 })
+    })
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    const nonce = `codename-${'a'.repeat(32)}`
+    await expect(rig.registerFreshNativeCollection(handle, nonce)).resolves.toEqual({ collectionId, completedStages: 0, closed: false })
+    await expect(rig.captureFreshNativeStage(handle, collectionId)).resolves.toEqual({ collectionId, completedStages: 1, closed: false })
+    expect(captures).toBe(1)
+    const original = requests.find(body => body.action === 'fresh-native-stage')!
+    await expect(control({ ...original, nativeCollectionId: '22222222-2222-4222-8222-222222222222' })).rejects.toThrow(/reused/)
+    await expect(control({ ...request, action: 'fresh-native-stage', handle, nativeCollectionId: collectionId, path: '/source' })).rejects.toThrow(/operation/)
+    await expect(control({ ...request, action: 'fresh-native-stage', handle })).rejects.toThrow(/collection/)
+    await expect(rig.finishFreshNativeCollection(handle, collectionId)).resolves.toMatchObject({ closed: true })
+    expect(registered).toHaveBeenCalledExactlyOnceWith(handle, nonce)
+    expect(capture).toHaveBeenCalledExactlyOnceWith(handle, collectionId)
+    expect(closed).toHaveBeenCalledExactlyOnceWith(handle, collectionId)
+    vi.spyOn(owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
+    await rig.stop()
+    await expect(rig.captureFreshNativeStage(handle, collectionId)).rejects.toThrow(/refused/)
+    await expect(control({ ...original, operationId: 'capture-after-finish' })).rejects.toThrow(/finished/)
+    expect(captures).toBe(1)
+  })
+
   it('returns fixed fresh-agent launch facts over a pre-native enclosure and refuses native commands', async () => {
     const { owned, context, request } = fixture()
     const enclosure = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'fresh-soul',

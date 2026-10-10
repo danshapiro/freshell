@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { captureNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/probe-cli.js'
 
-import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type ObservedNativeConversation } from './qualification-observations.js'
+import { deriveNativeRecoveryOriginals, readNativeOriginalReference, NATIVE_RECOVERY_ORIGINALS_FILE, type ObservedNativeConversation } from './qualification-observations.js'
 
 import {
   QUALIFIABLE_FRESH_AGENT_MODES,
@@ -47,7 +48,7 @@ const MODE_CONTRACT = {
   freshopencode: {
     provider: 'opencode',
     runtimeVariant: 'opencode-per-soul-http',
-    model: 'opencode/big-pickle',
+    model: 'openai/gpt-5.6-luna',
     effort: 'provider-default',
     pendingApproval: false,
   },
@@ -175,7 +176,9 @@ export function buildFreshAgentQualificationReceipt(
   assertBrokerSafe(readRegularFile(path.join(expectedDir, FRESH_AGENT_QUALIFICATION_BROKER_FILE), 'broker artifact'))
   assertCleanupSafe(readRegularFile(path.join(expectedDir, FRESH_AGENT_QUALIFICATION_CLEANUP_FILE), 'cleanup artifact'))
 
-  validateDerivedNativeRows(input.rows, deriveNativeRecoveryOriginals({ evidenceDir: expectedDir, candidateSha: input.candidateSha, runId: input.receiptRunId, runtimeImage: input.runtimeImage, selected: input.selectedModes }))
+  const observed = deriveNativeRecoveryOriginals({ evidenceDir: expectedDir, candidateSha: input.candidateSha, runId: input.receiptRunId, runtimeImage: input.runtimeImage, selected: input.selectedModes })
+  validateDerivedNativeRows(input.rows, observed)
+  validateNativeProfiles(repoRoot, expectedDir, input.rows, input.candidateSha, input.receiptRunId, input.runtimeImage, observed)
 
   const assertionPath = path.join(expectedDir, FRESH_AGENT_QUALIFICATION_ASSERTIONS_FILE)
   fs.writeFileSync(assertionPath, JSON.stringify({
@@ -268,10 +271,121 @@ export function validateFreshAgentQualificationReceipt(
   assertCleanupSafe(cleanupBytes)
   validateArtifact(evidenceDir, evidenceRun, NATIVE_RECOVERY_ORIGINALS_FILE, artifacts.nativeOriginals)
   const nativeReference = object(artifacts.nativeOriginals, 'native originals reference')
-  validateDerivedNativeRows(assertion.rows, deriveNativeRecoveryOriginals({ evidenceDir, candidateSha: input.candidateSha, runId: receipt.receiptRunId, runtimeImage: input.expectedRuntimeImage, selected: receipt.selectedModes, originalReference: { path: NATIVE_RECOVERY_ORIGINALS_FILE, sha256: nativeReference.sha256 } }))
+  const observed = deriveNativeRecoveryOriginals({ evidenceDir, candidateSha: input.candidateSha, runId: receipt.receiptRunId, runtimeImage: input.expectedRuntimeImage, selected: receipt.selectedModes, originalReference: { path: NATIVE_RECOVERY_ORIGINALS_FILE, sha256: nativeReference.sha256 } })
+  validateDerivedNativeRows(assertion.rows, observed)
+  validateNativeProfiles(repoRoot, evidenceDir, assertion.rows, input.candidateSha, receipt.receiptRunId, input.expectedRuntimeImage, observed)
   return {
     receipt: receipt as FreshAgentQualificationReceiptV1,
     rows: assertion.rows,
+  }
+}
+
+function validateStoppedNativeRead(stopped: Record<string, any>, row: FreshAgentQualificationRow,
+  lastView: Record<string, any>, lastCompletedAt: number): void {
+  const stopResult = object(stopped.stopResult, 'stopped Stop result'), writer = object(stopped.writer, 'stopped writer observation')
+  stringEqual(stopResult.outcome, 'verified_empty', 'stopped Stop outcome')
+  for (const view of [object(stopResult.view, 'stopped Stop view'), object(stopped.stoppedView, 'stopped inventory view')]) {
+    for (const [field, expected] of Object.entries({ soulId: row.soulId, nativeSessionId: row.nativeSessionId,
+      incarnationId: lastView.incarnationId, containerId: lastView.containerId, hostBootId: lastView.hostBootId,
+      provider: row.mode === 'kilroy' ? 'kilroy' : row.provider, launchState: 'stopped', desiredState: 'stopped', cleanupState: 'verified_empty' })) {
+      stringEqual(view[field], expected, `stopped view ${field}`)
+    }
+    if (view.executionGeneration !== lastView.executionGeneration) throw new Error('stopped execution generation differs')
+  }
+  for (const [field, expected] of Object.entries({ provider: row.mode === 'kilroy' ? 'kilroy' : row.provider,
+    soulId: row.soulId, providerStoreId: row.providerStoreId, nativeSessionId: row.nativeSessionId, incarnationId: lastView.incarnationId })) {
+    stringEqual(writer[field], expected, `stopped writer ${field}`)
+  }
+  if (writer.activeClaimCount !== 0 || writer.globalConflictingClaimCount !== 0) throw new Error('stopped writer is active or conflicting')
+  let previousObservation = lastCompletedAt
+  for (const field of ['stopCompletedAt', 'stoppedObservedAt', 'writerObservedAt', 'readStartedAt', 'readCompletedAt']) {
+    const at = stopped[field]
+    if (!Number.isSafeInteger(at) || at <= 0 || at < previousObservation) throw new Error('stopped native read order differs')
+    previousObservation = at
+  }
+}
+
+/** Profile configuration and optional native effort are separate observations. */
+function validateNativeProfiles(repoRoot: string, evidenceDir: string, rows: FreshAgentQualificationRow[], candidateSha: string, runId: string, runtimeImage: string, observed: ObservedNativeConversation[]): void {
+  const manifest = parseJsonObject(readRegularFile(path.join(evidenceDir, NATIVE_RECOVERY_ORIGINALS_FILE), 'native profiles manifest'), 'native profiles manifest')
+  const source = (reference: unknown, label: string) => {
+    if (!reference) throw new Error(`native profile ${label} original is missing`)
+    const value = parseJsonObject(readNativeOriginalReference(evidenceDir, reference).bytes, `native profile ${label}`)
+    for (const [field, expected] of Object.entries({ candidateSha, runId, runtimeImage })) stringEqual(value.execution?.[field], expected, `profile source ${field}`)
+    return value
+  }
+  const sdkPin = rows.some(row => row.provider === 'claude')
+    ? parseJsonObject(readRegularFile(path.join(repoRoot, 'crates/freshell-claude-sidecar/package.json'), 'sidecar package'), 'sidecar package').dependencies?.['@anthropic-ai/claude-agent-sdk'] : null
+  for (const [index, row] of rows.entries()) {
+    for (const stage of manifest.conversations[index].stages) {
+      const profile = source(stage.profile, 'capture'), process = source(profile.process, 'process'), accepted = source(profile.accepted, 'accepted launch')
+      const namespace = source(stage.namespace, 'namespace'), launch = source(stage.launch, 'launch')
+      const view = launch.response?.data?.view ?? launch.response?.result?.Ok?.data?.view
+      stringEqual(profile.mode, row.mode, 'profile mode')
+      stringEqual(process.provider, row.provider, 'profile provider')
+      stringEqual(process.version, row.providerVersion, 'profile native version')
+      stringEqual(accepted.source, 'registry-current-incarnation', 'accepted profile source')
+      for (const field of ['soulId', 'providerStoreId', 'nativeSessionId'] as const) stringEqual(accepted[field], row[field], `accepted ${field}`)
+      for (const field of ['incarnationId', 'containerId', 'launchNonce', 'executionGeneration'] as const) {
+        const expected = field === 'launchNonce' ? view.nativeIdentityObservation.launchNonce : view[field]
+        if (accepted[field] !== expected) throw new Error(`accepted current profile ${field} differs`)
+      }
+      const native = object(process.native, 'native profile process'), spec = object(accepted.spec, 'accepted fresh profile')
+      if (native.pid !== namespace.nativePid || native.uid !== 65534 || !/^\d+$/.test(native.startTicks ?? '') || !Number.isSafeInteger(native.parentPid)
+        || native.parentPid < 1 || !path.isAbsolute(native.executable ?? '')) throw new Error('profile actual native process identity differs')
+      for (const field of ['executableSha256', 'profileSha256'] as const) stringEqual(native[field], namespace[field], `profile ${field}`)
+      stringEqual(native.cwd, namespace.nativeCwd, 'native profile cwd')
+      for (const field of ['incarnationId', 'launchNonce', 'executionGeneration', 'evidenceRevision'] as const) {
+        const expected = field === 'executionGeneration' ? view.executionGeneration : view.nativeIdentityObservation[field]
+        if (native.launch?.[field] !== expected) throw new Error(`native profile launch ${field} differs`)
+      }
+      for (const [field, expected] of Object.entries({ sessionType: row.mode, provider: row.mode === 'kilroy' ? 'kilroy' : row.provider,
+        runtimeVariant: row.runtimeVariant, providerStoreId: row.providerStoreId, nativeSessionId: row.nativeSessionId, cwd: namespace.nativeCwd, model: row.model })) {
+        stringEqual(spec[field], expected, `accepted profile ${field}`)
+      }
+      if ((spec.effort ?? 'provider-default') !== row.effort) throw new Error('accepted profile configured effort differs')
+      if (row.provider === 'claude') {
+        stringEqual(native.configuredModel, row.model, 'native argv configured model')
+        stringEqual(native.configuredEffort, row.effort, 'native argv configured effort')
+        const sdk = object(process.sdk, 'selected SDK profile')
+        stringEqual(sdk.version, sdkPin, 'selected SDK version')
+        stringEqual(sdk.declaredNativeVersion, row.providerVersion, 'SDK native version')
+        stringEqual(sdk.selection, 'sidecar-selected-module-resolution', 'SDK resolution provenance')
+        const metadata = parseJsonObject(readNativeOriginalReference(evidenceDir, sdk.packageSource).bytes, 'SDK package original')
+        stringEqual(metadata.name, '@anthropic-ai/claude-agent-sdk', 'SDK package name')
+        stringEqual(metadata.version, sdkPin, 'SDK package version')
+        stringEqual(metadata.claudeCodeVersion, row.providerVersion, 'SDK package native version')
+        for (const [reference, expected] of [[sdk.moduleSource, sdk.moduleSha256], [sdk.entrySource, sdk.entrySha256]]) {
+          stringEqual(createHash('sha256').update(readNativeOriginalReference(evidenceDir, reference).bytes).digest('hex'), expected, 'SDK selected source digest')
+        }
+      }
+    }
+    const conversation = manifest.conversations[index], last = conversation.stages.at(-1)
+    const stopped = source(conversation.stopped, 'stopped raw read'), stoppedStore = source(stopped.store, 'stopped store')
+    const lastStore = source(last.store, 'last current store'), lastLaunch = source(last.launch, 'last launch')
+    const lastView = lastLaunch.response?.data?.view ?? lastLaunch.response?.result?.Ok?.data?.view
+    validateStoppedNativeRead(stopped, row, lastView, observed[index]!.stages.at(-1)!.completedAt)
+    const finalSource = readNativeOriginalReference(evidenceDir, stopped.nativeFile)
+    const captured = Buffer.from(stoppedStore.snapshot.querySnapshotBase64 ?? stoppedStore.snapshot.bytesBase64, 'base64')
+    if (!finalSource.bytes.equals(captured) || createHash('sha256').update(captured).digest('hex') !== (stoppedStore.snapshot.querySnapshotSha256 ?? stoppedStore.snapshot.sha256)
+      || stoppedStore.snapshot.completeEof !== true || JSON.stringify(stoppedStore.snapshot.identity.slice(0, 2)) !== JSON.stringify(lastStore.snapshot.identity.slice(0, 2))) throw new Error('stopped raw source capture differs')
+    stringEqual(stoppedStore.providerVolumeName, lastStore.providerVolumeName, 'stopped provider volume')
+    stringEqual(stoppedStore.containerId, lastView.containerId, 'stopped container')
+    stringEqual(stoppedStore.snapshot.path, lastStore.snapshot.path, 'stopped native source path')
+    const rawHistory = (reference: unknown) => {
+      const { filename } = readNativeOriginalReference(evidenceDir, reference)
+      return captureNativeHistory(row.provider, row.provider === 'opencode' ? filename : path.dirname(filename), row.nativeSessionId).turns
+    }
+    if (stableJson(rawHistory(stopped.nativeFile)) !== stableJson(rawHistory(last.nativeFile))) throw new Error('stopped native completed prefix differs')
+  }
+  for (const [index, row] of rows.entries()) {
+    for (const stage of observed[index]!.stages) {
+      const expectedProvider = row.provider === 'claude' ? 'anthropic' : 'openai'
+      const expectedModel = row.provider === 'claude' ? 'claude-haiku-4-5-20251001' : 'gpt-5.6-luna'
+      stringEqual(stage.profile.provider, expectedProvider, 'native completed profile provider')
+      stringEqual(stage.profile.observedModel, expectedModel, 'native completed profile model')
+      if (stage.profile.effort !== null && stage.profile.effort !== row.effort) throw new Error('native observed effort differs from intended profile')
+    }
   }
 }
 
@@ -333,7 +447,7 @@ function validateRows(
       throw new Error(`${mode}.ingresses must exactly cover the executable doorway inventory`)
     }
     const pinned = object(versions[contract.provider], `${contract.provider} pinned provider version`)
-    stringEqual(row.providerVersion, nonEmptyString(pinned.version, `${contract.provider} pinned version`), `${mode}.providerVersion`)
+    stringEqual(row.providerVersion, nonEmptyString(contract.provider === 'claude' ? pinned.sdkNativeVersion : pinned.version, `${contract.provider} pinned version`), `${mode}.providerVersion`)
     for (const field of ['soulId', 'nativeSessionId', 'providerStoreId'] as const) {
       nonEmptyString(row[field], `${mode}.${field}`)
     }

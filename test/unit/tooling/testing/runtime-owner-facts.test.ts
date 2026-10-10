@@ -2175,6 +2175,166 @@ describe('fixed observations of an owned prior enclosure', () => {
   })
 })
 
+describe('current running fresh-session lookup', () => {
+  it('resolves presentation and materialized native IDs to the same current running row', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
+      enabledProviders: [], freshAgentModes: [],
+    })
+    const row = { ...handle, freshAgentSessionId: 'presentation-owned', launchState: 'running', intentRevision: 1 }
+    const prior = { ...row, incarnationId: 'prior-incarnation', launchState: 'stopped' }
+    vi.spyOn(rig, 'inventory').mockResolvedValue([prior, row])
+    await expect(rig.runningViewForFreshSession(row.freshAgentSessionId)).resolves.toEqual(row)
+    await expect(rig.runningViewForFreshSession(row.nativeSessionId)).resolves.toEqual(row)
+    await expect(rig.runningViewForFreshSession('unrelated-session')).resolves.toBeNull()
+  })
+
+  it.each(['prepared', 'created', 'starting', 'stopped', 'failed'])('refuses %s rows and unrelated session identities', async launchState => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
+      enabledProviders: [], freshAgentModes: [],
+    })
+    const row = { ...handle, freshAgentSessionId: 'presentation-owned', launchState, intentRevision: 1 }
+    vi.spyOn(rig, 'inventory').mockResolvedValue([row])
+    await expect(rig.runningViewForFreshSession(row.freshAgentSessionId)).resolves.toBeNull()
+    await expect(rig.runningViewForFreshSession(row.nativeSessionId)).resolves.toBeNull()
+    await expect(rig.runningViewForFreshSession('unrelated-session')).resolves.toBeNull()
+  })
+})
+
+describe('startup replacement fixture observes bounded automatic recovery', () => {
+  it.each(['scheduled', 'blocked', 'unrelated-live', 'late-live', 'deadline-live', 'pending', 'near-deadline'] as const)('observes %s inventory without forcing or rearming recovery', async scenario => {
+    const { exercisePhase3StartupReplacementCrash } = await import('../../../runtime/gates/phase-3.test.js')
+    const h = new owner.RuntimeHarness(fixtureRepoRoot, 'startup-backoff-unit', 3, { bootstrapProviders: [] })
+    let starts = 0
+    let soulId = ''
+    const row = () => ({ soulId, incarnationId: 'original-incarnation', containerId: 'original-container',
+      nativeSessionId: 'native-root', launchState: 'running', recoveryState: 'live',
+      durabilityState: 'resume_captured', allocationState: 'verified_durable' })
+    h.broker = { receiptIds: () => new Set<string>() } as unknown as RestrictedDockerBroker
+    vi.spyOn(h, 'startSupervisor').mockImplementation(async () => ({
+      containerId: `supervisor-${++starts}`, volumeName: 'owned-volume',
+    }) as owner.SupervisorInstance)
+    vi.spyOn(h, 'stopSupervisorExact').mockImplementation(() => undefined)
+    vi.spyOn(h, 'removeContainerExact').mockImplementation(() => undefined)
+    vi.spyOn(h, 'killOwnedRuntimeExact').mockImplementation(() => undefined)
+    const waitForFault = vi.spyOn(h, 'waitForContainerExit').mockResolvedValue(undefined)
+    vi.spyOn(h, 'containerLogs').mockReturnValue(JSON.stringify({ event: 'supervisor.test_crash', point: 'after_docker_create' }))
+    vi.spyOn(h, 'brokerReceiptsSince').mockReturnValue([{ containerId: 'quarantined-container' }] as ReturnType<owner.RuntimeHarness['brokerReceiptsSince']>)
+    vi.spyOn(h, 'inspectContainer').mockReturnValue({ State: { Running: false } })
+    vi.spyOn(h, 'nativeFixtureCall').mockImplementation(async (_instance, _incarnation, request) =>
+      request.method === 'create' ? { ok: true, sessionId: 'native-root' }
+        : { ok: true, sessionId: 'native-root', history: ['create', 'automatic_resume'] })
+    const recoveryTimes: number[] = []
+    const inventoryTimes: number[] = []
+    const readTimeouts: Array<number | undefined> = []
+    let pendingReads = 0
+    vi.spyOn(h, 'adminOk').mockImplementation(async (_instance, body, options) => {
+      const elapsed = Date.now()
+      switch (body.method) {
+        case 'health': return { kind: 'health', data: { controlEpoch: 1 } }
+        case 'launch':
+          soulId = body.params.soulId
+          return { kind: 'launch', data: { view: row(), workerPid: 42, workerLaunchCount: 1 } }
+        case 'probe_recovery': return { kind: 'recovery_probe', data: { kind: 'reattach_ready' } }
+        case 'inventory': {
+          if (starts < 3) return { kind: 'inventory', data: [row()] }
+          inventoryTimes.push(elapsed)
+          readTimeouts.push(options?.timeoutMs)
+          if (scenario === 'pending') {
+            pendingReads++
+            const timeout = options?.timeoutMs ?? owner.CONTROL_ROUND_TRIP_TIMEOUT_MS
+            return await new Promise((_resolve, reject) => setTimeout(() => {
+              pendingReads--
+              reject(new Error(`control round trip exceeded ${timeout}ms`))
+            }, timeout))
+          }
+          if (scenario === 'late-live' || scenario === 'deadline-live') {
+            vi.setSystemTime(scenario === 'late-live' ? 9_001 : 8_000)
+            return { kind: 'inventory', data: [{ ...row(), incarnationId: 'replacement-incarnation' }] }
+          }
+          if (scenario === 'near-deadline') {
+            vi.setSystemTime(7_990)
+            return { kind: 'inventory', data: [{ ...row(), launchState: 'stopped', recoveryState: 'blocked' }] }
+          }
+          const recovered = elapsed >= 2_000 && scenario !== 'blocked'
+          return { kind: 'inventory', data: recovered
+            ? [{ ...row(), soulId: scenario === 'unrelated-live' ? 'other-soul' : soulId, incarnationId: 'replacement-incarnation' }]
+            : [{ ...row(), launchState: 'stopped', recoveryState: 'blocked' }] }
+        }
+        case 'recover':
+          expect(body.params.trigger).toBe('startup_reconcile')
+          recoveryTimes.push(elapsed)
+          return { kind: 'recovery', data: { outcome: elapsed >= 2_000 ? 'reattached' : 'blocked' } }
+        case 'stop': return { kind: 'stop', data: { outcome: 'verified_empty' } }
+        default: throw new Error(`unadmitted controlled request ${body.method}`)
+      }
+    })
+    vi.useFakeTimers({ now: 0 })
+    try {
+      const execution = exercisePhase3StartupReplacementCrash(h)
+      // Attach the assertion before advancing timers so a genuine driver
+      // failure is observed without creating an unhandled rejection.
+      const checked = scenario === 'scheduled'
+        ? expect(execution).resolves.toMatchObject({ recoveryOutcome: 'reattached', nativeSessionStable: true, stopOutcome: 'verified_empty' })
+        : expect(execution).rejects.toThrow(/within 8000ms|control round trip exceeded 8000ms/)
+      await Promise.all([vi.runAllTimersAsync(), checked])
+      expect(waitForFault).toHaveBeenCalledExactlyOnceWith('supervisor-2', 8_000)
+      expect(recoveryTimes).toEqual(scenario === 'scheduled' ? [2_000] : [])
+      expect(inventoryTimes.at(-1)).toBe(scenario === 'scheduled' ? 2_000 : scenario === 'blocked' || scenario === 'unrelated-live' ? 7_900 : 0)
+      expect(readTimeouts[0]).toBe(8_000)
+      if (scenario === 'scheduled') {
+        expect(readTimeouts.at(-2)).toBe(6_000)
+        expect(readTimeouts.at(-1)).toBeUndefined() // existing post-recovery inventory keeps its default
+      }
+      if (scenario === 'pending' || scenario === 'near-deadline') expect(Date.now()).toBe(8_000)
+      expect(pendingReads).toBe(0)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally { vi.useRealTimers() }
+  })
+})
+
+describe('owned inventory control read timeout', () => {
+  it.each(['adminRaw', 'adminOk', 'adminEnvelopeRaw'] as const)('settles %s and destroys its owned socket within the requested read budget', async method => {
+    const h = new owner.RuntimeHarness(fixtureRepoRoot, 'control-timeout-unit', 3, { bootstrapProviders: [] })
+    const socketPath = path.join(fixtureRepoRoot, 'control.sock')
+    const sockets = new Set<net.Socket>()
+    const timers = new Set<NodeJS.Timeout>()
+    let requests = 0
+    let closed = 0
+    const server = net.createServer(socket => {
+      sockets.add(socket)
+      socket.once('data', () => {
+        requests++
+        // A bounded fallback makes the pre-fix RED settle too, instead of
+        // waiting the unchanged default two-minute control timeout.
+        const timer = setTimeout(() => {
+          timers.delete(timer)
+          const payload = Buffer.from(JSON.stringify({ result: { Ok: { kind: 'inventory', data: [] } } }))
+          const frame = Buffer.alloc(4 + payload.length)
+          frame.writeUInt32BE(payload.length)
+          payload.copy(frame, 4)
+          socket.end(frame)
+        }, 100)
+        timers.add(timer)
+        socket.once('close', () => { clearTimeout(timer); timers.delete(timer) })
+      })
+      socket.once('close', () => { sockets.delete(socket); closed++ })
+    })
+    await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve) })
+    const instance = { controlSocket: socketPath, controlSecret: 'controlled-secret' } as owner.SupervisorInstance
+    try {
+      const read = method === 'adminEnvelopeRaw'
+        ? h.adminEnvelopeRaw(instance, { body: h.inventoryBody() }, { timeoutMs: 25 })
+        : h[method](instance, h.inventoryBody(), { timeoutMs: 25 })
+      await expect(read).rejects.toThrow(/control round trip exceeded 25ms/)
+      await vi.waitFor(() => { expect(requests).toBe(1); expect(closed).toBe(1); expect(sockets.size).toBe(0); expect(timers.size).toBe(0) })
+    } finally {
+      for (const timer of timers) clearTimeout(timer)
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+    }
+  })
+})
+
 describe('fixed fresh-agent launch observations', () => {
   it('crashes the matching fresh provider child rather than its adapter PID', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
@@ -2195,8 +2355,8 @@ describe('fixed fresh-agent launch observations', () => {
     expect(host).not.toHaveBeenCalled()
   })
   it.each([
-    { mode: 'freshclaude', provider: 'claude', version: '2.1.263', command: 'claude --session owned' },
-    { mode: 'kilroy', provider: 'claude', registeredProvider: 'kilroy', version: '2.1.263', command: 'claude --session owned' },
+    { mode: 'freshclaude', provider: 'claude', version: '2.1.237', command: 'claude --session owned' },
+    { mode: 'kilroy', provider: 'claude', registeredProvider: 'kilroy', version: '2.1.237', command: 'claude --session owned' },
     { mode: 'freshcodex', provider: 'codex', version: '0.147.0', command: 'codex app-server' },
     { mode: 'freshopencode', provider: 'opencode', version: '1.18.21', command: 'opencode serve' },
   ])('observes $mode native-family version/PID without requiring a pre-turn native ID', async ({ mode, provider, registeredProvider = provider, version, command }) => {
@@ -2212,14 +2372,13 @@ describe('fixed fresh-agent launch observations', () => {
     vi.spyOn(rig.runtime.broker, 'receipts').mockReturnValue([{ ...enclosure, imageRef: 'owned-image', runtimeDir: root,
       createdAt: new Date().toISOString(), requestDigest: 'd'.repeat(64) }])
     const probe = vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (_container, args) => (
-      args[0] === provider ? `${version} (provider)\n` : `1 session-host\n42 ${command}\n`
+      args[0] === 'python3' ? JSON.stringify({ provider, version, native: { pid: 42, parentPid: 41, startTicks: '123', uid: 65534, executable: `/owned/${provider}`, executableSha256: 'd'.repeat(64), cwd: '/owned/workspace', profileSha256: 'e'.repeat(64), launch: { incarnationId: enclosure.incarnationId } }, sdk: provider === 'claude' ? { version: '0.3.237', declaredNativeVersion: '2.1.237', modulePath: '/owned/sdk.mjs', moduleSha256: 'f'.repeat(64), entryPath: '/owned/index.mjs', entrySha256: 'a'.repeat(64), selection: 'sidecar-selected-module-resolution' } : null }) : `${version} (global)\n1 session-host\n99 ${command}\n`
     ))
     try {
       await expect(rig.freshAgentLaunchFacts(enclosure)).resolves.toEqual({ provider, version, workerPid: 42 })
-      expect(probe).toHaveBeenNthCalledWith(1, enclosure.containerId, [provider, '--version'])
-      expect(probe).toHaveBeenNthCalledWith(2, enclosure.containerId, ['ps', '-eo', 'pid,args'])
-      probe.mockImplementation(async (_container, args) => args[0] === provider ? version : '1 session-host\n')
-      await expect(rig.freshAgentLaunchFacts(enclosure)).rejects.toThrow(/provider.*PID/)
+      expect(probe).toHaveBeenCalledExactlyOnceWith(enclosure.containerId, ['python3', '-c', owner.FRESH_AGENT_PROCESS_SCRIPT, provider, enclosure.incarnationId])
+      probe.mockResolvedValue(JSON.stringify({ provider, version, native: { pid: 1 } }))
+      await expect(rig.freshAgentLaunchFacts(enclosure)).rejects.toThrow()
       probe.mockClear()
       inventory.mockResolvedValue([{ ...row, provider: registeredProvider === provider ? 'kilroy' : provider }])
       await expect(rig.freshAgentLaunchFacts(enclosure)).rejects.toThrow(/registration/)
@@ -4245,5 +4404,181 @@ describe('actual owned runtime cleanup observations', () => {
     expect(() => owner.verifyRuntimeCleanupAbsence({ ...expected, helperNames }, { containerIds: [], volumes: [] })).toThrow(/observation/)
     expect(() => owner.verifyRuntimeCleanupAbsence({ ...expected, helperNames }, { containerIds: [], volumes: [], containerNames: helperNames })).toThrow(/remains/)
     expect(() => owner.verifyRuntimeCleanupAbsence({ ...expected, helperNames }, { containerIds: [], volumes: [], containerNames: ['unrelated-helper'] })).not.toThrow()
+  })
+})
+
+describe('finite retained fresh native collection', () => {
+  it('still attempts owned cleanup when writing incomplete collection status fails', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    const collections = (rig as any).freshNativeCollections as Map<string, unknown>
+    collections.set('fixture-collection', { closed: false, failed: true })
+    const cleanup = vi.spyOn(rig.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    vi.spyOn(rig.runtime, 'writeArtifact').mockImplementation(name => { if (name === 'native-collection-status.json') throw new Error('controlled artifact write failure') })
+    await expect(rig.stop()).rejects.toThrow(/artifact write failure/)
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  it.each([false, true])('joins the full native file materialization before cleanup (abort=%s)', async abort => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    await fsp.mkdir(rig.runtime.evidenceDir, { recursive: true })
+    let release!: () => void
+    const pending = new Promise<void>(resolve => { release = resolve })
+    const file = path.join(rig.runtime.evidenceDir, 'pending-native-original.jsonl')
+    const cleanup = vi.spyOn(rig.runtime, 'cleanup').mockImplementation(async () => {
+      expect(await fsp.readFile(file, 'utf8')).toBe('completed raw bytes\n')
+      return { ok: true, errors: [] }
+    })
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const capture = (rig as any).trackNativeCapture(async () => { await pending; await fsp.writeFile(file, 'completed raw bytes\n') }) as Promise<void>
+    if (abort) rig.abortFreshNativeCollections()
+    const stop = rig.stop()
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(cleanup).not.toHaveBeenCalled()
+    release()
+    await Promise.all([capture, stop])
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect((rig as any).nativeCaptures.size).toBe(0)
+  })
+
+  it('selects the actual tagged SDK descendant while an unrelated global Claude is running', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'fresh-native-process-'))
+    const executable = path.join(directory, 'claude'), entry = path.join(directory, 'index.mjs')
+    const packageDir = path.join(directory, 'node_modules/@anthropic-ai/claude-agent-sdk')
+    await fsp.mkdir(packageDir, { recursive: true })
+    await fsp.writeFile(path.join(packageDir, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', version: '0.3.237', claudeCodeVersion: '2.1.237', main: 'sdk.mjs' }))
+    await fsp.writeFile(path.join(packageDir, 'sdk.mjs'), 'throw new Error("the fixture SDK must never execute")')
+    const source = path.join(directory, 'fake.c')
+    await fsp.writeFile(source, '#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\nint main(int n,char**v){if(n>1&&!strcmp(v[1],"--version")){puts("2.1.237");return 0;}for(;;)pause();}')
+    execFileSync('cc', [source, '-o', executable])
+    await fsp.writeFile(entry, `import {spawn} from 'node:child_process';import fs from 'node:fs';const child=spawn(${JSON.stringify(executable)},['--model','haiku','--effort','low'],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(path.join(directory, 'pid'))},String(child.pid));process.on('SIGTERM',()=>{child.kill();child.on('exit',()=>process.exit(0))});`)
+    const sidecar = execFile(process.execPath, [entry], { cwd: directory, env: { ...process.env, HOME: directory,
+      FRESHELL_CLAUDE_SIDECAR_ID: `fixture-${randomUUID()}`, FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify({ incarnationId: 'fixture-incarnation' }) } })
+    const unrelated = execFile(executable, [], { cwd: directory })
+    try {
+      const deadline = Date.now() + 5_000
+      while (!fs.existsSync(path.join(directory, 'pid')) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+      const nativePid = Number(await fsp.readFile(path.join(directory, 'pid'), 'utf8'))
+      // The host fixture uses its own UID; the container script retains the production UID 65534 guard.
+      const script = owner.FRESH_AGENT_PROCESS_SCRIPT.replaceAll('==65534', '==os.getuid()')
+      const measured = JSON.parse(execFileSync('python3', ['-c', script, 'claude', 'fixture-incarnation'], { encoding: 'utf8' }))
+      expect(measured.native).toMatchObject({ pid: nativePid, parentPid: sidecar.pid, configuredModel: 'haiku', configuredEffort: 'low', cwd: directory })
+      expect(measured.native.pid).not.toBe(unrelated.pid)
+      expect(measured).toMatchObject({ version: '2.1.237', sdk: { version: '0.3.237', declaredNativeVersion: '2.1.237', modulePath: path.join(packageDir, 'sdk.mjs') } })
+      expect(Buffer.from(measured.sdk.moduleBytesBase64, 'base64').toString()).toContain('must never execute')
+      await fsp.writeFile(path.join(packageDir, 'package.json'), JSON.stringify({ name: 'wrong-selected-module', version: '0.3.237', main: 'sdk.mjs' }))
+      expect(() => execFileSync('python3', ['-c', script, 'claude', 'fixture-incarnation'], { stdio: 'pipe' })).toThrow()
+    } finally {
+      const closed = [sidecar, unrelated].map(child => new Promise<void>(resolve => { if (child.exitCode !== null || child.signalCode !== null) resolve(); else child.once('exit', () => resolve()) }))
+      sidecar.kill('SIGTERM'); unrelated.kill('SIGTERM')
+      await Promise.all(closed)
+      await fsp.rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('retains three actual-format raw stages before owned cleanup deletes the source', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'fresh-native-collection-'))
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
+      enabledProviders: [], freshAgentModes: ['freshclaude'],
+    })
+    const nonce = `codename-${'a'.repeat(32)}`, nativeRoot = 'owned-native-root'
+    const projects = path.join(directory, 'projects'); await fsp.mkdir(projects)
+    const nativeFile = path.join(projects, `${nativeRoot}.jsonl`)
+    await fsp.writeFile(nativeFile, JSON.stringify({ type: 'system', sessionId: nativeRoot, subtype: 'init' }) + '\n')
+    const sdkPackage = Buffer.from(JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', version: '0.3.237', claudeCodeVersion: '2.1.237' }))
+    const sdkModule = Buffer.from('export const query = () => undefined'), sidecarEntry = Buffer.from('import {query} from "@anthropic-ai/claude-agent-sdk"')
+    let generation = 1, stopped = false, sent = 0
+    const current = () => ({ ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha,
+      incarnationId: `inc-${generation}`, containerId: String(generation).repeat(64), hostBootId: `boot-${generation}`,
+      nativeSessionId: nativeRoot, provider: 'claude', freshAgentSessionType: 'freshclaude', freshAgentRuntimeVariant: 'claude-agent-sdk',
+      launchState: stopped ? 'stopped' : 'running', desiredState: stopped ? 'stopped' : 'running', recoveryState: 'live', cleanupState: stopped ? 'verified_empty' : 'none',
+      executionGeneration: generation, intentRevision: 1,
+      nativeIdentityObservation: { nativeSessionId: nativeRoot, incarnationId: `inc-${generation}`, launchNonce: `launch-${generation}`,
+        evidenceRevision: generation, evidenceDigest: 'c'.repeat(64) } })
+    vi.spyOn(rig, 'inventory').mockImplementation(async () => [current()])
+    vi.spyOn(rig, 'assertCurrentHandle').mockImplementation(async requested => { expect(requested).toMatchObject(rig.runtimeEnclosureHandle(current())) })
+    rig.runtime.imageRef = `sha256:${'b'.repeat(64)}`
+    rig.supervisor = { containerId: 'f'.repeat(64) } as any
+    await fsp.mkdir(rig.runtime.evidenceDir, { recursive: true })
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: path.join(directory, 'unused.sock'), proxySocketPath: path.join(directory, 'proxy.sock'),
+      runtimeRootPrefix: directory, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId, logPath: path.join(directory, 'broker.jsonl') })
+    vi.spyOn(rig.runtime.broker, 'receipts').mockImplementation(() => Array.from({ length: generation }, (_, index) => ({
+      ...current(), incarnationId: `inc-${index + 1}`, containerId: String(index + 1).repeat(64), providerVolumeName: 'owned-native-volume',
+      imageRef: rig.runtime.imageRef, workspacePath: rig.repoRoot, runtimeDir: directory, createdAt: new Date().toISOString(), requestDigest: 'd'.repeat(64),
+    })))
+    const launchProcess = () => ({ provider: 'claude', version: '2.1.237', native: { pid: 42, parentPid: 41, startTicks: `100${generation}`, uid: 65534,
+      executable: '/owned/claude', executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64), cwd: fixtureRepoRoot,
+      configuredModel: 'haiku', configuredEffort: 'low', launch: { incarnationId: `inc-${generation}`, launchNonce: `launch-${generation}`,
+        executionGeneration: generation, evidenceRevision: generation } }, sdk: { version: '0.3.237', declaredNativeVersion: '2.1.237', selection: 'sidecar-selected-module-resolution',
+        packageBytesBase64: sdkPackage.toString('base64'), moduleBytesBase64: sdkModule.toString('base64'), entryBytesBase64: sidecarEntry.toString('base64'),
+        moduleSha256: createHash('sha256').update(sdkModule).digest('hex'), entrySha256: createHash('sha256').update(sidecarEntry).digest('hex') } })
+    vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (_container, args) => {
+      if (args.includes(owner.FRESH_AGENT_PROCESS_SCRIPT)) return JSON.stringify(launchProcess())
+      if (args[0] === 'node') {
+        const { captureNativeHistory } = await import('../../../e2e-browser/helpers/provider-native-history/probe-cli.js')
+        return JSON.stringify(captureNativeHistory('claude', projects, nativeRoot, args.at(-1) === 'boundary'))
+      }
+      return JSON.stringify({ uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, nativePid: 42, nativeRoot,
+        nativeCwd: fixtureRepoRoot, executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64), nativeLaunch: launchProcess().native.launch,
+        tlsVerifyMode: 2, tlsCheckHostname: true, httpsStatus: 200 })
+    })
+    vi.spyOn(rig as any, 'ownedDockerProbe').mockImplementation(async () => JSON.stringify({ source: 'registry-current-incarnation', soulId: handle.soulId,
+      incarnationId: `inc-${generation}`, containerId: String(generation).repeat(64), hostBootId: `boot-${generation}`, launchNonce: `launch-${generation}`,
+      executionGeneration: generation, providerStoreId: 'owned-native-store', nativeSessionId: nativeRoot,
+      spec: { sessionType: 'freshclaude', provider: 'claude', runtimeVariant: 'claude-agent-sdk', providerStoreId: 'owned-native-store',
+        nativeSessionId: nativeRoot, cwd: fixtureRepoRoot, model: 'haiku', effort: 'low' } }))
+    vi.spyOn(rig, 'writerClaimFacts').mockImplementation(async () => ({ provider: 'claude', providerStoreId: 'owned-native-store', nativeSessionId: nativeRoot,
+      soulId: handle.soulId, incarnationId: `inc-${generation}`, activeClaimCount: stopped ? 0 : 1, globalConflictingClaimCount: 0 }))
+    const completions: Promise<void>[] = []
+    vi.spyOn(rig.runtime, 'adminRaw').mockImplementation(async (_supervisor, body, options) => {
+      expect(body.method).toBe('fresh_agent_send')
+      sent += 1
+      const text = sent === 1 ? 'stored' : nonce
+      const turn = sent
+      await fsp.appendFile(nativeFile, JSON.stringify({ type: 'user', uuid: `user-${turn}`, sessionId: nativeRoot, message: { role: 'user', content: body.params.text } }) + '\n')
+      completions.push(new Promise<void>(resolve => setTimeout(resolve, 25)).then(async () => {
+        await fsp.appendFile(nativeFile, JSON.stringify({ type: 'assistant', uuid: `assistant-${turn}`, parentUuid: `user-${turn}`, sessionId: nativeRoot, timestamp: new Date().toISOString(),
+          message: { id: `turn-${turn}`, role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn', content: [{ type: 'text', text }] } }) + '\n')
+      }))
+      return { requestId: options?.requestId, result: { Ok: { data: {} } } } as any
+    })
+    let previousExited = false
+    vi.spyOn(rig.runtime, 'killOwnedRuntimeExact').mockImplementation(() => { previousExited = true })
+    vi.spyOn(rig, 'ownedContainerState').mockImplementation(async () => ({ present: true, running: !stopped && !previousExited }))
+    vi.spyOn(rig.runtime, 'killOwnedRuntimePidExact').mockImplementation(() => { previousExited = true })
+    vi.spyOn(rig, 'ownedRuntimeHostState').mockImplementation(async () => ({ running: !previousExited, pid: 1 }) as any)
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    vi.spyOn(rig, 'stopSoul').mockImplementation(async () => { stopped = true; return { outcome: 'verified_empty', view: current() } })
+    Object.assign(rig, { readStoppedNativeHistory: async () => {
+      expect(stopped).toBe(true)
+      const { captureNativeHistory } = await import('../../../e2e-browser/helpers/provider-native-history/probe-cli.js')
+      return captureNativeHistory('claude', projects, nativeRoot)
+    } })
+    vi.spyOn(rig.runtime, 'cleanup').mockImplementation(async () => { await fsp.rm(projects, { recursive: true }); return { ok: true, errors: [] } })
+    try {
+      const registered = await rig.registerFreshNativeCollection({ ...rig.runtimeEnclosureHandle(current()), nativeSessionId: nativeRoot }, nonce)
+      for (let index = 0; index < 3; index++) {
+        const exact = { ...rig.runtimeEnclosureHandle(current()), nativeSessionId: nativeRoot }
+        await expect(rig.captureFreshNativeStage(exact, registered.collectionId)).resolves.toMatchObject({ completedStages: index + 1, closed: false })
+        if (index === 0) await rig.crashRuntimeHost(Object.fromEntries(Object.entries(exact).reverse()) as typeof exact)
+        if (index === 1) await rig.crashProviderWorker(exact)
+        if (index < 2) { generation++; previousExited = false }
+      }
+      await expect(rig.finishFreshNativeCollection({ ...rig.runtimeEnclosureHandle(current()), nativeSessionId: nativeRoot }, registered.collectionId)).resolves.toMatchObject({ completedStages: 3, closed: true })
+      const manifest = JSON.parse(await fsp.readFile(path.join(rig.runtime.evidenceDir, 'native-recovery-originals.json'), 'utf8'))
+      const stoppedRead = JSON.parse(await fsp.readFile(path.join(rig.runtime.evidenceDir, manifest.conversations[0].stopped.path), 'utf8'))
+      expect(stoppedRead).toMatchObject({ stopResult: { outcome: 'verified_empty', view: { soulId: handle.soulId, incarnationId: 'inc-3', launchState: 'stopped' } },
+        stoppedView: { soulId: handle.soulId, incarnationId: 'inc-3', containerId: '3'.repeat(64), hostBootId: 'boot-3', nativeSessionId: nativeRoot, desiredState: 'stopped', cleanupState: 'verified_empty' },
+        writer: { providerStoreId: 'owned-native-store', incarnationId: 'inc-3', activeClaimCount: 0, globalConflictingClaimCount: 0 } })
+      const readOrder = ['stopCompletedAt', 'stoppedObservedAt', 'writerObservedAt', 'readStartedAt', 'readCompletedAt'].map(field => stoppedRead[field])
+      expect(readOrder.every((at, index) => Number.isSafeInteger(at) && at > 0 && (index === 0 || at >= readOrder[index - 1]))).toBe(true)
+      await rig.stop()
+      expect(fs.existsSync(projects)).toBe(false)
+      const { deriveNativeRecoveryOriginals } = await import('../../../../scripts/testing/qualification-observations.js')
+      const observed = deriveNativeRecoveryOriginals({ evidenceDir: rig.runtime.evidenceDir, candidateSha: rig.runtime.candidateSha,
+        runId: rig.runtime.runId, runtimeImage: rig.runtime.imageRef, selected: ['freshclaude'] })
+      expect(observed[0]!.stages.map(stage => [stage.recalledNonce, stage.profile.effort])).toEqual([[false, null], [true, null], [true, null]])
+      expect(sent).toBe(3)
+      await expect(rig.captureFreshNativeStage({ ...rig.runtimeEnclosureHandle(current()), nativeSessionId: nativeRoot }, registered.collectionId)).rejects.toThrow(/finished|closed/)
+    } finally { await Promise.all(completions); await fsp.rm(directory, { recursive: true, force: true }) }
   })
 })
