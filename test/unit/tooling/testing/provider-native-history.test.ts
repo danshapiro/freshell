@@ -13,6 +13,7 @@ import { readCodexNativeHistory, readCodexNativeObservation } from '../../../e2e
 import { readOpenCodeNativeHistory, readOpenCodeNativeObservation } from '../../../e2e-browser/helpers/provider-native-history/opencode.js'
 import { nativeTurnProof } from '../../../e2e-browser/helpers/provider-native-history/proof.js'
 import { OPENCODE_NATIVE_HISTORY_SCRIPT } from '../../../e2e-browser/helpers/opencode-native-history.js'
+import { captureNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/probe-cli.js'
 
 const roots: string[] = []
 
@@ -74,6 +75,46 @@ describe('Claude native history proof', () => {
         reasoningEffortProvenance: 'claude-transcript.effort',
       })],
     })
+  })
+
+  it.each([undefined, 'low'])('keeps absent Claude effort unknown and preserves message effort (%s)', (effort) => {
+    const root = tempRoot('claude-optional-effort')
+    writeJsonl(path.join(root, 'project', `${sessionId}.jsonl`), [
+      { type: 'user', uuid: 'user-1', sessionId, message: { role: 'user', content: 'remember' } },
+      { type: 'assistant', uuid: 'row-1', parentUuid: 'user-1', sessionId, timestamp: '2026-09-01T00:00:01.000Z',
+        message: { id: 'msg-1', role: 'assistant', model: 'claude-haiku-4-5-20251001', effort,
+          stop_reason: 'end_turn', content: [{ type: 'text', text: 'stored' }] } },
+    ])
+    const turn = readClaudeNativeHistory(root, sessionId).turns[0]!
+    expect(turn.resolvedReasoningEffort).toBe(effort ?? 'unknown')
+    expect(turn.reasoningEffortProvenance).toBe(effort ? 'claude-assistant-message.effort' : 'unsupported-native-telemetry')
+  })
+
+  it.each(['', 42, { level: 'low' }])('refuses malformed claimed Claude effort %j', (effort) => {
+    const root = tempRoot('claude-invalid-effort')
+    writeJsonl(path.join(root, `${sessionId}.jsonl`), [{ type: 'assistant', uuid: 'row', parentUuid: 'user', sessionId,
+      timestamp: '2026-09-01T00:00:01.000Z', effort,
+      message: { id: 'msg', role: 'assistant', model: 'haiku', stop_reason: 'end_turn', content: [{ type: 'text', text: 'stored' }] } }])
+    expect(() => readClaudeNativeHistory(root, sessionId)).toThrow(/effort/)
+  })
+
+  it('retains exact raw source through the unchanged stopped CLI arguments', () => {
+    const root = tempRoot('claude-raw-cli')
+    const file = path.join(root, 'project', `${sessionId}.jsonl`)
+    writeJsonl(file, [{ type: 'assistant', uuid: 'row', parentUuid: 'user', sessionId,
+      timestamp: '2026-09-01T00:00:01.000Z', effort: 'low',
+      message: { id: 'msg', role: 'assistant', model: 'haiku', stop_reason: 'end_turn', content: [{ type: 'text', text: 'private-recalled-marker' }] } }])
+    const captured = JSON.parse(execFileSync(process.execPath, ['--no-warnings', '--import', path.resolve('node_modules/tsx/dist/loader.mjs'),
+      path.resolve('test/e2e-browser/helpers/provider-native-history/probe-cli.ts'), 'claude', root, sessionId], { encoding: 'utf8' }))
+    expect(captured.nativeSessionId).toBe(sessionId)
+    expect(captured.turns[0].text).toBe('private-recalled-marker')
+    expect(Buffer.from(captured.rawSource.snapshot.bytesBase64, 'base64')).toEqual(fs.readFileSync(file))
+    expect(captured.rawSource.snapshot.path).toBe(file)
+    expect(captured.rawSource.snapshot.completeEof).toBe(true)
+    const copy = path.join(tempRoot('claude-raw-retained'), `${sessionId}.jsonl`)
+    fs.writeFileSync(copy, Buffer.from(captured.rawSource.snapshot.bytesBase64, 'base64'))
+    expect(readClaudeNativeHistory(path.dirname(copy), sessionId)).toEqual({ schemaVersion: captured.schemaVersion,
+      provider: captured.provider, nativeSessionId: captured.nativeSessionId, turns: captured.turns })
   })
 
   it('fails closed on duplicate exact-session transcripts, symlinks, malformed rows, and incomplete responses', () => {
@@ -212,6 +253,23 @@ describe('Codex native history proof', () => {
 })
 
 describe('OpenCode native history proof', () => {
+  it('retains committed WAL contents in a standalone raw database snapshot', () => {
+    const root = tempRoot('opencode-live-wal'), dbPath = path.join(root, 'opencode.db')
+    const db = new DatabaseSync(dbPath)
+    try {
+      db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE session (id TEXT PRIMARY KEY); CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, time_created INTEGER, data TEXT);')
+      db.prepare('INSERT INTO session VALUES (?)').run('ses_wal')
+      db.prepare('INSERT INTO message VALUES (?,?,?,?)').run('msg_wal', 'ses_wal', 1, JSON.stringify({ role: 'assistant', parentID: 'user_wal', providerID: 'openai', modelID: 'gpt-5.6-luna', time: { completed: 2 } }))
+      db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('part_wal', 'ses_wal', 'msg_wal', 1, JSON.stringify({ type: 'text', text: 'completed-in-wal' }))
+      expect(fs.statSync(`${dbPath}-wal`).size).toBeGreaterThan(0)
+      const captured = captureNativeHistory('opencode', dbPath, 'ses_wal')
+      const retained = path.join(tempRoot('opencode-retained-wal'), 'opencode.db')
+      fs.writeFileSync(retained, Buffer.from(captured.rawSource!.snapshot.querySnapshotBase64!, 'base64'))
+      expect(readOpenCodeNativeHistory(retained, 'ses_wal').turns[0]).toMatchObject({ text: 'completed-in-wal', resolvedProvider: 'openai', resolvedModel: 'gpt-5.6-luna' })
+      expect(captured.turns[0].text).toBe('completed-in-wal')
+    } finally { db.close() }
+  })
+
   it('uses the exact SQLite session, completed assistant message, parts, and native profile', () => {
     const root = tempRoot('opencode-native')
     const dbPath = path.join(root, 'opencode.db')
