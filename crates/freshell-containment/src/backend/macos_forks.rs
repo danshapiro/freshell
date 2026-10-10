@@ -23,10 +23,12 @@
 //! ancestor's, read after the process is registered) is never tracked, and
 //! so never recorded as a root. A tracked process that execs into the
 //! family is dropped at its exec event, before the scan of that batch, so
-//! a child it started before the tracker collected the exec is judged
-//! through it and refused too. Only the processes it started that the
-//! tracker already followed before it collected the exec were judged
-//! outside the family; they stay tracked until they exit.
+//! a child it started that the tracker first sees in that batch's scan is
+//! judged through it and refused too. A child an earlier batch's scan
+//! already followed (the ancestor walk stops at a tracked parent without
+//! re-reading its argv, so a scan that runs before the exec event is
+//! collected admits it) was judged outside the family; it stays tracked
+//! until it exits.
 //!
 //! The contract: a process is tracked when, at the scan that follows its
 //! parent's fork event, its parent, its process-group leader or its session
