@@ -1723,6 +1723,10 @@ impl Supervisor {
             RecoveryProbe::ReattachReady { .. } | RecoveryProbe::ResumeReady { .. }
         ) && context.desired_state == DesiredState::Running
             && context.provider == "opencode"
+            // A stopped repair receipt describes the already installed store.
+            // A source census cannot replace its immutable import authority
+            // when the current host is unavailable during Resume or Retry.
+            && context.opencode_adoption_baseline.is_none()
             && !matches!(
                 context.native_import_state,
                 NativeImportState::NotApplicable

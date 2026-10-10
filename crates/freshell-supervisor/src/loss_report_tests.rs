@@ -3752,6 +3752,119 @@ async fn stale_lifecycle_writer_does_not_recreate_withdrawn_incident_after_retra
     assert!(!lifecycle.exists());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_stale_exporter_and_rotator_preserve_exact_withdrawal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, prepared) = prepared_loss(dir.path()).await;
+    let incident = prepared.certificate.incident_id.clone();
+    let queued = registry
+        .pending_incident_exports(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.incident_id == incident)
+        .unwrap();
+    let incidents = dir.path().join("incidents");
+    fs::create_dir_all(&incidents).unwrap();
+    let lifecycle = dir.path().join("lifecycle.jsonl");
+    let unrelated = "{\"event\":\"unrelated\",\"incidentId\":\"incident-unrelated\"}\n";
+    let false_line = serde_json::json!({"incidentId":incident,"event":"false-loss"}).to_string();
+    fs::write(&lifecycle, format!("{false_line}\n{unrelated}")).unwrap();
+    let export = incidents.join(format!("{incident}.open.json"));
+    fs::write(&export, &false_line).unwrap();
+    let exporter = IncidentExporter::new(&incidents, "fixture-control-secret");
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let database = registry.database_path().to_path_buf();
+    let queued_event_id = queued.event_id.clone();
+    let retract_exporter = exporter.clone();
+    let retract_lifecycle = lifecycle.clone();
+    let retract_incident = incident.clone();
+    let retraction = std::thread::spawn(move || {
+        let _coordinator = crate::loss_report::incident_file_coordinator();
+        held_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let conn = Connection::open(database).unwrap();
+        // Model the committed exact withdrawal while queued producers retain
+        // their older snapshots; their production rechecks must reject them.
+        conn.execute("DELETE FROM outbox WHERE event_id=?1", [&queued_event_id])
+            .unwrap();
+        conn.execute(
+            "DELETE FROM loss_incidents WHERE incident_id=?1",
+            [retract_incident.as_str()],
+        )
+        .unwrap();
+        retract_exporter
+            .retract_false_incidents_coordinated(
+                &BTreeSet::from([retract_incident.to_string()]),
+                &retract_lifecycle,
+            )
+            .unwrap();
+    });
+    held_rx.await.unwrap();
+    let stale_registry = registry.clone();
+    let stale_exporter = exporter.clone();
+    let (export_ready_tx, export_ready_rx) = tokio::sync::oneshot::channel();
+    let stale_export = tokio::spawn(async move {
+        export_ready_tx.send(()).unwrap();
+        stale_registry
+            .export_and_ack_incident(queued, stale_exporter)
+            .await
+            .unwrap()
+    });
+    let writer_registry = registry.clone();
+    let writer_lifecycle = lifecycle.clone();
+    let writer_incident = incident.clone();
+    let (writer_ready_tx, writer_ready_rx) = tokio::sync::oneshot::channel();
+    let stale_writer = tokio::spawn(async move {
+        writer_ready_tx.send(()).unwrap();
+        crate::service::append_incident_event_if_current(
+            &writer_registry,
+            &writer_lifecycle,
+            "stale.loss.finalized",
+            serde_json::json!({"incidentId":writer_incident}),
+            writer_incident,
+        )
+        .await
+        .unwrap()
+    });
+    let rotate_lifecycle = lifecycle.clone();
+    let (rotate_ready_tx, rotate_ready_rx) = tokio::sync::oneshot::channel();
+    let rotator = tokio::task::spawn_blocking(move || {
+        rotate_ready_tx.send(()).unwrap();
+        crate::service::append_event(
+            &rotate_lifecycle,
+            "unrelated.rotation",
+            serde_json::json!({"fictionalPadding":"x".repeat(10 * 1024 * 1024)}),
+        );
+    });
+    export_ready_rx.await.unwrap();
+    writer_ready_rx.await.unwrap();
+    rotate_ready_rx.await.unwrap();
+    release_tx.send(()).unwrap();
+    retraction.join().unwrap();
+    assert!(stale_export.await.unwrap().is_none());
+    assert!(!stale_writer.await.unwrap());
+    rotator.await.unwrap();
+    assert!(!export.exists());
+    let rotated = lifecycle.with_file_name("lifecycle.jsonl.1");
+    assert_eq!(fs::read_to_string(&rotated).unwrap(), unrelated);
+    let current = fs::read_to_string(&lifecycle).unwrap();
+    assert!(!current.contains(incident.as_str()));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(current.trim()).unwrap()["event"],
+        "unrelated.rotation"
+    );
+    assert!(registry
+        .pending_incident_exports(10)
+        .await
+        .unwrap()
+        .iter()
+        .all(|event| event.incident_id != incident));
+}
+
 #[test]
 fn incident_export_redacts_and_never_evicts_open_reports() {
     let dir = tempfile::tempdir().unwrap();
@@ -4141,6 +4254,417 @@ async fn durable_souls_schema_seven_nine_rows_remain_unbound_until_verified_repa
     );
 }
 
+async fn import_stopped_fixture_root(
+    registry: &Registry,
+    target: &freshell_runtime_protocol::LostSoulRepairTarget,
+    database: &std::path::Path,
+    workspace: &std::path::Path,
+    fixture_root: &std::path::Path,
+    root: &str,
+    expected_generation: &str,
+) -> crate::registry::StoppedRepairRootReceipt {
+    use freshell_agent_runtime::opencode_transfer::{
+        import_bundle_payload, verify_installed_store, InstalledStoreReaderContext,
+    };
+    use freshell_runtime_protocol::{
+        opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeAdoptionBaseline,
+        OpenCodeTransferDescriptor, OpenCodeTransferFile, OPENCODE_TRANSFER_DESTINATION_DB,
+    };
+    use sha2::{Digest, Sha256};
+    let context = registry
+        .recovery_context(target.soul_id.clone())
+        .await
+        .unwrap();
+    let snapshot = freshell_sessions::opencode_transfer::export_exact_session(
+        &freshell_sessions::opencode_transfer::HostOpenCodeInventory::new(database.to_path_buf())
+            .with_trusted_mount_for_selected_session(workspace.to_path_buf()),
+        root,
+        freshell_sessions::opencode_transfer::ExportOptions::new(
+            fixture_root.join("root-extractions"),
+        ),
+    )
+    .unwrap();
+    let manifest = snapshot.manifest();
+    assert_eq!(manifest.generation, expected_generation);
+    let image = context.prior_handle.image_ref().to_owned();
+    let mut descriptor = OpenCodeTransferDescriptor {
+        transfer_id: format!("fixture-import-{}", target.soul_id),
+        provider: "opencode".into(),
+        source_store_id: manifest.source_store_id.clone(),
+        root_session_id: root.to_string(),
+        source_generation: manifest.generation.clone(),
+        provider_schema: manifest.provider_schema.clone(),
+        source_schema_fingerprint: manifest.source_schema_fingerprint.clone(),
+        migration_journal_fingerprint: manifest.migration_journal_fingerprint.clone(),
+        destination_store_id: context.provider_store_id.clone(),
+        destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
+        target_image_ref: image.clone(),
+        target_build_receipt: opencode_target_build_receipt(&image, "opencode-1.18.21"),
+        incarnation_id: context.prior_handle.incarnation_id().to_string(),
+        manifest_json: serde_json::to_string(manifest).unwrap(),
+        files: vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: manifest.payload_bytes,
+            sha256: manifest.payload_sha256.clone(),
+        }],
+        total_bytes: manifest.payload_bytes,
+        bundle_sha256: String::new(),
+    };
+    descriptor.bundle_sha256 =
+        opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+    let home = fixture_root.join(format!("provider-{}", target.soul_id));
+    let data = home.join(".local/share");
+    let config = home.join(".config");
+    std::fs::create_dir_all(&config).unwrap();
+    let destination = data.join("opencode/opencode.db");
+    let imported = import_bundle_payload(
+        &descriptor,
+        snapshot.open_payload().unwrap(),
+        &destination,
+        &workspace,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    #[cfg(not(unix))]
+    let (uid, gid) = (0, 0);
+    let readable = verify_installed_store(
+        &descriptor,
+        &InstalledStoreReaderContext {
+            database_path: &destination,
+            workspace_root: &workspace,
+            provider_uid: uid,
+            provider_gid: gid,
+            home: &home,
+            xdg_data_home: &data,
+            xdg_config_home: &config,
+            cwd: &workspace,
+        },
+    )
+    .unwrap();
+    assert_eq!(readable.structural_sha256, imported.structural_sha256);
+    assert_eq!(imported.row_count, manifest.row_count as u64);
+    assert!(imported.row_count > 0);
+    let execution_generation: u64 = Connection::open(registry.database_path())
+        .unwrap()
+        .query_row(
+            "SELECT execution_generation FROM incarnations WHERE incarnation_id=?1",
+            [context.prior_handle.incarnation_id().as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let receipt = crate::registry::StoppedRepairRootReceipt {
+        root_session_id: root.to_string(),
+        canonical_soul_id: target.soul_id.clone(),
+        transfer_id: descriptor.transfer_id.clone(),
+        adoption_baseline: OpenCodeAdoptionBaseline {
+            descriptor: descriptor.clone(),
+            manifest_sha256: format!("{:x}", Sha256::digest(descriptor.manifest_json.as_bytes())),
+        },
+        destination_store_id: context.provider_store_id.clone(),
+        source_store_id: descriptor.source_store_id.clone(),
+        source_generation: descriptor.source_generation.clone(),
+        bundle_sha256: descriptor.bundle_sha256.clone(),
+        source_schema_fingerprint: descriptor.source_schema_fingerprint.clone(),
+        migration_journal_fingerprint: descriptor.migration_journal_fingerprint.clone(),
+        target_image_ref: descriptor.target_image_ref.clone(),
+        target_build_receipt: descriptor.target_build_receipt.clone(),
+        row_count: imported.row_count,
+        asset_count: imported.asset_count,
+        structural_sha256: imported.structural_sha256,
+        provider_uid: context.terminal.as_ref().unwrap().run_as_uid,
+        provider_gid: context.terminal.as_ref().unwrap().run_as_gid,
+        reader_environment_sha256: format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&readable).unwrap())
+        ),
+        captured_identity_revision: context.identity_revision,
+        captured_evidence_revision: context.evidence_revision,
+        captured_intent_revision: context.intent_revision,
+        captured_native_import_revision: context.native_import_revision,
+        captured_native_import_state: context.native_import_state.as_str().into(),
+        captured_native_import_authority: context.native_import_authority.clone(),
+        incarnation_id: context.prior_handle.incarnation_id().clone(),
+        execution_generation,
+    };
+    receipt
+}
+
+#[tokio::test]
+async fn stopped_repair_resume_failure_retry_preserves_baseline() {
+    #[cfg(unix)]
+    {
+        const CHILD: &str = "FRESHELL_TASK007_BASELINE_RETRY_CHILD";
+        if std::env::var(CHILD).ok().as_deref() != Some("1") {
+            use std::os::unix::fs::OpenOptionsExt;
+            let home = tempfile::tempdir().unwrap();
+            let stdout_path = home.path().join("stdout.log");
+            let stderr_path = home.path().join("stderr.log");
+            let private_output = |path: &std::path::Path| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .unwrap()
+            };
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "loss_report::tests::stopped_repair_resume_failure_retry_preserves_baseline",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, "1")
+                .env("HOME", home.path())
+                .env("XDG_DATA_HOME", home.path().join("data"))
+                .stdout(private_output(&stdout_path))
+                .stderr(private_output(&stderr_path));
+            let mut child = child.spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("isolated baseline test exceeded its finite deadline");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let status = child.wait().unwrap();
+            let stdout = fs::read_to_string(stdout_path).unwrap();
+            let stderr = fs::read_to_string(stderr_path).unwrap();
+            assert!(status.success(), "{stdout}\n{stderr}");
+            assert!(
+                stdout.contains("1 passed"),
+                "actual child test must execute"
+            );
+            return;
+        }
+    }
+    use freshell_runtime_protocol::{
+        CanonicalOwnerChoice, DesiredState, PreflightLostSoulsRequest, RecoverRequest,
+        RecoveryOutcome, RecoveryState, RecoveryTrigger, RepairBatchSourceSelection, RequestId,
+        RestoreLostSoulsRequest,
+    };
+    use freshell_sessions::opencode_transfer::{
+        pinned_destination_migration_ids, pinned_destination_schema_sql, HostOpenCodeInventory,
+    };
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::open(dir.path(), None).unwrap();
+    let workspace = dir.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let database = dir.path().join("source.sqlite");
+    let source = Connection::open(&database).unwrap();
+    source
+        .execute_batch(pinned_destination_schema_sql())
+        .unwrap();
+    for migration in pinned_destination_migration_ids() {
+        source
+            .execute(
+                "INSERT INTO migration(id,time_completed) VALUES (?1,1)",
+                [migration],
+            )
+            .unwrap();
+    }
+    source.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('baseline-project',?1,1,1,'[]')", [workspace.to_string_lossy().as_ref()]).unwrap();
+    source.execute("INSERT INTO project_directory(project_id,directory,time_created) VALUES ('baseline-project',?1,1)", [workspace.to_string_lossy().as_ref()]).unwrap();
+    let names = (0..7)
+        .map(|index| format!("ses_baseline_root_{index}"))
+        .collect::<Vec<_>>();
+    for root in &names {
+        let child = format!("{root}_child");
+        for (id, parent) in [
+            (root.clone(), None),
+            (child.clone(), Some(root.clone())),
+            (format!("{root}_grandchild"), Some(child)),
+        ] {
+            source.execute("INSERT INTO session(id,project_id,parent_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,'baseline-project',?2,'baseline',?3,'fictional saved graph','1.18.21',1,1)", params![id,parent,workspace.to_string_lossy().as_ref()]).unwrap();
+            source.execute("INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES (?1,?2,1,1,?3)", params![format!("msg_{id}"),id,serde_json::json!({"role":"user","text":"fictional saved history"}).to_string()]).unwrap();
+            source.execute("INSERT INTO part(id,message_id,session_id,time_created,time_updated,data) VALUES (?1,?2,?3,1,1,?4)", params![format!("prt_{id}"),format!("msg_{id}"),id,serde_json::json!({"type":"text","text":"fictional saved part"}).to_string()]).unwrap();
+        }
+    }
+    drop(source);
+    let source_bytes = fs::read(&database).unwrap();
+    let mut targets = Vec::new();
+    #[cfg(unix)]
+    let (provider_uid, provider_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    #[cfg(not(unix))]
+    let (provider_uid, provider_gid) = (0, 0);
+    for index in 0..9 {
+        let target = stopped_legacy_fixture_target(&registry, dir.path(), &names[index % 7]).await;
+        let terminal = serde_json::json!({"terminalId":format!("terminal-{}",target.soul_id),"streamId":format!("stream-{}",target.soul_id),"mode":"opencode","program":"opencode","env":{"HOME":"/home/freshell/provider","XDG_DATA_HOME":"/home/freshell/provider/.local/share","XDG_CONFIG_HOME":"/home/freshell/provider/.config"},"runAsUid":provider_uid,"runAsGid":provider_gid,"cols":80,"rows":24,"projectKey":"test-project","workspacePath":workspace,"cwd":workspace});
+        Connection::open(registry.database_path())
+            .unwrap()
+            .execute(
+                "UPDATE incarnations SET terminal_spec=?1 WHERE soul_id=?2",
+                params![terminal.to_string(), target.soul_id.as_str()],
+            )
+            .unwrap();
+        targets.push(target);
+    }
+    let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    let scope = supervisor
+        .preflight_lost_souls_from_inventory(
+            PreflightLostSoulsRequest {
+                source: RepairBatchSourceSelection {
+                    source_store_id: format!(
+                        "{:x}",
+                        Sha256::digest(
+                            database
+                                .canonicalize()
+                                .unwrap()
+                                .to_string_lossy()
+                                .as_bytes()
+                        )
+                    ),
+                    root_session_ids: names.clone(),
+                },
+                expected_control_epoch: Some(registry.control_epoch()),
+            },
+            HostOpenCodeInventory::new(database.clone())
+                .with_trusted_mount_for_selected_session(workspace.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scope.targets.len(), 9);
+    assert_eq!(scope.roots.len(), 7);
+    let request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source: scope.source_selection(),
+        targets: targets.clone(),
+        canonical_owners: (0..2)
+            .map(|index| CanonicalOwnerChoice {
+                root_session_id: names[index].clone(),
+                soul_id: targets[index].soul_id.clone(),
+                expected_intent_revision: targets[index].expected_intent_revision,
+            })
+            .collect(),
+        expected_control_epoch: Some(registry.control_epoch()),
+    };
+    let operation = RequestId::new();
+    registry
+        .prepare_stopped_repair_operation(operation.clone(), request, scope.clone())
+        .await
+        .unwrap();
+    let mut receipts = Vec::new();
+    let mut stores = Vec::new();
+    for index in 0..7 {
+        let receipt = import_stopped_fixture_root(
+            &registry,
+            &targets[index],
+            &database,
+            &workspace,
+            dir.path(),
+            &names[index],
+            &scope
+                .roots
+                .iter()
+                .find(|root| root.root_session_id == names[index])
+                .unwrap()
+                .graph_digest,
+        )
+        .await;
+        let store = dir.path().join(format!(
+            "provider-{}/.local/share/opencode/opencode.db",
+            targets[index].soul_id
+        ));
+        let conn = Connection::open(&store).unwrap();
+        for table in ["session", "message", "part"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, u32>(0))
+                    .unwrap(),
+                3
+            );
+        }
+        drop(conn);
+        stores.push((store.clone(), fs::read(&store).unwrap()));
+        let context = registry
+            .recovery_context(targets[index].soul_id.clone())
+            .await
+            .unwrap();
+        registry
+            .persist_stopped_repair_root_receipt(
+                operation.clone(),
+                targets[index].clone(),
+                context,
+                receipt.clone(),
+            )
+            .await
+            .unwrap();
+        receipts.push(receipt);
+    }
+    // Actual export/import/reader receipts exercise baseline persistence here;
+    // the authenticated Docker/helper/UI path is the stopped browser runbook.
+    let result = registry
+        .finalize_stopped_repair_batch(
+            operation,
+            targets.clone(),
+            receipts.clone(),
+            dir.path().join("incidents"),
+            dir.path().join("lifecycle.jsonl"),
+        )
+        .await
+        .unwrap();
+    assert_eq!((result.repaired_target_count, result.roots.len()), (9, 7));
+    let soul = targets[0].soul_id.clone();
+    let baseline = receipts[0].adoption_baseline.clone();
+    let repaired = registry.recovery_context(soul.clone()).await.unwrap();
+    assert_eq!(repaired.desired_state, DesiredState::Stopped);
+    assert_eq!(repaired.recovery_state, RecoveryState::DataRepairComplete);
+    assert_eq!(repaired.opencode_adoption_baseline, Some(baseline.clone()));
+    for _ in 0..2 {
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let outcome = supervisor
+            .recover(RecoverRequest {
+                soul_id: soul.clone(),
+                trigger: RecoveryTrigger::ManualRetry,
+                expected_intent_revision: Some(context.intent_revision),
+                expected_control_epoch: Some(registry.control_epoch()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.outcome, RecoveryOutcome::Blocked);
+        let blocked = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(blocked.recovery_state, RecoveryState::Blocked);
+        assert!(
+            blocked.opencode_adoption_baseline.as_ref() == Some(&baseline),
+            "saved import baseline must survive a blocked Resume and explicit Retry"
+        );
+        assert_eq!(blocked.provider_store_id, receipts[0].destination_store_id);
+        assert_eq!(
+            blocked.native_session_id.as_deref(),
+            Some(names[0].as_str())
+        );
+        let candidate = crate::resume_catalog::exact_resume_candidate(&blocked, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.opencode_adoption_baseline, Some(baseline.clone()));
+        assert_eq!(
+            candidate.environment["OPENCODE_DB"],
+            "/home/freshell/provider/.local/share/opencode/opencode.db"
+        );
+    }
+    drop(supervisor);
+    drop(registry);
+    let reopened = Registry::open(dir.path(), None).unwrap();
+    assert_eq!(
+        reopened
+            .recovery_context(soul)
+            .await
+            .unwrap()
+            .opencode_adoption_baseline,
+        Some(baseline)
+    );
+    assert_eq!(fs::read(&database).unwrap(), source_bytes);
+    for (store, bytes) in stores {
+        assert_eq!(fs::read(store).unwrap(), bytes);
+    }
+}
+
 #[tokio::test]
 async fn durable_souls_server_resolved_scope_rejects_tenth_drift_before_writes() {
     use freshell_runtime_protocol::{
@@ -4340,142 +4864,25 @@ async fn durable_souls_server_resolved_scope_rejects_tenth_drift_before_writes()
         .unwrap();
     let mut receipts = Vec::new();
     for (index, root) in names.iter().enumerate() {
-        use freshell_agent_runtime::opencode_transfer::{
-            import_bundle_payload, verify_installed_store, InstalledStoreReaderContext,
-        };
-        use freshell_runtime_protocol::{
-            opencode_target_build_receipt, opencode_transfer_bundle_digest,
-            OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor, OpenCodeTransferFile,
-            OPENCODE_TRANSFER_DESTINATION_DB,
-        };
-        let context = registry
-            .recovery_context(targets[index].soul_id.clone())
-            .await
-            .unwrap();
-        let snapshot = freshell_sessions::opencode_transfer::export_exact_session(
-            &HostOpenCodeInventory::new(database.clone())
-                .with_trusted_mount_for_selected_session(workspace.clone()),
+        let receipt = import_stopped_fixture_root(
+            &registry,
+            &targets[index],
+            &database,
+            &workspace,
+            dir.path(),
             root,
-            freshell_sessions::opencode_transfer::ExportOptions::new(
-                dir.path().join("ten-root-extractions"),
-            ),
-        )
-        .unwrap();
-        let manifest = snapshot.manifest();
-        assert_eq!(
-            manifest.generation,
-            fresh
+            &fresh
                 .roots
                 .iter()
                 .find(|selected| selected.root_session_id == *root)
                 .unwrap()
-                .graph_digest
-        );
-        let image = context.prior_handle.image_ref().to_owned();
-        let mut descriptor = OpenCodeTransferDescriptor {
-            transfer_id: format!("ten-root-{index}"),
-            provider: "opencode".into(),
-            source_store_id: manifest.source_store_id.clone(),
-            root_session_id: root.to_string(),
-            source_generation: manifest.generation.clone(),
-            provider_schema: manifest.provider_schema.clone(),
-            source_schema_fingerprint: manifest.source_schema_fingerprint.clone(),
-            migration_journal_fingerprint: manifest.migration_journal_fingerprint.clone(),
-            destination_store_id: context.provider_store_id.clone(),
-            destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
-            target_image_ref: image.clone(),
-            target_build_receipt: opencode_target_build_receipt(&image, "opencode-1.18.21"),
-            incarnation_id: context.prior_handle.incarnation_id().to_string(),
-            manifest_json: serde_json::to_string(manifest).unwrap(),
-            files: vec![OpenCodeTransferFile {
-                index: 0,
-                relative_path: "payload.json".into(),
-                size_bytes: manifest.payload_bytes,
-                sha256: manifest.payload_sha256.clone(),
-            }],
-            total_bytes: manifest.payload_bytes,
-            bundle_sha256: String::new(),
-        };
-        descriptor.bundle_sha256 =
-            opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
-        let home = dir.path().join(format!("ten-provider-{index}"));
-        let data = home.join(".local/share");
-        let config = home.join(".config");
-        std::fs::create_dir_all(&config).unwrap();
-        let destination = data.join("opencode/opencode.db");
-        let imported = import_bundle_payload(
-            &descriptor,
-            snapshot.open_payload().unwrap(),
-            &destination,
-            &workspace,
+                .graph_digest,
         )
-        .unwrap();
-        #[cfg(unix)]
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        #[cfg(not(unix))]
-        let (uid, gid) = (0, 0);
-        let readable = verify_installed_store(
-            &descriptor,
-            &InstalledStoreReaderContext {
-                database_path: &destination,
-                workspace_root: &workspace,
-                provider_uid: uid,
-                provider_gid: gid,
-                home: &home,
-                xdg_data_home: &data,
-                xdg_config_home: &config,
-                cwd: &workspace,
-            },
-        )
-        .unwrap();
-        assert_eq!(readable.structural_sha256, imported.structural_sha256);
-        assert_eq!(imported.row_count, manifest.row_count as u64);
-        assert!(imported.row_count > 0);
-        let execution_generation: u64 = Connection::open(registry.database_path())
-            .unwrap()
-            .query_row(
-                "SELECT execution_generation FROM incarnations WHERE incarnation_id=?1",
-                [context.prior_handle.incarnation_id().as_str()],
-                |row| row.get(0),
-            )
+        .await;
+        let context = registry
+            .recovery_context(targets[index].soul_id.clone())
+            .await
             .unwrap();
-        let receipt = crate::registry::StoppedRepairRootReceipt {
-            root_session_id: root.to_string(),
-            canonical_soul_id: targets[index].soul_id.clone(),
-            transfer_id: descriptor.transfer_id.clone(),
-            adoption_baseline: OpenCodeAdoptionBaseline {
-                descriptor: descriptor.clone(),
-                manifest_sha256: format!(
-                    "{:x}",
-                    Sha256::digest(descriptor.manifest_json.as_bytes())
-                ),
-            },
-            destination_store_id: context.provider_store_id.clone(),
-            source_store_id: descriptor.source_store_id.clone(),
-            source_generation: descriptor.source_generation.clone(),
-            bundle_sha256: descriptor.bundle_sha256.clone(),
-            source_schema_fingerprint: descriptor.source_schema_fingerprint.clone(),
-            migration_journal_fingerprint: descriptor.migration_journal_fingerprint.clone(),
-            target_image_ref: descriptor.target_image_ref.clone(),
-            target_build_receipt: descriptor.target_build_receipt.clone(),
-            row_count: imported.row_count,
-            asset_count: imported.asset_count,
-            structural_sha256: imported.structural_sha256,
-            provider_uid: context.terminal.as_ref().unwrap().run_as_uid,
-            provider_gid: context.terminal.as_ref().unwrap().run_as_gid,
-            reader_environment_sha256: format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_vec(&readable).unwrap())
-            ),
-            captured_identity_revision: context.identity_revision,
-            captured_evidence_revision: context.evidence_revision,
-            captured_intent_revision: context.intent_revision,
-            captured_native_import_revision: context.native_import_revision,
-            captured_native_import_state: context.native_import_state.as_str().into(),
-            captured_native_import_authority: context.native_import_authority.clone(),
-            incarnation_id: context.prior_handle.incarnation_id().clone(),
-            execution_generation,
-        };
         registry
             .persist_stopped_repair_root_receipt(
                 operation.clone(),

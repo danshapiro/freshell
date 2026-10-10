@@ -1710,6 +1710,138 @@ mod tests {
         );
     }
 
+    #[test]
+    fn view_projection_retraction_treats_percent_and_underscore_as_literal_ids() {
+        for view_id in ["view%exact", "view_exact"] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE outbox(event_id TEXT PRIMARY KEY,event_kind TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,delivered_at INTEGER);").unwrap();
+            let selected = [
+                format!("projection-{view_id}-1"),
+                format!("projection-{view_id}-42"),
+            ];
+            let unrelated = [
+                "projection-viewXexact-1".to_string(),
+                format!("projection-{view_id}-child-1"),
+                format!("projection-{view_id}-42-not-a-revision"),
+                format!("projection-{view_id}suffix-1"),
+            ];
+            for id in selected.iter().chain(&unrelated) {
+                conn.execute("INSERT INTO outbox(event_id,event_kind,payload,created_at) VALUES (?1,'view_intent.changed','{}',1)", [id]).unwrap();
+            }
+            let tx = conn.transaction().unwrap();
+            delete_view_projection_rows(
+                &tx,
+                &freshell_runtime_protocol::ViewIntentId::parse(view_id).unwrap(),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            for id in selected {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT count(*) FROM outbox WHERE event_id=?1",
+                        [id],
+                        |row| row.get::<_, u32>(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+            }
+            for id in unrelated {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT count(*) FROM outbox WHERE event_id=?1",
+                        [id],
+                        |row| row.get::<_, u32>(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_stopped_repair_withdrawal_does_not_suppress_unrelated_exports_after_file_obstruction(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let operation = RequestId::new();
+        let targets = test_targets();
+        let roots = test_roots(&targets);
+        // This fixture represents the durable post-CAS boundary. Import and
+        // provider access are tested separately on the actual helper path.
+        seed_pending_operation(&registry, &operation, &targets, &roots);
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+        let incidents = dir.path().join("incidents");
+        std::fs::create_dir_all(&incidents).unwrap();
+        let selected = incidents.join(format!("{}.open.json", targets[0].incident_id));
+        let selected_bytes =
+            serde_json::to_vec(&json!({"incidentId":targets[0].incident_id})).unwrap();
+        std::fs::write(&selected, &selected_bytes).unwrap();
+        let log = incidents.join("incidents.jsonl");
+        let blocked_bytes = format!(
+            "{}\n{{unclassifiable\n",
+            incident_line(targets[0].incident_id.as_str())
+        );
+        std::fs::write(&log, blocked_bytes.as_bytes()).unwrap();
+        let unrelated = IncidentId::parse("incident-unrelated-drain").unwrap();
+        let conn = Connection::open(registry.database_path()).unwrap();
+        conn.execute("INSERT INTO outbox(event_id,event_kind,payload,created_at) VALUES ('unrelated-drain','loss_incident.final',?1,1)", [json!({"incidentId":unrelated,"cleanupState":"closed","event":"unrelated"}).to_string()]).unwrap();
+        drop(conn);
+        assert!(supervisor.export_pending_incidents().await.is_err());
+        assert_eq!(std::fs::read(&selected).unwrap(), selected_bytes);
+        assert_eq!(std::fs::read(&log).unwrap(), blocked_bytes.as_bytes());
+        let unrelated_export = incidents.join(format!("{unrelated}.closed.json"));
+        let unrelated_bytes = std::fs::read(&unrelated_export).unwrap();
+        let conn = Connection::open(registry.database_path()).unwrap();
+        assert!(conn
+            .query_row(
+                "SELECT delivered_at FROM outbox WHERE event_id='unrelated-drain'",
+                [],
+                |row| row.get::<_, Option<i64>>(0)
+            )
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM stopped_repair_operations WHERE operation_id=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "withdraw_pending"
+        );
+        drop(conn);
+        std::fs::write(
+            &log,
+            format!("{}\n", incident_line(targets[0].incident_id.as_str())),
+        )
+        .unwrap();
+        supervisor.export_pending_incidents().await.unwrap();
+        assert!(!selected.exists());
+        assert!(!log.exists());
+        assert_eq!(std::fs::read(&unrelated_export).unwrap(), unrelated_bytes);
+        let conn = Connection::open(registry.database_path()).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM stopped_repair_operations WHERE operation_id=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "complete"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM stopped_repair_withdrawals WHERE operation_id=?1",
+                [operation.as_str()],
+                |row| row.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn restore_lost_souls_nine() {
         let dir = tempfile::tempdir().unwrap();

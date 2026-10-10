@@ -1170,6 +1170,107 @@ mod stop_contract_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_souls_routes_require_auth_before_control_or_registry_mutation() {
+        use axum::{
+            body::{to_bytes, Body},
+            http::Request,
+        };
+        use freshell_runtime_protocol::{LostSoulRepairTarget, RepairBatchSourceSelection};
+        use freshell_supervisor::{backend::DockerEngineBackend, registry::Registry};
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut targets = Vec::new();
+        for index in 0..9 {
+            let (_, view) = stop_contract_tests::fixture_fresh_soul_with_cleanup(
+                root.path(),
+                true,
+                "opencode",
+                "freshopencode",
+                &format!("ses_auth_root_{}", index % 7),
+                true,
+            )
+            .await;
+            targets.push(LostSoulRepairTarget {
+                soul_id: view.soul_id,
+                incident_id: view.incident_id.unwrap(),
+                expected_intent_revision: view.intent_revision,
+            });
+        }
+        let registry = Registry::open(root.path(), None).unwrap();
+        let backend = Arc::new(DockerEngineBackend::new(root.path().join("no-docker.sock")));
+        let (socket, control) =
+            stop_contract_tests::start_control(root.path(), registry.clone(), backend).await;
+        let app = stop_contract_tests::web_router(&socket, root.path()).await;
+        let before = registry.inventory().await.unwrap();
+        let source = RepairBatchSourceSelection {
+            source_store_id: "a".repeat(64),
+            root_session_ids: (0..7)
+                .map(|index| format!("ses_auth_root_{index}"))
+                .collect(),
+        };
+        for token in [None, Some("wrong-token")] {
+            for (route, body) in [
+                (
+                    "/api/runtime/soul-loss-repairs/preflight".to_owned(),
+                    serde_json::to_value(&source).unwrap(),
+                ),
+                (
+                    "/api/runtime/soul-loss-repairs".to_owned(),
+                    serde_json::json!({"idempotencyKey":"auth-operation","scopeId":"b".repeat(64),"source":source,"targets":targets,"canonicalOwners":[]}),
+                ),
+                (
+                    format!("/api/runtime/souls/{}/retry", targets[0].soul_id),
+                    serde_json::json!({"requestId":RequestId::new()}),
+                ),
+            ] {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri(route)
+                    .header("content-type", "application/json");
+                if let Some(token) = token {
+                    request = request.header("x-auth-token", token);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                let body: serde_json::Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body, serde_json::json!({"error":"Unauthorized"}));
+            }
+        }
+        assert_eq!(registry.inventory().await.unwrap(), before);
+        let conn = rusqlite::Connection::open(root.path().join("runtime.sqlite3")).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM stopped_repair_operations",
+                [],
+                |row| row.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM stopped_repair_root_receipts",
+                [],
+                |row| row.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!root.path().join("no-docker.sock").exists());
+        control.abort();
+        let _ = control.await;
+    }
     use freshell_runtime_protocol::{
         InitialScanState, ProjectionEventId, RuntimeReadiness, ViewIntentKind,
     };

@@ -126,7 +126,7 @@ async fn fixture_fresh_soul(
         .await
 }
 
-async fn fixture_fresh_soul_with_cleanup(
+pub(super) async fn fixture_fresh_soul_with_cleanup(
     root: &std::path::Path,
     certify_loss: bool,
     provider: &str,
@@ -371,7 +371,7 @@ async fn fixture_fresh_soul_with_cleanup(
     (registry, view)
 }
 
-async fn web_router(socket: &std::path::Path, root: &std::path::Path) -> Router {
+pub(super) async fn web_router(socket: &std::path::Path, root: &std::path::Path) -> Router {
     let (tx, _) = tokio::sync::broadcast::channel(16);
     router(
         ManagedRuntimeApiState::new(
@@ -412,10 +412,10 @@ async fn stop(
     (status, serde_json::from_slice(&body).unwrap())
 }
 
-async fn start_control(
+pub(super) async fn start_control(
     root: &std::path::Path,
     registry: Registry,
-    backend: Arc<StopBackend>,
+    backend: Arc<dyn RuntimeBackend>,
 ) -> (PathBuf, tokio::task::JoinHandle<()>) {
     let socket = root.join("control.sock");
     let supervisor = Supervisor::new(

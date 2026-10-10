@@ -8790,6 +8790,75 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         );
     }
 
+    #[tokio::test]
+    async fn baseline_only_unreadable_store_asset_and_interrupted_gate_retry() {
+        for case in ["store", "asset", "pre_pty_log"] {
+            let missing_asset = case == "asset";
+            let fixture = stage_synthetic_opencode_transfer_with_asset(missing_asset).unwrap();
+            let imported = run_joined_synthetic_transfer_from_stage(fixture, None)
+                .await
+                .unwrap();
+            assert!(imported.result.is_ok());
+            let root = imported.root.path();
+            let database = root.join("provider-home/.local/share/opencode/opencode.db");
+            let preserved = [
+                root.join("source.sqlite"),
+                root.join("opencode-transfer-descriptor.json"),
+                root.join("host-state/opencode-synthetic-transfer-import.json"),
+                root.join("host-state/opencode-synthetic-transfer-readable.json"),
+                database.clone(),
+            ]
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            });
+            let unavailable = match case {
+                "asset" => imported.root.workspace.join("saved-prompt.txt"),
+                "pre_pty_log" => root.join("host-state/host-lifecycle.jsonl"),
+                _ => database,
+            };
+            let retained = unavailable.with_extension("retained");
+            std::fs::rename(&unavailable, &retained).unwrap();
+            if case == "pre_pty_log" {
+                std::fs::create_dir(&unavailable).unwrap();
+            }
+            let blocked = run_synthetic_exact_resume(&imported, None, true)
+                .await
+                .unwrap();
+            assert!(blocked.result.is_err(), "{case}");
+            assert!(blocked.state.persisted.lock().await.grant_id.is_none());
+            assert_eq!(*blocked.events.lock().unwrap(), ["current"]);
+            assert!(!blocked
+                .pty_callback_invoked
+                .load(std::sync::atomic::Ordering::SeqCst));
+            assert!(blocked.adoption_expectation.lock().unwrap().is_none());
+            assert!(!root.join("missing-transfer-mount").exists());
+            if case == "pre_pty_log" {
+                std::fs::remove_dir(&unavailable).unwrap();
+            }
+            std::fs::rename(&retained, &unavailable).unwrap();
+            let retry = run_synthetic_exact_resume(&imported, None, true)
+                .await
+                .unwrap();
+            assert!(retry.result.is_ok(), "explicit retry: {:?}", retry.result);
+            assert_eq!(*retry.events.lock().unwrap(), ["current", "pty"]);
+            let current = retry.adoption_expectation.lock().unwrap().clone().unwrap();
+            let original = imported
+                .adoption_expectation
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap();
+            assert_eq!(current.baseline, original.baseline);
+            assert_eq!(current.root_session_id, original.root_session_id);
+            assert_eq!(current.evidence_generation, original.evidence_generation);
+            assert_ne!(current.launch_nonce, original.launch_nonce);
+            for (path, bytes) in preserved {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum SyntheticTransferFailure {
         Mount,
@@ -9170,6 +9239,12 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
     }
 
     fn stage_synthetic_opencode_transfer() -> Result<SyntheticOpencodeStage, String> {
+        stage_synthetic_opencode_transfer_with_asset(false)
+    }
+
+    fn stage_synthetic_opencode_transfer_with_asset(
+        referenced_asset: bool,
+    ) -> Result<SyntheticOpencodeStage, String> {
         use freshell_runtime_protocol::{
             opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferChunk,
             OpenCodeTransferFile, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
@@ -9229,6 +9304,15 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                 ],
             )
             .map_err(|error| error.to_string())?;
+        if referenced_asset {
+            let asset = workspace.join("saved-prompt.txt");
+            std::fs::write(&asset, b"fictional saved prompt asset")
+                .map_err(|error| error.to_string())?;
+            source.execute(
+                "INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES ('synthetic-file-part','synthetic-message','ses_synthetictransfersession',1,1,?1)",
+                [serde_json::json!({"type":"file","mime":"text/plain","url":format!("file://{}",asset.display())}).to_string()],
+            ).map_err(|error| error.to_string())?;
+        }
         drop(source);
 
         let snapshot = export_exact_session(
@@ -9441,6 +9525,13 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         failure: Option<SyntheticTransferFailure>,
     ) -> Result<SyntheticGateAttempt, String> {
         let fixture = stage_synthetic_opencode_transfer()?;
+        run_joined_synthetic_transfer_from_stage(fixture, failure).await
+    }
+
+    async fn run_joined_synthetic_transfer_from_stage(
+        fixture: SyntheticOpencodeStage,
+        failure: Option<SyntheticTransferFailure>,
+    ) -> Result<SyntheticGateAttempt, String> {
         let root = &fixture.root;
         let workspace = fixture.workspace.clone();
         let descriptor = fixture.descriptor.clone();
