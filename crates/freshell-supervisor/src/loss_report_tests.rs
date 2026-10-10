@@ -3767,7 +3767,17 @@ async fn concurrent_stale_exporter_and_rotator_preserve_exact_withdrawal() {
     let incidents = dir.path().join("incidents");
     fs::create_dir_all(&incidents).unwrap();
     let lifecycle = dir.path().join("lifecycle.jsonl");
-    let unrelated = "{\"event\":\"unrelated\",\"incidentId\":\"incident-unrelated\"}\n";
+    // Prepare the retained history before any producer takes the shared
+    // coordinator. A small real event must rotate it; serializing an oversized
+    // live event under that coordinator would delay unrelated Stop operations.
+    let unrelated = format!(
+        "{}\n",
+        serde_json::json!({
+            "event": "unrelated",
+            "incidentId": "incident-unrelated",
+            "fictionalPadding": "x".repeat(10 * 1024 * 1024),
+        })
+    );
     let false_line = serde_json::json!({"incidentId":incident,"event":"false-loss"}).to_string();
     fs::write(&lifecycle, format!("{false_line}\n{unrelated}")).unwrap();
     let export = incidents.join(format!("{incident}.open.json"));
@@ -3837,7 +3847,7 @@ async fn concurrent_stale_exporter_and_rotator_preserve_exact_withdrawal() {
         crate::service::append_event(
             &rotate_lifecycle,
             "unrelated.rotation",
-            serde_json::json!({"fictionalPadding":"x".repeat(10 * 1024 * 1024)}),
+            serde_json::json!({"fixture":"rotation"}),
         );
     });
     export_ready_rx.await.unwrap();
@@ -3850,7 +3860,7 @@ async fn concurrent_stale_exporter_and_rotator_preserve_exact_withdrawal() {
     rotator.await.unwrap();
     assert!(!export.exists());
     let rotated = lifecycle.with_file_name("lifecycle.jsonl.1");
-    assert_eq!(fs::read_to_string(&rotated).unwrap(), unrelated);
+    assert!(fs::read_to_string(&rotated).unwrap() == unrelated);
     let current = fs::read_to_string(&lifecycle).unwrap();
     assert!(!current.contains(incident.as_str()));
     assert_eq!(
