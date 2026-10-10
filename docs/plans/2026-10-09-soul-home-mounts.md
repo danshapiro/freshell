@@ -36,7 +36,7 @@ The load-bearing stage falsified the request's proposed mechanism and replaced i
 3. **The mechanism is group-read, not uid-switch** (LB-12, verified empirically on the live daemon). Under the rootless mapping, container gid 0 — which children already hold — is the operator's own group: a 65534:0 child read a 0644 operator file through a bound home and traversed the 0750 home root, while 0700/0600 operator paths denied it (exactly the incident's failure surface). The referenced files fail today only for lack of group bits. Consequence: the host prep in Global Constraints (one-time chmod; Amplifier writes group-readable keys going forward) is REQUIRED for the requested result; Freshell launch code never enforces or refuses on it — it only reports (Task 2's readiness event). This is the tradeoff the user must ratify (LB-13, `load-bearing-ledger.md`).
 4. **tmpfs-over-bind masks work on the production daemon** (LB-04, verified): a read-only home bind plus `--tmpfs <home>/.freshell` yielded an empty `.freshell` inside the container with the rest of the home intact. The masking strategy stands, with `~/.config/gcloud` added to the mask list as zero-cost defense-in-depth for gcloud-robot infrastructure credentials (finder residual, accepted).
 5. **Supervisor topology verified** (LB-02): the production supervisor runs as `dan` with `HOME=/home/dan`. The home-mount derivation keeps using the supervisor's HOME env, now guarded by a home-owner check (skip the mount unless the home's st_uid equals the supervisor euid) so no unowned or root-owned home can ever be mounted.
-6. **E2e shape verified** (LB-11, `reports/load-bearing-validator-lb11.md`): the rig can express the regression via the existing `webHomeDir` + `supervisorEnv` seams with broker allow-list additions; opencode 1.18.21 resolves native provider ids offline (bundled models.dev snapshot; `{file:}` substitution is pre-schema and hard-fails on ENOENT and EACCES); the red reproduces through the `OPENCODE_CONFIG_CONTENT` inline lane; harness-created `testRoot` and `/tmp/f<uid>` are 0700 and the spec must chmod them 0750.
+6. **E2e shape verified** (LB-11, `reports/load-bearing-validator-lb11.md`): the rig can express the regression via the `webHomeDir` seam plus supervisor-launch options, with broker allow-list additions (fresh-eyes round 3 superseded the validator's `supervisorEnv` sketch with the explicit `--operator-home` flag, since rig supervisors run as root and the env fallback correctly declines for them); opencode 1.18.21 resolves native provider ids offline (bundled models.dev snapshot; `{file:}` substitution is pre-schema and hard-fails on ENOENT and EACCES); the red reproduces through the `OPENCODE_CONFIG_CONTENT` inline lane; harness-created `testRoot` and `/tmp/f<uid>` are 0700 and the spec must chmod them 0750.
 7. **User Request block provenance (2026-10-10):** the dispatcher updated the block's mechanism bullet and tradeoff list to record the user's explicit ratification of the rootless-native group-read design (the "ratify the group-read tradeoff" decision presented with the load-bearing receipt). No other block text changed; the falsified original mechanism is preserved above in this revisions section.
 
 **Goal:** Every fresh-agent and managed-terminal soul launches with a config that fully works — absolute references under the operator's home resolve in-soul — and the ms-runpod `bad file reference` incident class becomes structurally impossible on the production daemon.
@@ -49,9 +49,9 @@ The load-bearing stage falsified the request's proposed mechanism and replaced i
 
 - pnpm 10.34.5 exactly; `pnpm run <script> <args>` forwards args directly (no `--` separator). Use `pnpm exec` for installed binaries.
 - **Provider children stay 65534:0 everywhere.** No launch-record, protocol, digest, uid-constant, or fixture-identity changes. Any test that currently asserts `65534:0` stays as-is.
-- The home mount is derived from the supervisor process's `HOME` env, canonicalized, mounted read-only at its own path, and **skipped silently** when HOME is unset, does not canonicalize, or the home's owner uid ≠ the supervisor's euid. Never refuse a launch over the home mount.
-- Mask list (tmpfs, fixed): `<home>/.freshell`, `<home>/.amplifier/onecli`, `<home>/.config/gcloud`. The tmpfs-over-bind shape is validated; `verify_inspect_config` must only assert the new mounts/env for containers that carry the additive marker env (pre-upgrade containers must keep passing).
-- **Host prep (documented, never enforced by launch code):** referenced files under the operator home must be group-readable (0640 keys) under group-traversable directories (0750), per the rootless gid mapping. One-time remediation: `chmod g+rx ~/.amplifier && chmod g+r ~/.amplifier/*.key`; Amplifier should write 0640/0750 going forward. On rootful daemons group 0 is not the operator group, so the feature degrades to today's behavior with an observable readiness event — documented, not gated.
+- The home mount is derived from an explicit supervisor flag or, only for a non-root supervisor, its `HOME` env: `--operator-home <path>` wins (canonicalized, owner-guarded); otherwise `HOME` is used only when the supervisor's euid is non-zero, its `HOME` canonicalizes, and the home's owner uid equals the supervisor's euid — a containerized or root supervisor (the rig's default, compose deployments) gets NO home mount, because its `HOME` is not the operator's host home. Never refuse a launch over the home mount.
+- Mask list (tmpfs, fixed): `<home>/.freshell`, `<home>/.amplifier/onecli`, `<home>/.config/gcloud`, filtered to destinations that exist. The tmpfs-over-bind shape is validated; `verify_inspect_config` must only assert the new mounts/env for containers that carry the additive marker env (pre-upgrade containers must keep passing).
+- **Host prep (owned, one-time, verified — never enforced by launch code):** referenced files under the operator home must be group-readable (0640 keys) under group-traversable directories (0750), per the rootless gid mapping. The owned step is `scripts/prepare-operator-home.sh` (created by Task 4; idempotent), referenced from the self-hosted launch runbook; Amplifier should write 0640/0750 going forward. On rootful daemons group 0 is not the operator group, so the feature degrades to today's behavior with an observable readiness event — documented, not gated.
 - Red-Green-Refactor TDD: every task adds its failing test first, watches it fail for the stated reason, implements minimally, refactors while green, and runs the impacted set.
 - Test coordination (AGENTS.md): narrowed `cargo test -p <crate> -- <filters...>` selectors are delegated (no coordinator gate); cargo accepts one positional filter, so multiple filters go after `--` (the libtest harness takes several). Do not kill foreign gate holders. New e2e specs are `LOCAL_ONLY` (register in `test/e2e-browser/playwright.config.ts`, where `LOCAL_ONLY_SPECS` is defined — the cloud config imports it).
 - Never restart the production self-hosted server (port 3001) without the user's explicit "APPROVED". Building and running scratch supervisors/souls in the worktree is fine.
@@ -65,14 +65,18 @@ The load-bearing stage falsified the request's proposed mechanism and replaced i
 **Files:**
 - Modify: `crates/freshell-supervisor/src/backend/docker.rs` (TerminalMounts + workload_mounts, ~line 34-198)
 - Modify: `crates/freshell-supervisor/src/backend.rs` (binds assembly ~572-618, runtime_host_environment ~402-497, docker_create_body tmpfs merge, verify_inspect_config ~993-1030)
-- Test: inline unit tests in both files
+- Modify: `crates/freshell-supervisor/src/main.rs` (new `--operator-home <path>` CLI flag) and the service/config plumbing that carries it to the backend (follow how `--registry-root` and `--host-binary` flow)
+- Test: inline unit tests in both backend files
 
 **Interfaces:**
 - Consumes: `TerminalMounts` (docker.rs:34-42), `workload_mounts` (docker.rs:68-198), `runtime_host_environment` (backend.rs:402-497), `runtime_tmpfs(runtime_mode)` (backend.rs:629), `docker_create_body` (backend.rs:640), `verify_inspect_config` (backend.rs:993-1030).
 - Produces:
   - `pub struct OperatorHomeMount { pub home: PathBuf, pub mask_rel_paths: Vec<String> }` (new field `pub operator_home: Option<OperatorHomeMount>` on `TerminalMounts`).
-  - `fn operator_home_mount(home_env: Option<&std::ffi::OsStr>, supervisor_euid: u32) -> Option<OperatorHomeMount>` in docker.rs — canonicalize HOME, require the home directory to exist and its `st_uid` to equal `supervisor_euid` (the home-owner guard); masks are fixed `[".freshell", ".amplifier/onecli", ".config/gcloud"]` FILTERED to destinations that already exist as directories under the home (runc must never have to create a missing mountpoint inside the read-only bind — a home missing one target must still launch).
-  - Contract: `workload_mounts` sets `operator_home` to `None` when the workspace equals the operator home (that is the pre-existing workspace shape; no marker env, no masks, no verification applies to it), so `operator_home: Some(_)` always means: workspace differs from home, the `:ro` bind and all masks are emitted, and the marker env is set. Implemented as `fn effective_operator_mount(mount: Option<OperatorHomeMount>, workspace: &Path) -> Option<OperatorHomeMount>` in docker.rs (pure, testable), called from `workload_mounts`.
+  - `fn explicit_operator_home(path: Option<&std::ffi::OsStr>, supervisor_euid: u32) -> Option<OperatorHomeMount>` — the `--operator-home` flag path: canonicalize, require the directory to exist, and apply the home-owner guard (`st_uid == supervisor_euid`). The flag is explicit operator intent, so it is honored for a root supervisor too (the rig's supervisor runs as root inside a container, and under the rootless daemon the operator's files appear container-0-owned, so the guard holds there).
+  - `fn operator_home_mount(home_env: Option<&std::ffi::OsStr>, supervisor_euid: u32) -> Option<OperatorHomeMount>` — the env fallback: same canonicalize/owner guards, PLUS `supervisor_euid != 0` (a root or containerized supervisor's `HOME` is not the operator's host home — `/root` must never be mounted; the rig's default supervisors and compose deployments therefore get no home mount and no behavior change).
+  - Both constructors: masks are fixed `[".freshell", ".amplifier/onecli", ".config/gcloud"]` FILTERED to destinations that already exist as directories under the home (runc must never have to create a missing mountpoint inside the read-only bind — a home missing one target must still launch).
+  - Derivation order in `workload_mounts`: `explicit_operator_home(flag, euid)` falls back to `operator_home_mount(HOME, euid)`, then `effective_operator_mount(..., workspace)`.
+  - Contract: `effective_operator_mount(mount: Option<OperatorHomeMount>, workspace: &Path) -> Option<OperatorHomeMount>` returns `None` when the workspace equals the operator home (that is the pre-existing workspace shape; no marker env, no masks, no verification applies to it), so `operator_home: Some(_)` always means: workspace differs from home, the `:ro` bind and all masks are emitted, and the marker env is set.
   - `fn assemble_workload_binds(...) -> (Vec<String>, std::collections::BTreeMap<String, String>)` in backend.rs — extracted from `create_stopped` inline assembly; returns binds plus tmpfs destinations (`"<destination>": ""` merged with `runtime_tmpfs` output; additive keys win, existing tmpfs destinations must never be dropped).
   - Container env set by `runtime_host_environment` when the spec's mounts include `operator_home`: marker `FRESHELL_OPERATOR_HOME_MOUNT=1` plus `FRESHELL_OPERATOR_HOME=<canonical home path>` (consumed by Task 2).
 
@@ -141,6 +145,34 @@ fn operator_home_mount_skips_unset_or_missing_home() {
     assert!(operator_home_mount(None, euid).is_none());
     let tmp = tempfile::tempdir().unwrap();
     assert!(operator_home_mount(Some(tmp.path().join("nope").as_os_str()), euid).is_none());
+}
+
+#[test]
+fn operator_home_env_path_never_mounts_for_a_root_supervisor() {
+    // A containerized or root supervisor's HOME is not the operator's host
+    // home (e.g. /root inside the rig's supervisor container); the env
+    // fallback must decline so rig defaults and compose are unchanged.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    assert!(operator_home_mount(Some(home.as_os_str()), 0).is_none());
+}
+
+#[test]
+fn explicit_operator_home_flag_applies_the_owner_guard() {
+    // The rig supervisor runs as root in its container; under the rootless
+    // daemon the operator's files appear container-0-owned, so the explicit
+    // flag path mounts for it while the owner guard still rejects unowned homes.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(&home).unwrap().uid() as u32;
+    assert_eq!(
+        explicit_operator_home(Some(home.as_os_str()), owner).map(|m| m.home),
+        Some(home.canonicalize().unwrap())
+    );
+    assert_eq!(explicit_operator_home(Some(home.as_os_str()), owner + 1), None);
 }
 ```
 
@@ -251,15 +283,35 @@ pub struct OperatorHomeMount {
 pub const OPERATOR_HOME_MASK_REL_PATHS: &[&str] =
     &[".freshell", ".amplifier/onecli", ".config/gcloud"];
 
+pub fn explicit_operator_home(
+    path: Option<&std::ffi::OsStr>,
+    supervisor_euid: u32,
+) -> Option<OperatorHomeMount> {
+    derive_operator_mount(path, supervisor_euid)
+}
+
 pub fn operator_home_mount(
     home_env: Option<&std::ffi::OsStr>,
     supervisor_euid: u32,
 ) -> Option<OperatorHomeMount> {
-    let raw = home_env?;
+    if supervisor_euid == 0 {
+        // A root or containerized supervisor's HOME is not the operator's
+        // host home; the env fallback declines (compose deployments and the
+        // rig's default supervisors are unchanged).
+        return None;
+    }
+    derive_operator_mount(home_env, supervisor_euid)
+}
+
+fn derive_operator_mount(
+    raw: Option<&std::ffi::OsStr>,
+    supervisor_euid: u32,
+) -> Option<OperatorHomeMount> {
+    let raw = raw?;
     if raw.is_empty() {
         return None;
     }
-    let home = canonical_dir(Path::new(raw), "operator HOME").ok()?;
+    let home = canonical_dir(Path::new(raw), "operator home").ok()?;
     let metadata = std::fs::metadata(&home).ok()?;
     if !metadata.is_dir() {
         return None;
@@ -290,7 +342,7 @@ fn effective_operator_mount(
 }
 ```
 
-Wire it in `workload_mounts` (docker.rs:68-198): read `let supervisor_home = std::env::var_os("HOME");` once at the top (the user-root branch at line 141 reuses the same value) and set `operator_home: effective_operator_mount(operator_home_mount(supervisor_home.as_deref(), unsafe { libc::geteuid() }), &workspace)` on the returned `TerminalMounts` — `workspace` is the canonical workspace computed at the top of `workload_mounts` (docker.rs:77). `Some(_)` now guarantees workspace differs from home.
+Wire it in `workload_mounts` (docker.rs:68-198): derive the mount as `effective_operator_mount(explicit_operator_home(std::env::var_os("FRESHELL_SUPERVISOR_OPERATOR_HOME").as_deref(), unsafe { libc::geteuid() }).or_else(|| operator_home_mount(std::env::var_os("HOME").as_deref(), unsafe { libc::geteuid() })), &workspace)` on the returned `TerminalMounts` — `workspace` is the canonical workspace computed at the top of `workload_mounts` (docker.rs:77). The supervisor's `main.rs` parses the new `--operator-home <path>` flag and publishes it to its own process as `FRESHELL_SUPERVISOR_OPERATOR_HOME` before serving (follow the existing arg-parsing pattern beside `--registry-root`, main.rs:34 area), so no new parameter threads through the backend. `Some(_)` now guarantees workspace differs from home; rig supervisors pass the flag explicitly (Task 3) while default rig/compose supervisors (root, no flag) get no home mount.
 
 In backend.rs, extract the inline binds assembly at lines 572-618 into `assemble_workload_binds` exactly as sketched in the tests, adding after the existing mounts block:
 
@@ -326,7 +378,7 @@ Expected: PASS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-supervisor/src/backend.rs crates/freshell-supervisor/src/backend/docker.rs
+git add crates/freshell-supervisor/src/backend.rs crates/freshell-supervisor/src/backend/docker.rs crates/freshell-supervisor/src/main.rs
 git commit -m "feat(supervisor): mount operator home read-only in souls with tmpfs control-plane masks"
 ```
 
@@ -340,7 +392,7 @@ git commit -m "feat(supervisor): mount operator home read-only in souls with tmp
 - Consumes: env `FRESHELL_OPERATOR_HOME` and `FRESHELL_OPERATOR_HOME_MOUNT` (set by Task 1), env `FRESHELL_PROVIDER_RUN_AS_UID`/`FRESHELL_PROVIDER_RUN_AS_GID` (already in `runtime_host_environment`), the existing `append_event_with_secret` journal pattern.
 - Produces:
   - `fn child_can_traverse(mode_bits: u32, owner_uid: u32, owner_gid: u32, child_uid: u32, child_gid: u32) -> bool` — pure POSIX DAC evaluation (owner-x / group-x with gid match / other-x).
-  - Startup emission: when `FRESHELL_OPERATOR_HOME_MOUNT=1`, stat the home path and append one JSONL event `operator_home_readiness` with `path`, `present`, `uid`, `gid`, `mode` (octal string), and `traversable_by_child` computed by the pure function against the run-as identity. Never affects launch outcome.
+  - Startup emission: when `FRESHELL_OPERATOR_HOME_MOUNT=1`, stat the home path and append one JSONL event `operator_home_readiness` with `path`, `present`, `uid`, `gid`, `mode` (octal string), and `home_root_traversable_by_child` computed by the pure function against the run-as identity. Never affects launch outcome.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -375,7 +427,7 @@ fn readiness_event_reflects_real_home_metadata() {
     // and FRESHELL_OPERATOR_HOME_MOUNT=1 and FRESHELL_PROVIDER_RUN_AS_UID/GID
     // set to 65534/0, the startup emission must produce exactly one
     // operator_home_readiness event whose fields match the stat and whose
-    // traversable_by_child is child_can_traverse(...). Use the existing
+    // home_root_traversable_by_child is child_can_traverse(...). Use the existing
     // session-host event-journal test fixture (see the events written near
     // main.rs:2513) with a temp state dir.
 }
@@ -403,7 +455,7 @@ fn child_can_traverse(mode_bits: u32, owner_uid: u32, owner_gid: u32, child_uid:
 }
 ```
 
-At session-host startup, after arg parsing: read the two marker env vars; when both are set, `std::fs::metadata` the home path and append the `operator_home_readiness` event via the existing journal helper (no secret bytes in the payload — only path, present, uid, gid, octal mode, traversable_by_child). Run-as identity comes from `FRESHELL_PROVIDER_RUN_AS_UID`/`_GID` (default 65534/0 when unset). Failure to stat logs `present: false` and never fails startup.
+At session-host startup, after arg parsing: read the two marker env vars; when both are set, `std::fs::metadata` the home path and append the `operator_home_readiness` event via the existing journal helper (no secret bytes in the payload — only path, present, uid, gid, octal mode, home_root_traversable_by_child — the event reports the HOME ROOT ONLY; per-target group bits are the prep script's and Amplifier's business, documented in Task 4). Run-as identity comes from `FRESHELL_PROVIDER_RUN_AS_UID`/`_GID` (default 65534/0 when unset). Failure to stat logs `present: false` and never fails startup.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -439,17 +491,19 @@ git commit -m "feat(session-host): emit operator home readiness event for souls"
 - Modify: `test/e2e-browser/playwright.config.ts` (add the spec to `LOCAL_ONLY_SPECS`, defined here — the cloud config imports it)
 
 **Interfaces:**
-- Consumes: the rig pattern of `test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts` (fresh-agent pane lifecycle; construct rig → `await rig.start()` → drive the fresh-agent pane), `ManagedRuntimeBrowserRig` `webHomeDir` + `supervisorEnv` constructor options (managed-runtime.ts:79-106; `start()` runs `runtime.prepare()` at line 118 — which wipes and recreates testRoot — then starts the supervisor at 153 with the env). Authoritative seam list: `.worktrees/.the-usual-logs/soul-home-mounts/reports/load-bearing-validator-lb11.md`.
-- Produces: a reproducible spec proving the incident class is fixed on the real (rootless) daemon via the FRESH-AGENT launch path (not the terminal picker path); broker allow-list arms admitting read-only same-path home binds and tmpfs mask destinations.
+- Consumes: the rig pattern of `test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts` (fresh-agent pane lifecycle, first-send-then-running-view flow, `runningViewForFreshSession`), `ManagedRuntimeBrowserRig` `webHomeDir` constructor option (managed-runtime.ts:79-106; `start()` runs `runtime.prepare()` at line 118 — which wipes and recreates testRoot — then starts the supervisor at 153), the rig's provider-uid exec helper (`65534:0` exec in `runtime-sandbox.ts`, ~line 896), and the NEW `operatorHome` option this task adds to the rig's supervisor launcher (passed through `startSupervisor` as the `--operator-home` flag). Authoritative seam list: `.worktrees/.the-usual-logs/soul-home-mounts/reports/load-bearing-validator-lb11.md`.
+- Produces: a reproducible spec proving the incident class is fixed on the real (rootless) daemon via the FRESH-AGENT launch path (not the terminal picker path), with child-identity negative assertions that the control-plane masks hide their content; the rig's `operatorHome` supervisor option; broker allow-list arms admitting read-only same-path home binds and tmpfs mask destinations.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
 Build the spec by mirroring the fresh-agent qualification spec's real imports/rig calls (read it first; the sketch below names the verified seams, not the final API surface). Lifecycle is load-bearing: `rig.start()` wipes testRoot inside `prepare()`, so the home fixtures are created AFTER `await rig.start()` returns and BEFORE the fresh-agent pane is launched — the server stages the user-provider root per launch at pane creation, so post-start fixtures are picked up:
 
 ```ts
-// 1. Construct the rig with webHomeDir: <testRoot>/web-home and
-//    supervisorEnv: { HOME: <testRoot>/web-home } (constructor options; the
-//    supervisor starts inside start() with this env).
+// 1. Construct the rig with webHomeDir: <testRoot>/web-home and the new
+//    supervisor flag option: operatorHome: <testRoot>/web-home (the rig's
+//    startSupervisor gains the option and passes --operator-home; the rig's
+//    supervisor runs as root in its container, so the HOME env path is
+//    deliberately NOT used — the env fallback declines for root supervisors).
 // 2. await rig.start()  // prepare() has now wiped and recreated testRoot
 // 3. Create the home fixtures (owned by the test process, i.e. the operator):
 //    - <home>/.amplifier/ms-runpod.key  ("e2e-key-not-real", mode 0640)
@@ -458,9 +512,11 @@ Build the spec by mirroring the fresh-agent qualification spec's real imports/ri
 //        "provider": { "openai": { "name": "OpenAI",
 //          "options": { "apiKey": "{file:<home>/.amplifier/ms-runpod.key}" } } },
 //        "model": "openai/gpt-5.6-luna" }   // native provider id: validates offline
-//    - Empty dirs for EVERY mask destination (they must pre-exist in the home;
-//      create all three to exercise the full mask set):
-//      <home>/.freshell/, <home>/.amplifier/onecli/, <home>/.config/gcloud/
+//    - Empty dirs + canary files for EVERY mask destination (they must
+//      pre-exist in the home; create all three to exercise the full mask set):
+//      <home>/.freshell/            (the rig itself writes config.json here at startup)
+//      <home>/.amplifier/onecli/canary
+//      <home>/.config/gcloud/canary
 //    - chmod 0750 on <testRoot> and /tmp/f<uid> ancestors (harness creates them
 //      0700; under the rootless daemon the 65534:0 child needs group traversal).
 // 4. Launch a freshopencode fresh-agent pane (the qualification spec's
@@ -470,16 +526,29 @@ test('freshopencode soul resolves {file:} API key references under the operator 
   const info = await rig.start()
   // ...create home fixtures per steps 3 above, using info's testRoot...
   const sessionId = await rig.launchFreshAgentPane('opencode') // exact helper per the qualification spec
-  // Positive proof the opencode child actually started (the incident's child
-  // died instantly): the qualification running view carries a native session id.
+  // The composer's ready state renders via its textarea PLACEHOLDER
+  // ("Send a message…"), not text content — see FreshAgentComposer.tsx.
+  await expect(page.getByPlaceholder('Send a message')).toBeVisible({ timeout: 120_000 })
+  // nativeSessionId materializes only after the first send (HostedTransport::start
+  // returns None for a new session) — send a first turn like the qualification
+  // spec does; the turn may fail auth (the key is fake) but the child must be
+  // alive, which is the pre-fix/post-fix distinction: pre-fix, opencode dies at
+  // startup with the config error and never reaches this state.
+  await rig.sendFreshAgentTurn(sessionId, 'ping') // exact helper per the qualification spec
   const view = await rig.runningViewForFreshSession(sessionId)
   expect(view?.nativeSessionId).toBeTruthy()
-  // The fresh-agent composer renders "Send a message…" when the pane is ready
-  // (the current UI has no "Ask anything" text — see FreshAgentComposer.tsx).
-  await expect(page.getByText('Send a message')).toBeVisible({ timeout: 120_000 })
   const paneText = await rig.capturePaneText()
   expect(paneText).not.toContain('Configuration is invalid')
   expect(paneText).not.toContain('bad file reference')
+  // Control-plane masking proof, from the child's own identity: the rig's
+  // provider-uid exec helper (65534:0) must be DENIED on every masked path.
+  for (const secret of [
+    `${home}/.freshell/config.json`,
+    `${home}/.amplifier/onecli/canary`,
+    `${home}/.config/gcloud/canary`,
+  ]) {
+    await expect(rig.ownedProviderExec(soulRef, `cat ${secret}`)).resolves.toMatch(/denied|Permission/i)
+  }
 })
 ```
 
@@ -520,27 +589,59 @@ git add test/e2e-browser/specs/runtime-opencode-home-file-reference-rust.spec.ts
 git commit -m "test(e2e): freshopencode soul boots with {file:} operator-home key references"
 ```
 
-### Task 4: Posture documentation
+### Task 4: Host-prep script and posture documentation
 
 **Files:**
+- Create: `scripts/prepare-operator-home.sh`
 - Modify: `docs/development/managed-runtime.md` (~217, ~220-225, ~329-338)
+- Modify: `docs/development/self-hosted-launch-runbook.md` (one-time prep step)
 - Modify: `docker/runtime/README.md` (~19-30)
 
 **Interfaces:**
 - Consumes: Task 1's mount/mask/env contract, Task 2's readiness event, the load-bearing ledger and validator reports as evidence sources.
-- Produces: documentation only — no behavior change.
+- Produces: `scripts/prepare-operator-home.sh` — the OWNED, idempotent, one-time host-prep step for the ratified group-read change (the plan does not leave the prep as an unexecuted doc note); documentation. No server behavior change.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Docs task: no test. The repo's rule set exempts doc changes from TDD; verification is review. (State this explicitly in the commit message.)
+Docs + script task: no Rust/TS test. The script is verified by a shellcheck-style review and a documented dry-run mode. (State this explicitly in the commit message.)
 
 - [ ] **Step 2: N/A**
 
 - [ ] **Step 3: Add the minimal production implementation**
 
+`scripts/prepare-operator-home.sh` (idempotent, exits 0 even when targets are absent; prints what it changed and what to check via the readiness event):
+
+```bash
+#!/usr/bin/env bash
+# One-time operator-home prep for soul home mounts (see docs/development/managed-runtime.md).
+# Under the rootless Docker daemon, provider children run with gid 0, which maps
+# to the operator's group — group bits are how in-home config references resolve.
+# Run once as the operator after deploying the soul home-mount feature.
+set -euo pipefail
+home="${FRESHELL_OPERATOR_HOME:-$HOME}"
+changed=0
+if [ -d "$home/.amplifier" ]; then
+  chmod g+rx "$home/.amplifier"
+  echo "chmod g+rx $home/.amplifier"
+  changed=1
+fi
+for key in "$home"/.amplifier/*.key; do
+  [ -e "$key" ] || continue
+  chmod g+r "$key"
+  echo "chmod g+r $key"
+  changed=1
+done
+if [ "$changed" -eq 0 ]; then
+  echo "nothing to prepare (no ~/.amplifier or keys under it)"
+fi
+echo "note: Amplifier should write keys 0640 and ~/.amplifier 0750 going forward so rotation preserves this."
+```
+
+`docs/development/self-hosted-launch-runbook.md`: add the one-time step — after deploying, run `scripts/prepare-operator-home.sh` once as the operator; the `operator_home_readiness` event (Task 2) confirms the home root's group traversal afterward.
+
 `docs/development/managed-runtime.md`:
-- Replace the "no unrelated home" bullet (~220-225) and the rootless uid rationale (~329-338) with the new contract: souls mount the operator home read-only at its canonical path; provider children keep 65534:0; under the rootless production daemon the child's gid 0 is the operator's group, so group-readable reference targets (0750 directories, 0640 key files) resolve with no identity change; the home-owner guard; the tmpfs mask list (`.freshell`, `.amplifier/onecli`, `.config/gcloud`) and why each entry is control-plane or infrastructure authorization material; the additive `FRESHELL_OPERATOR_HOME_MOUNT`/`FRESHELL_OPERATOR_HOME` env markers and that pre-upgrade running containers lack them; the `operator_home_readiness` event and how to read it when a `{file:}` reference fails; the rootful-degradation note (group 0 is not the operator group, feature degrades to legacy readability, observed via the readiness event, never gated).
-- Add the operator prep section: the one-time `chmod g+rx ~/.amplifier && chmod g+r ~/.amplifier/*.key` remediation and the Amplifier-going-forward requirement (0640 keys, 0750 dirs), with the reasoning that under the rootless mapping group-dan access is effectively "processes running as the operator" on this single-user host.
+- Replace the "no unrelated home" bullet (~220-225) and the rootless uid rationale (~329-338) with the new contract: souls mount the operator home read-only at its canonical path; provider children keep 65534:0; under the rootless production daemon the child's gid 0 is the operator's group, so group-readable reference targets (0750 directories, 0640 key files) resolve with no identity change; the `--operator-home` flag and the owner/euid guards (containerized/root supervisors get no home mount); the tmpfs mask list (`.freshell`, `.amplifier/onecli`, `.config/gcloud`) and why each entry is control-plane or infrastructure authorization material; the additive `FRESHELL_OPERATOR_HOME_MOUNT`/`FRESHELL_OPERATOR_HOME` env markers and that pre-upgrade running containers lack them; the `operator_home_readiness` event (home-root scope: `home_root_traversable_by_child`) and how to read it when a `{file:}` reference fails; the rootful-degradation note (group 0 is not the operator group, feature degrades to legacy readability, observed via the readiness event, never gated); the residual that owner-only references OUTSIDE `~/.amplifier` need their own group bits (the prep script covers the known incident class, the readiness event surfaces the home root, and nothing scans arbitrary configs).
+- Add the operator prep section referencing `scripts/prepare-operator-home.sh` and the Amplifier-going-forward requirement (0640 keys, 0750 dirs), with the reasoning that under the rootless mapping group-dan access is effectively "processes running as the operator" on this single-user host.
 
 `docker/runtime/README.md` (~19-30): update the uid story (session host uid 0; provider children 65534:0 unchanged; no passwd entry — same as today) and reword the 0600-secret guarantee around the masked-home boundary.
 
@@ -550,19 +651,19 @@ Docs task: no test. The repo's rule set exempts doc changes from TDD; verificati
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Docs only; run the repo's doc-link/docs lint if one exists (`grep -r "managed-runtime.md" package.json` for a docs check script; otherwise skip with a note).
+Docs + shell script; run `bash -n scripts/prepare-operator-home.sh` and any docs lint the repo has (`grep -r "managed-runtime.md" package.json` for a docs check script; otherwise note the skip).
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add docs/development/managed-runtime.md docker/runtime/README.md
-git commit -m "docs(managed-runtime): operator home mounts, masks, and group-read posture"
+git add scripts/prepare-operator-home.sh docs/development/managed-runtime.md docs/development/self-hosted-launch-runbook.md docker/runtime/README.md
+git commit -m "docs(managed-runtime): operator home mounts, masks, group-read prep script, and posture"
 ```
 
 ## Verification (user-visible outcome)
 
 1. The incident scenario end-to-end: covered by Task 3's spec on the real rootless daemon — a freshopencode fresh-agent pane (fresh-agent launch path) with a `{file:}`-referencing global config starts its child (native session id), reaches the composer's ready state, and shows no "Configuration is invalid" text.
-2. Production, after user-approved deploy and the one-time host prep from Task 4: a freshopencode pane in `/home/dan/code/shapiroserver2` with the real global `~/.config/opencode/opencode.json` boots opencode.
+2. Production, after user-approved deploy and one run of `scripts/prepare-operator-home.sh` (Task 4): a freshopencode pane in `/home/dan/code/shapiroserver2` with the real global `~/.config/opencode/opencode.json` boots opencode.
 3. Pre-upgrade running souls: untouched by construction — no identity, record, digest, or volume changes; replaced incarnations naturally gain the home mount.
-4. Control-plane safety: `~/.freshell`, `~/.amplifier/onecli`, and `~/.config/gcloud` are tmpfs-masked in-soul; all other operator secrets remain protected by their owner-only modes.
+4. Control-plane safety, proven from the child's own identity in Task 3's spec: `~/.freshell`, `~/.amplifier/onecli`, and `~/.config/gcloud` are tmpfs-masked in-soul (the provider-uid exec is denied on each canary); all other operator secrets remain protected by their owner-only modes.
 5. Resource bounding and teardown: unchanged (no limits code touched); the full `pnpm run check` gate before any PR proves it.
