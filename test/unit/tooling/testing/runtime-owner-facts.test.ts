@@ -892,6 +892,76 @@ describe('Task7 registered physical stopped fixture preparation', () => {
     } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
   })
 
+  it.each((['provider', 'helper'] as const).flatMap(kind =>
+    (['lost', 'incomplete'] as const).map(outcome => ({ kind, outcome }))))(
+    'refuses zero activity after an owned $kind start reaches upstream with $outcome response', async ({ kind, outcome }) => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused start-outcome web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig), target = batch.output.targets[0], helperId = 'e'.repeat(64)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const upstreamSocket = path.join(batch.outputDir, 'upstream.sock'), received: string[] = []
+    const upstream = http.createServer((request, response) => {
+      request.resume(); request.on('end', () => {
+        received.push(request.url!)
+        if (request.url!.endsWith('/start')) {
+          if (outcome === 'incomplete') {
+            response.writeHead(200, { 'content-length': '20' }); response.write('partial')
+            setImmediate(() => response.destroy())
+          } else response.destroy()
+        } else response.writeHead(201).end(JSON.stringify({ Id: helperId }))
+      })
+    })
+    const broker = new RestrictedDockerBroker({ realSocketPath: upstreamSocket, proxySocketPath: batch.input.brokerSocketPath,
+      runtimeRootPrefix: batch.input.ownerRoot, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set([batch.input.imageRef]),
+      allowedWorkspaceRoots: new Set([batch.input.workspacePath]), testRunId: rig.runtime.runId, logPath: path.join(batch.outputDir, 'broker.jsonl') })
+    const receipt = { ...target, imageRef: batch.input.imageRef, workspacePath: batch.input.workspacePath,
+      createdAt: 'controlled', requestDigest: 'f'.repeat(64) }
+    Object.assign(broker, { receiptsById: new Map([[target.containerId, receipt]]), knownContainerIds: new Set([target.containerId]) })
+    rig.runtime.broker = broker
+    const request = (url: string, body?: unknown) => new Promise<number>((resolve, reject) => {
+      const client = http.request({ socketPath: broker.proxySocketPath, method: 'POST', path: url }, response => {
+        response.resume(); response.on('end', () => resolve(response.statusCode!)); response.on('error', reject)
+      })
+      client.on('error', reject); client.end(body === undefined ? undefined : JSON.stringify(body))
+    })
+    try {
+      await new Promise<void>(resolve => upstream.listen(upstreamSocket, resolve)); await broker.start()
+      if (kind === 'helper') {
+        const body = { Image: batch.input.imageRef, User: '65534:0', Tty: false, WorkingDir: batch.input.workspacePath, Entrypoint: ['node'],
+          Cmd: ['--no-warnings', '-e', owner.TASK007_BATCH_STORE_PROBE, '/home/freshell/provider/.local/share/opencode/opencode.db', target.rootSessionId],
+          Env: ['HOME=/home/freshell/provider'], HostConfig: { NetworkMode: 'none', ReadonlyRootfs: true,
+            CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges'], Memory: 256 * 1024 * 1024, MemorySwap: 256 * 1024 * 1024,
+            NanoCpus: 500_000_000, PidsLimit: 32, Tmpfs: { '/tmp': 'rw,noexec,nosuid,nodev,size=16m' },
+            Mounts: [{ Type: 'volume', Source: target.providerVolumeName, Target: '/home/freshell/provider', ReadOnly: true },
+              { Type: 'bind', Source: batch.input.workspacePath, Target: batch.input.workspacePath, ReadOnly: true }] } }
+        expect(await request(`/v1.47/containers/create?name=freshell-history-${randomUUID()}`, body)).toBe(201)
+      }
+      expect(await rig.prepareSyntheticStoppedRepairBatch()).toHaveProperty('activity.providerContainerStartRequests', 0)
+      const refusedUrl = `/v1.47/containers/${'f'.repeat(64)}/start`
+      expect(await request(refusedUrl)).toBe(403)
+      expect(received).not.toContain(refusedUrl)
+      expect((await rig.syntheticStoppedRepairBatchFacts()).activity).toMatchObject({ helperStartRequests: 0, providerContainerStartRequests: 0 })
+      const url = `/v1.47/containers/${kind === 'helper' ? helperId : target.containerId}/start`
+      await expect(request(url)).rejects.toThrow()
+      await broker.awaitPendingRequests()
+      expect(received).toContain(url)
+      expect(broker.eventsSnapshot()).toContainEqual(expect.objectContaining({ method: 'POST', url, reason: 'owner_request_failed' }))
+      expect(broker.eventsSnapshot()).toContainEqual(expect.objectContaining({ method: 'POST', url,
+        reason: outcome === 'lost' ? 'upstream_request_failed' : 'upstream_response_incomplete' }))
+      await expect(rig.syntheticStoppedRepairBatchFacts()).rejects.toThrow(/start.*outcome|activity.*unknown/)
+      const events = broker.eventsSnapshot()
+      const observedEvents = vi.spyOn(broker, 'eventsSnapshot')
+      for (const reason of ['owner_request_failed', outcome === 'lost' ? 'upstream_request_failed' : 'upstream_response_incomplete']) {
+        observedEvents.mockReturnValue(events.filter(event => event.reason === undefined || event.reason === reason || event.url === refusedUrl))
+        await expect(rig.syntheticStoppedRepairBatchFacts()).rejects.toThrow(/start.*outcome|activity.*unknown/)
+      }
+    } finally {
+      await broker.close(); upstream.closeAllConnections(); await new Promise<void>(resolve => upstream.close(() => resolve()))
+      vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true })
+    }
+  })
+
   it('measures registered setup completion and forwarded helper/provider requests separately from launch events', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused activity web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })

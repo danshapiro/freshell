@@ -4487,9 +4487,18 @@ export class ManagedRuntimeOwner {
       if (!targetIds.has(data.ownerContainerId)) throw new Error('setup completion belongs to an unregistered container')
       return true
     }).length
+    const brokerEvents = this.runtime.broker.eventsSnapshot()
+    const registeredHelperIds = new Set(brokerEvents.flatMap(event => event.helperName && event.containerId
+      && providerIds.has(Task007Hex.parse(event.ownerContainerId)) ? [Task007Hex.parse(event.containerId)] : []))
     let helperStartRequests = 0, providerContainerStartRequests = 0
-    for (const event of this.runtime.broker.eventsSnapshot()) {
-      if (event.decision !== 'forward' || event.method !== 'POST' || !event.url.endsWith('/start')) continue
+    for (const event of brokerEvents) {
+      if (event.method !== 'POST' || !event.url.endsWith('/start')) continue
+      const addressedId = event.url.match(/^\/v1\.47\/containers\/([a-f0-9]{64})\/start$/)?.[1]
+      if (addressedId && (providerIds.has(addressedId) || registeredHelperIds.has(addressedId))
+        && ['upstream_request_failed', 'upstream_response_incomplete', 'owner_request_failed', 'cleanup_deadline'].includes(event.reason ?? '')) {
+        throw new Error('registered start outcome is unknown; activity cannot certify zero starts')
+      }
+      if (event.decision !== 'forward') continue
       const containerId = Task007Hex.parse(event.containerId)
       if (event.url !== `/v1.47/containers/${containerId}/start`) throw new Error('forwarded start address differs from recorded container')
       if (event.helperName) {
