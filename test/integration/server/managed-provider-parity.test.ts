@@ -117,10 +117,37 @@ class TerminalWire {
   }
 }
 
+const ordinaryClaudeSessionStart = [{ hooks: [{ type: 'command', command:
+  'sh -lc \'d="$HOME/.freshell/session-signals/claude"; n=$(date +%s%N 2>/dev/null); case "$n" in *[!0-9]*|"") n="$(date +%s)000000000";; esac; f="$d/${FRESHELL_TERMINAL_ID:-unknown}__$n-$$"; mkdir -p "$d" && cat > "$f.tmp" && mv "$f.tmp" "$f.json"\' 2>/dev/null || true',
+}] }]
+const managedClaudeSessionStart = [{ hooks: [{ type: 'command', command:
+  'node /opt/freshell-claude-sidecar/native-session-channel.mjs',
+}] }]
+const managedClaudeStatusLine = { type: 'command', command:
+  'node /opt/freshell-claude-sidecar/native-session-channel.mjs --status-line' }
+
+function ordinaryClaudeSettings(raw: string): string {
+  let settings
+  try { settings = JSON.parse(raw) } catch { return raw }
+  const startup = JSON.stringify(settings?.hooks?.SessionStart)
+  const ordinary = startup === JSON.stringify(ordinaryClaudeSessionStart)
+  const managed = startup === JSON.stringify(managedClaudeSessionStart)
+    && JSON.stringify(settings.statusLine) === JSON.stringify(managedClaudeStatusLine)
+  if (ordinary || managed) {
+    settings.hooks.SessionStart = '<owned-session-start>'
+    if (managed) delete settings.statusLine
+  }
+  return JSON.stringify(settings)
+}
+
 function ordinaryProviderArgs(argv: string[], provider: Provider): string[] {
   const result: string[] = []
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
+    if (provider === 'claude' && arg === '--settings' && typeof argv[index + 1] === 'string') {
+      result.push(arg, ordinaryClaudeSettings(argv[++index]))
+      continue
+    }
     if (provider === 'codex' && arg === '-c' && argv[index + 1] === 'check_for_update_on_startup=false') {
       index++
       continue
@@ -189,6 +216,33 @@ function normalized(record: RecordRow) {
 }
 
 describe('managed provider parity argv comparison', () => {
+  it('compares only the exact owned Claude startup producer policy and preserves other settings', () => {
+    const settings = (SessionStart: unknown, statusLine?: unknown) => ({
+      hooks: { SessionStart, Stop: [{ hooks: [{ type: 'command', command: 'controlled-stop' }] }] },
+      ...(statusLine ? { statusLine } : {}), userSetting: 'keep',
+    })
+    const ordinary = settings(ordinaryClaudeSessionStart)
+    const managed = settings(managedClaudeSessionStart, managedClaudeStatusLine)
+    const record = (value: unknown, rest = ['--model', 'haiku', '--effort', 'low']): RecordRow => ({
+      provider: 'claude', kind: 'launch', env: {}, argv: ['--settings', JSON.stringify(value), ...rest],
+    })
+    expect(normalized(record(managed))).toEqual(normalized(record(ordinary)))
+    for (const mutated of [
+      settings([{ hooks: [{ type: 'command', command: 'unexpected-startup' }] }], managedClaudeStatusLine),
+      settings(managedClaudeSessionStart),
+      settings(managedClaudeSessionStart, { ...managedClaudeStatusLine, command: 'unexpected-status' }),
+      settings([...managedClaudeSessionStart, { hooks: [{ type: 'command', command: 'extra-hook' }] }], managedClaudeStatusLine),
+      { ...managed, userSetting: 'changed' },
+      { ...managed, hooks: { ...managed.hooks, Stop: [] } },
+      { ...managed, hooks: { ...managed.hooks, PreToolUse: [{ hooks: [] }] } },
+      { ...managed, statusLine: { ...managedClaudeStatusLine, refreshInterval: 99 } },
+    ]) expect(normalized(record(mutated))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record(managed))).not.toEqual(normalized(record(settings([{ hooks: [] }]))))
+    expect(normalized(record(managed, ['--effort', 'low', '--model', 'haiku']))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record(managed, ['--model', 'changed', '--effort', 'low']))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record(managed, ['--model', 'haiku', '--effort', 'high']))).not.toEqual(normalized(record(ordinary)))
+  })
+
   it('compares Codex arguments around the managed image update suppression without hiding other settings', () => {
     const record = (argv: string[]): RecordRow => ({ provider: 'codex', kind: 'launch', argv, env: {} })
     const ordinary = ['--model', 'gpt-5.6-luna', '--sandbox', 'workspace-write']
@@ -428,6 +482,12 @@ describe('ordinary and managed terminal provider parity', () => {
           wire.recordRows().find(row => row.provider === provider && row.kind === 'identity' && row.terminalId === terminalId)
         )))
       }
+    }
+    if (provider === 'claude') {
+      const settings = observed.map(row => JSON.parse(row.argv[row.argv.indexOf('--settings') + 1]))
+      expect(settings[0].hooks.SessionStart).toEqual(ordinaryClaudeSessionStart)
+      expect(settings[1].hooks.SessionStart).toEqual(managedClaudeSessionStart)
+      expect(settings[1].statusLine).toEqual(managedClaudeStatusLine)
     }
     if (provider === 'codex') {
       // The managed image owns the pin and must not ask for updater input
