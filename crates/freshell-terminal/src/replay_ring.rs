@@ -99,12 +99,20 @@ pub struct ReplayDeque {
 
 impl ReplayDeque {
     pub fn new(max_bytes: i64) -> Self {
+        Self::starting_at(max_bytes, 1)
+    }
+
+    /// An empty deque whose first appended frame is numbered `first_seq`
+    /// (its head is `first_seq - 1`, so a reader that has seen everything
+    /// up to there has missed nothing). A unit row's replacement screen
+    /// uses it to continue its row's output sequence.
+    pub fn starting_at(max_bytes: i64, first_seq: i64) -> Self {
         Self {
             frames: Vec::new(),
             start_index: 0,
             retained_bytes: 0,
-            next_seq: 1,
-            head: 0,
+            next_seq: first_seq,
+            head: first_seq - 1,
             max_bytes: normalize_max_bytes(max_bytes),
             retention_loss_pending: false,
         }
@@ -319,9 +327,15 @@ pub struct ReplayRing {
 
 impl ReplayRing {
     pub fn new(max_bytes: Option<i64>) -> Self {
+        Self::starting_at(max_bytes, 1)
+    }
+
+    /// As [`new`](Self::new), but the first appended frame is numbered
+    /// `first_seq` ([`ReplayDeque::starting_at`]).
+    pub fn starting_at(max_bytes: Option<i64>, first_seq: i64) -> Self {
         let resolved = resolve_max_bytes(max_bytes);
         Self {
-            storage: ReplayDeque::new(resolved as i64),
+            storage: ReplayDeque::starting_at(resolved as i64, first_seq),
             max_bytes: resolved,
         }
     }
@@ -411,6 +425,26 @@ mod tests {
             barrier: false,
             at: Some(0),
         }
+    }
+
+    #[test]
+    fn a_ring_started_at_a_later_seq_continues_from_it() {
+        let mut ring = ReplayRing::starting_at(Some(1024), 42);
+        assert_eq!(
+            ring.head_seq(),
+            41,
+            "an empty ring's head is the seq before its first"
+        );
+        assert_eq!(ring.tail_seq(), 42);
+        assert_eq!(
+            ring.replay_since(Some(41)).missed_from_seq,
+            None,
+            "a reader that saw seq 41 has missed nothing"
+        );
+        let first = ring.append("x", "s");
+        assert_eq!((first.seq_start, first.seq_end), (42, 42));
+        assert_eq!(ring.append("y", "s").seq_start, 43);
+        assert_eq!(ring.head_seq(), 43);
     }
 
     #[test]

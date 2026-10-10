@@ -65,7 +65,8 @@ pub use registry::{
     compute_scrollback_max_bytes, ActivityEvent, ActivityObserver, AttachOutcome, ClaimState,
     FrameSink, InputOutcome, PacedAttachOptions, PacedAttachStart, PacedExitNotify,
     PacedGapExitReason, PacedPage, PacedSessionDesc, PacedTailCompletion, ReplayBounds,
-    StuckTransition, TerminalRegistry, DEFAULT_PACED_PAGE_MAX_BYTES, DEFAULT_STUCK_WINDOW_MS,
+    StuckTransition, TerminalRegistry, UnitEnding, UnitPlacement, UnitScreenExit,
+    UnitScreenExitHook, DEFAULT_PACED_PAGE_MAX_BYTES, DEFAULT_STUCK_WINDOW_MS,
     STUCK_ACTIVITY_FRESH_MS,
 };
 pub use replay_ring::{ReplayDeque, ReplayFrame, ReplayRing};

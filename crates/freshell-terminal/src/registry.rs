@@ -73,6 +73,55 @@ use crate::pty::{MessageSink, PtyTerminal};
 /// that forwards into that connection's tokio mpsc → WebSocket.
 pub type FrameSink = Arc<dyn Fn(ServerMessage) + Send + Sync>;
 
+/// Where a unit row's screen starts: the containment unit it belongs to and
+/// how a member of that unit is spawned (the unit's placement wrapper and
+/// environment). The registry treats a unit as plain data; this crate never
+/// depends on the containment crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitPlacement {
+    pub unit_id: String,
+    /// Prepended to the resolved program and its arguments when present.
+    pub wrapper: Option<Vec<String>>,
+    /// Added to the screen's environment.
+    pub env: Vec<(String, String)>,
+    /// true when the screen process IS the agent main process (Claude Code,
+    /// OpenCode, Gemini, Kimi, Amplifier…); false for Codex (main = sidecar).
+    /// The registry treats every screen alike; the unit lifecycle acts on it.
+    pub main_is_screen: bool,
+}
+
+/// Why a unit row is ending. The first ending marked wins; the row's
+/// `terminal.exit` is published only when the unit lifecycle completes the
+/// ending at Gone ([`TerminalRegistry::complete_unit_end`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitEnding {
+    /// A stop someone asked for (Shift-X, kill command, cleanup, respawn,
+    /// shutdown): published silently as `terminal.exit{exitCode:0}`, and the
+    /// row is removed.
+    Requested,
+    /// The agent ended on its own: published as a natural exit (crash path).
+    AgentExited { exit_code: i64 },
+    /// The start's placement was never confirmed: published as an exit with
+    /// the wrapper's code, silently, never as a crash.
+    StartFailed { exit_code: i64 },
+}
+
+/// An unrequested exit of a unit row's screen, handed to the unit lifecycle
+/// ([`TerminalRegistry::set_unit_screen_exit_hook`]), which decides whether
+/// the unit ends or the screen is replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitScreenExit {
+    pub terminal_id: String,
+    pub unit_id: String,
+    pub exit_code: i64,
+    /// 0 for the row's first screen, +1 for each replacement.
+    pub screen_generation: u32,
+}
+
+/// The unit lifecycle's screen-exit handler. It runs on the PTY reader
+/// thread: it must not block and must never call `tokio::spawn`.
+pub type UnitScreenExitHook = Arc<dyn Fn(UnitScreenExit) + Send + Sync>;
+
 /// `DEFAULT_MAX_SCROLLBACK_CHARS` (`terminal-registry.ts:57`): the replay-log
 /// byte cap used when no `settings.terminal.scrollback` value has been wired
 /// into the registry yet (TERM-13's "absent" default -- mirrors the legacy
@@ -566,10 +615,13 @@ struct TerminalShared {
     /// Lifecycle invariant: keyed to this ROW, i.e. effectively
     /// (terminalId, streamId) — the Rust port has no stream-replace lifecycle
     /// (auto-resume spawns a NEW terminal id; a live row's `stream_id` never
-    /// mutates), so the tracker dies exactly when the row does
-    /// (`kill_internal` is the only row-removal site; `finish_pty_exit`
-    /// RETAINS the row and therefore the frozen mode state, which is exactly
-    /// what an attach to an exited terminal must sync to render its tail).
+    /// mutates, and a unit row's replacement screen writes into the same
+    /// stream, continuing the state the client's emulator already has), so
+    /// the tracker dies exactly when the row does
+    /// (`remove_row_and_notify_exit` is the only row-removal site;
+    /// `finish_pty_exit` RETAINS the row and therefore the frozen mode state,
+    /// which is exactly what an attach to an exited terminal must sync to
+    /// render its tail).
     modes: ModeTracker,
     /// Per-terminal repaint-noise fingerprinter feeding the DEV-0009
     /// meaningful clocks (`last_meaningful_activity_at` for the idle reaper,
@@ -710,6 +762,43 @@ struct TerminalShared {
     /// broadcast and store reads are the authority). Updated by the naming
     /// publisher on every committed change and at scoped create.
     session_name: Option<freshell_protocol::session_names::SessionNameRecord>,
+    /// Set when this row's screen is a member of a containment unit
+    /// ([`TerminalRegistry::create_in_unit`]). A unit row publishes
+    /// `terminal.exit` only when its unit ends; its screen's own exits go to
+    /// the unit lifecycle.
+    unit: Option<UnitRow>,
+    /// How the row is ending, once a stop or the agent's own exit has been
+    /// decided ([`TerminalRegistry::mark_ending`]; the first ending wins).
+    /// A unit row with an ending ignores its screen's exit.
+    ending: Option<UnitEnding>,
+    /// When `ending` was marked (epoch ms).
+    ending_since_ms: Option<i64>,
+}
+
+/// The unit half of a unit row ([`TerminalShared::unit`]).
+struct UnitRow {
+    unit_id: String,
+    /// 0 for the first screen, +1 for each [`TerminalRegistry::replace_screen`].
+    screen_generation: u32,
+    /// When the current screen started (epoch ms).
+    screen_started_at: i64,
+    /// Consecutive replacements of screens that died within the respawn
+    /// liveness window: the per-row screen-restart cap.
+    quick_screen_restarts: u32,
+    /// The current generation's exit has been taken. A replacement screen
+    /// can exit before its PTY is put into the row; the replacement then
+    /// marks that PTY reaped as it installs it.
+    screen_exit_seen: bool,
+    /// A [`TerminalRegistry::replace_screen`] is between its reservation
+    /// and its install; a second one is refused meanwhile.
+    replacing: bool,
+    /// The unwrapped spawn inputs the row was created with.
+    respawn_spec: (SpawnSpec, BTreeMap<String, String>),
+    /// The create's PTY framer ring cap, reused by every replacement screen.
+    ring_max_bytes: Option<i64>,
+    /// The caller's Gone-time teardown, run once by
+    /// [`TerminalRegistry::complete_unit_end`] after the exit is published.
+    gone_hook: Option<crate::pty::ExitHook>,
 }
 
 impl TerminalShared {
@@ -1314,6 +1403,10 @@ pub struct TerminalRegistry {
     /// (the `terminal_create_pause` idiom) so every cloned handle
     /// observes a test-armed hook.
     paced_exit_stage_hook: Arc<Mutex<Option<PacedExitStageHook>>>,
+    /// The unit lifecycle's handler for unrequested screen exits of unit
+    /// rows ([`Self::set_unit_screen_exit_hook`]). Interior-shared so every
+    /// cloned registry handle sees the hook installed at boot.
+    unit_screen_exit_hook: Arc<std::sync::RwLock<Option<UnitScreenExitHook>>>,
 }
 
 /// The retained coordinator claim for one sessionRef-owning terminal (kata
@@ -1605,6 +1698,7 @@ impl TerminalRegistry {
             identity_readopt_pause: Arc::new(std::sync::RwLock::new(None)),
             terminal_create_postclaim_pause: Arc::new(std::sync::RwLock::new(None)),
             paced_exit_stage_hook: Arc::new(Mutex::new(None)),
+            unit_screen_exit_hook: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -2324,6 +2418,86 @@ impl TerminalRegistry {
         ring_max_bytes: Option<i64>,
         on_exit: Option<crate::pty::ExitHook>,
     ) -> io::Result<()> {
+        self.create_inner(
+            spec,
+            env,
+            terminal_id,
+            stream_id,
+            mode,
+            resume_session_id,
+            create_request_id,
+            ring_max_bytes,
+            on_exit,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// [`Self::create`] for a coding-agent pane whose screen is a member of
+    /// a containment unit. The program is resolved via `$PATH` first
+    /// (TERM-28), then spawned as `wrapper ++ [resolved, args...]` when the
+    /// placement has a wrapper, with the placement's environment added.
+    /// Returns the screen's pid (with the systemd wrapper, the agent's own
+    /// pid, since `systemd-run` execs in place; with the Windows shim, the
+    /// shim's pid, which exits with the agent).
+    ///
+    /// The row then publishes `terminal.exit` only through
+    /// [`Self::complete_unit_end`]: an unrequested screen exit goes to the
+    /// [`Self::set_unit_screen_exit_hook`] handler and changes nothing else,
+    /// and `on_exit` is kept as the row's Gone hook, run once by
+    /// `complete_unit_end` after the exit is published (never at a screen
+    /// exit, never for a screen replacement).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_in_unit(
+        &self,
+        spec: &SpawnSpec,
+        env: &BTreeMap<String, String>,
+        terminal_id: String,
+        stream_id: String,
+        mode: &str,
+        resume_session_id: Option<&str>,
+        create_request_id: Option<&str>,
+        ring_max_bytes: Option<i64>,
+        on_exit: Option<crate::pty::ExitHook>,
+        placement: UnitPlacement,
+    ) -> io::Result<u32> {
+        self.create_inner(
+            spec,
+            env,
+            terminal_id,
+            stream_id,
+            mode,
+            resume_session_id,
+            create_request_id,
+            ring_max_bytes,
+            on_exit,
+            Some(placement),
+        )
+    }
+
+    /// The body of [`Self::create`] and [`Self::create_in_unit`]; returns
+    /// the screen's pid (0 when the platform reports none).
+    #[allow(clippy::too_many_arguments)]
+    fn create_inner(
+        &self,
+        spec: &SpawnSpec,
+        env: &BTreeMap<String, String>,
+        terminal_id: String,
+        stream_id: String,
+        mode: &str,
+        resume_session_id: Option<&str>,
+        create_request_id: Option<&str>,
+        ring_max_bytes: Option<i64>,
+        on_exit: Option<crate::pty::ExitHook>,
+        placement: Option<UnitPlacement>,
+    ) -> io::Result<u32> {
+        // A unit row's screen starts through the unit's placement; resolve
+        // and wrap before anything is reserved, so a missing program fails
+        // cleanly.
+        let wrapped = match &placement {
+            Some(placement) => Some(wrap_for_unit(spec, env, placement)?),
+            None => None,
+        };
         // Duplicate-live-resume enforcement (amplifier identity plan,
         // validated fix F5/V7): the callers' `has_live_resume` pre-check is
         // check-then-act and can race across WS/REST tasks — this registry's
@@ -2361,6 +2535,12 @@ impl TerminalRegistry {
             }
         }
 
+        // A unit row's PTY gets the registry's own exit hook; the caller's
+        // hook becomes the row's Gone hook.
+        let (gone_hook, pty_exit_hook) = match &placement {
+            Some(_) => (on_exit, Some(self.unit_row_exit_hook(&terminal_id, 0))),
+            None => (None, on_exit),
+        };
         let now = now_ms();
         let shared = Arc::new(Mutex::new(TerminalShared {
             terminal_id: terminal_id.clone(),
@@ -2400,43 +2580,34 @@ impl TerminalRegistry {
             name_ref: None,
             naming_handle: None,
             session_name: None,
+            unit: placement.as_ref().map(|placement| UnitRow {
+                unit_id: placement.unit_id.clone(),
+                screen_generation: 0,
+                screen_started_at: now,
+                quick_screen_restarts: 0,
+                screen_exit_seen: false,
+                replacing: false,
+                respawn_spec: (spec.clone(), env.clone()),
+                ring_max_bytes,
+                gone_hook,
+            }),
+            ending: None,
+            ending_since_ms: None,
         }));
 
-        // The reader thread invokes this for every framed terminal.output: append to
-        // the replay log + fan out (stamped) to subscribers. Captures the shared
-        // state, NOT the PTY (which does not exist yet).
-        let sink_shared = Arc::clone(&shared);
-        // TERM-15/TERM-16 output tap: CLI modes forward each framed output
-        // chunk to the activity observer (BEL turn-complete detection +
-        // liveness). Shell terminals skip the tap entirely (`tapped` false):
-        // zero per-chunk overhead beyond one bool test.
-        let tapped = mode != "shell";
-        let tap_observer = Arc::clone(&self.activity_observer);
-        let tap_terminal_id = terminal_id.clone();
-        let sink: MessageSink = Box::new(move |msg| {
-            if tapped {
-                if let ServerMessage::TerminalOutput(frame) = &msg {
-                    let guard = tap_observer.read().expect("activity observer lock");
-                    if let Some(observer) = guard.as_ref() {
-                        observer(ActivityEvent::Output {
-                            terminal_id: tap_terminal_id.clone(),
-                            data: frame.data.clone(),
-                            at: now_ms(),
-                        });
-                    }
-                }
-            }
-            ingest(&sink_shared, msg)
-        });
-
+        let sink = self.build_output_sink(&shared, &terminal_id, mode);
+        let (spawn_spec, spawn_env) = match &wrapped {
+            Some((spec, env)) => (spec, env),
+            None => (spec, env),
+        };
         let pty = match PtyTerminal::spawn_with_sink(
-            spec,
-            env,
+            spawn_spec,
+            spawn_env,
             terminal_id.clone(),
             stream_id,
             ring_max_bytes,
             Some(sink),
-            on_exit,
+            pty_exit_hook,
         ) {
             Ok(pty) => pty,
             Err(err) => {
@@ -2485,6 +2656,7 @@ impl TerminalRegistry {
             resume_applied = resume_session_id.is_some(),
             cwd = %spec.cwd.as_deref().unwrap_or(""),
             pid = pid.unwrap_or(0),
+            unit_id = %placement.as_ref().map_or("", |p| p.unit_id.as_str()),
             "terminal.created"
         );
         // §5.4 backstop: two live PTYs on one createRequestId is the
@@ -2499,7 +2671,65 @@ impl TerminalRegistry {
             resume_session_id: resume_session_id.map(str::to_string),
             at: now,
         });
-        Ok(())
+        Ok(pid.unwrap_or(0))
+    }
+
+    /// The reader-thread sink for one row: every framed `terminal.output` is
+    /// appended to the row's replay log and fanned out (stamped) to its
+    /// subscribers. Captures the row's shared state, never the PTY (which
+    /// does not exist yet when the sink is built). Shared by
+    /// [`Self::create`] and [`Self::replace_screen`], whose new screen
+    /// writes into the same row.
+    fn build_output_sink(
+        &self,
+        shared: &Arc<Mutex<TerminalShared>>,
+        terminal_id: &str,
+        mode: &str,
+    ) -> MessageSink {
+        let sink_shared = Arc::clone(shared);
+        // TERM-15/TERM-16 output tap: CLI modes forward each framed output
+        // chunk to the activity observer (BEL turn-complete detection +
+        // liveness). Shell terminals skip the tap entirely (`tapped` false):
+        // zero per-chunk overhead beyond one bool test.
+        let tapped = mode != "shell";
+        let tap_observer = Arc::clone(&self.activity_observer);
+        let tap_terminal_id = terminal_id.to_string();
+        Box::new(move |msg| {
+            if tapped {
+                if let ServerMessage::TerminalOutput(frame) = &msg {
+                    let guard = tap_observer.read().expect("activity observer lock");
+                    if let Some(observer) = guard.as_ref() {
+                        observer(ActivityEvent::Output {
+                            terminal_id: tap_terminal_id.clone(),
+                            data: frame.data.clone(),
+                            at: now_ms(),
+                        });
+                    }
+                }
+            }
+            ingest(&sink_shared, msg)
+        })
+    }
+
+    /// The exit hook of a unit row's screen number `generation`: it hands
+    /// the exit to the unit path ([`screen_exited`]) and never publishes.
+    /// It holds the registry only weakly, so a running screen never keeps
+    /// the registry that owns it alive. A replaced screen's late exit is
+    /// ignored by its stale generation.
+    fn unit_row_exit_hook(&self, terminal_id: &str, generation: u32) -> crate::pty::ExitHook {
+        let inner = Arc::downgrade(&self.inner);
+        let hook = Arc::downgrade(&self.unit_screen_exit_hook);
+        let terminal_id = terminal_id.to_string();
+        Box::new(move |exit_code| {
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            let exit = screen_exited(&inner, &terminal_id, Some(generation), exit_code);
+            drop(inner);
+            if let (ScreenExit::Unit(Some(exit)), Some(hook)) = (exit, hook.upgrade()) {
+                fire_unit_screen_exit(&hook, exit);
+            }
+        })
     }
 
     /// `broker.attach*()` (`broker.ts:258-610`): attach connection `conn_id` (with its
@@ -3887,55 +4117,10 @@ impl TerminalRegistry {
     /// without adding a public parameter to [`Self::kill`] (preserving that
     /// method's existing signature for `freshell-ws` and any other caller).
     fn kill_internal(&self, terminal_id: &str, by: &'static str, allow_managed: bool) -> bool {
-        let handle = {
-            let mut inner = self.inner.lock().expect("registry lock");
-            if !allow_managed
-                && inner
-                    .terminals
-                    .get(terminal_id)
-                    .is_some_and(|handle| handle.managed.is_some())
-            {
-                tracing::warn!(terminal_id = %terminal_id, by = by,
-                    "managed_terminal_legacy_kill_refused: supervisor stop is required");
-                return false;
-            }
-            match inner.terminals.remove(terminal_id) {
-                Some(handle) => {
-                    inner.revision += 1;
-                    Some(handle)
-                }
-                None => None,
-            }
-        };
-        let Some(mut handle) = handle else {
+        let Some((mut handle, was_running)) =
+            self.remove_row_and_notify_exit(terminal_id, by, allow_managed)
+        else {
             return false;
-        };
-        // sessionRef lease fix (finding 1): the kill path REMOVES the row
-        // entirely, so `claim_session_ref`'s "known dead" probe (which needs
-        // a registered-but-not-Running row) can never fire for a killed
-        // winner — an UNKNOWN id would be honored as `BoundElsewhere{dead-id}`
-        // forever. Prune any sessionRef binding pointing at this terminal at
-        // row-removal time instead. This is the ONLY row-removal site
-        // (natural exit RETAINS the row via `finish_pty_exit`). The `inner`
-        // lock is already released here, so no ordering hazard.
-        self.session_ref_bindings
-            .lock()
-            .expect("session-ref bindings lock")
-            .retain(|_, bound_id| bound_id != terminal_id);
-        let was_running = {
-            let mut s = handle.shared.lock().expect("terminal lock");
-            let was_running = s.status == TerminalRunStatus::Running;
-            s.status = TerminalRunStatus::Exited;
-            s.exit_code = Some(0);
-            let exit = ServerMessage::TerminalExit(TerminalExit {
-                exit_code: 0,
-                terminal_id: terminal_id.to_string(),
-            });
-            for sub in s.subscribers.values() {
-                (sub.sink)(exit.clone());
-            }
-            s.subscribers.clear();
-            was_running
         };
         // SAFE-11/TERM-22 (stale-pid group-kill hardening, second independent
         // layer): only ever call `pty.kill()` when the registry itself still
@@ -3978,6 +4163,65 @@ impl TerminalRegistry {
         true
     }
 
+    /// Remove a row and tell its subscribers it ended: the revision bump,
+    /// the sessionRef binding prune, `terminal.exit{exitCode:0}` to every
+    /// subscriber and the subscriber clear. Shared by the kill path and
+    /// [`Self::complete_unit_end`]`(Requested)`; each does its own PTY work
+    /// afterwards. `None` when the row is absent, or is a managed facade and
+    /// `allow_managed` is false. The `bool` is whether the row was still
+    /// `Running`.
+    fn remove_row_and_notify_exit(
+        &self,
+        terminal_id: &str,
+        by: &'static str,
+        allow_managed: bool,
+    ) -> Option<(TerminalHandle, bool)> {
+        let handle = {
+            let mut inner = self.inner.lock().expect("registry lock");
+            if !allow_managed
+                && inner
+                    .terminals
+                    .get(terminal_id)
+                    .is_some_and(|handle| handle.managed.is_some())
+            {
+                tracing::warn!(terminal_id = %terminal_id, by = by,
+                    "managed_terminal_legacy_kill_refused: supervisor stop is required");
+                return None;
+            }
+            let handle = inner.terminals.remove(terminal_id)?;
+            inner.revision += 1;
+            handle
+        };
+        // sessionRef lease fix (finding 1): the kill path REMOVES the row
+        // entirely, so `claim_session_ref`'s "known dead" probe (which needs
+        // a registered-but-not-Running row) can never fire for a killed
+        // winner — an UNKNOWN id would be honored as `BoundElsewhere{dead-id}`
+        // forever. Prune any sessionRef binding pointing at this terminal at
+        // row-removal time instead. This is the ONLY row-removal site
+        // (natural exit RETAINS the row via `finish_pty_exit`). The `inner`
+        // lock is already released here, so no ordering hazard.
+        self.session_ref_bindings
+            .lock()
+            .expect("session-ref bindings lock")
+            .retain(|_, bound_id| bound_id != terminal_id);
+        let was_running = {
+            let mut s = handle.shared.lock().expect("terminal lock");
+            let was_running = s.status == TerminalRunStatus::Running;
+            s.status = TerminalRunStatus::Exited;
+            s.exit_code = Some(0);
+            let exit = ServerMessage::TerminalExit(TerminalExit {
+                exit_code: 0,
+                terminal_id: terminal_id.to_string(),
+            });
+            for sub in s.subscribers.values() {
+                (sub.sink)(exit.clone());
+            }
+            s.subscribers.clear();
+            was_running
+        };
+        Some((handle, was_running))
+    }
+
     /// SAFE-11/TERM-22: reap **every** currently-tracked terminal on server
     /// shutdown — legacy parity with `terminal-registry.ts:4843`
     /// `shutdownGracefully()` (SIGTERM every running PTY, wait up to a
@@ -3992,19 +4236,373 @@ impl TerminalRegistry {
     /// while killing) so a `kill()` reentered from a terminal's own exit
     /// fan-out can't deadlock against this call. Returns the number of
     /// terminals actually killed, for shutdown logging/tests.
+    ///
+    /// A unit row is not killed here: its ending is marked `Requested` and
+    /// only its screen is signalled, through the row's PTY handle. The row,
+    /// its subscribers, bindings and ownership stay, no `terminal.exit` is
+    /// sent and its Gone hook does not run: whether the unit is kept for the
+    /// next server or stopped is the shutdown's decision, and a stopped unit
+    /// publishes through its own stop at Gone.
     pub fn kill_all(&self) -> usize {
-        let ids: Vec<String> = {
+        let ids: Vec<(String, bool)> = {
             let inner = self.inner.lock().expect("registry lock");
             inner
                 .terminals
                 .iter()
                 .filter(|(_, handle)| handle.managed.is_none())
-                .map(|(id, _)| id.clone())
+                .map(|(id, handle)| {
+                    let unit = handle.shared.lock().expect("terminal lock").unit.is_some();
+                    (id.clone(), unit)
+                })
                 .collect()
         };
         ids.iter()
-            .filter(|id| self.kill_internal(id, "shutdown", false))
+            .filter(|(id, unit)| {
+                if *unit {
+                    self.kill_unit_screen(id, "shutdown")
+                } else {
+                    self.kill_internal(id, "shutdown", false)
+                }
+            })
             .count()
+    }
+
+    /// Mark a unit row's ending `Requested` and signal its screen through
+    /// the row's PTY handle (the group kill of [`PtyTerminal::kill`]; a
+    /// no-op for a screen already seen exiting). Publishes nothing.
+    fn kill_unit_screen(&self, terminal_id: &str, by: &'static str) -> bool {
+        self.mark_ending(terminal_id, UnitEnding::Requested);
+        let mut inner = self.inner.lock().expect("registry lock");
+        let Some(handle) = inner.terminals.get_mut(terminal_id) else {
+            return false;
+        };
+        if let Some(pty) = handle.pty.as_mut() {
+            pty.kill();
+        }
+        let s = handle.shared.lock().expect("terminal lock");
+        tracing::info!(
+            target: "freshell_unit",
+            event = "terminal.unit_screen_killed",
+            unit_id = %s.unit.as_ref().map_or("", |u| u.unit_id.as_str()),
+            provider = %s.mode,
+            session_id = %s.resume_session_id.as_deref().unwrap_or(""),
+            terminal_id = %terminal_id,
+            operation_id = "",
+            by = by,
+            "unit row's screen killed; the row stays until its unit ends"
+        );
+        true
+    }
+
+    /// Install the unit lifecycle's handler for unrequested screen exits of
+    /// unit rows ([`UnitScreenExit`]). For a unit row whose ending is unset,
+    /// a screen exit calls it and changes nothing else (no `terminal.exit`,
+    /// no crash event, no ownership release, no Gone hook); a unit row with
+    /// an ending ignores its screen's exit. The handler runs on the PTY
+    /// reader thread: it must not block and must never call `tokio::spawn`.
+    pub fn set_unit_screen_exit_hook(&self, hook: UnitScreenExitHook) {
+        *self
+            .unit_screen_exit_hook
+            .write()
+            .expect("unit screen exit hook lock") = Some(hook);
+    }
+
+    /// The unit a row's screen belongs to; `None` for a plain or unknown row.
+    pub fn unit_id_for(&self, terminal_id: &str) -> Option<String> {
+        let shared = self.shared_for(terminal_id)?;
+        let s = shared.lock().expect("terminal lock");
+        s.unit.as_ref().map(|unit| unit.unit_id.clone())
+    }
+
+    /// The running row created for `create_request_id` (the newest, as
+    /// [`Self::newest_live_by_create_request_id`] answers).
+    pub fn terminal_for_create_request(&self, create_request_id: &str) -> Option<String> {
+        self.newest_live_by_create_request_id(create_request_id)
+    }
+
+    /// The spawn inputs a unit row was created with, before its placement
+    /// wrapped them; `None` for a plain or unknown row.
+    pub fn respawn_spec(&self, terminal_id: &str) -> Option<(SpawnSpec, BTreeMap<String, String>)> {
+        let shared = self.shared_for(terminal_id)?;
+        let s = shared.lock().expect("terminal lock");
+        s.unit.as_ref().map(|unit| unit.respawn_spec.clone())
+    }
+
+    /// Record how a row is ending; the first ending wins (a kill's
+    /// `Requested` is never replaced by a later `AgentExited`, nor the
+    /// reverse). Records when it was marked ([`Self::ending_since`]).
+    /// Returns whether this call set it.
+    pub fn mark_ending(&self, terminal_id: &str, ending: UnitEnding) -> bool {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return false;
+        };
+        let mut s = shared.lock().expect("terminal lock");
+        if s.ending.is_some() {
+            return false;
+        }
+        s.ending = Some(ending);
+        s.ending_since_ms = Some(now_ms());
+        true
+    }
+
+    /// The row's marked ending, if any.
+    pub fn ending(&self, terminal_id: &str) -> Option<UnitEnding> {
+        let shared = self.shared_for(terminal_id)?;
+        let ending = shared.lock().expect("terminal lock").ending;
+        ending
+    }
+
+    /// When the row's ending was marked (epoch ms).
+    pub fn ending_since(&self, terminal_id: &str) -> Option<i64> {
+        let shared = self.shared_for(terminal_id)?;
+        let since = shared.lock().expect("terminal lock").ending_since_ms;
+        since
+    }
+
+    /// Publish a unit row's end at Gone; the unit has already stopped its
+    /// processes, so this never signals.
+    ///
+    /// - `Requested`: the row is removed (revision bump, sessionRef bindings
+    ///   pruned), its subscribers get `terminal.exit{exitCode:0}`, ownership
+    ///   is released fenced, `terminal.killed by=unit` is logged and
+    ///   `ActivityEvent::Exit{spontaneous:false}` emitted.
+    /// - `AgentExited`: the row is kept `Exited` with the code and published
+    ///   as a natural exit (respawn-window accounting,
+    ///   `Exit{spontaneous:true}`).
+    /// - `StartFailed`: as `AgentExited`, but silent
+    ///   (`Exit{spontaneous:false}`) and never counted as a crash.
+    ///
+    /// Then the row's Gone hook runs once with the published exit code.
+    /// The row's PTY is dropped on a detached thread, so a process still
+    /// holding the PTY slave cannot delay the publication. Returns whether
+    /// the row existed. Blocking callers only: the Gone hook may write to
+    /// disk.
+    pub fn complete_unit_end(&self, terminal_id: &str, ending: UnitEnding) -> bool {
+        let (exit_code, gone_hook) = match ending {
+            UnitEnding::Requested => {
+                let Some((mut handle, _)) =
+                    self.remove_row_and_notify_exit(terminal_id, "unit", false)
+                else {
+                    return false;
+                };
+                if let Some(pty) = handle.pty.take() {
+                    drop_pty_detached(terminal_id, pty);
+                }
+                let (unit_id, gone_hook) = {
+                    let mut s = handle.shared.lock().expect("terminal lock");
+                    s.unit.as_mut().map_or((String::new(), None), |unit| {
+                        (unit.unit_id.clone(), unit.gone_hook.take())
+                    })
+                };
+                tracing::info!(terminal_id = %terminal_id, by = "unit", unit_id = %unit_id,
+                    "terminal.killed");
+                self.release_session_ref_ownership(terminal_id, "unit");
+                self.notify_activity(ActivityEvent::Exit {
+                    terminal_id: terminal_id.to_string(),
+                    at: now_ms(),
+                    spontaneous: false,
+                });
+                (0, gone_hook)
+            }
+            UnitEnding::AgentExited { exit_code } | UnitEnding::StartFailed { exit_code } => {
+                // The ending is settled now: a screen exit still in flight is
+                // ignored like any screen exit after a marked ending.
+                self.mark_ending(terminal_id, ending);
+                let (shared, pty) = {
+                    let mut inner = self.inner.lock().expect("registry lock");
+                    let Some(handle) = inner.terminals.get_mut(terminal_id) else {
+                        return false;
+                    };
+                    (Arc::clone(&handle.shared), handle.pty.take())
+                };
+                if let Some(pty) = pty {
+                    drop_pty_detached(terminal_id, pty);
+                }
+                let spontaneous = matches!(ending, UnitEnding::AgentExited { .. });
+                self.publish_natural_exit(terminal_id, &shared, exit_code, spontaneous);
+                let gone_hook = shared
+                    .lock()
+                    .expect("terminal lock")
+                    .unit
+                    .as_mut()
+                    .and_then(|unit| unit.gone_hook.take());
+                (exit_code, gone_hook)
+            }
+        };
+        if let Some(hook) = gone_hook {
+            hook(exit_code);
+        }
+        true
+    }
+
+    /// Start a new screen in a running unit row whose screen has exited
+    /// (its exit reached the [`Self::set_unit_screen_exit_hook`] handler):
+    /// same terminal id and stream id, same subscribers and replay log. The
+    /// new screen's output continues the row's sequence at `head_seq + 1`,
+    /// so attached and reattaching clients (which drop frames at or below
+    /// the highest sequence they have seen) accept it, and it starts at the
+    /// row's current geometry (the last resize), not the original spec's.
+    ///
+    /// Per-row cap: when the screen being replaced lived at least the
+    /// respawn liveness window the restart count starts again at 1, when it
+    /// died sooner the count grows by 1, and a count above the respawn
+    /// generation cap fails with `respawn cap` without spawning. Auto-resume's
+    /// create-request budget ([`Self::respawn_exhausted`]) is never touched.
+    /// A replacement whose spawn fails still counts. The old screen's PTY is
+    /// dropped on a detached thread without being signalled. Returns the new
+    /// screen's pid; the caller confirms its placement as for a start.
+    pub fn replace_screen(
+        &self,
+        terminal_id: &str,
+        spec: &SpawnSpec,
+        env: &BTreeMap<String, String>,
+        placement: UnitPlacement,
+    ) -> io::Result<u32> {
+        let (wrapped, child_env) = wrap_for_unit(spec, env, &placement)?;
+        let (shared, reserved) = self.reserve_screen(terminal_id)?;
+        let ScreenReservation {
+            stream_id,
+            mode,
+            cols,
+            rows,
+            first_seq,
+            ring_max_bytes,
+            generation,
+            restarts,
+        } = reserved;
+        let spawned = PtyTerminal::spawn_with_sink_from_seq(
+            &SpawnSpec {
+                cols,
+                rows,
+                ..wrapped
+            },
+            &child_env,
+            terminal_id.to_string(),
+            stream_id,
+            ring_max_bytes,
+            Some(self.build_output_sink(&shared, terminal_id, &mode)),
+            Some(self.unit_row_exit_hook(terminal_id, generation)),
+            first_seq,
+        );
+        #[cfg(test)]
+        REPLACE_SCREEN_INTERLOCK.wait_if_targeted(terminal_id);
+        // Install the new screen's PTY. Its exit may already have been
+        // taken (the generation was reserved before the spawn); then the
+        // PTY is marked reaped as it goes in, so its pid is never signalled.
+        let installed = {
+            let mut inner = self.inner.lock().expect("registry lock");
+            let handle = inner.terminals.get_mut(terminal_id);
+            let exit_seen = handle.as_ref().and_then(|handle| {
+                let mut s = handle.shared.lock().expect("terminal lock");
+                let unit = s.unit.as_mut()?;
+                unit.replacing = false;
+                Some(unit.screen_exit_seen)
+            });
+            match (spawned, handle, exit_seen) {
+                (Ok(mut pty), Some(handle), Some(exit_seen)) => {
+                    let pid = pty.pid();
+                    if exit_seen {
+                        pty.mark_naturally_exited();
+                    }
+                    Ok((pid, handle.pty.replace(pty)))
+                }
+                // The row ended while the screen started: the unit owns its
+                // processes, so the PTY is only released here.
+                (Ok(pty), _, _) => Err((
+                    Some(pty),
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("terminal {terminal_id} ended during its screen replacement"),
+                    ),
+                )),
+                (Err(err), _, _) => Err((None, err)),
+            }
+        };
+        let (pid, old) = match installed {
+            Ok(installed) => installed,
+            Err((orphan, err)) => {
+                if let Some(orphan) = orphan {
+                    drop_pty_detached(terminal_id, orphan);
+                }
+                return Err(err);
+            }
+        };
+        if let Some(old) = old {
+            drop_pty_detached(terminal_id, old);
+        }
+        tracing::info!(
+            target: "freshell_unit",
+            event = "terminal.screen_replaced",
+            unit_id = %placement.unit_id,
+            provider = %mode,
+            terminal_id = %terminal_id,
+            operation_id = "",
+            screen_generation = generation,
+            quick_screen_restarts = restarts,
+            pid = pid.unwrap_or(0),
+            "unit row's screen replaced"
+        );
+        Ok(pid.unwrap_or(0))
+    }
+
+    /// The first half of [`Self::replace_screen`], under the registry and
+    /// row locks: check the cap and reserve the next screen generation (so
+    /// the new screen's exit is recognised however early it comes).
+    fn reserve_screen(
+        &self,
+        terminal_id: &str,
+    ) -> io::Result<(Arc<Mutex<TerminalShared>>, ScreenReservation)> {
+        let inner = self.inner.lock().expect("registry lock");
+        let handle = inner.terminals.get(terminal_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("terminal {terminal_id} not found"),
+            )
+        })?;
+        let mut s = handle.shared.lock().expect("terminal lock");
+        let running = s.status == TerminalRunStatus::Running;
+        let (stream_id, mode, cols, rows, first_seq) = (
+            s.stream_id.clone(),
+            s.mode.clone(),
+            s.cols,
+            s.rows,
+            s.head_seq + 1,
+        );
+        let unit = s.unit.as_mut().filter(|unit| running && !unit.replacing);
+        let Some(unit) = unit else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("terminal {terminal_id} is not a running unit row ready for a new screen"),
+            ));
+        };
+        let now = now_ms();
+        let window = self.respawn_liveness_window_ms.load(Ordering::Relaxed);
+        let restarts = if now.saturating_sub(unit.screen_started_at) < window {
+            unit.quick_screen_restarts + 1
+        } else {
+            1
+        };
+        let cap = self.respawn_generation_cap.load(Ordering::Relaxed).max(1) as u32;
+        if restarts > cap {
+            return Err(io::Error::other("respawn cap"));
+        }
+        unit.screen_generation += 1;
+        unit.screen_started_at = now;
+        unit.quick_screen_restarts = restarts;
+        unit.screen_exit_seen = false;
+        unit.replacing = true;
+        let reservation = ScreenReservation {
+            stream_id,
+            mode,
+            cols,
+            rows,
+            first_seq,
+            ring_max_bytes: unit.ring_max_bytes,
+            generation: unit.screen_generation,
+            restarts,
+        };
+        drop(s);
+        Ok((Arc::clone(&handle.shared), reservation))
     }
 
     /// Read-only liveness probe: is a terminal with this id currently in the
@@ -4036,28 +4634,41 @@ impl TerminalRegistry {
     /// frame; the exit code comes from the waiter thread's `child.wait()`).
     /// Deliberately does NOT drop the `TerminalHandle.pty` here — that would join
     /// the very reader thread this runs on.
+    ///
+    /// A unit row's screen exit publishes nothing here: it goes to the unit
+    /// lifecycle's [`Self::set_unit_screen_exit_hook`] handler (unless an
+    /// ending is already marked), and the unit publishes the row's exit at
+    /// Gone through [`Self::complete_unit_end`].
     pub fn finish_pty_exit(&self, terminal_id: &str, exit_code: i64) -> bool {
-        let shared = {
-            let mut inner = self.inner.lock().expect("registry lock");
-            match inner.terminals.get_mut(terminal_id) {
-                Some(handle) => {
-                    // SAFE-11/TERM-22 (stale-pid group-kill hardening): mark
-                    // the underlying PtyTerminal reaped + drop its cached pid
-                    // NOW, at the moment of natural exit, rather than leaving
-                    // it live in the (retained) record for a later, unrelated
-                    // `kill()`/`kill_all()` to potentially re-signal against a
-                    // since-recycled pid. Safe to call from here: it neither
-                    // blocks nor joins any thread (see its own doc comment),
-                    // which matters because natural exit runs THIS callback
-                    // from inside the PtyTerminal's own reader thread.
-                    if let Some(pty) = handle.pty.as_mut() {
-                        pty.mark_naturally_exited();
-                    }
-                    Arc::clone(&handle.shared)
+        match screen_exited(&self.inner, terminal_id, None, exit_code) {
+            ScreenExit::Ignored => false,
+            ScreenExit::Unit(exit) => {
+                if let Some(exit) = exit {
+                    fire_unit_screen_exit(&self.unit_screen_exit_hook, exit);
                 }
-                None => return false, // killed (kill removes the record) or unknown
+                false
             }
-        };
+            ScreenExit::Plain(shared) => {
+                self.publish_natural_exit(terminal_id, &shared, exit_code, true)
+            }
+        }
+    }
+
+    /// The natural-exit publication of a row: mark it `Exited` with
+    /// `exit_code` (RETAINED), fan `terminal.exit` out (paced subscribers
+    /// get it staged), log `terminal.exited`, release its coordinator
+    /// ownership fenced, and emit `ActivityEvent::Exit`. `spontaneous` is
+    /// true for a process that died on its own (a crash candidate: it also
+    /// counts toward the create-request respawn window) and false for a
+    /// start that failed (silent, never a crash). Returns false when the row
+    /// was already `Exited`.
+    fn publish_natural_exit(
+        &self,
+        terminal_id: &str,
+        shared: &Arc<Mutex<TerminalShared>>,
+        exit_code: i64,
+        spontaneous: bool,
+    ) -> bool {
         let mut s = shared.lock().expect("terminal lock");
         if s.status == TerminalRunStatus::Exited {
             return false;
@@ -4119,8 +4730,9 @@ impl TerminalRegistry {
         // Reconciliation §7.5: a generation that died inside the liveness
         // window counts toward the respawn cap; one that survived it resets
         // the counter (a healthy resume is not penalized). Natural exits only
-        // — a user-initiated `kill` removes the record without passing here.
-        if let Some(key) = respawn_key {
+        // — a user-initiated `kill` removes the record without passing here,
+        // and a failed start is never a crash.
+        if let Some(key) = respawn_key.filter(|_| spontaneous) {
             let window = self.respawn_liveness_window_ms.load(Ordering::Relaxed);
             let mut inner = self.inner.lock().expect("registry lock");
             if lifetime_ms < window {
@@ -4142,7 +4754,7 @@ impl TerminalRegistry {
         self.notify_activity(ActivityEvent::Exit {
             terminal_id: terminal_id.to_string(),
             at: now_ms(),
-            spontaneous: true,
+            spontaneous,
         });
         true
     }
@@ -4597,6 +5209,9 @@ impl TerminalRegistry {
             name_ref: None,
             naming_handle: None,
             session_name: None,
+            unit: None,
+            ending: None,
+            ending_since_ms: None,
         }));
         let mut inner = self.inner.lock().expect("registry lock");
         inner.terminals.insert(
@@ -5003,6 +5618,9 @@ impl TerminalRegistry {
             name_ref: None,
             naming_handle: None,
             session_name: None,
+            unit: None,
+            ending: None,
+            ending_since_ms: None,
         }));
         {
             let mut inner = self.inner.lock().expect("registry lock");
@@ -5557,7 +6175,9 @@ impl TerminalRegistry {
             live_session_key: None,
             pid,
             ownership_id: Some(operation_id.to_string()),
-            unit_id: None,
+            // A unit row's Live commit names its unit, so the unit's stop
+            // finds every key it holds.
+            unit_id: self.unit_id_for(terminal_id),
             hold: freshell_ownership::HoldKind::Main,
         };
         let outcome = ownership.commit_live(
@@ -5703,7 +6323,9 @@ impl TerminalRegistry {
             live_session_key: None,
             pid,
             ownership_id: Some(operation_id.to_string()),
-            unit_id: None,
+            // A unit row's Live commit names its unit, so the unit's stop
+            // finds every key it holds.
+            unit_id: self.unit_id_for(terminal_id),
             hold: freshell_ownership::HoldKind::Main,
         };
         let outcome = ownership.commit_live_rekey_from_terminal(
@@ -6117,6 +6739,165 @@ pub fn has_other_live_resume(
             && row.status == TerminalRunStatus::Running
             && row.resume_session_id.as_deref() == Some(session_id)
     })
+}
+
+/// A unit member's spawn: `spec.program` resolved via `$PATH` first
+/// (TERM-28), then `wrapper ++ [resolved, args...]` when the placement has a
+/// wrapper, and the child environment plus the placement's variables.
+fn wrap_for_unit(
+    spec: &SpawnSpec,
+    env: &BTreeMap<String, String>,
+    placement: &UnitPlacement,
+) -> io::Result<(SpawnSpec, BTreeMap<String, String>)> {
+    let resolved = freshell_platform::path::resolve_program_via_path(
+        &spec.program,
+        env.get("PATH").map(String::as_str),
+    )
+    .map_err(|_| io::Error::from(io::ErrorKind::NotFound))?;
+    let mut wrapped = spec.clone();
+    match placement.wrapper.as_deref() {
+        Some([program, leading @ ..]) => {
+            wrapped.program = program.clone();
+            wrapped.args = leading
+                .iter()
+                .cloned()
+                .chain(std::iter::once(resolved))
+                .chain(spec.args.iter().cloned())
+                .collect();
+        }
+        Some([]) | None => wrapped.program = resolved,
+    }
+    let mut child_env = env.clone();
+    for (key, value) in &placement.env {
+        child_env.insert(key.clone(), value.clone());
+    }
+    Ok((wrapped, child_env))
+}
+
+/// What [`TerminalRegistry::replace_screen`] reserved for its new screen.
+struct ScreenReservation {
+    stream_id: String,
+    mode: String,
+    cols: u16,
+    rows: u16,
+    first_seq: i64,
+    ring_max_bytes: Option<i64>,
+    generation: u32,
+    restarts: u32,
+}
+
+/// What a screen exit means for its row ([`screen_exited`]).
+enum ScreenExit {
+    /// No such row (a removed row), or a replaced screen's late exit.
+    Ignored,
+    /// A plain row: its natural exit is published.
+    Plain(Arc<Mutex<TerminalShared>>),
+    /// A unit row's current screen: nothing is published; the unit
+    /// lifecycle is told, unless an ending is already marked (`None`).
+    Unit(Option<UnitScreenExit>),
+}
+
+/// The registry half of a screen exit, under the registry lock: the row's
+/// PTY is marked reaped (SAFE-11/TERM-22: its cached pid is never signalled
+/// again), and the exit is classified. `generation` is the exiting screen's
+/// own generation (`None` from [`TerminalRegistry::finish_pty_exit`], which
+/// means the row's current screen); an older screen's exit leaves the row
+/// and its current PTY untouched.
+fn screen_exited(
+    inner: &Mutex<RegistryInner>,
+    terminal_id: &str,
+    generation: Option<u32>,
+    exit_code: i64,
+) -> ScreenExit {
+    let mut inner = inner.lock().expect("registry lock");
+    let Some(handle) = inner.terminals.get_mut(terminal_id) else {
+        return ScreenExit::Ignored; // killed (kill removes the record) or unknown
+    };
+    let (unit, ending) = {
+        let mut s = handle.shared.lock().expect("terminal lock");
+        let ending = s.ending;
+        let unit = s.unit.as_mut().map(|unit| {
+            let current = unit.screen_generation;
+            if generation.is_none_or(|exiting| exiting == current) {
+                unit.screen_exit_seen = true;
+            }
+            (unit.unit_id.clone(), current)
+        });
+        (unit, ending)
+    };
+    if let (Some((unit_id, current)), Some(exiting)) = (&unit, generation) {
+        if exiting != *current {
+            tracing::debug!(
+                target: "freshell_unit",
+                event = "terminal.stale_screen_exit_ignored",
+                unit_id = %unit_id,
+                terminal_id = %terminal_id,
+                screen_generation = exiting,
+                current_generation = *current,
+                exit_code,
+                "a replaced screen exited; the row's current screen is unaffected"
+            );
+            return ScreenExit::Ignored;
+        }
+    }
+    // SAFE-11/TERM-22 (stale-pid group-kill hardening): mark the underlying
+    // PtyTerminal reaped + drop its cached pid NOW, at the moment of natural
+    // exit, rather than leaving it live in the (retained) record for a
+    // later, unrelated `kill()`/`kill_all()` to potentially re-signal against
+    // a since-recycled pid. Safe to call from here: it neither blocks nor
+    // joins any thread (see its own doc comment), which matters because
+    // natural exit runs this from inside the PtyTerminal's own reader thread.
+    if let Some(pty) = handle.pty.as_mut() {
+        pty.mark_naturally_exited();
+    }
+    match unit {
+        None => ScreenExit::Plain(Arc::clone(&handle.shared)),
+        Some((unit_id, screen_generation)) => {
+            ScreenExit::Unit(ending.is_none().then(|| UnitScreenExit {
+                terminal_id: terminal_id.to_string(),
+                unit_id,
+                exit_code,
+                screen_generation,
+            }))
+        }
+    }
+}
+
+/// Call the unit lifecycle's screen-exit handler, with no registry lock held.
+fn fire_unit_screen_exit(
+    slot: &std::sync::RwLock<Option<UnitScreenExitHook>>,
+    exit: UnitScreenExit,
+) {
+    let hook = slot.read().expect("unit screen exit hook lock").clone();
+    if let Some(hook) = hook {
+        hook(exit);
+    }
+}
+
+/// Drop a screen's PTY on a detached thread, never signalling it: dropping
+/// joins the PTY's reader and waiter threads, which wait until the last
+/// process holding the PTY slave closes it (a stuck, escaped or spared
+/// process can hold it indefinitely). Used where the unit, not the PTY
+/// handle, owns the processes: Gone publication and screen replacement.
+fn drop_pty_detached(terminal_id: &str, mut pty: PtyTerminal) {
+    pty.mark_naturally_exited();
+    let slot = Arc::new(Mutex::new(Some(pty)));
+    let held = Arc::clone(&slot);
+    let spawned = std::thread::Builder::new()
+        .name(format!("pty-drop-{terminal_id}"))
+        .spawn(move || drop(held.lock().expect("pty drop slot").take()));
+    if let Err(err) = spawned {
+        tracing::error!(
+            target: "freshell_unit",
+            event = "terminal.pty_drop_detach_failed",
+            terminal_id = %terminal_id,
+            error = %err,
+            "no thread to drop the PTY handle on; it is leaked instead of joined inline"
+        );
+        if let Some(pty) = slot.lock().expect("pty drop slot").take() {
+            std::mem::forget(pty);
+        }
+    }
 }
 
 /// The reader-thread sink body (`onTerminalOutputRaw` → append + live flush,
@@ -6577,6 +7358,17 @@ fn build_batch_messages(
     }
     messages
 }
+
+/// Test-only: parks [`TerminalRegistry::replace_screen`] for ONE targeted
+/// terminal id after the new screen is spawned and before its PTY is put
+/// into the row, so a test can make the new screen exit inside that window.
+#[cfg(test)]
+pub(crate) static REPLACE_SCREEN_INTERLOCK: RekeyInterlock = RekeyInterlock {
+    target: std::sync::Mutex::new(None),
+    reached: std::sync::atomic::AtomicBool::new(false),
+    gate: std::sync::Mutex::new(false),
+    cv: std::sync::Condvar::new(),
+};
 
 /// b8ke ext r30 F2 (test-only): the rekey's deterministic INTERLOCK —
 /// parks the rekey's critical section between the old→new coordinator
@@ -7148,7 +7940,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     /// A `FrameSink` that records every delivered message for assertions.
-    fn collector() -> (FrameSink, Arc<StdMutex<Vec<ServerMessage>>>) {
+    pub(super) fn collector() -> (FrameSink, Arc<StdMutex<Vec<ServerMessage>>>) {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let seen2 = Arc::clone(&seen);
         let sink: FrameSink = Arc::new(move |msg| seen2.lock().unwrap().push(msg));
@@ -15382,3 +16174,7 @@ mod tests {
 #[cfg(test)]
 #[path = "managed_output_tests.rs"]
 mod managed_output_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "unit_row_tests.rs"]
+mod unit_row_tests;

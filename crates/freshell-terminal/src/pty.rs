@@ -166,6 +166,33 @@ impl PtyTerminal {
         sink: Option<MessageSink>,
         on_exit: Option<ExitHook>,
     ) -> io::Result<Self> {
+        Self::spawn_with_sink_from_seq(
+            spec,
+            env,
+            terminal_id,
+            stream_id,
+            ring_max_bytes,
+            sink,
+            on_exit,
+            1,
+        )
+    }
+
+    /// As [`spawn_with_sink`](Self::spawn_with_sink), but the first framed
+    /// output is numbered `first_seq` instead of 1. A unit row's replacement
+    /// screen passes its row's `head_seq + 1`, so the new screen's output
+    /// continues the row's sequence on the same stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_sink_from_seq(
+        spec: &SpawnSpec,
+        env: &BTreeMap<String, String>,
+        terminal_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        ring_max_bytes: Option<i64>,
+        sink: Option<MessageSink>,
+        on_exit: Option<ExitHook>,
+        first_seq: i64,
+    ) -> io::Result<Self> {
         let terminal_id = terminal_id.into();
         let stream_id = stream_id.into();
 
@@ -265,7 +292,12 @@ impl PtyTerminal {
         let writer = pair.master.take_writer().map_err(to_io)?;
 
         let captured = Arc::new(Mutex::new(Captured::default()));
-        let framer = OutputFramer::new(terminal_id.clone(), stream_id.clone(), ring_max_bytes);
+        let framer = OutputFramer::starting_at(
+            terminal_id.clone(),
+            stream_id.clone(),
+            ring_max_bytes,
+            first_seq,
+        );
 
         // The child is owned by a waiter thread that blocks in `wait()` (node-pty's
         // Windows agent does the same with RegisterWaitForSingleObject). On Windows
@@ -474,10 +506,20 @@ impl Drop for PtyTerminal {
         // stream EOFs \u2014 unix: slave EIO; Windows: master closed by the waiter).
         // Both joins are bounded: kill() guarantees the child is exiting.
         self.kill();
-        if let Some(handle) = self.waiter_thread.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.reader_thread.take() {
+        join_unless_current(self.waiter_thread.take());
+        join_unless_current(self.reader_thread.take());
+    }
+}
+
+/// Join `handle` unless it is the calling thread. The reader thread runs the
+/// exit hook, and a unit row's hook reaches back into the registry that owns
+/// this `PtyTerminal`: when the registry is dropped while the hook runs, the
+/// last reference can go away on the reader thread itself, which then drops
+/// this struct. Joining itself would fail (`EDEADLK`); the thread is about to
+/// finish anyway, so it is left to end on its own.
+fn join_unless_current(handle: Option<JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        if handle.thread().id() != std::thread::current().id() {
             let _ = handle.join();
         }
     }
@@ -888,5 +930,59 @@ mod tests {
         let result = PtyTerminal::spawn(&spec, &env, "t-missing", "s-missing", None);
         let err = result.err().expect("spawn must fail cleanly");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A terminal whose own exit hook releases the last reference to it is
+    /// dropped on its own reader thread. The drop must finish (the reader is
+    /// not joined from itself) instead of failing the self-join. A unit
+    /// row's screen reaches back into the registry that owns it this way.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_dropped_by_its_own_exit_hook_drops_cleanly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "read line; exit 0".into()],
+            env_overrides: BTreeMap::new(),
+            cwd: None,
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+        };
+        let env: BTreeMap<String, String> = std::env::vars().filter(|(k, _)| k == "PATH").collect();
+        let slot: Arc<Mutex<Option<PtyTerminal>>> = Arc::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (hook_slot, hook_dropped) = (Arc::clone(&slot), Arc::clone(&dropped));
+        let hook: ExitHook = Box::new(move |_| {
+            let pty = hook_slot.lock().expect("slot").take();
+            assert!(pty.is_some(), "the terminal was stored before its exit");
+            drop(pty);
+            hook_dropped.store(true, Ordering::SeqCst);
+        });
+        let sink: MessageSink = Box::new(|_| {});
+        let pty = PtyTerminal::spawn_with_sink(
+            &spec,
+            &env,
+            "t-self",
+            "s-self",
+            None,
+            Some(sink),
+            Some(hook),
+        )
+        .expect("spawn");
+        *slot.lock().expect("slot") = Some(pty);
+        slot.lock()
+            .expect("slot")
+            .as_mut()
+            .expect("stored")
+            .write_input(b"go\n")
+            .expect("input");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exit hook never finished dropping its own terminal"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

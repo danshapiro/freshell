@@ -37,8 +37,21 @@ pub struct OutputFramer {
 
 impl OutputFramer {
     pub fn new(terminal_id: String, stream_id: String, ring_max_bytes: Option<i64>) -> Self {
+        Self::starting_at(terminal_id, stream_id, ring_max_bytes, 1)
+    }
+
+    /// As [`new`](Self::new), but the first framed output is numbered
+    /// `first_seq`: a unit row's replacement screen continues its row's
+    /// sequence, so clients that drop frames at or below the highest
+    /// sequence they have seen accept the new screen's output.
+    pub fn starting_at(
+        terminal_id: String,
+        stream_id: String,
+        ring_max_bytes: Option<i64>,
+        first_seq: i64,
+    ) -> Self {
         Self {
-            ring: ReplayRing::new(ring_max_bytes),
+            ring: ReplayRing::starting_at(ring_max_bytes, first_seq),
             terminal_id,
             stream_id,
             batch_max_bytes: terminal_stream_batch_max_bytes(),
@@ -167,6 +180,16 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn a_framer_started_at_a_later_seq_numbers_its_output_from_it() {
+        let mut framer = OutputFramer::starting_at("term".into(), "stream".into(), None, 7);
+        let a = framer.append_output("1\r\n");
+        let b = framer.append_output("2\r\n");
+        assert_eq!(seqs_of(&a[0]), (7, 7));
+        assert_eq!(seqs_of(&b[0]), (8, 8));
+        assert_eq!(framer.head_seq(), 8);
     }
 
     #[test]
