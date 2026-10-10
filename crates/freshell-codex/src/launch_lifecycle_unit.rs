@@ -11,7 +11,9 @@
 //! its unit through the lifecycle and waits for Gone before the next attempt.
 
 use freshell_containment::events::{self, UnitLogKeys};
-use freshell_containment::{listening_socket_owner, AgentUnit, MemberRole, ProcWatch};
+use freshell_containment::{
+    listening_socket_owner, AgentUnit, MemberRole, ProcIdentity, ProcWatch,
+};
 
 use super::{NotListening, SpawnedCodexAppServerRuntime, SpawnedSidecar};
 use crate::launch_plan::{UnitSeed, CODEX_START_CANCELLED_MESSAGE};
@@ -108,16 +110,13 @@ impl SpawnedCodexAppServerRuntime {
         }
 
         // 7. The main: the listener among THIS unit's members.
-        let Some(main_pid) = listener_among_members(&unit, spawn.port).await? else {
+        let Some(main) = listener_among_members(&unit, spawn.port).await? else {
             events::main_discovery_failed(&keys, spawn.port, spawned_pid);
             return Err(format!(
                 "codex app-server listener on port {} is not a member of this unit",
                 spawn.port
             ));
         };
-        let main = ProcWatch::open(main_pid).map_err(|error| {
-            format!("codex app-server main {main_pid} could not be pinned: {error}")
-        })?;
         unit.set_main(main.clone());
 
         // 8. The durable record (detached spawns only, as before).
@@ -155,22 +154,41 @@ impl SpawnedCodexAppServerRuntime {
     }
 }
 
-/// The member of `unit` (or a descendant of one) that owns the LISTEN socket
-/// on `port`. A full member scan on the tag backend, so it runs on a
-/// blocking thread.
+/// The member of `unit` that owns the LISTEN socket on `port`, pinned by the
+/// identity the member snapshot read. A full member scan on the tag backend,
+/// so it runs on a blocking thread.
 pub(crate) async fn listener_among_members(
     unit: &AgentUnit,
     port: u16,
-) -> Result<Option<u32>, String> {
+) -> Result<Option<ProcWatch>, String> {
     let unit = unit.clone();
     tokio::task::spawn_blocking(move || {
-        let members = unit.members()?;
+        let members = unit
+            .members()
+            .map_err(|error| format!("codex unit members unreadable: {error}"))?;
         let pids: Vec<u32> = members.iter().map(|member| member.pid).collect();
-        Ok::<_, std::io::Error>(listening_socket_owner(port, &pids))
+        pin_listener(&members, listening_socket_owner(port, &pids))
     })
     .await
     .map_err(|error| format!("codex unit member lookup failed: {error}"))?
-    .map_err(|error| format!("codex unit members unreadable: {error}"))
+}
+
+/// Pins the listener `owner` by the pid AND start time the member snapshot
+/// read for it, so a pid reused since the snapshot is never taken as the main.
+/// `None` when no member owns the listener: no owner, or a process the
+/// snapshot does not list (a spared Codex daemon process is never a member).
+fn pin_listener(members: &[ProcIdentity], owner: Option<u32>) -> Result<Option<ProcWatch>, String> {
+    let Some(member) = owner.and_then(|pid| members.iter().find(|member| member.pid == pid)) else {
+        return Ok(None);
+    };
+    ProcWatch::open_expecting(member.pid, member.start)
+        .map(Some)
+        .map_err(|error| {
+            format!(
+                "codex app-server listener {} is no longer the member the snapshot saw: {error}",
+                member.pid
+            )
+        })
 }
 
 /// The keys every `freshell_unit` event carries, from the unit's label.
@@ -198,5 +216,60 @@ fn exit_code(status: std::process::ExitStatus) -> Option<i64> {
     #[cfg(not(unix))]
     {
         None
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// This test's own `sleep`, killed and reaped when dropped.
+    struct OwnSleep(std::process::Child);
+
+    impl Drop for OwnSleep {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The main is pinned by the pid AND the start time the member snapshot
+    /// read: a pid that names another process by the time it is pinned (the
+    /// snapshot's process exited and the pid was reused) is never taken as
+    /// the main, and an owner the snapshot does not list is no member.
+    #[test]
+    fn the_listener_is_pinned_by_the_identity_the_member_snapshot_read() {
+        let child = OwnSleep(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let pid = child.0.id();
+        let seen = freshell_containment::identity(pid).expect("the child's identity");
+
+        let pinned = pin_listener(std::slice::from_ref(&seen), Some(pid))
+            .expect("pinned")
+            .expect("a member owns the listener");
+        assert_eq!(
+            (pinned.pid(), pinned.identity().start),
+            (seen.pid, seen.start)
+        );
+
+        let reused = ProcIdentity {
+            start: seen.start + 1,
+            ..seen.clone()
+        };
+        assert!(
+            pin_listener(&[reused], Some(pid)).is_err(),
+            "a pid that no longer names the member the snapshot saw is never pinned"
+        );
+        assert!(
+            pin_listener(&[], Some(pid)).expect("no member").is_none(),
+            "an owner the member snapshot does not list is not a member"
+        );
+        assert!(pin_listener(std::slice::from_ref(&seen), None)
+            .expect("no owner")
+            .is_none());
     }
 }

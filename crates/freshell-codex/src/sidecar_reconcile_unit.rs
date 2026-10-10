@@ -172,15 +172,11 @@ impl ReattachedCodexAppServerRuntime {
         let main = match (record.main_pid, record.main_starttime) {
             (Some(pid), Some(start)) => ProcWatch::open_expecting(pid, start)
                 .map_err(|error| format!("native main {pid} not pinned: {error}"))?,
-            _ => match listener_among_members(unit, port).await? {
-                Some(pid) => ProcWatch::open(pid)
-                    .map_err(|error| format!("native main {pid} not pinned: {error}"))?,
-                None => {
-                    return Err(format!(
-                        "no member of the unit owns the listener on port {port}"
-                    ))
-                }
-            },
+            // A legacy record names no main: the listener among the unit's
+            // members, pinned by the identity the member snapshot read.
+            _ => listener_among_members(unit, port)
+                .await?
+                .ok_or_else(|| format!("no member of the unit owns the listener on port {port}"))?,
         };
         let codex_home =
             match tokio::time::timeout(REATTACH_PROBE_BUDGET, probe_app_server(&record.ws_url))
@@ -192,8 +188,11 @@ impl ReattachedCodexAppServerRuntime {
                     return Err("probe timed out awaiting the WS handshake or initialize".into())
                 }
             };
+        let same = |owner: &ProcWatch| {
+            (owner.pid(), owner.identity().start) == (main.pid(), main.identity().start)
+        };
         match listener_among_members(unit, port).await? {
-            Some(owner) if owner == main.pid() => Ok((main, codex_home)),
+            Some(owner) if same(&owner) => Ok((main, codex_home)),
             _ => Err(format!(
                 "the listener on port {port} is not the pinned native main {}",
                 main.pid()
