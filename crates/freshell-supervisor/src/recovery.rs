@@ -2346,7 +2346,7 @@ impl Supervisor {
                 });
             }
         }
-        if self
+        if let Some(retired) = self
             .registry
             .retire_unowned_prepared_replacement(request.soul_id.clone())
             .await
@@ -2357,8 +2357,11 @@ impl Supervisor {
                 "supervisor.recovery.interrupted_prepared_retired",
                 serde_json::json!({
                     "severity":"warn", "soulId":request.soul_id,
-                    "incarnationId":before_retry.prior_handle.incarnation_id(),
-                    "intentRevision":before_retry.intent_revision,
+                    "incarnationId":retired.incarnation_id,
+                    "attemptId":retired.journal.as_ref().map(|(attempt, _)| attempt),
+                    "intentRevision":retired.journal.as_ref().map(|(_, revision)| revision),
+                    "priorIncarnationId":before_retry.prior_handle.incarnation_id(),
+                    "currentIntentRevision":before_retry.intent_revision,
                     "controlEpoch":self.registry.control_epoch(),
                     "reason":"unregistered_stopped_object_quarantined",
                 }),
@@ -9527,6 +9530,29 @@ mod automatic_retry_tests {
         assert!(!inspected.lines().any(|value| value == incarnation.as_str()));
     }
 
+    fn assert_retirement_event(
+        root: &Path,
+        incarnation: &IncarnationId,
+        attempt: &str,
+        original: &RecoveryContext,
+        current_revision: u64,
+    ) {
+        let events = std::fs::read_to_string(root.join("lifecycle.jsonl")).unwrap();
+        let retired = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "supervisor.recovery.interrupted_prepared_retired")
+            .unwrap();
+        assert_eq!(retired["data"]["incarnationId"], incarnation.as_str());
+        assert_eq!(retired["data"]["attemptId"], attempt);
+        assert_eq!(retired["data"]["intentRevision"], original.intent_revision);
+        assert_eq!(
+            retired["data"]["priorIncarnationId"],
+            original.prior_handle.incarnation_id().as_str()
+        );
+        assert_eq!(retired["data"]["currentIntentRevision"], current_revision);
+    }
+
     #[tokio::test]
     async fn retry_uncommitted_replacement_reopens_with_backoff_and_preserves_native_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -9560,7 +9586,10 @@ mod automatic_retry_tests {
         assert!(retry.reserved_attempt_id.is_none());
         assert_eq!(
             attempts(dir.path()),
-            vec![(attempt, "interrupted_before_ownership_commit".into())]
+            vec![(
+                attempt.clone(),
+                "interrupted_before_ownership_commit".into()
+            )]
         );
         assert_eq!(backend.count("creates"), 1);
         assert_uncommitted_object_quarantined(
@@ -9571,6 +9600,13 @@ mod automatic_retry_tests {
             &container,
         );
         let events = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
+        assert_retirement_event(
+            dir.path(),
+            &incarnation,
+            &attempt,
+            &original,
+            original.intent_revision,
+        );
         let scheduled: serde_json::Value = events
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -9702,6 +9738,7 @@ mod automatic_retry_tests {
             .rearm_recovery_retry(soul.clone(), original.intent_revision)
             .await
             .unwrap();
+        let retired_attempt = attempts(dir.path())[0].0.clone();
         clock.store(1_000, Ordering::SeqCst);
         let reserved = supervisor
             .registry
@@ -9737,6 +9774,13 @@ mod automatic_retry_tests {
             )
         );
         assert_eq!(result.view.intent_revision, revision);
+        assert_retirement_event(
+            dir.path(),
+            &incarnation,
+            &retired_attempt,
+            &original,
+            revision,
+        );
         assert_uncommitted_object_quarantined(
             &supervisor,
             &backend,

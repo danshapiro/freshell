@@ -434,6 +434,11 @@ impl OwnedRuntimeHandle {
     }
 }
 
+pub(crate) struct RetiredPreparedReplacement {
+    pub incarnation_id: IncarnationId,
+    pub journal: Option<(RecoveryAttemptId, u64)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RecoveryContext {
     pub claude_fork: Option<freshell_runtime_protocol::ClaudeForkRecipe>,
@@ -2729,10 +2734,10 @@ impl Registry {
     /// must not infer authority over it. The protected PREPARED row can be
     /// retired because no execution grant could have existed, allowing a new
     /// exact-owned replacement attempt while preserving the forensic row.
-    pub async fn retire_unowned_prepared_replacement(
+    pub(crate) async fn retire_unowned_prepared_replacement(
         &self,
         soul_id: SoulId,
-    ) -> Result<bool, RegistryError> {
+    ) -> Result<Option<RetiredPreparedReplacement>, RegistryError> {
         let now = self.recovery_now_ms();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2745,7 +2750,7 @@ impl Registry {
                 .optional()?;
             let Some((incarnation_raw, attempt_raw)) = candidate else {
                 tx.commit()?;
-                return Ok(false);
+                return Ok(None);
             };
             let incarnation_id = IncarnationId::parse(incarnation_raw)
                 .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
@@ -2769,6 +2774,7 @@ impl Registry {
                 "DELETE FROM admission_reservations WHERE incarnation_id=?1",
                 params![incarnation_id.as_str()],
             )?;
+            let mut journal = None;
             if let Some(raw) = attempt_raw {
                 let attempt = RecoveryAttemptId::parse(raw)
                     .map_err(|_| RegistryError::Integrity("invalid interrupted attempt".into()))?;
@@ -2801,9 +2807,10 @@ impl Registry {
                 // backoff survive; the abandoned object acquires no authority.
                 settle_recovery_retry_tx(&tx, &soul_id, revision, &attempt, now,
                     RetrySettlement::Blocked { retryable: true, reason: "ownership_not_committed" })?;
+                journal = Some((attempt, revision));
             }
             tx.commit()?;
-            Ok(true)
+            Ok(Some(RetiredPreparedReplacement { incarnation_id, journal }))
         })
         .await
     }
@@ -8864,11 +8871,13 @@ pub(crate) mod tests {
         assert!(registry
             .retire_unowned_prepared_replacement(soul.clone())
             .await
-            .unwrap());
-        assert!(!registry
+            .unwrap()
+            .is_some());
+        assert!(registry
             .retire_unowned_prepared_replacement(soul.clone())
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
 
         let context = registry.recovery_context(soul.clone()).await.unwrap();
         assert_eq!(
