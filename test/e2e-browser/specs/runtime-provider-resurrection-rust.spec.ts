@@ -131,7 +131,9 @@ function assertStoppedRepairGraphs(
     expect(installed.providerStoreId).toBe(root.destinationStoreId)
     expect([root.providerUid, root.providerGid]).toEqual([65534, 0])
     expect([installed.providerUid, installed.providerGid]).toEqual([65534, 0])
-    expect(installed.generation).toBe(root.sourceGeneration)
+    expect(installed.generation).toBe(root.expectedInstalledGeneration)
+    expect(installed.sourceSchemaFingerprint).toBe(root.sourceSchemaFingerprint)
+    expect(installed.migrationJournalFingerprint).toBe(root.migrationJournalFingerprint)
     expect(installed.rowCount).toBe(root.rowCount)
     expect(installed.parents).toEqual({ [family.rootId]: null,
       [family.childId]: family.rootId, [family.grandchildId]: family.childId })

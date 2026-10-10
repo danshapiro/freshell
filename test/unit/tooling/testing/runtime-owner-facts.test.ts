@@ -182,6 +182,33 @@ try{await runTask007DestructiveSandbox(${JSON.stringify(fixtureRepoRoot)})}catch
   }, 90_000)
 })
 
+describe('Task7 installed export generation comparison', () => {
+  function manifestJson() {
+    // Preserve exporter field ordering and its exact large integer bytes.
+    const empty = '{"version":1,"source_store_id":"' + 'a'.repeat(64)
+      + '","row_count":1,"rows":[{"table":"session","sha256":"' + 'b'.repeat(64)
+      + '"}],"sqlite_version":"3.45.0","payload_bytes":9007199254740993,"generation":""}'
+    return empty.replace('"generation":""', '"generation":"' + createHash('sha256').update(empty).digest('hex') + '"')
+  }
+  it('compares destination exports using captured bytes without changing original source authority', () => {
+    const original = manifestJson()
+    const database = '/home/freshell/provider/.local/share/opencode/opencode.db'
+    const cleared = original.replace(/"generation":"[a-f0-9]{64}"/, '"generation":""')
+    const relocated = cleared.replace('"source_store_id":"' + 'a'.repeat(64) + '"',
+      '"source_store_id":"' + createHash('sha256').update(database).digest('hex') + '"')
+    const expected = createHash('sha256').update(relocated).digest('hex')
+    expect(owner.task007ExpectedInstalledGeneration(original, database)).toBe(expected)
+    expect(original).toBe(manifestJson())
+    expect(owner.task007ExpectedInstalledGeneration(original, database)).not.toBe(JSON.parse(original).generation)
+  })
+  it('refuses a changed captured manifest and a noncanonical destination', () => {
+    expect(() => owner.task007ExpectedInstalledGeneration(manifestJson().replace('3.45.0', 'changed'), '/dest.db'))
+      .toThrow(/generation|manifest/)
+    expect(() => owner.task007ExpectedInstalledGeneration(manifestJson(), '/home/provider/../dest.db'))
+      .toThrow(/canonical/)
+  })
+})
+
 describe('Task7 exact library test artifact packaging', () => {
   it('packages the actual Cargo-selected library harness through an asynchronous process and refuses decoys', async () => {
     const crate = path.join(fixtureRepoRoot, 'crates/freshell-supervisor')
@@ -1333,6 +1360,12 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
             canonicalSoulId: eligibleOwners.length === 1 ? eligibleOwners[0] : null } }) }
       // Production scopes use a SHA256 generation, independently of the selection ID.
       scope.roots.forEach(root => { root.graphDigest = 'f'.repeat(64) })
+      const capturedManifest = { version: 1, root_session_id: batch.output.targets[0].rootSessionId,
+        source_store_id: facts.sourceStoreId, source_schema_fingerprint: '1'.repeat(64),
+        migration_journal_fingerprint: '2'.repeat(64), rows: [], generation: '' }
+      capturedManifest.generation = createHash('sha256').update(JSON.stringify(capturedManifest)).digest('hex')
+      const capturedManifestJson = JSON.stringify(capturedManifest)
+      scope.roots[0].graphDigest = capturedManifest.generation
       const insertOperation = db.prepare('INSERT INTO stopped_repair_operations VALUES(?,?,?,?,?)')
       insertOperation.run('repair-current', 'complete', JSON.stringify(targets), JSON.stringify(scope), JSON.stringify(batch.output.canonicalChoices))
       insertOperation.run('repair-foreign', 'complete', '[]', JSON.stringify(scope), JSON.stringify(batch.output.canonicalChoices))
@@ -1344,7 +1377,12 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       db.prepare('INSERT INTO outbox VALUES(?)').run('event-unrelated')
       const root = batch.output.targets[0]
       db.prepare('INSERT INTO stopped_repair_root_receipts VALUES(?,?,?,?,?,?,?,?,?,?,?)').run('repair-current', root.rootSessionId, root.soulId,
-        'f'.repeat(64), 'transfer-current', JSON.stringify({ adoption_baseline: { manifestSha256: 'f'.repeat(64) } }),
+        capturedManifest.generation, 'transfer-current', JSON.stringify({ adoption_baseline: {
+          manifestSha256: createHash('sha256').update(capturedManifestJson).digest('hex'),
+          descriptor: { manifestJson: capturedManifestJson, sourceStoreId: facts.sourceStoreId,
+            sourceGeneration: capturedManifest.generation, rootSessionId: root.rootSessionId,
+            destinationStoreId: root.providerStoreId, destinationDatabasePath: '.local/share/opencode/opencode.db' },
+        } }),
         JSON.stringify({ destinationStoreId: root.providerStoreId, rowCount: 318, assetCount: 0, structuralSha256: 'a'.repeat(64),
           providerUid: 65534, providerGid: 0, readerEnvironmentSha256: 'b'.repeat(64) }), facts.sourceStoreId, 1, 1, 1)
       db.close()
@@ -1390,7 +1428,13 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       expect(observed.status).toBe('complete')
       expect(observed.souls).toHaveLength(9)
       expect(observed.souls.every(soul => soul.activeWriters === 0 && !soul.incidentPresent)).toBe(true)
-      expect(observed.roots[0]).toMatchObject({ rootSessionId: root.rootSessionId, providerUid: 65534, rowCount: 318 })
+      expect(observed.roots[0]).toMatchObject({ rootSessionId: root.rootSessionId, providerUid: 65534, rowCount: 318,
+        sourceGeneration: capturedManifest.generation,
+        expectedInstalledGeneration: owner.task007ExpectedInstalledGeneration(capturedManifestJson, '/home/freshell/provider/.local/share/opencode/opencode.db'),
+        sourceSchemaFingerprint: capturedManifest.source_schema_fingerprint,
+        migrationJournalFingerprint: capturedManifest.migration_journal_fingerprint })
+      expect(observed.roots[0]).not.toHaveProperty('sourceManifestJson')
+      expect(observed.roots[0]).not.toHaveProperty('destinationDatabasePath')
       expect(observed.installedStores.map(({ parents, history, excludedSourceSentinels, ...measured }) => measured)).toEqual([{ rootSessionId: root.rootSessionId, providerStoreId: root.providerStoreId,
         providerUid: 65534, providerGid: 0, providerVersion: '1.18.21', sourceSchemaFingerprint: 'schema-current',
         migrationJournalFingerprint: 'migration-current', generation: 'generation-current', rowCount: 318 }])

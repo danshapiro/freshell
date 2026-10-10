@@ -9564,6 +9564,158 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         assert!(!root_path.exists(), "owned stage must be removed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stopped_repair_installed_generation_uses_actual_export_import_and_node_comparison() {
+        use freshell_agent_runtime::opencode_transfer::{
+            import_bundle_payload, verify_installed_store, InstalledStoreReaderContext,
+        };
+        use freshell_sessions::opencode_transfer::{
+            export_exact_session, ExportOptions, HostOpenCodeInventory,
+        };
+        let fixture = stage_synthetic_opencode_transfer().unwrap();
+        let descriptor = &fixture.descriptor;
+        let home = fixture.root.path().join("destination-home");
+        let data = home.join(".local/share");
+        let config = home.join(".config");
+        std::fs::create_dir_all(&config).unwrap();
+        let database = data.join("opencode/opencode.db");
+        let imported = import_bundle_payload(
+            descriptor,
+            std::fs::File::open(fixture.ready.join("entry-0000.bin")).unwrap(),
+            &database,
+            &fixture.workspace,
+        )
+        .unwrap();
+        let reader = InstalledStoreReaderContext {
+            database_path: &database,
+            workspace_root: &fixture.workspace,
+            provider_uid: unsafe { libc::geteuid() },
+            provider_gid: unsafe { libc::getegid() },
+            home: &home,
+            xdg_data_home: &data,
+            xdg_config_home: &config,
+            cwd: &fixture.workspace,
+        };
+        let readable = verify_installed_store(descriptor, &reader).unwrap();
+        assert_eq!(imported.source_generation, descriptor.source_generation);
+        assert_eq!(readable.source_generation, descriptor.source_generation);
+        let export = |database: &Path, name: &str| {
+            export_exact_session(
+                &HostOpenCodeInventory::new(database.to_path_buf())
+                    .with_trusted_mount_for_selected_session(fixture.workspace.clone()),
+                &descriptor.root_session_id,
+                ExportOptions::new(fixture.root.path().join(name)),
+            )
+            .unwrap()
+            .manifest()
+            .clone()
+        };
+        let installed = export(&database, "installed-extraction");
+        assert_ne!(installed.generation, descriptor.source_generation);
+        assert_eq!(installed.row_count as u64, readable.row_count);
+        let source_database = fixture.root.path().join("source.sqlite");
+        let mut mutations = Vec::new();
+        for (name, database, change, restore) in [
+            (
+                "native-title",
+                &database,
+                "UPDATE session SET title='changed native title'",
+                "UPDATE session SET title='synthetic history'",
+            ),
+            (
+                "message",
+                &database,
+                "UPDATE message SET data='{\"text\":\"changed native message\"}'",
+                "UPDATE message SET data='{\"text\":\"synthetic message body is test-only\"}'",
+            ),
+            (
+                "source-title",
+                &source_database,
+                "UPDATE session SET title='changed source title'",
+                "UPDATE session SET title='synthetic history'",
+            ),
+        ] {
+            let connection = rusqlite::Connection::open(database).unwrap();
+            connection.execute_batch(change).unwrap();
+            drop(connection);
+            let changed = export(database, &format!("{name}-changed"));
+            assert_eq!(changed.row_count, installed.row_count);
+            if name == "source-title" {
+                assert_ne!(changed.generation, descriptor.source_generation);
+            } else {
+                assert!(verify_installed_store(descriptor, &reader).is_err());
+            }
+            let connection = rusqlite::Connection::open(database).unwrap();
+            connection.execute_batch(restore).unwrap();
+            drop(connection);
+            let restored = export(database, &format!("{name}-restored"));
+            assert_eq!(
+                &restored.generation,
+                if name == "source-title" {
+                    &descriptor.source_generation
+                } else {
+                    &installed.generation
+                }
+            );
+            mutations.push(serde_json::json!({
+                "name": name,
+                "manifestJson": serde_json::to_string(&changed).unwrap(),
+                "restoredManifestJson": serde_json::to_string(&restored).unwrap(),
+            }));
+        }
+        assert!(verify_installed_store(descriptor, &reader).is_ok());
+        let facts = fixture.root.path().join("generation-facts.json");
+        std::fs::write(
+            &facts,
+            serde_json::to_vec(&serde_json::json!({
+                "originalManifestJson": descriptor.manifest_json,
+                "installedManifestJson": serde_json::to_string(&installed).unwrap(),
+                "destinationDatabase": database.canonicalize().unwrap(),
+                "mutations": mutations,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        // Execute the same Node calculation used by the owner projection against
+        // genuine library exports. These temporary artifacts contain fiction only.
+        let result = std::process::Command::new("node")
+            .current_dir(&repo)
+            .args(["--import", "tsx", "--input-type=module", "-e", r#"
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { task007ExpectedInstalledGeneration as expected } from './scripts/testing/runtime-sandbox.ts';
+const f=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));
+const original=JSON.parse(f.originalManifestJson), installed=JSON.parse(f.installedManifestJson);
+assert.notEqual(original.generation,installed.generation);
+const comparable=expected(f.originalManifestJson,f.destinationDatabase);
+assert.equal(comparable,installed.generation,'same actual imported rows at a different database path');
+for(const m of f.mutations){
+  const changed=JSON.parse(m.manifestJson),restored=JSON.parse(m.restoredManifestJson);
+  assert.equal(changed.row_count,installed.row_count);
+  if(m.name==='source-title'){
+    assert.notEqual(changed.generation,original.generation);
+    assert.notEqual(expected(m.manifestJson,f.destinationDatabase),installed.generation);
+    assert.equal(restored.generation,original.generation);
+  }else{
+    assert.notEqual(changed.generation,comparable,m.name);
+    assert.equal(restored.generation,comparable,m.name);
+  }
+}
+assert.equal(JSON.parse(f.originalManifestJson).generation,original.generation);
+console.log('actual library export/import/read and Node comparison passed');
+"#])
+            .arg(&facts)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
     #[test]
     fn stopped_repair_stage_rejects_invalid_envelopes_and_tampered_files() {
         use std::os::unix::fs::{symlink, PermissionsExt};

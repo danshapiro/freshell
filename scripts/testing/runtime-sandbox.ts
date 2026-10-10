@@ -1743,6 +1743,23 @@ export const SyntheticStoppedRepairBatchFactsSchema = z.object({ fixtureId: Task
     noticeIds: z.array(Task007Id), outboxEventIds: z.array(Task007Id), exportSha256: z.array(Task007Hex) }).strict(),
 }).strict()
 export type SyntheticStoppedRepairBatchFacts = z.infer<typeof SyntheticStoppedRepairBatchFactsSchema>
+// A fresh export binds its generation to the database's canonical location.
+// Keep the immutable exporter's JSON bytes: parsing/reserializing can reorder
+// fields or round integers, changing content that this comparison must preserve.
+export function task007ExpectedInstalledGeneration(manifestJson: string, canonicalDestinationDatabase: string): string {
+  if (!path.posix.isAbsolute(canonicalDestinationDatabase)
+    || path.posix.normalize(canonicalDestinationDatabase) !== canonicalDestinationDatabase) {
+    throw new Error('installed export database path is not canonical')
+  }
+  const manifest = z.object({ source_store_id: Task007Hex, generation: Task007Hex }).parse(JSON.parse(manifestJson))
+  const generationField = `"generation":"${manifest.generation}"`
+  const sourceField = `"source_store_id":"${manifest.source_store_id}"`
+  if (!manifestJson.endsWith(`${generationField}}`)
+    || manifestJson.split(sourceField).length !== 2) throw new Error('captured manifest serialization differs from exporter')
+  const cleared = manifestJson.slice(0, -generationField.length - 1) + '"generation":""}'
+  if (sha256(cleared) !== manifest.generation) throw new Error('captured manifest generation differs from immutable content')
+  return sha256(cleared.replace(sourceField, `"source_store_id":"${sha256(canonicalDestinationDatabase)}"`))
+}
 const Task007RepairSoulSchema = z.object({ soulId: Task007Id, providerStoreId: Task007Id,
   nativeSessionId: Task007Id.nullable(), desiredState: z.string(), recoveryState: z.string(),
   identityRevision: z.number().int().nonnegative(), intentRevision: z.number().int().nonnegative(),
@@ -1791,6 +1808,12 @@ const Task007FaultMarkersSchema = z.object({ preset: SyntheticStoppedRepairFault
   crash: z.object({ point: Task007CrashPointSchema, running: z.boolean(), exitCode: z.number().int() }).strict().nullable(),
   firstResumeObservationFailures: z.array(z.object({ soulId: Task007Id, incarnationId: Task007Id,
     executionGeneration: z.number().int().positive() }).strict()).max(9) }).strict()
+const Task007RepairRootSchema = z.object({ rootSessionId: Task007Id, canonicalSoulId: Task007Id, destinationStoreId: Task007Id,
+    expectedInstalledGeneration: Task007Hex, sourceSchemaFingerprint: Task007Hex, migrationJournalFingerprint: Task007Hex,
+    sourceGeneration: Task007Id, transferId: Task007Id, rowCount: z.number().int().nonnegative(),
+    assetCount: z.number().int().nonnegative(), structuralSha256: Task007Hex,
+    providerUid: z.number().int().nonnegative(), providerGid: z.number().int().nonnegative(),
+    readerEnvironmentSha256: Task007Hex, adoptionBaselineSha256: Task007Hex }).strict()
 export const SyntheticStoppedRepairBatchObservationSchema = z.object({ fixtureId: Task007Id, operationId: Task007Id,
   activity: Task007ActivitySchema, faultMarkers: Task007FaultMarkersSchema,
   controlEpoch: z.number().int().nonnegative(), scope: ManagedRuntimeRepairBatchScopeSchema,
@@ -1798,11 +1821,7 @@ export const SyntheticStoppedRepairBatchObservationSchema = z.object({ fixtureId
     expectedIntentRevision: z.number().int().positive() }).strict()).length(2),
   status: z.enum(['importing', 'withdraw_pending', 'complete']), withdrawalStatus: z.enum(['files_pending', 'files_complete']).nullable(),
   souls: z.array(Task007RepairSoulSchema).length(9),
-  roots: z.array(z.object({ rootSessionId: Task007Id, canonicalSoulId: Task007Id, destinationStoreId: Task007Id,
-    sourceGeneration: Task007Id, transferId: Task007Id, rowCount: z.number().int().nonnegative(),
-    assetCount: z.number().int().nonnegative(), structuralSha256: Task007Hex,
-    providerUid: z.number().int().nonnegative(), providerGid: z.number().int().nonnegative(),
-    readerEnvironmentSha256: Task007Hex, adoptionBaselineSha256: Task007Hex }).strict()).max(7),
+  roots: z.array(Task007RepairRootSchema).max(7),
   unrelated: z.object({ incidentPresent: z.boolean(), viewPresent: z.boolean(), noticeIds: z.array(Task007Id),
     outboxEventIds: z.array(Task007Id), exportSha256: z.array(Task007Hex.nullable()) }).strict(),
   installedStores: z.array(z.object({ rootSessionId: Task007Id, providerStoreId: Task007Id,
@@ -1813,7 +1832,17 @@ export const SyntheticStoppedRepairBatchObservationSchema = z.object({ fixtureId
 }).strict()
 const Task007RepairRecordsSchema = SyntheticStoppedRepairBatchObservationSchema.omit({ installedStores: true, nativeObservations: true,
   activity: true, faultMarkers: true })
-  .extend({ currentIncarnations: z.array(Task007CurrentIncarnationSchema).max(9) }).strict()
+  .extend({ currentIncarnations: z.array(Task007CurrentIncarnationSchema).max(9),
+    roots: z.array(Task007RepairRootSchema.omit({ expectedInstalledGeneration: true,
+      sourceSchemaFingerprint: true, migrationJournalFingerprint: true }).extend({
+      sourceManifestJson: z.string(), destinationDatabasePath: z.literal('/home/freshell/provider/.local/share/opencode/opencode.db'),
+    }).strict().transform(({ sourceManifestJson, destinationDatabasePath, ...root }) => {
+      const manifest = z.object({ generation: z.literal(root.sourceGeneration),
+        source_schema_fingerprint: Task007Hex, migration_journal_fingerprint: Task007Hex }).parse(JSON.parse(sourceManifestJson))
+      return { ...root, expectedInstalledGeneration: task007ExpectedInstalledGeneration(sourceManifestJson, destinationDatabasePath),
+        sourceSchemaFingerprint: manifest.source_schema_fingerprint, migrationJournalFingerprint: manifest.migration_journal_fingerprint }
+    })).max(7),
+  }).strict()
 export type SyntheticStoppedRepairBatchObservation = z.infer<typeof SyntheticStoppedRepairBatchObservationSchema>
 
 // Fixed owner-only read of current production records; browser supplies IDs,
@@ -1871,7 +1900,11 @@ for row in c.execute('SELECT root_session_id,canonical_soul_id,source_store_id,s
     captured=next(t for t in scope['targets'] if t['target']['soulId']==row['canonical_soul_id'])
     if row['source_store_id']!=source_store or row['identity_revision']!=captured['identityRevision'] or row['intent_revision']!=captured['target']['expectedIntentRevision'] or row['native_import_revision']!=captured['nativeImportRevision']: raise RuntimeError('installed source or captured revisions differ from operation scope')
     if readable['destinationStoreId']!=expected[row['canonical_soul_id']]['providerStoreId']: raise RuntimeError('installed destination differs from selected owner')
-    roots.append(dict(rootSessionId=row['root_session_id'],canonicalSoulId=row['canonical_soul_id'],destinationStoreId=readable['destinationStoreId'],sourceGeneration=row['source_generation'],transferId=row['transfer_id'],rowCount=readable['rowCount'],assetCount=readable['assetCount'],structuralSha256=readable['structuralSha256'],providerUid=readable['providerUid'],providerGid=readable['providerGid'],readerEnvironmentSha256=readable['readerEnvironmentSha256'],adoptionBaselineSha256=digest(json.dumps(imported['adoption_baseline'],sort_keys=True,separators=(',',':')).encode())))
+    descriptor=imported['adoption_baseline']['descriptor']
+    if descriptor['sourceStoreId']!=row['source_store_id'] or descriptor['sourceGeneration']!=row['source_generation'] or descriptor['rootSessionId']!=row['root_session_id'] or descriptor['destinationStoreId']!=readable['destinationStoreId'] or descriptor['destinationDatabasePath']!='.local/share/opencode/opencode.db': raise RuntimeError('immutable adoption descriptor differs from registered source/root/destination')
+    manifest=json.loads(descriptor['manifestJson'])
+    if manifest['source_store_id']!=row['source_store_id'] or manifest['root_session_id']!=row['root_session_id']: raise RuntimeError('immutable manifest differs from source/root')
+    roots.append(dict(rootSessionId=row['root_session_id'],canonicalSoulId=row['canonical_soul_id'],destinationStoreId=readable['destinationStoreId'],sourceManifestJson=descriptor['manifestJson'],destinationDatabasePath='/home/freshell/provider/'+descriptor['destinationDatabasePath'],sourceGeneration=row['source_generation'],transferId=row['transfer_id'],rowCount=readable['rowCount'],assetCount=readable['assetCount'],structuralSha256=readable['structuralSha256'],providerUid=readable['providerUid'],providerGid=readable['providerGid'],readerEnvironmentSha256=readable['readerEnvironmentSha256'],adoptionBaselineSha256=digest(json.dumps(imported['adoption_baseline'],sort_keys=True,separators=(',',':')).encode())))
 withdrawal=c.execute('SELECT status FROM stopped_repair_withdrawals WHERE operation_id=?',(operation,)).fetchone()
 unrelated=fixture['unrelated']
 epoch=c.execute('SELECT control_epoch FROM installation WHERE singleton=1').fetchone()[0]
