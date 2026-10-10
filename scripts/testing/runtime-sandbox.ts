@@ -16,7 +16,7 @@ import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchem
 import fsp from 'node:fs/promises'
 import { defaultReceiptFileName } from './runtime-receipts.js'
 import { buildProviderQualificationReceipt, type ProviderQualificationReceiptV2, type ProviderQualificationRow } from './provider-qualification-receipt.js'
-import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, validateFreshBrowserAlias, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
+import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, validateFreshBrowserAlias, validateFreshApprovalCheckpoint, validateFreshApprovalDispatch, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome } from './runtime-native-feasibility.js'
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
 import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
@@ -5867,6 +5867,7 @@ export class ManagedRuntimeOwner {
           "import pathlib,json,base64,hashlib,sys,os;p=pathlib.Path(sys.argv[1]);b=p.read_bytes();assert len(b)<=32*1024*1024;json.loads(b);print(json.dumps({'path':str(p),'sha256':hashlib.sha256(b).hexdigest(),'bytesBase64':base64.b64encode(b).decode(),'readerUid':os.getuid()}))", file], providerUser)))
       }
       const effectCount = await this.freshApprovalEffect(challenge, handle)
+      validateFreshApprovalCheckpoint(card, native, files, view, challenge.command)
       if (card.payload.tool?.name !== 'Bash' || card.payload.tool.input?.command !== challenge.command
         || card.payload.nativeCheckpoint.nativeSessionId !== challenge.nativeRoot || card.payload.nativeCheckpoint.toolUseID !== card.payload.toolUseID
         || native.nativeLaunch.incarnationId !== handle.incarnationId || effectCount !== 0) throw new Error('actual native solo Bash checkpoint/input differs')
@@ -5906,6 +5907,7 @@ export class ManagedRuntimeOwner {
         batch = await this.readFreshApprovalEvents(challenge)
       }
       challenge.recheckedEffectCount = await this.freshApprovalEffect(challenge, handle)
+      validateFreshApprovalDispatch(challenge)
       if (challenge.recheckedEffectCount !== challenge.effectCount || challenge.events.filter((event: any) => event.kind === 'permission_requested').length !== (challenge.recovery === 'web' ? 1 : 2)) throw new Error('native approval replayed')
       challenge.finished = true
       await this.retainNativeOriginal('fresh-approval-' + challengeId + '/outcome.json', challenge)

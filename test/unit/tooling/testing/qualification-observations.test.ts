@@ -73,18 +73,32 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
   if (['freshclaude', 'kilroy'].includes(current.mode)) for (const recovery of ['web', 'host', 'provider']) for (const allowed of [true, false]) {
     const decisionId = 'decision-' + current.mode + '-' + recovery + '-' + allowed, toolUseID = 'toolu_' + decisionId
     const command = "printf 'effect\\n' >> '/owned/effect-" + decisionId + ".jsonl'"
-    const bytes = Buffer.from(JSON.stringify({ type: 'assistant', sessionId: otherRoot, message: { content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command } }] } }) + '\n')
-    const checkpoint = { nativeSessionId: otherRoot, toolUseID, inputDigest: createHash('sha256').update(JSON.stringify({ command })).digest('hex'), profileDigest: 'a'.repeat(64) }
+    const inputDigest = createHash('sha256').update(JSON.stringify({ command })).digest('hex')
+    const assistant = { type: 'assistant', uuid: 'assistant-' + decisionId, version: '2.1.237', sessionId: otherRoot, message: { id: 'message-' + decisionId, content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command } }] } }
+    const deferred = { type: 'attachment', uuid: 'checkpoint-' + decisionId, version: '2.1.237', sessionId: otherRoot, attachment: { type: 'hook_deferred_tool', hookEvent: 'PreToolUse', toolUseID, toolName: 'Bash', toolInput: { command } } }
+    const bytes = Buffer.from(JSON.stringify(assistant) + '\n' + JSON.stringify(deferred) + '\n')
+    const checkpoint = { nativeSessionId: otherRoot, toolUseID, inputDigest, profileDigest: 'a'.repeat(64), toolName: 'Bash', checkpointUuid: deferred.uuid, assistantUuid: assistant.uuid, nativeVersion: '2.1.237', checkpointDigest: createHash('sha256').update(JSON.stringify(deferred)).digest('hex') }
     const beforeNative = { nativeRoot: otherRoot, version: current.providerVersion + ' (Claude Code)', executableSha256: 'd'.repeat(64), nativeCwd: '/owned/workspace', transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
     const beforeCard = { decision_id: decisionId, payload: { tool: { name: 'Bash', input: { command } }, toolUseID, nativeCheckpoint: checkpoint,
-      nativeRequestId: 'old-' + decisionId, nativeBinding: { launch: { incarnationId: 'other-inc' } } } }
+      nativeRequestId: 'old-' + decisionId, nativeBinding: { nativeRequestId: 'old-' + decisionId, queryGeneration: 1, launch: { incarnationId: 'other-inc', launchNonce: 'old-' + decisionId } } } }
     const currentCard = structuredClone(beforeCard), afterView = { ...other.view, incarnationId: recovery === 'web' ? 'other-inc' : 'recovered-' + decisionId }
     currentCard.payload.nativeBinding.launch.incarnationId = afterView.incarnationId
     if (recovery !== 'web') currentCard.payload.nativeRequestId = 'new-' + decisionId
-    const events = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, requestId: decisionId } } } },
+    currentCard.payload.nativeBinding.nativeRequestId = currentCard.payload.nativeRequestId
+    const currentNative = structuredClone(beforeNative)
+    Object.assign(beforeNative, { nativeLaunch: beforeCard.payload.nativeBinding.launch })
+    Object.assign(currentNative, { nativeLaunch: currentCard.payload.nativeBinding.launch })
+    const files = (card: any) => {
+      const { profileDigest, ...nativeCheckpoint } = card.payload.nativeCheckpoint
+      return [{ path: '/home/freshell/provider/.freshell/native-checkpoints/claude/' + otherRoot + '.json', readerUid: 65534,
+        value: { schemaVersion: 1, phase: 'approval_waiting', checkpoint: nativeCheckpoint, nativeSessionId: otherRoot, toolUseID, inputDigest, profileDigest, nativeBinding: card.payload.nativeBinding } },
+      { path: '/run/freshell-host-actor/fresh-agent-state.json', readerUid: 0, value: { schemaVersion: 1, decisions: { [card.decision_id]: { state: 'pending', payload: card.payload } } } }]
+        .map(({ value, ...file }) => { const bytes = Buffer.from(JSON.stringify(value)); return { ...file, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } })
+    }
+    const events = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, sessionId: otherRoot, requestId: decisionId, nativeRequestId: currentCard.payload.nativeRequestId } } } },
       { kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result', content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
       { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: otherRoot, isError: false } } } }]
-    approvals.push({ recovery, allowed, nativeRoot: otherRoot, command, beforeCard, currentCard, beforeNative, currentNative: structuredClone(beforeNative),
+    approvals.push({ recovery, allowed, nativeRoot: otherRoot, command, beforeCard, currentCard, beforeView: structuredClone(other.view), beforeNative, currentNative, beforeFiles: files(beforeCard), currentFiles: files(currentCard),
       beforeEffectCount: 0, currentEffectCount: 0, afterView, effectCount: allowed ? 1 : 0, recheckedEffectCount: allowed ? 1 : 0, events,
       browserDecision: { type: 'freshAgent.approval.respond', sessionId: otherRoot, requestId: decisionId, decision: { behavior: allowed ? 'allow' : 'deny' } } })
   }

@@ -34,7 +34,7 @@ describe('observed fresh browser execution', () => {
     const module = await import('../../../../scripts/testing/fresh-agent-qualification-receipt.js')
     expect(() => (module as any).deriveFreshBrowserExecution({ mode: 'freshcodex', routes: [], allocations: [], lifecycle: [] }, {})).toThrow(/executed ingress/)
   })
-  it.each(['alias-wrong-rest-tab', 'alias-wrong-rest-split', 'alias-wrong-mcp-new-tab', 'alias-wrong-mcp-split', 'alias-wrong-request', 'alias-wrong-store', 'alias-stale-writer', 'missing-route', 'wrong-reply', 'two-writers', 'shared-store', 'shared-container', 'release-after-prepare', 'missing-release', 'missing-running', 'web-process-replaced', 'startup-empty', 'approval-missing-deny', 'approval-old-callback', 'approval-effect-replayed', 'approval-duplicate-dispatch', 'approval-extra-completion', 'approval-changed-native-root', 'approval-changed-native-executable'])('reopens originals and rejects %s', fault => {
+  it.each(['approval-missing-before-files', 'approval-missing-current-files', 'approval-no-native-operation', 'approval-wrong-native-input', 'approval-wrong-checkpoint', 'approval-stale-actor', 'approval-wrong-dispatch-id', 'approval-wrong-native-dispatch', 'alias-wrong-rest-tab', 'alias-wrong-rest-split', 'alias-wrong-mcp-new-tab', 'alias-wrong-mcp-split', 'alias-wrong-request', 'alias-wrong-store', 'alias-stale-writer', 'missing-route', 'wrong-reply', 'two-writers', 'shared-store', 'shared-container', 'release-after-prepare', 'missing-release', 'missing-running', 'web-process-replaced', 'startup-empty', 'approval-missing-deny', 'approval-old-callback', 'approval-effect-replayed', 'approval-duplicate-dispatch', 'approval-extra-completion', 'approval-changed-native-root', 'approval-changed-native-executable'])('reopens originals and rejects %s', fault => {
     const built = fixture()
     const current = built.receipt.rows[0]!, reference = current.executionOriginal as { path: string; sha256: string }
     const filename = path.join(built.evidenceDir, reference.path), original = JSON.parse(fs.readFileSync(filename, 'utf8'))
@@ -58,6 +58,23 @@ describe('observed fresh browser execution', () => {
     if (fault === 'startup-empty') original.supervisorRestarts[0].lifecycle[0].data.scanned = 0
     if (fault === 'approval-missing-deny') original.approvals.pop()
     const approval = original.approvals[2]
+    const rewriteNative = (snapshot: any, change: (rows: any[]) => any[]) => {
+      const rows = change(Buffer.from(snapshot.transcript.bytesBase64, 'base64').toString().trim().split('\n').map(line => JSON.parse(line)))
+      const bytes = Buffer.from(rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+      snapshot.transcript.bytesBase64 = bytes.toString('base64'); snapshot.transcript.sha256 = createHash('sha256').update(bytes).digest('hex')
+    }
+    const rewriteFile = (file: any, change: (value: any) => void) => {
+      const value = JSON.parse(Buffer.from(file.bytesBase64, 'base64').toString()); change(value)
+      const bytes = Buffer.from(JSON.stringify(value)); file.bytesBase64 = bytes.toString('base64'); file.sha256 = createHash('sha256').update(bytes).digest('hex')
+    }
+    if (fault === 'approval-missing-before-files') delete approval.beforeFiles
+    if (fault === 'approval-missing-current-files') delete approval.currentFiles
+    if (fault === 'approval-no-native-operation') for (const snapshot of [approval.beforeNative, approval.currentNative]) rewriteNative(snapshot, () => [{ type: 'system', sessionId: approval.nativeRoot }])
+    if (fault === 'approval-wrong-native-input') for (const snapshot of [approval.beforeNative, approval.currentNative]) rewriteNative(snapshot, rows => { rows[0].message.content[0].input.command = 'unrelated operation'; return rows })
+    if (fault === 'approval-wrong-checkpoint') rewriteFile(approval.currentFiles[0], value => { value.checkpoint.toolUseID = 'toolu_other' })
+    if (fault === 'approval-stale-actor') rewriteFile(approval.currentFiles[1], value => { value.decisions[approval.currentCard.decision_id].payload.nativeBinding.nativeRequestId = 'stale-callback' })
+    if (fault === 'approval-wrong-dispatch-id') approval.events[0].data.payload.event.requestId = 'unrelated-decision'
+    if (fault === 'approval-wrong-native-dispatch') approval.events[0].data.payload.event.nativeRequestId = 'unrelated-native-callback'
     if (fault === 'approval-old-callback') approval.currentCard.payload.nativeRequestId = approval.beforeCard.payload.nativeRequestId
     if (fault === 'approval-effect-replayed') approval.recheckedEffectCount += 1
     if (fault === 'approval-duplicate-dispatch') approval.events.push(approval.events[0])
@@ -196,18 +213,32 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
   if (['freshclaude', 'kilroy'].includes(current.mode)) for (const recovery of ['web', 'host', 'provider']) for (const allowed of [true, false]) {
     const decisionId = 'decision-' + current.mode + '-' + recovery + '-' + allowed, toolUseID = 'toolu_' + decisionId
     const command = "printf 'effect\\n' >> '/owned/effect-" + decisionId + ".jsonl'"
-    const bytes = Buffer.from(JSON.stringify({ type: 'assistant', sessionId: otherRoot, message: { content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command } }] } }) + '\n')
-    const checkpoint = { nativeSessionId: otherRoot, toolUseID, inputDigest: createHash('sha256').update(JSON.stringify({ command })).digest('hex'), profileDigest: 'a'.repeat(64) }
+    const inputDigest = createHash('sha256').update(JSON.stringify({ command })).digest('hex')
+    const assistant = { type: 'assistant', uuid: 'assistant-' + decisionId, version: '2.1.237', sessionId: otherRoot, message: { id: 'message-' + decisionId, content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command } }] } }
+    const deferred = { type: 'attachment', uuid: 'checkpoint-' + decisionId, version: '2.1.237', sessionId: otherRoot, attachment: { type: 'hook_deferred_tool', hookEvent: 'PreToolUse', toolUseID, toolName: 'Bash', toolInput: { command } } }
+    const bytes = Buffer.from(JSON.stringify(assistant) + '\n' + JSON.stringify(deferred) + '\n')
+    const checkpoint = { nativeSessionId: otherRoot, toolUseID, inputDigest, profileDigest: 'a'.repeat(64), toolName: 'Bash', checkpointUuid: deferred.uuid, assistantUuid: assistant.uuid, nativeVersion: '2.1.237', checkpointDigest: createHash('sha256').update(JSON.stringify(deferred)).digest('hex') }
     const beforeNative = { nativeRoot: otherRoot, version: current.providerVersion + ' (Claude Code)', executableSha256: 'd'.repeat(64), nativeCwd: '/owned/workspace', transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
     const beforeCard = { decision_id: decisionId, payload: { tool: { name: 'Bash', input: { command } }, toolUseID, nativeCheckpoint: checkpoint,
-      nativeRequestId: 'old-' + decisionId, nativeBinding: { launch: { incarnationId: 'other-inc' } } } }
+      nativeRequestId: 'old-' + decisionId, nativeBinding: { nativeRequestId: 'old-' + decisionId, queryGeneration: 1, launch: { incarnationId: 'other-inc', launchNonce: 'old-' + decisionId } } } }
     const currentCard = structuredClone(beforeCard), afterView = { ...other.view, incarnationId: recovery === 'web' ? 'other-inc' : 'recovered-' + decisionId }
     currentCard.payload.nativeBinding.launch.incarnationId = afterView.incarnationId
     if (recovery !== 'web') currentCard.payload.nativeRequestId = 'new-' + decisionId
-    const events = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, requestId: decisionId } } } },
+    currentCard.payload.nativeBinding.nativeRequestId = currentCard.payload.nativeRequestId
+    const currentNative = structuredClone(beforeNative)
+    Object.assign(beforeNative, { nativeLaunch: beforeCard.payload.nativeBinding.launch })
+    Object.assign(currentNative, { nativeLaunch: currentCard.payload.nativeBinding.launch })
+    const files = (card: any) => {
+      const { profileDigest, ...nativeCheckpoint } = card.payload.nativeCheckpoint
+      return [{ path: '/home/freshell/provider/.freshell/native-checkpoints/claude/' + otherRoot + '.json', readerUid: 65534,
+        value: { schemaVersion: 1, phase: 'approval_waiting', checkpoint: nativeCheckpoint, nativeSessionId: otherRoot, toolUseID, inputDigest, profileDigest, nativeBinding: card.payload.nativeBinding } },
+      { path: '/run/freshell-host-actor/fresh-agent-state.json', readerUid: 0, value: { schemaVersion: 1, decisions: { [card.decision_id]: { state: 'pending', payload: card.payload } } } }]
+        .map(({ value, ...file }) => { const bytes = Buffer.from(JSON.stringify(value)); return { ...file, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } })
+    }
+    const events = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, sessionId: otherRoot, requestId: decisionId, nativeRequestId: currentCard.payload.nativeRequestId } } } },
       { kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result', content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
       { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: otherRoot, isError: false } } } }]
-    approvals.push({ recovery, allowed, nativeRoot: otherRoot, command, beforeCard, currentCard, beforeNative, currentNative: structuredClone(beforeNative),
+    approvals.push({ recovery, allowed, nativeRoot: otherRoot, command, beforeCard, currentCard, beforeView: structuredClone(other.view), beforeNative, currentNative, beforeFiles: files(beforeCard), currentFiles: files(currentCard),
       beforeEffectCount: 0, currentEffectCount: 0, afterView, effectCount: allowed ? 1 : 0, recheckedEffectCount: allowed ? 1 : 0, events,
       browserDecision: { type: 'freshAgent.approval.respond', sessionId: otherRoot, requestId: decisionId, decision: { behavior: allowed ? 'allow' : 'deny' } } })
   }

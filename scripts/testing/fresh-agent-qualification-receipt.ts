@@ -82,6 +82,55 @@ export function validateFreshBrowserAlias(route: Record<string, any>, main: { so
     || writer.activeClaimCount !== 1 || writer.globalConflictingClaimCount !== 0) throw new Error('executed alias did not resume the registered main soul/store/root')
 }
 
+export function validateFreshApprovalCheckpoint(card: any, native: any, files: any[], view: any, command: string): void {
+  const payload = card.payload, checkpoint = payload.nativeCheckpoint, binding = payload.nativeBinding
+  const bytes = Buffer.from(native.transcript.bytesBase64, 'base64')
+  if (!bytes.length || bytes.length > 32 * 1024 * 1024 || bytes.at(-1) !== 10 || !native.transcript.completeEof
+    || createHash('sha256').update(bytes).digest('hex') !== native.transcript.sha256) throw new Error('native approval transcript is incomplete')
+  const lines = bytes.toString('utf8').split('\n').filter(Boolean), rows = lines.map(line => JSON.parse(line))
+  const index = rows.findIndex(row => row.uuid === checkpoint.checkpointUuid), deferred = rows[index]
+  const assistant = rows.slice(0, index).find(row => row.uuid === checkpoint.assistantUuid)
+  const batch = rows.filter(row => row.type === 'assistant' && row.message?.id === assistant?.message?.id)
+  const tools = batch.flatMap(row => row.message.content.filter((part: any) => part.type === 'tool_use'))
+  const digest = (input: any) => createHash('sha256').update(stableJson(input)).digest('hex')
+  if (native.nativeRoot !== view.nativeSessionId || checkpoint.nativeSessionId !== view.nativeSessionId
+    || checkpoint.nativeVersion !== '2.1.237' || checkpoint.toolName !== 'Bash' || checkpoint.toolUseID !== payload.toolUseID
+    || payload.tool?.name !== 'Bash' || payload.tool.input?.command !== command || digest(payload.tool.input) !== checkpoint.inputDigest
+    || !assistant?.message.id || !assistant.uuid || batch.some(row => row.sessionId !== view.nativeSessionId || row.version !== checkpoint.nativeVersion)
+    || tools.length !== 1 || tools[0].id !== payload.toolUseID || tools[0].name !== 'Bash' || digest(tools[0].input) !== checkpoint.inputDigest
+    || deferred?.type !== 'attachment' || deferred.sessionId !== view.nativeSessionId || deferred.version !== checkpoint.nativeVersion
+    || deferred.attachment?.type !== 'hook_deferred_tool' || deferred.attachment.hookEvent !== 'PreToolUse'
+    || deferred.attachment.toolUseID !== payload.toolUseID || deferred.attachment.toolName !== 'Bash'
+    || digest(deferred.attachment.toolInput) !== checkpoint.inputDigest
+    || createHash('sha256').update(lines[index]!).digest('hex') !== checkpoint.checkpointDigest
+    || !binding?.nativeRequestId || binding.nativeRequestId !== payload.nativeRequestId || binding.launch?.incarnationId !== view.incarnationId
+    || stableJson(binding.launch) !== stableJson(native.nativeLaunch)) throw new Error('native approval operation/checkpoint/current binding differs')
+  const file = (pathname: string, uid: number) => {
+    const matches = files?.filter(value => value.path === pathname && value.readerUid === uid) ?? []
+    if (matches.length !== 1) throw new Error('native approval checkpoint/actor original is missing')
+    const raw = Buffer.from(matches[0].bytesBase64, 'base64')
+    if (raw.length > 32 * 1024 * 1024 || createHash('sha256').update(raw).digest('hex') !== matches[0].sha256) throw new Error('native approval file differs')
+    return JSON.parse(raw.toString('utf8'))
+  }
+  const record = file('/home/freshell/provider/.freshell/native-checkpoints/claude/' + view.nativeSessionId + '.json', 65534)
+  const actor = file('/run/freshell-host-actor/fresh-agent-state.json', 0), decision = actor.decisions?.[card.decision_id]
+  const { profileDigest, ...nativeCheckpoint } = checkpoint
+  if (record.schemaVersion !== 1 || record.phase !== 'approval_waiting' || record.nativeSessionId !== view.nativeSessionId
+    || record.toolUseID !== payload.toolUseID || record.inputDigest !== checkpoint.inputDigest || record.profileDigest !== profileDigest
+    || !/^[a-f0-9]{64}$/.test(profileDigest) || stableJson(record.checkpoint) !== stableJson(nativeCheckpoint)
+    || stableJson(record.nativeBinding) !== stableJson(binding) || actor.schemaVersion !== 1 || decision?.state !== 'pending'
+    || stableJson(decision.payload) !== stableJson(payload)) throw new Error('native approval persisted checkpoint/actor binding differs')
+}
+
+export function validateFreshApprovalDispatch(value: any): void {
+  const current = value.currentCard, view = value.afterView
+  const dispatches = value.events.filter((event: any) => event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.permission.dispatch')
+  const dispatch = dispatches[0]?.data.payload.event
+  if (dispatches.length !== 1 || dispatch.ok !== true || String(dispatch.requestId) !== current.decision_id
+    || dispatch.nativeRequestId !== current.payload.nativeRequestId || dispatch.sessionId !== view.freshAgentSessionId
+    || value.browserDecision?.sessionId !== view.freshAgentSessionId) throw new Error('native approval current dispatch differs')
+}
+
 /** Reopens practical browser/owner observations, rather than treating inventory as execution. */
 export function deriveFreshBrowserExecution(original: Record<string, any>, conversation: ObservedNativeConversation): Pick<FreshAgentQualificationRow,
   'ingresses' | 'crashes' | 'pendingApproval' | 'writerProof' | 'isolation' | 'limits' | 'oldEnclosure'> {
@@ -158,6 +207,9 @@ export function deriveFreshBrowserExecution(original: Record<string, any>, conve
       const cases = approvals.filter((value: any) => value.recovery === recovery && value.allowed === allowed)
       if (cases.length !== 1) throw new Error('native solo Bash allow/deny recovery matrix is incomplete')
       const value = cases[0], old = value.beforeCard, current = value.currentCard
+      validateFreshApprovalCheckpoint(old, value.beforeNative, value.beforeFiles, value.beforeView, value.command)
+      validateFreshApprovalCheckpoint(current, value.currentNative, value.currentFiles, value.afterView, value.command)
+      validateFreshApprovalDispatch(value)
       if (old.decision_id !== current.decision_id || old.payload.tool.name !== 'Bash' || old.payload.tool.input.command !== value.command
         || stableJson(old.payload.nativeCheckpoint) !== stableJson(current.payload.nativeCheckpoint)
         || current.payload.nativeCheckpoint.nativeSessionId !== value.nativeRoot || current.payload.toolUseID !== old.payload.toolUseID
@@ -171,9 +223,7 @@ export function deriveFreshBrowserExecution(original: Record<string, any>, conve
         || value.beforeNative.nativeCwd !== value.currentNative.nativeCwd
         || !nativeCheckpointTranscriptRetained(value.beforeNative, value.currentNative, old.payload.toolUseID)) throw new Error('native solo Bash current checkpoint/input/profile differs')
       observeNativeSoloBashOutcome({ nativeRoot: value.nativeRoot, toolUseID: old.payload.toolUseID, allowed, observed: value.events, effectCount: value.effectCount })
-      const dispatches = value.events.filter((event: any) => event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.permission.dispatch')
-      if (dispatches.length !== 1 || dispatches[0].data.payload.event.ok !== true
-        || value.browserDecision?.type !== 'freshAgent.approval.respond' || String(value.browserDecision.requestId) !== current.decision_id
+      if (value.browserDecision?.type !== 'freshAgent.approval.respond' || String(value.browserDecision.requestId) !== current.decision_id
         || value.browserDecision.decision?.behavior !== (allowed ? 'allow' : 'deny') || value.recheckedEffectCount !== value.effectCount) throw new Error('native decision dispatch/effect replay differs')
     }
     pendingApproval = { supported: true, survivedWebRestart: approvals.some((value: any) => value.recovery === 'web'),

@@ -4131,29 +4131,33 @@ describe('finite retained fresh native collection', () => {
       return JSON.stringify(native)
     })
     vi.spyOn(rig as any, 'ownedDockerProbe').mockImplementation(async (_container: string, _args: string[], providerUser: boolean) => {
-      const value = providerUser ? { phase: 'approval_waiting', nativeSessionId: address.nativeSessionId, toolUseID: card.payload.toolUseID,
+      const { profileDigest, ...checkpoint } = card.payload.nativeCheckpoint
+      const value = providerUser ? { schemaVersion: 1, checkpoint, phase: 'approval_waiting', nativeSessionId: address.nativeSessionId, toolUseID: card.payload.toolUseID,
         inputDigest: card.payload.nativeCheckpoint.inputDigest, profileDigest: card.payload.nativeCheckpoint.profileDigest, nativeBinding: card.payload.nativeBinding }
-        : { decisions: { [card.decision_id]: { state: 'pending', payload: card.payload } } }
+        : { schemaVersion: 1, decisions: { [card.decision_id]: { state: 'pending', payload: card.payload } } }
       const bytes = Buffer.from(JSON.stringify(value))
-      return JSON.stringify({ readerUid: providerUser ? 65534 : 0, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') })
+      return JSON.stringify({ path: _args.at(-1), readerUid: providerUser ? 65534 : 0, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') })
     })
     try {
       const registered = await rig.registerFreshApproval(address, allowed, recovery)
       const challenge = (rig as any).freshApprovalChallenges.get(registered.challengeId)
       const toolUseID = 'toolu_actual_original'
       card = { decision_id: 'actual-browser-decision', payload: { tool: { name: 'Bash', input: { command: challenge.command } }, toolUseID,
-        nativeCheckpoint: { nativeSessionId: address.nativeSessionId, toolUseID, inputDigest: 'd'.repeat(64), profileDigest: 'e'.repeat(64) },
-        nativeRequestId: 'original-native-callback', nativeBinding: { nativeRequestId: 'original-native-callback', launch: { incarnationId: address.incarnationId } } } }
-      const bytes = Buffer.from(JSON.stringify({ type: 'assistant', sessionId: address.nativeSessionId, message: { content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command: challenge.command } }] } }) + '\n')
-      native = { nativeRoot: address.nativeSessionId, nativeLaunch: { incarnationId: address.incarnationId },
+        nativeCheckpoint: { nativeSessionId: address.nativeSessionId, toolUseID, inputDigest: createHash('sha256').update(JSON.stringify({ command: challenge.command })).digest('hex'), profileDigest: 'e'.repeat(64) },
+        nativeRequestId: 'original-native-callback', nativeBinding: { nativeRequestId: 'original-native-callback', queryGeneration: 1, launch: { incarnationId: address.incarnationId, launchNonce: 'original-nonce' } } } }
+      const assistant = { type: 'assistant', uuid: 'actual-assistant', version: '2.1.237', sessionId: address.nativeSessionId, message: { id: 'actual-message', content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command: challenge.command } }] } }
+      const deferred = { type: 'attachment', uuid: 'actual-checkpoint', version: '2.1.237', sessionId: address.nativeSessionId, attachment: { type: 'hook_deferred_tool', hookEvent: 'PreToolUse', toolUseID, toolName: 'Bash', toolInput: { command: challenge.command } } }
+      const bytes = Buffer.from(JSON.stringify(assistant) + '\n' + JSON.stringify(deferred) + '\n')
+      Object.assign(card.payload.nativeCheckpoint, { toolName: 'Bash', assistantUuid: assistant.uuid, checkpointUuid: deferred.uuid, nativeVersion: '2.1.237', checkpointDigest: createHash('sha256').update(JSON.stringify(deferred)).digest('hex') })
+      native = { nativeRoot: address.nativeSessionId, nativeLaunch: structuredClone(card.payload.nativeBinding.launch),
         transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
       pending = [{ kind: 'permission_requested', data: card }]
       await rig.captureFreshApprovalCheckpoint(address, registered.challengeId)
       if (recovery !== 'web') {
         current = { ...current, incarnationId: 'replacement-inc', containerId: 'd'.repeat(64), hostBootId: 'replacement-boot' }
         card = structuredClone(card); card.payload.nativeRequestId = 'current-native-callback'
-        card.payload.nativeBinding = { nativeRequestId: 'current-native-callback', launch: { incarnationId: current.incarnationId } }
-        native.nativeLaunch.incarnationId = current.incarnationId
+        card.payload.nativeBinding = { nativeRequestId: 'current-native-callback', queryGeneration: 1, launch: { incarnationId: current.incarnationId, launchNonce: 'replacement-nonce' } }
+        native = structuredClone(native); native.nativeLaunch = structuredClone(card.payload.nativeBinding.launch)
         pending = [{ kind: 'permission_requested', data: card }]
       }
       const currentAddress = { ...address, incarnationId: current.incarnationId, containerId: current.containerId, hostBootId: current.hostBootId }
@@ -4163,7 +4167,7 @@ describe('finite retained fresh native collection', () => {
       await expect(rig.finishFreshApproval(currentAddress, registered.challengeId, { ...decision, requestId: 'stale-card' })).rejects.toThrow(/current browser decision/)
       expect(fs.existsSync(effect)).toBe(false)
       if (allowed) await fsp.writeFile(effect, 'effect\n')
-      pending = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, requestId: checkpoint.decisionId } } } },
+      pending = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, sessionId: current.freshAgentSessionId, requestId: checkpoint.decisionId, nativeRequestId: checkpoint.nativeRequestId } } } },
         { kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result', content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
         { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: address.nativeSessionId, isError: false } } } }]
       await rig.finishFreshApproval(currentAddress, registered.challengeId, decision)
