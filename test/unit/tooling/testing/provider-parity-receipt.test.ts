@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -11,6 +12,32 @@ import {
 } from '../../../../scripts/testing/provider-parity-receipt.js'
 import { validateProviderQualificationReceipt } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import { validateFreshAgentQualificationReceipt } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
+import { exposeGrantsToHarness, fakeOnecliGrants } from '../../../integration/server/provider-parity-onecli.js'
+
+describe('fake provider parity grant isolation', () => {
+  it('exposes only owned fake references to actual child processes and restores ambient references', () => {
+    const ambient = {
+      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: '/nonexistent/operator/auth.json',
+      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: '/nonexistent/operator/ca.pem',
+      FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE: '/nonexistent/operator/claude.env',
+      FRESHELL_MANAGED_AMPLIFIER_ONECLI_CA_FILE: '/nonexistent/operator/amplifier.pem',
+    }
+    for (const [key, value] of Object.entries(ambient)) vi.stubEnv(key, value)
+    const fake = fakeOnecliGrants(['opencode'])
+    const restore = exposeGrantsToHarness(fake.serverEnv)
+    try {
+      const observed = JSON.parse(execFileSync(process.execPath, ['-e',
+        "process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key])=>/^FRESHELL_MANAGED_(CLAUDE|CODEX|OPENCODE|AMPLIFIER)_ONECLI_/.test(key)))))"], { encoding: 'utf8' }))
+      expect(observed).toEqual(fake.serverEnv)
+      expect(fs.readFileSync(observed.FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE, 'utf8')).toContain('fixture-secret-byte-opencode')
+    } finally {
+      restore()
+      for (const [key, value] of Object.entries(ambient)) expect(process.env[key]).toBe(value)
+      fs.rmSync(fake.directory, { recursive: true, force: true })
+      vi.unstubAllEnvs()
+    }
+  })
+})
 
 const trace = {
   provider: 'claude',
