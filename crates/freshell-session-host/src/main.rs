@@ -1224,7 +1224,6 @@ async fn grant_execution(
         }
         prepare_opencode_adoption_expectation(
             state,
-            &soul_id,
             &mut preflight_terminal,
             resume_spec.as_ref(),
             transfer_readiness_receipt
@@ -2288,7 +2287,6 @@ fn run_opencode_transfer_readiness(
 /// imports data itself.
 fn prepare_opencode_adoption_expectation(
     state: &HostState,
-    soul_id: &SoulId,
     terminal: &mut TerminalLaunchSpec,
     resume_spec: Option<&ResumeSpec>,
     readiness_receipt: Option<&OpenCodeTransferReadinessReceipt>,
@@ -2326,7 +2324,6 @@ fn prepare_opencode_adoption_expectation(
     descriptor.validate()?;
     if terminal.mode != "opencode"
         || descriptor.provider != "opencode"
-        || descriptor.destination_store_id != soul_id.as_str()
         || descriptor.destination_database_path != ".local/share/opencode/opencode.db"
         || terminal.resume_session_id.as_deref() != Some(descriptor.root_session_id.as_str())
     {
@@ -2335,6 +2332,9 @@ fn prepare_opencode_adoption_expectation(
             "OpenCode adoption baseline does not match this provider launch",
         ));
     }
+    // A stopped repair can retain a provider-store ID distinct from its soul.
+    // Bind exact resumes to that durable store and root; first transfers have
+    // already checked their soul/incarnation binding in StageVerified.
     if let Some(resume) = resume_spec {
         if resume.provider_session.provider != "opencode"
             || resume.provider_session.provider_store_id != descriptor.destination_store_id
@@ -8648,6 +8648,168 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn baseline_only_distinct_provider_store_and_soul_resume_keeps_exact_identity_fences() {
+        let imported = run_joined_synthetic_transfer(None).await.unwrap();
+        assert!(imported.result.is_ok());
+        let original = imported
+            .adoption_expectation
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let soul_id = SoulId::parse("synthetic-repaired-soul").unwrap();
+        assert_ne!(
+            original.baseline.descriptor.destination_store_id,
+            soul_id.as_str()
+        );
+
+        for baseline_only in [false, true] {
+            // Descriptor-carrying resumes reject a conflicting root during
+            // terminal preparation; baseline-only resumes bind it during
+            // adoption preparation instead. Preserve both refusal paths.
+            let wrong_root_code = if baseline_only {
+                RuntimeErrorCode::OwnershipMismatch
+            } else {
+                RuntimeErrorCode::InvalidRequest
+            };
+            let resumed =
+                run_synthetic_exact_resume_for_soul(&imported, None, baseline_only, &soul_id)
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(
+                    &resumed.result,
+                    Ok(HostResult::GrantAccepted {
+                        worker_launch_count: 1,
+                        ..
+                    })
+                ),
+                "distinct store/soul exact resume (baseline-only={baseline_only}): {:?}",
+                resumed.result
+            );
+            assert_eq!(*resumed.events.lock().unwrap(), ["current", "pty"]);
+            assert!(resumed
+                .pty_callback_invoked
+                .load(std::sync::atomic::Ordering::SeqCst));
+            let adoption = resumed
+                .adoption_expectation
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap();
+            assert_eq!(adoption.baseline, original.baseline);
+            assert_eq!(adoption.root_session_id, original.root_session_id);
+            assert_eq!(adoption.evidence_generation, original.evidence_generation);
+            assert_eq!(adoption.incarnation_id, resumed.state.incarnation_id);
+            assert_ne!(adoption.launch_nonce, original.launch_nonce);
+            let persisted = resumed.state.persisted.try_lock().unwrap();
+            assert_eq!(persisted.max_execution_generation, 2);
+            assert_eq!(persisted.worker_launch_count, 1);
+            drop(persisted);
+
+            for (failure, code, helper_read) in [
+                (
+                    SyntheticTransferFailure::ExactResumeStoreMismatch,
+                    RuntimeErrorCode::OwnershipMismatch,
+                    false,
+                ),
+                (
+                    SyntheticTransferFailure::ExactResumeRootMismatch,
+                    wrong_root_code,
+                    false,
+                ),
+                (
+                    SyntheticTransferFailure::ReadinessStoreMismatch,
+                    RuntimeErrorCode::OwnershipMismatch,
+                    false,
+                ),
+                (
+                    SyntheticTransferFailure::ReadinessRootMismatch,
+                    RuntimeErrorCode::OwnershipMismatch,
+                    false,
+                ),
+                (
+                    SyntheticTransferFailure::ReadinessIdentityMismatch,
+                    RuntimeErrorCode::OwnershipMismatch,
+                    false,
+                ),
+                (
+                    SyntheticTransferFailure::ReadinessGidMismatch,
+                    RuntimeErrorCode::OwnershipMismatch,
+                    false,
+                ),
+                (
+                    SyntheticTransferFailure::CurrentEvidenceRead,
+                    RuntimeErrorCode::HostUnreachable,
+                    true,
+                ),
+                (
+                    SyntheticTransferFailure::CurrentEvidenceMismatch,
+                    RuntimeErrorCode::HostUnreachable,
+                    true,
+                ),
+                (
+                    SyntheticTransferFailure::CurrentEvidenceStoreMismatch,
+                    RuntimeErrorCode::HostUnreachable,
+                    true,
+                ),
+                (
+                    SyntheticTransferFailure::CurrentEvidenceGenerationMismatch,
+                    RuntimeErrorCode::HostUnreachable,
+                    true,
+                ),
+            ] {
+                let blocked = run_synthetic_exact_resume_for_soul(
+                    &imported,
+                    Some(failure),
+                    baseline_only,
+                    &soul_id,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    blocked.result.as_ref().unwrap_err().code,
+                    code,
+                    "{failure:?}, baseline-only={baseline_only}"
+                );
+                let persisted = blocked.state.persisted.try_lock().unwrap();
+                assert!(persisted.grant_id.is_none());
+                assert_eq!(persisted.worker_launch_count, 0);
+                assert!(!blocked
+                    .pty_callback_invoked
+                    .load(std::sync::atomic::Ordering::SeqCst));
+                assert!(blocked.adoption_expectation.lock().unwrap().is_none());
+                assert_eq!(
+                    blocked.events.lock().unwrap().as_slice(),
+                    if helper_read {
+                        &["current"][..]
+                    } else {
+                        &[][..]
+                    }
+                );
+            }
+        }
+        let blocked = run_synthetic_exact_resume_for_soul(
+            &imported,
+            Some(SyntheticTransferFailure::SavedBaselineMismatch),
+            true,
+            &soul_id,
+        )
+        .await
+        .unwrap();
+        assert!(blocked.result.is_err());
+        let persisted = blocked.state.persisted.try_lock().unwrap();
+        assert!(persisted.grant_id.is_none());
+        assert_eq!(persisted.worker_launch_count, 0);
+        assert!(!blocked
+            .pty_callback_invoked
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(blocked.adoption_expectation.lock().unwrap().is_none());
+        assert!(blocked.events.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn baseline_only_resume_failure_retry_preserves_installed_history_and_current_tail() {
         let imported = run_joined_synthetic_transfer(None).await.unwrap();
         assert!(imported.result.is_ok());
@@ -8961,6 +9123,12 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         CurrentEvidenceMismatch,
         CurrentEvidenceGenerationMismatch,
         ReadinessIdentityMismatch,
+        ReadinessStoreMismatch,
+        ReadinessRootMismatch,
+        ReadinessGidMismatch,
+        ExactResumeStoreMismatch,
+        ExactResumeRootMismatch,
+        CurrentEvidenceStoreMismatch,
         SavedBaselineMismatch,
     }
 
@@ -9072,6 +9240,10 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                         .map_err(|error| error.to_string())?;
                     if self.failure == Some(SyntheticTransferFailure::CurrentEvidenceMismatch) {
                         evidence.root_session_id = "ses_mismatched-root".into();
+                    }
+                    if self.failure == Some(SyntheticTransferFailure::CurrentEvidenceStoreMismatch)
+                    {
+                        evidence.destination_store_id = "synthetic-wrong-store".into();
                     }
                     if self.failure
                         == Some(SyntheticTransferFailure::CurrentEvidenceGenerationMismatch)
@@ -10144,6 +10316,21 @@ console.log('actual library export/import/full-row reader and Node semantic bind
         failure: Option<SyntheticTransferFailure>,
         stopped_repair_baseline: bool,
     ) -> Result<SyntheticResumeAttempt, String> {
+        run_synthetic_exact_resume_for_soul(
+            imported,
+            failure,
+            stopped_repair_baseline,
+            &SoulId::parse("synthetic-soul").map_err(|error| error.to_string())?,
+        )
+        .await
+    }
+
+    async fn run_synthetic_exact_resume_for_soul(
+        imported: &SyntheticGateAttempt,
+        failure: Option<SyntheticTransferFailure>,
+        stopped_repair_baseline: bool,
+        soul_id: &SoulId,
+    ) -> Result<SyntheticResumeAttempt, String> {
         let root = imported.root.path();
         let descriptor: OpenCodeTransferDescriptor = serde_json::from_slice(
             &std::fs::read(root.join("opencode-transfer-descriptor.json"))
@@ -10162,14 +10349,26 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             .map_err(|_| "prior synthetic grant state is still locked")?
             .opencode_transfer_receipt
             .clone();
-        if failure == Some(SyntheticTransferFailure::ReadinessIdentityMismatch) {
-            if let Some(receipt) = preserved_receipt.as_mut() {
-                receipt.provider_uid = receipt.provider_uid.wrapping_add(1);
+        if let Some(receipt) = preserved_receipt.as_mut() {
+            match failure {
+                Some(SyntheticTransferFailure::ReadinessIdentityMismatch) => {
+                    receipt.provider_uid = receipt.provider_uid.wrapping_add(1);
+                }
+                Some(SyntheticTransferFailure::ReadinessGidMismatch) => {
+                    receipt.provider_gid = receipt.provider_gid.wrapping_add(1);
+                }
+                Some(SyntheticTransferFailure::ReadinessStoreMismatch) => {
+                    receipt.destination_store_id = "synthetic-wrong-store".into();
+                }
+                Some(SyntheticTransferFailure::ReadinessRootMismatch) => {
+                    receipt.root_session_id = "ses_mismatched-root".into();
+                }
+                _ => {}
             }
         }
         let incarnation_id = IncarnationId::parse("synthetic-resume-incarnation")
             .map_err(|error| error.to_string())?;
-        let soul_id = SoulId::parse("synthetic-soul").map_err(|error| error.to_string())?;
+        let soul_id = soul_id.clone();
         let host_boot_id = HostBootId::new();
         let state_dir = root.join("host-state");
         let persisted_state_path = state_dir.join("host-state.json");
@@ -10242,6 +10441,12 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             evidence_revision: 1,
             never_dispatched: false,
         };
+        if failure == Some(SyntheticTransferFailure::ExactResumeStoreMismatch) {
+            resume_spec.provider_session.provider_store_id = "synthetic-wrong-store".into();
+        }
+        if failure == Some(SyntheticTransferFailure::ExactResumeRootMismatch) {
+            resume_spec.provider_session.native_session_id = "ses_mismatched-root".into();
+        }
         if stopped_repair_baseline {
             let baseline = freshell_runtime_protocol::OpenCodeAdoptionBaseline {
                 manifest_sha256: sha256_hex(descriptor.manifest_json.as_bytes()),
