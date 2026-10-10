@@ -13,6 +13,13 @@
 //!   ignores its arguments, so
 //!   `freshell-test-helper idle app-server --managed-daemon` is shaped like a
 //!   Codex daemon-family process (`is_codex_daemon_family` judges argv).
+//! - `until-eof`: prints `until-eof <pid>` and exits normally when its stdin
+//!   reaches end of file.
+//! - `job-child` (Windows only): runs an `until-eof` copy of itself in a
+//!   nested kill-on-close job of its own, as Codex runs each shell command
+//!   (prints `job-child <child pid>`); when its own stdin reaches end of
+//!   file it ends the child's stdin, waits for the child, prints
+//!   `child-exited` (the nested job is now empty) and sleeps until killed.
 //! - `breakaway-daemon` (Windows only): starts a copy of itself as
 //!   `idle app-server --managed-daemon` with
 //!   `DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB` (Codex 0.162's exact
@@ -32,10 +39,12 @@ fn main() {
     let code = match args.first().map(String::as_str) {
         Some("hold-lock") => hold_lock(&args[1..]),
         Some("idle") => idle(),
+        Some("until-eof") => until_eof(),
+        Some("job-child") => job_child(),
         Some("breakaway-daemon") => breakaway_daemon(),
         _ => {
             eprintln!(
-                "usage: freshell-test-helper hold-lock <path> [--threads N] [--child] | idle [args...] | breakaway-daemon"
+                "usage: freshell-test-helper hold-lock <path> [--threads N] [--child] | idle [args...] | until-eof | job-child | breakaway-daemon"
             );
             USAGE_EXIT
         }
@@ -121,6 +130,91 @@ fn idle() -> i32 {
     println!("idle {}", std::process::id());
     let _ = std::io::stdout().flush();
     park_forever()
+}
+
+fn until_eof() -> i32 {
+    println!("until-eof {}", std::process::id());
+    let _ = std::io::stdout().flush();
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+    0
+}
+
+#[cfg(windows)]
+fn job_child() -> i32 {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    // SAFETY: an unnamed job with default security; checked below.
+    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if raw.is_null() {
+        eprintln!(
+            "freshell-test-helper job-child: CreateJobObjectW: {}",
+            std::io::Error::last_os_error()
+        );
+        return 1;
+    }
+    // SAFETY: a fresh handle this process owns.
+    let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: an all-zero limit block is valid; only the flags are set.
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: a live job and a correctly sized information block.
+    let limited = unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&limits).cast(),
+            std::mem::size_of_val(&limits) as u32,
+        )
+    };
+    if limited == 0 {
+        eprintln!(
+            "freshell-test-helper job-child: SetInformationJobObject: {}",
+            std::io::Error::last_os_error()
+        );
+        return 1;
+    }
+    let spawned = std::env::current_exe().and_then(|exe| {
+        Command::new(exe)
+            .arg("until-eof")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+    });
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("freshell-test-helper job-child: cannot start the child: {err}");
+            return 1;
+        }
+    };
+    // SAFETY: two live handles.
+    if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0 {
+        eprintln!(
+            "freshell-test-helper job-child: AssignProcessToJobObject: {}",
+            std::io::Error::last_os_error()
+        );
+        let _ = child.kill();
+        return 1;
+    }
+    println!("job-child {}", child.id());
+    let _ = std::io::stdout().flush();
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+    drop(child.stdin.take());
+    let _ = child.wait();
+    println!("child-exited");
+    let _ = std::io::stdout().flush();
+    park_forever()
+}
+
+#[cfg(not(windows))]
+fn job_child() -> i32 {
+    eprintln!("freshell-test-helper job-child: Windows only");
+    USAGE_EXIT
 }
 
 fn park_forever() -> i32 {

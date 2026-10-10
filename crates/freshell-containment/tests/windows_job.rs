@@ -391,26 +391,11 @@ impl Drop for PortJob {
     }
 }
 
-/// Node A runs node B, which starts a non-detached `cmd /d /c exit 0` (so B
-/// gets its own libuv job) and exits when its stdin ends; A ends B's stdin
-/// when A's own stdin ends, and prints `child-exited` once B is gone. B's
-/// job then empties and posts a zero message to every port up its job chain
-/// while A and the shim still run.
-fn nested_zero_js() -> String {
-    let inner = "require('child_process').spawn('cmd.exe',['/d','/c','exit 0'],{stdio:'inherit'});\
-        process.stdin.on('end',()=>process.exit(0));process.stdin.resume();";
-    format!(
-        "const b=require('child_process').spawn(process.execPath,['-e',{}],{{stdio:['pipe','inherit','inherit']}});\
-         b.on('exit',()=>console.log('child-exited'));\
-         process.stdin.on('end',()=>b.stdin.end());process.stdin.resume();\
-         console.log('ready');setInterval(()=>{{}},1e9);",
-        js(inner)
-    )
-}
-
-/// LB-08 (V5 §3.7): nested jobs (libuv's per-`node.exe` job) post their zero
-/// messages under the unit's own key, so the unit's empty wait must confirm
-/// each one against the unit job's active process count.
+/// LB-08 (V5 §3.7): nested jobs post their zero messages under the unit's
+/// own key, so the unit's empty wait must confirm each one against the unit
+/// job's active process count. The member runs a child in a nested
+/// kill-on-close job of its own, as Codex runs each shell command; when that
+/// child exits, the nested job empties while the member still runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_unit_empty_wait_ignores_nested_job_zero_messages() {
     // Precondition: this scenario really posts a nested zero message while
@@ -418,23 +403,23 @@ async fn the_unit_empty_wait_ignores_nested_job_zero_messages() {
     {
         let job = PortJob::new();
         let mut child = std::process::Command::new(SHIM)
-            .args(["--job", &job.name, "--", "node", "-e", &nested_zero_js()])
+            .args(["--job", &job.name, "--", HELPER, "job-child"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
         let shim = Proc::open(child.id());
         let mut lines = windows_support::Lines::new(child.stdout.take().unwrap());
-        lines.expect("ready", |l| l == "ready");
+        lines.expect_pid("job-child ");
         assert!(
             !job.zero_message_within(Duration::from_millis(200)),
-            "precondition: a zero message before node B ended"
+            "precondition: a zero message before the nested job's child ended"
         );
         drop(child.stdin.take());
         lines.expect("child-exited", |l| l == "child-exited");
         assert!(
             job.zero_message_within(Duration::from_secs(10)),
-            "precondition: no nested zero message after node B ended"
+            "precondition: no zero message after the nested job emptied"
         );
         assert!(
             job.active_processes() > 0,
@@ -448,10 +433,11 @@ async fn the_unit_empty_wait_ignores_nested_job_zero_messages() {
     let state = tempfile::tempdir().unwrap();
     let containment = containment(state.path());
     let unit = containment.create_unit(UnitId::mint(), label()).unwrap();
-    let mut member = start(&unit, "node", &["-e", &nested_zero_js()]);
-    member.lines.expect("ready", |l| l == "ready").await;
-    let node_pid = child_named(member.shim.pid, "node.exe").expect("node A under the shim");
-    unit.set_main(ProcWatch::open(node_pid).unwrap());
+    let mut member = start(&unit, HELPER, &["job-child"]);
+    member.lines.expect_pid("job-child ").await;
+    let helper = child_named(member.shim.pid, "freshell-test-helper.exe")
+        .expect("the helper under the shim");
+    unit.set_main(ProcWatch::open(helper).unwrap());
     let empty = testing::unit_empty_wait(&unit).expect("the job backend has an empty event");
     tokio::pin!(empty);
     drop(member.child.stdin.take());
@@ -463,7 +449,7 @@ async fn the_unit_empty_wait_ignores_nested_job_zero_messages() {
         tokio::time::timeout(Duration::from_millis(500), &mut empty)
             .await
             .is_err(),
-        "the unit's empty wait completed while its shim and node A still run"
+        "the unit's empty wait completed while its shim and helper still run"
     );
     let (_report, survivors) = force_stop(&unit, StopReason::ShiftX).await;
     assert!(survivors.is_empty(), "{survivors:?}");
