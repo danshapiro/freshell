@@ -77,7 +77,7 @@ function verifyCapturedNativeCopy(evidenceDir: string, reference: unknown, bytes
   equal(sha256(captured), digest, `${label} capture digest`)
 }
 
-function nativeMaterial(evidenceDir: string, stage: JsonObject, provider: string, root: string): { history: NativeHistory; inputs: NativeInput[] } {
+export function nativeMaterial(evidenceDir: string, stage: JsonObject, provider: string, root: string): { history: NativeHistory; inputs: NativeInput[] } {
   const { filename } = readNativeOriginalReference(evidenceDir, stage.nativeFile)
   if (provider === 'codex') {
     const basename = path.basename(filename), [meta] = readBoundedJsonl(filename, 'Codex referenced native rollout')

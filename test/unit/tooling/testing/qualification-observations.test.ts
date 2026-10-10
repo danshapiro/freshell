@@ -1,5 +1,7 @@
 // @vitest-environment node
 import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
+const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -13,6 +15,84 @@ const roots: string[] = []
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }) })
 const candidateSha = 'a'.repeat(40), runtimeImage = `sha256:${'b'.repeat(64)}`, receiptRunId = 'native-originals-001'
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex')
+
+
+function browserExecutionFixture(current: FreshAgentQualificationRow, stages: any[], evidenceDir: string, write: (name: string, value: any) => { path: string; sha256: string }, prefix: string) {
+  const read = (reference: any) => JSON.parse(fs.readFileSync(path.join(evidenceDir, reference.path), 'utf8'))
+  const stageViews = stages.map(stage => read(stage.launch).response.data.view)
+  const view = { ...stageViews.at(-1), freshAgentSessionType: current.mode, freshAgentSessionId: current.nativeSessionId }
+  const native = read(read(stages.at(-1).profile).process)
+  const allocation = { view, writer: { soulId: current.soulId, incarnationId: view.incarnationId, nativeSessionId: current.nativeSessionId,
+    providerStoreId: current.providerStoreId, activeClaimCount: 1, globalConflictingClaimCount: 0 }, volume: { providerVolumeName: 'owned-volume' }, process: native, limits: current.limits }
+  const otherRoot = 'other-' + current.nativeSessionId
+  const other = structuredClone(allocation)
+  Object.assign(other.view, { soulId: 'other-soul', incarnationId: 'other-inc', containerId: 'other-container', nativeSessionId: otherRoot, freshAgentSessionId: otherRoot,
+    nativeIdentityObservation: { ...view.nativeIdentityObservation, nativeSessionId: otherRoot, incarnationId: 'other-inc' } })
+  Object.assign(other.writer, { soulId: other.view.soulId, incarnationId: other.view.incarnationId, nativeSessionId: otherRoot, providerStoreId: 'other-store' })
+  other.volume.providerVolumeName = 'other-volume'; other.process.native.launch.incarnationId = other.view.incarnationId
+  const routes = FRESH_AGENT_INGRESS_INVENTORY.filter(({ ingress }) => !['startup-restore', 'auto-resume'].includes(ingress)).map(({ ingress }) => {
+    const target = ingress === 'browser-split' ? other.view : view
+    const requestId = 'create-' + ingress
+    if (['browser-picker', 'browser-split', 'ws-create', 'history-resume'].includes(ingress)) return { ingress, view: target,
+      request: { type: 'freshAgent.create', requestId, sessionType: current.mode, ...(ingress === 'history-resume' ? { sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } : {}) },
+      reply: { type: 'freshAgent.created', requestId, sessionId: target.freshAgentSessionId } }
+    if (ingress === 'ws-attach') return { ingress, view: target, request: { type: 'freshAgent.attach', sessionId: target.freshAgentSessionId } }
+    return { ingress, view: target, request: { method: 'POST', path: ingress.endsWith('split') ? '/api/panes/actual-pane/split' : '/api/tabs', body: { agent: current.mode, sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } },
+      reply: { paneId: 'actual-pane', sessionId: target.freshAgentSessionId } }
+  })
+  const lifecycle: any[] = [{ event: 'supervisor.runtime_observer.recovery_scheduled', data: { soulId: current.soulId } }]
+  for (const index of [1, 2]) {
+    lifecycle.push({ event: 'supervisor.recovery.old_writer_released', data: { soulId: current.soulId, incarnationId: stageViews[index - 1].incarnationId,
+      containerId: stageViews[index - 1].containerId, providerStoreId: current.providerStoreId, outcome: 'verified_empty', writerState: 'released' } },
+    { event: 'supervisor.recovery.replacement_writer_prepared', data: { soulId: current.soulId, priorIncarnationId: stageViews[index - 1].incarnationId,
+      incarnationId: stageViews[index].incarnationId, providerStoreId: current.providerStoreId, nativeSessionId: current.nativeSessionId, writerState: 'prepared' } },
+    { event: 'supervisor.launch_running', data: { soulId: current.soulId, incarnationId: stageViews[index].incarnationId, containerId: stageViews[index].containerId } })
+  }
+  const prompt = 'Reply ready. Do not use tools.'
+  let after: { path: string; sha256: string }
+  const firstFile = path.join(evidenceDir, stages[0].nativeFile.path)
+  if (current.provider === 'opencode') {
+    const target = path.join(evidenceDir, prefix, 'ui', 'opencode.db'); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.copyFileSync(firstFile, target)
+    const db = new DatabaseSync(target)
+    db.prepare('UPDATE session SET id=?').run(otherRoot)
+    for (const table of ['message', 'part']) db.prepare('UPDATE ' + table + ' SET session_id=?').run(otherRoot)
+    db.prepare('UPDATE part SET data=? WHERE message_id=?').run(JSON.stringify({ type: 'text', text: prompt }), 'user-0')
+    db.close(); after = { path: path.relative(evidenceDir, target), sha256: createHash('sha256').update(fs.readFileSync(target)).digest('hex') }
+  } else {
+    const rows = fs.readFileSync(firstFile, 'utf8').trim().split('\n').map(line => JSON.parse(line.replaceAll(current.nativeSessionId || 'invalid-root', otherRoot)))
+    for (const row of rows) {
+      if (row.type === 'user' && row.message.role === 'user') row.message.content = prompt
+      if (row.type === 'event_msg' && row.payload.type === 'user_message') row.payload.message = prompt
+    }
+    after = write(prefix + '/ui/' + (current.provider === 'codex' ? 'rollout-' : '') + otherRoot + '.jsonl', rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+  }
+  const ui = { provider: current.provider, nativeRoot: otherRoot, beforeTurns: 0, after,
+    request: { type: 'freshAgent.send', requestId: 'actual-ui-send', sessionId: otherRoot, text: prompt },
+    reply: { type: 'freshAgent.send.accepted', requestId: 'actual-ui-send', sessionId: otherRoot } }
+  const approvals: any[] = []
+  if (['freshclaude', 'kilroy'].includes(current.mode)) for (const recovery of ['web', 'host', 'provider']) for (const allowed of [true, false]) {
+    const decisionId = 'decision-' + current.mode + '-' + recovery + '-' + allowed, toolUseID = 'toolu_' + decisionId
+    const command = "printf 'effect\\n' >> '/owned/effect-" + decisionId + ".jsonl'"
+    const bytes = Buffer.from(JSON.stringify({ type: 'assistant', sessionId: otherRoot, message: { content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command } }] } }) + '\n')
+    const checkpoint = { nativeSessionId: otherRoot, toolUseID, inputDigest: createHash('sha256').update(JSON.stringify({ command })).digest('hex'), profileDigest: 'a'.repeat(64) }
+    const beforeNative = { nativeRoot: otherRoot, version: current.providerVersion + ' (Claude Code)', executableSha256: 'd'.repeat(64), nativeCwd: '/owned/workspace', transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
+    const beforeCard = { decision_id: decisionId, payload: { tool: { name: 'Bash', input: { command } }, toolUseID, nativeCheckpoint: checkpoint,
+      nativeRequestId: 'old-' + decisionId, nativeBinding: { launch: { incarnationId: 'other-inc' } } } }
+    const currentCard = structuredClone(beforeCard), afterView = { ...other.view, incarnationId: recovery === 'web' ? 'other-inc' : 'recovered-' + decisionId }
+    currentCard.payload.nativeBinding.launch.incarnationId = afterView.incarnationId
+    if (recovery !== 'web') currentCard.payload.nativeRequestId = 'new-' + decisionId
+    const events = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, requestId: decisionId } } } },
+      { kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result', content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
+      { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: otherRoot, isError: false } } } }]
+    approvals.push({ recovery, allowed, nativeRoot: otherRoot, command, beforeCard, currentCard, beforeNative, currentNative: structuredClone(beforeNative),
+      beforeEffectCount: 0, currentEffectCount: 0, afterView, effectCount: allowed ? 1 : 0, recheckedEffectCount: allowed ? 1 : 0, events,
+      browserDecision: { type: 'freshAgent.approval.respond', sessionId: otherRoot, requestId: decisionId, decision: { behavior: allowed ? 'allow' : 'deny' } } })
+  }
+  const execution = { mode: current.mode, routes, ui, allocations: [allocation, other], stageViews, lifecycle,
+    webRestarts: [{ before: allocation, after: structuredClone(allocation) }],
+    supervisorRestarts: [{ before: view, after: structuredClone(view), lifecycle: [{ event: 'supervisor.startup_scan.finished', data: { scanned: 2 } }] }], approvals }
+  return write(prefix + '/execution.json', execution)
+}
 
 function fixture(missingHostCompletion = false) {
   const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'qualification-originals-')); roots.push(repoRoot)
@@ -33,7 +113,7 @@ function fixture(missingHostCompletion = false) {
     ingresses: FRESH_AGENT_INGRESS_INVENTORY.map(({ ingress }) => ingress), soulId: 'soul-freshcodex', providerStoreId: 'store-freshcodex', nativeSessionId,
     completedNativeTurns: [0, 1, 2].map(index => ({ turnId: `turn-${index}`, assistantMessageId: `assistant-${index}`, completionKind: 'provider_native_completed' })), noToolRecall: true,
     crashes: { web: ['abrupt_restart'], host: ['session_host_exit', 'provider_process_exit'] }, pendingApproval: { supported: false }, writerProof: { activeWriterCount: 1, conflictingWriterCount: 0, dispatchCountForPrompt: 1, completionCountForPrompt: 1 },
-    isolation: { providerVolumeNameHash: 'e'.repeat(64), enclosureIdHash: 'f'.repeat(64), independentProviderStore: true, independentEnclosure: true }, limits: { cpuMax: '50000 100000', memoryMax: '268435456', swapMax: '0', pidsMax: '64' }, oldEnclosure: { verifiedEmptyBeforeResume: true, writerClaimReleasedBeforeResume: true } }]
+    isolation: { providerVolumeNameHash: digest('owned-volume'), enclosureIdHash: digest('container-2'), independentProviderStore: true, independentEnclosure: true }, limits: { cpuMax: '50000 100000', memoryMax: '268435456', swapMax: '0', pidsMax: '64' }, oldEnclosure: { verifiedEmptyBeforeResume: true, writerClaimReleasedBeforeResume: true } }]
   const priorRows: unknown[] = []
   const stages = ['initial', 'after_session_host_crash', 'after_provider_process_crash'].map((stage, index) => {
     const prompt = index === 0 ? `Remember ${nonce}. Reply stored. Do not use tools.` : 'Recall the remembered marker. Do not use tools.'
@@ -66,6 +146,7 @@ function fixture(missingHostCompletion = false) {
     stopCompletedAt: 1_780_000_024_000, stoppedObservedAt: 1_780_000_024_100, writerObservedAt: 1_780_000_024_200,
     readStartedAt: 1_780_000_024_300, readCompletedAt: 1_780_000_024_400, completedTurnCount: 3 })
   write('native-recovery-originals.json', { schemaVersion: 1, candidateSha, runId: receiptRunId, runtimeImage, selected: ['freshcodex'], conversations: [{ mode: 'freshcodex', provider: 'codex', soulId: rows[0]!.soulId, providerStoreId: rows[0]!.providerStoreId, nativeSessionId, nonce, stages, stopped }] })
+  rows[0]!.executionOriginal = browserExecutionFixture(rows[0]!, stages, evidenceDir, write, 'browser')
   const input = { repoRoot, evidenceDir, candidateSha, receiptRunId, runtimeImage, selectedModes: ['freshcodex'] as const, rows }
   return { input: { ...input, selectedModes: [...input.selectedModes] }, write, stages }
 }

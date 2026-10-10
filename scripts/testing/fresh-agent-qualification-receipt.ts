@@ -2,8 +2,9 @@ import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { captureNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/probe-cli.js'
+import { nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome } from './runtime-native-feasibility.js'
 
-import { deriveNativeRecoveryOriginals, readNativeOriginalReference, NATIVE_RECOVERY_ORIGINALS_FILE, type ObservedNativeConversation } from './qualification-observations.js'
+import { deriveNativeRecoveryOriginals, nativeMaterial, readNativeOriginalReference, NATIVE_RECOVERY_ORIGINALS_FILE, type ObservedNativeConversation } from './qualification-observations.js'
 
 import {
   QUALIFIABLE_FRESH_AGENT_MODES,
@@ -64,6 +65,120 @@ export type NativeTurnProof = {
   turnId: string
   assistantMessageId: string
   completionKind: 'provider_native_completed'
+}
+
+export type FreshBrowserIngressObservation = {
+  ingress: FreshAgentIngressId
+  request: Record<string, any>
+  reply?: Record<string, any>
+}
+
+/** Reopens practical browser/owner observations, rather than treating inventory as execution. */
+export function deriveFreshBrowserExecution(original: Record<string, any>, conversation: ObservedNativeConversation): Pick<FreshAgentQualificationRow,
+  'ingresses' | 'crashes' | 'pendingApproval' | 'writerProof' | 'isolation' | 'limits' | 'oldEnclosure'> {
+  const required = FRESH_AGENT_INGRESS_INVENTORY.map(({ ingress }) => ingress)
+  const routes: Record<string, any>[] = original.routes ?? []
+  const external = required.filter(id => !['startup-restore', 'auto-resume'].includes(id))
+  for (const id of external) {
+    const matching = routes.filter(route => route.ingress === id)
+    if (matching.length !== 1) throw new Error(`executed ingress ${id} is missing or repeated`)
+    const { request, reply, view } = matching[0]!
+    if (!view || view.launchState !== 'running' || view.recoveryState !== 'live' || view.freshAgentSessionType !== original.mode
+      || !view.nativeIdentityObservation || view.nativeSessionId !== view.nativeIdentityObservation.nativeSessionId) throw new Error(`executed ingress ${id} has no current native activation`)
+    if (id === 'history-resume' && request?.type === 'freshAgent.attach') {
+      if (request.sessionId !== view.freshAgentSessionId) throw new Error('executed history attach differs')
+    } else if (['browser-picker', 'browser-split', 'ws-create', 'history-resume'].includes(id)) {
+      if (request?.type !== 'freshAgent.create' || request.sessionType !== original.mode || !request.requestId
+        || reply?.type !== 'freshAgent.created' || reply.requestId !== request.requestId || reply.sessionId !== view.freshAgentSessionId) throw new Error(`executed ingress ${id} request/reply differs`)
+      if (id === 'history-resume' && request.sessionRef?.sessionId !== view.nativeSessionId) throw new Error('history resume did not use the actual native root')
+    } else if (id === 'ws-attach') {
+      // Successful attach has no wire acknowledgment. The exact current activation is the observed outcome.
+      if (request?.type !== 'freshAgent.attach' || request.sessionId !== view.freshAgentSessionId) throw new Error('executed ingress ws-attach differs')
+    } else {
+      const split = id.endsWith('split')
+      if (request?.method !== 'POST' || (split ? !/^\/api\/panes\/[^/]+\/split$/.test(request.path) : request.path !== '/api/tabs')
+        || !reply?.paneId || reply.sessionId !== view.freshAgentSessionId) throw new Error(`executed ingress ${id} request/reply differs`)
+    }
+  }
+  const allocations = original.allocations ?? []
+  if (allocations.length !== 2) throw new Error('two observed native allocations required')
+  const [main, other] = allocations
+  for (const allocation of allocations) {
+    const { view, writer, process, volume } = allocation
+    if (view.freshAgentSessionType !== original.mode || view.launchState !== 'running' || view.recoveryState !== 'live'
+      || writer.soulId !== view.soulId || writer.incarnationId !== view.incarnationId || writer.nativeSessionId !== view.nativeSessionId
+      || writer.activeClaimCount !== 1 || writer.globalConflictingClaimCount !== 0 || !volume.providerVolumeName
+      || process.native.launch.incarnationId !== view.incarnationId || process.native.uid !== 65534 || process.native.pid <= 1) throw new Error('observed allocation native process/writer differs')
+  }
+  if (main.view.soulId !== conversation.soulId || main.writer.providerStoreId !== conversation.providerStoreId
+    || main.view.nativeSessionId !== conversation.nativeSessionId) throw new Error('browser execution main allocation differs from native collection')
+  for (const field of ['soulId', 'incarnationId', 'containerId', 'nativeSessionId']) {
+    if (main.view[field] === other.view[field]) throw new Error(`independent allocation ${field} differs`)
+  }
+  if (main.writer.providerStoreId === other.writer.providerStoreId || main.volume.providerVolumeName === other.volume.providerVolumeName) throw new Error('independent provider store/volume differs')
+  const lifecycle: Record<string, any>[] = original.lifecycle ?? []
+  const target = (event: Record<string, any>, name: string) => event.event === name && event.data?.soulId === conversation.soulId
+  const releases = lifecycle.filter(event => target(event, 'supervisor.recovery.old_writer_released'))
+  const prepared = lifecycle.filter(event => target(event, 'supervisor.recovery.replacement_writer_prepared'))
+  const running = lifecycle.filter(event => target(event, 'supervisor.launch_running'))
+  for (const [index, stage] of conversation.stages.entries()) {
+    if (index === 0) continue
+    const prior = original.stageViews[index - 1], current = original.stageViews[index]
+    const release = releases.find(event => event.data.incarnationId === prior.incarnationId && event.data.containerId === prior.containerId
+      && event.data.providerStoreId === conversation.providerStoreId && event.data.outcome === 'verified_empty' && event.data.writerState === 'released')
+    const preparation = prepared.find(event => event.data.priorIncarnationId === prior.incarnationId && event.data.incarnationId === current.incarnationId
+      && event.data.providerStoreId === conversation.providerStoreId && event.data.nativeSessionId === conversation.nativeSessionId && event.data.writerState === 'prepared')
+    const launch = running.find(event => event.data.incarnationId === current.incarnationId && event.data.containerId === current.containerId)
+    if (!release || !preparation || !launch || lifecycle.indexOf(release) >= lifecycle.indexOf(preparation)
+      || lifecycle.indexOf(preparation) >= lifecycle.indexOf(launch)) throw new Error(`committed old writer release/preparation/running order differs at ${stage.stage}`)
+  }
+  if (!lifecycle.some(event => target(event, 'supervisor.runtime_observer.recovery_scheduled'))) throw new Error('automatic recovery was not observed')
+  const stable = (before: any, after: any) => ['soulId', 'incarnationId', 'containerId', 'nativeSessionId'].every(field => before.view[field] === after.view[field])
+    && ['pid', 'startTicks', 'executableSha256'].every(field => before.process.native[field] === after.process.native[field])
+  const web = (original.webRestarts ?? []).find((restart: any) => restart.before.view.soulId === conversation.soulId && stable(restart.before, restart.after))
+  if (!web) throw new Error('web restart did not retain the observed live native process')
+  const startup = (original.supervisorRestarts ?? []).find((restart: any) => restart.before.soulId === conversation.soulId
+    && ['soulId', 'incarnationId', 'containerId', 'nativeSessionId'].every(field => restart.before[field] === restart.after[field])
+    && restart.lifecycle.some((event: any) => event.event === 'supervisor.startup_scan.finished' && event.data.scanned > 0))
+  if (!startup) throw new Error('actual supervisor startup restore is missing')
+  const approvals = original.approvals ?? []
+  let pendingApproval: FreshAgentQualificationRow['pendingApproval'] = { supported: false }
+  if (MODE_CONTRACT[original.mode as QualifiableFreshAgentMode].pendingApproval) {
+    for (const recovery of ['web', 'host', 'provider']) for (const allowed of [true, false]) {
+      const cases = approvals.filter((value: any) => value.recovery === recovery && value.allowed === allowed)
+      if (cases.length !== 1) throw new Error('native solo Bash allow/deny recovery matrix is incomplete')
+      const value = cases[0], old = value.beforeCard, current = value.currentCard
+      if (old.decision_id !== current.decision_id || old.payload.tool.name !== 'Bash' || old.payload.tool.input.command !== value.command
+        || stableJson(old.payload.nativeCheckpoint) !== stableJson(current.payload.nativeCheckpoint)
+        || current.payload.nativeCheckpoint.nativeSessionId !== value.nativeRoot || current.payload.toolUseID !== old.payload.toolUseID
+        || current.payload.nativeBinding?.launch.incarnationId !== value.afterView.incarnationId
+        || (recovery === 'web' ? old.payload.nativeRequestId !== current.payload.nativeRequestId : old.payload.nativeRequestId === current.payload.nativeRequestId)
+        || value.beforeEffectCount !== 0 || value.currentEffectCount !== 0
+        || value.beforeNative.nativeRoot !== value.nativeRoot || value.currentNative.nativeRoot !== value.nativeRoot
+        || value.beforeNative.executableSha256 !== other.process.native.executableSha256
+        || value.currentNative.executableSha256 !== value.beforeNative.executableSha256
+        || value.beforeNative.version?.match(/\b\d+\.\d+\.\d+\b/)?.[0] !== main.process.version || value.currentNative.version !== value.beforeNative.version
+        || value.beforeNative.nativeCwd !== value.currentNative.nativeCwd
+        || !nativeCheckpointTranscriptRetained(value.beforeNative, value.currentNative, old.payload.toolUseID)) throw new Error('native solo Bash current checkpoint/input/profile differs')
+      observeNativeSoloBashOutcome({ nativeRoot: value.nativeRoot, toolUseID: old.payload.toolUseID, allowed, observed: value.events, effectCount: value.effectCount })
+      const dispatches = value.events.filter((event: any) => event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.permission.dispatch')
+      if (dispatches.length !== 1 || dispatches[0].data.payload.event.ok !== true
+        || value.browserDecision?.type !== 'freshAgent.approval.respond' || String(value.browserDecision.requestId) !== current.decision_id
+        || value.browserDecision.decision?.behavior !== (allowed ? 'allow' : 'deny') || value.recheckedEffectCount !== value.effectCount) throw new Error('native decision dispatch/effect replay differs')
+    }
+    pendingApproval = { supported: true, survivedWebRestart: approvals.some((value: any) => value.recovery === 'web'),
+      survivedHostRecovery: approvals.some((value: any) => value.recovery === 'host'), resolvedExactlyOnce: approvals.every((value: any) => value.effectCount === (value.allowed ? 1 : 0)),
+      decisionIdHash: createHash('sha256').update(approvals.map((value: any) => value.beforeCard.decision_id).join('\n')).digest('hex') }
+  } else if (approvals.length) throw new Error('unsupported adapter must not invent native approvals')
+  const last = conversation.stages.at(-1)!
+  return { ingresses: required, crashes: { web: ['abrupt_restart'], host: conversation.stages.slice(1).map(stage => stage.stage === 'after_session_host_crash' ? 'session_host_exit' : 'provider_process_exit') }, pendingApproval,
+    writerProof: { activeWriterCount: main.writer.activeClaimCount, conflictingWriterCount: main.writer.globalConflictingClaimCount,
+      dispatchCountForPrompt: conversation.stages.filter(stage => stage.requestId === last.requestId).length,
+      completionCountForPrompt: nativeCompletedTurnProofs(conversation).filter(turn => turn.turnId === nativeCompletedTurnProofs(conversation).at(-1)!.turnId).length },
+    isolation: { providerVolumeNameHash: createHash('sha256').update(main.volume.providerVolumeName).digest('hex'), enclosureIdHash: createHash('sha256').update(main.view.containerId).digest('hex'),
+      independentProviderStore: main.writer.providerStoreId !== other.writer.providerStoreId, independentEnclosure: main.view.containerId !== other.view.containerId },
+    limits: main.limits, oldEnclosure: { verifiedEmptyBeforeResume: releases.length >= conversation.stages.length - 1,
+      writerClaimReleasedBeforeResume: prepared.length >= conversation.stages.length - 1 } }
 }
 
 export type FreshAgentQualificationRow = {
@@ -179,6 +294,7 @@ export function buildFreshAgentQualificationReceipt(
   const observed = deriveNativeRecoveryOriginals({ evidenceDir: expectedDir, candidateSha: input.candidateSha, runId: input.receiptRunId, runtimeImage: input.runtimeImage, selected: input.selectedModes })
   validateDerivedNativeRows(input.rows, observed)
   validateNativeProfiles(repoRoot, expectedDir, input.rows, input.candidateSha, input.receiptRunId, input.runtimeImage, observed)
+  validateBrowserExecutions(expectedDir, input.rows, observed, input.candidateSha, input.receiptRunId, input.runtimeImage)
 
   const assertionPath = path.join(expectedDir, FRESH_AGENT_QUALIFICATION_ASSERTIONS_FILE)
   fs.writeFileSync(assertionPath, JSON.stringify({
@@ -274,9 +390,41 @@ export function validateFreshAgentQualificationReceipt(
   const observed = deriveNativeRecoveryOriginals({ evidenceDir, candidateSha: input.candidateSha, runId: receipt.receiptRunId, runtimeImage: input.expectedRuntimeImage, selected: receipt.selectedModes, originalReference: { path: NATIVE_RECOVERY_ORIGINALS_FILE, sha256: nativeReference.sha256 } })
   validateDerivedNativeRows(assertion.rows, observed)
   validateNativeProfiles(repoRoot, evidenceDir, assertion.rows, input.candidateSha, receipt.receiptRunId, input.expectedRuntimeImage, observed)
+  validateBrowserExecutions(evidenceDir, assertion.rows, observed, input.candidateSha, receipt.receiptRunId, input.expectedRuntimeImage)
   return {
     receipt: receipt as FreshAgentQualificationReceiptV1,
     rows: assertion.rows,
+  }
+}
+
+
+function validateBrowserExecutions(evidenceDir: string, rows: FreshAgentQualificationRow[], observed: ObservedNativeConversation[], candidateSha: string, runId: string, runtimeImage: string): void {
+  const manifest = JSON.parse(fs.readFileSync(path.join(evidenceDir, NATIVE_RECOVERY_ORIGINALS_FILE), 'utf8'))
+  for (const [index, row] of rows.entries()) {
+    if (!row.executionOriginal) throw new Error('fresh browser execution original is missing')
+    const original = JSON.parse(readNativeOriginalReference(evidenceDir, row.executionOriginal).bytes.toString('utf8'))
+    for (const [field, expected] of Object.entries({ candidateSha, runId, runtimeImage })) stringEqual(original.execution?.[field], expected, 'browser execution ' + field)
+    stringEqual(original.mode, row.mode, 'browser execution mode')
+    original.stageViews = manifest.conversations[index].stages.map((stage: any) => {
+      const launch = JSON.parse(readNativeOriginalReference(evidenceDir, stage.launch).bytes.toString('utf8'))
+      return launch.response?.data?.view ?? launch.response?.result?.Ok?.data?.view
+    })
+    const ui = object(original.ui, 'actual browser native turn')
+    const material = (reference: unknown) => nativeMaterial(evidenceDir, { nativeFile: reference }, row.provider, ui.nativeRoot)
+    const before = ui.boundary ? material(ui.boundary) : { history: { turns: [] }, inputs: [] }, after = material(ui.after)
+    const newInputs = after.inputs.filter(input => !before.inputs.some(prior => prior.id === input.id))
+    const last = after.history.turns.at(-1)!, evidence = last?.nativeEvidence
+    if (ui.nativeRoot !== original.allocations[1].view.nativeSessionId || ui.request?.type !== 'freshAgent.send'
+      || ui.request.text !== 'Reply ready. Do not use tools.' || ui.request.sessionId !== original.allocations[1].view.freshAgentSessionId
+      || ui.reply?.type !== 'freshAgent.send.accepted' || ui.reply.requestId !== ui.request.requestId
+      || ui.reply.sessionId !== ui.request.sessionId || before.history.turns.length !== ui.beforeTurns || after.history.turns.length !== before.history.turns.length + 1
+      || newInputs.length !== 1 || newInputs[0]!.text !== ui.request.text || evidence?.kind !== 'identified_message'
+      || (row.provider === 'codex' ? evidence.turnId !== newInputs[0]!.id : evidence.parentMessageId !== newInputs[0]!.id)
+      || last.toolCalls.length || stableJson(after.history.turns.slice(0, before.history.turns.length)) !== stableJson(before.history.turns)) throw new Error('actual browser native no-tool completion differs')
+    const derived = deriveFreshBrowserExecution(original, observed[index]!)
+    for (const [field, value] of Object.entries(derived)) {
+      if (stableJson(row[field]) !== stableJson(value)) throw new Error('browser execution derived ' + field + ' differs')
+    }
   }
 }
 

@@ -4030,6 +4030,143 @@ describe('actual owned runtime cleanup observations', () => {
 })
 
 describe('finite retained fresh native collection', () => {
+  it('retains an empty raw UI boundary without asking the completed-turn decoder to read it', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    const id = randomUUID(), current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    ;(rig as any).freshNativeCollections.set(id, { collectionId: id, soulId: 'main-soul', mode: 'freshclaude', provider: 'claude', providerStoreId: 'main-store' })
+    vi.spyOn(rig as any, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(rig as any, 'freshBrowserAllocation').mockResolvedValue({ view: { freshAgentSessionType: 'freshclaude' }, writer: { providerStoreId: 'independent-store' } })
+    vi.spyOn(rig, 'currentRuntimeEnclosure').mockResolvedValue({ freshAgentSessionId: 'actual-public-session' } as any)
+    vi.spyOn(rig as any, 'captureFreshNativeSource').mockResolvedValueOnce({ turns: [] }).mockResolvedValueOnce({ turns: [{ toolCalls: [] }] })
+    const materialize = vi.spyOn(rig as any, 'materializeNativeSource').mockImplementation(async (name: string) => ({ path: name, sha256: 'a'.repeat(64) }))
+    const challenge = await rig.registerFreshBrowserTurn(current, id)
+    const request = { type: 'freshAgent.send', sessionId: 'actual-public-session', requestId: 'actual-request', text: challenge.prompt }
+    await rig.finishFreshBrowserTurn(current, challenge.challengeId, request, { ...request, type: 'freshAgent.send.accepted' })
+    const ui = (rig as any).freshBrowserCollections.get(id).ui
+    expect(materialize).toHaveBeenCalledTimes(2)
+    expect(ui.beforeTurns).toBe(0)
+    expect(ui.boundary).toBeUndefined()
+    expect(ui.after.path).toContain('/completed')
+  })
+  it('makes selected fresh families available in the actual picker from the owned scratch configuration', async () => {
+    const home = path.join(fixtureRepoRoot, 'owned-browser-home')
+    let options!: owner.RuntimeWebConstructOptions
+    const info = { baseUrl: 'http://127.0.0.1:1', wsUrl: 'ws://127.0.0.1:1/ws', token: 'controlled-unused-token', homeDir: home }
+    const rig = new owner.ManagedRuntimeOwner(value => { options = value; return { info,
+      start: async () => { await value.setupHome?.(home); return info }, stop: async () => {} } as any }, fixtureRepoRoot, 5, {}, {}, 'release',
+      { enabledProviders: [], freshAgentModes: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] })
+    vi.spyOn(rig.runtime, 'prepare').mockResolvedValue(undefined)
+    vi.spyOn(rig as any, 'buildQualificationSupervisor').mockReturnValue(undefined)
+    vi.spyOn(rig as any, 'buildManagedServer').mockReturnValue('/controlled/unused-server')
+    vi.spyOn(rig.runtime, 'recordProviderQualificationBuild').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'recordFreshAgentQualificationBuild').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'startSupervisor').mockResolvedValue({ containerId: 'f'.repeat(64), controlSocket: '/controlled/socket', controlSecretFile: '/controlled/secret' } as any)
+    const React = await import('react'), { Provider } = await import('react-redux'), { configureStore } = await import('@reduxjs/toolkit')
+    const { render } = await import('@testing-library/react/pure'), { default: PanePicker } = await import('../../../../src/components/panes/PanePicker.js')
+    try {
+      await rig.start()
+      const configuration = JSON.parse(await fsp.readFile(path.join(home, '.freshell/config.json'), 'utf8'))
+      const state = { settings: { settings: configuration.settings }, connection: { platform: 'linux', availableClis: { claude: true, codex: true, opencode: true }, featureFlags: { kilroy: options.env.KILROY_ENABLED === '1' } },
+        extensions: { entries: [] }, panes: { activePane: { tab: 'pane' } }, tabs: { activeTabId: 'tab' } }
+      const renderPicker = () => {
+        const store = configureStore({ reducer: () => state })
+        const rendered = render(React.createElement(Provider, { store, children: React.createElement(PanePicker, { tabId: 'tab', paneId: 'pane', isOnlyPane: true, focusEligible: false, onSelect: () => {} }) }))
+        try { return Array.from(rendered.container.querySelectorAll('button')).map(button => button.getAttribute('aria-label')) }
+        finally { rendered.unmount() }
+      }
+      expect(renderPicker()).toEqual(expect.arrayContaining(['Freshclaude', 'Kilroy', 'Freshcodex', 'Freshopencode']))
+      // This is a picker behavior test: removing the fresh family support
+      // changes the rendered choices, while terminal qualification stays empty.
+      configuration.settings.codingCli.enabledProviders = []
+      expect(renderPicker()).not.toContain('Freshclaude')
+      expect(rig.fixtureRegistrationFacts().enabledProviders).toEqual([])
+    } finally { await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+  it('drains native event pages without skipping the checkpoint beyond the first page', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    let calls = 0
+    const permission = { kind: 'permission_requested', data: { payload: { nativeCheckpoint: { toolUseID: 'toolu_actual' } } } }
+    vi.spyOn(rig.runtime, 'adminOk').mockImplementation(async (_supervisor, body) => {
+      calls++
+      expect(body.params.afterSequence).toBe(calls === 1 ? 0 : 2)
+      return { data: { head: 3, reset_required: false, events: calls === 1
+        ? [1, 2].map(sequence => ({ sequence, event: { kind: 'provider', data: { payload: { event: { type: 'freshAgent.status' } } } } }))
+        : [{ sequence: 3, event: permission }] } } as any
+    })
+    const challenge = { soulId: 'owned-soul', cursor: 0, batches: [], events: [] }
+    await expect((rig as any).freshApprovalEvents(challenge, (event: any) => event.kind === 'permission_requested')).resolves.toEqual(permission)
+    expect(challenge.cursor).toBe(3)
+    expect(challenge.events).toHaveLength(3)
+  })
+  it.each([['web', true], ['web', false], ['host', true], ['host', false], ['provider', true], ['provider', false]] as const)('observes the current solo Bash callback and independent effect (%s allow=%s)', async (recovery, allowed) => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'owned-browser-approval-'))
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    const address = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    let current = { ...address, freshAgentSessionType: 'freshclaude', freshAgentSessionId: 'actual-browser-session', launchState: 'running', recoveryState: 'live' }
+    vi.spyOn(rig, 'assertCurrentHandle').mockImplementation(async requested => { expect(requested.incarnationId).toBe(current.incarnationId) })
+    vi.spyOn(rig as any, 'currentRuntimeEnclosure').mockImplementation(async () => current)
+    vi.spyOn(rig, 'freshAgentLaunchFacts').mockResolvedValue({ provider: 'claude', version: '2.1.237', workerPid: 42 })
+    vi.spyOn(rig as any, 'retainNativeOriginal').mockResolvedValue({ path: 'private-controlled.json', sha256: 'a'.repeat(64) })
+    let native: any, card: any, pending: any[] = [], head = 0
+    vi.spyOn(rig.runtime, 'adminOk').mockImplementation(async (_supervisor, request) => {
+      expect(request.method).toBe('fresh_agent_read_events')
+      const events = pending; pending = []; head += events.length
+      return { data: { head, reset_required: false, events: events.map((event, index) => ({ sequence: head - events.length + index + 1, event })) } } as any
+    })
+    const effect = path.join(directory, 'effect.jsonl')
+    vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (_container, args) => {
+      if (args[2]?.startsWith('import pathlib,sys,json;')) return execFileSync('python3', ['-c', args[2], effect], { encoding: 'utf8' })
+      return JSON.stringify(native)
+    })
+    vi.spyOn(rig as any, 'ownedDockerProbe').mockImplementation(async (_container: string, _args: string[], providerUser: boolean) => {
+      const value = providerUser ? { phase: 'approval_waiting', nativeSessionId: address.nativeSessionId, toolUseID: card.payload.toolUseID,
+        inputDigest: card.payload.nativeCheckpoint.inputDigest, profileDigest: card.payload.nativeCheckpoint.profileDigest, nativeBinding: card.payload.nativeBinding }
+        : { decisions: { [card.decision_id]: { state: 'pending', payload: card.payload } } }
+      const bytes = Buffer.from(JSON.stringify(value))
+      return JSON.stringify({ readerUid: providerUser ? 65534 : 0, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') })
+    })
+    try {
+      const registered = await rig.registerFreshApproval(address, allowed, recovery)
+      const challenge = (rig as any).freshApprovalChallenges.get(registered.challengeId)
+      const toolUseID = 'toolu_actual_original'
+      card = { decision_id: 'actual-browser-decision', payload: { tool: { name: 'Bash', input: { command: challenge.command } }, toolUseID,
+        nativeCheckpoint: { nativeSessionId: address.nativeSessionId, toolUseID, inputDigest: 'd'.repeat(64), profileDigest: 'e'.repeat(64) },
+        nativeRequestId: 'original-native-callback', nativeBinding: { nativeRequestId: 'original-native-callback', launch: { incarnationId: address.incarnationId } } } }
+      const bytes = Buffer.from(JSON.stringify({ type: 'assistant', sessionId: address.nativeSessionId, message: { content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command: challenge.command } }] } }) + '\n')
+      native = { nativeRoot: address.nativeSessionId, nativeLaunch: { incarnationId: address.incarnationId },
+        transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
+      pending = [{ kind: 'permission_requested', data: card }]
+      await rig.captureFreshApprovalCheckpoint(address, registered.challengeId)
+      if (recovery !== 'web') {
+        current = { ...current, incarnationId: 'replacement-inc', containerId: 'd'.repeat(64), hostBootId: 'replacement-boot' }
+        card = structuredClone(card); card.payload.nativeRequestId = 'current-native-callback'
+        card.payload.nativeBinding = { nativeRequestId: 'current-native-callback', launch: { incarnationId: current.incarnationId } }
+        native.nativeLaunch.incarnationId = current.incarnationId
+        pending = [{ kind: 'permission_requested', data: card }]
+      }
+      const currentAddress = { ...address, incarnationId: current.incarnationId, containerId: current.containerId, hostBootId: current.hostBootId }
+      const checkpoint = await rig.captureFreshApprovalCheckpoint(currentAddress, registered.challengeId)
+      expect(checkpoint.decisionId).toBe('actual-browser-decision')
+      const decision = { type: 'freshAgent.approval.respond', sessionId: current.freshAgentSessionId, requestId: checkpoint.decisionId, decision: { behavior: allowed ? 'allow' : 'deny' } }
+      await expect(rig.finishFreshApproval(currentAddress, registered.challengeId, { ...decision, requestId: 'stale-card' })).rejects.toThrow(/current browser decision/)
+      expect(fs.existsSync(effect)).toBe(false)
+      if (allowed) await fsp.writeFile(effect, 'effect\n')
+      pending = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, requestId: checkpoint.decisionId } } } },
+        { kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result', content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
+        { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: address.nativeSessionId, isError: false } } } }]
+      await rig.finishFreshApproval(currentAddress, registered.challengeId, decision)
+      expect(challenge).toMatchObject({ finished: true, effectCount: allowed ? 1 : 0, recheckedEffectCount: allowed ? 1 : 0 })
+      await expect(rig.finishFreshApproval(currentAddress, registered.challengeId, decision)).rejects.toThrow(/captured current/)
+    } finally { await fsp.rm(directory, { recursive: true, force: true }) }
+  })
+  it('refuses a browser UI challenge on the collection allocation itself', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    const id = randomUUID()
+    ;(rig as any).freshNativeCollections.set(id, { collectionId: id, soulId: current.soulId, mode: 'freshclaude', nativeSessionId: current.nativeSessionId })
+    await expect((rig as any).registerFreshBrowserTurn(current, id)).rejects.toThrow(/independent allocation/)
+    expect((rig as any).freshBrowserChallenges.size).toBe(0)
+  })
   it('still attempts owned cleanup when writing incomplete collection status fails', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
     const collections = (rig as any).freshNativeCollections as Map<string, unknown>

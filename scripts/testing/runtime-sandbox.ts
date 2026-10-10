@@ -16,7 +16,8 @@ import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchem
 import fsp from 'node:fs/promises'
 import { defaultReceiptFileName } from './runtime-receipts.js'
 import { buildProviderQualificationReceipt, type ProviderQualificationReceiptV2, type ProviderQualificationRow } from './provider-qualification-receipt.js'
-import { buildFreshAgentQualificationReceipt, nativeCompletedTurnProofs, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
+import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
+import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome } from './runtime-native-feasibility.js'
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
 import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
 import type { NativeHistory } from './provider-native-history.js'
@@ -740,6 +741,12 @@ export const FreshNativeCollectionResultSchema = z.object({ collectionId: z.stri
   || (value.closed && value.completedStages === 3 && value.providerStoreId !== undefined && value.completedNativeTurns !== undefined),
 'native IDs require the successful closed three-stage collection')
 export type FreshNativeCollectionResult = z.infer<typeof FreshNativeCollectionResultSchema>
+export const FreshBrowserChallengeResultSchema = z.object({ challengeId: z.string().uuid(), prompt: z.string().optional(),
+  decisionId: z.string().optional(), toolUseID: z.string().optional(), nativeRequestId: z.string().optional() }).strict()
+export type FreshBrowserChallengeResult = z.infer<typeof FreshBrowserChallengeResultSchema>
+export const FreshBrowserIngressObservationSchema = z.object({ ingress: z.enum(['browser-picker', 'browser-split', 'history-resume', 'ws-create', 'ws-attach',
+  'rest-tab', 'rest-split', 'mcp-new-tab', 'mcp-split', 'startup-restore', 'auto-resume']), request: z.record(z.string(), z.any()), reply: z.record(z.string(), z.any()).optional() }).strict()
+  .refine(value => Buffer.byteLength(JSON.stringify(value)) <= 32768, 'bounded browser route observation required')
 type FreshNativeCollection = {
   collectionId: string; mode: string; provider: string; soulId: string; providerStoreId: string; nativeSessionId: string
   nonce: string; stages: Record<string, unknown>[]; lastHandle: ExactRuntimeHandle; closed: boolean; failed: boolean
@@ -1475,7 +1482,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'interrupted-stop-history', 'interrupted-stop-arm', 'interrupted-stop-counters', 'interrupted-stop-facts',
     'interrupted-stop-crash-facts', 'interrupted-stop-artifact',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'provider-receipt', 'fresh-agent-launch-facts', 'fresh-native-register', 'fresh-native-stage', 'fresh-native-finish', 'container-state', 'host-process-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'provider-receipt', 'fresh-agent-launch-facts', 'fresh-native-register', 'fresh-native-stage', 'fresh-native-finish', 'fresh-browser-ingress', 'fresh-browser-turn-register', 'fresh-browser-turn-finish', 'fresh-browser-row', 'fresh-approval-register', 'fresh-approval-checkpoint', 'fresh-approval-finish', 'container-state', 'host-process-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -1498,6 +1505,11 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     hostBootId: z.string().min(1) }).strict().optional(),
   nativeCollectionId: z.string().uuid().optional(),
   nativeCollectionNonce: z.string().regex(/^codename-[a-f0-9]{32}$/).optional(),
+  freshBrowserIngress: FreshBrowserIngressObservationSchema.optional(),
+  freshBrowserRequest: z.record(z.string(), z.any()).optional(),
+  freshBrowserReply: z.record(z.string(), z.any()).optional(),
+  freshApprovalAllowed: z.boolean().optional(),
+  freshApprovalRecovery: z.enum(['web', 'host', 'provider']).optional(),
   challengeId: z.string().min(1).optional(),
   incidentId: z.string().min(1).max(200).optional(),
   expectedControlEpoch: z.number().int().nonnegative().optional(),
@@ -4524,6 +4536,11 @@ export class ManagedRuntimeOwner {
   private readonly nativeChallenges = new Map<string, { soulId: string; nativeSessionId: string; marker: string }>()
   private readonly freshNativeProcesses = new Map<string, z.infer<typeof FreshNativeProcessSchema>>()
   private readonly freshNativeCollections = new Map<string, FreshNativeCollection>()
+  private readonly freshBrowserCollections = new Map<string, { routes: any[]; auxiliarySoulId?: string; ui?: any }>()
+  private readonly freshBrowserChallenges = new Map<string, any>()
+  private readonly freshApprovalChallenges = new Map<string, any>()
+  private readonly freshWebRestarts: any[] = []
+  private readonly freshSupervisorRestarts: any[] = []
   private readonly nativeCaptures = new Set<Promise<unknown>>()
   private readonly nativeCaptureFailures: string[] = []
   private nativeCollectionsClosing = false
@@ -5240,7 +5257,7 @@ export class ManagedRuntimeOwner {
         FRESHELL_BIND_HOST: '0.0.0.0',
         FRESHELL_MANAGED_RUNTIME_V1: '1',
         ...(this.freshAgentModes.length > 0
-          ? { FRESHELL_MANAGED_FRESH_AGENT_V1: '1' }
+          ? { FRESHELL_MANAGED_FRESH_AGENT_V1: '1', ...(this.freshAgentModes.includes('kilroy') ? { KILROY_ENABLED: '1' } : {}) }
           : {}),
         ...(this.fixtureFreshAgentModes.length > 0
           ? { FRESHELL_MANAGED_FRESH_AGENT_FIXTURE_MODES: this.fixtureFreshAgentModes.join(',') }
@@ -5258,7 +5275,7 @@ export class ManagedRuntimeOwner {
           settings: {
             defaultCwd: this.workspaceCwd,
             codingCli: {
-              enabledProviders: this.enabledProviders,
+              enabledProviders: [...new Set([...this.enabledProviders, ...this.freshAgentModes.map(mode => mode === 'freshcodex' ? 'codex' : mode === 'freshopencode' ? 'opencode' : 'claude')])],
               providers: {
                 ...(this.enabledProviders.includes('opencode')
                   ? { opencode: { model: P2_OPENCODE_MODEL } }
@@ -5336,7 +5353,23 @@ export class ManagedRuntimeOwner {
   }
 
   async crashAndRestartWeb(): Promise<RuntimeWebInfo> {
-    return this.withManagedBin(() => this.web.restartAbrupt())
+    const before = await this.observeLiveFreshAllocations()
+    const info = await this.withManagedBin(() => this.web.restartAbrupt())
+    const after = await this.observeLiveFreshAllocations()
+    for (const allocation of before) {
+      const current = after.find(value => value.view.soulId === allocation.view.soulId)
+      if (current) this.freshWebRestarts.push({ before: allocation, after: current, observedAt: Date.now() })
+    }
+    return info
+  }
+
+  private async observeLiveFreshAllocations() {
+    if (!this.freshNativeCollections.size || this.runtime.phase !== 5) return []
+    const views = (await this.inventory()).filter(view => view.launchState === 'running' && view.nativeSessionId
+      && this.freshAgentModes.includes(view.freshAgentSessionType ?? '') && !this.fixtureFreshAgentModes.includes(view.freshAgentSessionType ?? ''))
+    const allocations = []
+    for (const view of views) allocations.push(await this.freshBrowserAllocation(this.exactRuntimeHandle(view)))
+    return allocations
   }
 
   async crashWeb(): Promise<RuntimeWebInfo> {
@@ -5344,7 +5377,15 @@ export class ManagedRuntimeOwner {
   }
 
   async restartSupervisor(): Promise<SupervisorInstance> {
-    return this.replaceSupervisor('graceful')
+    const before = await this.observeLiveFreshAllocations()
+    const instance = await this.replaceSupervisor('graceful')
+    const after = await this.observeLiveFreshAllocations()
+    const lifecycle = before.length ? await this.readOwnedLifecycle() : []
+    for (const allocation of before) {
+      const current = after.find(value => value.view.soulId === allocation.view.soulId)
+      if (current) this.freshSupervisorRestarts.push({ before: allocation.view, after: current.view, lifecycle, observedAt: Date.now() })
+    }
+    return instance
   }
 
   async restartSupervisorAbrupt(): Promise<SupervisorInstance> {
@@ -5687,6 +5728,213 @@ export class ManagedRuntimeOwner {
     })
     this.nativeCaptures.add(result)
     return result
+  }
+
+
+  private freshBrowserCollection(collectionId: string) {
+    const collection = this.freshNativeCollections.get(collectionId)
+    if (!collection || collection.failed || this.nativeCollectionsClosing || this.stopSettlement) throw new Error('registered fresh collection required')
+    let browser = this.freshBrowserCollections.get(collectionId)
+    if (!browser) { browser = { routes: [] }; this.freshBrowserCollections.set(collectionId, browser) }
+    return { collection, browser }
+  }
+
+  private async freshBrowserAllocation(handle: ExactRuntimeHandle) {
+    await this.freshAgentLaunchFacts(this.runtimeEnclosureHandle(handle))
+    return { view: await this.currentRuntimeEnclosure(handle), writer: await this.writerClaimFacts(handle),
+      volume: await this.providerVolumeFacts(handle), process: this.freshNativeProcesses.get(JSON.stringify(this.runtimeEnclosureHandle(handle)))!,
+      limits: (await this.chaosHostFacts(handle)).limits }
+  }
+
+  async observeFreshBrowserIngress(handle: ExactRuntimeHandle, collectionId: string, observation: FreshBrowserIngressObservation): Promise<void> {
+    return this.trackNativeCapture(async () => {
+      const { collection, browser } = this.freshBrowserCollection(collectionId)
+      await this.assertCurrentHandle(handle)
+      const view = await this.currentRuntimeEnclosure(handle)
+      if (view.freshAgentSessionType !== collection.mode || browser.routes.some(route => route.ingress === observation.ingress)
+        || ['startup-restore', 'auto-resume'].includes(observation.ingress)) throw new Error('one executed browser route on the selected mode required')
+      browser.routes.push({ ...FreshBrowserIngressObservationSchema.parse(observation), view, observedAt: Date.now() })
+    })
+  }
+
+  async registerFreshBrowserTurn(handle: ExactRuntimeHandle, collectionId: string): Promise<FreshBrowserChallengeResult> {
+    const { collection, browser } = this.freshBrowserCollection(collectionId)
+    if (collection.soulId === handle.soulId || browser.auxiliarySoulId) throw new Error('one independent allocation required for browser UI turn')
+    return this.trackNativeCapture(async () => {
+      await this.assertCurrentHandle(handle)
+      const allocation = await this.freshBrowserAllocation(handle)
+      if (allocation.view.freshAgentSessionType !== collection.mode || allocation.writer.providerStoreId === collection.providerStoreId) throw new Error('independent selected native allocation required')
+      const captured = await this.captureFreshNativeSource(handle, collection.provider, true)
+      const challengeId = randomUUID(), prefix = 'fresh-browser-' + collectionId + '/ui'
+      const boundary = await this.materializeNativeSource(prefix + '/boundary', captured)
+      browser.auxiliarySoulId = handle.soulId
+      this.freshBrowserChallenges.set(challengeId, { challengeId, collectionId, handle, provider: collection.provider,
+        // Keep the raw empty boundary, but completed-turn decoders require
+        // at least one completion. The first UI send starts at zero turns.
+        boundary: captured.turns.length ? boundary : undefined, beforeTurns: captured.turns.length, prompt: 'Reply ready. Do not use tools.' })
+      return { challengeId, prompt: 'Reply ready. Do not use tools.' }
+    })
+  }
+
+  async finishFreshBrowserTurn(handle: ExactRuntimeHandle, challengeId: string, request: Record<string, any>, reply: Record<string, any>): Promise<void> {
+    return this.trackNativeCapture(async () => {
+      const challenge = this.freshBrowserChallenges.get(challengeId)
+      if (!challenge || challenge.finished || JSON.stringify(handle) !== JSON.stringify(challenge.handle)
+        || request.type !== 'freshAgent.send' || request.text !== challenge.prompt
+        || reply.type !== 'freshAgent.send.accepted' || request.requestId !== reply.requestId
+        || request.sessionId !== reply.sessionId) throw new Error('registered actual browser send/ack required')
+      const view = await this.currentRuntimeEnclosure(handle)
+      if (view.freshAgentSessionId !== request.sessionId) throw new Error('browser send activation differs')
+      const deadline = Date.now() + 90_000
+      let captured: FreshCapturedNativeHistory | undefined
+      while (Date.now() < deadline) {
+        await this.assertCurrentHandle(handle)
+        try { captured = await this.captureFreshNativeSource(handle, challenge.provider) } catch { captured = undefined }
+        if (captured && captured.turns.length > challenge.beforeTurns) break
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+      if (!captured || captured.turns.length !== challenge.beforeTurns + 1 || captured.turns.at(-1)!.toolCalls.length) throw new Error('actual browser no-tool native completion differs')
+      const after = await this.materializeNativeSource('fresh-browser-' + challenge.collectionId + '/ui/completed', captured)
+      this.freshBrowserCollection(challenge.collectionId).browser.ui = { provider: challenge.provider, nativeRoot: handle.nativeSessionId,
+        boundary: challenge.boundary, after, request, reply, beforeTurns: challenge.beforeTurns }
+      challenge.finished = true
+    })
+  }
+
+  async registerFreshApproval(handle: ExactRuntimeHandle, allowed: boolean, recovery: 'web' | 'host' | 'provider'): Promise<FreshBrowserChallengeResult> {
+    return this.trackNativeCapture(async () => {
+      await this.assertCurrentHandle(handle)
+      const view = await this.currentRuntimeEnclosure(handle)
+      if (!['freshclaude', 'kilroy'].includes(view.freshAgentSessionType ?? '') || !this.freshAgentModes.includes(view.freshAgentSessionType!)
+        || this.fixtureFreshAgentModes.includes(view.freshAgentSessionType!)) throw new Error('actual Claude-backed native approval allocation required')
+      await this.freshAgentLaunchFacts(this.runtimeEnclosureHandle(handle))
+      const challengeId = randomUUID(), effectPath = '/home/freshell/provider/owned-native-effect-' + challengeId + '.jsonl'
+      const command = "printf 'effect\\n' >> '" + effectPath + "'"
+      const baseline = await this.runtime.adminOk(this.supervisor, { method: 'fresh_agent_read_events', params: { soulId: handle.soulId, afterSequence: 0, maxEvents: 128 } })
+      const challenge = { challengeId, allowed, recovery, soulId: handle.soulId, nativeRoot: handle.nativeSessionId,
+        beforeView: view, effectPath, command, cursor: baseline.data.head, events: [] as any[], batches: [] as any[] }
+      if (await this.freshApprovalEffect(challenge, handle) !== 0) throw new Error('new effect oracle must be absent')
+      this.freshApprovalChallenges.set(challengeId, challenge)
+      return { challengeId, prompt: 'Use the Bash tool exactly once with this exact command: ' + command + '. Do not use other tools or another command. After its result, reply done. If denied, do not retry, use no other tools, and reply done.' }
+    })
+  }
+
+  private async freshApprovalEffect(challenge: any, handle: ExactRuntimeHandle): Promise<number> {
+    const raw = await this.ownedProviderExec(handle.containerId, ['python3', '-c',
+      "import pathlib,sys,json;p=pathlib.Path(sys.argv[1]);b=p.read_bytes() if p.exists() else b'';assert b==b'effect\\n'*b.count(b'\\n');print(json.dumps(b.count(b'\\n')))", challenge.effectPath])
+    return z.number().int().nonnegative().parse(JSON.parse(raw))
+  }
+
+  private async freshApprovalEvents(challenge: any, select: (event: any) => boolean): Promise<any> {
+    const deadline = Date.now() + 90_000
+    while (Date.now() < deadline) {
+      if (this.nativeCollectionsAborted) throw new Error('native approval observation aborted')
+      const { events } = await this.readFreshApprovalEvents(challenge)
+      const found = events.find(select)
+      if (found) return found
+      if (events.some((event: any) => event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.result')) throw new Error('native completion preceded required approval checkpoint')
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    throw new Error('bounded native approval observation deadline exceeded')
+  }
+
+  private async readFreshApprovalEvents(challenge: any): Promise<{ head: number; events: any[] }> {
+    const batch = await this.runtime.adminOk(this.supervisor, { method: 'fresh_agent_read_events',
+      params: { soulId: challenge.soulId, afterSequence: challenge.cursor, maxEvents: 128 } })
+    if (batch.data.reset_required) throw new Error('native approval event retention gap')
+    challenge.batches.push(batch)
+    challenge.cursor = batch.data.events.at(-1)?.sequence ?? batch.data.head
+    const events = batch.data.events.map((row: any) => row.event)
+    challenge.events.push(...events)
+    return { head: batch.data.head, events }
+  }
+
+  async captureFreshApprovalCheckpoint(handle: ExactRuntimeHandle, challengeId: string): Promise<FreshBrowserChallengeResult> {
+    return this.trackNativeCapture(async () => {
+      const challenge = this.freshApprovalChallenges.get(challengeId)
+      if (!challenge || challenge.finished || challenge.soulId !== handle.soulId || challenge.nativeRoot !== handle.nativeSessionId) throw new Error('registered native approval challenge required')
+      await this.assertCurrentHandle(handle)
+      const view = await this.currentRuntimeEnclosure(handle)
+      const card = challenge.beforeCard && challenge.recovery === 'web' ? challenge.beforeCard
+        : (await this.freshApprovalEvents(challenge, event => event.kind === 'permission_requested' && !!event.data.payload.nativeCheckpoint)).data
+      const native = JSON.parse(await this.ownedProviderExec(handle.containerId, ['python3', '-c', claudeNativeInspection, handle.nativeSessionId, 'true', 'fresh', 'ordinary']))
+      const files = []
+      for (const [file, providerUser] of [['/home/freshell/provider/.freshell/native-checkpoints/claude/' + handle.nativeSessionId + '.json', true], ['/run/freshell-host-actor/fresh-agent-state.json', false]] as const) {
+        files.push(JSON.parse(await this.ownedDockerProbe(handle.containerId, ['python3', '-c',
+          "import pathlib,json,base64,hashlib,sys,os;p=pathlib.Path(sys.argv[1]);b=p.read_bytes();assert len(b)<=32*1024*1024;json.loads(b);print(json.dumps({'path':str(p),'sha256':hashlib.sha256(b).hexdigest(),'bytesBase64':base64.b64encode(b).decode(),'readerUid':os.getuid()}))", file], providerUser)))
+      }
+      const effectCount = await this.freshApprovalEffect(challenge, handle)
+      if (card.payload.tool?.name !== 'Bash' || card.payload.tool.input?.command !== challenge.command
+        || card.payload.nativeCheckpoint.nativeSessionId !== challenge.nativeRoot || card.payload.nativeCheckpoint.toolUseID !== card.payload.toolUseID
+        || native.nativeLaunch.incarnationId !== handle.incarnationId || effectCount !== 0) throw new Error('actual native solo Bash checkpoint/input differs')
+      if (!challenge.beforeCard) Object.assign(challenge, { beforeCard: card, beforeNative: native, beforeFiles: files, beforeEffectCount: effectCount })
+      else {
+        if (challenge.beforeCard.decision_id !== card.decision_id || !nativeCheckpointTranscriptRetained(challenge.beforeNative, native, card.payload.toolUseID)
+          || JSON.stringify(challenge.beforeCard.payload.nativeCheckpoint) !== JSON.stringify(card.payload.nativeCheckpoint)
+          || (challenge.recovery === 'web' ? challenge.beforeView.incarnationId !== view.incarnationId
+            : challenge.beforeView.incarnationId === view.incarnationId || challenge.beforeCard.payload.nativeRequestId === card.payload.nativeRequestId)) throw new Error('current native callback/checkpoint did not survive recovery')
+        Object.assign(challenge, { currentCard: card, currentNative: native, currentFiles: files, currentEffectCount: effectCount, afterView: view })
+      }
+      await this.retainNativeOriginal('fresh-approval-' + challengeId + '/' + (challenge.currentCard ? 'current' : 'before') + '.json', { card, native, files, effectCount, view })
+      return { challengeId, decisionId: card.decision_id, toolUseID: card.payload.toolUseID, nativeRequestId: card.payload.nativeRequestId }
+    })
+  }
+
+  async finishFreshApproval(handle: ExactRuntimeHandle, challengeId: string, decision: Record<string, any>): Promise<void> {
+    return this.trackNativeCapture(async () => {
+      const challenge = this.freshApprovalChallenges.get(challengeId)
+      if (!challenge?.currentCard || challenge.finished || challenge.soulId !== handle.soulId || challenge.nativeRoot !== handle.nativeSessionId) throw new Error('captured current native approval required')
+      await this.assertCurrentHandle(handle)
+      const view = await this.currentRuntimeEnclosure(handle)
+      if (decision.type !== 'freshAgent.approval.respond' || decision.sessionId !== view.freshAgentSessionId || String(decision.requestId) !== challenge.currentCard.decision_id
+        || decision.decision?.behavior !== (challenge.allowed ? 'allow' : 'deny')) throw new Error('actual current browser decision differs')
+      challenge.browserDecision = decision
+      const terminal = await this.freshApprovalEvents(challenge, event => event.kind === 'permission_requested'
+        || event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.result')
+      if (terminal.kind === 'permission_requested') throw new Error('bounded native decision requested another operation')
+      challenge.effectCount = await this.freshApprovalEffect(challenge, handle)
+      observeNativeSoloBashOutcome({ nativeRoot: challenge.nativeRoot, toolUseID: challenge.beforeCard.payload.toolUseID,
+        allowed: challenge.allowed, observed: challenge.events, effectCount: challenge.effectCount })
+      await new Promise(resolve => setTimeout(resolve, 1_000))
+      const deadline = Date.now() + 5_000
+      let batch = await this.readFreshApprovalEvents(challenge)
+      while (challenge.cursor < batch.head) {
+        if (Date.now() >= deadline) throw new Error('bounded native post-decision drain deadline exceeded')
+        batch = await this.readFreshApprovalEvents(challenge)
+      }
+      challenge.recheckedEffectCount = await this.freshApprovalEffect(challenge, handle)
+      if (challenge.recheckedEffectCount !== challenge.effectCount || challenge.events.filter((event: any) => event.kind === 'permission_requested').length !== (challenge.recovery === 'web' ? 1 : 2)) throw new Error('native approval replayed')
+      challenge.finished = true
+      await this.retainNativeOriginal('fresh-approval-' + challengeId + '/outcome.json', challenge)
+    })
+  }
+
+  async captureFreshBrowserRow(handle: ExactRuntimeHandle, collectionId: string): Promise<FreshAgentQualificationRow> {
+    return this.trackNativeCapture(async () => {
+      const { collection, browser } = this.freshBrowserCollection(collectionId)
+      if (collection.stages.length !== 3 || !browser.ui || !browser.auxiliarySoulId || handle.soulId !== collection.soulId) throw new Error('three native stages and actual independent browser turn required')
+      const other = (await this.inventory()).find(view => view.soulId === browser.auxiliarySoulId && view.launchState === 'running')
+      if (!other) throw new Error('current independent allocation absent')
+      const allocations = [await this.freshBrowserAllocation(handle), await this.freshBrowserAllocation(this.exactRuntimeHandle(other))]
+      const stageViews = []
+      for (const stage of collection.stages) {
+        const value = JSON.parse(await fsp.readFile(path.join(this.runtime.evidenceDir, (stage.launch as NativeOriginalReference).path), 'utf8'))
+        stageViews.push(value.response.data.view)
+      }
+      const original = { mode: collection.mode, routes: browser.routes, ui: browser.ui, allocations, stageViews,
+        lifecycle: await this.readOwnedLifecycle(), webRestarts: this.freshWebRestarts, supervisorRestarts: this.freshSupervisorRestarts,
+        approvals: [...this.freshApprovalChallenges.values()].filter(value => value.soulId === browser.auxiliarySoulId && value.finished) }
+      const reference = await this.retainNativeOriginal('fresh-browser-' + collectionId + '/execution.json', original)
+      const manifestPath = 'fresh-native-' + collectionId + '/manifest.json'
+      const conversation = deriveNativeRecoveryOriginals({ evidenceDir: this.runtime.evidenceDir, candidateSha: this.runtime.candidateSha, runId: this.runtime.runId,
+        runtimeImage: this.runtime.imageRef, selected: [collection.mode], originalReference: { path: manifestPath, sha256: createHash('sha256').update(await fsp.readFile(path.join(this.runtime.evidenceDir, manifestPath))).digest('hex') } })[0]!
+      const accepted = JSON.parse(await fsp.readFile(path.join(this.runtime.evidenceDir, 'fresh-native-' + collectionId + '/stage-2/accepted.json'), 'utf8'))
+      return { mode: collection.mode as FreshAgentQualificationRow['mode'], provider: collection.provider, providerVersion: allocations[0]!.process.version,
+        model: accepted.spec.model, effort: accepted.spec.effort ?? 'provider-default', runtimeVariant: accepted.spec.runtimeVariant,
+        actualProviderProcess: true, fixtureTransport: false, soulId: collection.soulId, nativeSessionId: collection.nativeSessionId,
+        providerStoreId: collection.providerStoreId, completedNativeTurns: nativeCompletedTurnProofs(conversation), noToolRecall: conversation.stages.slice(1).every(stage => stage.recalledNonce),
+        ...deriveFreshBrowserExecution(original, conversation), executionOriginal: reference }
+    })
   }
 
   private nativeCollectionResult(collection: FreshNativeCollection): FreshNativeCollectionResult {

@@ -3,13 +3,10 @@
  * the default campaign and never selects a fixture transport. The exact mode
  * allowlist is parsed before the RuntimeHarness (and therefore Docker) exists.
  */
-import { createHash } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 
 import { expect, type Page } from '@playwright/test'
 
-import {
-  FRESH_AGENT_INGRESS_INVENTORY,
-} from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
 import type { FreshAgentQualificationRow } from '../../../scripts/testing/fresh-agent-qualification-receipt.js'
 import {
   FRESH_AGENT_QUALIFICATION_MODES_ENV,
@@ -20,6 +17,7 @@ import { FRESH_AGENT_QUALIFICATION_LIVE_ENV } from '../../../scripts/testing/run
 import { executeAction } from '../../../tools/freshell-mcp/freshell-tool.js'
 import { test } from '../helpers/fixtures.js'
 import { createManagedRuntimeBrowserRig, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
+import { stageOwnedFreshBrowserProfile } from '../../../scripts/testing/runtime-external-browser.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
 type Definition = {
@@ -65,35 +63,11 @@ function dataOf(result: any): any {
   return result?.data?.data ?? result?.data ?? result
 }
 
-async function sessionFor(page: Page, sessionId: string): Promise<any | null> {
-  return page.evaluate((id) => {
-    const sessions = window.__FRESHELL_TEST_HARNESS__?.getState()?.freshAgent?.sessions ?? {}
-    return Object.values(sessions).find((session: any) => (
-      session.sessionId === id || session.threadId === id || session.cliSessionId === id
-    )) ?? null
-  }, sessionId)
-}
-
-async function completedAssistantTurns(page: Page, sessionId: string): Promise<any[]> {
-  const session = await sessionFor(page, sessionId)
-  return (session?.turns ?? []).filter((turn: any) => turn.role === 'assistant')
-}
-
-async function sendNoToolTurn(page: Page, paneId: string, sessionId: string, instruction: string): Promise<any> {
-  const before = (await completedAssistantTurns(page, sessionId)).length
-  const pane = page.locator(`[data-pane-id="${paneId}"]`)
-  const composer = pane.getByRole('textbox', { name: 'Chat message input' })
+async function sendBrowserNoToolTurn(page: Page, paneId: string, instruction: string): Promise<void> {
+  const composer = page.locator('[data-pane-id="' + paneId + '"]').getByRole('textbox', { name: 'Chat message input' })
   await expect(composer).toBeEnabled({ timeout: 60_000 })
   await composer.fill(instruction)
   await composer.press('Enter')
-  return waitFor('provider-native assistant completion', async () => {
-    const turns = await completedAssistantTurns(page, sessionId)
-    const turn = turns.length > before ? turns.at(-1) : null
-    if (!turn) return null
-    const usedTool = (turn.items ?? []).some((item: any) => String(item.kind).includes('tool'))
-    if (usedTool) throw new Error('no-tool qualification turn invoked a tool')
-    return turn
-  })
 }
 
 async function replacement(rig: ManagedFixtureRig, sessionId: string, prior: string): Promise<ManagedRuntimeView> {
@@ -103,134 +77,178 @@ async function replacement(rig: ManagedFixtureRig, sessionId: string, prior: str
   })
 }
 
-async function crashCurrentHost(rig: ManagedFixtureRig, sessionId: string, incarnationId: string): Promise<void> {
-  const current = await waitFor('current provider-native host', async () => {
-    const view = await rig.runningViewForFreshSession(sessionId)
-    return view?.incarnationId === incarnationId && view.nativeSessionId ? view : null
+type WireObservations = { sent: any[]; received: any[] }
+function observeBrowserWire(page: Page): WireObservations {
+  const observed: WireObservations = { sent: [], received: [] }
+  page.on('websocket', socket => {
+    socket.on('framesent', frame => { try { observed.sent.push(JSON.parse(String(frame.payload))) } catch { /* non-JSON frame */ } })
+    socket.on('framereceived', frame => { try { observed.received.push(JSON.parse(String(frame.payload))) } catch { /* non-JSON frame */ } })
   })
-  await rig.crashRuntimeHost(rig.exactRuntimeHandle(current))
+  return observed
 }
 
-async function qualify(
-  page: Page,
-  rig: ManagedFixtureRig,
-  definition: Definition,
-): Promise<FreshAgentQualificationRow> {
-  const created = dataOf(await executeAction('new-tab', {
-    agent: definition.agent,
-    cwd: rig.repoRoot,
-    model: definition.model,
-    effort: definition.effort === 'provider-default' ? undefined : definition.effort,
-  }))
-  if (!created?.paneId || !created?.sessionId) throw new Error('MCP new-tab did not create a fresh-agent pane')
-  const paneId = created.paneId as string
-  const sessionId = created.sessionId as string
-  const initial = await waitFor('managed fresh-agent view', () => rig.runningViewForFreshSession(sessionId))
-  if (!initial.containerId) throw new Error('managed fresh-agent view has no enclosure')
-  const initialLaunch = await rig.freshAgentLaunchFacts(rig.runtimeEnclosureHandle(initial))
-  expect(initialLaunch.version).toBe(definition.version)
-  expect(initialLaunch.provider).toBe(definition.provider)
-  expect(initialLaunch.workerPid).toBeGreaterThan(1)
+async function paneFor(page: Page, sessionId: string): Promise<string> {
+  return waitFor('actual fresh pane', () => page.evaluate(id => {
+    const find = (node: any): string | null => node?.type === 'leaf'
+      ? node.content?.kind === 'fresh-agent' && node.content.sessionId === id ? node.id : null
+      : node?.children?.map(find).find(Boolean) ?? null
+    return Object.values(window.__FRESHELL_TEST_HARNESS__?.getState()?.panes?.layouts ?? {}).map(find).find(Boolean) ?? null
+  }, sessionId))
+}
 
-  const first = await sendNoToolTurn(page, paneId, sessionId, 'Remember the next ordinary word in this conversation: cedar. Use no tools. Reply only acknowledged.')
-  const second = await sendNoToolTurn(page, paneId, sessionId, 'Use no tools or files. Reply with the ordinary word I asked you to remember.')
-  const nativeSessionId = await waitFor('provider native identity', async () => (
-    (await rig.runningViewForFreshSession(sessionId))?.nativeSessionId ?? null
-  ))
-
-  // History resume and WS attach reuse the active soul rather than opening a
-  // second writer. The REST create path recognizes the exact native alias.
-  const resumed = dataOf(await executeAction('new-tab', {
-    agent: definition.agent,
-    cwd: rig.repoRoot,
-    sessionRef: { provider: definition.provider, sessionId: nativeSessionId },
-  }))
-  expect(resumed.sessionId).toBe(nativeSessionId)
-  await rig.crashAndRestartWeb()
-  await page.goto(`${rig.info.baseUrl}/?token=${rig.info.token}&e2e=1`)
-  await new TestHarness(page).waitForConnection()
-
-  let pendingApproval: FreshAgentQualificationRow['pendingApproval'] = { supported: false }
-  if (definition.pendingApproval) {
-    const pane = page.locator(`[data-pane-id="${paneId}"]`)
-    const composer = pane.getByRole('textbox', { name: 'Chat message input' })
-    await composer.fill('Read package.json with the provider read tool, then report only that the read completed.')
-    await composer.press('Enter')
-    const decisionId = await waitFor('pending provider approval', async () => {
-      const session = await sessionFor(page, sessionId)
-      return Object.keys(session?.pendingPermissions ?? {})[0] ?? null
+async function actualCreate(page: Page, rig: ManagedFixtureRig, definition: Definition, wire: WireObservations, split: boolean) {
+  const cursor = wire.sent.length
+  const beforeSouls = (await rig.inventory()).map(view => view.soulId).sort()
+  // The existing harness holds network effects only while the real picker
+  // stages its pane. Profile setup precedes the first actual create; the
+  // picker interaction and its subsequently observed wire request remain real.
+  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.setSuppressAllFreshAgentNetworkEffects(true))
+  try {
+    if (split) {
+      await page.locator('[data-context="fresh-agent"]').last().click({ button: 'right' })
+      await page.getByRole('menuitem', { name: /split horizontally/i }).click()
+    } else await page.keyboard.press('Alt+t')
+    const label = { freshclaude: 'Freshclaude', kilroy: 'Kilroy', freshcodex: 'Freshcodex', freshopencode: 'Freshopencode' }[definition.mode]
+    const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
+    await expect(picker).toBeVisible()
+    await picker.getByRole('button', { name: new RegExp('^' + label + '$', 'i') }).click()
+    const cwd = page.getByLabel('Starting directory for ' + label)
+    await expect(cwd).toBeVisible()
+    await cwd.fill(rig.repoRoot)
+    await cwd.press('Enter')
+    expect(wire.sent.slice(cursor).filter(frame => frame.type === 'freshAgent.create')).toHaveLength(0)
+    expect((await rig.inventory()).map(view => view.soulId).sort()).toEqual(beforeSouls)
+    await waitFor('picker-staged fresh pane', () => page.evaluate(stageOwnedFreshBrowserProfile,
+      { mode: definition.mode, model: definition.model, effort: definition.effort }))
+    const request = await waitFor('actual UI fresh create request', () => wire.sent.slice(cursor).find(frame => frame.type === 'freshAgent.create' && frame.sessionType === definition.mode) ?? null)
+    const reply = await waitFor('actual UI fresh create reply', () => wire.received.find(frame => frame.type === 'freshAgent.created' && frame.requestId === request.requestId) ?? null)
+    const view = await waitFor('actual supervised UI native allocation', async () => {
+      const value = await rig.runningViewForFreshSession(reply.sessionId)
+      return value?.nativeSessionId && value.containerId ? value : null
     })
-    await rig.crashAndRestartWeb()
-    await page.goto(`${rig.info.baseUrl}/?token=${rig.info.token}&e2e=1`)
-    await new TestHarness(page).waitForConnection()
-    expect(await sessionFor(page, sessionId)).toBeTruthy()
-    await crashCurrentHost(rig, sessionId, initial.incarnationId)
-    const recovered = await replacement(rig, sessionId, initial.incarnationId)
-    await page.getByRole('button', { name: 'Allow tool use', exact: true }).click()
-    pendingApproval = {
-      supported: true,
-      survivedWebRestart: true,
-      survivedHostRecovery: recovered.nativeSessionId === nativeSessionId,
-      resolvedExactlyOnce: true,
-      decisionIdHash: createHash('sha256').update(decisionId).digest('hex'),
+    return { request, reply, view, paneId: await paneFor(page, reply.sessionId), sessionId: reply.sessionId }
+  } finally { await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.setSuppressAllFreshAgentNetworkEffects(false)) }
+}
+
+async function observeMcp(action: string, params: Record<string, unknown>) {
+  const prior = globalThis.fetch
+  const requests: any[] = []
+  globalThis.fetch = async (input, init) => {
+    const response = await prior(input, init)
+    const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url)
+    if (init?.method === 'POST' && /^\/api\/(?:tabs|panes\/[^/]+\/split)$/.test(url.pathname)) {
+      requests.push({ request: { method: init.method, path: url.pathname, body: JSON.parse(String(init.body)) },
+        reply: dataOf(await response.clone().json()) })
     }
-  } else {
-    await crashCurrentHost(rig, sessionId, initial.incarnationId)
+    return response
   }
-  const afterHost = await replacement(rig, sessionId, initial.incarnationId)
-  if (!afterHost.containerId) throw new Error('host replacement has no enclosure')
-  expect(afterHost.nativeSessionId).toBe(nativeSessionId)
-  expect((await rig.ownedContainerState(rig.runtimeEnclosureHandle(initial))).running).toBe(false)
+  try {
+    const result = dataOf(await executeAction(action, params))
+    if (requests.length !== 1 || !result?.paneId) throw new Error('actual MCP request/reply was not observed')
+    return requests[0]!
+  } finally { globalThis.fetch = prior }
+}
 
-  await rig.crashProviderWorker(rig.exactRuntimeHandle(afterHost))
-  const afterProvider = await replacement(rig, sessionId, afterHost.incarnationId)
-  expect(afterProvider.nativeSessionId).toBe(nativeSessionId)
-  const claim = await rig.writerClaimFacts(rig.exactRuntimeHandle(afterProvider))
-  expect(claim.provider).toBe(afterProvider.provider)
-  expect(claim.activeClaimCount).toBe(1)
-  expect(claim.globalConflictingClaimCount).toBe(0)
+async function reloadOwnedBrowser(page: Page, rig: ManagedFixtureRig) {
+  await page.goto(rig.info.baseUrl + '/?token=' + rig.info.token + '&e2e=1')
+  await new TestHarness(page).waitForConnection()
+}
 
-  // The REST split path is also the MCP split path; create it through the MCP
-  // adapter and require a distinct supervised enclosure before cleanup.
-  const split = dataOf(await executeAction('split-pane', {
-    target: paneId, agent: definition.agent, cwd: rig.repoRoot, model: definition.model,
-  }))
-  expect(split?.paneId).toBeTruthy()
+async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definition, wire: WireObservations): Promise<FreshAgentQualificationRow> {
+  const initial = await actualCreate(page, rig, definition, wire, false)
+  let main = initial.view
+  const collection = await rig.registerFreshNativeCollection(rig.exactRuntimeHandle(main), 'codename-' + randomBytes(16).toString('hex'))
+  const id = collection.collectionId
+  await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(main), id, { ingress: 'browser-picker', request: initial.request, reply: initial.reply })
+  await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(main), id, { ingress: 'ws-create', request: initial.request, reply: initial.reply })
+  await rig.captureFreshNativeStage(rig.exactRuntimeHandle(main), id)
 
-  const address = rig.exactRuntimeHandle(afterProvider)
-  const { providerVolumeName } = await rig.providerVolumeFacts(address)
-  const { limits } = await rig.chaosHostFacts(address)
-  return {
-    mode: definition.mode,
-    provider: definition.provider,
-    providerVersion: definition.version,
-    model: definition.model,
-    effort: definition.effort,
-    runtimeVariant: afterProvider.freshAgentRuntimeVariant!,
-    actualProviderProcess: true,
-    fixtureTransport: false,
-    ingresses: FRESH_AGENT_INGRESS_INVENTORY.map(({ ingress }) => ingress),
-    soulId: afterProvider.soulId,
-    nativeSessionId,
-    providerStoreId: afterProvider.soulId,
-    completedNativeTurns: [first, second].map((turn) => ({
-      turnId: turn.turnId ?? turn.id,
-      assistantMessageId: turn.messageId ?? turn.id,
-      completionKind: 'provider_native_completed' as const,
-    })),
-    noToolRecall: true,
-    crashes: { web: ['abrupt_restart'], host: ['session_host_exit', 'provider_process_exit'] },
-    pendingApproval,
-    writerProof: { activeWriterCount: 1, conflictingWriterCount: 0, dispatchCountForPrompt: 1, completionCountForPrompt: 1 },
-    isolation: {
-      providerVolumeNameHash: createHash('sha256').update(providerVolumeName).digest('hex'),
-      enclosureIdHash: createHash('sha256').update(afterProvider.containerId!).digest('hex'),
-      independentProviderStore: true,
-      independentEnclosure: true,
-    },
-    limits,
-    oldEnclosure: { verifiedEmptyBeforeResume: true, writerClaimReleasedBeforeResume: true },
+  const auxiliary = await actualCreate(page, rig, definition, wire, true)
+  let other = auxiliary.view
+  await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(other), id, { ingress: 'browser-split', request: auxiliary.request, reply: auxiliary.reply })
+  const ui = await rig.registerFreshBrowserTurn(rig.exactRuntimeHandle(other), id)
+  const sendCursor = wire.sent.length
+  await sendBrowserNoToolTurn(page, auxiliary.paneId, ui.prompt!)
+  const send = await waitFor('browser composer send', () => wire.sent.slice(sendCursor).find(frame => frame.type === 'freshAgent.send' && frame.sessionId === auxiliary.sessionId) ?? null)
+  const accepted = await waitFor('browser composer accepted', () => wire.received.find(frame => frame.type === 'freshAgent.send.accepted' && frame.requestId === send.requestId) ?? null)
+  await rig.finishFreshBrowserTurn(rig.exactRuntimeHandle(other), ui.challengeId, send, accepted)
+
+  // Each alias doorway is invoked separately against the existing root. It needs no additional model call.
+  const params = { agent: definition.agent, cwd: rig.repoRoot, model: definition.model,
+    effort: definition.effort === 'provider-default' ? undefined : definition.effort,
+    permissionMode: 'default', sessionRef: { provider: definition.provider, sessionId: main.nativeSessionId } }
+  for (const [ingress, action] of [['mcp-new-tab', 'new-tab'], ['mcp-split', 'split-pane']] as const) {
+    const observed = await observeMcp(action, { ...params, ...(action === 'split-pane' ? { target: auxiliary.paneId, direction: 'horizontal' } : {}) })
+    const view = await waitFor('actual MCP alias activation', () => rig.runningViewForFreshSession(observed.reply.sessionId))
+    await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(view), id, { ingress, ...observed })
   }
+  for (const [ingress, route] of [['rest-tab', '/api/tabs'], ['rest-split', '/api/panes/' + auxiliary.paneId + '/split']] as const) {
+    const body = { ...params, ...(ingress === 'rest-split' ? { direction: 'horizontal' } : {}) }
+    const response = await page.request.post(rig.info.baseUrl + route, { headers: { 'X-Auth-Token': rig.info.token }, data: body })
+    expect(response.ok()).toBe(true)
+    const reply = dataOf(await response.json())
+    const view = await waitFor('actual REST alias activation', () => rig.runningViewForFreshSession(reply.sessionId))
+    await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(view), id, { ingress, request: { method: 'POST', path: route, body }, reply })
+  }
+
+  const historyCursor = wire.sent.length
+  await page.getByRole('button', { name: /^Projects/ }).click()
+  await page.getByRole('button', { name: 'Refresh sessions' }).click()
+  const project = page.locator('[data-project-path]').filter({ hasText: rig.repoRoot }).last()
+  if (!await page.locator('[data-session-id="' + main.nativeSessionId + '"]').isVisible().catch(() => false)) await project.click()
+  const history = page.locator('[data-session-id="' + main.nativeSessionId + '"]')
+  await expect(history).toBeVisible({ timeout: 60_000 })
+  await history.getByRole('button', { name: /^Open session/ }).first().click()
+  const historyRequest = await waitFor('actual history resume route', () => wire.sent.slice(historyCursor).find(frame =>
+    frame.type === 'freshAgent.create' && frame.sessionRef?.sessionId === main.nativeSessionId
+    || frame.type === 'freshAgent.attach' && frame.sessionId === initial.sessionId) ?? null)
+  const historyReply = historyRequest.type === 'freshAgent.create' ? await waitFor('actual history create reply',
+    () => wire.received.find(frame => frame.type === 'freshAgent.created' && frame.requestId === historyRequest.requestId) ?? null) : undefined
+  await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(main), id, { ingress: 'history-resume', request: historyRequest, ...(historyReply ? { reply: historyReply } : {}) })
+
+  const attachCursor = wire.sent.length
+  await rig.crashAndRestartWeb()
+  await reloadOwnedBrowser(page, rig)
+  const attach = await waitFor('actual reconnect attach', () => wire.sent.slice(attachCursor).find(frame => frame.type === 'freshAgent.attach' && frame.sessionId === initial.sessionId) ?? null)
+  await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(main), id, { ingress: 'ws-attach', request: attach })
+  await rig.restartSupervisor()
+  await rig.crashRuntimeHost(rig.exactRuntimeHandle(main))
+  main = await replacement(rig, initial.sessionId, main.incarnationId)
+  await rig.captureFreshNativeStage(rig.exactRuntimeHandle(main), id)
+  await rig.crashProviderWorker(rig.exactRuntimeHandle(main))
+  main = await replacement(rig, initial.sessionId, main.incarnationId)
+  await rig.captureFreshNativeStage(rig.exactRuntimeHandle(main), id)
+
+  if (definition.pendingApproval) {
+    for (const recovery of ['web', 'host', 'provider'] as const) for (const allowed of [true, false]) {
+      const challenge = await rig.registerFreshApproval(rig.exactRuntimeHandle(other), allowed, recovery)
+      const paneId = await paneFor(page, auxiliary.sessionId)
+      const composer = page.locator('[data-pane-id="' + paneId + '"]').getByRole('textbox', { name: 'Chat message input' })
+      await expect(composer).toBeEnabled()
+      await composer.fill(challenge.prompt!)
+      await composer.press('Enter')
+      await rig.captureFreshApprovalCheckpoint(rig.exactRuntimeHandle(other), challenge.challengeId)
+      if (recovery === 'web') { await rig.crashAndRestartWeb(); await reloadOwnedBrowser(page, rig) }
+      else {
+        const prior = other.incarnationId
+        if (recovery === 'host') await rig.crashRuntimeHost(rig.exactRuntimeHandle(other))
+        else await rig.crashProviderWorker(rig.exactRuntimeHandle(other))
+        other = await replacement(rig, auxiliary.sessionId, prior)
+      }
+      const current = await rig.captureFreshApprovalCheckpoint(rig.exactRuntimeHandle(other), challenge.challengeId)
+      const decisionCursor = wire.sent.length
+      const decisionPane = page.locator('[data-pane-id="' + await paneFor(page, auxiliary.sessionId) + '"]')
+      await decisionPane.getByRole('button', { name: allowed ? 'Allow tool use' : 'Deny tool use', exact: true }).click()
+      const decision = await waitFor('actual current browser approval response', () => wire.sent.slice(decisionCursor).find(frame =>
+        frame.type === 'freshAgent.approval.respond' && String(frame.requestId) === current.decisionId) ?? null)
+      await rig.finishFreshApproval(rig.exactRuntimeHandle(other), challenge.challengeId, decision)
+    }
+  }
+  const row = await rig.captureFreshBrowserRow(rig.exactRuntimeHandle(main), id)
+  const finished = await rig.finishFreshNativeCollection(rig.exactRuntimeHandle(main), id)
+  expect(finished.completedNativeTurns).toEqual(row.completedNativeTurns)
+  expect(finished.providerStoreId).toBe(row.providerStoreId)
+  return row
 }
 
 test.describe.serial('authentic fresh-agent qualification', () => {
@@ -244,18 +262,19 @@ test.describe.serial('authentic fresh-agent qualification', () => {
       enabledProviders: [],
       freshAgentModes: definitions.map(({ mode }) => mode),
       providerSettings: Object.fromEntries(definitions.map((row) => [row.mode, {
-        model: row.model, effort: row.effort === 'provider-default' ? undefined : row.effort,
+        model: row.model, modelSelection: { kind: 'exact', modelId: row.model }, defaultPermissionMode: 'default', effort: row.effort === 'provider-default' ? undefined : row.effort,
       }])),
     })
     await rig.validateFreshAgentIngressInventory()
     const rows: FreshAgentQualificationRow[] = []
+    const wire = observeBrowserWire(page)
     try {
       const info = await rig.start()
       process.env.FRESHELL_URL = info.baseUrl
       process.env.FRESHELL_TOKEN = info.token
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
       await new TestHarness(page).waitForConnection()
-      for (const definition of definitions) rows.push(await qualify(page, rig, definition))
+      for (const definition of definitions) rows.push(await qualify(page, rig, definition, wire))
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)

@@ -29,6 +29,45 @@ const runtimeImage = `sha256:${'b'.repeat(64)}`
 const receiptRunId = 'fresh-agent-live-001'
 const tempRoots: string[] = []
 
+describe('observed fresh browser execution', () => {
+  it('rejects inventory labels without an executed request and current activation', async () => {
+    const module = await import('../../../../scripts/testing/fresh-agent-qualification-receipt.js')
+    expect(() => (module as any).deriveFreshBrowserExecution({ mode: 'freshcodex', routes: [], allocations: [], lifecycle: [] }, {})).toThrow(/executed ingress/)
+  })
+  it.each(['missing-route', 'wrong-reply', 'two-writers', 'shared-store', 'shared-container', 'release-after-prepare', 'missing-release', 'missing-running', 'web-process-replaced', 'startup-empty', 'approval-missing-deny', 'approval-old-callback', 'approval-effect-replayed', 'approval-duplicate-dispatch', 'approval-extra-completion', 'approval-changed-native-root', 'approval-changed-native-executable'])('reopens originals and rejects %s', fault => {
+    const built = fixture()
+    const current = built.receipt.rows[0]!, reference = current.executionOriginal as { path: string; sha256: string }
+    const filename = path.join(built.evidenceDir, reference.path), original = JSON.parse(fs.readFileSync(filename, 'utf8'))
+    if (fault === 'missing-route') original.routes.pop()
+    if (fault === 'wrong-reply') original.routes[0].reply.requestId = 'another-request'
+    if (fault === 'two-writers') original.allocations[0].writer.activeClaimCount = 2
+    if (fault === 'shared-store') original.allocations[1].writer.providerStoreId = original.allocations[0].writer.providerStoreId
+    if (fault === 'shared-container') original.allocations[1].view.containerId = original.allocations[0].view.containerId
+    if (fault === 'release-after-prepare') [original.lifecycle[1], original.lifecycle[2]] = [original.lifecycle[2], original.lifecycle[1]]
+    if (fault === 'missing-release') original.lifecycle = original.lifecycle.filter((event: any) => !event.event.endsWith('old_writer_released'))
+    if (fault === 'missing-running') original.lifecycle = original.lifecycle.filter((event: any) => event.event !== 'supervisor.launch_running')
+    if (fault === 'web-process-replaced') original.webRestarts[0].after.process.native.pid += 1
+    if (fault === 'startup-empty') original.supervisorRestarts[0].lifecycle[0].data.scanned = 0
+    if (fault === 'approval-missing-deny') original.approvals.pop()
+    const approval = original.approvals[2]
+    if (fault === 'approval-old-callback') approval.currentCard.payload.nativeRequestId = approval.beforeCard.payload.nativeRequestId
+    if (fault === 'approval-effect-replayed') approval.recheckedEffectCount += 1
+    if (fault === 'approval-duplicate-dispatch') approval.events.push(approval.events[0])
+    if (fault === 'approval-extra-completion') approval.events.push(approval.events.at(-1))
+    if (fault === 'approval-changed-native-root') approval.beforeNative.nativeRoot = approval.currentNative.nativeRoot = 'another-real-root'
+    if (fault === 'approval-changed-native-executable') approval.currentNative.executableSha256 = 'f'.repeat(64)
+    fs.writeFileSync(filename, JSON.stringify(original))
+    current.executionOriginal = { path: reference.path, sha256: createHash('sha256').update(fs.readFileSync(filename)).digest('hex') }
+    const assertionsPath = path.join(built.evidenceDir, 'fresh-agent-qualification-assertions.json')
+    const assertions = JSON.parse(fs.readFileSync(assertionsPath, 'utf8')); assertions.rows = built.receipt.rows
+    fs.writeFileSync(assertionsPath, JSON.stringify(assertions))
+    built.receipt.artifacts.assertions.sha256 = createHash('sha256').update(fs.readFileSync(assertionsPath)).digest('hex')
+    expect(() => validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt })).toThrow()
+    expect(() => buildFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, evidenceDir: built.evidenceDir, candidateSha, receiptRunId, runtimeImage, selectedModes: ['freshclaude'], rows: built.receipt.rows })).toThrow()
+  })
+
+})
+
 afterEach(() => {
   while (tempRoots.length) fs.rmSync(tempRoots.pop()!, { recursive: true, force: true })
 })
@@ -65,7 +104,7 @@ function row(mode: FreshAgentQualificationRow['mode'] = 'freshclaude'): FreshAge
       host: ['session_host_exit', 'provider_process_exit'],
     },
     pendingApproval: definition.pending
-      ? { supported: true, survivedWebRestart: true, survivedHostRecovery: true, resolvedExactlyOnce: true, decisionIdHash: 'd'.repeat(64) }
+      ? { supported: true, survivedWebRestart: true, survivedHostRecovery: true, resolvedExactlyOnce: true, decisionIdHash: createHash('sha256').update(['web', 'host', 'provider'].flatMap(recovery => [true, false].map(allowed => 'decision-' + mode + '-' + recovery + '-' + allowed)).join('\n')).digest('hex') }
       : { supported: false },
     writerProof: {
       activeWriterCount: 1,
@@ -74,8 +113,8 @@ function row(mode: FreshAgentQualificationRow['mode'] = 'freshclaude'): FreshAge
       completionCountForPrompt: 1,
     },
     isolation: {
-      providerVolumeNameHash: 'e'.repeat(64),
-      enclosureIdHash: 'f'.repeat(64),
+      providerVolumeNameHash: createHash('sha256').update('owned-volume').digest('hex'),
+      enclosureIdHash: createHash('sha256').update('container-2').digest('hex'),
       independentProviderStore: true,
       independentEnclosure: true,
     },
@@ -90,6 +129,84 @@ function row(mode: FreshAgentQualificationRow['mode'] = 'freshclaude'): FreshAge
       writerClaimReleasedBeforeResume: true,
     },
   }
+}
+
+
+function browserExecutionFixture(current: FreshAgentQualificationRow, stages: any[], evidenceDir: string, write: (name: string, value: any) => { path: string; sha256: string }, prefix: string) {
+  const read = (reference: any) => JSON.parse(fs.readFileSync(path.join(evidenceDir, reference.path), 'utf8'))
+  const stageViews = stages.map(stage => read(stage.launch).response.data.view)
+  const view = { ...stageViews.at(-1), freshAgentSessionType: current.mode, freshAgentSessionId: current.nativeSessionId }
+  const native = read(read(stages.at(-1).profile).process)
+  const allocation = { view, writer: { soulId: current.soulId, incarnationId: view.incarnationId, nativeSessionId: current.nativeSessionId,
+    providerStoreId: current.providerStoreId, activeClaimCount: 1, globalConflictingClaimCount: 0 }, volume: { providerVolumeName: 'owned-volume' }, process: native, limits: current.limits }
+  const otherRoot = 'other-' + current.nativeSessionId
+  const other = structuredClone(allocation)
+  Object.assign(other.view, { soulId: 'other-soul', incarnationId: 'other-inc', containerId: 'other-container', nativeSessionId: otherRoot, freshAgentSessionId: otherRoot,
+    nativeIdentityObservation: { ...view.nativeIdentityObservation, nativeSessionId: otherRoot, incarnationId: 'other-inc' } })
+  Object.assign(other.writer, { soulId: other.view.soulId, incarnationId: other.view.incarnationId, nativeSessionId: otherRoot, providerStoreId: 'other-store' })
+  other.volume.providerVolumeName = 'other-volume'; other.process.native.launch.incarnationId = other.view.incarnationId
+  const routes = FRESH_AGENT_INGRESS_INVENTORY.filter(({ ingress }) => !['startup-restore', 'auto-resume'].includes(ingress)).map(({ ingress }) => {
+    const target = ingress === 'browser-split' ? other.view : view
+    const requestId = 'create-' + ingress
+    if (['browser-picker', 'browser-split', 'ws-create', 'history-resume'].includes(ingress)) return { ingress, view: target,
+      request: { type: 'freshAgent.create', requestId, sessionType: current.mode, ...(ingress === 'history-resume' ? { sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } : {}) },
+      reply: { type: 'freshAgent.created', requestId, sessionId: target.freshAgentSessionId } }
+    if (ingress === 'ws-attach') return { ingress, view: target, request: { type: 'freshAgent.attach', sessionId: target.freshAgentSessionId } }
+    return { ingress, view: target, request: { method: 'POST', path: ingress.endsWith('split') ? '/api/panes/actual-pane/split' : '/api/tabs', body: { agent: current.mode, sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } },
+      reply: { paneId: 'actual-pane', sessionId: target.freshAgentSessionId } }
+  })
+  const lifecycle: any[] = [{ event: 'supervisor.runtime_observer.recovery_scheduled', data: { soulId: current.soulId } }]
+  for (const index of [1, 2]) {
+    lifecycle.push({ event: 'supervisor.recovery.old_writer_released', data: { soulId: current.soulId, incarnationId: stageViews[index - 1].incarnationId,
+      containerId: stageViews[index - 1].containerId, providerStoreId: current.providerStoreId, outcome: 'verified_empty', writerState: 'released' } },
+    { event: 'supervisor.recovery.replacement_writer_prepared', data: { soulId: current.soulId, priorIncarnationId: stageViews[index - 1].incarnationId,
+      incarnationId: stageViews[index].incarnationId, providerStoreId: current.providerStoreId, nativeSessionId: current.nativeSessionId, writerState: 'prepared' } },
+    { event: 'supervisor.launch_running', data: { soulId: current.soulId, incarnationId: stageViews[index].incarnationId, containerId: stageViews[index].containerId } })
+  }
+  const prompt = 'Reply ready. Do not use tools.'
+  let after: { path: string; sha256: string }
+  const firstFile = path.join(evidenceDir, stages[0].nativeFile.path)
+  if (current.provider === 'opencode') {
+    const target = path.join(evidenceDir, prefix, 'ui', 'opencode.db'); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.copyFileSync(firstFile, target)
+    const db = new DatabaseSync(target)
+    db.prepare('UPDATE session SET id=?').run(otherRoot)
+    for (const table of ['message', 'part']) db.prepare('UPDATE ' + table + ' SET session_id=?').run(otherRoot)
+    db.prepare('UPDATE part SET data=? WHERE message_id=?').run(JSON.stringify({ type: 'text', text: prompt }), 'user-0')
+    db.close(); after = { path: path.relative(evidenceDir, target), sha256: createHash('sha256').update(fs.readFileSync(target)).digest('hex') }
+  } else {
+    const rows = fs.readFileSync(firstFile, 'utf8').trim().split('\n').map(line => JSON.parse(line.replaceAll(current.nativeSessionId || 'invalid-root', otherRoot)))
+    for (const row of rows) {
+      if (row.type === 'user' && row.message.role === 'user') row.message.content = prompt
+      if (row.type === 'event_msg' && row.payload.type === 'user_message') row.payload.message = prompt
+    }
+    after = write(prefix + '/ui/' + (current.provider === 'codex' ? 'rollout-' : '') + otherRoot + '.jsonl', rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+  }
+  const ui = { provider: current.provider, nativeRoot: otherRoot, beforeTurns: 0, after,
+    request: { type: 'freshAgent.send', requestId: 'actual-ui-send', sessionId: otherRoot, text: prompt },
+    reply: { type: 'freshAgent.send.accepted', requestId: 'actual-ui-send', sessionId: otherRoot } }
+  const approvals: any[] = []
+  if (['freshclaude', 'kilroy'].includes(current.mode)) for (const recovery of ['web', 'host', 'provider']) for (const allowed of [true, false]) {
+    const decisionId = 'decision-' + current.mode + '-' + recovery + '-' + allowed, toolUseID = 'toolu_' + decisionId
+    const command = "printf 'effect\\n' >> '/owned/effect-" + decisionId + ".jsonl'"
+    const bytes = Buffer.from(JSON.stringify({ type: 'assistant', sessionId: otherRoot, message: { content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command } }] } }) + '\n')
+    const checkpoint = { nativeSessionId: otherRoot, toolUseID, inputDigest: createHash('sha256').update(JSON.stringify({ command })).digest('hex'), profileDigest: 'a'.repeat(64) }
+    const beforeNative = { nativeRoot: otherRoot, version: current.providerVersion + ' (Claude Code)', executableSha256: 'd'.repeat(64), nativeCwd: '/owned/workspace', transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
+    const beforeCard = { decision_id: decisionId, payload: { tool: { name: 'Bash', input: { command } }, toolUseID, nativeCheckpoint: checkpoint,
+      nativeRequestId: 'old-' + decisionId, nativeBinding: { launch: { incarnationId: 'other-inc' } } } }
+    const currentCard = structuredClone(beforeCard), afterView = { ...other.view, incarnationId: recovery === 'web' ? 'other-inc' : 'recovered-' + decisionId }
+    currentCard.payload.nativeBinding.launch.incarnationId = afterView.incarnationId
+    if (recovery !== 'web') currentCard.payload.nativeRequestId = 'new-' + decisionId
+    const events = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, requestId: decisionId } } } },
+      { kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result', content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
+      { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: otherRoot, isError: false } } } }]
+    approvals.push({ recovery, allowed, nativeRoot: otherRoot, command, beforeCard, currentCard, beforeNative, currentNative: structuredClone(beforeNative),
+      beforeEffectCount: 0, currentEffectCount: 0, afterView, effectCount: allowed ? 1 : 0, recheckedEffectCount: allowed ? 1 : 0, events,
+      browserDecision: { type: 'freshAgent.approval.respond', sessionId: otherRoot, requestId: decisionId, decision: { behavior: allowed ? 'allow' : 'deny' } } })
+  }
+  const execution = { mode: current.mode, routes, ui, allocations: [allocation, other], stageViews, lifecycle,
+    webRestarts: [{ before: allocation, after: structuredClone(allocation) }],
+    supervisorRestarts: [{ before: view, after: structuredClone(view), lifecycle: [{ event: 'supervisor.startup_scan.finished', data: { scanned: 2 } }] }], approvals }
+  return write(prefix + '/execution.json', execution)
 }
 
 function fixture(
@@ -195,6 +312,7 @@ function fixture(
       writer: { provider: stoppedView.provider, soulId: currentRow.soulId, incarnationId: stoppedView.incarnationId, providerStoreId: currentRow.providerStoreId, nativeSessionId, activeClaimCount: 0, globalConflictingClaimCount: 0 },
       stopCompletedAt: 1_780_000_024_000, stoppedObservedAt: 1_780_000_024_100, writerObservedAt: 1_780_000_024_200,
       readStartedAt: 1_780_000_024_300, readCompletedAt: 1_780_000_024_400, completedTurnCount: 3 })
+    currentRow.executionOriginal = browserExecutionFixture(currentRow, stages, evidenceDir, original, 'browser-' + rowIndex)
     return { mode: currentRow.mode, provider: currentRow.provider, soulId: currentRow.soulId, providerStoreId: currentRow.providerStoreId, nativeSessionId, nonce, stages, stopped }
   })
   original('native-recovery-originals.json', { schemaVersion: 1, candidateSha, runId: receiptRunId, runtimeImage, selected: rows.map(current => current.mode), conversations })
@@ -359,7 +477,7 @@ describe('fresh-agent qualification receipt v1', () => {
       candidateSha,
       expectedRuntimeImage: runtimeImage,
       receipt: built.receipt,
-    }).rows).toEqual([row()])
+    }).rows).toEqual([{ ...row(), executionOriginal: built.receipt.rows[0]!.executionOriginal }])
   })
 
   it('never accepts a deterministic fixture build as live-provider evidence', () => {

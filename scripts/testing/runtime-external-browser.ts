@@ -14,6 +14,8 @@ import net from 'node:net'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import type { FreshBrowserIngressObservation } from './fresh-agent-qualification-receipt.js'
+import { FreshBrowserChallengeResultSchema, RuntimeFreshAgentObservationSchema, type FreshBrowserChallengeResult } from './runtime-sandbox.js'
 import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
 import type { SyntheticStoppedRepairBatchFacts, SyntheticStoppedRepairBatchObservation, SyntheticStoppedRepairFault } from './runtime-sandbox.js'
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, stripRuntimeWebEnvironment,
@@ -60,6 +62,22 @@ import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBr
 import { requireAmplifierOnecliBootstrap } from './runtime-amplifier-onecli.js'
 
 type OwnedProcessIdentity = { pid: number; startTicks: string; executable: string; cwd: string }
+
+/** Serialized by Playwright into the owned page; uses only its existing harness. */
+export function stageOwnedFreshBrowserProfile(profile: { mode: string; model: string; effort: string }): { tabId: string; paneId: string; createRequestId: string } | null {
+  const harness = (globalThis as any).window?.__FRESHELL_TEST_HARNESS__
+  if (!harness?.isAllFreshAgentNetworkEffectsSuppressed()) throw new Error('fresh create effects must be suppressed while staging the selected profile')
+  const state = harness.getState(), tabId = state.tabs.activeTabId, activeId = state.panes.activePane[tabId]
+  const find = (node: any): any => node?.type === 'leaf' ? node.id === activeId ? node : null : node?.children?.map(find).find(Boolean)
+  const leaf = find(state.panes.layouts[tabId])
+  if (leaf?.content.kind !== 'fresh-agent' || leaf.content.sessionType !== profile.mode) return null
+  if (leaf.content.sessionId) throw new Error('profile must be staged before any native create')
+  const content = { ...leaf.content, model: profile.model, modelSelection: { kind: 'exact', modelId: profile.model },
+    effort: profile.effort === 'provider-default' ? undefined : profile.effort, permissionMode: 'default' }
+  harness.setSuppressAllFreshAgentNetworkEffects(false)
+  harness.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId: leaf.id, content } })
+  return { tabId, paneId: leaf.id, createRequestId: content.createRequestId }
+}
 
 function processIdentity(pid: number): OwnedProcessIdentity | null {
   try {
@@ -734,7 +752,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'historyControllerReattachment' | 'historyMeasurement' | 'historyPreservation' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'terminalQualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic' | 'interruptedStopRetainedTurns' | 'fixtureId' | 'repairOperationId' | 'stoppedRepairFault' | 'nativeCollectionId' | 'nativeCollectionNonce'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'historyControllerReattachment' | 'historyMeasurement' | 'historyPreservation' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'terminalQualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic' | 'interruptedStopRetainedTurns' | 'fixtureId' | 'repairOperationId' | 'stoppedRepairFault' | 'nativeCollectionId' | 'nativeCollectionNonce' | 'freshBrowserIngress' | 'freshBrowserRequest' | 'freshBrowserReply' | 'freshApprovalAllowed' | 'freshApprovalRecovery'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -973,6 +991,29 @@ export class ExternalManagedRuntimeRig {
   async finishFreshNativeCollection(handle: ExactRuntimeHandle, nativeCollectionId: string): Promise<FreshNativeCollectionResult> {
     return this.rpc('fresh-native-finish', FreshNativeCollectionResultSchema, { handle, nativeCollectionId })
   }
+
+  async observeFreshBrowserIngress(handle: ExactRuntimeHandle, nativeCollectionId: string, freshBrowserIngress: FreshBrowserIngressObservation): Promise<void> {
+    await this.rpc('fresh-browser-ingress', CompletedOwnerOperationSchema, { handle, nativeCollectionId, freshBrowserIngress })
+  }
+  async registerFreshBrowserTurn(handle: ExactRuntimeHandle, nativeCollectionId: string): Promise<FreshBrowserChallengeResult> {
+    return this.rpc('fresh-browser-turn-register', FreshBrowserChallengeResultSchema, { handle, nativeCollectionId })
+  }
+  async finishFreshBrowserTurn(handle: ExactRuntimeHandle, challengeId: string, freshBrowserRequest: Record<string, any>, freshBrowserReply: Record<string, any>): Promise<void> {
+    await this.rpc('fresh-browser-turn-finish', CompletedOwnerOperationSchema, { handle, challengeId, freshBrowserRequest, freshBrowserReply })
+  }
+  async registerFreshApproval(handle: ExactRuntimeHandle, freshApprovalAllowed: boolean, freshApprovalRecovery: 'web' | 'host' | 'provider'): Promise<FreshBrowserChallengeResult> {
+    return this.rpc('fresh-approval-register', FreshBrowserChallengeResultSchema, { handle, freshApprovalAllowed, freshApprovalRecovery })
+  }
+  async captureFreshApprovalCheckpoint(handle: ExactRuntimeHandle, challengeId: string): Promise<FreshBrowserChallengeResult> {
+    return this.rpc('fresh-approval-checkpoint', FreshBrowserChallengeResultSchema, { handle, challengeId })
+  }
+  async finishFreshApproval(handle: ExactRuntimeHandle, challengeId: string, freshBrowserRequest: Record<string, any>): Promise<void> {
+    await this.rpc('fresh-approval-finish', CompletedOwnerOperationSchema, { handle, challengeId, freshBrowserRequest })
+  }
+  async captureFreshBrowserRow(handle: ExactRuntimeHandle, nativeCollectionId: string): Promise<FreshAgentQualificationRow> {
+    return this.rpc('fresh-browser-row', RuntimeFreshAgentObservationSchema, { handle, nativeCollectionId })
+  }
+
   async freshAgentLaunchFacts(enclosure: RuntimeEnclosureHandle): Promise<FreshAgentLaunchFacts> {
     return this.rpc('fresh-agent-launch-facts', FreshAgentLaunchFactsSchema, { enclosure })
   }
@@ -1520,6 +1561,32 @@ export function createExternalRuntimeControl(
         if (!request.nativeCollectionId) throw new Error('registered fresh native collection required')
         result = await owner.finishFreshNativeCollection(handle(), request.nativeCollectionId)
         break
+
+      case 'fresh-browser-ingress':
+        if (!request.nativeCollectionId || !request.freshBrowserIngress) throw new Error('registered collection and actual route required')
+        await owner.observeFreshBrowserIngress(handle(), request.nativeCollectionId, request.freshBrowserIngress)
+        result = { completed: true }; break
+      case 'fresh-browser-turn-register':
+        if (!request.nativeCollectionId) throw new Error('registered collection required')
+        result = await owner.registerFreshBrowserTurn(handle(), request.nativeCollectionId); break
+      case 'fresh-browser-turn-finish':
+        if (!request.challengeId || !request.freshBrowserRequest || !request.freshBrowserReply) throw new Error('registered actual browser turn required')
+        await owner.finishFreshBrowserTurn(handle(), request.challengeId, request.freshBrowserRequest, request.freshBrowserReply)
+        result = { completed: true }; break
+      case 'fresh-browser-row':
+        if (!request.nativeCollectionId) throw new Error('registered collection required')
+        result = await owner.captureFreshBrowserRow(handle(), request.nativeCollectionId); break
+      case 'fresh-approval-register':
+        if (request.freshApprovalAllowed === undefined || !request.freshApprovalRecovery) throw new Error('fixed native decision and recovery required')
+        result = await owner.registerFreshApproval(handle(), request.freshApprovalAllowed, request.freshApprovalRecovery); break
+      case 'fresh-approval-checkpoint':
+        if (!request.challengeId) throw new Error('registered native approval required')
+        result = await owner.captureFreshApprovalCheckpoint(handle(), request.challengeId); break
+      case 'fresh-approval-finish':
+        if (!request.challengeId || !request.freshBrowserRequest) throw new Error('registered native approval and actual browser decision required')
+        await owner.finishFreshApproval(handle(), request.challengeId, request.freshBrowserRequest)
+        result = { completed: true }; break
+
       case 'fresh-agent-launch-facts':
         if (!request.enclosure) throw new Error('exact current runtime enclosure address required')
         result = await owner.freshAgentLaunchFacts(request.enclosure)
