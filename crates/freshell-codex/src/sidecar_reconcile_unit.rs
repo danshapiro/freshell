@@ -22,7 +22,10 @@ use super::{
     REATTACH_PROBE_BUDGET,
 };
 use crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV;
-use crate::launch_lifecycle::{listener_among_members, probe_app_server, CodexRuntimeReady};
+use crate::launch_lifecycle::{
+    label_log_keys, listener_among_members, probe_app_server, unit_event, unit_log_keys,
+    CodexRuntimeReady,
+};
 use crate::launch_plan::UnitSeed;
 use crate::sidecar_store::CodexSidecarRecord;
 
@@ -56,15 +59,21 @@ impl ReattachedCodexAppServerRuntime {
             (Some(_), Some(unit_record)) => seed
                 .services
                 .containment
-                .reopen_unit(unit_record, label)
+                .reopen_unit(unit_record, label.clone())
                 .map_err(|error| {
-                    tracing::error!(
-                        target: "freshell_codex::sidecar_reconcile",
+                    // Not reachable on Linux (no backend's reopen fails
+                    // there), the only platform that retains sidecars.
+                    unit_event!(
+                        error,
+                        "freshell_codex::sidecar_reconcile",
+                        label_log_keys(unit_record.unit_id.as_str(), label),
+                        "sidecar_reattach_unit_unopened",
                         ownership_id = %record.ownership_id,
-                        unit_id = %unit_record.unit_id,
                         error = %error,
                         "sidecar_reattach_unit_unopened: the recorded unit could not be \
-                         reopened; record kept for the next boot"
+                         reopened; nothing is signalled, the failed attempt's cleanup \
+                         removes the sidecar record, and the unit record stays for the \
+                         next boot"
                     );
                     format!("codex sidecar unit could not be reopened: {error}")
                 })?,
@@ -118,10 +127,12 @@ impl ReattachedCodexAppServerRuntime {
                 if changed {
                     write_record_loudly(&self.store, &snapshot);
                 }
-                tracing::info!(
-                    target: "freshell_codex::sidecar_reconcile",
+                unit_event!(
+                    info,
+                    "freshell_codex::sidecar_reconcile",
+                    unit_log_keys(&unit),
+                    "sidecar_reattached",
                     ownership_id = %snapshot.ownership_id,
-                    unit_id = %unit.id(),
                     main_pid = main.pid(),
                     ws_url = %snapshot.ws_url,
                     "sidecar_reattached: surviving app-server adopted inside its unit; no spawn"
@@ -145,10 +156,12 @@ impl ReattachedCodexAppServerRuntime {
                 .wait()
                 .await;
                 remove_pruned(&self.store, &record.ownership_id);
-                tracing::warn!(
-                    target: "freshell_codex::sidecar_reconcile",
+                unit_event!(
+                    warn,
+                    "freshell_codex::sidecar_reconcile",
+                    unit_log_keys(&unit),
+                    "sidecar_reattach_reaped",
                     ownership_id = %record.ownership_id,
-                    unit_id = %unit.id(),
                     reason = %reason,
                     "sidecar_reattach_reaped: verified survivor unusable; its unit was \
                      stopped, record removed"

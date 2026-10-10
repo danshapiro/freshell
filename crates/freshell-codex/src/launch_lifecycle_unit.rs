@@ -11,12 +11,33 @@
 //! its unit through the lifecycle and waits for Gone before the next attempt.
 
 use freshell_containment::events::{self, UnitLogKeys};
+use freshell_containment::UnitLabel;
 use freshell_containment::{
     listening_socket_owner, AgentUnit, MemberRole, ProcIdentity, ProcWatch,
 };
 
 use super::{NotListening, SpawnedCodexAppServerRuntime, SpawnedSidecar};
 use crate::launch_plan::{UnitSeed, CODEX_START_CANCELLED_MESSAGE};
+
+/// One Codex log line about a unit: `event` plus every key the unit has (the
+/// `freshell_unit` key set, from [`UnitLogKeys`]; an absent value is an empty
+/// string), then the line's own fields and message.
+macro_rules! unit_event {
+    ($level:ident, $target:literal, $keys:expr, $event:literal, $($rest:tt)*) => {{
+        let keys: &freshell_containment::events::UnitLogKeys = &$keys;
+        tracing::$level!(
+            target: $target,
+            event = $event,
+            unit_id = %keys.unit_id,
+            provider = %keys.provider,
+            session_id = %keys.session_id.as_deref().unwrap_or(""),
+            terminal_id = %keys.terminal_id.as_deref().unwrap_or(""),
+            operation_id = %keys.operation_id.as_deref().unwrap_or(""),
+            $($rest)*
+        )
+    }};
+}
+pub(crate) use unit_event;
 
 impl SpawnedCodexAppServerRuntime {
     /// One seeded start attempt (see the module docs).
@@ -62,10 +83,11 @@ impl SpawnedCodexAppServerRuntime {
         match ProcWatch::open(spawned_pid) {
             Ok(watch) => unit.add_root(watch),
             // The backend still counts the process as a member.
-            Err(error) => tracing::warn!(
-                target: "freshell_codex::launch",
-                event = "codex_unit_root_unpinned",
-                unit_id = %unit.id(),
+            Err(error) => unit_event!(
+                warn,
+                "freshell_codex::launch",
+                keys,
+                "codex_unit_root_unpinned",
                 pid = spawned_pid,
                 error = %error,
                 "codex_unit_root_unpinned: the spawned app-server could not be pinned \
@@ -128,10 +150,12 @@ impl SpawnedCodexAppServerRuntime {
                 codex_home.clone(),
             );
             if let Err(error) = self.store.write(&row) {
-                tracing::error!(
-                    target: "freshell_codex::launch",
+                unit_event!(
+                    error,
+                    "freshell_codex::launch",
+                    keys,
+                    "sidecar_record_write_failed",
                     ownership_id = %row.ownership_id,
-                    unit_id = %unit.id(),
                     error = %error,
                     "sidecar_record_write_failed: the attempt fails and its unit is stopped"
                 );
@@ -191,11 +215,18 @@ fn pin_listener(members: &[ProcIdentity], owner: Option<u32>) -> Result<Option<P
         })
 }
 
-/// The keys every `freshell_unit` event carries, from the unit's label.
-fn unit_log_keys(unit: &AgentUnit) -> UnitLogKeys {
-    let label = unit.label();
+/// The keys every `freshell_unit` event carries, from the unit's label. The
+/// owner operation of a stop belongs to the lifecycle that started it, so it
+/// is empty here.
+pub(crate) fn unit_log_keys(unit: &AgentUnit) -> UnitLogKeys {
+    label_log_keys(unit.id().as_str(), unit.label())
+}
+
+/// The same keys for a unit known by its id (empty when there is none) and
+/// label.
+pub(crate) fn label_log_keys(unit_id: &str, label: UnitLabel) -> UnitLogKeys {
     UnitLogKeys {
-        unit_id: unit.id().to_string(),
+        unit_id: unit_id.to_string(),
         provider: label.provider,
         session_id: label.session_id,
         terminal_id: label.terminal_id,

@@ -20,7 +20,7 @@ use std::time::Duration;
 use freshell_containment::{AgentUnit, StopHandle, StopMode, StopReason, UnitRecord};
 
 use crate::app_server::{BoxFuture, CodexAppServerClient};
-use crate::launch_lifecycle::{CodexLaunchRuntime, CodexRuntimeReady};
+use crate::launch_lifecycle::{unit_event, unit_log_keys, CodexLaunchRuntime, CodexRuntimeReady};
 use crate::launch_plan::UnitSeed;
 use crate::sidecar_store::{
     verify_sidecar_identity, CodexSidecarRecord, CodexSidecarStore, IdentityVerdict, SidecarLane,
@@ -766,9 +766,12 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
         Box::pin(async move {
             if let (Some(seed), Some(unit)) = (self.seed.as_ref(), self.unit.get()) {
                 if seed.is_stopping(unit) {
-                    tracing::info!(
-                        target: "freshell_codex::sidecar_reconcile",
-                        unit_id = %unit.id(),
+                    unit_event!(
+                        info,
+                        "freshell_codex::sidecar_reconcile",
+                        unit_log_keys(unit),
+                        "sidecar_retention_skipped",
+                        reason = %reason,
                         "sidecar_retention_skipped: the unit is stopping; a kill beats retention"
                     );
                     return Ok(());

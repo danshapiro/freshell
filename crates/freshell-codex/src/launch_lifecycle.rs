@@ -63,7 +63,7 @@ use crate::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 
 #[path = "launch_lifecycle_unit.rs"]
 mod unit_attempt;
-pub(crate) use unit_attempt::listener_among_members;
+pub(crate) use unit_attempt::{label_log_keys, listener_among_members, unit_event, unit_log_keys};
 
 /// `assertAcceptingPlans` (`launch-planner.ts:199`), byte-identical.
 pub const CODEX_LAUNCH_PLANNER_SHUTDOWN_MESSAGE: &str =
@@ -343,8 +343,16 @@ impl CodexLaunchSidecar {
     /// exactly as today. A unit whose stop has begun is never retained.
     pub async fn retain(&self, reason: &str) -> Result<(), String> {
         if self.is_stopping() {
-            tracing::info!(
-                target: "freshell_codex::launch",
+            let keys = self
+                .runtime
+                .unit()
+                .map(|unit| unit_log_keys(&unit))
+                .unwrap_or_default();
+            unit_event!(
+                info,
+                "freshell_codex::launch",
+                keys,
+                "sidecar_retention_skipped",
                 reason,
                 "sidecar_retention_skipped: the unit is stopping; a kill beats retention"
             );
@@ -633,13 +641,17 @@ impl CodexLaunchPlanner {
             match self.plan_create(input).await {
                 Ok(launch) => return Ok(launch),
                 Err(error) => {
-                    if input
+                    if let Some(seed) = input
                         .unit_seed
                         .as_ref()
-                        .is_some_and(UnitSeed::start_cancelled)
+                        .filter(|seed| seed.start_cancelled())
                     {
-                        tracing::info!(
-                            target: "freshell_codex::launch",
+                        // The cancelled attempt's own unit logged its stop.
+                        unit_event!(
+                            info,
+                            "freshell_codex::launch",
+                            label_log_keys("", seed.label.clone()),
+                            "codex_start_cancelled",
                             attempt,
                             error = %error,
                             "codex_start_cancelled: a kill cancelled the start; no further attempt"
@@ -1930,9 +1942,12 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
         Box::pin(async move {
             if let (Some(seed), Some(unit)) = (self.seed.as_ref(), self.unit.get()) {
                 if seed.is_stopping(unit) {
-                    tracing::info!(
-                        target: "freshell_codex::launch",
-                        unit_id = %unit.id(),
+                    unit_event!(
+                        info,
+                        "freshell_codex::launch",
+                        unit_log_keys(unit),
+                        "sidecar_retention_skipped",
+                        reason = %reason,
                         "sidecar_retention_skipped: the unit is stopping; a kill beats retention"
                     );
                     return Ok(());
