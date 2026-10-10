@@ -24,6 +24,10 @@ const vitestManifest = JSON.parse(fs.readFileSync(vitestPackagePath, 'utf8')) as
 const expectedVitestEntrypoint = path.resolve(path.dirname(vitestPackagePath), vitestManifest.bin.vitest)
 const fixtureCommit = 'a'.repeat(40)
 
+function shellQuote(word: string): string {
+  return `'${word.replaceAll("'", "'\\''")}'`
+}
+
 interface LaunchFixture {
   root: string
   pnpmCjs: string
@@ -117,9 +121,9 @@ describe('runtime test script manager launches', () => {
       [fixture.pnpmCjs, 'run', 'build:tools'],
       ['build', '--release', '-p', 'freshell-server', '--locked'],
     ])
-    expect(specs).toHaveLength(5)
-    expect(specs[4].command).toBe(path.resolve('scripts/sandbox-test.sh'))
-    expect((specs[4].args as string[])[0]).toBe('--runtime-suite')
+    expect(specs).toHaveLength(6)
+    expect(specs[5].command).toBe(path.resolve('scripts/sandbox-test.sh'))
+    expect((specs[5].args as string[])[0]).toBe('--runtime-suite')
     expect(execFileSync).toHaveBeenCalledExactlyOnceWith('git', ['rev-parse', 'HEAD'], {
       cwd: path.resolve('.'), encoding: 'utf8',
     })
@@ -157,17 +161,17 @@ describe('runtime test script manager launches', () => {
   it.each([17, 125, 143])('returns sandbox failure %s without a host runtime fallback', async code => {
     vi.stubEnv('FRESHELL_RUST_TEST_SANDBOX', '1')
     vi.stubEnv('npm_execpath', fixture.pnpmCjs)
-    spawn.mockImplementation((command: string) => {
+    spawn.mockImplementation((command: string, args: string[]) => {
       const child = Object.assign(new EventEmitter(), { exitCode: null, killed: false })
       queueMicrotask(() => {
-        const result = command.endsWith('sandbox-test.sh') ? code : 0
+        const result = command.endsWith('sandbox-test.sh') && args[0] === '--runtime-suite' ? code : 0
         child.emit('exit', result, null)
         child.emit('close', result, null)
       })
       return child
     })
     expect(await runSourceRuntimeTests([])).toBe(code)
-    expect(spawn).toHaveBeenCalledTimes(5)
+    expect(spawn).toHaveBeenCalledTimes(6)
   })
 
   it.each([0, 31])('executes the sandbox shell boundary with exact argv and cleanup on suite exit %s', async code => {
@@ -181,17 +185,16 @@ describe('runtime test script manager launches', () => {
         commit:process.env.FRESHELL_BUILD_COMMIT,
         tmp:process.env.TMPDIR, executableTmp:process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR})+'\\n');
       process.exit(process.argv[2]==='node' ? Number(process.env.SUITE_EXIT) : 0);`)
-    const quote = (word: string) => `'${word.replaceAll("'", "'\\''")}'`
     for (const name of ['cargo', 'node']) {
-      fs.writeFileSync(path.join(fixture.binDir, name), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(helper)} ${name} "$@"\n`, { mode: 0o755 })
+      fs.writeFileSync(path.join(fixture.binDir, name), `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(helper)} ${name} "$@"\n`, { mode: 0o755 })
     }
     let shellOutput = ''
     spawn.mockImplementation((command: string, args: string[]) => {
       const child = Object.assign(new EventEmitter(), { exitCode: null, killed: false })
       queueMicrotask(() => {
         let status = 0
-        if (command.endsWith('sandbox-test.sh')) {
-          const payload = args[1].replace('/freshell-test-artifacts/', `${quote(fixture.root)}/`)
+        if (command.endsWith('sandbox-test.sh') && args[0] === '--runtime-suite') {
+          const payload = args[1].replace('/freshell-test-artifacts/', `${shellQuote(fixture.root)}/`)
           const result = spawnSync('bash', ['-c', payload], {
             cwd: fixture.root,
             env: { ...process.env, PATH: `${fixture.binDir}:${process.env.PATH}`, RECEIPT: receipt, SUITE_EXIT: String(code) },
@@ -221,6 +224,48 @@ describe('runtime test script manager launches', () => {
     expect(fs.existsSync(path.join(fixture.root, 'SHOULD_NOT_EXIST'))).toBe(false)
     expect(shellOutput).not.toContain('quote')
     expect(shellOutput).toContain('source_runtime_temp_settled')
+  })
+
+  it.each([0, 33])('prepares sandbox prerequisites before the strict suite and propagates preparation exit %s', async preparationExit => {
+    vi.stubEnv('FRESHELL_RUST_TEST_SANDBOX', '1')
+    vi.stubEnv('npm_execpath', fixture.pnpmCjs)
+    const readyPath = path.join(fixture.root, 'prerequisites-ready')
+    const receiptPath = path.join(fixture.root, 'prerequisite-events.jsonl')
+    const helperPath = path.join(fixture.root, 'prerequisite-child.mjs')
+    fs.writeFileSync(helperPath, `import fs from 'node:fs';
+      const preparing = process.argv.includes('scripts/ensure-claude-sidecar.ts');
+      fs.appendFileSync(process.env.RECEIPT, JSON.stringify({preparing, ready:fs.existsSync(process.env.READY)})+'\\n');
+      if (preparing) {
+        if (Number(process.env.PREPARATION_EXIT)) process.exit(Number(process.env.PREPARATION_EXIT));
+        fs.writeFileSync(process.env.READY, 'prepared');
+      } else if (!fs.existsSync(process.env.READY)) process.exit(41);`)
+    fs.writeFileSync(path.join(fixture.binDir, 'cargo'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    fs.writeFileSync(path.join(fixture.binDir, 'node'), `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(helperPath)} "$@"\n`, { mode: 0o755 })
+    let shellOutput = ''
+    spawn.mockImplementation((command: string, args: string[]) => {
+      const child = Object.assign(new EventEmitter(), { exitCode: null, killed: false })
+      queueMicrotask(() => {
+        let status = 0
+        if (command.endsWith('sandbox-test.sh')) {
+          const payload = args.at(-1)!.replace('/freshell-test-artifacts/', `${shellQuote(fixture.root)}/`)
+          const result = spawnSync('bash', ['-c', payload], {
+            cwd: fixture.root,
+            env: { ...process.env, PATH: `${fixture.binDir}:${process.env.PATH}`, RECEIPT: receiptPath, READY: readyPath, PREPARATION_EXIT: String(preparationExit) },
+            encoding: 'utf8', timeout: 10_000,
+          })
+          shellOutput += result.stdout + result.stderr
+          status = result.status ?? 1
+        }
+        child.emit('close', status, null)
+      })
+      return child
+    })
+
+    expect(await runSourceRuntimeTests([]), shellOutput).toBe(preparationExit)
+    const events = fs.readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(events).toEqual(preparationExit === 0
+      ? [{ preparing: true, ready: false }, { preparing: false, ready: true }]
+      : [{ preparing: true, ready: false }])
   })
 
   it('forwards SIGTERM from a simulated listener and removes its handlers after child close', async () => {
