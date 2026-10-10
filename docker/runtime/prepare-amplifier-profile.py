@@ -5,6 +5,49 @@ import os
 from pathlib import Path
 import sys
 
+
+def reuse_native_secret_reference(provider):
+    """Keep a matching native key stable when ordinary settings are refreshed."""
+    from amplifier_app_cli.provider_config_utils import (
+        KeyManager,
+        _secret_config_field,
+        _suggest_instance_env_var,
+    )
+
+    field = _secret_config_field(provider["module"])
+    config = provider.get("config") or {}
+    value = config.get(field["id"]) if field else None
+    if not isinstance(value, str) or not value:
+        return
+    if value.startswith("${") and value.endswith("}"):
+        return
+    candidates = []
+    instance = str(provider.get("id") or provider["module"])
+    try:
+        candidates.append(_suggest_instance_env_var(provider["module"], instance, set()))
+    except ValueError:
+        # Native normalization still decides whether a new name is available.
+        pass
+    if field.get("env_var"):
+        candidates.append(field["env_var"])
+    manager = KeyManager()
+    if not manager.keys_file.exists():
+        return
+    # Use the pinned native store's lock and parsing convention. Environment
+    # values can override loaded keys and cannot prove the persisted value.
+    with manager._lock:
+        stored = {}
+        for line in manager.keys_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                name, saved = line.split("=", 1)
+                stored[name.strip()] = saved.strip().strip('"').strip("'")
+        for name in candidates:
+            if stored.get(name) == value:
+                config[field["id"]] = "${" + name + "}"
+                return
+
+
 def prepare(bundle):
     phase = "load_native_settings"
     try:
@@ -30,6 +73,7 @@ def prepare(bundle):
                 raise ValueError("selected Amplifier provider is not installed")
         phase = "write_native_settings"
         for provider in providers:
+            reuse_native_secret_reference(provider)
             settings.set_provider_override(provider)
         phase = "verify_native_settings"
         if settings.get_provider_overrides() != providers:
