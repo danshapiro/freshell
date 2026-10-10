@@ -323,7 +323,7 @@ impl NativeObservation {
                 .any(|pair| pair[0] >= pair[1])
             || self.local_settings.len() > 2
             || local_enabled != (self.local_decision != LocalDecision::Disabled)
-            || local_enabled != !self.local_settings.is_empty()
+            || local_enabled == self.local_settings.is_empty()
             || (!self.local_settings.is_empty()
                 && self.local_settings[0] != self.cwd.join(".claude/settings.local.json"))
             || (!local_enabled

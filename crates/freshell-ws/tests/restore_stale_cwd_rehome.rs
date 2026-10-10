@@ -154,7 +154,7 @@ async fn next_created_or_error(ws: &mut common::TestWs, request_id: &str) -> Val
 
 #[tokio::test(flavor = "multi_thread")]
 async fn restore_create_with_deleted_cwd_rehomes_instead_of_failing_spawn() {
-    if common::run_with_opencode_home(
+    if common::opencode_home::run_with_opencode_home(
         "restore_create_with_deleted_cwd_rehomes_instead_of_failing_spawn",
     ) {
         return;
