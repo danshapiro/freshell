@@ -683,28 +683,31 @@ describe('ordinary and managed terminal provider parity', () => {
     )))
     const before = await waitFor('managed OpenCode container before switch', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
-      return view?.containerId ? view : undefined
+      return view?.containerId && view.durabilityState === 'resume_captured' ? view : undefined
     })
     if (!before.containerId) throw new Error('managed OpenCode container missing')
     const switchedId = `ses_ParitySwitch${Date.now()}`
-    const writeSignal = `
-      const fs = require('node:fs')
+    const createSelectedRoot = `
       const path = require('node:path')
       const { DatabaseSync } = require('node:sqlite')
-      const [previous, next, terminal] = process.argv.slice(1)
+      const [previous, next] = process.argv.slice(1)
       const home = '/home/freshell/provider'
       const db = new DatabaseSync(path.join(home, '.local/share/opencode/opencode.db'))
-      const changed = db.prepare('UPDATE session SET id = ? WHERE id = ?').run(next, previous)
+      const oldMessages = db.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get(previous).count
+      const created = db.prepare(\`INSERT INTO session
+        (id, project_id, parent_id, slug, directory, title, version, model, time_created, time_updated)
+        SELECT ?, project_id, NULL, ?, directory, ?, version, model, ?, ? FROM session WHERE id = ?\`)
+        .run(next, next, next, Date.now(), Date.now(), previous)
+      if (created.changes !== 1) throw new Error('native session row was not available')
+      if (!db.prepare('SELECT id FROM session WHERE id = ?').get(previous)
+        || db.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get(previous).count !== oldMessages)
+        throw new Error('original native graph changed')
       db.close()
-      if (changed.changes !== 1) throw new Error('native session row was not available')
-      const signals = path.join(home, '.freshell/session-signals/opencode')
-      fs.mkdirSync(signals, { recursive: true })
-      fs.writeFileSync(path.join(signals, terminal + '__' + Date.now() + '.json'),
-        JSON.stringify({ session_id: next }))
     `
     await rig.ownedProviderExec(before.containerId, [
-      'node', '-e', writeSignal, initial.nativeSession.value, switchedId, terminalId,
+      'node', '-e', createSelectedRoot, initial.nativeSession.value, switchedId,
     ])
+    wire.send({ type: 'terminal.input', terminalId, data: `SELECT_SESSION ${switchedId}\r` })
     await wire.wait(frame => frame.type === 'terminal.session.associated'
       && frame.terminalId === terminalId && frame.sessionRef?.sessionId === switchedId, 30_000).catch(async error => {
       throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; web: ${Object.values(rig.web.capturedOutput()).join('\n').slice(-3000)}`)

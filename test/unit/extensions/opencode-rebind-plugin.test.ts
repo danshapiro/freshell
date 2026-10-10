@@ -958,6 +958,58 @@ describe('default export (TuiPluginModule)', () => {
     } finally { abort.abort(); rmSync(home, { recursive: true, force: true }) }
   })
 
+  it.each(['qualified', 'wrong-root', 'parent-root', 'unhydrated-tail', 'unhydrated-parts', 'changed-route', 'dispose', 'resume-pinned'])
+    ('follows a fresh native root switch only with the complete %s loader conjunction', async (condition) => {
+      const home = mkdtempSync(join(tmpdir(), 'freshell-native-opencode-switch-'))
+      const original = 'ses_originalnative1', selected = 'ses_selectednative1', tail = 'msg_selectednative1'
+      const launch = { incarnationId: 'incarnation-native1', launchNonce: 'launch-native1', evidenceRevision: 4,
+        executionGeneration: 2, requestedNativeSessionId: condition === 'resume-pinned' ? original : null }
+      vi.stubEnv('HOME', home)
+      vi.stubEnv('FRESHELL_NATIVE_IDENTITY_LAUNCH', JSON.stringify(launch))
+      vi.stubEnv('FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR', join(home, '.freshell/native-identity', launch.launchNonce))
+      const route = { current: { name: 'session', params: { sessionID: original } },
+        navigate: (name: string, params: { sessionID: string }) => { route.current = { name, params } } }
+      const abort = new AbortController()
+      const session = (id: string) => ({ id, parentID: null })
+      const info = { id: tail, sessionID: selected, role: 'user' }
+      const part = { id: 'prt_selectednative1', messageID: tail, sessionID: selected, type: 'text' }
+      let switching = false
+      const create = vi.fn(async () => ({ data: session(original) }))
+      const get = vi.fn(async ({ sessionID }: { sessionID: string }) => {
+        if (switching && condition === 'changed-route') route.current.params.sessionID = original
+        if (switching && condition === 'dispose') abort.abort()
+        return { data: switching && condition === 'wrong-root' ? session(original)
+          : switching && condition === 'parent-root' ? { ...session(sessionID), parentID: original } : session(sessionID) }
+      })
+      try {
+        plugin.tui({ route, lifecycle: { signal: abort.signal },
+          state: { ready: true, part: () => condition === 'unhydrated-parts' ? [] : [part], session: {
+            get: session, messages: (id: string) => id === original ? []
+              : condition === 'unhydrated-tail' ? [] : [info],
+          } },
+          client: { session: { create, get, messages: async ({ sessionID }: { sessionID: string }) => ({
+            data: sessionID === original ? [] : [{ info, parts: [part] }],
+          }) } },
+        })
+        await vi.advanceTimersByTimeAsync(0)
+        const file = join(home, '.freshell/native-identity', launch.launchNonce, 'opencode-loaded.json')
+        expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ launch, native: { session_id: original, hydrated: true } })
+        switching = true
+        route.navigate('session', { sessionID: selected })
+        await vi.advanceTimersByTimeAsync(1000)
+        const emitted = JSON.parse(readFileSync(file, 'utf8'))
+        if (condition === 'qualified') {
+          expect(emitted).toMatchObject({ launch, native: { session_id: selected, parent_id: null,
+            hydrated: true, messages_read: 'success', active_message_count: 1, tail_message_id: tail } })
+          expect(get).toHaveBeenLastCalledWith({ sessionID: selected }, { throwOnError: true })
+        } else {
+          expect(emitted.native.hydrated).toBe(false)
+        }
+        expect(create).toHaveBeenCalledTimes(condition === 'resume-pinned' ? 0 : 1)
+        if (condition === 'resume-pinned') expect(get).toHaveBeenCalledOnce()
+      } finally { abort.abort(); rmSync(home, { recursive: true, force: true }) }
+    })
+
   it.each(['wrong-root', 'history-error', 'unhydrated-tail', 'unhydrated-parts', 'parent-root', 'malformed-binding'])
     ('keeps managed nonadoption %s unobserved without a legacy fallback', async (fault) => {
       const home = mkdtempSync(join(tmpdir(), 'freshell-native-opencode-refusal-'))

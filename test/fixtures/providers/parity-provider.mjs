@@ -279,8 +279,116 @@ asyncio.run(main())
   })
 }
 
+async function controlledOpenCodeTui() {
+  // This function runs in a child with Node's TypeScript transform enabled:
+  // the installed TUI plugin contains parameter properties. All native and
+  // hydrated reads below come from the same real controlled SQLite store.
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const { randomUUID } = await import('node:crypto')
+  const { DatabaseSync } = await import('node:sqlite')
+  const config = JSON.parse(fs.readFileSync(process.env.OPENCODE_TUI_CONFIG, 'utf8'))
+  const pluginPath = config.plugin.find(value => value.endsWith('/freshell-rebind-plugin.ts'))
+  if (!pluginPath) throw new Error('configured native TUI plugin missing')
+  const plugin = (await import(pluginPath)).default
+  const dataHome = path.join(process.env.HOME, '.local/share/opencode')
+  fs.mkdirSync(dataHome, { recursive: true })
+  const db = new DatabaseSync(path.join(dataHome, 'opencode.db'))
+  db.exec(`
+    PRAGMA busy_timeout = 5000;
+    CREATE TABLE IF NOT EXISTS project (id text PRIMARY KEY, worktree text);
+    CREATE TABLE IF NOT EXISTS session (
+      id text PRIMARY KEY, project_id text NOT NULL, workspace_id text, parent_id text,
+      slug text NOT NULL, directory text NOT NULL, path text, title text NOT NULL,
+      version text NOT NULL, share_url text, summary_additions integer, summary_deletions integer,
+      summary_files integer, summary_diffs text, metadata text, cost real NOT NULL DEFAULT 0,
+      tokens_input integer NOT NULL DEFAULT 0, tokens_output integer NOT NULL DEFAULT 0,
+      tokens_reasoning integer NOT NULL DEFAULT 0, tokens_cache_read integer NOT NULL DEFAULT 0,
+      tokens_cache_write integer NOT NULL DEFAULT 0, revert text, permission text, agent text,
+      model text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL,
+      time_compacting integer, time_archived integer);
+    CREATE TABLE IF NOT EXISTS message (id text PRIMARY KEY, session_id text NOT NULL,
+      time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
+    CREATE TABLE IF NOT EXISTS part (id text PRIMARY KEY, message_id text NOT NULL,
+      session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
+    CREATE TABLE IF NOT EXISTS message_seq (session_id text PRIMARY KEY, next integer NOT NULL);
+  `)
+  const get = id => {
+    const row = db.prepare('SELECT * FROM session WHERE id = ?').get(id)
+    if (!row) throw new Error('native root not found')
+    return { id: row.id, parentID: row.parent_id, revert: row.revert ? JSON.parse(row.revert) : undefined }
+  }
+  const parts = id => db.prepare('SELECT * FROM part WHERE message_id = ? ORDER BY time_created, id')
+    .all(id).map(row => ({ ...JSON.parse(row.data), id: row.id, messageID: row.message_id, sessionID: row.session_id }))
+  const messages = id => db.prepare('SELECT * FROM message WHERE session_id = ? ORDER BY time_created, id')
+    .all(id).map(row => ({ info: { ...JSON.parse(row.data), id: row.id, sessionID: row.session_id }, parts: parts(row.id) }))
+  const resume = argv.indexOf('--session')
+  const selected = resume >= 0 ? argv[resume + 1] : null
+  const route = { current: selected ? { name: 'session', params: { sessionID: selected } } : { name: 'home' },
+    navigate(name, params) { this.current = { name, params } } }
+  const lifecycle = new AbortController()
+  const api = {
+    route, lifecycle: { signal: lifecycle.signal },
+    state: { ready: true, part: parts, session: { get, messages: id => messages(id).map(row => row.info) } },
+    client: { session: {
+      async create() {
+        const id = 'ses_' + randomUUID().replaceAll('-', '')
+        const now = Date.now()
+        db.prepare('INSERT INTO project (id, worktree) VALUES (?, ?)').run(id, process.cwd())
+        db.prepare(`INSERT INTO session
+          (id, project_id, parent_id, slug, directory, title, version, model, time_created, time_updated)
+          VALUES (?, ?, NULL, ?, ?, ?, 'controlled-parity', 'controlled-model', ?, ?)`)
+          .run(id, id, id, process.cwd(), id, now, now)
+        return { data: get(id) }
+      },
+      async get({ sessionID }) { return { data: get(sessionID) } },
+      async messages({ sessionID }) { get(sessionID); return { data: messages(sessionID) } },
+    } },
+  }
+  plugin.tui(api)
+  // The native plugin creates/navigates the fresh root asynchronously. This
+  // marker observes its selected row; it never constructs an identity ACK.
+  let announced = false
+  const observation = setInterval(() => {
+    const id = route.current.params?.sessionID
+    if (!id || announced) return
+    get(id)
+    announced = true
+    process.stdout.write(`opencode: session ${id} started\n`)
+    process.stdout.write('FRESHELL_PROVIDER_PARITY_ROW:' + Buffer.from(JSON.stringify({
+      provider: 'opencode', kind: 'identity', terminalId: process.env.FRESHELL_TERMINAL_ID,
+      nativeSession: { source: 'provider-store', value: id },
+    })).toString('base64') + '\n')
+  }, 25)
+  process.stdin.on('data', chunk => {
+    const id = route.current.params?.sessionID
+    const prompt = String(chunk).trim()
+    if (prompt.startsWith('SELECT_SESSION ')) {
+      const selected = prompt.slice('SELECT_SESSION '.length)
+      get(selected)
+      route.navigate('session', { sessionID: selected })
+      return
+    }
+    if (!id || !prompt || messages(id).length) return
+    const now = Date.now()
+    const message = 'msg_' + randomUUID().replaceAll('-', '')
+    db.prepare('INSERT INTO message VALUES (?, ?, ?, ?, ?)')
+      .run(message, id, now, now, JSON.stringify({ role: 'user' }))
+    db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)')
+      .run('prt_' + randomUUID().replaceAll('-', ''), message, id, now, now, JSON.stringify({ type: 'text', text: prompt }))
+  })
+  process.stdin.resume()
+  const dispose = () => { lifecycle.abort(); clearInterval(observation); db.close() }
+  process.once('exit', dispose)
+}
+
 if (provider === 'amplifier') await configuredAmplifierStartup()
-if (provider === 'codex' || provider === 'opencode') {
+if (provider === 'opencode' && process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) {
+  const terminal = spawn(process.execPath, ['--experimental-transform-types', '--input-type=module', '-e',
+    `const argv = process.argv.slice(1); await (${controlledOpenCodeTui.toString()})()`, '--', ...argv],
+  { env: process.env, cwd, stdio: 'inherit' })
+  terminal.once('exit', code => { process.exitCode = code ?? 1 })
+} else if (provider === 'codex' || provider === 'opencode') {
   // Keep ordinary fake transcripts Enter-bound. Only this managed Codex
   // parity wrapper requests the current proxy handshake before input.
   const fake = path.join(import.meta.dirname,
