@@ -633,8 +633,13 @@ async fn a_reopened_unit_stops_its_recorded_roots_and_their_descendants() {
         .split_whitespace()
         .map(|p| p.parse().unwrap())
         .collect();
-    lines.expect("idle", |l| l.starts_with("idle "));
-    lines.expect("idle", |l| l.starts_with("idle "));
+    // Each child reports itself running, before or after the `kids` line.
+    for pid in &kids {
+        let line = format!("idle {pid}");
+        if !lines.seen.contains(&line) {
+            lines.expect(&line, |l| l == line);
+        }
+    }
     let (plain, daemon) = (Proc::open(kids[0]), Proc::open(kids[1]));
     let root_start = freshell_containment::process::start_time(root_proc.pid).unwrap();
 

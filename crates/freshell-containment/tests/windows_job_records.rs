@@ -3,6 +3,7 @@
 //! held after the exits are confirmed, so the record can be read mid-stop).
 mod windows_support;
 
+use std::os::windows::io::AsRawHandle;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -112,7 +113,9 @@ async fn a_process_joining_after_kill_on_close_is_cleared_is_recorded_until_it_e
             "open the unit's job: {}",
             std::io::Error::last_os_error()
         );
-        let joined = AssignProcessToJobObject(job, late_proc.handle);
+        // The child's own handle has the access assignment needs
+        // (PROCESS_SET_QUOTA and PROCESS_TERMINATE).
+        let joined = AssignProcessToJobObject(job, late.as_raw_handle());
         let err = std::io::Error::last_os_error();
         CloseHandle(job);
         assert_ne!(joined, 0, "assign to the unit's job: {err}");
