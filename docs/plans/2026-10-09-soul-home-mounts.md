@@ -11,16 +11,17 @@
 
 ### Explicit constraints
 - Primary priority, stated by the user: "it works without bothering the user." No launch refusals, registration steps, approval prompts, or config re-authoring for this reference class.
-- Chosen mechanism: mount the operator's home read-only at its own path into every soul container and run provider children as the operator's uid:gid instead of 65534 (`nobody`). No config scanner/rewriter/classifier machinery.
+- Chosen mechanism (ratified by the user 2026-10-10, superseding the original uid:gid proposal that the load-bearing stage falsified under the rootless production daemon): mount the operator's home read-only at its own path into every soul container; provider children KEEP running as 65534:0 — under the rootless daemon their gid 0 is the operator's group, so group-readable reference targets resolve with no identity change. No config scanner/rewriter/classifier machinery.
 - The soul's purpose is resource bounding (CPU/memory/swap/pids) and clean process lifecycle, NOT data confidentiality (user ratified). Resource limits and teardown semantics must not change.
 - Control-plane authorization material under the operator home (at minimum `~/.freshell`: incarnation secrets, MCP capability grants, server config secrets) must not become readable by provider children through the new mount — mask it inside the container.
 - Home mount is read-only; provider writes go to the soul HOME volume and the workspace as today; workspace mounts stay read-write.
-- Existing durable souls must keep working across the uid change: provider-home state ownership (old uid 65534) migrates to the operator uid at incarnation start, with no user intervention and no loss of provider state.
+- Existing durable souls must keep working across the change (restated per the ratified 2026-10-10 design): with no identity change, launch records, digests, and provider volumes are untouched and nothing migrates.
 - Unchanged: config-root staging/projection into the soul HOME volume, OneCLI env grants for `{env:}` references, auth.json provider-file grants, per-incarnation MCP capability mounts.
 - Production self-hosted server must not be restarted without the user's explicit "APPROVED"; building and testing in worktrees is fine. Running souls keep their old mounts until natural incarnation replacement.
 - TDD per repo rules; work in `.worktrees/soul-home-mounts`; PR to main only after explicit user approval.
 
 ### Accepted tradeoffs and residuals
+- Ratified 2026-10-10: referenced files under the operator home become group-readable — one-time `chmod g+rx ~/.amplifier && chmod g+r ~/.amplifier/*.key` host prep, with Amplifier writing 0640/0750 going forward so rotation preserves it. Rootful deployments degrade to today's behavior, observable via the readiness event, never gated.
 - Accepted posture change: souls can read the operator's home except masked control-plane paths. The "blast radius"/confidentiality concern was explicitly withdrawn by the user.
 - `{env:}` references for new custom providers still require allow-list additions in `provider_secret_resolution.rs`; pressure is reduced but the mechanism is unchanged.
 - References outside home/workspace/grants (rare) and cross-host drift (referenced file absent on this machine) still fail at runtime exactly as host CLIs would; an optional doctor lint is out of scope.
@@ -36,6 +37,7 @@ The load-bearing stage falsified the request's proposed mechanism and replaced i
 4. **tmpfs-over-bind masks work on the production daemon** (LB-04, verified): a read-only home bind plus `--tmpfs <home>/.freshell` yielded an empty `.freshell` inside the container with the rest of the home intact. The masking strategy stands, with `~/.config/gcloud` added to the mask list as zero-cost defense-in-depth for gcloud-robot infrastructure credentials (finder residual, accepted).
 5. **Supervisor topology verified** (LB-02): the production supervisor runs as `dan` with `HOME=/home/dan`. The home-mount derivation keeps using the supervisor's HOME env, now guarded by a home-owner check (skip the mount unless the home's st_uid equals the supervisor euid) so no unowned or root-owned home can ever be mounted.
 6. **E2e shape verified** (LB-11, `reports/load-bearing-validator-lb11.md`): the rig can express the regression via the existing `webHomeDir` + `supervisorEnv` seams with broker allow-list additions; opencode 1.18.21 resolves native provider ids offline (bundled models.dev snapshot; `{file:}` substitution is pre-schema and hard-fails on ENOENT and EACCES); the red reproduces through the `OPENCODE_CONFIG_CONTENT` inline lane; harness-created `testRoot` and `/tmp/f<uid>` are 0700 and the spec must chmod them 0750.
+7. **User Request block provenance (2026-10-10):** the dispatcher updated the block's mechanism bullet and tradeoff list to record the user's explicit ratification of the rootless-native group-read design (the "ratify the group-read tradeoff" decision presented with the load-bearing receipt). No other block text changed; the falsified original mechanism is preserved above in this revisions section.
 
 **Goal:** Every fresh-agent and managed-terminal soul launches with a config that fully works — absolute references under the operator's home resolve in-soul — and the ms-runpod `bad file reference` incident class becomes structurally impossible on the production daemon.
 
@@ -51,7 +53,7 @@ The load-bearing stage falsified the request's proposed mechanism and replaced i
 - Mask list (tmpfs, fixed): `<home>/.freshell`, `<home>/.amplifier/onecli`, `<home>/.config/gcloud`. The tmpfs-over-bind shape is validated; `verify_inspect_config` must only assert the new mounts/env for containers that carry the additive marker env (pre-upgrade containers must keep passing).
 - **Host prep (documented, never enforced by launch code):** referenced files under the operator home must be group-readable (0640 keys) under group-traversable directories (0750), per the rootless gid mapping. One-time remediation: `chmod g+rx ~/.amplifier && chmod g+r ~/.amplifier/*.key`; Amplifier should write 0640/0750 going forward. On rootful daemons group 0 is not the operator group, so the feature degrades to today's behavior with an observable readiness event — documented, not gated.
 - Red-Green-Refactor TDD: every task adds its failing test first, watches it fail for the stated reason, implements minimally, refactors while green, and runs the impacted set.
-- Test coordination (AGENTS.md): narrowed `cargo test -p <crate> <filter>` selectors are delegated (no coordinator gate). Do not kill foreign gate holders. New e2e specs are `LOCAL_ONLY` (register in `test/e2e-browser/playwright.cloud.config.ts`).
+- Test coordination (AGENTS.md): narrowed `cargo test -p <crate> -- <filters...>` selectors are delegated (no coordinator gate); cargo accepts one positional filter, so multiple filters go after `--` (the libtest harness takes several). Do not kill foreign gate holders. New e2e specs are `LOCAL_ONLY` (register in `test/e2e-browser/playwright.config.ts`, where `LOCAL_ONLY_SPECS` is defined — the cloud config imports it).
 - Never restart the production self-hosted server (port 3001) without the user's explicit "APPROVED". Building and running scratch supervisors/souls in the worktree is fine.
 - No changes to: `copy_provider_config_references_with_ownership` projection semantics, `provider_secret_resolution.rs` env allow-lists, resource limits, teardown semantics, the `run_as_uid`/`run_as_gid` fields or their validation.
 - Commits use `Dan Shapiro <3732858+danshapiro@users.noreply.github.com>` (repo config already provides it; do not override).
@@ -183,7 +185,7 @@ fn home_mount_env_marker_is_set_only_when_mounted() {
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-supervisor operator_home_mount workload_binds home_mount_env_marker`
+Run: `cargo test -p freshell-supervisor -- operator_home_mount workload_binds home_mount_env_marker`
 
 Expected: FAIL to compile — `operator_home_mount`, `OperatorHomeMount`, and `assemble_workload_binds` do not exist yet (missing behavior, not a syntax accident).
 
@@ -251,7 +253,7 @@ if let Some(home) = &mounts.operator_home {
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `cargo test -p freshell-supervisor operator_home_mount workload_binds home_mount_env_marker`
+Run: `cargo test -p freshell-supervisor -- operator_home_mount workload_binds home_mount_env_marker`
 
 Expected: PASS
 
@@ -291,16 +293,23 @@ git commit -m "feat(supervisor): mount operator home read-only in souls with tmp
 ```rust
 #[test]
 fn child_can_traverse_evaluates_dac_classes() {
-    // Owner execute (0700, child is owner).
+    // All metadata is the IN-CONTAINER view. Under the rootless daemon an
+    // operator-owned file (host uid/gid 1000/1000) appears as container 0:0,
+    // and the child's gid 0 then matches the file's group.
+    // Owner execute, child is the owner.
     assert!(child_can_traverse(0o700, 1000, 1000, 1000, 0));
-    // Group execute with gid match (0750, child gid 0 = operator group under rootless).
-    assert!(child_can_traverse(0o750, 1000, 1000, 65_534, 0));
-    // Group execute but gid mismatch (rootful daemon: group 0 is not the operator group).
-    assert!(!child_can_traverse(0o750, 1000, 1000, 65_534, 65_534));
-    // No group bits (0700 home, child not owner) — the incident's failure surface.
-    assert!(!child_can_traverse(0o700, 1000, 1000, 65_534, 0));
+    // Group execute with gid match — the rootless production shape:
+    // operator-owned file seen as (0,0), child 65534:0 → group r-x applies.
+    assert!(child_can_traverse(0o750, 0, 0, 65_534, 0));
+    // Group execute but gid mismatch — the rootful shape: the operator's file
+    // keeps host gid 1000 in-container, and group 0 is the root group, not the
+    // operator's group.
+    assert!(!child_can_traverse(0o750, 1000, 1000, 65_534, 0));
+    // No group bits (0700 operator dir, child not the owner) — the incident's
+    // failure surface under the rootless mapping.
+    assert!(!child_can_traverse(0o700, 0, 0, 65_534, 0));
     // Other execute always passes.
-    assert!(child_can_traverse(0o701, 1000, 1000, 65_534, 65_534));
+    assert!(child_can_traverse(0o701, 0, 0, 65_534, 65_534));
 }
 
 #[test]
@@ -317,7 +326,7 @@ fn readiness_event_reflects_real_home_metadata() {
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-session-host child_can_traverse readiness_event`
+Run: `cargo test -p freshell-session-host -- child_can_traverse readiness_event`
 
 Expected: FAIL to compile — `child_can_traverse` and the emission do not exist yet.
 
@@ -338,7 +347,7 @@ At session-host startup, after arg parsing: read the two marker env vars; when b
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `cargo test -p freshell-session-host child_can_traverse readiness_event`
+Run: `cargo test -p freshell-session-host -- child_can_traverse readiness_event`
 
 Expected: PASS
 
@@ -361,37 +370,43 @@ git add crates/freshell-session-host/src/main.rs
 git commit -m "feat(session-host): emit operator home readiness event for souls"
 ```
 
-### Task 3: E2E regression — soul boots with `{file:}` key references
+### Task 3: E2E regression — freshopencode soul boots with `{file:}` key references
 
 **Files:**
 - Create: `test/e2e-browser/specs/runtime-opencode-home-file-reference-rust.spec.ts`
-- Modify: `scripts/testing/runtime-test-broker.ts` (~lines 330-380 bind allow-list; tmpfs allow arms)
-- Modify: `test/e2e-browser/playwright.cloud.config.ts` (add the spec to `LOCAL_ONLY_SPECS`)
+- Modify: `scripts/testing/runtime-test-broker.ts` (allow-list policy types/arms)
+- Modify: `scripts/testing/runtime-sandbox.ts` (`RuntimeHarness.prepare()` — where the broker allow-lists are constructed)
+- Modify: `test/e2e-browser/playwright.config.ts` (add the spec to `LOCAL_ONLY_SPECS`, defined here — the cloud config imports it)
 
 **Interfaces:**
-- Consumes: the rig pattern of `test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts` (P2-G04: construct rig → open an OpenCode pane via the picker → wait for `Ask anything`), `ManagedRuntimeBrowserRig` `webHomeDir`, `startSupervisor({ env })` (`supervisorEnv`), the broker allow-list. Authoritative seam list: `.worktrees/.the-usual-logs/soul-home-mounts/reports/load-bearing-validator-lb11.md`.
-- Produces: a reproducible spec proving the incident class is fixed on the real (rootless) daemon; broker arms admitting read-only same-path home binds and tmpfs mask destinations.
+- Consumes: the rig pattern of `test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts` (fresh-agent pane lifecycle; construct rig → `await rig.start()` → drive the fresh-agent pane), `ManagedRuntimeBrowserRig` `webHomeDir` + `supervisorEnv` constructor options (managed-runtime.ts:79-106; `start()` runs `runtime.prepare()` at line 118 — which wipes and recreates testRoot — then starts the supervisor at 153 with the env). Authoritative seam list: `.worktrees/.the-usual-logs/soul-home-mounts/reports/load-bearing-validator-lb11.md`.
+- Produces: a reproducible spec proving the incident class is fixed on the real (rootless) daemon via the FRESH-AGENT launch path (not the terminal picker path); broker allow-list arms admitting read-only same-path home binds and tmpfs mask destinations.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Build the spec by mirroring the continuity spec's real imports/rig calls (read it first; the sketch below names the verified seams, not the final API surface):
+Build the spec by mirroring the fresh-agent qualification spec's real imports/rig calls (read it first; the sketch below names the verified seams, not the final API surface). Lifecycle is load-bearing: `rig.start()` wipes testRoot inside `prepare()`, so the home fixtures are created AFTER `await rig.start()` returns and BEFORE the fresh-agent pane is launched — the server stages the user-provider root per launch at pane creation, so post-start fixtures are picked up:
 
 ```ts
-// Setup, before rig construction:
-// 1. home = <testRoot>/web-home (create AFTER prepare(), per the validator):
-//    - .amplifier/ms-runpod.key  ("e2e-key-not-real", mode 0640, group = operator)
-//    - .config/opencode/opencode.json:
+// 1. Construct the rig with webHomeDir: <testRoot>/web-home and
+//    supervisorEnv: { HOME: <testRoot>/web-home } (constructor options; the
+//    supervisor starts inside start() with this env).
+// 2. await rig.start()  // prepare() has now wiped and recreated testRoot
+// 3. Create the home fixtures (owned by the test process, i.e. the operator):
+//    - <home>/.amplifier/ms-runpod.key  ("e2e-key-not-real", mode 0640)
+//    - <home>/.config/opencode/opencode.json:
 //      { "$schema": "https://opencode.ai/config.json",
 //        "provider": { "openai": { "name": "OpenAI",
 //          "options": { "apiKey": "{file:<home>/.amplifier/ms-runpod.key}" } } },
 //        "model": "openai/gpt-5.6-luna" }   // native provider id: validates offline
-// 2. chmod 0750 on <testRoot> and /tmp/f<uid> ancestors (harness creates them 0700;
-//    under the rootless daemon the 65534:0 child needs group traversal).
-// 3. supervisorEnv: { HOME: home }  (existing parameter; no rig code change)
-// 4. webHomeDir: home (existing parameter)
+//    - chmod 0750 on <testRoot> and /tmp/f<uid> ancestors (harness creates them
+//      0700; under the rootless daemon the 65534:0 child needs group traversal).
+// 4. Launch a freshopencode fresh-agent pane (the qualification spec's
+//    fresh-agent launch helper with provider opencode — NOT the terminal picker).
 // Body:
-test('soul resolves {file:} API key references under the operator home', async () => {
-  await rig.openOpenCodePane() // exact helper per the continuity spec
+test('freshopencode soul resolves {file:} API key references under the operator home', async () => {
+  const info = await rig.start()
+  // ...create home fixtures per steps 3 above, using info's testRoot...
+  await rig.launchFreshAgentPane('opencode') // exact helper per the qualification spec
   await expect(page.getByText('Ask anything')).toBeVisible({ timeout: 120_000 })
   const paneText = await rig.capturePaneText()
   expect(paneText).not.toContain('Configuration is invalid')
@@ -399,41 +414,41 @@ test('soul resolves {file:} API key references under the operator home', async (
 })
 ```
 
-Broker changes: add an `allowedOperatorHomeRoots` policy set plus a same-path read-only bind arm (`dest === source && mode === 'ro'`) and tmpfs allow arms for the three mask destinations, following the existing arm structure at `runtime-test-broker.ts:330-380`.
+Allow-list changes in BOTH files: add the policy types/arms in `runtime-test-broker.ts` (an `allowedOperatorHomeRoots` set plus a same-path read-only bind arm `dest === source && mode === 'ro'` and tmpfs allow arms for the three mask destinations, following the existing arm structure at ~lines 330-380), and construct them in `RuntimeHarness.prepare()` in `runtime-sandbox.ts`, which builds the broker's allow lists today — without this the supervisor's home bind is rejected before the pane ever launches.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `pnpm run test:e2e:local test/e2e-browser/specs/runtime-opencode-home-file-reference-rust.spec.ts --project=chromium` (match the continuity spec's canonical invocation if it differs)
+Run: `pnpm run test:e2e:local test/e2e-browser/specs/runtime-opencode-home-file-reference-rust.spec.ts --project=chromium` (match the qualification spec's canonical invocation if it differs)
 
-Expected: FAIL before Task 1's supervisor change is wired into the rig's supervisor — the pane shows `Configuration is invalid ... bad file reference` exactly like the production incident, because the `{file:}` reference rides the `OPENCODE_CONFIG_CONTENT` inline lane and the target is unreadable to the 65534:0 child (the validator confirmed the lane). After Task 1 lands, the same command must PASS. If Tasks 1-2 are already on the branch, temporarily confirm the red by unsetting the supervisor HOME env override in a scratch run and record it in the commit message — never weaken the spec to fabricate a red.
+Expected: FAIL before Task 1's supervisor change is wired into the rig's supervisor — the freshopencode pane shows `Configuration is invalid ... bad file reference` exactly like the production incident, because the `{file:}` reference rides the `OPENCODE_CONFIG_CONTENT` inline lane and the target is unreadable to the 65534:0 child (the validator confirmed the lane). After Task 1 lands, the same command must PASS. If Tasks 1-2 are already on the branch, temporarily confirm the red by unsetting the supervisor HOME env override in a scratch run and record it in the commit message — never weaken the spec to fabricate a red.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-No production change: this task is the system-level proof. The rig/broker changes in Step 1 are the implementation.
+No production change: this task is the system-level proof. The broker/sandbox allow-list changes in Step 1 are the implementation.
 
 - [ ] **Step 4: Run the focused test**
 
 Run: `pnpm run test:e2e:local test/e2e-browser/specs/runtime-opencode-home-file-reference-rust.spec.ts --project=chromium`
 
-Expected: PASS — opencode boots to its prompt, proving the `{file:}` reference resolved in-soul through the mounted, group-readable home.
+Expected: PASS — the freshopencode fresh-agent pane boots to the opencode prompt, proving the `{file:}` reference resolved in-soul through the mounted, group-readable home.
 
 - [ ] **Step 5: Refactor while green**
 
-Extract the home-fixture builder (key file + config + chmods) into the shared helper beside `managed-runtime.ts` only if the continuity spec would reuse it; otherwise leave.
+Extract the home-fixture builder (key file + config + chmods) into the shared helper beside `managed-runtime.ts` only if the qualification spec would reuse it; otherwise leave.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted set: the broker unit tests (`scripts/testing` vitest suite covering the allow-list) and the other LOCAL_ONLY runtime specs that construct the rig — at minimum `runtime-terminal-continuity-rust.spec.ts`.
+Impacted set: the broker unit tests at `test/unit/tooling/testing/runtime-test-broker.test.ts` (and any runtime-sandbox unit tests that cover allow-list construction) and the other LOCAL_ONLY runtime specs that construct the rig.
 
-Run: `pnpm run test:vitest run test/unit/scripts --config config/vitest/vitest.config.ts` (or the suite owning the broker tests — locate by grepping for `runtime-test-broker` under `test/`) and `pnpm run test:e2e:local --project=chromium --grep runtime` (match the repo's filtered runtime-spec lane)
+Run: `pnpm run test:vitest run test/unit/tooling/testing/runtime-test-broker.test.ts --config config/vitest/vitest.config.ts` and `pnpm run test:e2e:local --project=chromium --grep runtime` (match the repo's filtered runtime-spec lane)
 
 Expected: PASS
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add test/e2e-browser/specs/runtime-opencode-home-file-reference-rust.spec.ts scripts/testing/runtime-test-broker.ts test/e2e-browser/playwright.cloud.config.ts
-git commit -m "test(e2e): soul boots opencode with {file:} operator-home key references"
+git add test/e2e-browser/specs/runtime-opencode-home-file-reference-rust.spec.ts scripts/testing/runtime-test-broker.ts scripts/testing/runtime-sandbox.ts test/e2e-browser/playwright.config.ts
+git commit -m "test(e2e): freshopencode soul boots with {file:} operator-home key references"
 ```
 
 ### Task 4: Posture documentation
@@ -477,7 +492,7 @@ git commit -m "docs(managed-runtime): operator home mounts, masks, and group-rea
 
 ## Verification (user-visible outcome)
 
-1. The incident scenario end-to-end: covered by Task 3's spec on the real rootless daemon — an opencode pane with a `{file:}`-referencing global config boots to its prompt with no "Configuration is invalid" text.
+1. The incident scenario end-to-end: covered by Task 3's spec on the real rootless daemon — a freshopencode fresh-agent pane (fresh-agent launch path) with a `{file:}`-referencing global config boots to its prompt with no "Configuration is invalid" text.
 2. Production, after user-approved deploy and the one-time host prep from Task 4: a freshopencode pane in `/home/dan/code/shapiroserver2` with the real global `~/.config/opencode/opencode.json` boots opencode.
 3. Pre-upgrade running souls: untouched by construction — no identity, record, digest, or volume changes; replaced incarnations naturally gain the home mount.
 4. Control-plane safety: `~/.freshell`, `~/.amplifier/onecli`, and `~/.config/gcloud` are tmpfs-masked in-soul; all other operator secrets remain protected by their owner-only modes.
