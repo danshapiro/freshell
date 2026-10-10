@@ -1717,7 +1717,7 @@ impl Supervisor {
             {
                 let stored = self
                     .registry
-                    .store_verified_resume_spec_fenced(
+                    .store_verified_recovery_resume_spec_fenced(
                         context.soul_id.clone(),
                         *resume_spec,
                         context.write_fence(),
@@ -2082,6 +2082,13 @@ impl Supervisor {
                     .retained_store_compatibility_probe(context, "retained_host_exited")
                     .await;
             }
+            if context.resume_spec.is_none()
+                && context.native_session_id.is_some()
+                && context.fixture.is_none()
+                && !deterministic_fresh_fixture(context)
+            {
+                return self.probe_offline_store(context).await;
+            }
             return offline_probe(context);
         }
 
@@ -2094,6 +2101,90 @@ impl Supervisor {
             ),
             Some(2_000),
         ))
+    }
+
+    /// A native loader observation may precede the first durable save. After
+    /// host death, verify that save from the owned volume before capturing a
+    /// resume spec; the recorded root and launch are only selection inputs.
+    async fn probe_offline_store(
+        &self,
+        context: &RecoveryContext,
+    ) -> Result<RecoveryProbe, RuntimeError> {
+        let spec = match resume_catalog::exact_resume_candidate(context, None) {
+            Ok(Some(spec)) => spec,
+            Ok(None) => return offline_probe(context),
+            Err(probe) => return Ok(probe),
+        };
+        let store = self
+            .backend
+            .read_native_census(
+                &context.prior_handle,
+                &spec,
+                &self.config.host_binary_path,
+                &self.config.image_ref,
+            )
+            .await;
+        let reader_outcome = match &store {
+            Ok(freshell_agent_runtime::ProviderStoreProbe::Ready { .. }) => "ready",
+            Ok(freshell_agent_runtime::ProviderStoreProbe::Blocked { .. }) => "blocked",
+            Ok(freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable { .. }) => {
+                "durable_content_absent"
+            }
+            Ok(freshell_agent_runtime::ProviderStoreProbe::ParentBackedClaudeFork { .. }) => {
+                "parent_backed_recipe_unverified"
+            }
+            Err(BackendError::OwnershipMismatch(_)) => "ownership_mismatch",
+            Err(BackendError::PolicyMismatch(_)) => "policy_mismatch",
+            Err(BackendError::Malformed(_)) => "malformed_reader_result",
+            Err(_) => "reader_unavailable",
+        };
+        let probe = match store {
+            Ok(freshell_agent_runtime::ProviderStoreProbe::Ready { .. }) => {
+                RecoveryProbe::ResumeReady {
+                    evidence_revision: spec.evidence_revision,
+                    resume_spec: Box::new(spec),
+                }
+            }
+            Ok(freshell_agent_runtime::ProviderStoreProbe::Blocked {
+                reason,
+                retry_hint,
+                evidence,
+            }) => RecoveryProbe::Blocked {
+                path: RecoveryPath::NativeResume,
+                reason,
+                retry_hint,
+                evidence,
+            },
+            // This capture path establishes positive durability only. Negative
+            // reads and parent-backed recipes retain the existing refusal to
+            // substitute an unverified spec or authorize loss.
+            Ok(_) | Err(_) => blocked(
+                RecoveryPath::NativeResume,
+                RecoveryBlockReason::StoreUnreadable,
+                "the retained provider store has no verified durable resume evidence",
+                None,
+            ),
+        };
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery.offline_store_probe",
+            serde_json::json!({
+                "severity": if matches!(probe, RecoveryProbe::ResumeReady { .. }) { "info" } else { "warn" },
+                "soulId": context.soul_id,
+                "incarnationId": context.prior_handle.incarnation_id(),
+                "intentRevision": context.intent_revision,
+                "identityRevision": context.identity_revision,
+                "evidenceRevision": context.evidence_revision,
+                "controlEpoch": context.control_epoch,
+                "reason": if matches!(probe, RecoveryProbe::ResumeReady { .. }) { "durable_store_verified" } else { "durable_store_unverified" },
+                "readerOutcome": reader_outcome,
+                "blockReason": match &probe { RecoveryProbe::Blocked { reason, .. } => Some(reason), _ => None },
+                "providerStoreId": context.provider_store_id,
+                "executionGeneration": context.native_identity_launch.as_ref().map(|launch| launch.execution_generation),
+                "attemptReserved": context.recovery_attempt_id.is_some(),
+            }),
+        );
+        Ok(probe)
     }
 
     async fn retained_store_compatibility_probe(
@@ -7830,7 +7921,14 @@ mod automatic_retry_tests {
             let generation_path = runtime.join("fixture-generation");
             let native_launch_path = runtime.join("native-launch.json");
             let provider_home = self.root.join("provider");
-            let native_file = provider_home.join(".codex/sessions/rollout-retry-root.jsonl");
+            let amplifier_file =
+                provider_home.join(".amplifier/projects/fixture/sessions/retry-root/metadata.json");
+            let amplifier = amplifier_file.exists();
+            let native_file = if amplifier {
+                amplifier_file
+            } else {
+                provider_home.join(".codex/sessions/rollout-retry-root.jsonl")
+            };
             let retained_observation = runtime.join("retained-opencode-observation.json");
             let retained_blocker = runtime.join("retained-store-unreadable");
             let retained_probe_failure = runtime.join("retained-probe-unreachable");
@@ -7930,11 +8028,11 @@ mod automatic_retry_tests {
                                 let launch: freshell_runtime_protocol::NativeIdentityLaunch = serde_json::from_slice(&std::fs::read(&native_launch_path).unwrap()).unwrap();
                                 let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&native_file).unwrap()).unwrap();
                                 freshell_runtime_protocol::NativeIdentityObservation {
-                                    native_session_id: if final_identity_path.exists() { "wrong-root".into() } else { record["payload"]["id"].as_str().unwrap().into() },
+                                    native_session_id: if final_identity_path.exists() { "wrong-root".into() } else if amplifier { record["session_id"].as_str().unwrap().into() } else { record["payload"]["id"].as_str().unwrap().into() },
                                     incarnation_id: launch.incarnation_id,
                                     launch_nonce: launch.launch_nonce,
                                     evidence_revision: launch.evidence_revision,
-                                    source: freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+                                    source: if amplifier { freshell_runtime_protocol::NativeIdentitySource::AmplifierNativeLoadedContext } else { freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake },
                                     evidence_digest: format!("{:x}", Sha256::digest(std::fs::read(&native_file).unwrap())),
                                 }
                             })
@@ -8046,6 +8144,48 @@ mod automatic_retry_tests {
     }
     #[async_trait::async_trait]
     impl RuntimeBackend for RetryBackend {
+        async fn read_native_census(
+            &self,
+            handle: &OwnedRuntimeHandle,
+            spec: &freshell_runtime_protocol::ResumeSpec,
+            reader_binary: &Path,
+            image_ref: &str,
+        ) -> Result<freshell_agent_runtime::ProviderStoreProbe, BackendError> {
+            // Test-only volume transport; execute the real bounded provider
+            // parser against this test's fictional native store.
+            assert_eq!(
+                spec.provider_session.provider_store_id,
+                handle.provider_store_id()
+            );
+            assert_eq!(
+                spec.provider_volume.as_ref().unwrap().volume_name,
+                handle.provider_volume_name()
+            );
+            assert_eq!(reader_binary, std::env::current_exe().unwrap());
+            assert_eq!(image_ref, format!("sha256:{}", "a".repeat(64)));
+            assert_eq!(
+                handle.terminal().map(|t| (t.run_as_uid, t.run_as_gid)),
+                Some((65534, 0))
+            );
+            self.record("native-census", handle.incarnation_id().as_str());
+            if self.root.join("census-unavailable").exists() {
+                return Err(BackendError::Unavailable(
+                    "fictional reader unavailable".into(),
+                ));
+            }
+            let result =
+                freshell_agent_runtime::probe_provider_store(&self.root.join("provider"), spec);
+            if self.root.join("census-stale-fence").exists() {
+                Connection::open(self.root.join("registry/runtime.sqlite3"))
+                    .unwrap()
+                    .execute(
+                        "UPDATE souls SET evidence_revision=evidence_revision+1 WHERE soul_id=?1",
+                        [handle.soul_id().as_str()],
+                    )
+                    .unwrap();
+            }
+            Ok(result)
+        }
         async fn inspect(
             &self,
             handle: &OwnedRuntimeHandle,
@@ -8266,6 +8406,620 @@ mod automatic_retry_tests {
             .unwrap();
         soul
     }
+    async fn seed_offline_amplifier(supervisor: &Supervisor, root: &Path) -> SoulId {
+        let soul = seed(supervisor).await;
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let runtime = root.join("retained-amplifier");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        std::fs::write(
+            runtime.join("fixture-object"),
+            context.prior_handle.container_id(),
+        )
+        .unwrap();
+        std::fs::write(runtime.join("fixture-started"), b"started").unwrap();
+        std::fs::write(runtime.join("fixture-stopped"), b"exited").unwrap();
+        let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"ordinary-amplifier", "streamId":"amplifier-stream", "mode":"amplifier",
+            "program":"amplifier", "cwd":root, "workspacePath":root, "projectKey":"fixture-project",
+            "env":{"HOME":"/home/freshell/provider", "AMPLIFIER_HOME":"/home/freshell/provider/.amplifier"},
+            "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24
+        })).unwrap();
+        terminal.validate().unwrap();
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute("UPDATE souls SET provider='amplifier',resume_spec=NULL,allocation_state='materializing',durability_state='live_only',evidence_revision=0 WHERE soul_id=?1", [soul.as_str()]).unwrap();
+        conn.execute(
+            "UPDATE writer_claims SET provider='amplifier' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute("UPDATE incarnations SET fixture_kind=NULL,terminal_spec=?1,runtime_dir=?2,execution_generation=1 WHERE incarnation_id=?3",
+            rusqlite::params![serde_json::to_string(&terminal).unwrap(), runtime.to_str().unwrap(), context.prior_handle.incarnation_id().as_str()]).unwrap();
+        drop(conn);
+        let store = root.join("provider/.amplifier/projects/fixture/sessions/retry-root");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("metadata.json"), serde_json::to_vec(&serde_json::json!({
+            "session_id":"retry-root", "created":"2026-10-10T00:00:00Z", "working_dir":root, "turn_count":1
+        })).unwrap()).unwrap();
+        std::fs::write(
+            store.join("metadata.json.backup"),
+            b"{\"session_id\":\"retry-root\"}",
+        )
+        .unwrap();
+        std::fs::write(store.join("transcript.jsonl.backup"), b"").unwrap();
+        std::fs::write(store.join("transcript.jsonl"), b"{\"role\":\"user\",\"content\":\"fictional seed\"}\n{\"role\":\"assistant\",\"content\":\"fictional stored reply\"}\n").unwrap();
+        std::fs::write(store.join("events.jsonl"), b"{\"event\":\"prompt:complete\",\"session_id\":\"retry-root\"}\n{\"event\":\"cleanup:store_end\",\"session_id\":\"retry-root\"}\n").unwrap();
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: context.prior_handle.incarnation_id().clone(),
+            launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+            evidence_revision: context.evidence_revision,
+            execution_generation: 1,
+            requested_native_session_id: None,
+        };
+        supervisor
+            .registry
+            .bind_native_identity_launch(launch.clone())
+            .await
+            .unwrap();
+        supervisor.registry.record_native_identity_observation(soul.clone(), freshell_runtime_protocol::NativeIdentityObservation {
+            native_session_id: "retry-root".into(), incarnation_id: launch.incarnation_id,
+            launch_nonce: launch.launch_nonce, evidence_revision: launch.evidence_revision,
+            source: freshell_runtime_protocol::NativeIdentitySource::AmplifierNativeLoadedContext,
+            evidence_digest: format!("{:x}", Sha256::digest(std::fs::read(store.join("metadata.json")).unwrap())),
+        }, context.write_fence()).await.unwrap();
+        let spec = resume_catalog::exact_resume_candidate(&context, None)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            freshell_agent_runtime::probe_provider_store(&root.join("provider"), &spec),
+            freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
+        ));
+        assert!(context.resume_spec.is_none());
+        soul
+    }
+
+    fn fictional_amplifier_preparation(
+        grant_id: &str,
+    ) -> freshell_runtime_protocol::ProviderLaunchContext {
+        serde_json::from_value(serde_json::json!({
+            "preparation":{"amplifier":{"bundle":"default", "resume_args":[]}},
+            "mcpCapability":{"grantId":grant_id, "endpoint":"http://host.docker.internal:9", "providerRelativePath":".freshell/mcp-capability.json"},
+            "config":[]
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn offline_amplifier_captures_durable_store_before_exact_replacement() {
+        // Capability-directory configuration is process-global. Keep this
+        // wholly fictional replacement protocol isolated from other tests.
+        const CHILD: &str = "FRESHELL_OFFLINE_AMPLIFIER_TEST_CHILD";
+        let phase = std::env::var(CHILD).unwrap_or_default();
+        if !matches!(phase.as_str(), "active" | "retired") {
+            for phase in ["active", "retired"] {
+                let output = std::process::Command::new("timeout")
+                    .arg("60s")
+                    .arg(std::env::current_exe().unwrap())
+                    .args(["--exact", "recovery::automatic_retry_tests::offline_amplifier_captures_durable_store_before_exact_replacement", "--nocapture"])
+                    .env(CHILD, phase)
+                    .env_remove("FRESHELL_RUNTIME_CAPABILITY_DIR")
+                    .output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{phase}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(root.path(), 0);
+        let soul = Box::pin(seed_offline_amplifier(&supervisor, root.path())).await;
+        if phase == "retired" {
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            supervisor
+                .registry
+                .mark_stop_outcome(
+                    context.prior_handle.incarnation_id().clone(),
+                    StopOutcome::VerifiedEmpty,
+                )
+                .await
+                .unwrap();
+        }
+        std::fs::create_dir(root.path().join("mcp-capabilities")).unwrap();
+        std::fs::create_dir_all(root.path().join("provider-roots/grant-offline-fixture")).unwrap();
+        crate::backend::docker::configure_capability_dir(&root.path().join("control.sock"))
+            .unwrap();
+        let before = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let mut terminal = before.terminal.clone().unwrap();
+        let launch_context = fictional_amplifier_preparation("grant-offline-fixture");
+        terminal.provider_launch_context = Some(launch_context.clone());
+        terminal.validate().unwrap();
+        Connection::open(supervisor.registry.database_path())
+            .unwrap()
+            .execute(
+                "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                rusqlite::params![
+                    serde_json::to_string(&terminal).unwrap(),
+                    before.prior_handle.incarnation_id().as_str()
+                ],
+            )
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(root.path().join("mcp.sock")).unwrap();
+        let response =
+            serde_json::to_vec(&freshell_runtime_protocol::ProviderReplacementPreparation {
+                context: launch_context,
+                secret_references: vec![],
+            })
+            .unwrap();
+        let callback = tokio::spawn(async move {
+            for action in ["issue", "activate"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![];
+                stream.read_to_end(&mut request).await.unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                assert_eq!(request["action"], action);
+                if action == "issue" {
+                    assert_eq!(request["provider"], "amplifier");
+                    stream.write_all(&response).await.unwrap();
+                } else {
+                    assert_eq!(request["grantId"], "grant-offline-fixture");
+                    stream.write_all(b"ok").await.unwrap();
+                }
+            }
+        });
+        assert!(before.resume_spec.is_none());
+        let result = Box::pin(supervisor.recover(RecoverRequest {
+            soul_id: soul.clone(),
+            trigger: RecoveryTrigger::ProviderExit,
+            expected_intent_revision: Some(before.intent_revision),
+            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+        }))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), callback)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.outcome,
+            RecoveryOutcome::Replaced,
+            "probe={:?}",
+            result.probe
+        );
+        let after = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let saved = after.resume_spec.unwrap();
+        assert_eq!(saved.provider_session.native_session_id, "retry-root");
+        assert_eq!(
+            saved.provider_session.provider_store_id,
+            before.provider_store_id
+        );
+        assert!(saved.evidence_revision > before.evidence_revision);
+        assert_eq!(
+            saved.allocation_state,
+            freshell_runtime_protocol::AllocationState::VerifiedDurable
+        );
+        assert_ne!(
+            after.prior_handle.incarnation_id(),
+            before.prior_handle.incarnation_id()
+        );
+        assert_eq!(
+            result.observed_native_session_id.as_deref(),
+            Some("retry-root")
+        );
+        assert_eq!(backend.count("native-census"), 1);
+        assert_eq!(backend.count("creates"), 1);
+        assert_root_and_successes(&supervisor, &soul, 1).await;
+    }
+
+    #[tokio::test]
+    async fn offline_amplifier_unverified_stores_cannot_capture_or_replace() {
+        for case in [
+            "missing_store",
+            "missing_history",
+            "unreadable",
+            "tampered_root",
+            "truncated",
+            "ambiguous",
+            "uninspected_home",
+            "reader_unavailable",
+            "pristine_stub",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (supervisor, backend, _) = open(root.path(), 0);
+            let soul = seed_offline_amplifier(&supervisor, root.path()).await;
+            let before = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let store = root
+                .path()
+                .join("provider/.amplifier/projects/fixture/sessions/retry-root");
+            match case {
+                "missing_store" => std::fs::rename(
+                    root.path().join("provider/.amplifier"),
+                    root.path().join("unmounted-store"),
+                )
+                .unwrap(),
+                "missing_history" => std::fs::remove_file(store.join("transcript.jsonl")).unwrap(),
+                "unreadable" => {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(
+                        store.join("metadata.json"),
+                        std::fs::Permissions::from_mode(0o000),
+                    )
+                    .unwrap();
+                }
+                "tampered_root" => std::fs::write(
+                    store.join("metadata.json"),
+                    b"{\"session_id\":\"wrong-root\"}",
+                )
+                .unwrap(),
+                "truncated" => std::fs::write(
+                    store.join("events.jsonl"),
+                    b"{\"event\":\"cleanup:store_end\",\"session_id\":\"retry-root\"}",
+                )
+                .unwrap(),
+                "ambiguous" => std::fs::create_dir_all(
+                    root.path()
+                        .join("provider/.amplifier/projects/another/sessions/retry-root"),
+                )
+                .unwrap(),
+                "uninspected_home" => {
+                    let mut terminal = before.terminal.clone().unwrap();
+                    terminal
+                        .env
+                        .insert("AMPLIFIER_HOME".into(), "/uninspected-home".into());
+                    Connection::open(supervisor.registry.database_path())
+                        .unwrap()
+                        .execute(
+                            "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                            rusqlite::params![
+                                serde_json::to_string(&terminal).unwrap(),
+                                before.prior_handle.incarnation_id().as_str()
+                            ],
+                        )
+                        .unwrap();
+                }
+                "reader_unavailable" => {
+                    std::fs::write(root.path().join("census-unavailable"), b"unavailable").unwrap()
+                }
+                "pristine_stub" => {
+                    // A requested/observed identity plus a launcher directory
+                    // must never be promoted to durable conversation evidence.
+                    std::fs::write(store.join("metadata.json"), b"{\"session_id\":\"retry-root\",\"created\":\"fictional-date\",\"working_dir\":\"/fictional\"}").unwrap();
+                    std::fs::write(store.join("transcript.jsonl"), b"").unwrap();
+                    std::fs::write(
+                        store.join("events.jsonl"),
+                        b"{\"event\":\"session:start\",\"session_id\":\"retry-root\"}\n",
+                    )
+                    .unwrap();
+                    std::fs::remove_file(store.join("metadata.json.backup")).unwrap();
+                    std::fs::remove_file(store.join("transcript.jsonl.backup")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let result = supervisor
+                .recover(RecoverRequest {
+                    soul_id: soul.clone(),
+                    trigger: RecoveryTrigger::ProviderExit,
+                    expected_intent_revision: Some(before.intent_revision),
+                    expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                result.outcome,
+                RecoveryOutcome::Blocked,
+                "{case}: {:?}",
+                result.probe
+            );
+            let after = supervisor.registry.recovery_context(soul).await.unwrap();
+            assert!(after.resume_spec.is_none(), "{case}");
+            assert_eq!(after.evidence_revision, before.evidence_revision, "{case}");
+            assert_eq!(
+                after.prior_handle.incarnation_id(),
+                before.prior_handle.incarnation_id(),
+                "{case}"
+            );
+            assert_eq!(backend.count("native-census"), 1, "{case}");
+            assert_eq!(backend.count("creates"), 0, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_amplifier_stale_capture_fence_cannot_grant_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(root.path(), 0);
+        let soul = seed_offline_amplifier(&supervisor, root.path()).await;
+        let before = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        std::fs::write(
+            root.path().join("census-stale-fence"),
+            b"change during read",
+        )
+        .unwrap();
+        assert!(supervisor.probe_recovery(soul.clone()).await.is_err());
+        let after = supervisor.registry.recovery_context(soul).await.unwrap();
+        assert!(after.resume_spec.is_none());
+        assert_eq!(after.evidence_revision, before.evidence_revision + 1);
+        assert_eq!(
+            after.prior_handle.incarnation_id(),
+            before.prior_handle.incarnation_id()
+        );
+        assert_eq!(backend.count("native-census"), 1);
+        assert_eq!(backend.count("creates"), 0);
+    }
+
+    #[tokio::test]
+    async fn offline_amplifier_saved_spec_identity_validation_is_preserved() {
+        for case in ["valid", "wrong_root", "wrong_store", "wrong_provider"] {
+            let root = tempfile::tempdir().unwrap();
+            let (supervisor, backend, _) = open(root.path(), 0);
+            let soul = seed_offline_amplifier(&supervisor, root.path()).await;
+            let before = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let spec = resume_catalog::exact_resume_candidate(&before, None)
+                .unwrap()
+                .unwrap();
+            let mut saved = supervisor
+                .registry
+                .store_verified_resume_spec_fenced(soul.clone(), spec, before.write_fence())
+                .await
+                .unwrap();
+            match case {
+                "wrong_root" => saved.provider_session.native_session_id = "wrong-root".into(),
+                "wrong_store" => saved.provider_session.provider_store_id = "wrong-store".into(),
+                "wrong_provider" => saved.provider_session.provider = "codex".into(),
+                _ => {}
+            }
+            Connection::open(supervisor.registry.database_path())
+                .unwrap()
+                .execute(
+                    "UPDATE souls SET resume_spec=?1 WHERE soul_id=?2",
+                    rusqlite::params![serde_json::to_string(&saved).unwrap(), soul.as_str()],
+                )
+                .unwrap();
+            let probe = supervisor.probe_recovery(soul.clone()).await.unwrap();
+            if case == "valid" {
+                assert!(matches!(probe, RecoveryProbe::ResumeReady { .. }));
+            } else {
+                assert!(
+                    matches!(
+                        probe,
+                        RecoveryProbe::Blocked {
+                            reason: RecoveryBlockReason::WrongNativeIdentity,
+                            ..
+                        }
+                    ),
+                    "{case}: {probe:?}"
+                );
+            }
+            assert_eq!(backend.count("native-census"), 0, "{case}");
+            assert_eq!(backend.count("creates"), 0, "{case}");
+            assert_eq!(
+                supervisor
+                    .registry
+                    .recovery_context(soul)
+                    .await
+                    .unwrap()
+                    .resume_spec,
+                Some(saved)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_amplifier_missing_preparation_blocks_after_verified_retirement() {
+        for callback_missing in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (supervisor, backend, _) = open(root.path(), 0);
+            let soul = seed_offline_amplifier(&supervisor, root.path()).await;
+            let before = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            if callback_missing {
+                let mut terminal = before.terminal.clone().unwrap();
+                terminal.provider_launch_context =
+                    Some(fictional_amplifier_preparation("grant-missing-fictional"));
+                terminal.validate().unwrap();
+                Connection::open(supervisor.registry.database_path())
+                    .unwrap()
+                    .execute(
+                        "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                        rusqlite::params![
+                            serde_json::to_string(&terminal).unwrap(),
+                            before.prior_handle.incarnation_id().as_str()
+                        ],
+                    )
+                    .unwrap();
+            }
+            let result = supervisor
+                .recover(RecoverRequest {
+                    soul_id: soul.clone(),
+                    trigger: RecoveryTrigger::ProviderExit,
+                    expected_intent_revision: Some(before.intent_revision),
+                    expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(result.outcome, RecoveryOutcome::Blocked);
+            assert!(matches!(
+                result.probe,
+                Some(RecoveryProbe::Blocked {
+                    reason: RecoveryBlockReason::CapabilityPending,
+                    ..
+                })
+            ));
+            let after = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert!(after.resume_spec.is_some());
+            assert_eq!(
+                after.recovery_state,
+                freshell_runtime_protocol::RecoveryState::Blocked
+            );
+            assert_eq!(
+                after.prior_handle.incarnation_id(),
+                before.prior_handle.incarnation_id()
+            );
+            let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+            let state: (String, String) = conn
+                .query_row(
+                    "SELECT launch_state,cleanup_state FROM incarnations WHERE incarnation_id=?1",
+                    [before.prior_handle.incarnation_id().as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("stopped".into(), "verified_empty".into()));
+            let claims: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1",
+                    [soul.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(claims, 0);
+            assert_eq!(backend.count("native-census"), 1);
+            assert_eq!(backend.count("creates"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_amplifier_already_retired_prior_captures_before_missing_preparation_block() {
+        let root = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(root.path(), 0);
+        let soul = seed_offline_amplifier(&supervisor, root.path()).await;
+        let before = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        // Legitimate owned retirement preserves RUNNING intent, but leaves the
+        // latest prior row STOPPED and no active writer. This is also the phase
+        // used by installed stopped-data repair before explicit Resume.
+        assert!(backend.verify_empty(&before.prior_handle).await.unwrap());
+        supervisor
+            .registry
+            .mark_stop_outcome(
+                before.prior_handle.incarnation_id().clone(),
+                StopOutcome::VerifiedEmpty,
+            )
+            .await
+            .unwrap();
+        let result = supervisor
+            .recover(RecoverRequest {
+                soul_id: soul.clone(),
+                trigger: RecoveryTrigger::ProviderExit,
+                expected_intent_revision: Some(before.intent_revision),
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, RecoveryOutcome::Blocked);
+        assert!(matches!(
+            result.probe,
+            Some(RecoveryProbe::Blocked {
+                reason: RecoveryBlockReason::CapabilityPending,
+                ..
+            })
+        ));
+        let saved = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .resume_spec
+            .unwrap();
+        assert_eq!(saved.provider_session.native_session_id, "retry-root");
+        assert_eq!(backend.count("native-census"), 1);
+        assert_eq!(backend.count("creates"), 0);
+        drop(supervisor);
+        drop(backend);
+        let (reopened, backend, _) = open(root.path(), 1_000);
+        let probe = reopened.probe_recovery(soul.clone()).await.unwrap();
+        assert!(
+            matches!(probe, RecoveryProbe::ResumeReady { ref resume_spec, .. } if **resume_spec == saved)
+        );
+        assert_eq!(
+            reopened
+                .registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .resume_spec,
+            Some(saved)
+        );
+        assert_eq!(
+            backend.count("native-census"),
+            1,
+            "re-entry must use the durable saved exact input"
+        );
+        assert_eq!(backend.count("creates"), 0);
+    }
+
+    #[tokio::test]
+    async fn offline_amplifier_unknown_identity_cannot_use_unselected_history() {
+        let root = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(root.path(), 0);
+        let soul = seed_offline_amplifier(&supervisor, root.path()).await;
+        let mut context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        context.native_session_id = None;
+        context.never_dispatched = false;
+        let mut transient = None;
+        let probe = supervisor
+            .probe_recovery_context(&mut context, &mut transient)
+            .await
+            .unwrap();
+        assert!(matches!(probe, RecoveryProbe::Blocked { .. }));
+        assert_eq!(backend.count("native-census"), 0);
+        assert_eq!(backend.count("creates"), 0);
+        assert!(supervisor
+            .registry
+            .recovery_context(soul)
+            .await
+            .unwrap()
+            .resume_spec
+            .is_none());
+    }
+
     fn attempts(root: &Path) -> Vec<(String, String)> {
         let conn = Connection::open(root.join("registry/runtime.sqlite3")).unwrap();
         let mut stmt = conn
