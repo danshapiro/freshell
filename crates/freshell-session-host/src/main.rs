@@ -9795,17 +9795,17 @@ process.stdout.write(JSON.stringify(source.families.map(f=>f.rootId)));
         assert_eq!(roots.len(), 7);
         // All seven families use one source store, followed by the original
         // pinned-schema compatibility fixture. Each gets its own staged bundle/HOME.
-        for index in 0..8 {
-            let fixture = stage_synthetic_opencode_transfer_history(if index == 7 {
-                SyntheticTransferHistory::Default
-            } else {
-                SyntheticTransferHistory::ExistingRich {
-                    database: rich.source_database.clone(),
-                    workspace: rich.workspace.clone(),
-                    session_id: roots[index].clone(),
-                }
+        for (index, history) in roots
+            .iter()
+            .map(|session_id| SyntheticTransferHistory::ExistingRich {
+                database: rich.source_database.clone(),
+                workspace: rich.workspace.clone(),
+                session_id: session_id.clone(),
             })
-            .unwrap();
+            .chain(std::iter::once(SyntheticTransferHistory::Default))
+            .enumerate()
+        {
+            let fixture = stage_synthetic_opencode_transfer_history(history).unwrap();
             let descriptor = &fixture.descriptor;
             let home = fixture.root.path().join("destination-home");
             let data = home.join(".local/share");
