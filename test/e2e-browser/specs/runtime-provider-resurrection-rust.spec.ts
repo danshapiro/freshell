@@ -29,6 +29,7 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { resumeStoppedRepairBrowserView } from '../helpers/stopped-repair-browser-phase.js'
 
 function leavesByMode(node: any, mode: string): any[] {
   if (!node) return []
@@ -385,18 +386,12 @@ test('stopped nine-soul restoration runbook', async ({ page }) => {
     const resumedView = repairedInventory.viewIntents.find(view => view.soulId === resumedRoot.canonicalSoulId
       && explicitViews.some(before => before.viewId === view.viewId))!
     if (!resumedView) throw new Error('canonical restored soul has no retained explicit browser view')
-    await rig.setSyntheticStoppedRepairFault(facts.fixtureId, 'first_resume_observation')
-    const sentBeforeReload = await harness.getSentWsMessages()
-    await page.reload()
-    await harness.waitForHarness()
-    await harness.waitForConnection()
-    await page.evaluate(tabId => window.__FRESHELL_TEST_HARNESS__!.dispatch({
-      type: 'tabs/setActiveTab', payload: tabId }), resumedView.preferredTabId)
-    const card = page.locator(`[data-pane-id="${resumedView.preferredPaneId}"]`)
-      .getByTestId('managed-runtime-recovery-card').first()
-    await expect(card.getByRole('button', { name: 'Resume restored session', exact: true }))
-      .toBeVisible({ timeout: 60_000 })
-    await card.getByRole('button', { name: 'Resume restored session', exact: true }).click()
+    await test.step('stopped repair: first Resume fault', () =>
+      rig.setSyntheticStoppedRepairFault(facts.fixtureId, 'first_resume_observation'), { timeout: 240_000 })
+    const sentBeforeReload = await test.step('stopped repair: pre-reload input evidence', () =>
+      harness.getSentWsMessages(), { timeout: 60_000 })
+    const card = await resumeStoppedRepairBrowserView(page, harness,
+      resumedView.preferredTabId, resumedView.preferredPaneId)
     await expect(card.getByRole('button', { name: 'Retry recovery', exact: true }))
       .toBeVisible({ timeout: 180_000 })
     const blocked = await rig.syntheticStoppedRepairBatchObservation(facts.fixtureId, result.operationId)
