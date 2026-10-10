@@ -5,6 +5,9 @@
 //! [[bin]]-only), the safe11_term22_shutdown_reaping.rs harness convention.
 #![cfg(unix)]
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -95,7 +98,7 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> std::process::Exit
 #[tokio::test(flavor = "multi_thread")]
 async fn sighup_triggers_graceful_shutdown_and_logs_forensics() {
     let binary = discover_server_binary();
-    let home = tempfile::tempdir().expect("tempdir home");
+    let home = test_home::TestHome::new().expect("tempdir home");
     // Boot exactly as safe11_term22_shutdown_reaping.rs does: same env vars
     // (isolated home, ephemeral PORT, AUTH_TOKEN), same /api/health poll.
     let port = allocate_ephemeral_port();

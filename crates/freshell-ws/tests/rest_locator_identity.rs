@@ -143,6 +143,7 @@ async fn spawn_merged_server(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     // The REST door: same auth token + broadcast bus + terminal registry as

@@ -211,6 +211,7 @@ pub async fn spawn_server_with_specs_and_shared_settings(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -292,6 +293,7 @@ pub async fn spawn_server_with_specs(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -629,6 +631,7 @@ pub async fn spawn_server_with_specs_and_naming(
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -710,6 +713,7 @@ pub async fn spawn_server_with_specs_and_auto_resume_rx(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -822,6 +826,7 @@ pub async fn spawn_server_with_specs_hub_and_state(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     freshell_ws::auto_resume::spawn_auto_resume_hub_with_schedules(
@@ -907,6 +912,7 @@ pub async fn spawn_server_with_specs_and_state(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state.clone());
@@ -999,6 +1005,7 @@ pub async fn spawn_server_with_ledger(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -1092,6 +1099,7 @@ pub async fn spawn_server_with_ledger_and_state(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state.clone());
@@ -1181,6 +1189,7 @@ pub async fn spawn_server_with_specs_and_activity(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -1270,6 +1279,7 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     // Mirrors main.rs's sweep wiring; 150 ms is re-declared here because
@@ -1386,6 +1396,7 @@ pub async fn spawn_server_with_specs_activity_codex_locator_and_naming(
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
+        units: Default::default(),
     };
 
     // Mirrors main.rs's sweep wiring; 150 ms is re-declared here because
@@ -1498,6 +1509,7 @@ pub async fn spawn_server_with_create_protect_probes(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);

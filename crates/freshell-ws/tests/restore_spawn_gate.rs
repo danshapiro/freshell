@@ -168,6 +168,7 @@ async fn spawn_server(
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);

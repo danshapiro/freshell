@@ -38,6 +38,9 @@
 //! retention behavior itself is pinned by
 //! `crates/freshell-codex/tests/launch_lifecycle.rs`'s Task 10 section.
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -279,7 +282,7 @@ fn pid_cmdline(pid: u32) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_reaps_terminal_and_codex_sidecar_within_5s() {
     let server_binary = discover_server_binary();
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let port = allocate_ephemeral_port();
     seed_fresh_agent_enabled(home.path());
 
@@ -558,7 +561,7 @@ impl Drop for KillOnPanic {
 #[tokio::test]
 async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
     let server_binary = discover_server_binary();
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let port1 = allocate_ephemeral_port();
     seed_fresh_agent_enabled(home.path());
 

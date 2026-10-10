@@ -25,7 +25,8 @@
 
 use crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV;
 use freshell_containment::{
-    AgentUnit, Containment, StopHandle, StopMode, StopReason, StopRequest, UnitId, UnitLabel,
+    AgentUnit, Containment, StopHandle, StopMode, StopReason, StopRequest, UnitDirectory,
+    UnitEntry, UnitId, UnitLabel,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -303,6 +304,176 @@ impl CodexUnitLifecycle for RegistryFreeUnitLifecycle {
 
     fn is_stopping(&self, unit: &AgentUnit) -> bool {
         unit.stop_in_flight().is_some()
+    }
+}
+
+/// A pane start's lifecycle over its entry in the shared
+/// [`UnitDirectory`] (Task 12): the start registered its own base unit, and
+/// each start attempt's unit takes over the start's entry while it runs, so a
+/// kill by terminal or create-request id always reaches the attempt that is
+/// running. Every stop goes through the directory's installed
+/// [`UnitLifecycle`] (the WebSocket layer's single stop path); without one
+/// (tests) it goes straight to the unit.
+///
+/// While the plan runs, a stop of the current attempt's unit is the
+/// attempt's own (a failed start attempt, an unusable reattach): the start's
+/// entry goes back to its base unit first, so that stop never cancels the
+/// pane's start and the plan may retry. [`Self::finish_planning`] ends the
+/// plan: the entry then names the launch's unit, the base unit (unused) is
+/// stopped, and later stops are the pane's own.
+pub struct DirectoryUnitLifecycle {
+    directory: Arc<UnitDirectory>,
+    base: AgentUnit,
+    provider: String,
+    mode: String,
+    current: std::sync::Mutex<AgentUnit>,
+    planning: std::sync::atomic::AtomicBool,
+}
+
+impl DirectoryUnitLifecycle {
+    /// The lifecycle of the start whose entry names `base`.
+    pub fn new(directory: Arc<UnitDirectory>, base: AgentUnit) -> Arc<Self> {
+        let (provider, mode) = match directory.get(base.id()) {
+            Some(entry) => (entry.provider, entry.mode),
+            None => {
+                let label = base.label();
+                (label.provider, label.mode)
+            }
+        };
+        Arc::new(Self {
+            directory,
+            current: std::sync::Mutex::new(base.clone()),
+            base,
+            provider,
+            mode,
+            planning: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    /// The unit the start's entry names now.
+    pub fn current(&self) -> AgentUnit {
+        self.lock_current().clone()
+    }
+
+    /// The start's own base unit.
+    pub fn base(&self) -> AgentUnit {
+        self.base.clone()
+    }
+
+    /// The plan ended with `launch_unit`: the start's entry names it from now
+    /// on, and the base unit (unused) is stopped. Stops after this are the
+    /// pane's.
+    pub fn finish_planning(&self, launch_unit: Option<AgentUnit>) {
+        self.planning
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let Some(launch_unit) = launch_unit else {
+            return;
+        };
+        let previous = std::mem::replace(&mut *self.lock_current(), launch_unit.clone());
+        if previous.id() != launch_unit.id() {
+            let _ = self
+                .directory
+                .replace_unit(previous.id(), launch_unit.clone());
+        }
+        if self.base.id() != launch_unit.id() {
+            let _ = self.stop_entry(
+                &self.detached(&self.base),
+                StopMode::Force,
+                StopReason::StartCancelled,
+                "codex-start-base-unused",
+            );
+        }
+    }
+
+    fn lock_current(&self) -> std::sync::MutexGuard<'_, AgentUnit> {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// An entry for a unit that is not (or no longer) the start's: no
+    /// terminal and no create-request id, so its stop ends no row and
+    /// cancels no start.
+    fn detached(&self, unit: &AgentUnit) -> UnitEntry {
+        UnitEntry {
+            unit: unit.clone(),
+            provider: self.provider.clone(),
+            mode: self.mode.clone(),
+            create_request_id: None,
+            terminal_id: None,
+        }
+    }
+
+    fn stop_entry(
+        &self,
+        entry: &UnitEntry,
+        mode: StopMode,
+        reason: StopReason,
+        initiator: &str,
+    ) -> StopHandle {
+        match self.directory.lifecycle() {
+            Some(lifecycle) => lifecycle.stop(entry, mode, reason, initiator),
+            None => entry.unit.stop(StopRequest::new(mode, reason, initiator)),
+        }
+    }
+}
+
+impl CodexUnitLifecycle for DirectoryUnitLifecycle {
+    fn attempt_started(&self, unit: &AgentUnit) {
+        let previous = std::mem::replace(&mut *self.lock_current(), unit.clone());
+        let _ = self.directory.replace_unit(previous.id(), unit.clone());
+        // Between attempts the entry names the base unit (see `stop`); an
+        // earlier attempt still named here was never stopped by its plan,
+        // so it is stopped now rather than left running unrecorded.
+        if previous.id() != self.base.id() && previous.id() != unit.id() {
+            let _ = self.stop_entry(
+                &self.detached(&previous),
+                StopMode::Force,
+                StopReason::StartCancelled,
+                "codex-start-attempt-replaced",
+            );
+        }
+    }
+
+    fn start_cancelled(&self) -> bool {
+        let current = self.current();
+        self.directory.get(current.id()).is_none() || self.directory.start_cancelled(current.id())
+    }
+
+    fn stop(
+        &self,
+        unit: &AgentUnit,
+        mode: StopMode,
+        reason: StopReason,
+        initiator: &str,
+    ) -> StopHandle {
+        let planning = self.planning.load(std::sync::atomic::Ordering::SeqCst);
+        if planning && unit.id() != self.base.id() {
+            let was_current = {
+                let mut current = self.lock_current();
+                let was_current = current.id() == unit.id();
+                if was_current {
+                    *current = self.base.clone();
+                }
+                was_current
+            };
+            if was_current {
+                let _ = self.directory.replace_unit(unit.id(), self.base.clone());
+            }
+            return self.stop_entry(&self.detached(unit), mode, reason, initiator);
+        }
+        let entry = self
+            .directory
+            .get(unit.id())
+            .unwrap_or_else(|| self.detached(unit));
+        self.stop_entry(&entry, mode, reason, initiator)
+    }
+
+    fn is_stopping(&self, unit: &AgentUnit) -> bool {
+        match self.directory.lifecycle() {
+            Some(lifecycle) => lifecycle.is_stopping(unit),
+            None => unit.stop_in_flight().is_some(),
+        }
     }
 }
 
@@ -1181,5 +1352,167 @@ mod tests {
             .expect("the memberless unit is stopped through the lifecycle");
         let report = stop.wait().await;
         assert_eq!(report.reason, "start-cancelled");
+    }
+
+    // ── the directory-backed lifecycle: a pane start's attempts in its directory entry ──
+
+    /// A pane start registered the way the unit lifecycle registers one: its
+    /// own base unit, a create-request id and no terminal yet.
+    fn registered_start(directory: &Arc<UnitDirectory>) -> (Containment, AgentUnit) {
+        let containment = Containment::tag_backend(Default::default());
+        let base = containment
+            .create_unit(UnitId::mint(), UnitLabel::default())
+            .expect("base unit");
+        directory.register(UnitEntry {
+            unit: base.clone(),
+            provider: "codex".into(),
+            mode: "codex".into(),
+            create_request_id: Some("crq-dir".into()),
+            terminal_id: None,
+        });
+        (containment, base)
+    }
+
+    fn directory_seed(
+        containment: Containment,
+        lifecycle: Arc<DirectoryUnitLifecycle>,
+    ) -> UnitSeed {
+        UnitSeed {
+            services: CodexUnitServices {
+                containment,
+                lifecycle,
+            },
+            label: UnitLabel {
+                provider: "codex".to_string(),
+                mode: "codex".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn each_attempt_takes_over_the_starts_directory_entry() {
+        let directory = UnitDirectory::new();
+        let (containment, base) = registered_start(&directory);
+        let lifecycle = DirectoryUnitLifecycle::new(directory.clone(), base.clone());
+        let seed = directory_seed(containment, lifecycle.clone());
+
+        let attempt = seed.mint_attempt().expect("attempt");
+        assert_eq!(
+            directory.by_create_request("crq-dir").unwrap().unit.id(),
+            attempt.id(),
+            "a kill by create-request id now reaches the attempt's unit"
+        );
+        assert_eq!(lifecycle.current().id(), attempt.id());
+        assert!(
+            base.stop_in_flight().is_none(),
+            "the base unit waits for the plan's end"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempts_stop_never_cancels_the_start() {
+        let directory = UnitDirectory::new();
+        let (containment, base) = registered_start(&directory);
+        let lifecycle = DirectoryUnitLifecycle::new(directory.clone(), base.clone());
+        let seed = directory_seed(containment, lifecycle.clone());
+
+        let failed = seed.mint_attempt().expect("first attempt");
+        let report = seed
+            .stop(
+                &failed,
+                StopMode::Force,
+                StopReason::StartCancelled,
+                "codex-sidecar-start-failed",
+            )
+            .wait()
+            .await;
+        assert_eq!(report.reason, "start-cancelled");
+        assert!(!seed.start_cancelled(), "the plan may retry");
+        assert_eq!(
+            directory.by_create_request("crq-dir").unwrap().unit.id(),
+            base.id(),
+            "between attempts the start's entry names its base unit again"
+        );
+        let retry = seed.mint_attempt().expect("the retry is allowed");
+        assert_eq!(
+            directory.by_create_request("crq-dir").unwrap().unit.id(),
+            retry.id()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kill_between_attempts_cancels_the_start_and_refuses_the_next() {
+        let directory = UnitDirectory::new();
+        let (containment, base) = registered_start(&directory);
+        let lifecycle = DirectoryUnitLifecycle::new(directory.clone(), base.clone());
+        let seed = directory_seed(containment, lifecycle.clone());
+
+        let attempt = seed.mint_attempt().expect("attempt");
+        // The user's kill finds the start by its create-request id.
+        let entry = directory.by_create_request("crq-dir").unwrap();
+        assert!(directory.cancel_start(entry.unit.id()));
+        seed.stop(
+            &attempt,
+            StopMode::Force,
+            StopReason::StartCancelled,
+            "codex-sidecar-start-failed",
+        )
+        .wait()
+        .await;
+        assert!(seed.start_cancelled(), "the cancellation follows the start");
+        assert_eq!(
+            seed.mint_attempt().map(|unit| unit.id().clone()),
+            Err(CODEX_START_CANCELLED_MESSAGE.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_plans_end_stops_the_unused_base_and_later_stops_use_the_entry() {
+        let directory = UnitDirectory::new();
+        let (containment, base) = registered_start(&directory);
+        let lifecycle = DirectoryUnitLifecycle::new(directory.clone(), base.clone());
+        let seed = directory_seed(containment, lifecycle.clone());
+
+        let launched = seed.mint_attempt().expect("attempt");
+        lifecycle.finish_planning(Some(launched.clone()));
+        let base_stop = base
+            .stop_in_flight()
+            .expect("the unused base unit is stopped at the plan's end");
+        assert_eq!(base_stop.wait().await.reason, "start-cancelled");
+        assert_eq!(
+            directory.by_create_request("crq-dir").unwrap().unit.id(),
+            launched.id()
+        );
+
+        // A pane stop (no lifecycle installed: straight to the unit) leaves
+        // the entry in place for the stop's own Gone publication.
+        seed.stop(
+            &launched,
+            StopMode::Force,
+            StopReason::ServerShutdown,
+            "server-shutdown",
+        )
+        .wait()
+        .await;
+        assert_eq!(
+            directory.by_create_request("crq-dir").unwrap().unit.id(),
+            launched.id(),
+            "after the plan a stop is the pane's stop, not an attempt's"
+        );
+        assert!(seed.is_stopping(&launched));
+    }
+
+    #[tokio::test]
+    async fn a_removed_start_counts_as_cancelled() {
+        let directory = UnitDirectory::new();
+        let (containment, base) = registered_start(&directory);
+        let lifecycle = DirectoryUnitLifecycle::new(directory.clone(), base.clone());
+        let seed = directory_seed(containment, lifecycle);
+        directory.remove(base.id());
+        assert!(
+            seed.start_cancelled(),
+            "a start whose entry is gone is over"
+        );
     }
 }

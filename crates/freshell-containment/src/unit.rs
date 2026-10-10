@@ -122,11 +122,16 @@ impl StopReason {
     }
 
     /// A stop whose reason a joining user kill replaces: re-creating callers
-    /// read `StopReport::reason` and must not re-create what a user killed.
+    /// (auto-resume after an agent exit, a respawn, a stuck restart) read
+    /// `StopReport::reason` and must not re-create what a user killed.
     fn yields_to_user_kill(&self) -> bool {
         matches!(
             self,
-            Self::Respawn | Self::StuckRestart | Self::Handoff | Self::Cleanup
+            Self::Respawn
+                | Self::StuckRestart
+                | Self::Handoff
+                | Self::Cleanup
+                | Self::AgentExited { .. }
         )
     }
 }
@@ -619,7 +624,8 @@ impl AgentUnit {
     /// of the soft signal's grace (all of it when it arrives before the
     /// signal, including the join that retried a failed Stopping write).
     /// A Shift-X or kill-command join on a respawn,
-    /// stuck-restart, handoff or cleanup stop takes over its reason. A
+    /// stuck-restart, handoff, cleanup or agent-exit stop takes over its
+    /// reason. A
     /// joiner's own callbacks and operation id are dropped: it awaits the
     /// returned handle.
     pub fn stop(&self, req: StopRequest) -> StopHandle {
@@ -1733,6 +1739,28 @@ mod tests {
             assert_eq!(event.level, tracing::Level::INFO);
             assert_unit_keys(event, &unit, "op-1");
         }
+    }
+
+    /// A user kill that joins an agent-exit stop takes over its reason: the
+    /// pane was killed, so callers that re-create after an agent exit (the
+    /// crash event at Gone) must not re-create it (R6).
+    #[test]
+    fn a_user_kill_joining_an_agent_exit_stop_takes_over_its_reason() {
+        let unit = unit_on(Arc::new(NoProcesses));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = runtime.block_on(async {
+            let handle = unit.stop(StopRequest::new(
+                StopMode::Force,
+                StopReason::AgentExited { exit_code: Some(3) },
+                "unit-screen-exit",
+            ));
+            unit.stop(StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws"));
+            handle.wait().await
+        });
+        assert_eq!(report.reason, "shift-x");
     }
 
     #[test]

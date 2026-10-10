@@ -14,6 +14,9 @@
 //! `safe11_term22_shutdown_reaping.rs` / `diag01_diag03_logging.rs`
 //! (this repo's black-box test files each carry their own small copy).
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -300,7 +303,7 @@ fn find_all<'a>(lines: &'a [LogLine], msg: &str) -> Vec<&'a LogLine> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diag01_full_flow_log_schema_and_correlation() {
     let server_binary = discover_server_binary();
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let mut boot = boot_server(&server_binary, home.path()).await;
     let server_pid = boot.child.id();
     let base = format!("http://127.0.0.1:{}", boot.port);
@@ -589,7 +592,7 @@ async fn diag01_full_flow_log_schema_and_correlation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diag01_restart_writes_two_coherent_lifecycles() {
     let server_binary = discover_server_binary();
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
 
     let mut boot_a = boot_server(&server_binary, home.path()).await;
     let pid_a = boot_a.child.id();

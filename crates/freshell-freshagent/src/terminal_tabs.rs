@@ -1031,6 +1031,152 @@ async fn teardown_unowned_spawn(
     }
 }
 
+/// A REST-created Codex pane's start in its unit (Task 12): the pane's own
+/// base unit registered in the shared [`freshell_containment::UnitDirectory`]
+/// and the Codex seed's lifecycle over that entry (each start attempt's unit
+/// takes the entry over). Every stop goes through the directory's installed
+/// lifecycle — the WebSocket layer's single stop path — which ends the row
+/// and the unit at Gone; nothing here waits for Gone.
+struct RestUnitStart {
+    units: std::sync::Arc<freshell_containment::UnitDirectory>,
+    containment: freshell_containment::Containment,
+    label: freshell_containment::UnitLabel,
+    lifecycle: std::sync::Arc<freshell_codex::launch_plan::DirectoryUnitLifecycle>,
+}
+
+impl RestUnitStart {
+    /// Creates the pane's unit (its record written first) and registers the
+    /// starting entry. `None` when no single stop path is installed (a state
+    /// built without the WebSocket layer): such a create keeps the plain,
+    /// unit-less spawn.
+    fn begin(
+        state: &FreshAgentState,
+        mode: &str,
+        create_request_id: &str,
+        terminal_id: &str,
+        session_id: Option<&str>,
+    ) -> std::io::Result<Option<Self>> {
+        if state.units.lifecycle().is_none() {
+            return Ok(None);
+        }
+        let label = freshell_containment::UnitLabel {
+            provider: mode.to_string(),
+            session_id: session_id.map(str::to_string),
+            terminal_id: Some(terminal_id.to_string()),
+            mode: mode.to_string(),
+            create_request_id: Some(create_request_id.to_string()),
+        };
+        let base = state
+            .containment
+            .create_unit(freshell_containment::UnitId::mint(), label.clone())?;
+        state.units.register(freshell_containment::UnitEntry {
+            unit: base.clone(),
+            provider: mode.to_string(),
+            mode: mode.to_string(),
+            create_request_id: Some(create_request_id.to_string()),
+            terminal_id: None,
+        });
+        Ok(Some(Self {
+            lifecycle: freshell_codex::launch_plan::DirectoryUnitLifecycle::new(
+                state.units.clone(),
+                base,
+            ),
+            units: state.units.clone(),
+            containment: state.containment.clone(),
+            label,
+        }))
+    }
+
+    /// The Codex seed: one fresh unit per start attempt.
+    fn seed(&self) -> freshell_codex::launch_plan::UnitSeed {
+        freshell_codex::launch_plan::UnitSeed {
+            services: freshell_codex::launch_plan::CodexUnitServices {
+                containment: self.containment.clone(),
+                lifecycle: self.lifecycle.clone(),
+            },
+            label: self.label.clone(),
+        }
+    }
+
+    /// The unit the pane runs in now.
+    fn unit(&self) -> freshell_containment::AgentUnit {
+        self.lifecycle.current()
+    }
+
+    fn cancelled(&self) -> bool {
+        let unit = self.unit();
+        self.units.get(unit.id()).is_none() || self.units.start_cancelled(unit.id())
+    }
+
+    /// The screen `screen_pid` of `terminal_id` started in the unit: it is
+    /// pinned (pin before any placement check, as macOS requires) and its
+    /// terminal noted, so every stop from now on ends this row.
+    fn spawned(&self, terminal_id: &str, screen_pid: u32) {
+        let unit = self.unit();
+        if let Ok(watch) = freshell_containment::ProcWatch::open(screen_pid) {
+            unit.set_screen(watch);
+        }
+        self.units.note_terminal(unit.id(), terminal_id);
+    }
+
+    /// Binds the unit to its terminal and hands the screen to the
+    /// placement settlement (the start settles once it is confirmed).
+    fn bind(&self, terminal_id: &str, screen_pid: u32) {
+        let unit = self.unit();
+        self.units.bind_terminal(unit.id(), terminal_id);
+        self.units.settle_start(unit.id(), screen_pid);
+    }
+
+    /// The create gives the start up: its unit (and the unused base unit)
+    /// is stopped through the single stop path; once Gone, `after_gone`
+    /// runs (a lease release) and the start is settled and its entry
+    /// removed. Nothing waits here.
+    fn give_up(self, initiator: &'static str, after_gone: Option<Box<dyn FnOnce() + Send>>) {
+        use freshell_codex::launch_plan::CodexUnitLifecycle as _;
+        let unit = self.unit();
+        let base = self.lifecycle.base();
+        let stop = self.lifecycle.stop(
+            &unit,
+            freshell_containment::StopMode::Force,
+            freshell_containment::StopReason::StartCancelled,
+            initiator,
+        );
+        let base_stop = (base.id() != unit.id()).then(|| {
+            self.lifecycle.stop(
+                &base,
+                freshell_containment::StopMode::Force,
+                freshell_containment::StopReason::StartCancelled,
+                initiator,
+            )
+        });
+        let units = self.units.clone();
+        tokio::spawn(async move {
+            stop.wait().await;
+            if let Some(base_stop) = base_stop {
+                base_stop.wait().await;
+            }
+            if let Some(after_gone) = after_gone {
+                after_gone();
+            }
+            units.mark_start_settled(unit.id());
+            units.remove(unit.id());
+        });
+    }
+}
+
+/// The lease release a given-up REST start runs once its unit is Gone (the
+/// confirmed death `force_release_after_confirmed_kill` requires).
+fn release_lease_after_gone(
+    registry: &freshell_terminal::TerminalRegistry,
+    locator: &SessionLocator,
+) -> Option<Box<dyn FnOnce() + Send>> {
+    let registry = registry.clone();
+    let locator = locator.clone();
+    Some(Box::new(move || {
+        registry.force_release_after_confirmed_kill(&locator)
+    }))
+}
+
 /// Poll `kill(pid, 0)` for ESRCH for up to 500ms (the PTY's dedicated waiter
 /// thread reaps promptly -- `pty.rs` reader/waiter; same 20x25ms cadence as
 /// the WS path's `confirm_pid_dead_within_500ms`). `true` = death CONFIRMED.
@@ -2424,6 +2570,9 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // mode, and for codex with the flag OFF). Planned inside the non-shell branch;
     // consumed at create-failure (discard) and post-create (adopt) below.
     let mut codex_launch: Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch> = None;
+    // The managed Codex pane's start in its unit (None for every other mode,
+    // and when no single stop path is installed).
+    let mut rest_unit: Option<RestUnitStart> = None;
     let spec: SpawnSpec;
     let child_env: BTreeMap<String, String>;
     // Explicit REST overrides are also copied into ManagedTerminalLaunch so
@@ -2537,6 +2686,21 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         // byte-identical. The raw-resume rejection already ran in
         // `derive_resume_identity` — planning happens strictly after it.
         codex_launch = if let Some(setup) = codex_setup.as_ref() {
+            // The pane's unit: its record is written before anything spawns;
+            // each start attempt runs in its own unit (the seed).
+            rest_unit = RestUnitStart::begin(
+                &state,
+                &mode,
+                &create_request_id,
+                &terminal_id,
+                resume_session_id.as_deref(),
+            )
+            .map_err(|error| {
+                fail_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("codex unit could not be recorded: {error}"),
+                )
+            })?;
             let input = freshell_codex::launch_plan::CodexLaunchPlanInput {
                 cwd: setup.runtime_cwd.as_deref(),
                 resume_session_id: resume_session_id.as_deref(),
@@ -2544,8 +2708,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 sandbox: sandbox.as_deref(),
                 approval_policy: permission_mode.as_deref(),
                 sidecar_context: setup.sidecar_context.clone(),
-                // Task 12 passes the pane's containment seed.
-                unit_seed: None,
+                unit_seed: rest_unit.as_ref().map(RestUnitStart::seed),
             };
             match freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .plan_create_with_retry_uncancellable(
@@ -2555,8 +2718,29 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 )
                 .await
             {
-                Ok(launch) => Some(launch),
-                Err(error) => return Err(codex_launch_error_response(error)),
+                Ok(launch) => {
+                    if let Some(start) = rest_unit.as_ref() {
+                        start.lifecycle.finish_planning(launch.unit.clone());
+                    }
+                    // A kill that cancelled the start while it planned wins.
+                    if rest_unit.as_ref().is_some_and(RestUnitStart::cancelled) {
+                        freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                            .discard_sync(launch);
+                        if let Some(start) = rest_unit.take() {
+                            start.give_up("rest-start-cancelled", None);
+                        }
+                        return Err(codex_launch_error_response(
+                            freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled,
+                        ));
+                    }
+                    Some(launch)
+                }
+                Err(error) => {
+                    if let Some(start) = rest_unit.take() {
+                        start.give_up("rest-start-cancelled", None);
+                    }
+                    return Err(codex_launch_error_response(error));
+                }
             }
         } else {
             None
@@ -2765,15 +2949,21 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             .filter(|s| s.created)
             .zip(resume_session_id.as_ref())
             .map(|(s, sid)| (s.session_dir.clone(), sid.clone()));
+        // A unit row's hook is its Gone hook (Stage 2: LB-33): the registry
+        // runs it once at Gone, after the unit lifecycle published the exit
+        // and finished the Codex launch, so it only tears down.
+        let unit_row = rest_unit.is_some();
         Some(Box::new(move |exit_code: i64| {
             cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
-            registry_for_exit.finish_pty_exit(&tid, exit_code);
-            // DEV-0006 S4: tear down this pane's managed codex sidecar + remote proxy
-            // (no-op for terminals without a managed launch). Sync-safe: hands the
-            // handle to the manager's async teardown worker. Same call as the WS
-            // path's on_exit (`crates/freshell-ws/src/terminal.rs`).
-            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-                .notify_terminal_exit(&tid);
+            if !unit_row {
+                registry_for_exit.finish_pty_exit(&tid, exit_code);
+                // DEV-0006 S4: tear down this pane's managed codex sidecar + remote proxy
+                // (no-op for terminals without a managed launch). Sync-safe: hands the
+                // handle to the manager's async teardown worker. Same call as the WS
+                // path's on_exit (`crates/freshell-ws/src/terminal.rs`).
+                freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                    .notify_terminal_exit(&tid);
+            }
             // Identity retire + pending-marker delete (kata hbsa, ledger A2):
             // inline sync on the PTY reader thread — see the block comment
             // above the hook for why this must NOT hop through tokio.
@@ -2829,9 +3019,15 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             Ok(permit) => _spawn_permit = Some(permit),
             Err(err) => {
                 if let Some(launch) = codex_launch.take() {
-                    freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-                        .discard(launch)
-                        .await;
+                    let manager =
+                        freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
+                    match rest_unit.take() {
+                        Some(start) => {
+                            manager.discard_sync(launch);
+                            start.give_up("rest-start-cancelled", None);
+                        }
+                        None => manager.discard(launch).await,
+                    }
                 }
                 // The SAME cleanup statements the PTY-spawn-failure arm below
                 // runs (MCP config cleanup + amplifier-stub GC): nothing has
@@ -2909,31 +3105,81 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         match registry.launch_managed(managed).await {
             Ok(descriptor) => {
                 registry.register_managed(descriptor);
-                Ok(())
+                Ok(None)
             }
             Err(error) => Err(std::io::Error::other(format!(
                 "managed runtime launch failed: {error}"
             ))),
         }
     } else {
+        // A Codex pane's TUI starts in the pane's unit (its screen); a unit
+        // already stopping refuses the placement (the start was cancelled).
+        let unit_placement = match rest_unit.as_ref() {
+            Some(start) => {
+                let unit = start.unit();
+                match unit.placement(freshell_containment::MemberRole::Screen) {
+                    Ok(placement) => Some(freshell_terminal::UnitPlacement {
+                        unit_id: unit.id().to_string(),
+                        wrapper: placement.wrapper,
+                        env: placement.env,
+                        main_is_screen: false,
+                    }),
+                    Err(_) => {
+                        if let Some(launch) = codex_launch.take() {
+                            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                                .discard_sync(launch);
+                        }
+                        if let Some(start) = rest_unit.take() {
+                            start.give_up("rest-start-cancelled", None);
+                        }
+                        cleanup_mcp_config(
+                            &RealMcpRuntime,
+                            &terminal_id,
+                            &mode,
+                            mcp_cwd.as_deref(),
+                        );
+                        return Err(codex_launch_error_response(
+                            freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled,
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
         let spawn_registry = registry.clone();
         let spawn_spec = spec.clone();
         let spawn_terminal_id = terminal_id.clone();
         let spawn_mode = mode.clone();
         let spawn_resume = resume_session_id.clone();
         let spawn_request_id = create_request_id.clone();
-        match tokio::task::spawn_blocking(move || {
-            spawn_registry.create(
-                &spawn_spec,
-                &child_env,
-                spawn_terminal_id,
-                stream_id,
-                &spawn_mode,
-                spawn_resume.as_deref(),
-                Some(spawn_request_id.as_str()),
-                None,
-                on_exit,
-            )
+        match tokio::task::spawn_blocking(move || match unit_placement {
+            Some(placement) => spawn_registry
+                .create_in_unit(
+                    &spawn_spec,
+                    &child_env,
+                    spawn_terminal_id,
+                    stream_id,
+                    &spawn_mode,
+                    spawn_resume.as_deref(),
+                    Some(spawn_request_id.as_str()),
+                    None,
+                    on_exit,
+                    placement,
+                )
+                .map(Some),
+            None => spawn_registry
+                .create(
+                    &spawn_spec,
+                    &child_env,
+                    spawn_terminal_id,
+                    stream_id,
+                    &spawn_mode,
+                    spawn_resume.as_deref(),
+                    Some(spawn_request_id.as_str()),
+                    None,
+                    on_exit,
+                )
+                .map(|()| None),
         })
         .await
         {
@@ -2942,6 +3188,10 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 "terminal spawn task panicked: {join_err}"
             ))),
         }
+    };
+    let unit_screen_pid = match &create_result {
+        Ok(screen_pid) => *screen_pid,
+        Err(_) => None,
     };
     if let Err(err) = create_result {
         // PIN 2 compensating delete — SAME gate as the write (eaa25b7d).
@@ -2999,10 +3249,17 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         }
         // DEV-0006 S4: a planned-but-unadopted codex launch dies with the failed create
         // (`cleanupUnadoptedCodexLaunch`, `router.ts:445`) — sidecar + proxy torn down.
+        // A pane in its unit is given up instead (its unit's stop ends the
+        // sidecar; nothing waits here).
         if let Some(launch) = codex_launch {
-            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-                .discard(launch)
-                .await;
+            let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
+            match rest_unit.take() {
+                Some(start) => {
+                    manager.discard_sync(launch);
+                    start.give_up("rest-start-cancelled", None);
+                }
+                None => manager.discard(launch).await,
+            }
         }
         let label = mode_label(&mode, cli.as_ref());
         let env_var = state
@@ -3042,12 +3299,38 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // S5.b / D-03: capture "managed?" BEFORE the adopt below takes the launch
     // out of the Option — the arm suppression further down keys off it.
     let managed_codex = codex_launch.is_some();
+    // The TUI is the unit's screen: pin it and note the terminal, so every
+    // stop from now on ends this row. A start a stop cancelled meanwhile is
+    // given up; otherwise the unit is bound and its placement settlement
+    // begins (the start settles once the screen is confirmed placed).
+    let mut rest_unit_bound: Option<RestUnitStart> = None;
+    if let (Some(start), Some(screen_pid)) = (rest_unit.take(), unit_screen_pid) {
+        start.spawned(&terminal_id, screen_pid);
+        if start.cancelled() {
+            if let Some(launch) = codex_launch.take() {
+                freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                    .discard_sync(launch);
+            }
+            start.give_up("rest-start-cancelled", None);
+            return Err(codex_launch_error_response(
+                freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled,
+            ));
+        }
+        start.bind(&terminal_id, screen_pid);
+        // Kept for the failure arms below (they stop the unit).
+        rest_unit_bound = Some(start);
+    }
     if let Some(launch) = codex_launch.take() {
         if let Err(message) = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
             .adopt(&terminal_id, launch, 0)
             .await
         {
-            registry.kill(&terminal_id);
+            match rest_unit_bound.take() {
+                Some(start) => start.give_up("rest-adopt-failed", None),
+                None => {
+                    registry.kill(&terminal_id);
+                }
+            }
             return Err(fail_json(StatusCode::INTERNAL_SERVER_ERROR, message));
         }
     }
@@ -3112,19 +3395,23 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     terminal_id = %terminal_id, error = %reg_err,
                     "handoff_target_registration_failed: the terminal target's                      durable identity registration failed — the spawned terminal                      is reaped and the handoff fails typed (kata b8ke ext r27 F3)"
                 );
-                let pid = registry.pid_of(&terminal_id);
-                registry.kill(&terminal_id);
-                let confirmed = match pid {
-                    Some(pid) => confirm_pid_dead_within_500ms(pid).await,
-                    // No pid handle to probe: the registry kill removed the
-                    // row; nothing is left to signal, so treat as confirmed.
-                    None => true,
-                };
-                if !confirmed {
-                    tracing::error!(target: "invariant",
-                        terminal_id = %terminal_id,
-                        "handoff_target_registration_failure_kill_unconfirmed: the                          spawned terminal did not confirm dead within budget"
-                    );
+                if let Some(start) = rest_unit_bound.take() {
+                    start.give_up("rest-handoff-registration-failed", None);
+                } else {
+                    let pid = registry.pid_of(&terminal_id);
+                    registry.kill(&terminal_id);
+                    let confirmed = match pid {
+                        Some(pid) => confirm_pid_dead_within_500ms(pid).await,
+                        // No pid handle to probe: the registry kill removed the
+                        // row; nothing is left to signal, so treat as confirmed.
+                        None => true,
+                    };
+                    if !confirmed {
+                        tracing::error!(target: "invariant",
+                            terminal_id = %terminal_id,
+                            "handoff_target_registration_failure_kill_unconfirmed: the                          spawned terminal did not confirm dead within budget"
+                        );
+                    }
                 }
                 return Err(fail_json_code(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -3178,18 +3465,32 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             // Revoked while spawning (TTL expired on the then-pid-less lease):
             // kill OUR OWN just-spawned child via the registry handle
             // (group-kill discipline), confirm, and fail the create loudly --
-            // never leave an orphan running.
-            let pid = registry.pid_of(&terminal_id);
-            registry.kill(&terminal_id);
-            let confirmed = match pid {
-                Some(pid) => confirm_pid_dead_within_500ms(pid).await,
-                // No pid handle to probe: the registry kill removed the row;
-                // nothing is left to signal, so treat as confirmed.
-                None => true,
+            // never leave an orphan running. A pane in its unit is stopped
+            // through the unit; the lease is released at its Gone.
+            let confirmed = match rest_unit_bound.take() {
+                Some(start) => {
+                    start.give_up(
+                        "rest-lease-revoked",
+                        release_lease_after_gone(&registry, &locator),
+                    );
+                    true
+                }
+                None => {
+                    let pid = registry.pid_of(&terminal_id);
+                    registry.kill(&terminal_id);
+                    let confirmed = match pid {
+                        Some(pid) => confirm_pid_dead_within_500ms(pid).await,
+                        // No pid handle to probe: the registry kill removed the
+                        // row; nothing is left to signal, so treat as confirmed.
+                        None => true,
+                    };
+                    if confirmed {
+                        registry.force_release_after_confirmed_kill(&locator);
+                    }
+                    confirmed
+                }
             };
-            if confirmed {
-                registry.force_release_after_confirmed_kill(&locator);
-            } else {
+            if !confirmed {
                 tracing::error!(target: "invariant",
                     terminal_id = %terminal_id,
                     provider = %locator.provider,
@@ -3286,7 +3587,13 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                      coordinator claim and the key moved on; killing the unclaimed child \
                      (REST rung)"
                 );
-                teardown_unowned_spawn(&registry, &locator, &terminal_id).await;
+                match rest_unit_bound.take() {
+                    Some(start) => start.give_up(
+                        "rest-ownership-lost",
+                        release_lease_after_gone(&registry, &locator),
+                    ),
+                    None => teardown_unowned_spawn(&registry, &locator, &terminal_id).await,
+                }
                 return Err(fail_json_code(
                     StatusCode::CONFLICT,
                     "RESTORE_UNAVAILABLE",
@@ -3386,7 +3693,13 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                          the REST create spawned; killing the unowned child"
                     );
                     let locator = claim_locator;
-                    teardown_unowned_spawn(&registry, &locator, &terminal_id).await;
+                    match rest_unit_bound.take() {
+                        Some(start) => start.give_up(
+                            "rest-ownership-lost",
+                            release_lease_after_gone(&registry, &locator),
+                        ),
+                        None => teardown_unowned_spawn(&registry, &locator, &terminal_id).await,
+                    }
                     return Err(fail_json_code(
                         StatusCode::CONFLICT,
                         "RESTORE_UNAVAILABLE",

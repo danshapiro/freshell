@@ -146,7 +146,7 @@
 //!     discriminator exists, and a stale blue that self-heals is the
 //!     conservative direction (never a false green).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use freshell_protocol::TerminalIdleReason;
 
@@ -185,6 +185,10 @@ struct TerminalIdleState {
 #[derive(Debug)]
 pub struct IdleGate {
     states: HashMap<String, TerminalIdleState>,
+    /// Terminals whose stop was requested (Stage 2: LB-37): from the request
+    /// until their exit they keep no gate state, so nothing arms, nothing is
+    /// emitted and the death bell never rings for them.
+    stopping: HashSet<String>,
     grace_ms: i64,
 }
 
@@ -204,6 +208,7 @@ impl IdleGate {
     pub fn with_grace_ms(grace_ms: i64) -> Self {
         Self {
             states: HashMap::new(),
+            stopping: HashSet::new(),
             grace_ms,
         }
     }
@@ -212,6 +217,9 @@ impl IdleGate {
     /// any pending window; an idle report is INERT (no cancel, no arm —
     /// deadman/signal-loss idle flips never arm).
     pub fn note_phase(&mut self, terminal_id: &str, phase: IdleGatePhase) {
+        if self.stopping.contains(terminal_id) {
+            return;
+        }
         let state = self.states.entry(terminal_id.to_string()).or_default();
         let next_busy = matches!(phase, IdleGatePhase::Busy | IdleGatePhase::Pending);
         if next_busy {
@@ -230,6 +238,9 @@ impl IdleGate {
     /// a QUEUED turn (claude keeps phase Busy until in_flight drains): never
     /// arm mid-turn. Otherwise arm (or re-arm) the grace window.
     pub fn note_turn_boundary(&mut self, terminal_id: &str, at: i64) {
+        if self.stopping.contains(terminal_id) {
+            return;
+        }
         let state = self.states.entry(terminal_id.to_string()).or_default();
         if state.busy {
             // Queued turn (claude in_flight ledger keeps phase busy until the
@@ -260,10 +271,31 @@ impl IdleGate {
         }
     }
 
-    /// Terminal exited or was removed from a tracker: drop ALL gate state for
-    /// it (legacy remove semantics — never emit for a dead terminal).
+    /// Terminal exited: drop ALL gate state for it (legacy remove semantics —
+    /// never emit for a dead terminal), including its stop request.
     pub fn note_exit(&mut self, terminal_id: &str) {
         self.states.remove(terminal_id);
+        self.stopping.remove(terminal_id);
+    }
+
+    /// A tracker removed the terminal's record (it is still running): drop
+    /// its gate state. A stop request stays in force until the exit.
+    pub fn note_removed(&mut self, terminal_id: &str) {
+        self.states.remove(terminal_id);
+    }
+
+    /// The terminal's stop was requested (Stage 2: LB-37): its gate state
+    /// (and any armed grace window) is dropped, and until its exit nothing
+    /// arms for it and it is never engaged, so a requested stop produces no
+    /// `terminal.idle` and no death bell. A crash never comes through here.
+    pub fn note_stopping(&mut self, terminal_id: &str) {
+        self.states.remove(terminal_id);
+        self.stopping.insert(terminal_id.to_string());
+    }
+
+    /// Whether the terminal's stop was requested and it has not exited yet.
+    pub fn is_stopping(&self, terminal_id: &str) -> bool {
+        self.stopping.contains(terminal_id)
     }
 
     /// Engagement for the DEATH BELL (decision 3): true only for a CONFIRMED
@@ -274,6 +306,9 @@ impl IdleGate {
     /// human quit. Read by the hub's exit arm BEFORE `note_exit` drops the
     /// state: a spontaneous process death while engaged rings the bell.
     pub fn is_engaged(&self, terminal_id: &str) -> bool {
+        if self.stopping.contains(terminal_id) {
+            return false;
+        }
         self.states
             .get(terminal_id)
             .map(|s| (s.busy && !s.pending) || s.deadline.is_some())
@@ -576,5 +611,45 @@ mod tests {
             "the default gate must honor the full grace window"
         );
         assert_eq!(gate.expire(100 + IDLE_GRACE_MS).len(), 1);
+    }
+
+    #[test]
+    fn a_stop_request_drops_the_window_and_nothing_arms_until_the_exit() {
+        let mut gate = IdleGate::new();
+        gate.note_turn_boundary("t1", 100);
+        gate.note_stopping("t1");
+        assert!(gate.is_stopping("t1"));
+        assert_eq!(gate.next_deadline(), None, "the armed window is dropped");
+        assert!(gate.expire(100 + 10 * IDLE_GRACE_MS).is_empty());
+
+        gate.note_phase("t1", IdleGatePhase::Busy);
+        assert!(
+            !gate.is_engaged("t1"),
+            "a stopping terminal is never engaged"
+        );
+        gate.note_phase("t1", IdleGatePhase::Idle);
+        gate.note_turn_boundary("t1", 200);
+        assert_eq!(
+            gate.next_deadline(),
+            None,
+            "no boundary arms while stopping"
+        );
+
+        gate.note_removed("t1");
+        gate.note_turn_boundary("t1", 300);
+        assert_eq!(
+            gate.next_deadline(),
+            None,
+            "a tracker removal does not lift the stop request"
+        );
+
+        gate.note_exit("t1");
+        assert!(!gate.is_stopping("t1"), "the exit clears the stop request");
+        gate.note_turn_boundary("t1", 400);
+        assert_eq!(
+            gate.next_deadline(),
+            Some(400 + IDLE_GRACE_MS),
+            "a terminal id reused after the exit behaves as before"
+        );
     }
 }

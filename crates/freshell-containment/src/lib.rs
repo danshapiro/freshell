@@ -13,6 +13,7 @@ mod backend;
 pub mod containment;
 #[cfg(target_os = "macos")]
 mod darwin;
+pub mod directory;
 pub mod events;
 pub mod exec_shim;
 pub mod listener;
@@ -31,8 +32,10 @@ pub mod unit_id;
 
 pub use backend::{BackendKind, Capability};
 pub use containment::{
-    global_containment, set_global_containment, Containment, SelectOptions, ShimCommand,
+    global_containment, global_or_fallback_containment, set_global_containment, Containment,
+    SelectOptions, ShimCommand,
 };
+pub use directory::{UnitDirectory, UnitEntry, UnitLifecycle};
 pub use listener::listening_socket_owner;
 pub use locks::{codex_thread_lock_path, lock_holders, lock_holders_among, LockHolder};
 pub use proc_watch::{ProcWatch, Sig};

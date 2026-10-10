@@ -65,7 +65,7 @@ pub use registry::{
     compute_scrollback_max_bytes, ActivityEvent, ActivityObserver, AttachOutcome, ClaimState,
     FrameSink, InputOutcome, PacedAttachOptions, PacedAttachStart, PacedExitNotify,
     PacedGapExitReason, PacedPage, PacedSessionDesc, PacedTailCompletion, ReplayBounds,
-    StuckTransition, TerminalRegistry, UnitEnding, UnitPlacement, UnitScreenExit,
+    StuckTransition, TerminalRegistry, UnitEnding, UnitKillHook, UnitPlacement, UnitScreenExit,
     UnitScreenExitHook, DEFAULT_PACED_PAGE_MAX_BYTES, DEFAULT_STUCK_WINDOW_MS,
     STUCK_ACTIVITY_FRESH_MS,
 };

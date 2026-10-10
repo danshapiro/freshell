@@ -320,3 +320,24 @@ pub fn set_global_containment(c: Containment) -> bool {
 pub fn global_containment() -> Option<Containment> {
     GLOBAL.get().cloned()
 }
+
+/// The process-global containment; where none was installed (tests, tools
+/// that never boot a server), one per-process tag-backend containment whose
+/// unit records live in a per-process directory under the system temp
+/// directory (never a relative path: creating a unit writes its record
+/// there).
+pub fn global_or_fallback_containment() -> Containment {
+    if let Some(global) = global_containment() {
+        return global;
+    }
+    static FALLBACK: OnceLock<Containment> = OnceLock::new();
+    FALLBACK
+        .get_or_init(|| {
+            Containment::tag_backend(SelectOptions {
+                shim: None,
+                state_root: std::env::temp_dir()
+                    .join(format!("freshell-units-{}", std::process::id())),
+            })
+        })
+        .clone()
+}

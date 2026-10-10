@@ -405,6 +405,7 @@ pub(crate) async fn coordinator_commit_identity(
             match outcome {
                 freshell_ownership::CommitOutcome::Committed => {
                     ticket.disarm();
+                    note_unit_conversation(state, terminal_id, provider, session_id).await;
                     let snapshot = ownership.observe(provider, session_id);
                     // b8ke ext r22 F2: the commit-side ownership stamp — the
                     // row's delayed-write fence baseline advances to THIS
@@ -491,6 +492,7 @@ pub(crate) async fn coordinator_commit_identity(
             match outcome {
                 freshell_ownership::CommitOutcome::Committed => {
                     ticket.disarm();
+                    note_unit_conversation(state, terminal_id, provider, session_id).await;
                     // The new key's authoritative owner frame.
                     let snapshot = ownership.observe(provider, session_id);
                     // b8ke ext r22 F2: the commit-side ownership stamp — the
@@ -548,6 +550,26 @@ pub(crate) async fn coordinator_commit_identity(
             }
         }
     }
+}
+
+/// A committed conversation of a unit row (the commit's owner already
+/// carries the row's unit id) joins that unit's recorded conversation keys,
+/// so a restarted server finds every conversation the unit held. The record
+/// write runs on a blocking thread.
+async fn note_unit_conversation(
+    state: &WsState,
+    terminal_id: &str,
+    provider: &str,
+    session_id: &str,
+) {
+    let Some(entry) = state.units.by_terminal(terminal_id) else {
+        return;
+    };
+    let (provider, session_id) = (provider.to_string(), session_id.to_string());
+    let _ = tokio::task::spawn_blocking(move || {
+        entry.unit.note_conversation(&provider, &session_id);
+    })
+    .await;
 }
 
 /// b8ke ext r14 F2: the rebind's old-key release for the ADOPT-armed
@@ -917,6 +939,7 @@ mod tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: Some(ownership),
+            units: Default::default(),
         };
         (state, rx)
     }

@@ -73,6 +73,7 @@ pub(crate) mod tabs_store_migrate;
 pub mod tabs_store_model;
 pub mod terminal;
 pub mod terminal_meta;
+pub mod unit_lifecycle;
 
 pub use codex_identity::codex_sessions_root;
 pub use codex_reconcile::locate_codex_rollout;
@@ -413,6 +414,12 @@ pub struct WsState {
     /// existence probe. Arc'd: identity events write it durably before they
     /// are answered (async paths wrap the sync API in awaited spawn_blocking).
     pub pane_ledger: std::sync::Arc<crate::pane_ledger::PaneLedger>,
+    /// The pane-unit services: which containment unit is which pane (the
+    /// shared `UnitDirectory`, also handed to the REST lane) and the
+    /// containment that creates units. Every stop of a coding-agent terminal
+    /// pane runs through [`crate::unit_lifecycle::stop_terminal_unit`]. Reads
+    /// as the directory (`state.units.by_terminal(..)`).
+    pub units: crate::unit_lifecycle::UnitServices,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -1137,6 +1144,7 @@ pub(crate) fn test_ws_state() -> WsState {
         reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     }
 }
 

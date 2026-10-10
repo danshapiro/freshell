@@ -17,6 +17,9 @@
 //! REAL server process logs is to read the JSONL file it writes, exactly as
 //! an operator would.
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -107,7 +110,7 @@ fn drain_stderr(child: &mut Child) -> String {
 async fn nested_json_encoded_secrets_in_client_log_strings_are_redacted() {
     let server_binary = discover_server_binary();
 
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let home_path = home.path().to_path_buf();
 
     let port = allocate_ephemeral_port();
@@ -220,7 +223,7 @@ async fn nested_json_encoded_secrets_in_client_log_strings_are_redacted() {
 async fn client_log_entries_are_emitted_into_the_structured_log() {
     let server_binary = discover_server_binary();
 
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let home_path = home.path().to_path_buf();
 
     let port = allocate_ephemeral_port();

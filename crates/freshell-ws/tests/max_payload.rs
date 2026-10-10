@@ -107,6 +107,7 @@ async fn spawn_server(ws_max_payload_bytes: usize) -> String {
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);

@@ -2907,6 +2907,7 @@ async fn plan_codex_managed_launch(
     resume_session_id: Option<&str>,
     class: freshell_codex::launch_lifecycle::LaunchClass,
     cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
+    unit_seed: Option<freshell_codex::launch_plan::UnitSeed>,
 ) -> Result<freshell_codex::launch_lifecycle::CodexTerminalLaunch, PlanLaunchError> {
     let codex_provider = state.settings.coding_cli.providers.get("codex");
     let plan_model = codex_provider.and_then(|provider| provider.model.clone());
@@ -2920,8 +2921,9 @@ async fn plan_codex_managed_launch(
         sandbox: plan_sandbox.as_deref(),
         approval_policy: plan_approval.as_deref(),
         sidecar_context: setup.sidecar_context.clone(),
-        // Task 12 passes the pane's containment seed.
-        unit_seed: None,
+        // The pane's containment seed: each start attempt runs in its own
+        // unit, which takes over the pane's directory entry.
+        unit_seed,
     };
     let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
     let result = match cancel {
@@ -2950,6 +2952,69 @@ async fn plan_codex_managed_launch(
         freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled => PlanLaunchError::Cancelled,
         other => PlanLaunchError::Failed(other.to_string()),
     })
+}
+
+/// Plans a Codex pane's managed launch inside its start scope (Task 12; the
+/// three Codex create paths share it): every start attempt runs in its own
+/// unit (the scope's seed), the plan is raced against the start's
+/// cancellation (a kill drops the plan), and the launch's unit becomes the
+/// pane's unit (the unused base unit is stopped).
+async fn plan_codex_launch_in_unit(
+    state: &WsState,
+    setup: &CodexManagedLaunchSetup,
+    resume_session_id: Option<&str>,
+    class: freshell_codex::launch_lifecycle::LaunchClass,
+    cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
+    scope: &mut crate::unit_lifecycle::StartScope,
+) -> Result<freshell_codex::launch_lifecycle::CodexTerminalLaunch, PlanLaunchError> {
+    let planned = tokio::select! {
+        planned = plan_codex_managed_launch(
+            state,
+            setup,
+            resume_session_id,
+            class,
+            cancel,
+            Some(scope.seed()),
+        ) => planned,
+        () = scope.wait_cancelled() => Err(PlanLaunchError::Cancelled),
+    };
+    if let Ok(launch) = planned.as_ref() {
+        scope.adopt_launch_unit(launch.unit.clone());
+    }
+    planned
+}
+
+/// Where a Codex pane's TUI starts: as the screen of the scope's current
+/// unit (the launch's). A unit whose stop began refuses: the start was
+/// cancelled.
+fn codex_screen_placement(
+    scope: &crate::unit_lifecycle::StartScope,
+) -> std::io::Result<freshell_terminal::UnitPlacement> {
+    let unit = scope.unit();
+    let placement = unit.placement(freshell_containment::MemberRole::Screen)?;
+    Ok(freshell_terminal::UnitPlacement {
+        unit_id: unit.id().to_string(),
+        wrapper: placement.wrapper,
+        env: placement.env,
+        main_is_screen: false,
+    })
+}
+
+/// The Codex TUI `screen_pid` of `terminal_id` started: it is pinned as the
+/// unit's screen and its row noted, and the unit is bound unless a stop
+/// reached Gone or cancelled the start meanwhile (`false`: give the start
+/// up).
+async fn codex_screen_spawned(
+    scope: &mut crate::unit_lifecycle::StartScope,
+    terminal_id: &str,
+    screen_pid: u32,
+) -> bool {
+    let spawned = scope.spawned(terminal_id, screen_pid).await;
+    if spawned == crate::unit_lifecycle::Spawned::AlreadyStopped || scope.cancelled() {
+        return false;
+    }
+    scope.bind();
+    true
 }
 
 /// RAII release of a §5.4 keyed-create reservation
@@ -3088,6 +3153,153 @@ async fn teardown_unowned_spawn(state: &WsState, locator: &SessionLocator, termi
     }
 }
 
+/// The watchdog's cancellation of a terminal start (b8ke delta round-2 F2):
+/// a start running in its unit (a Codex pane, found by its create-request
+/// id) is stopped through its unit — which cancels the start, ends its row
+/// at Gone and lets its create give it up; any other start's row is killed
+/// the moment it exists.
+fn start_cancel_signal(
+    state: &WsState,
+    create_request_id: &str,
+    tid_slot: Arc<std::sync::Mutex<Option<String>>>,
+) -> Arc<dyn Fn() + Send + Sync> {
+    let state = state.clone();
+    let create_request_id = create_request_id.to_string();
+    let rt = tokio::runtime::Handle::try_current().ok();
+    Arc::new(move || {
+        if let (Some(entry), Some(rt)) = (
+            state.units.by_create_request(&create_request_id),
+            rt.as_ref(),
+        ) {
+            tracing::warn!(target: "freshell_ws::terminal",
+                create_request_id = %create_request_id,
+                unit_id = %entry.unit.id(),
+                event = "ownership.start.cancel_signal",
+                "the watchdog's start cancellation stops the start's unit");
+            let state = state.clone();
+            rt.spawn(async move {
+                let _ = crate::unit_lifecycle::stop_terminal_unit(
+                    &state,
+                    &entry,
+                    crate::unit_lifecycle::UnitStopCommand {
+                        mode: freshell_containment::StopMode::Force,
+                        reason: freshell_containment::StopReason::StartCancelled,
+                        initiator: "ownership-start-watchdog".to_string(),
+                        operation_id: format!("unit-start-cancel-{}", uuid::Uuid::new_v4()),
+                        record_stopped_pane: false,
+                    },
+                );
+            });
+            return;
+        }
+        if let Some(tid) = tid_slot
+            .lock()
+            .expect("terminal start tid slot lock")
+            .clone()
+        {
+            tracing::warn!(target: "freshell_ws::terminal",
+                terminal_id = %tid,
+                event = "ownership.start.cancel_signal",
+                "the watchdog's start cancellation kills the spawned \
+                 terminal's registry row");
+            state.registry.kill(&tid);
+        }
+    })
+}
+
+/// The create's ownership holds — its coordinator claim, its sessionRef
+/// lease and its registered start cancellation — handed to an abandoned
+/// start, which drops them only after its unit is Gone, so the Starting key
+/// is released after the agent is confirmed dead and before the start
+/// settles.
+fn take_create_claims(
+    ownership: &mut Option<TerminalOwnershipClaim>,
+    lease: &mut Option<SessionRefLeaseGuard>,
+    start_cancellation: &mut Option<freshell_freshagent::ownership_lane::StartCancellationGuard>,
+) -> Box<dyn std::any::Any + Send> {
+    Box::new((ownership.take(), lease.take(), start_cancellation.take()))
+}
+
+/// Releases a sessionRef lease (and its retained coordinator claim) when
+/// dropped: handed to an abandoned start, it runs after the unit's Gone —
+/// the confirmed death `force_release_after_confirmed_kill` requires.
+struct ReleaseLeaseAfterGone {
+    registry: freshell_terminal::TerminalRegistry,
+    locator: SessionLocator,
+}
+
+impl Drop for ReleaseLeaseAfterGone {
+    fn drop(&mut self) {
+        self.registry
+            .force_release_after_confirmed_kill(&self.locator);
+    }
+}
+
+/// Tear down a create's own just-spawned child after its claim was lost: a
+/// pane in its unit is given up through its start scope (the unit's stop is
+/// spawned; the claims and the lease release follow Gone); any other row
+/// keeps [`teardown_unowned_spawn`].
+async fn teardown_create_spawn(
+    state: &WsState,
+    scope: Option<crate::unit_lifecycle::StartScope>,
+    claims: Box<dyn std::any::Any + Send>,
+    locator: &SessionLocator,
+    terminal_id: &str,
+) {
+    match scope {
+        Some(scope) => scope.abandon(Some(Box::new((
+            claims,
+            ReleaseLeaseAfterGone {
+                registry: state.registry.clone(),
+                locator: locator.clone(),
+            },
+        )))),
+        None => {
+            drop(claims);
+            teardown_unowned_spawn(state, locator, terminal_id).await;
+        }
+    }
+}
+
+/// A respawn's planned-but-unadopted Codex launch dies with the failed
+/// respawn: inside a unit the start is given up (its unit's stop ends the
+/// sidecar; neither is awaited here); a launch outside a unit is discarded
+/// as before.
+async fn discard_respawn_launch(
+    launch: Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>,
+    scope: Option<crate::unit_lifecycle::StartScope>,
+) {
+    let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
+    match (launch, scope) {
+        (Some(launch), Some(scope)) => {
+            manager.discard_sync(launch);
+            scope.abandon(None);
+        }
+        (Some(launch), None) => manager.discard(launch).await,
+        (None, Some(scope)) => scope.abandon(None),
+        (None, None) => {}
+    }
+}
+
+/// A Codex start given up: its unit is stopped and the create's claims are
+/// released after Gone (spawned, never awaited here). A start a user's kill
+/// ended is answered with nothing (the client closed the pane); any other
+/// gets the create's `PTY_SPAWN_FAILED` error.
+async fn abandon_codex_start(
+    state: &WsState,
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    request_id: &str,
+    scope: crate::unit_lifecycle::StartScope,
+    claims: Box<dyn std::any::Any + Send>,
+    message: String,
+) -> bool {
+    scope.abandon(Some(claims));
+    if state.units.killed_start(request_id) {
+        return true;
+    }
+    send_create_error(out, ErrorCode::PtySpawnFailed, message, request_id).await
+}
+
 /// Poll `kill(pid, 0)` for ESRCH for up to 500ms (the PTY's dedicated waiter
 /// thread reaps promptly — `pty.rs` reader/waiter). `true` = death CONFIRMED.
 pub(crate) async fn confirm_pid_dead_within_500ms(pid: u32) -> bool {
@@ -3218,106 +3430,158 @@ pub(crate) fn build_pty_exit_hook(
 ) -> freshell_terminal::pty::ExitHook {
     Box::new(move |exit_code: i64| {
         cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
-        // Lane D1: read identity/probe BEFORE finish/retire mutate state.
-        let probe = deps.registry.probe(&terminal_id);
-        // kata b8ke Task 4: the dying generation's committed ownership fence,
-        // captured BEFORE `finish_pty_exit` below consumes the retained
-        // claim (its fenced release). The CrashEvent carries it as the
-        // respawn claim's observed fence — a recovery observing a superseded
-        // generation is typed-refused stale.
-        let observed_fence = deps.registry.retained_ownership_fence(&terminal_id);
-        let create_request_id = deps.registry.probe_create_request_id(&terminal_id);
+        // Lane D1: the crash event is read (identity/probe, and the dying
+        // generation's committed ownership fence — kata b8ke Task 4) BEFORE
+        // `finish_pty_exit` consumes the retained claim (its fenced release)
+        // and before the retire below mutates state. The CrashEvent carries
+        // that fence as the respawn claim's observed fence — a recovery
+        // observing a superseded generation is typed-refused stale.
+        let crash = crash_event_from_registry(&deps.registry, &terminal_id, &mode, exit_code);
         let finished = deps.registry.finish_pty_exit(&terminal_id, exit_code);
         // DEV-0006 S4: tear down this pane's managed codex sidecar + remote proxy
         // (no-op for terminals without a managed launch). Sync-safe: hands the
         // handle to the manager's async teardown worker.
         freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
             .notify_terminal_exit(&terminal_id);
-        deps.identity.retire(&terminal_id);
-        // DEV-0008 closure (Task 18): retire the META record + broadcast the
-        // removal on NATURAL exit (see ExitHookDeps::terminal_meta).
-        if deps.terminal_meta.retire(&terminal_id, now_ms()) {
-            crate::terminal_meta::broadcast_terminal_meta_updated(
-                &deps.broadcast_tx,
-                vec![],
-                vec![terminal_id.clone()],
-            );
-        }
-        // P1.8: an observed PTY exit in this epoch ends any
-        // identity-in-flight window — the marker's job (distinguishing
-        // fresh-by-race from fresh-by-intent across a SERVER death) is
-        // over. Best-effort; never load-bearing. INLINE sync call is
-        // correct HERE: the ExitHook (`pty.rs:55`, `FnOnce + Send`) runs
-        // on the PTY's blocking/reader thread, not an async worker —
-        // the one truly-synchronous ledger call site (V1.md).
-        if let Err(err) = deps.pane_ledger.delete_pending(&terminal_id) {
-            tracing::warn!(terminal_id = %terminal_id, error = %err, "pane_ledger_marker_delete_failed_on_exit");
-        }
-        if let Some(locator) = &deps.opencode_locator {
-            locator.disarm(&terminal_id);
-        }
-        if let Some(locator) = &deps.codex_locator {
-            locator.disarm(&terminal_id);
-        }
-        // Launcher-assigned amplifier identity (Task 10): GC the never-used
-        // stub this create pre-wrote. Runs AFTER finish_pty_exit (our own
-        // row is no longer Running) and BEFORE the CrashEvent send below —
-        // the integration tests use the CrashEvent as their happens-after
-        // "the GC decision has been made" signal.
-        if let Some(gc) = &deps.amplifier_stub_gc {
-            // GC-vs-second-resume race (validated fix F5/V7): by the time
-            // this hook runs, our own row is already Exited (or removed by
-            // kill) — a NEW terminal may already be live on this same resume
-            // id, and deleting the dir out from under it would doom its
-            // resume. Skip GC in that case; the new terminal's own exit hook
-            // is not responsible either (`created == false` for it), which
-            // is correct: the dir is in use.
-            // ACCEPTED RESIDUAL: this guard reads registry rows, so a
-            // concurrent re-resume that has already passed `ensure_session`
-            // (found our stub) but has NOT yet inserted its registry row is
-            // invisible here — its dir can be GC'd in that sub-second window
-            // and its `amplifier session resume --full-history <id>` then fails
-            // LOUDLY in-terminal;
-            // reopening the pane re-stubs the same id (ensure-after-GC).
-            if freshell_terminal::registry::has_other_live_resume(
-                &deps.registry.identity_probe_rows(),
-                "amplifier",
-                &gc.session_id,
-                &terminal_id,
-            ) {
-                tracing::debug!(
-                    terminal_id = %terminal_id,
-                    session_id = %gc.session_id,
-                    "amplifier_stub_gc: skipped — another live terminal holds this resume id"
-                );
-            } else if freshell_sessions::amplifier_stub::gc_stub_if_unused(&gc.session_dir) {
-                tracing::debug!(
-                    terminal_id = %terminal_id,
-                    dir = %gc.session_dir.display(),
-                    "amplifier_stub_gc: removed never-used pre-created session"
-                );
-            }
-        }
+        retire_exited_terminal(&deps, &terminal_id);
         // Lane D1: genuine natural exits only (kill removed the row → false).
         if finished {
-            // Missing probe: i64::MAX is a deliberate "treat as healthy /
-            // fresh attempt budget" sentinel (the healthy-lifetime check
-            // reads it as a long-lived process), NOT "unknown".
-            let lifetime_ms = probe
-                .as_ref()
-                .map(|p| now_ms() - p.created_at)
-                .unwrap_or(i64::MAX);
-            // kata b8ke Task 4: the fence captured above rides the event.
-            let _ = deps.auto_resume_tx.send(crate::auto_resume::CrashEvent {
-                terminal_id: terminal_id.clone(),
-                exit_code,
-                mode: mode.clone(),
-                create_request_id,
-                lifetime_ms,
-                observed_fence,
-            });
+            let _ = deps.auto_resume_tx.send(crash);
         }
     })
+}
+
+/// The Gone hook of a coding-agent pane's unit row (Stage 2: LB-33):
+/// [`build_pty_exit_hook`]'s teardown half — MCP config cleanup, identity
+/// retire, terminal-meta retire + broadcast, the ledger pending-marker
+/// delete, the Codex/OpenCode locator disarm and the amplifier stub GC. The
+/// registry runs it once, at Gone, after the row's exit is published. It
+/// never publishes an exit, never touches the Codex launch and never sends a
+/// crash event: the unit lifecycle's Gone publication does those
+/// (`crate::unit_lifecycle::publish_gone`).
+pub(crate) fn build_unit_gone_hook(
+    deps: ExitHookDeps,
+    terminal_id: String,
+    mode: String,
+    mcp_cwd: Option<String>,
+) -> freshell_terminal::pty::ExitHook {
+    Box::new(move |_exit_code: i64| {
+        cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+        retire_exited_terminal(&deps, &terminal_id);
+    })
+}
+
+/// The exit teardown shared by the PTY exit hook and the unit Gone hook:
+/// identity and terminal-meta retire, the ledger pending-marker delete, the
+/// locator disarms and the amplifier stub GC. Runs on the PTY reader thread
+/// (or a blocking thread at Gone): plain synchronous calls only.
+fn retire_exited_terminal(deps: &ExitHookDeps, terminal_id: &str) {
+    deps.identity.retire(terminal_id);
+    // DEV-0008 closure (Task 18): retire the META record + broadcast the
+    // removal on NATURAL exit (see ExitHookDeps::terminal_meta).
+    if deps.terminal_meta.retire(terminal_id, now_ms()) {
+        crate::terminal_meta::broadcast_terminal_meta_updated(
+            &deps.broadcast_tx,
+            vec![],
+            vec![terminal_id.to_string()],
+        );
+    }
+    // P1.8: an observed PTY exit in this epoch ends any
+    // identity-in-flight window — the marker's job (distinguishing
+    // fresh-by-race from fresh-by-intent across a SERVER death) is
+    // over. Best-effort; never load-bearing. INLINE sync call is
+    // correct HERE: the ExitHook (`pty.rs:55`, `FnOnce + Send`) runs
+    // on the PTY's blocking/reader thread, not an async worker —
+    // the one truly-synchronous ledger call site (V1.md).
+    if let Err(err) = deps.pane_ledger.delete_pending(terminal_id) {
+        tracing::warn!(terminal_id = %terminal_id, error = %err, "pane_ledger_marker_delete_failed_on_exit");
+    }
+    if let Some(locator) = &deps.opencode_locator {
+        locator.disarm(terminal_id);
+    }
+    if let Some(locator) = &deps.codex_locator {
+        locator.disarm(terminal_id);
+    }
+    // Launcher-assigned amplifier identity (Task 10): GC the never-used
+    // stub this create pre-wrote. Runs AFTER the row stopped Running and
+    // BEFORE the caller's crash event — the integration tests use the
+    // CrashEvent as their happens-after "the GC decision has been made"
+    // signal.
+    if let Some(gc) = &deps.amplifier_stub_gc {
+        // GC-vs-second-resume race (validated fix F5/V7): by the time
+        // this hook runs, our own row is already Exited (or removed by
+        // kill) — a NEW terminal may already be live on this same resume
+        // id, and deleting the dir out from under it would doom its
+        // resume. Skip GC in that case; the new terminal's own exit hook
+        // is not responsible either (`created == false` for it), which
+        // is correct: the dir is in use.
+        // ACCEPTED RESIDUAL: this guard reads registry rows, so a
+        // concurrent re-resume that has already passed `ensure_session`
+        // (found our stub) but has NOT yet inserted its registry row is
+        // invisible here — its dir can be GC'd in that sub-second window
+        // and its `amplifier session resume --full-history <id>` then fails
+        // LOUDLY in-terminal;
+        // reopening the pane re-stubs the same id (ensure-after-GC).
+        if freshell_terminal::registry::has_other_live_resume(
+            &deps.registry.identity_probe_rows(),
+            "amplifier",
+            &gc.session_id,
+            terminal_id,
+        ) {
+            tracing::debug!(
+                terminal_id = %terminal_id,
+                session_id = %gc.session_id,
+                "amplifier_stub_gc: skipped — another live terminal holds this resume id"
+            );
+        } else if freshell_sessions::amplifier_stub::gc_stub_if_unused(&gc.session_dir) {
+            tracing::debug!(
+                terminal_id = %terminal_id,
+                dir = %gc.session_dir.display(),
+                "amplifier_stub_gc: removed never-used pre-created session"
+            );
+        }
+    }
+}
+
+/// The crash event a terminal's natural exit with `exit_code` reports (read
+/// before the row changes): its create-request id, mode, lifetime and the
+/// committed ownership fence it ran under. `None` when the registry has no
+/// row for it.
+pub(crate) fn crash_event_for(
+    state: &WsState,
+    terminal_id: &str,
+    exit_code: i64,
+) -> Option<crate::auto_resume::CrashEvent> {
+    let mode = state.registry.probe(terminal_id)?.mode;
+    Some(crash_event_from_registry(
+        &state.registry,
+        terminal_id,
+        &mode,
+        exit_code,
+    ))
+}
+
+fn crash_event_from_registry(
+    registry: &freshell_terminal::TerminalRegistry,
+    terminal_id: &str,
+    mode: &str,
+    exit_code: i64,
+) -> crate::auto_resume::CrashEvent {
+    // Missing probe: i64::MAX is a deliberate "treat as healthy / fresh
+    // attempt budget" sentinel (the healthy-lifetime check reads it as a
+    // long-lived process), NOT "unknown".
+    let lifetime_ms = registry
+        .probe(terminal_id)
+        .map(|p| now_ms() - p.created_at)
+        .unwrap_or(i64::MAX);
+    crate::auto_resume::CrashEvent {
+        terminal_id: terminal_id.to_string(),
+        exit_code,
+        mode: mode.to_string(),
+        create_request_id: registry.probe_create_request_id(terminal_id),
+        lifetime_ms,
+        observed_fence: registry.retained_ownership_fence(terminal_id),
+    }
 }
 
 /// Spawn-time launch intent + resume identity, derived before spawn.
@@ -3949,6 +4213,7 @@ pub(crate) struct PreparedCodexLaunch(
     Option<(
         CodexManagedLaunchSetup,
         freshell_codex::launch_lifecycle::CodexTerminalLaunch,
+        crate::unit_lifecycle::StartScope,
     )>,
 );
 
@@ -3956,22 +4221,27 @@ impl PreparedCodexLaunch {
     fn new(
         setup: CodexManagedLaunchSetup,
         launch: freshell_codex::launch_lifecycle::CodexTerminalLaunch,
+        scope: crate::unit_lifecycle::StartScope,
     ) -> Self {
-        Self(Some((setup, launch)))
+        Self(Some((setup, launch, scope)))
     }
 
     /// The ID was reserved before off-permit planning. Reuse it in
     /// `handle_create`; do not mint or render a second terminal context.
     fn terminal_id(&self) -> Option<&str> {
-        self.0.as_ref().map(|(setup, _)| setup.terminal_id.as_str())
+        self.0
+            .as_ref()
+            .map(|(setup, _, _)| setup.terminal_id.as_str())
     }
 
-    /// Hand the launch to the adoption path; the guard becomes inert.
+    /// Hand the launch (and the pane's start scope) to the adoption path;
+    /// the guard becomes inert.
     fn take(
         &mut self,
     ) -> Option<(
         CodexManagedLaunchSetup,
         freshell_codex::launch_lifecycle::CodexTerminalLaunch,
+        crate::unit_lifecycle::StartScope,
     )> {
         self.0.take()
     }
@@ -3979,13 +4249,15 @@ impl PreparedCodexLaunch {
 
 impl Drop for PreparedCodexLaunch {
     fn drop(&mut self) {
-        if let Some((_, launch)) = self.0.take() {
+        if let Some((_, launch, scope)) = self.0.take() {
             tracing::info!(
                 target: "freshell_ws::create",
                 "prepared_codex_launch_discarded"
             );
             freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .discard_sync(launch);
+            // Its unit is stopped and the start given up (no claim yet).
+            scope.abandon(None);
         }
     }
 }
@@ -4314,19 +4586,45 @@ pub(crate) async fn prepare_launch(
             create.pane_id.as_deref(),
         )
         .map_err(PrepareError::PlanFailed)?;
-        match plan_codex_managed_launch(
+        // The pane's unit: its record is written before anything spawns, and
+        // a kill by this create's id reaches the start attempt that runs.
+        let mut scope = crate::unit_lifecycle::StartScope::begin(
+            state,
+            "codex",
+            &mode,
+            &create.request_id,
+            &setup.terminal_id,
+            prep.resume_session_id.as_deref(),
+        )
+        .map_err(|error| {
+            PrepareError::PlanFailed(format!("codex unit could not be recorded: {error}"))
+        })?;
+        let planned = plan_codex_launch_in_unit(
             state,
             &setup,
             prep.resume_session_id.as_deref(),
             freshell_codex::launch_lifecycle::LaunchClass::Restore,
-            Some(cancel),
+            Some(&mut *cancel),
+            &mut scope,
         )
-        .await
-        {
-            Ok(launch) => Some(PreparedCodexLaunch::new(setup, launch)),
-            Err(PlanLaunchError::QueueFull) => return Err(PrepareError::PlanQueueFull),
-            Err(PlanLaunchError::Cancelled) => return Err(PrepareError::Cancelled),
-            Err(PlanLaunchError::Failed(message)) => return Err(PrepareError::PlanFailed(message)),
+        .await;
+        match planned {
+            Ok(launch) => Some(PreparedCodexLaunch::new(setup, launch, scope)),
+            Err(error) => {
+                // No claim exists yet: the start is given up on its own.
+                let killed = state.units.killed_start(&create.request_id);
+                scope.abandon(None);
+                return Err(match error {
+                    PlanLaunchError::QueueFull => PrepareError::PlanQueueFull,
+                    PlanLaunchError::Cancelled if *cancel.borrow() || killed => {
+                        PrepareError::Cancelled
+                    }
+                    PlanLaunchError::Cancelled => PrepareError::PlanFailed(
+                        freshell_codex::launch_plan::CODEX_START_CANCELLED_MESSAGE.to_string(),
+                    ),
+                    PlanLaunchError::Failed(message) => PrepareError::PlanFailed(message),
+                });
+            }
         }
     } else {
         None
@@ -4715,22 +5013,11 @@ pub(crate) async fn handle_create(
                     // cancellation + settle (the tid slot arms at the
                     // preallocated id below) — BEFORE the claim construction
                     // moves the ticket.
-                    let registry = state.registry.clone();
-                    let tid_slot = Arc::clone(&terminal_start_tid_slot);
-                    let cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                        if let Some(tid) = tid_slot
-                            .lock()
-                            .expect("terminal start tid slot lock")
-                            .clone()
-                        {
-                            tracing::warn!(target: "freshell_ws::terminal",
-                                terminal_id = %tid,
-                                event = "ownership.start.cancel_signal",
-                                "the watchdog's start cancellation kills the spawned \
-                                 terminal's registry row");
-                            registry.kill(&tid);
-                        }
-                    });
+                    let cancel = start_cancel_signal(
+                        state,
+                        &create.request_id,
+                        Arc::clone(&terminal_start_tid_slot),
+                    );
                     let mut registration_ticket = Some(ticket);
                     _terminal_start_cancellation = Some(
                         freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
@@ -5699,22 +5986,11 @@ pub(crate) async fn handle_create(
                     // tid slot's cancellation kills the row the moment it
                     // exists; the partial runtime arms the evidence a
                     // sweep needs during the async spawn work.
-                    let registry = state.registry.clone();
-                    let tid_slot = Arc::clone(&terminal_start_tid_slot);
-                    let cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                        if let Some(tid) = tid_slot
-                            .lock()
-                            .expect("terminal start tid slot lock")
-                            .clone()
-                        {
-                            tracing::warn!(target: "freshell_ws::terminal",
-                                terminal_id = %tid,
-                                event = "ownership.start.cancel_signal",
-                                "the watchdog's start cancellation kills the spawned \
-                                 terminal's registry row");
-                            registry.kill(&tid);
-                        }
-                    });
+                    let cancel = start_cancel_signal(
+                        state,
+                        &create.request_id,
+                        Arc::clone(&terminal_start_tid_slot),
+                    );
                     let mut registration_ticket = Some(ticket);
                     _terminal_start_cancellation = Some(
                         freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
@@ -6140,8 +6416,8 @@ pub(crate) async fn handle_create(
     let prepared_pair = prepared_codex.as_mut().and_then(PreparedCodexLaunch::take);
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
-    let (codex_setup, codex_launch) = match prepared_pair {
-        Some((setup, launch)) => (Some(setup), Some(launch)),
+    let (codex_setup, mut codex_launch, mut codex_scope) = match prepared_pair {
+        Some((setup, launch, scope)) => (Some(setup), Some(launch), Some(scope)),
         None if !use_managed_runtime
             && codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) =>
         {
@@ -6165,29 +6441,63 @@ pub(crate) async fn handle_create(
                     .await
                 }
             };
-            let launch = match plan_codex_managed_launch(
+            // The pane's unit: its record is written before anything
+            // spawns, and a kill by this create's id reaches the start
+            // attempt that runs (Stage 2: LB-16, LB-17).
+            let mut scope = match crate::unit_lifecycle::StartScope::begin(
                 state,
-                &setup,
+                "codex",
+                &mode,
+                &create.request_id,
+                &terminal_id,
                 resume_session_id.as_deref(),
-                freshell_codex::launch_lifecycle::LaunchClass::Interactive,
-                None,
-            )
-            .await
-            {
-                Ok(launch) => launch,
+            ) {
+                Ok(scope) => scope,
                 Err(error) => {
                     return send_create_error(
                         out,
                         ErrorCode::PtySpawnFailed,
-                        error.message(),
+                        format!("codex unit could not be recorded: {error}"),
                         &create.request_id,
                     )
                     .await
                 }
             };
-            (Some(setup), Some(launch))
+            let planned = plan_codex_launch_in_unit(
+                state,
+                &setup,
+                resume_session_id.as_deref(),
+                freshell_codex::launch_lifecycle::LaunchClass::Interactive,
+                None,
+                &mut scope,
+            )
+            .await;
+            match planned {
+                Ok(launch) => (Some(setup), Some(launch), Some(scope)),
+                Err(error) => {
+                    let message = match error {
+                        PlanLaunchError::Cancelled => {
+                            freshell_codex::launch_plan::CODEX_START_CANCELLED_MESSAGE.to_string()
+                        }
+                        other => other.message(),
+                    };
+                    return abandon_codex_start(
+                        state,
+                        out,
+                        &create.request_id,
+                        scope,
+                        take_create_claims(
+                            &mut terminal_ownership,
+                            &mut session_ref_lease,
+                            &mut _terminal_start_cancellation,
+                        ),
+                        message,
+                    )
+                    .await;
+                }
+            }
         }
-        None => (None, None),
+        None => (None, None, None),
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
@@ -6339,8 +6649,15 @@ pub(crate) async fn handle_create(
 
     // Exit hook: built by `build_pty_exit_hook` (see its doc comment for the
     // reference anchors) so the auto-resume respawn seam (Task 4) reuses the
-    // exact same hook for respawned generations.
-    let on_exit: Option<freshell_terminal::pty::ExitHook> = Some(build_pty_exit_hook(
+    // exact same hook for respawned generations. A unit row (a Codex pane in
+    // its unit) never gets it: its teardown runs once at Gone
+    // (`build_unit_gone_hook`, Stage 2: LB-33).
+    let exit_hook_builder = if codex_scope.is_some() {
+        build_unit_gone_hook
+    } else {
+        build_pty_exit_hook
+    };
+    let on_exit: Option<freshell_terminal::pty::ExitHook> = Some(exit_hook_builder(
         ExitHookDeps {
             registry: state.registry.clone(),
             identity: state.identity.clone(),
@@ -6455,7 +6772,8 @@ pub(crate) async fn handle_create(
     // every non-negotiating connection retain the legacy local spawn path.
     // PIN2_PTY_SPAWN_ANCHOR: either the local PTY spawn OR the supervisor's
     // host-owned PTY makes the preallocated identity observable.
-    let create_result: std::io::Result<()> = if use_managed_runtime {
+    // `Ok(Some(screen pid))` for a unit row, `Ok(None)` otherwise.
+    let create_result: std::io::Result<Option<u32>> = if use_managed_runtime {
         let managed = ManagedTerminalLaunch {
             spec: spec.clone(),
             env: child_env.clone(),
@@ -6479,13 +6797,42 @@ pub(crate) async fn handle_create(
                     mode = %mode,
                     "terminal.created_managed: PTY/process ownership lives in session host"
                 );
-                Ok(())
+                Ok(None)
             }
             Err(error) => Err(std::io::Error::other(format!(
                 "managed runtime launch failed: {error}"
             ))),
         }
     } else {
+        // A Codex pane's TUI starts in the pane's unit (its screen). A unit
+        // that stopped before this point refuses the placement: the start
+        // was cancelled.
+        let unit_placement = match codex_scope.as_ref() {
+            Some(scope) => match codex_screen_placement(scope) {
+                Ok(placement) => Some(placement),
+                Err(_) => {
+                    if let Some(launch) = codex_launch.take() {
+                        freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                            .discard_sync(launch);
+                    }
+                    cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+                    return abandon_codex_start(
+                        state,
+                        out,
+                        &create.request_id,
+                        codex_scope.take().expect("the scope is present"),
+                        take_create_claims(
+                            &mut terminal_ownership,
+                            &mut session_ref_lease,
+                            &mut _terminal_start_cancellation,
+                        ),
+                        freshell_codex::launch_plan::CODEX_START_CANCELLED_MESSAGE.to_string(),
+                    )
+                    .await;
+                }
+            },
+            None => None,
+        };
         // The legacy PTY spawn is synchronous; run it on the blocking pool so
         // hung/slow spawns never occupy an async worker.
         let registry = state.registry.clone();
@@ -6495,18 +6842,34 @@ pub(crate) async fn handle_create(
         let spawn_mode = mode.clone();
         let spawn_resume_session_id = resume_session_id.clone();
         let spawn_create_request_id = create.request_id.clone();
-        match spawn_blocking_in_span(move || {
-            registry.create(
-                &spawn_spec,
-                &child_env,
-                spawn_terminal_id,
-                spawn_stream_id,
-                &spawn_mode,
-                spawn_resume_session_id.as_deref(),
-                Some(&spawn_create_request_id),
-                None,
-                on_exit,
-            )
+        match spawn_blocking_in_span(move || match unit_placement {
+            Some(placement) => registry
+                .create_in_unit(
+                    &spawn_spec,
+                    &child_env,
+                    spawn_terminal_id,
+                    spawn_stream_id,
+                    &spawn_mode,
+                    spawn_resume_session_id.as_deref(),
+                    Some(&spawn_create_request_id),
+                    None,
+                    on_exit,
+                    placement,
+                )
+                .map(Some),
+            None => registry
+                .create(
+                    &spawn_spec,
+                    &child_env,
+                    spawn_terminal_id,
+                    spawn_stream_id,
+                    &spawn_mode,
+                    spawn_resume_session_id.as_deref(),
+                    Some(&spawn_create_request_id),
+                    None,
+                    on_exit,
+                )
+                .map(|()| None),
         })
         .await
         {
@@ -6515,6 +6878,10 @@ pub(crate) async fn handle_create(
                 "terminal spawn task panicked: {join_err}"
             ))),
         }
+    };
+    let unit_screen_pid = match &create_result {
+        Ok(screen_pid) => *screen_pid,
+        Err(_) => None,
     };
     if let Err(err) = create_result {
         // PIN 2 (Step 4b): the spawn FAILED, so the pre-spawn claude binding
@@ -6576,10 +6943,23 @@ pub(crate) async fn handle_create(
         // an `error{code:PTY_SPAWN_FAILED}` frame.
         // DEV-0006 S4: a planned-but-unadopted codex launch dies with the failed
         // create (the `pendingCodexPlan` cleanup path) — sidecar + proxy torn down.
-        if let Some(launch) = codex_launch {
-            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-                .discard(launch)
-                .await;
+        // A pane in its unit is given up instead: its unit's stop (spawned,
+        // never awaited here) ends the sidecar, and the create's claims are
+        // released after Gone.
+        if let Some(launch) = codex_launch.take() {
+            let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
+            if codex_scope.is_some() {
+                manager.discard_sync(launch);
+            } else {
+                manager.discard(launch).await;
+            }
+        }
+        if let Some(scope) = codex_scope.take() {
+            scope.abandon(Some(take_create_claims(
+                &mut terminal_ownership,
+                &mut session_ref_lease,
+                &mut _terminal_start_cancellation,
+            )));
         }
         cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
         let label = mode_label(&mode, cli.as_ref());
@@ -6629,24 +7009,62 @@ pub(crate) async fn handle_create(
                 live_session_key: None,
                 pid: state.registry.pid_of(&terminal_id),
                 ownership_id: None,
-                unit_id: None,
+                // A unit row's start is stamped with its unit: a stop of the
+                // unit moves this Starting key to Stopping and commits it at
+                // Gone.
+                unit_id: state.registry.unit_id_for(&terminal_id),
                 hold: freshell_ownership::HoldKind::Main,
             },
         );
     }
 
+    // The TUI is the unit's screen: pin it and note the terminal, so every
+    // stop from now on ends this row. A stop that already reached Gone (or
+    // cancelled the start meanwhile) gives the start up.
+    if let (Some(scope), Some(screen_pid)) = (codex_scope.as_mut(), unit_screen_pid) {
+        if !codex_screen_spawned(scope, &terminal_id, screen_pid).await {
+            if let Some(launch) = codex_launch.take() {
+                freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                    .discard_sync(launch);
+            }
+            return abandon_codex_start(
+                state,
+                out,
+                &create.request_id,
+                codex_scope.take().expect("the scope is present"),
+                take_create_claims(
+                    &mut terminal_ownership,
+                    &mut session_ref_lease,
+                    &mut _terminal_start_cancellation,
+                ),
+                freshell_codex::launch_plan::CODEX_START_CANCELLED_MESSAGE.to_string(),
+            )
+            .await;
+        }
+    }
+
     // DEV-0006 S4: adopt the managed codex launch for this terminal
     // (`codexPlan.sidecar.adopt({terminalId, generation: 0})`, `ws:2511`) — ownership
-    // transfers from the planner to the terminal; the PTY exit hook above tears it
-    // down. Adoption only fails when the planner/sidecar is already shutting down
-    // (server exit); legacy's thrown adopt fails the create, so kill the just-spawned
-    // pty and surface the error.
+    // transfers from the planner to the terminal; the unit's Gone (or, for a
+    // terminal outside a unit, the PTY exit hook above) tears it down. Adoption
+    // only fails when the planner/sidecar is already shutting down (server
+    // exit); legacy's thrown adopt fails the create, so the just-spawned pane is
+    // ended and the error surfaced.
     if let Some(launch) = codex_launch {
         if let Err(message) = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
             .adopt(&terminal_id, launch, 0)
             .await
         {
-            state.registry.kill(&terminal_id);
+            match codex_scope.take() {
+                Some(scope) => scope.abandon(Some(take_create_claims(
+                    &mut terminal_ownership,
+                    &mut session_ref_lease,
+                    &mut _terminal_start_cancellation,
+                ))),
+                None => {
+                    state.registry.kill(&terminal_id);
+                }
+            }
             return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
                 .await;
         }
@@ -6925,6 +7343,35 @@ pub(crate) async fn handle_create(
                 spawn_elapsed_ms = now_ms().saturating_sub(claimed_at_ms),
                 "session_ref.winner_bound"
             );
+        } else if let Some(scope) = codex_scope.take() {
+            // Revoked while spawning, for a pane in its unit: the start is
+            // given up (its unit's stop is spawned, never awaited here), and
+            // the lease is released once the unit is Gone.
+            tracing::warn!(
+                terminal_id = %terminal_id,
+                provider = %locator.provider,
+                session_id = %locator.session_id,
+                "session_ref_lease_revoked_during_spawn: the unit is stopped; the lease is \
+                 released at its Gone"
+            );
+            scope.abandon(Some(Box::new((
+                take_create_claims(
+                    &mut terminal_ownership,
+                    &mut session_ref_lease,
+                    &mut _terminal_start_cancellation,
+                ),
+                ReleaseLeaseAfterGone {
+                    registry: state.registry.clone(),
+                    locator: locator.clone(),
+                },
+            ))));
+            return send_create_error(
+                out,
+                ErrorCode::InternalError,
+                "Terminal create lost its sessionRef lease during spawn; the spawned process was killed".to_string(),
+                &create.request_id,
+            )
+            .await;
         } else {
             // Revoked while spawning (TTL expired on the then-pid-less lease):
             // kill OUR OWN just-spawned child via the registry handle
@@ -7056,7 +7503,18 @@ pub(crate) async fn handle_create(
                     "session_ref_ownership_late_claim_refused: the create spawned with no \
                      coordinator claim and the key moved on; killing the unclaimed child"
                 );
-                teardown_unowned_spawn(state, &locator, &terminal_id).await;
+                teardown_create_spawn(
+                    state,
+                    codex_scope.take(),
+                    take_create_claims(
+                        &mut terminal_ownership,
+                        &mut session_ref_lease,
+                        &mut _terminal_start_cancellation,
+                    ),
+                    &locator,
+                    &terminal_id,
+                )
+                .await;
                 return send_create_error(
                     out,
                     ErrorCode::InternalError,
@@ -7079,6 +7537,23 @@ pub(crate) async fn handle_create(
     // fence until a page reload and the pane's queued attach / later kills
     // and recreates were refused typed ("moved to a newer runtime; refresh
     // and retry").
+    // A pane whose start a stop cancelled since its bind is given up before
+    // its claim could commit Live for a stopping unit.
+    if codex_scope.as_ref().is_some_and(|scope| scope.cancelled()) {
+        return abandon_codex_start(
+            state,
+            out,
+            &create.request_id,
+            codex_scope.take().expect("the scope is present"),
+            take_create_claims(
+                &mut terminal_ownership,
+                &mut session_ref_lease,
+                &mut _terminal_start_cancellation,
+            ),
+            freshell_codex::launch_plan::CODEX_START_CANCELLED_MESSAGE.to_string(),
+        )
+        .await;
+    }
     let mut committed_owner_generation: Option<u64> = None;
     if let Some(ownership_claim) = terminal_ownership.take() {
         let locator = ownership_claim.locator.clone();
@@ -7112,7 +7587,18 @@ pub(crate) async fn handle_create(
                     "session_ref_ownership_commit_stale: the coordinator moved on while the \
                      create spawned; killing the unowned child"
                 );
-                teardown_unowned_spawn(state, &locator, &terminal_id).await;
+                teardown_create_spawn(
+                    state,
+                    codex_scope.take(),
+                    take_create_claims(
+                        &mut terminal_ownership,
+                        &mut session_ref_lease,
+                        &mut _terminal_start_cancellation,
+                    ),
+                    &locator,
+                    &terminal_id,
+                )
+                .await;
                 return send_create_error(
                     out,
                     ErrorCode::InternalError,
@@ -7146,6 +7632,12 @@ pub(crate) async fn handle_create(
     .await;
     let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
     let session_name = naming_projection.map(|(_, record)| record);
+
+    // The create succeeded: its start settles once the screen's placement
+    // is confirmed (`terminal.created` is not delayed by it).
+    if let Some(scope) = codex_scope.take() {
+        scope.commit();
+    }
 
     // Dedupe settle needs both ids, but the `TerminalCreated` literal below
     // MOVES `create.request_id` and `terminal_id` into the struct — clone
@@ -7413,19 +7905,46 @@ pub async fn respawn_agent_terminal(
     } else {
         None
     };
-    let codex_launch = match codex_setup.as_ref() {
-        Some(setup) => Some(
-            plan_codex_managed_launch(
+    // The replacement pane runs in its own unit (the respawn has no create
+    // to answer; a failure answers its caller and gives the start up).
+    let (mut codex_launch, mut codex_scope) = match codex_setup.as_ref() {
+        Some(setup) => {
+            let mut scope = crate::unit_lifecycle::StartScope::begin(
+                state,
+                "codex",
+                &mode,
+                &req.create_request_id,
+                &terminal_id,
+                resume_session_id.as_deref(),
+            )
+            .map_err(|error| {
+                RespawnError::LaunchUnresolvable(format!(
+                    "codex unit could not be recorded: {error}"
+                ))
+            })?;
+            let planned = plan_codex_launch_in_unit(
                 state,
                 setup,
                 resume_session_id.as_deref(),
                 freshell_codex::launch_lifecycle::LaunchClass::Interactive,
                 None,
+                &mut scope,
             )
-            .await
-            .map_err(|error| RespawnError::LaunchUnresolvable(error.message()))?,
-        ),
-        None => None,
+            .await;
+            match planned {
+                Ok(launch) => (Some(launch), Some(scope)),
+                Err(error) => {
+                    scope.abandon(None);
+                    return Err(RespawnError::LaunchUnresolvable(match error {
+                        PlanLaunchError::Cancelled => {
+                            freshell_codex::launch_plan::CODEX_START_CANCELLED_MESSAGE.to_string()
+                        }
+                        other => other.message(),
+                    }));
+                }
+            }
+        }
+        None => (None, None),
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
@@ -7585,8 +8104,15 @@ pub async fn respawn_agent_terminal(
     }
 
     // The SAME exit hook `handle_create` builds — so respawned generations
-    // report their own crashes (load-bearing for retry #2, Task 2).
-    let on_exit: Option<freshell_terminal::pty::ExitHook> = Some(build_pty_exit_hook(
+    // report their own crashes (load-bearing for retry #2, Task 2). A unit
+    // row's teardown runs at Gone instead, and its crashes are reported by
+    // the unit lifecycle.
+    let exit_hook_builder = if codex_scope.is_some() {
+        build_unit_gone_hook
+    } else {
+        build_pty_exit_hook
+    };
+    let on_exit: Option<freshell_terminal::pty::ExitHook> = Some(exit_hook_builder(
         ExitHookDeps {
             registry: state.registry.clone(),
             identity: state.identity.clone(),
@@ -7622,11 +8148,7 @@ pub async fn respawn_agent_terminal(
     {
         Ok(permit) => permit,
         Err(err) => {
-            if let Some(launch) = codex_launch {
-                freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-                    .discard(launch)
-                    .await;
-            }
+            discard_respawn_launch(codex_launch.take(), codex_scope.take()).await;
             cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
             let (_code, msg) = spawn_gate_error_parts(err);
             return Err(RespawnError::LaunchUnresolvable(msg.to_string()));
@@ -7641,19 +8163,49 @@ pub async fn respawn_agent_terminal(
     let spawn_mode = mode.clone();
     let spawn_resume_session_id = resume_session_id.clone();
     let spawn_create_request_id = req.create_request_id.clone();
-    let create_result = match spawn_blocking_in_span(move || {
-        registry.create(
-            &spawn_spec,
-            &child_env,
-            spawn_terminal_id,
-            stream_id,
-            &spawn_mode,
-            spawn_resume_session_id.as_deref(),
-            // Cap continuity: the SAME createRequestId as the dead generation.
-            Some(&spawn_create_request_id),
-            None,
-            on_exit,
-        )
+    // A Codex replacement's TUI starts in its unit; a unit already stopping
+    // refuses the placement (the start was cancelled).
+    let unit_placement = match codex_scope.as_ref() {
+        Some(scope) => match codex_screen_placement(scope) {
+            Ok(placement) => Some(placement),
+            Err(error) => {
+                discard_respawn_launch(codex_launch.take(), codex_scope.take()).await;
+                cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+                return Err(RespawnError::LaunchUnresolvable(error.to_string()));
+            }
+        },
+        None => None,
+    };
+    let create_result = match spawn_blocking_in_span(move || match unit_placement {
+        Some(placement) => registry
+            .create_in_unit(
+                &spawn_spec,
+                &child_env,
+                spawn_terminal_id,
+                stream_id,
+                &spawn_mode,
+                spawn_resume_session_id.as_deref(),
+                // Cap continuity: the SAME createRequestId as the dead generation.
+                Some(&spawn_create_request_id),
+                None,
+                on_exit,
+                placement,
+            )
+            .map(Some),
+        None => registry
+            .create(
+                &spawn_spec,
+                &child_env,
+                spawn_terminal_id,
+                stream_id,
+                &spawn_mode,
+                spawn_resume_session_id.as_deref(),
+                // Cap continuity: the SAME createRequestId as the dead generation.
+                Some(&spawn_create_request_id),
+                None,
+                on_exit,
+            )
+            .map(|()| None),
     })
     .await
     {
@@ -7662,28 +8214,48 @@ pub async fn respawn_agent_terminal(
             "terminal spawn task panicked: {join_err}"
         ))),
     };
-    if let Err(err) = create_result {
-        // Failed-spawn parity: discard a planned-but-unadopted codex launch,
-        // clean up MCP side-effects with the mcpCwd (NOT procCwd).
-        if let Some(launch) = codex_launch {
-            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-                .discard(launch)
-                .await;
+    let unit_screen_pid = match create_result {
+        Ok(screen_pid) => screen_pid,
+        Err(err) => {
+            // Failed-spawn parity: discard a planned-but-unadopted codex launch,
+            // clean up MCP side-effects with the mcpCwd (NOT procCwd).
+            discard_respawn_launch(codex_launch.take(), codex_scope.take()).await;
+            cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+            return Err(RespawnError::Spawn(err));
         }
-        cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
-        return Err(RespawnError::Spawn(err));
+    };
+
+    // The TUI is the unit's screen (pinned; its row noted); a stop that
+    // reached Gone or cancelled the start meanwhile gives the start up.
+    if let (Some(scope), Some(screen_pid)) = (codex_scope.as_mut(), unit_screen_pid) {
+        if !codex_screen_spawned(scope, &terminal_id, screen_pid).await {
+            discard_respawn_launch(codex_launch.take(), codex_scope.take()).await;
+            return Err(RespawnError::LaunchUnresolvable(
+                freshell_codex::launch_plan::CODEX_START_CANCELLED_MESSAGE.to_string(),
+            ));
+        }
     }
 
     // DEV-0006 S4: adopt the managed codex launch for this terminal, same as
-    // `handle_create` — a failed adopt kills the just-spawned pty.
+    // `handle_create` — a failed adopt ends the just-spawned pane.
     if let Some(launch) = codex_launch {
         if let Err(message) = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
             .adopt(&terminal_id, launch, 0)
             .await
         {
-            state.registry.kill(&terminal_id);
+            match codex_scope.take() {
+                Some(scope) => scope.abandon(None),
+                None => {
+                    state.registry.kill(&terminal_id);
+                }
+            }
             return Err(RespawnError::LaunchUnresolvable(message));
         }
+    }
+    // The replacement started: its start settles once the screen's
+    // placement is confirmed.
+    if let Some(scope) = codex_scope.take() {
+        scope.commit();
     }
 
     // Post-insert bookkeeping, same order as `handle_create`.
@@ -9619,7 +10191,13 @@ async fn handle_kill(
     // handler's scope end — fires on completion, unwind, OR panic).
     let mut _stop_settlement: Option<freshell_freshagent::ownership_lane::StopSettlementGuard> =
         None;
-    if let (Some(ownership), Some(retained)) = (
+    // A unit row's conversation keys move to Stopping and are committed
+    // Vacant by its unit's own stop at Gone (`kill_and_broadcast` below
+    // routes it through `unit_lifecycle::stop_terminal_unit`), never by this
+    // legacy fenced stop.
+    let unit_row = state.units.by_terminal(&kill.terminal_id).is_some();
+    if let (false, Some(ownership), Some(retained)) = (
+        unit_row,
         state.ownership.as_ref(),
         state.registry.retained_ownership_claim(&kill.terminal_id),
     ) {
@@ -9993,7 +10571,7 @@ async fn handle_kill(
             }
         }
     } else {
-        kill_and_broadcast(state, &kill.terminal_id)
+        kill_and_broadcast(state, &kill.terminal_id, stuck_recovery)
     };
     // The supervisor's verified stop is the managed equivalent of the local
     // PTY's confirmed reap. Never publish Vacant after an unverified stop.
@@ -10122,7 +10700,24 @@ fn abort_terminal_stop(state: &WsState, stop_commit: &mut Option<(String, String
 /// terminal existed, was killed/removed, and `terminals.changed` was broadcast
 /// (`ws:2988`); `false` = unknown id, nothing broadcast (the caller sends the
 /// `INVALID_TERMINAL_ID` error).
-fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
+fn kill_and_broadcast(state: &WsState, terminal_id: &str, stuck_recovery: bool) -> bool {
+    // A coding-agent pane in its unit is stopped through the unit (Force:
+    // SIGINT to the agent, then the whole unit); its row ends, and
+    // `terminal.exit`/`terminals.changed` are published, at Gone. A stuck
+    // restart keeps the pane resumable, so it is not remembered as killed.
+    let (reason, initiator) = if stuck_recovery {
+        (
+            freshell_containment::StopReason::StuckRestart,
+            "ws-terminal-kill-stuck-recovery",
+        )
+    } else {
+        (freshell_containment::StopReason::ShiftX, "ws-terminal-kill")
+    };
+    if crate::unit_lifecycle::stop_unit_row(state, terminal_id, reason, initiator, !stuck_recovery)
+        .is_some()
+    {
+        return true;
+    }
     if state.registry.kill(terminal_id) {
         after_terminal_removed(state, terminal_id);
         return true;
@@ -10138,7 +10733,7 @@ fn remove_managed_after_stop_and_broadcast(state: &WsState, terminal_id: &str) -
     false
 }
 
-fn after_terminal_removed(state: &WsState, terminal_id: &str) {
+pub(crate) fn after_terminal_removed(state: &WsState, terminal_id: &str) {
     // Fix Spec: Session Naming Cluster -- retire (not remove) on the KILL exit
     // path too (the natural-exit `on_exit` hook handles the other path); a
     // kill that never established an identity is a harmless no-op `retire()`.
@@ -11204,6 +11799,7 @@ mod terminals_changed_tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: None,
+            units: Default::default(),
         };
         (state, rx)
     }
@@ -11258,7 +11854,7 @@ mod terminals_changed_tests {
     #[test]
     fn kill_of_unknown_terminal_does_not_broadcast() {
         let (state, mut rx) = state_with_bus();
-        assert!(!kill_and_broadcast(&state, "does-not-exist"));
+        assert!(!kill_and_broadcast(&state, "does-not-exist", false));
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -11403,6 +11999,7 @@ mod terminal_kill_stop_wedge_tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: Some(Arc::clone(&ownership)),
+            units: Default::default(),
         };
         (state, ownership, "t-kill-wedge".to_string())
     }
@@ -11836,6 +12433,7 @@ mod terminal_meta_created_tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: None,
+            units: Default::default(),
         };
         (state, rx)
     }
@@ -12480,6 +13078,7 @@ mod pane_reconcile_gate_tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: None,
+            units: Default::default(),
         }
     }
 
@@ -13067,6 +13666,7 @@ mod host_stats_dispatch_tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: None,
+            units: Default::default(),
         }
     }
 

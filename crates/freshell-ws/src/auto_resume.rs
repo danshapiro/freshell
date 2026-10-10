@@ -788,6 +788,34 @@ struct PendingOwnershipClaim {
     ticket: freshell_ownership::OperationTicket,
 }
 
+/// A replacement in its unit (a Codex pane) that must die is stopped
+/// through its unit's single stop path instead of a registry kill (which
+/// would leave its app-server running): its sessionRef lease and retained
+/// claim are released once the unit is Gone, on a spawned task. `false`
+/// when the replacement is not a unit row.
+fn stop_unit_replacement(
+    state: &crate::WsState,
+    terminal_id: &str,
+    locator: &freshell_protocol::SessionLocator,
+) -> bool {
+    let Some(stop) = crate::unit_lifecycle::stop_unit_row(
+        state,
+        terminal_id,
+        freshell_containment::StopReason::StartCancelled,
+        "auto-resume-unowned-replacement",
+        false,
+    ) else {
+        return false;
+    };
+    let registry = state.registry.clone();
+    let locator = locator.clone();
+    tokio::spawn(async move {
+        stop.wait().await;
+        registry.force_release_after_confirmed_kill(&locator);
+    });
+    true
+}
+
 fn session_locator(provider: &str, session_id: &str) -> freshell_protocol::SessionLocator {
     freshell_protocol::SessionLocator {
         provider: provider.to_string(),
@@ -1193,6 +1221,9 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                             "auto_resume_ownership_commit_stale: the coordinator moved on \
                              while the respawn settled; killing the unowned child"
                         );
+                        if stop_unit_replacement(&state, &new_terminal_id, &locator) {
+                            return false;
+                        }
                         let pid = state.registry.pid_of(&new_terminal_id);
                         state.registry.kill(&new_terminal_id);
                         let confirmed = match pid {
@@ -1247,6 +1278,9 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                             "auto_resume_settle_without_authority: no parked ticket at the \
                              settle — the replacement is unowned and must die"
                         );
+                        if stop_unit_replacement(&state, &new_terminal_id, &locator) {
+                            return false;
+                        }
                         let pid = state.registry.pid_of(&new_terminal_id);
                         state.registry.kill(&new_terminal_id);
                         let confirmed = match pid {
@@ -1260,6 +1294,9 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                     }
                 }
                 return true;
+            }
+            if stop_unit_replacement(&state, &new_terminal_id, &locator) {
+                return false;
             }
             let pid = state.registry.pid_of(&new_terminal_id);
             state.registry.kill(&new_terminal_id);
@@ -3067,6 +3104,7 @@ mod tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: Some(std::sync::Arc::clone(&ownership)),
+            units: Default::default(),
         };
         (state, ownership)
     }

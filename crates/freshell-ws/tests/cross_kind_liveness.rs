@@ -585,6 +585,7 @@ async fn build_ws_state_with_probe(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: Some(Arc::clone(&ownership)),
+        units: Default::default(),
     };
 
     (state, registry, fresh_agent_state)
@@ -5271,8 +5272,9 @@ async fn race_browser_disconnect_mid_handoff_reaches_consistent_state() {
 /// and assert the key returns to Vacant and a new claim succeeds. The
 /// observability contract (round-1 review): this race also asserts the
 /// COMPLETE transition-event field set for `ownership.stop.begin` /
-/// `ownership.stop.commit` / `ownership.released` (the capturing-layer
-/// idiom).
+/// `ownership.stop.commit`, and for the unit-scoped `ownership.stop.commit`
+/// that releases the killed Codex pane's key at its unit's Gone (the
+/// capturing-layer idiom).
 #[tokio::test]
 async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state() {
     let _guard = ENV_LOCK.lock().await;
@@ -5449,7 +5451,9 @@ async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state(
     )
     .await;
 
-    // Kill the terminal: the COMPLETE ownership.released field set.
+    // Kill the terminal. A Codex pane runs in its unit, so the kill stops
+    // the unit and the key is released by the unit's own commit at Gone:
+    // the COMPLETE field set of that unit-scoped ownership.stop.commit.
     let capture_before_release = events.lock().expect("capture lock").len();
     h.ws_state.registry.kill(&terminal_id);
     await_ownership(
@@ -5463,8 +5467,18 @@ async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state(
         let captured = events.lock().expect("capture lock");
         captured[capture_before_release..].to_vec()
     };
-    let released =
-        find_captured(&release_scope, "ownership.released").expect("ownership.released event");
+    let released = release_scope
+        .iter()
+        .find(|e| {
+            e.target == "freshell_ownership"
+                && e.event == "ownership.stop.commit"
+                && e.fields
+                    .get("unit_id")
+                    .is_some_and(|unit_id| !unit_id.is_empty())
+        })
+        .unwrap_or_else(|| {
+            panic!("the unit's ownership.stop.commit releases the key: {release_scope:?}")
+        });
     for field in [
         "provider",
         "session_id",
@@ -5477,15 +5491,21 @@ async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state(
         "generation",
         "duration_ms",
         "outcome",
+        "unit_id",
+        "terminal_id",
     ] {
         assert!(
             released.fields.contains_key(field),
-            "ownership.released must carry {field}: {released:?}"
+            "the unit's ownership.stop.commit must carry {field}: {released:?}"
         );
     }
     assert_eq!(
         released.fields.get("outcome").map(String::as_str),
-        Some("released")
+        Some("committed")
+    );
+    assert_eq!(
+        released.fields.get("terminal_id").map(String::as_str),
+        Some(terminal_id.as_str())
     );
 }
 

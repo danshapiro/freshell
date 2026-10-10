@@ -3,6 +3,9 @@
 //! leave every unrelated top-level document key byte-identical, across restart.
 //! Harness helpers copied from safe11_term22_shutdown_reaping.rs (attribution).
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -76,7 +79,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[tokio::test]
 async fn network_mutation_preserves_every_unmanaged_top_level_key() {
-    let home = tempfile::tempdir().unwrap();
+    let home = test_home::TestHome::new().unwrap();
     // Include codexDisplayIdSecret in serverSecrets so it survives byte-for-byte
     // across restart (load_or_mint_codex_display_id_secret reads it back from disk).
     let seed = serde_json::json!({

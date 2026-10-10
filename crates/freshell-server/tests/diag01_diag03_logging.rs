@@ -20,6 +20,9 @@
 //! import, so proving the operator experience means driving the real thing
 //! over HTTP exactly as an operator would.
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -114,7 +117,7 @@ fn all_log_paths(log_path: &Path) -> Vec<PathBuf> {
 async fn diag01_diag03_operator_experience() {
     let server_binary = discover_server_binary();
 
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let home_path = home.path().to_path_buf();
 
     let port = allocate_ephemeral_port();

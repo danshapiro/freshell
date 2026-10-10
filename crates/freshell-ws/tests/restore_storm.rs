@@ -162,6 +162,7 @@ async fn spawn_server(
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -469,14 +470,15 @@ fn storm_rt() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// Ground-rule drain: block until the manager's async teardowns of ADOPTED
-/// codex terminals have all executed, so no late `shutdown_calls` increment
+/// Ground-rule drain: block until every runtime stop this test caused has
+/// executed, then pin the exact total, so no late `shutdown_calls` increment
 /// can bleed past TEST_LOCK into the next test's exact-count asserts.
-/// Deterministic (see ground rules): `kill_all()` joins each PTY reader
-/// thread, whose exit hook queues the teardown — every send is already on
-/// the worker channel when this poll starts; it only waits for execution.
-/// Call after the final `kill_all()` in every test that adopted codex
-/// terminals (`expected_total` = adopted count; counters reset at start).
+/// A codex pane runs in its unit, and `kill_all()` (the shutdown sweep) only
+/// marks a unit row's ending and kills its screen: whether the unit is kept
+/// for the next server or stopped is the shutdown's decision
+/// (`CodexTerminalLaunchManager::shutdown`), so an ADOPTED sidecar's runtime
+/// is never stopped by it. The total is therefore the planner's own inline
+/// cleanups (counters reset at start).
 async fn drain_adopted_teardowns(c: &StormControls, expected_total: u64) {
     for _ in 0..400 {
         if c.shutdown_calls.load(Ordering::SeqCst) >= expected_total {
@@ -649,7 +651,9 @@ fn restore_storm_settles_all_twelve_with_zero_error_frames_and_no_shell_starvati
         let peak = c.peak.load(Ordering::SeqCst);
         assert!(peak <= 2, "plan concurrency exceeded the budget: {peak}");
         assert_eq!(registry.kill_all(), 12, "exactly 12 PTYs, no duplicates");
-        drain_adopted_teardowns(c, 8).await; // 8 adopted codex sidecars — ground-rule drain
+        // The 8 adopted codex sidecars run in their units: the shutdown
+        // sweep leaves them to the shutdown's decision, and no plan failed.
+        drain_adopted_teardowns(c, 0).await;
     });
 }
 
@@ -714,15 +718,16 @@ fn deterministic_plan_failure_is_loud_for_that_create_only() {
             errors[0]
         );
         assert_eq!(registry.kill_all(), 11, "the doomed create must not spawn");
-        // 7 adopted codex sidecars tear down asynchronously after kill_all.
-        // PLUS: the planner's cleanup-on-plan-failure (`plan_create`'s Err
-        // arm, launch_lifecycle.rs) runs `sidecar.stop_and_finish()` — and thus
-        // `runtime.stop()` — once per failed attempt, and the doomed
-        // create burns the full initial retry budget; those cleanups were
-        // awaited inline BEFORE the error frame we already received, so the
-        // total is exact and deterministic.
+        // The 7 adopted codex sidecars run in their units: the shutdown
+        // sweep leaves them to the shutdown's decision. The planner's
+        // cleanup-on-plan-failure (`plan_create`'s Err arm,
+        // launch_lifecycle.rs) runs `sidecar.stop_and_finish()` — and thus
+        // `runtime.stop()` — once per failed attempt, and the doomed create
+        // burns the full initial retry budget; those cleanups were awaited
+        // inline BEFORE the error frame we already received, so the total is
+        // exact and deterministic.
         let doomed_cleanups = u64::from(freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS);
-        drain_adopted_teardowns(c, 7 + doomed_cleanups).await;
+        drain_adopted_teardowns(c, doomed_cleanups).await;
         *c.fail_cwd.lock().unwrap() = None;
     });
 }

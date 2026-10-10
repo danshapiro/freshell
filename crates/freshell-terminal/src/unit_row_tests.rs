@@ -1124,3 +1124,58 @@ fn a_new_screen_that_exits_before_it_is_installed_still_reaches_the_hook() {
         "the installed screen is known exited, so its pid is never signalled"
     );
 }
+
+/// A kill of a unit row goes to the unit lifecycle's kill handler, which
+/// stops the whole unit; the row stays (nothing published, nothing
+/// signalled here) until the unit's Gone ends it. A handler that declines
+/// (an unknown unit) falls back to the plain kill.
+#[test]
+fn a_unit_rows_kill_goes_to_the_unit_kill_hook() {
+    let reg = TerminalRegistry::new();
+    type Kills = Arc<Mutex<Vec<(String, String, &'static str)>>>;
+    let kills: Kills = Arc::default();
+    let accept = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    reg.set_unit_kill_hook(Arc::new({
+        let kills = kills.clone();
+        let accept = accept.clone();
+        move |terminal_id: &str, unit_id: &str, by: &'static str| {
+            kills
+                .lock()
+                .unwrap()
+                .push((terminal_id.to_string(), unit_id.to_string(), by));
+            accept.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }));
+    let pid = reg
+        .create_in_unit(
+            &bash("sleep 30"),
+            &env(),
+            "TK".into(),
+            "SK".into(),
+            "codex",
+            None,
+            None,
+            None,
+            None,
+            placement(None),
+        )
+        .unwrap();
+    let screen = Own::pin(pid);
+    let seen = attach_collector(&reg, "TK");
+
+    assert!(reg.kill("TK"), "the unit lifecycle took the kill");
+    assert_eq!(
+        *kills.lock().unwrap(),
+        vec![("TK".to_string(), "u1".to_string(), "api")]
+    );
+    assert!(reg.is_running("TK"), "the row stays for its unit's Gone");
+    assert!(screen.alive(), "the registry signalled nothing itself");
+    assert!(exits(&seen).is_empty(), "nothing published before Gone");
+
+    // A declining handler (its unit is unknown) leaves the plain kill.
+    accept.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(reg.kill("TK"));
+    assert_eq!(exits(&seen), vec![0], "the plain kill published the exit");
+    wait("the screen is dead", || !screen.alive());
+    assert!(!reg.is_running("TK"));
+}

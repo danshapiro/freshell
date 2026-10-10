@@ -122,6 +122,12 @@ pub struct UnitScreenExit {
 /// thread: it must not block and must never call `tokio::spawn`.
 pub type UnitScreenExitHook = Arc<dyn Fn(UnitScreenExit) + Send + Sync>;
 
+/// The unit lifecycle's handler for a registry kill of a unit row: called
+/// with `(terminal id, unit id, by)` and no registry lock held; returns
+/// whether it started the unit's stop (which ends the row at Gone). It must
+/// not block.
+pub type UnitKillHook = Arc<dyn Fn(&str, &str, &'static str) -> bool + Send + Sync>;
+
 /// `DEFAULT_MAX_SCROLLBACK_CHARS` (`terminal-registry.ts:57`): the replay-log
 /// byte cap used when no `settings.terminal.scrollback` value has been wired
 /// into the registry yet (TERM-13's "absent" default -- mirrors the legacy
@@ -1451,6 +1457,9 @@ pub struct TerminalRegistry {
     /// rows ([`Self::set_unit_screen_exit_hook`]). Interior-shared so every
     /// cloned registry handle sees the hook installed at boot.
     unit_screen_exit_hook: Arc<std::sync::RwLock<Option<UnitScreenExitHook>>>,
+    /// The unit lifecycle's handler for a kill of a unit row
+    /// ([`Self::set_unit_kill_hook`]); shared like the screen-exit hook.
+    unit_kill_hook: Arc<std::sync::RwLock<Option<UnitKillHook>>>,
 }
 
 /// The retained coordinator claim for one sessionRef-owning terminal (kata
@@ -1743,6 +1752,7 @@ impl TerminalRegistry {
             terminal_create_postclaim_pause: Arc::new(std::sync::RwLock::new(None)),
             paced_exit_stage_hook: Arc::new(Mutex::new(None)),
             unit_screen_exit_hook: Arc::new(std::sync::RwLock::new(None)),
+            unit_kill_hook: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -4161,6 +4171,20 @@ impl TerminalRegistry {
     /// without adding a public parameter to [`Self::kill`] (preserving that
     /// method's existing signature for `freshell-ws` and any other caller).
     fn kill_internal(&self, terminal_id: &str, by: &'static str, allow_managed: bool) -> bool {
+        // A unit row is one pane of a contained unit: its kill stops the
+        // whole unit through the unit lifecycle (when one is installed and
+        // knows the unit), and the row ends at the unit's Gone. Nothing is
+        // removed or signalled here then.
+        if let Some(unit_id) = self.unit_id_for(terminal_id) {
+            let hook = self
+                .unit_kill_hook
+                .read()
+                .expect("unit kill hook lock")
+                .clone();
+            if hook.is_some_and(|hook| hook(terminal_id, &unit_id, by)) {
+                return true;
+            }
+        }
         let Some((mut handle, was_running)) =
             self.remove_row_and_notify_exit(terminal_id, by, allow_managed)
         else {
@@ -4349,6 +4373,14 @@ impl TerminalRegistry {
             .unit_screen_exit_hook
             .write()
             .expect("unit screen exit hook lock") = Some(hook);
+    }
+
+    /// Install the unit lifecycle's handler for kills of unit rows
+    /// ([`UnitKillHook`]): a kill of a unit row (`kill`, the idle reaper)
+    /// then stops the whole unit instead of removing the row and killing
+    /// only its screen. Shutdown's [`Self::kill_all`] is not routed here.
+    pub fn set_unit_kill_hook(&self, hook: UnitKillHook) {
+        *self.unit_kill_hook.write().expect("unit kill hook lock") = Some(hook);
     }
 
     /// The unit a row's screen belongs to; `None` for a plain or unknown row.

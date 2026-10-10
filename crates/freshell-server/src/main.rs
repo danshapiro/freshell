@@ -996,6 +996,54 @@ async fn async_main() -> ExitCode {
     // per-connection `configFallback` (`server/index.ts:372-380`).
     let config_fallback = settings_store.config_fallback();
 
+    // Agent-pane containment (codex-pane-lifecycle Task 12): selected once,
+    // after settings load and before any lane is built, and installed as the
+    // process-global containment. Unit records live in this server's own
+    // state directory (`<home>/.freshell/units/`); a booting server takes
+    // over only records whose server is gone. Every member starts through
+    // this binary's `__unit-exec` shim (the Linux fallback's reaper, Windows
+    // job self-placement, macOS session leadership), which lowers its own
+    // open-file soft limit back to the one this server started with before
+    // it starts anything (`--nofile-soft`).
+    let unit_containment = {
+        let state_root = match home.as_deref() {
+            Some(home_dir) => home_dir.join(".freshell"),
+            None => {
+                let fallback = std::env::temp_dir().join("freshell-state");
+                tracing::warn!(target: "freshell_unit",
+                    event = "containment.state_root_fallback",
+                    path = %fallback.display(),
+                    "no home resolves: agent-pane unit records live under the system temp directory");
+                fallback
+            }
+        };
+        let shim = match std::env::current_exe() {
+            Ok(exe) => {
+                let mut leading_args = vec!["__unit-exec".to_string()];
+                if let Some(soft) = freshell_platform::child_nofile::original_soft_limit() {
+                    leading_args.push(format!("--nofile-soft={soft}"));
+                }
+                Some(freshell_containment::ShimCommand { exe, leading_args })
+            }
+            Err(error) => {
+                tracing::error!(target: "freshell_unit",
+                    event = "containment.shim_unavailable",
+                    error = %error,
+                    "this server's executable path is unknown: agent-pane members start without the unit shim");
+                None
+            }
+        };
+        freshell_containment::Containment::select(freshell_containment::SelectOptions {
+            shim,
+            state_root,
+        })
+    };
+    freshell_containment::set_global_containment(unit_containment.clone());
+    let unit_services = freshell_ws::unit_lifecycle::UnitServices {
+        directory: freshell_containment::UnitDirectory::new(),
+        containment: unit_containment.clone(),
+    };
+
     // Task 2 (AI key cell): process-local mirror of Node's `AI_CONFIG`
     // (`server/ai-prompts.ts:13-23`). Boot semantics = `server/index.ts:251`:
     // env `GOOGLE_GENERATIVE_AI_API_KEY` wins over `settings.ai.geminiApiKey`
@@ -1148,7 +1196,14 @@ async fn async_main() -> ExitCode {
         FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
             .with_shared_sessions_revision(Arc::clone(&sessions_revision))
             .with_layout(layout_store.clone())
-            .with_ownership(Arc::clone(&ownership));
+            .with_ownership(Arc::clone(&ownership))
+            // The SAME unit directory the WS state holds: REST-created agent
+            // panes register their starts there and stop through the WS
+            // lifecycle installed below.
+            .with_units(
+                Arc::clone(&unit_services.directory),
+                unit_services.containment.clone(),
+            );
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
     let mut fresh_opencode_state =
@@ -2333,7 +2388,28 @@ async fn async_main() -> ExitCode {
         shutdown_started: std::sync::Arc::clone(&shutdown_started),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         pane_ledger: std::sync::Arc::clone(&pane_ledger),
+        units: unit_services.clone(),
     };
+
+    // The pane-unit lifecycle (Task 12), installed before any connection or
+    // REST request can create a pane: a unit row's unrequested screen exit
+    // goes to the lifecycle (never published as an ordinary exit), and every
+    // stop — including those of REST-created panes and of the Codex seed —
+    // runs through `stop_terminal_unit`.
+    registry.set_unit_screen_exit_hook(freshell_ws::unit_lifecycle::screen_exit_hook(
+        ws_state.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    registry.set_unit_kill_hook(freshell_ws::unit_lifecycle::kill_hook(
+        ws_state.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    ws_state
+        .units
+        .set_lifecycle(freshell_ws::unit_lifecycle::lifecycle(
+            ws_state.clone(),
+            tokio::runtime::Handle::current(),
+        ));
 
     // Lane D1 (Task 5): the auto-resume hub — consumes the crash events the
     // PTY exit hook sends and drives bounded respawns. A boot-time background
@@ -2404,9 +2480,21 @@ async fn async_main() -> ExitCode {
                  terminal-pane sidecars spawned now will NOT survive a restart of this process"
             );
         }
+        // Rows naming a unit are judged against the unit records this
+        // server took over at boot (Task 9; Stage 2: LB-32): Running →
+        // held, Stopping → finishing (never offered for reuse), no record →
+        // pruned with nothing signalled.
+        let unit_records = unit_containment.recorded_units().unwrap_or_else(|error| {
+            tracing::error!(target: "freshell_unit",
+                event = "containment.unit_records_unread",
+                error = %error,
+                "the unit records could not be read at boot: sidecar rows naming a unit are judged without them");
+            Vec::new()
+        });
         let (reconciler, report) =
-            freshell_codex::sidecar_reconcile::SidecarReconciler::boot_reconcile(
+            freshell_codex::sidecar_reconcile::SidecarReconciler::boot_reconcile_with_units(
                 codex_sidecar_store.clone(),
+                &unit_records,
             );
         tracing::info!(
             codex_sidecar_store_enabled = codex_sidecar_store.is_enabled(),
@@ -2414,6 +2502,8 @@ async fn async_main() -> ExitCode {
             pruned_dead = report.pruned_dead,
             pruned_mismatch = report.pruned_mismatch,
             held = report.held,
+            finishing = report.finishing.len(),
+            pruned_unit_gone = report.pruned_unit_gone,
             "codex_sidecar_boot_reconcile: previous generation's sidecar records reconciled"
         );
         let reconciler = std::sync::Arc::new(reconciler);
@@ -4731,6 +4821,7 @@ mod sessions_sweep_tests {
                 freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: None,
+            units: Default::default(),
         };
 
         let mut gen_rx = index.subscribe_changes();

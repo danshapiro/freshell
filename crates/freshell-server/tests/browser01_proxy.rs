@@ -12,6 +12,9 @@
 //! tests (`src/proxy.rs::socket_contract*`); this file pins the main.rs
 //! wiring proof and the headline behaviors.
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -319,7 +322,7 @@ fn spawn_upstream(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn browser01_proxy_through_the_real_binary() {
     let server_binary = discover_server_binary();
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let port = allocate_ephemeral_port();
     let token = format!("browser01-outer-test-secret-{}", std::process::id());
 

@@ -94,6 +94,7 @@ async fn spawn_server_with_default_cwd(
         session_existence: Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);

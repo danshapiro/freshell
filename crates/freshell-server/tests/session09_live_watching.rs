@@ -17,6 +17,9 @@
 //! `diag01_lifecycle_logging.rs` / `safe11_term22_shutdown_reaping.rs` (this
 //! repo's black-box test files each carry their own small copy).
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -237,7 +240,7 @@ async fn expect_quiet(ws: &mut WsStream, window: Duration, leg: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session09_live_watch_and_coalescing_over_ws() {
     let server_binary = discover_server_binary();
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let claude_projects = home.path().join(".claude").join("projects").join("-p");
 
     // Anchor session, seeded BEFORE boot: sits at a FUTURE corpus max

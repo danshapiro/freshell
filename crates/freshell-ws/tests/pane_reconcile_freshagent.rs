@@ -249,6 +249,7 @@ async fn spawn_server_with_probe(probe: Arc<StubProbe>) -> Server {
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Arc::clone(&respawn_counts),
         ownership: None,
+        units: Default::default(),
     };
 
     let router = freshell_ws::router(state);

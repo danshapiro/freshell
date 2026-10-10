@@ -2175,6 +2175,14 @@ pub struct FreshAgentState {
     /// `None` (every pre-existing test) = the lane skips coordinator
     /// bookkeeping and keeps its current probe-based behavior only.
     pub(crate) ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    /// The shared pane-unit directory (the SAME one `freshell_ws::WsState`
+    /// holds, wired by `freshell-server` via [`Self::with_units`]): REST
+    /// creates register their starts in it, and every stop and placement
+    /// settlement goes through its installed lifecycle — the WebSocket
+    /// layer's single stop path.
+    pub(crate) units: Arc<freshell_containment::UnitDirectory>,
+    /// The containment that creates units (the server's global one).
+    pub(crate) containment: freshell_containment::Containment,
     /// The lane's retained coordinator commit stamps (kata b8ke Task 3):
     /// canonical `ses_*` id → the stamp its `commit_live` left — the
     /// kill/exit `StopClaim`/`ReleaseClaim` source. Shared with the WS
@@ -2339,10 +2347,24 @@ impl FreshAgentState {
             #[cfg(test)]
             rest_turn_test_pause: Arc::new(Mutex::new(None)),
             ownership: None,
+            units: freshell_containment::UnitDirectory::new(),
+            containment: freshell_containment::global_or_fallback_containment(),
             ownership_stamps: Arc::new(Mutex::new(HashMap::new())),
             rest_opencode_turns: Arc::new(Mutex::new(HashMap::new())),
             rest_turn_gates: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Wire the shared pane-unit directory and the containment (the SAME
+    /// ones `freshell_ws::WsState::units` holds). Builder form.
+    pub fn with_units(
+        mut self,
+        units: Arc<freshell_containment::UnitDirectory>,
+        containment: freshell_containment::Containment,
+    ) -> Self {
+        self.units = units;
+        self.containment = containment;
+        self
     }
 
     /// Wire the ONE server-wide runtime-ownership coordinator (kata b8ke

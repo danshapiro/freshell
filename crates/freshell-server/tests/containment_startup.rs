@@ -19,6 +19,9 @@
 //! their own small copy). Every process signalled here was spawned here.
 #![cfg(target_os = "linux")]
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -402,7 +405,7 @@ fn environ_entries(pid: u32) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_server_never_passes_an_inherited_unit_tag_to_its_children() {
     let server_binary = discover_server_binary();
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let port = allocate_ephemeral_port();
     let mut cmd = server_command(&server_binary, home.path(), port);
     // As if this server had been started from inside an agent pane.
@@ -451,7 +454,7 @@ async fn the_server_never_passes_an_inherited_unit_tag_to_its_children() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_server_logs_one_containment_self_check_at_start() {
     let server_binary = discover_server_binary();
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let port = allocate_ephemeral_port();
     let mut boot = boot(server_command(&server_binary, home.path(), port), port).await;
     let stderr_seen = boot
@@ -487,7 +490,7 @@ async fn the_server_logs_one_containment_self_check_at_start() {
 async fn the_server_raises_its_open_file_soft_limit() {
     const LOWERED_SOFT: u64 = 256;
     let server_binary = discover_server_binary();
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let port = allocate_ephemeral_port();
     let mut cmd = server_command(&server_binary, home.path(), port);
     start_with_soft_nofile(&mut cmd, LOWERED_SOFT);
@@ -514,7 +517,7 @@ async fn the_server_raises_its_open_file_soft_limit() {
 async fn the_servers_children_start_with_its_original_open_file_soft_limit() {
     const LOWERED_SOFT: u64 = 256;
     let server_binary = discover_server_binary();
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = test_home::TestHome::new().expect("create temp home");
     let port = allocate_ephemeral_port();
     let mut cmd = server_command(&server_binary, home.path(), port);
     start_with_soft_nofile(&mut cmd, LOWERED_SOFT);

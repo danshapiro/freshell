@@ -203,6 +203,12 @@ enum HubEvent {
         terminal_id: String,
         base_url: String,
     },
+    /// A requested stop of the terminal's unit began (Stage 2: LB-37): from
+    /// now until its exit the terminal produces no idle, turn-complete or
+    /// death-bell edge.
+    StopRequested {
+        terminal_id: String,
+    },
 }
 
 /// The opencode SSE lane's event vocabulary ([`crate::opencode_lane`]
@@ -452,6 +458,19 @@ impl ActivityHub {
             turn_id: turn_id.map(str::to_string),
             status: status.map(str::to_string),
             completed,
+        });
+    }
+
+    /// A requested stop of the terminal's unit began (Stage 2: LB-37; the
+    /// unit lifecycle calls this for every stop except an agent exit):
+    /// channel-deferred like `note_codex_proxy_turn`, so it is ordered after
+    /// every event already queued. The terminal's armed grace window is
+    /// dropped, and until its exit no `terminal.idle`, no
+    /// `terminal.turn.complete` and no death bell is produced for it. A crash
+    /// never comes through here and still rings at its exit.
+    pub fn note_stop_requested(&self, terminal_id: &str) {
+        let _ = self.tx.send(HubEvent::StopRequested {
+            terminal_id: terminal_id.to_string(),
         });
     }
 
@@ -860,6 +879,14 @@ impl ActivityHub {
             } => self.attach_lane(&terminal_id, &session_id, &events_path, attach_at),
             HubEvent::AmplifierFsChange { terminal_id } => {
                 self.drain_lane(&terminal_id);
+            }
+            HubEvent::StopRequested { terminal_id } => {
+                let mut inner = self.inner.lock().expect("activity hub lock");
+                // Only a tracked terminal has gate state or an exit that
+                // clears the mark (an untracked one never rings anyway).
+                if inner.modes.contains_key(&terminal_id) {
+                    inner.idle.note_stopping(&terminal_id);
+                }
             }
             HubEvent::CodexBind {
                 terminal_id,
@@ -1386,8 +1413,11 @@ impl ActivityHub {
                     // still ring (owner ruling 6).
                     let quit_intent =
                         quit_intent_active(inner.quit_intents.get(&terminal_id).copied(), at);
+                    // Stage 2: LB-37: a terminal whose stop was requested
+                    // never rings (a crash never marks it stopping).
                     let ring_death_bell = spontaneous
                         && !quit_intent
+                        && !inner.idle.is_stopping(&terminal_id)
                         && ((inner.idle.is_engaged(&terminal_id) && opencode_death_eligible)
                             || inner.codex.has_pending_approvals(&terminal_id)
                             || (inner.opencode.has_pending_permissions(&terminal_id)
@@ -2052,6 +2082,10 @@ fn claude_frames(
                 at,
                 completion_seq,
             } => {
+                // Stage 2: LB-37: a stopping terminal's turn end is silent.
+                if idle.is_stopping(&terminal_id) {
+                    continue;
+                }
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
                     AgentProvider::Claude,
@@ -2111,6 +2145,10 @@ fn codex_frames(
                 at,
                 completion_seq,
             } => {
+                // Stage 2: LB-37: a stopping terminal's turn end is silent.
+                if idle.is_stopping(&terminal_id) {
+                    continue;
+                }
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
                     AgentProvider::Codex,
@@ -2145,7 +2183,7 @@ fn opencode_frames(
     for effect in effects {
         match effect {
             TrackerEffect::Changed { upsert, remove } => {
-                // remove -> note_exit clears gate state; the boundary that FOLLOWS
+                // remove -> note_removed clears gate state; the boundary that FOLLOWS
                 // in the same batch re-arms grace-only (D7 — the Node emitter's
                 // "activityRemove followed by turnComplete" contract). Busy is
                 // the ONLY opencode phase on the wire, so every upsert maps to
@@ -2167,6 +2205,10 @@ fn opencode_frames(
                 at,
                 completion_seq,
             } => {
+                // Stage 2: LB-37: a stopping terminal's turn end is silent.
+                if idle.is_stopping(&terminal_id) {
+                    continue;
+                }
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
                     AgentProvider::Opencode,
@@ -2225,6 +2267,10 @@ fn amplifier_frames(
                 at,
                 completion_seq,
             } => {
+                // Stage 2: LB-37: a stopping terminal's turn end is silent.
+                if idle.is_stopping(&terminal_id) {
+                    continue;
+                }
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
                     AgentProvider::Amplifier,
@@ -2257,7 +2303,7 @@ fn note_changed_to_gate<'a>(
         idle.note_phase(terminal_id, phase);
     }
     for terminal_id in remove {
-        idle.note_exit(terminal_id);
+        idle.note_removed(terminal_id);
     }
 }
 
@@ -5222,6 +5268,91 @@ mod tests {
             .await
             .expect("death bell: pending approvals count as engagement");
         assert_eq!(second["terminalId"], "t1");
+    }
+
+    // ---- Stop-start silence (Stage 2: LB-37) ----
+
+    /// A requested stop drops a grace window that was already armed: no
+    /// `terminal.idle` after the grace, and the stop's own non-spontaneous
+    /// exit at Gone emits nothing either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_request_drops_an_armed_grace_window() {
+        let (hub, mut rx) = hub();
+        busy_codex_terminal(&hub, &mut rx).await;
+        hub.note_codex_proxy_turn("t1", "thread-1", Some("turn-1"), Some("completed"), true);
+        next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+            v["terminalId"] == "t1"
+        })
+        .await
+        .expect("the turn completed (and armed the grace window) before the stop");
+
+        hub.note_stop_requested("t1");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 3_000)
+                .await
+                .is_none(),
+            "a stop request drops the armed grace window"
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now_ms(),
+                spontaneous: false,
+            },
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 500)
+                .await
+                .is_none(),
+            "the stop's exit at Gone rings nothing"
+        );
+    }
+
+    /// After a stop request, neither a completed turn nor an approval pause
+    /// produces a `terminal.turn.complete` or a `terminal.idle`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_boundary_after_a_stop_request_never_arms() {
+        let (hub, mut rx) = hub();
+        busy_codex_terminal(&hub, &mut rx).await;
+
+        hub.note_stop_requested("t1");
+        hub.note_codex_proxy_turn("t1", "thread-1", Some("turn-1"), Some("completed"), true);
+        hub.note_codex_approval("t1", Some("thread-1"), "41", true);
+        assert!(
+            next_frame_matching(&mut rx, "terminal.turn.complete", 1_000, |v| {
+                v["terminalId"] == "t1"
+            })
+            .await
+            .is_none(),
+            "no turn.complete for a stopping terminal"
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 3_000)
+                .await
+                .is_none(),
+            "no boundary arms the grace window of a stopping terminal"
+        );
+    }
+
+    /// The crash path is untouched: an engaged terminal that dies on its own
+    /// without any stop request still rings the death bell.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_without_a_stop_request_still_rings() {
+        let (hub, mut rx) = hub();
+        busy_codex_terminal(&hub, &mut rx).await;
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_000)
+            .await
+            .expect("an engaged terminal's crash rings the death bell");
+        assert_eq!(idle["terminalId"], "t1");
     }
 
     // ---- OpenCode lane (attention bell, Task 8) ----
