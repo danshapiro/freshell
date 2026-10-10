@@ -470,6 +470,64 @@ describe('Task7 registered physical stopped fixture preparation', () => {
       sourceDatabaseFile, registryRoot: path.join(root, 'registry'), scenarioId: 'browser-managed-runtime', volumeName: 'registered-unit-volume' }
   }
 
+  it('retains exact lost-ACK Registry reader ownership across failed inner and outer cleanup', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused cleanup-retry web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const supervisor: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    const helperId = 'e'.repeat(64), foreignId = 'f'.repeat(64)
+    const stateFile = path.join(batch.outputDir, 'cleanup-daemon.json'), calls = path.join(batch.outputDir, 'cleanup-calls.jsonl')
+    const state = { containers: {
+      [supervisor.containerId]: { Id: supervisor.containerId, Name: 'registered-supervisor' },
+      [foreignId]: { Id: foreignId, Name: 'unrelated-sentinel' },
+    }, volumes: [batch.volumeName!, 'unrelated-volume'], cleanupInspectFailed: false }
+    await fsp.writeFile(stateFile, JSON.stringify(state), { mode: 0o600 })
+    await fsp.writeFile(path.join(batch.outputDir, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),args=process.argv.slice(2),file=${JSON.stringify(stateFile)},state=JSON.parse(fs.readFileSync(file));const save=()=>fs.writeFileSync(file,JSON.stringify(state));fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');
+if(args[0]==='inspect'){
+ const item=Object.values(state.containers).find(item=>item.Id===args.at(-1)||item.Name===args.at(-1));if(!item)process.exit(1);
+ if(args.includes('--format'))process.stdout.write('false');else if(item.Id==='${helperId}'&&!state.cleanupInspectFailed){state.cleanupInspectFailed=true;save();process.exit(9)}else process.stdout.write(JSON.stringify([item]));
+}else if(args[0]==='create'){
+ const labels={};for(let i=0;i<args.length;i++)if(args[i]==='--label'){const [key,value]=args[++i].split('=');labels[key]=value}
+ const mounts=[];for(let i=0;i<args.length;i++)if(args[i]==='--mount'){const parts=args[++i].split(','),values=Object.fromEntries(parts.map(part=>part.split('=')));mounts.push({Type:values.type,Name:values.type==='volume'?values.source:undefined,Source:values.source,Destination:values.target,RW:!parts.includes('readonly')})}
+ state.containers['${helperId}']={Id:'${helperId}',Name:args[args.indexOf('--name')+1],Image:args[args.indexOf('--entrypoint')+2],Config:{Labels:labels},Mounts:mounts};save();process.stderr.write('controlled create ACK lost');process.exit(9);
+}else if(args[0]==='rm'){
+ if(args.at(-1)==='${foreignId}')process.exit(7);delete state.containers[args.at(-1)];save();
+}else if(args[0]==='ps')process.stdout.write(Object.values(state.containers).map(item=>args.includes('--format')?item.Name:item.Id).join('\\n'));
+else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')process.exit(7);state.volumes=state.volumes.filter(name=>name!==args[2]);save()}else process.stdout.write(state.volumes.join('\\n'))}else process.exit(8);\n`, { mode: 0o700 })
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch(); rig.supervisor = supervisor
+      Object.assign(rig.runtime, { imageRef: batch.input.imageRef, task007Fixtures: new Map([['browser', batch]]),
+        trackedSupervisorContainers: new Set([supervisor.containerId]), trackedVolumes: new Set([batch.volumeName]) })
+      vi.mocked(rig.runtime.isContainerRunning).mockRestore()
+      vi.stubEnv('PATH', `${batch.outputDir}${path.delimiter}${process.env.PATH}`)
+      await expect(rig.runtime.readTask007StoppedRegistry(supervisor, batch.input.fixtureId, 'repair-current')).rejects.toThrow(/owned cleanup failed/)
+      expect(rig.runtime.transferOwnedIds().containers).not.toContain(helperId)
+      const readState = () => JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+      let current = readState()
+      expect(current.cleanupInspectFailed).toBe(true)
+      expect(current.containers[helperId]).toBeDefined()
+      current.containers[helperId].Config.Labels['com.freshell.task007-supervisor-id'] = foreignId
+      await fsp.writeFile(stateFile, JSON.stringify(current))
+      const refused = await rig.runtime.cleanup()
+      expect(refused.ok).toBe(false)
+      expect(refused.errors.some(error => error.includes('ownership is unknown'))).toBe(true)
+      current = readState()
+      expect(current.containers[supervisor.containerId]).toBeUndefined()
+      expect(current.containers[helperId]).toBeDefined(); expect(current.containers[foreignId]).toBeDefined()
+      current.containers[helperId].Config.Labels['com.freshell.task007-supervisor-id'] = supervisor.containerId
+      await fsp.writeFile(stateFile, JSON.stringify(current))
+      await expect(rig.runtime.cleanup()).resolves.toEqual({ ok: true, errors: [] })
+      current = readState()
+      expect(Object.keys(current.containers)).toEqual([foreignId]); expect(current.volumes).toEqual(['unrelated-volume'])
+      const actual = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+      expect(actual.filter(args => args[0] === 'rm')).toEqual([['rm', '-f', supervisor.containerId], ['rm', '--force', helperId]])
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
   it('starts only the exact registered historical host copy and refuses changed artifact bytes', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused copied-host web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })

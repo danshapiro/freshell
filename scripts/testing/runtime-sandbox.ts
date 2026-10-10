@@ -2240,6 +2240,7 @@ export class RuntimeHarness {
   private task007Artifact?: Promise<Task007LibTestArtifact>
   private readonly task007Brokers: RestrictedDockerBroker[] = []
   private readonly task007HelperNames = new Set<string>()
+  private readonly task007RegistryReaderSupervisors = new Map<string, string>()
   private readonly task007Children = new Set<Promise<unknown>>()
   private readonly task007Cancellation = new AbortController()
   private readonly task007Fixtures = new Map<Task007StoppedFixtureKind, Task007PreparedStoppedFixture>()
@@ -2546,6 +2547,7 @@ export class RuntimeHarness {
       throw new Error('stopped Registry reader name already exists')
     }
     this.task007HelperNames.add(name)
+    this.task007RegistryReaderSupervisors.set(name, supervisor.containerId)
     let containerId: string | undefined, failure: unknown
     try {
       const returnedId = (await this.task007Docker(['create', '--name', name, '--user', '0:0', '--network', 'none', '--read-only',
@@ -2578,6 +2580,7 @@ export class RuntimeHarness {
           await this.task007Docker(['rm', '--force', containerId]); this.trackedContainers.delete(containerId)
         } else await this.removeTask007Helper(name)
         this.task007HelperNames.delete(name)
+        this.task007RegistryReaderSupervisors.delete(name)
       } catch (cleanupError) {
         if (failure) throw new AggregateError([failure, cleanupError], 'stopped Registry read and owned cleanup failed')
         throw cleanupError
@@ -2891,7 +2894,11 @@ export class RuntimeHarness {
   private async removeTask007Helper(name: string): Promise<void> {
     if (!this.task007HelperNames.has(name)) { this.removeContainerExact(name); return }
     const names = (await this.task007Docker(['ps', '-a', '--format', '{{.Names}}'])).trim().split('\n')
-    if (!names.includes(name)) return
+    if (!names.includes(name)) {
+      this.task007HelperNames.delete(name)
+      this.task007RegistryReaderSupervisors.delete(name)
+      return
+    }
     const observed = z.array(z.object({ Id: Task007Hex, Image: z.string(), Config: z.object({ Labels: z.record(z.string(), z.string()) }),
       Mounts: z.array(z.object({ Type: z.string(), Name: z.string().optional(), Source: z.string().optional(), Destination: z.string(), RW: z.boolean() })) })).length(1)
       .parse(JSON.parse(await this.task007Docker(['inspect', name])))[0]
@@ -2910,7 +2917,8 @@ export class RuntimeHarness {
     const batch = this.task007Fixtures.get('browser')
     const registryReaderMounts = kind === 'registry-observation' && name.startsWith('freshell-task007-registry-read-')
       && !!batch && labels['com.freshell.task007-fixture-id'] === batch.input.fixtureId
-      && this.trackedSupervisorContainers.has(labels['com.freshell.task007-supervisor-id'])
+      && this.task007RegistryReaderSupervisors.has(name)
+      && this.task007RegistryReaderSupervisors.get(name) === labels['com.freshell.task007-supervisor-id']
       && observed.Mounts.length === 2 && volumes.length === 1 && volumes[0].Name === batch.volumeName
       && !!batch.volumeName && this.trackedVolumes.has(batch.volumeName) && volumes[0].Destination === '/registry' && !volumes[0].RW
       && binds.length === 1 && binds[0].Source === batch.metadataFile && binds[0].Destination === '/fixture/metadata.json' && !binds[0].RW
@@ -2918,6 +2926,8 @@ export class RuntimeHarness {
       || labels['com.freshell.runtime-test-candidate'] !== this.candidateSha
       || (!parentMounts && !setupMounts && !registryReaderMounts)) throw new Error('Task7 partial setup helper ownership is unknown')
     await this.task007Docker(['rm', '--force', observed.Id])
+    this.task007HelperNames.delete(name)
+    this.task007RegistryReaderSupervisors.delete(name)
   }
 
   async cleanup(): Promise<{ ok: boolean; errors: string[] }> {
