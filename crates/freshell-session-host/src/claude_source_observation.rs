@@ -864,7 +864,7 @@ fn write_reply(reply: &ObservationReply, output: &mut impl Write) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Cursor, Error, ErrorKind};
+    use std::io::{Cursor, Error};
 
     #[test]
     fn claude_retained_candidate_seed_preserves_metadata_and_executes_only_frozen_ordinary_inputs()
@@ -1616,7 +1616,7 @@ process.stdin.on('data',()=>{}).on('end',()=>{
         fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
             if self.header.position() == 4 {
                 self.body_reads += 1;
-                return Err(Error::new(ErrorKind::Other, "body must remain unread"));
+                return Err(Error::other("body must remain unread"));
             }
             self.header.read(bytes)
         }

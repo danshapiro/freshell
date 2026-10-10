@@ -58,6 +58,12 @@ enum MountPurpose {
     Adopt,
 }
 
+struct WorkloadPaths<'a> {
+    workspace_path: &'a str,
+    cwd_path: &'a str,
+    git_common_path: Option<&'a str>,
+}
+
 pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, String> {
     terminal_mounts_for(spec, MountPurpose::Create)
 }
@@ -73,9 +79,11 @@ fn terminal_mounts_for(
     purpose: MountPurpose,
 ) -> Result<TerminalMounts, String> {
     workload_mounts(
-        &spec.workspace_path,
-        &spec.cwd,
-        spec.git_common_dir.as_deref(),
+        WorkloadPaths {
+            workspace_path: &spec.workspace_path,
+            cwd_path: &spec.cwd,
+            git_common_path: spec.git_common_dir.as_deref(),
+        },
         &spec.provider_bootstrap_files,
         &spec.provider_secret_references,
         spec.provider_launch_context.as_ref(),
@@ -99,9 +107,11 @@ fn fresh_agent_mounts_for(
     purpose: MountPurpose,
 ) -> Result<TerminalMounts, String> {
     workload_mounts(
-        &spec.workspace_path,
-        &spec.cwd,
-        spec.git_common_dir.as_deref(),
+        WorkloadPaths {
+            workspace_path: &spec.workspace_path,
+            cwd_path: &spec.cwd,
+            git_common_path: spec.git_common_dir.as_deref(),
+        },
         &spec.provider_bootstrap_files,
         &spec.provider_secret_references,
         spec.provider_launch_context.as_ref(),
@@ -111,15 +121,18 @@ fn fresh_agent_mounts_for(
 }
 
 fn workload_mounts(
-    workspace_path: &str,
-    cwd_path: &str,
-    git_common_path: Option<&str>,
+    paths: WorkloadPaths<'_>,
     bootstrap_files: &[ProviderBootstrapFile],
     secret_references: &[ProviderSecretReference],
     context: Option<&ProviderLaunchContext>,
     provider: &str,
     purpose: MountPurpose,
 ) -> Result<TerminalMounts, String> {
+    let WorkloadPaths {
+        workspace_path,
+        cwd_path,
+        git_common_path,
+    } = paths;
     if let Some(context) = context {
         context.validate(provider).map_err(|error| error.message)?;
     }

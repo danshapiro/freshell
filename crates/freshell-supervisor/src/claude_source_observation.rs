@@ -96,7 +96,7 @@ impl Supervisor {
                 };
                 recovery = Some(authority.start);
                 ClaudeSourceOwner::Retained {
-                    handle,
+                    handle: Box::new(handle),
                     recovery_source,
                 }
             }
@@ -453,7 +453,7 @@ mod tests {
             let mut envelope = Envelope::new(
                 RequestId::new(),
                 ControlRole::Web,
-                AdminCommand::ObserveClaudeSources(request),
+                AdminCommand::ObserveClaudeSources(Box::new(request)),
             );
             envelope.auth = Some("synthetic-control-secret".into());
             let result = tokio::time::timeout(

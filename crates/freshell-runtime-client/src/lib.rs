@@ -125,7 +125,7 @@ impl RuntimeClient {
         match self
             .request(
                 RequestId::new(),
-                AdminCommand::ObserveClaudeSources(request),
+                AdminCommand::ObserveClaudeSources(Box::new(request)),
             )
             .await?
         {

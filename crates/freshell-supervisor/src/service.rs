@@ -300,7 +300,7 @@ impl Supervisor {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                self.observe_claude_sources(request)
+                self.observe_claude_sources(*request)
                     .await
                     .map(AdminResult::ClaudeSourceObservation)
             }

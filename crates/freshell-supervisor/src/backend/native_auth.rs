@@ -454,6 +454,23 @@ impl DockerEngineBackend {
     }
 }
 
+fn reserved_volume_labels(
+    reservation: &crate::registry::OwnedInputReservation,
+    daemon: &DockerDaemonId,
+    incarnation: &freshell_runtime_protocol::IncarnationId,
+) -> Value {
+    json!({
+        "com.freshell.installation-id":reservation.installation_id.as_str(),
+        "com.freshell.soul-id":reservation.soul_id.as_str(),
+        "freshell.input.reservation":reservation.id,
+        "freshell.input.incarnation":incarnation.as_str(),
+        "freshell.input.intent":"1",
+        "freshell.input.daemon":daemon.as_str(),
+        "freshell.input.image":reservation.image_ref,
+        "freshell.input.binary-sha256":reservation.binary_sha256
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,21 +997,4 @@ mod tests {
             let _ = server.await;
         }
     }
-}
-
-fn reserved_volume_labels(
-    reservation: &crate::registry::OwnedInputReservation,
-    daemon: &DockerDaemonId,
-    incarnation: &freshell_runtime_protocol::IncarnationId,
-) -> Value {
-    json!({
-        "com.freshell.installation-id":reservation.installation_id.as_str(),
-        "com.freshell.soul-id":reservation.soul_id.as_str(),
-        "freshell.input.reservation":reservation.id,
-        "freshell.input.incarnation":incarnation.as_str(),
-        "freshell.input.intent":"1",
-        "freshell.input.daemon":daemon.as_str(),
-        "freshell.input.image":reservation.image_ref,
-        "freshell.input.binary-sha256":reservation.binary_sha256
-    })
 }

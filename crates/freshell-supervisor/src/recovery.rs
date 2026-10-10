@@ -2092,22 +2092,7 @@ fn terminal_without_first_boot_state(
     })
 }
 
-fn refresh_terminal_provider_config(
-    terminal: &mut TerminalLaunchSpec,
-    user_root: &std::path::Path,
-) {
-    let Some(context) = terminal.provider_launch_context.as_mut() else {
-        return;
-    };
-    refresh_provider_context_from_user_root(
-        context,
-        &terminal.mode,
-        std::path::Path::new(&terminal.workspace_path),
-        std::path::Path::new(&terminal.cwd),
-        user_root,
-    );
-}
-
+#[cfg(test)]
 fn replace_terminal_mcp_reference(
     terminal: &mut TerminalLaunchSpec,
     reference: freshell_runtime_protocol::McpCapabilityReference,
@@ -2143,6 +2128,7 @@ fn install_prepared_provider_context(
     Ok(())
 }
 
+#[cfg(test)]
 fn refresh_provider_context_from_user_root(
     context: &mut freshell_runtime_protocol::ProviderLaunchContext,
     provider: &str,
@@ -2255,6 +2241,7 @@ fn refresh_provider_context_from_user_root(
     }
 }
 
+#[cfg(test)]
 fn safe_provider_config_source(
     root: &std::path::Path,
     candidate: &std::path::Path,

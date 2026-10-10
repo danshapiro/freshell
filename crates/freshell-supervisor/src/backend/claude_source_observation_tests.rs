@@ -453,7 +453,7 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
                     (None,Some(serde_json::from_value(json!({"sessionId":"retained-session","provider":flavor,"sessionType":if flavor=="kilroy" {"kilroy"} else {"freshclaude"},"runtimeVariant":"claude","providerStoreId":"retained-store","cwd":prior_workspace,"workspacePath":prior_workspace,"runAsUid":65534,"runAsGid":0,"providerLaunchContext":prior_context})).unwrap()))
                 };
                 ClaudeSourceOwner::Retained {
-                    handle: OwnedRuntimeHandle::from_registry(
+                    handle: Box::new(OwnedRuntimeHandle::from_registry(
                         InstallationId::new(),
                         reservation.soul_id,
                         IncarnationId::new(),
@@ -474,7 +474,7 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
                         terminal,
                         agent,
                         "retained-owned-home".into(),
-                    ),
+                    )),
                     recovery_source: Some(freshell_runtime_protocol::ClaudeRecoverySourceBinding {
                         provider: flavor.into(),
                         git_common_dir: None,
@@ -679,7 +679,7 @@ async fn qualify_transport(mode: &'static str) {
         })).unwrap()))
         };
         ClaudeSourceOwner::Retained {
-            handle: OwnedRuntimeHandle::from_registry(
+            handle: Box::new(OwnedRuntimeHandle::from_registry(
                 InstallationId::new(),
                 reservation.soul_id.clone(),
                 IncarnationId::new(),
@@ -700,7 +700,7 @@ async fn qualify_transport(mode: &'static str) {
                 terminal,
                 agent,
                 "owned-retained-home".into(),
-            ),
+            )),
             recovery_source: None,
         }
     } else {

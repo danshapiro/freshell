@@ -159,7 +159,8 @@ impl Registry {
     ) -> Result<Option<BoundInputReservation>, RegistryError> {
         let installation = self.installation_id().clone();
         self.run_blocking(move |conn| {
-            let row: Option<(String,String,String,String,String,String,String,String)> = conn.query_row(
+            type BoundInputReservationRow = (String, String, String, String, String, String, String, String);
+            let row: Option<BoundInputReservationRow> = conn.query_row(
                 "SELECT p.soul_id,p.reservation_id,p.creation_seed_ref,p.image_ref,p.host_binary_path,p.host_binary_sha256,p.observation,p.provider FROM provider_input_preparations p JOIN incarnations i ON i.incarnation_id=p.bound_incarnation_id JOIN souls s ON s.soul_id=p.soul_id WHERE p.bound_incarnation_id=?1 AND p.consumed=1 AND i.launch_state='prepared' AND i.soul_id=p.soul_id AND s.desired_state='running' AND s.intent_revision=p.intent_revision AND s.provider=p.provider AND s.creation_seed_ref=p.creation_seed_ref",
                 params![incarnation_id.as_str()], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?))
             ).optional()?;

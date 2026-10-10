@@ -1580,8 +1580,8 @@ mod provider_launch_context_tests {
             profile: ProviderSecretProfile::ClaudeConfigurationFile,
             provider_relative_path: Some(".freshell/references/one".into()),
         };
-        assert!(validate_provider_secrets("claude", &[reference.clone()]).is_ok());
-        assert!(validate_provider_secrets("codex", &[reference.clone()]).is_err());
+        assert!(validate_provider_secrets("claude", std::slice::from_ref(&reference)).is_ok());
+        assert!(validate_provider_secrets("codex", std::slice::from_ref(&reference)).is_err());
         assert!(
             validate_provider_secrets("claude", &[reference.clone(), reference.clone()]).is_err()
         );
@@ -2799,7 +2799,7 @@ pub enum AdminCommand {
     Health,
     ReserveProviderInputs(ReserveProviderInputsRequest),
     NativeAuthLookup(NativeAuthLookupRequest),
-    ObserveClaudeSources(ObserveClaudeSourcesRequest),
+    ObserveClaudeSources(Box<ObserveClaudeSourcesRequest>),
     BindProviderPathInputs(BindProviderPathInputsRequest),
     Launch(Box<LaunchRequest>),
     Stop(StopRequest),

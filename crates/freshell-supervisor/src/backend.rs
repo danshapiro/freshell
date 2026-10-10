@@ -129,7 +129,7 @@ pub enum ClaudeSourceOwner {
         observation: freshell_runtime_protocol::InitialAuthVolumeObservation,
     },
     Retained {
-        handle: OwnedRuntimeHandle,
+        handle: Box<OwnedRuntimeHandle>,
         recovery_source: Option<freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
     },
 }
