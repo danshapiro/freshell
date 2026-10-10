@@ -174,6 +174,20 @@ fn write_codex_dispatcher() -> std::path::PathBuf {
     dispatcher
 }
 
+/// Kills a pane and, when it runs in its unit, waits for the unit's Gone,
+/// so no process the pane started (its app-server included) outlives the
+/// test.
+async fn kill_and_wait_gone(state: &freshell_ws::WsState, terminal_id: &str) {
+    let unit = state.units.by_terminal(terminal_id).map(|entry| entry.unit);
+    state.registry.kill(terminal_id);
+    if let Some(stop) = unit.and_then(|unit| unit.stop_in_flight()) {
+        assert!(
+            stop.wait_for(Duration::from_secs(30)).await.is_some(),
+            "the pane's unit reaches Gone"
+        );
+    }
+}
+
 async fn spawn_server() -> (
     String,
     freshell_terminal::TerminalRegistry,
@@ -552,7 +566,7 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
     // under the default.)
     std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
 
-    let (ws_url, registry, state) = spawn_server().await;
+    let (ws_url, _registry, state) = spawn_server().await;
     let mut ws = connect_and_handshake(&ws_url).await;
 
     // ── Phase 1: default (unset) must plan the managed launch (--remote 4-tuple
@@ -637,7 +651,7 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
         "initialize through the relay failed: {reply}"
     );
     // Kill the pane; the exit hook tears the managed launch down.
-    registry.kill(&default_terminal_id);
+    kill_and_wait_gone(&state, &default_terminal_id).await;
 
     // ── Phase 2: explicit "0" must keep the plain-CLI shape (opt-out) ─────────────
     let off_capture = std::env::temp_dir().join(format!(
@@ -668,7 +682,7 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
             .any(|(_, value)| value == &managed_env_vars_config()),
         "explicit opt-out must not add the managed-sidecar-only env_vars configuration"
     );
-    registry.kill(&off_terminal_id);
+    kill_and_wait_gone(&state, &off_terminal_id).await;
 
     // ── Phase 3: managed resume — default (unset) + resumeSessionId; the resume
     // ── pair rides LAST (the S5.e resume golden at the integration level) ─────────
@@ -720,7 +734,7 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
         resume_argv.len(),
         "resume pair must be last: {resume_argv:?}"
     );
-    registry.kill(&resume_terminal_id);
+    kill_and_wait_gone(&state, &resume_terminal_id).await;
 
     // ── Phase 4: headless auto-resume gets a newly spawned managed pair, but
     // ── intentionally has no layout ids ─────────────────────────────────────────
@@ -766,7 +780,7 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
         resume_pair_position(auto_resume_argv, "thread-e2e-auto-resume").is_some(),
         "auto-resume argv must retain the Codex resume pair: {auto_resume_argv:?}"
     );
-    registry.kill(&auto_resume_terminal_id);
+    kill_and_wait_gone(&state, &auto_resume_terminal_id).await;
 
     // ── Cleanup ───────────────────────────────────────────────────────────────────
     // `_environment` restores all process-global test seams on scope exit.
