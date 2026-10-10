@@ -539,12 +539,17 @@ if ($l == 0) {{
 sleep 600;"#,
             pids.display()
         );
-        let mut q = std::process::Command::new("perl")
+        let q = std::process::Command::new("perl")
             .args(["-e", &script])
             .spawn()
             .unwrap();
         // Our own unreaped child: its pid names it.
         let q_watch = ProcWatch::open(q.id()).unwrap();
+        let mut tree = KillTree {
+            q,
+            q_watch: q_watch.clone(),
+            extra: Vec::new(),
+        };
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let (l, s) = loop {
             if let Ok(raw) = std::fs::read_to_string(&pids) {
@@ -560,15 +565,7 @@ sleep 600;"#,
         let s_watch = ProcWatch::open(s).unwrap();
         // Pinned while S is certainly still S (L, its parent, sleeps 600 s).
         let s_start = s_watch.identity().start;
-        struct KillOnDrop(Vec<ProcWatch>);
-        impl Drop for KillOnDrop {
-            fn drop(&mut self) {
-                for watch in &self.0 {
-                    let _ = watch.signal(Sig::Kill);
-                }
-            }
-        }
-        let _cleanup = KillOnDrop(vec![s_watch.clone(), q_watch.clone()]);
+        tree.extra.push(s_watch.clone());
         // S runs its daemon-family argv only once it has exec'd.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !process::argv(s).is_ok_and(|argv| is_codex_daemon_family(&argv)) {
@@ -577,7 +574,7 @@ sleep 600;"#,
         }
 
         let me = std::process::id();
-        let root = q.id();
+        let root = q_watch.pid();
         let doomed = std::cell::RefCell::new(Vec::new());
         stop_the_world(
             || {
@@ -620,7 +617,57 @@ sleep 600;"#,
             !s_watch.has_exited() && process::start_time(s).ok() == Some(s_start),
             "the spared daemon-family process was killed"
         );
-        let _ = q.wait();
+    }
+
+    /// Everything the kernel-level test above started, killed and waited
+    /// for when dropped, so a failure at any point leaves nothing running:
+    /// the processes still below Q are stopped round by round until none is
+    /// new (the sweep's own rounds, so nothing forks past the kill), each
+    /// pinned and then admitted only as Q or a child of the tree read in the
+    /// same round (the test's own processes, by pid and start time); then
+    /// every pin, the extra ones included (S, which the sweep leaves outside
+    /// Q's tree), gets SIGKILL and is waited for, and Q is reaped.
+    struct KillTree {
+        q: std::process::Child,
+        q_watch: ProcWatch,
+        extra: Vec<ProcWatch>,
+    }
+
+    impl Drop for KillTree {
+        fn drop(&mut self) {
+            let root = self.q_watch.pid();
+            let pins = std::cell::RefCell::new(Vec::new());
+            let _ = stop_the_world(
+                || {
+                    let mut tree = with_descendants(BTreeSet::from([root]), std::process::id());
+                    tree.retain(|pid| process::is_running(*pid));
+                    (tree, BTreeSet::new())
+                },
+                |watch, tree| {
+                    let pid = watch.pid();
+                    let ours =
+                        pid == root || process::parent(pid).is_some_and(|pp| tree.contains(&pp));
+                    if ours {
+                        pins.borrow_mut().push(watch.clone());
+                    }
+                    ours
+                },
+            );
+            // The sweep resumes, rather than kills, a daemon-family process.
+            let pins = pins.into_inner();
+            let all: Vec<&ProcWatch> = pins
+                .iter()
+                .chain(&self.extra)
+                .chain([&self.q_watch])
+                .collect();
+            for watch in &all {
+                let _ = watch.signal(Sig::Kill);
+            }
+            for watch in &all {
+                let _ = watch.wait_exited_blocking(Duration::from_secs(5));
+            }
+            let _ = self.q.wait();
+        }
     }
 
     fn fresh_unit() -> TagUnit {
