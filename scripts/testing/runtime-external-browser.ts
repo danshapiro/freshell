@@ -1,3 +1,4 @@
+import { BROWSER_ORIGINAL_FILES, TABS_CASE_TITLES, type BrowserOriginalIndex } from './runtime-campaign-policy.js'
 import {
   QUALIFICATION_PROVIDER_SELECTION_ENV, parseQualificationProviderSelection,
   type QualifiableTerminalProvider,
@@ -1906,6 +1907,7 @@ export type ExternalBrowserCaseResult = ExternalBrowserCase & {
   status: 'passed' | 'failed' | 'skipped' | 'timedOut' | 'interrupted'
 }
 export type ExternalBrowserCounts = {
+  originals?: BrowserOriginalIndex[]
   selected: number; executed: number; passed: number; failed: number; skipped: number; timedOut: number
 }
 
@@ -2035,6 +2037,7 @@ export interface ExternalBrowserLifecycle {
     exitCode: number; cases: ExternalBrowserCaseResult[]
   }>
   finish(): Promise<{ ok: boolean; errors: string[] }>
+  publishOriginals?(selected: ExternalBrowserCase[], executed: ExternalBrowserCaseResult[]): BrowserOriginalIndex
   abort(): Promise<{ ok: boolean; errors: string[] }>
 }
 
@@ -2294,6 +2297,7 @@ export async function dispatchOwnedExternalBrowser(
     }
     const cleanup = await owner.finish()
     if (!cleanup.ok || cleanup.errors.length) throw new Error('owned external cleanup failed')
+    if (owner.publishOriginals) counts.originals = [owner.publishOriginals(selected, results)]
     return counts
   } catch (error) {
     let cleanup: { ok: boolean; errors: string[] }
@@ -2346,11 +2350,6 @@ async function verifyExternalManagedTransport(descriptor: ManagedExternalDescrip
   }
   throw new Error('owned HTTPS/WSS provenance and admission readiness failed')
 }
-
-const TABS_CASE_TITLES = [
-  'managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth',
-  'P4-G08: controller inventory reconstructs views without duplicating souls',
-] as const
 
 function tabsCaseSelections(selection: ExternalBrowserSelection): Array<ExternalBrowserSelection & { grep: string }> {
   const fullTitles = TABS_CASE_TITLES.map(title => `Phase 4 managed-runtime tab rehydration › ${title}`)
@@ -2480,10 +2479,14 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
   private cloudDiagnosticFingerprint?: string
   private descriptor?: ManagedExternalDescriptor
   private retained?: OwnedRetainedBrowserFixtures
+  private cleanupSettled = false
+  private receiptBefore: Record<string, string> = {}
   private readonly cloudJobs = new Map<string, OwnedExternalCloudJob>()
   constructor(private readonly repoRoot = process.cwd(), private readonly environment: NodeJS.ProcessEnv = process.env) {}
 
   async start(selection: ExternalBrowserSelection): Promise<NodeJS.ProcessEnv> {
+    this.cleanupSettled = false
+    this.receiptBefore = this.receiptDigests()
     const root = fs.realpathSync(this.repoRoot)
     if (!fs.statSync(path.join(root, '.git')).isFile()
       || execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim()) {
@@ -2622,7 +2625,44 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     ] as const) {
       try { await cleanup() } catch { errors.push(`${name} cleanup failed`) }
     }
-    return { ok: errors.length === 0, errors }
+    this.cleanupSettled = errors.length === 0
+    return { ok: this.cleanupSettled, errors }
+  }
+  private receiptDigests(): Record<string, string> {
+    const result: Record<string, string> = {}
+    for (const [name, target] of Object.entries(this.environment)) {
+      if (!name.startsWith('FRESHELL_RUNTIME_') || !name.endsWith('_RECEIPT') || !target) continue
+      try {
+        const stat = fs.lstatSync(target)
+        if (stat.isFile() && !stat.isSymbolicLink() && stat.size <= 16 * 1024 * 1024) {
+          result[name] = createHash('sha256').update(fs.readFileSync(target)).digest('hex')
+        }
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    }
+    return result
+  }
+  publishOriginals(selected: ExternalBrowserCase[], executed: ExternalBrowserCaseResult[]): BrowserOriginalIndex {
+    if (!this.cleanupSettled || !this.owner || !this.descriptor) throw new Error('browser originals require successful finalized owned cleanup')
+    const runtime = this.owner.runtime
+    const artifacts = Object.fromEntries(Object.entries(BROWSER_ORIGINAL_FILES).map(([key, file]) => {
+      const target = path.join(runtime.evidenceDir, file), stat = fs.lstatSync(target)
+      if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) || stat.size === 0 || stat.size > 16 * 1024 * 1024) {
+        throw new Error('browser original must be a bounded private regular file')
+      }
+      return [key, { path: path.relative(this.repoRoot, target), sha256: createHash('sha256').update(fs.readFileSync(target)).digest('hex') }]
+    })) as BrowserOriginalIndex['artifacts']
+    const events = fs.readFileSync(runtime.lifecyclePath, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line))
+    const executions = [...new Map(events.filter(row => row.event === 'managed_external_job_execution').map(row => [JSON.stringify(row.data), row.data])).values()] as any[]
+    if (executions.length !== 1 || executions[0].runId !== runtime.runId || executions[0].candidateSha !== runtime.candidateSha
+      || !/^sha256:[a-f0-9]{64}$/.test(executions[0].imageDigest)) throw new Error('browser original lacks exact owned Cloud image execution')
+    const cleanup = JSON.parse(fs.readFileSync(path.join(runtime.evidenceDir, 'cleanup.json'), 'utf8'))
+    if (cleanup.ok !== true || !Array.isArray(cleanup.errors) || cleanup.errors.length) throw new Error('browser original cleanup is not finalized successfully')
+    const after = this.receiptDigests()
+    return { candidateSha: runtime.candidateSha, runId: runtime.runId, runtimeImage: runtime.imageRef,
+      browserImage: executions[0].imageDigest, selected, executed: executed.map(row => {
+        if (row.status !== 'passed') throw new Error('browser original has unsuccessful selected execution')
+        return { ...row, status: 'passed' as const }
+      }), artifacts, receiptDigests: Object.fromEntries(Object.entries(after).filter(([name, digest]) => digest !== this.receiptBefore[name])) }
   }
   async abort(): Promise<{ ok: boolean; errors: string[] }> { return this.finish() }
 }
@@ -2641,6 +2681,7 @@ export async function runExternalBrowserCli(args: readonly string[], environment
     counts.failed += result.failed
     counts.skipped += result.skipped
     counts.timedOut += result.timedOut
+    if (result.originals) (counts.originals ??= []).push(...result.originals)
   }
   return counts
 }
@@ -2651,7 +2692,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   process.once('SIGTERM', cancel)
   process.once('SIGINT', cancel)
   runExternalBrowserCli(process.argv.slice(2), process.env, undefined, cancellation.signal).then(counts => {
-    process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'managed_external_browser_passed', counts })}\n`)
+    process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'managed_external_browser_passed', counts: { selected: counts.selected, executed: counts.executed, passed: counts.passed, failed: counts.failed, skipped: counts.skipped, timedOut: counts.timedOut }, originals: counts.originals })}\n`)
   }).catch(() => {
     process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'managed_external_admission_or_run_failed' })}\n`)
     process.exitCode = 1

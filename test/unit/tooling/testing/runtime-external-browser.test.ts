@@ -532,6 +532,43 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     expect(owned.finish).toHaveBeenCalledOnce()
     expect(owned.abort).not.toHaveBeenCalled()
   })
+  it('hands current original references off only after actual child and settled cleanup', async () => {
+    const { owned, cases } = lifecycle()
+    const originals = { runId: descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID, candidateSha: descriptor.FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA }
+    const publishOriginals = vi.fn().mockReturnValue(originals)
+    const result = await runner.dispatchOwnedExternalBrowser({ spec: smokeSpec }, { FRESHELL_E2E_BACKEND: 'cloud' }, { ...owned, publishOriginals })
+    expect(result.originals).toEqual([originals])
+    expect(publishOriginals).toHaveBeenCalledWith(cases, cases.map(row => ({ ...row, status: 'passed' })))
+    expect(owned.finish.mock.invocationCallOrder[0]).toBeLessThan(publishOriginals.mock.invocationCallOrder[0])
+    publishOriginals.mockClear()
+    owned.finish.mockResolvedValueOnce({ ok: false, errors: ['cleanup failed'] })
+    await expect(runner.dispatchOwnedExternalBrowser({ spec: smokeSpec }, { FRESHELL_E2E_BACKEND: 'cloud' }, { ...owned, publishOriginals })).rejects.toThrow(/cleanup/)
+    expect(publishOriginals).not.toHaveBeenCalled()
+    owned.child.mockResolvedValueOnce({ exitCode: 1, cases: cases.map(row => ({ ...row, status: 'passed' })) })
+    await expect(runner.dispatchOwnedExternalBrowser({ spec: smokeSpec }, { FRESHELL_E2E_BACKEND: 'cloud' }, { ...owned, publishOriginals })).rejects.toThrow(/failed/)
+    expect(publishOriginals).not.toHaveBeenCalled()
+  })
+  it('retains both separately owned rehydrate original indexes and aggregate counts', async () => {
+    const spec = 'test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts'
+    const cases = [
+      { id: 'history', file: spec, title: 'Phase 4 managed-runtime tab rehydration › managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth' },
+      { id: 'tabs', file: spec, title: 'Phase 4 managed-runtime tab rehydration › P4-G08: controller inventory reconstructs views without duplicating souls' },
+    ]
+    const { owned } = lifecycle()
+    owned.list.mockResolvedValue(cases)
+    owned.child.mockImplementation(async (_command, args) => ({ exitCode: 0,
+      cases: cases.filter(row => new RegExp(args[args.indexOf('--grep') + 1]).test(row.title)).map(row => ({ ...row, status: 'passed' })) }))
+    const publishOriginals = vi.fn().mockReturnValueOnce({ runId: 'owned-first' }).mockReturnValueOnce({ runId: 'owned-second' })
+    const result = await runner.runExternalBrowserCli(['--spec', spec], { FRESHELL_E2E_BACKEND: 'cloud' }, { ...owned, publishOriginals })
+    expect(result).toMatchObject({ selected: 2, executed: 2, passed: 2, originals: [{ runId: 'owned-first' }, { runId: 'owned-second' }] })
+    expect(publishOriginals).toHaveBeenCalledTimes(2)
+    publishOriginals.mockClear().mockReturnValue({ runId: 'owned-partial' })
+    const partial = await runner.runExternalBrowserCli(['--spec', spec, '--grep', 'P4-G08:'],
+      { FRESHELL_E2E_BACKEND: 'cloud' }, { ...owned, publishOriginals })
+    expect(partial).toMatchObject({ selected: 1, executed: 1, passed: 1, originals: [{ runId: 'owned-partial' }] })
+    expect(publishOriginals).toHaveBeenCalledOnce()
+    expect(publishOriginals.mock.calls[0][0]).toEqual([cases[1]])
+  })
   it('requires native provider cases while leaving separately opted-in synthetic cases honestly unselected', async () => {
     const { owned } = lifecycle()
     const spec = 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts'
