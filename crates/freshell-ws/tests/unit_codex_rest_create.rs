@@ -564,7 +564,8 @@ async fn late_claimed_rest_start_stopped_after_its_bind(until_gone: bool) {
 /// terminal pane of the same conversation, through the real handoff runner)
 /// succeeds on its first attempt: the prior is stopped under the handoff's
 /// own operation, so the handoff keeps its key and commits it to the target
-/// (Task 12 review I2: a fresh kill operation made that commit stale).
+/// (Task 12 review I2: a fresh kill operation made that commit stale), and
+/// the handoff answers only after the prior's Gone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_handoff_away_from_a_pane_in_its_unit_succeeds_on_the_first_attempt() {
     let h = UnitHarness::start(HarnessOpts::default()).await;
@@ -603,9 +604,10 @@ async fn a_handoff_away_from_a_pane_in_its_unit_succeeds_on_the_first_attempt() 
         !fake_codex::pid_alive(prior_native),
         "the prior's app-server is gone"
     );
+    // The handoff waits for the prior's Gone, which removes its entry.
     assert!(
         h.state.units.by_terminal(&prior).is_none(),
-        "the prior's unit is gone"
+        "the prior's unit was Gone before the handoff answered"
     );
     match h
         .state
@@ -613,6 +615,78 @@ async fn a_handoff_away_from_a_pane_in_its_unit_succeeds_on_the_first_attempt() 
         .as_ref()
         .unwrap()
         .observe("codex", "t-handoff")
+        .state
+    {
+        freshell_ownership::OwnershipState::Live { owner, .. } => {
+            let target = owner.terminal_id.expect("a terminal owner");
+            assert_ne!(target, prior, "the target owns the conversation");
+            assert!(h.state.registry.is_pty_running(&target));
+        }
+        other => panic!("the handoff committed its target: {other:?}"),
+    }
+}
+
+/// A handoff away from a Codex terminal pane in its unit waits for that
+/// unit's Gone, not only for its screen's death: the prior's row stays
+/// until Gone, and a target spawned before it would be refused because the
+/// conversation still has a running terminal. Here Gone is held 1.5 s
+/// after the prior's processes died; the handoff still succeeds on its
+/// first attempt, and the prior is fully gone when it answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handoff_away_from_a_pane_in_its_unit_waits_for_its_gone() {
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    let mut ws = h.connect().await;
+    let prior = h
+        .create_codex(&mut ws, "crq-handoff-gone", Some("t-handoff-gone"))
+        .await;
+    tui_ready(&h, &mut ws).await;
+    let prior_unit = h.unit_for(&prior);
+    tokio::time::timeout(LIMIT, h.state.units.start_settled(prior_unit.id()))
+        .await
+        .expect("the prior's start settled");
+    let prior_native = h.native_pid(&prior);
+    let _gone_delay = GoneDelay::set(1500);
+
+    let (status, body) = h
+        .post(
+            "/api/sessions/handoff",
+            json!({
+                "provider": "codex",
+                "sessionId": "t-handoff-gone",
+                "targetKind": "terminal",
+                "mode": "codex",
+                "cwd": h.home.path().display().to_string(),
+                "deviceId": "test-device",
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["ok"],
+        json!(true),
+        "the first attempt succeeds: {body}"
+    );
+    assert!(
+        prior_unit
+            .stop_in_flight()
+            .and_then(|stop| stop.try_report())
+            .is_some(),
+        "the prior's unit was Gone before the handoff answered"
+    );
+    assert!(
+        !h.state.registry.is_pty_running(&prior),
+        "the prior's row is gone"
+    );
+    assert!(
+        !fake_codex::pid_alive(prior_native),
+        "the prior's app-server is gone"
+    );
+    match h
+        .state
+        .ownership
+        .as_ref()
+        .unwrap()
+        .observe("codex", "t-handoff-gone")
         .state
     {
         freshell_ownership::OwnershipState::Live { owner, .. } => {

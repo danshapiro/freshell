@@ -3284,6 +3284,17 @@ impl SessionHandoffRunner {
         None
     }
 
+    /// The stop a kill began for a terminal in a pane unit (`None` for a
+    /// terminal outside any unit): such a terminal is dead only at that
+    /// stop's Gone, which resolves after its row was ended and its
+    /// conversations released, and can come after its screen's death.
+    fn unit_stop_of(&self, terminal_id: &str) -> Option<freshell_containment::StopHandle> {
+        self.fresh_agent
+            .units
+            .by_terminal(terminal_id)
+            .and_then(|entry| entry.unit.stop_in_flight())
+    }
+
     async fn stop_runtime(
         self: &Arc<Self>,
         req: &HandoffRequest,
@@ -3315,6 +3326,11 @@ impl SessionHandoffRunner {
                 match owner.pid {
                     Some(pid) => {
                         self.registry.kill(terminal_id);
+                        // A prior in a pane unit is dead only at its unit's
+                        // Gone (the stop the kill began): its row stays until
+                        // then, and a target spawned earlier is refused while
+                        // the conversation still has that running terminal.
+                        let unit_gone = self.unit_stop_of(terminal_id);
                         // Round-3 review I-1 (prior-reap window): the kill is
                         // now ISSUED (SIGKILL sent) but unconfirmed — the
                         // abort-window test's deterministic hold parks HERE,
@@ -3325,9 +3341,13 @@ impl SessionHandoffRunner {
                                 let _ = pause.notified().await;
                             }
                         }
+                        let watcher_gone = unit_gone.clone();
                         let mut confirm = std::pin::pin!(async {
                             while freshell_terminal::registry::pid_alive(pid) {
                                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                            if let Some(stop) = unit_gone.as_ref() {
+                                stop.wait().await;
                             }
                         });
                         tokio::select! {
@@ -3350,6 +3370,9 @@ impl SessionHandoffRunner {
                                     async move {
                                         while freshell_terminal::registry::pid_alive(pid) {
                                             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                        }
+                                        if let Some(stop) = watcher_gone.as_ref() {
+                                            stop.wait().await;
                                         }
                                         ReapAnswer::Confirmed
                                     },
