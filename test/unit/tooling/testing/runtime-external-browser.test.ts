@@ -760,6 +760,64 @@ describe('owned web process lifetime (Node process fixture only)', () => {
     })
     return { fixture, entry, home, setup }
   }
+  async function authenticatedFixture() {
+    const owned = await fixture()
+    await fsp.writeFile(owned.entry, `require('node:http').createServer((req,res)=>{res.setHeader('content-type','application/json');if(req.headers['x-auth-token']!==process.env.AUTH_TOKEN){res.writeHead(401);res.end('{}');return}res.end(JSON.stringify({runtime:'rust',commit:'${'a'.repeat(40)}',buildDirty:false}))}).listen(Number(process.env.PORT),'127.0.0.1')`)
+    return owned
+  }
+  it.each([
+    { identity: 'generated', token: undefined }, { identity: 'configured', token: 'owned-configured-test-token' },
+  ])('retains its $identity authentication identity after owned stop/start', async ({ token }) => {
+    const { fixture: directory, entry, home, setup } = await authenticatedFixture()
+    const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
+      candidateSha: 'a'.repeat(40), buildDirty: false, setupHome: setup, homeDir: home,
+      preserveHomeOnStop: true, token, env: { NODE_OPTIONS: `--require=${entry}` } })
+    const pids: number[] = []
+    try {
+      const initial = await server.start()
+      pids.push(initial.pid)
+      const headers = { 'x-auth-token': token ?? initial.token }
+      expect((await fetch(`${initial.baseUrl}/api/server-info`, { headers })).status).toBe(200)
+      await server.stop()
+      await expect(fsp.stat(`/proc/${initial.pid}`)).rejects.toThrow()
+      const next = await server.start()
+      pids.push(next.pid)
+      expect(next.pid).not.toBe(initial.pid)
+      expect(next.homeDir).toBe(initial.homeDir)
+      expect(setup).toHaveBeenCalledOnce()
+      expect((await fetch(`${next.baseUrl}/api/server-info`, { headers })).status).toBe(200)
+      expect((await fetch(`${next.baseUrl}/api/server-info`, { headers: { 'x-auth-token': 'foreign-token' } })).status).toBe(401)
+    } finally {
+      await server.stop()
+      for (const pid of pids) await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
+      await fsp.rm(directory, { recursive: true })
+    }
+  })
+  it('keeps generated authentication identities independent between owned web instances', async () => {
+    const { fixture: directory, entry, setup } = await authenticatedFixture()
+    const options = { binary: process.execPath, repoRoot: process.cwd(), candidateSha: 'a'.repeat(40),
+      buildDirty: false, setupHome: setup, preserveHomeOnStop: false, env: { NODE_OPTIONS: `--require=${entry}` } }
+    const first = new runner.ManagedRuntimeWebServer(options)
+    const second = new runner.ManagedRuntimeWebServer(options)
+    const pids: number[] = []
+    const homes: string[] = []
+    try {
+      const initial = await first.start()
+      pids.push(initial.pid); homes.push(initial.homeDir)
+      const other = await second.start()
+      pids.push(other.pid); homes.push(other.homeDir)
+      for (const [accepted, rejected] of [[initial, other], [other, initial]]) {
+        expect((await fetch(`${accepted.baseUrl}/api/server-info`, { headers: { 'x-auth-token': accepted.token } })).status).toBe(200)
+        expect((await fetch(`${accepted.baseUrl}/api/server-info`, { headers: { 'x-auth-token': rejected.token } })).status).toBe(401)
+      }
+    } finally {
+      await first.stop()
+      await second.stop()
+      for (const pid of pids) await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
+      for (const home of homes) await expect(fsp.stat(home)).rejects.toThrow()
+      await fsp.rm(directory, { recursive: true })
+    }
+  })
   it.each([
     { grep: 'P3-G10: pending native approval survives exact provider resurrection', permission: 'ask', delay: '7000' },
     { grep: 'imports only the selected synthetic conversation and reopens under its native ID', permission: null, delay: null },
@@ -1019,8 +1077,7 @@ describe('owned web process lifetime (Node process fixture only)', () => {
     }
   })
   it('keeps the relay token admitted when the retained fixture selects another owned web process', async () => {
-    const { fixture: directory, entry, setup } = await fixture()
-    await fsp.writeFile(entry, `require('node:http').createServer((req,res)=>{res.setHeader('content-type','application/json');if(req.headers['x-auth-token']!==process.env.AUTH_TOKEN){res.writeHead(401);res.end('{}');return}res.end(JSON.stringify({runtime:'rust',commit:'${'a'.repeat(40)}',buildDirty:false}))}).listen(Number(process.env.PORT),'127.0.0.1')`)
+    const { fixture: directory, entry, setup } = await authenticatedFixture()
     const token = 'owned-retained-relay-token'
     const options = { binary: process.execPath, repoRoot: process.cwd(), candidateSha: 'a'.repeat(40),
       buildDirty: false, setupHome: setup, preserveHomeOnStop: false, token,
@@ -1058,8 +1115,8 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       await fsp.rm(directory, { recursive: true })
     }
   })
-  it('preserves scratch config and token/port across exact owned replacement, then verifies PID absence', async () => {
-    const { fixture: directory, entry, home, setup } = await fixture()
+  it.each(['restart', 'restartAbrupt'] as const)('preserves scratch config and token/port across exact owned %s, then verifies PID absence', async (restart) => {
+    const { fixture: directory, entry, home, setup } = await authenticatedFixture()
     const server = new runner.ManagedRuntimeWebServer({
       binary: process.execPath, repoRoot: process.cwd(), candidateSha: 'a'.repeat(40), buildDirty: false,
       setupHome: setup, homeDir: home, preserveHomeOnStop: true,
@@ -1071,11 +1128,13 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       const first = await server.start()
       firstPid = first.pid
       await fsp.writeFile(path.join(home, '.freshell/config.json'), JSON.stringify({ version: 1, settings: { retainedChange: 'owned-change' } }))
-      const next = await server.restartAbrupt()
+      const next = await server[restart]()
       nextPid = next.pid
       expect(next.baseUrl).toBe(first.baseUrl)
       expect(next.token).toBe(first.token)
       expect(next.pid).not.toBe(first.pid)
+      expect((await fetch(`${next.baseUrl}/api/server-info`, { headers: { 'x-auth-token': first.token } })).status).toBe(200)
+      expect((await fetch(`${next.baseUrl}/api/server-info`, { headers: { 'x-auth-token': 'foreign-token' } })).status).toBe(401)
       expect(setup).toHaveBeenCalledOnce()
       expect(JSON.parse(await fsp.readFile(path.join(home, '.freshell/config.json'), 'utf8')).settings.retainedChange).toBe('owned-change')
       await expect(fsp.stat(`/proc/${first.pid}`)).rejects.toThrow()

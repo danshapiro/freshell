@@ -263,6 +263,7 @@ function ownedWebDiagnosticFacts(output: { stdout: string; stderr: string }, nat
 
 /** The runtime owner supplies the artifact; this class never builds or locates a foreign server. */
 export class ManagedRuntimeWebServer implements RuntimeWebHandle {
+  private readonly token: string
   private process?: OwnedRuntimeChild
   private current?: RuntimeWebInfo
   private homeDir?: string
@@ -272,7 +273,9 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
   private logsDir?: string
 
   constructor(private readonly options: RuntimeWebConstructOptions,
-    private readonly diagnostics?: (record: OwnedWebDiagnosticRecord) => void | Promise<void>) {}
+    private readonly diagnostics?: (record: OwnedWebDiagnosticRecord) => void | Promise<void>) {
+    this.token = options.token ?? randomUUID()
+  }
 
   get info(): RuntimeWebInfo {
     if (!this.current) throw new Error('owned managed web is not started')
@@ -287,10 +290,11 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
   async start(): Promise<RuntimeWebInfo> {
     if (this.process?.alive()) throw new Error('owned managed web is already started')
     this.homeDir ??= this.options.homeDir ?? await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-managed-web-'))
-    return this.boot(await freeOwnerPort(), this.options.token ?? randomUUID())
+    return this.boot(await freeOwnerPort())
   }
 
-  private async boot(port: number, token: string): Promise<RuntimeWebInfo> {
+  private async boot(port: number): Promise<RuntimeWebInfo> {
+    const token = this.token
     const home = this.homeDir!
     const configDir = path.join(home, '.freshell')
     if (!this.homeConfigured) {
@@ -351,14 +355,14 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
   }
 
   async restart(): Promise<RuntimeWebInfo> {
-    const { port, token } = this.info
+    const { port } = this.info
     await this.kill('SIGTERM')
-    return this.boot(port, token)
+    return this.boot(port)
   }
   async restartAbrupt(): Promise<RuntimeWebInfo> {
-    const { port, token } = this.info
+    const { port } = this.info
     await this.kill('SIGKILL')
-    return this.boot(port, token)
+    return this.boot(port)
   }
   async kill(signal: NodeJS.Signals = 'SIGKILL'): Promise<void> {
     if (this.process) {
