@@ -7,8 +7,47 @@
 //! Linux only: every process a test signals is pinned by pid and start time
 //! through `/proc`, so a signal never reaches a recycled pid.
 use super::tests::collector;
+use super::tests::tracing_capture::{self, CapturedEvent};
 use super::*;
 use std::time::{Duration, Instant};
+
+/// Tests that park a replacement on the shared [`REPLACE_SCREEN_INTERLOCK`]
+/// run one at a time.
+fn interlock_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The captured line whose `event` field is `event`.
+fn unit_event(logs: &Arc<Mutex<Vec<CapturedEvent>>>, event: &str) -> CapturedEvent {
+    let logs = logs.lock().unwrap();
+    logs.iter()
+        .find(|e| e.fields.get("event").map(String::as_str) == Some(event))
+        .cloned()
+        .unwrap_or_else(|| panic!("no {event} line: {logs:?}"))
+}
+
+/// A unit lifecycle line carries the unit's keys as plain values, under the
+/// `freshell_unit` target. The registry never owns the stop's operation, so
+/// `operation_id` is empty.
+fn assert_unit_keys(e: &CapturedEvent, tid: &str, session_id: &str) {
+    assert_eq!(e.target, "freshell_unit", "{e:?}");
+    for (key, value) in [
+        ("unit_id", "u1"),
+        ("provider", "codex"),
+        ("session_id", session_id),
+        ("terminal_id", tid),
+        ("operation_id", ""),
+    ] {
+        assert_eq!(
+            e.fields.get(key).map(String::as_str),
+            Some(value),
+            "{key} on {e:?}"
+        );
+    }
+}
 
 fn bash(script: &str) -> SpawnSpec {
     SpawnSpec {
@@ -438,13 +477,13 @@ fn screen_restarts_are_capped_per_liveness_window() {
     wait("screen 1 exits", seen_exits(2));
     reg.replace_screen("T7", &bash("sleep 0.3; exit 4"), &env(), placement(None))
         .expect("second quick restart");
+    wait("screen 2 exits after living 300 ms", seen_exits(3));
     let err = reg
         .replace_screen("T7", &bash("exit 4"), &env(), placement(None))
         .expect_err("a third quick restart is over the cap");
     assert_eq!(err.to_string(), "respawn cap");
     assert!(!reg.respawn_exhausted("crq-cap"));
     reg.set_respawn_liveness_window_ms(100);
-    wait("screen 2 exits after living 300 ms", seen_exits(3));
     reg.replace_screen("T7", &bash("exit 4"), &env(), placement(None))
         .expect("a screen that outlived the window resets the count");
     assert!(
@@ -557,6 +596,11 @@ fn kill_all_never_publishes_exit_for_unit_rows() {
         reg.is_running("TU"),
         "the unit row stays until its unit ends"
     );
+    let err = reg
+        .replace_screen("TU", &bash("sleep 30"), &env(), placement(None))
+        .expect_err("a row that is ending takes no new screen");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(reg.pid_of("TU"), None, "no new screen was started");
     assert_eq!(reg.unit_id_for("TP"), None);
 }
 
@@ -656,15 +700,15 @@ fn a_start_failure_ending_publishes_the_wrapper_code_silently() {
 }
 
 #[test]
-fn a_replaced_screens_late_exit_never_touches_the_new_screen() {
+fn replacing_a_live_screen_is_refused() {
     let reg = TerminalRegistry::new();
     let got = record_screen_exits(&reg);
     let first = reg
         .create_in_unit(
             &bash("sleep 30"),
             &env(),
-            "T12".into(),
-            "S12".into(),
+            "T11".into(),
+            "S11".into(),
             "codex",
             None,
             None,
@@ -674,18 +718,111 @@ fn a_replaced_screens_late_exit_never_touches_the_new_screen() {
         )
         .unwrap();
     let first = Own::pin(first);
+    let seen = attach_collector(&reg, "T11");
+    // The old screen's output would keep arriving under sequence numbers the
+    // new screen also uses, so a replacement waits for the old screen's exit.
+    let err = reg
+        .replace_screen(
+            "T11",
+            &bash("echo SECOND; sleep 30"),
+            &env(),
+            placement(None),
+        )
+        .expect_err("a live screen is never replaced");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(first.alive(), "a refused replacement signals nothing");
+    assert_eq!(reg.pid_of("T11"), Some(first.pid));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !output_text(&seen).contains("SECOND"),
+        "no new screen was started"
+    );
+    first.kill();
+    wait("the screen's exit reaches the hook", || {
+        !got.lock().unwrap().is_empty()
+    });
+    assert_eq!(
+        got.lock().unwrap()[0].screen_generation,
+        0,
+        "the refusal reserved no generation"
+    );
+    let second = reg
+        .replace_screen(
+            "T11",
+            &bash("echo SECOND; sleep 30"),
+            &env(),
+            placement(None),
+        )
+        .expect("an exited screen is replaced");
+    let _second = Own::pin(second);
+    wait("second screen output", || {
+        output_text(&seen).contains("SECOND")
+    });
+}
+
+#[test]
+fn a_replacement_whose_spawn_failed_can_be_retried() {
+    let reg = TerminalRegistry::new();
+    let got = record_screen_exits(&reg);
+    reg.create_in_unit(
+        &bash("exit 3"),
+        &env(),
+        "T11b".into(),
+        "S11b".into(),
+        "codex",
+        None,
+        None,
+        None,
+        None,
+        placement(None),
+    )
+    .unwrap();
+    wait("first screen exits", || got.lock().unwrap().len() == 1);
+    let missing_wrapper = placement(Some(vec!["/nonexistent/freshell-unit-wrapper".into()]));
+    reg.replace_screen("T11b", &bash("sleep 30"), &env(), missing_wrapper)
+        .expect_err("the wrapper does not exist");
+    let pid = reg
+        .replace_screen("T11b", &bash("sleep 30"), &env(), placement(None))
+        .expect("a failed spawn left no screen running, so a retry is admitted");
+    let screen = Own::pin(pid);
+    assert_eq!(reg.pid_of("T11b"), Some(pid));
+    screen.kill();
+    wait("the new screen's exit reaches the hook", || {
+        got.lock().unwrap().len() == 2
+    });
+    assert_eq!(got.lock().unwrap()[1].screen_generation, 2);
+}
+
+#[test]
+fn a_replaced_screens_late_exit_never_touches_the_new_screen() {
+    let reg = TerminalRegistry::new();
+    let got = record_screen_exits(&reg);
+    reg.create_in_unit(
+        &bash("exit 3"),
+        &env(),
+        "T12".into(),
+        "S12".into(),
+        "codex",
+        Some("ses-12"),
+        None,
+        None,
+        None,
+        placement(None),
+    )
+    .unwrap();
+    wait("first screen exits", || got.lock().unwrap().len() == 1);
     let second = reg
         .replace_screen("T12", &bash("sleep 30"), &env(), placement(None))
         .unwrap();
     let second = Own::pin(second);
-    assert!(first.alive(), "a replacement never signals the old screen");
-    first.kill(); // ended later, as the unit's stop would
-    wait("the replaced screen is ended", || !first.alive());
-    // The replaced screen's exit reaches the registry right after its death;
-    // give its reader time to deliver it.
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        got.lock().unwrap().is_empty(),
+    // Defence: the first screen's exit hook delivering again, late, as it
+    // would if its exit were ever taken after the replacement.
+    let (logs, guard) = tracing_capture::capture();
+    (reg.unit_row_exit_hook("T12", 0))(3);
+    drop(guard);
+    assert_eq!(
+        got.lock().unwrap().len(),
+        1,
         "a replaced screen's exit is not the row's screen exit"
     );
     assert_eq!(
@@ -693,11 +830,189 @@ fn a_replaced_screens_late_exit_never_touches_the_new_screen() {
         Some(second.pid),
         "the new screen stays signalable"
     );
+    let stale = unit_event(&logs, "terminal.stale_screen_exit_ignored");
+    assert_unit_keys(&stale, "T12", "ses-12");
+    assert_eq!(
+        (
+            stale.fields["screen_generation"].as_str(),
+            stale.fields["current_generation"].as_str()
+        ),
+        ("0", "1")
+    );
     second.kill();
     wait("the new screen's exit reaches the hook", || {
-        !got.lock().unwrap().is_empty()
+        got.lock().unwrap().len() == 2
     });
-    assert_eq!(got.lock().unwrap()[0].screen_generation, 1);
+    assert_eq!(got.lock().unwrap()[1].screen_generation, 1);
+}
+
+/// A replacement parked between its spawn and its install while the row
+/// ends: the new screen must not go into a row that is no longer running.
+#[test]
+fn a_replacement_racing_the_units_end_is_refused_and_its_screen_killed() {
+    let _serial = interlock_serial();
+    let dir = tempfile::tempdir().unwrap();
+    // How the row ends inside the window: the agent's own exit published
+    // (the row is kept Exited), or a stop marked (`kill_all` at shutdown).
+    type EndTheRow = fn(&TerminalRegistry, &str);
+    let endings: [(&str, EndTheRow); 2] = [
+        ("T15", |reg, tid| {
+            assert!(reg.complete_unit_end(tid, UnitEnding::AgentExited { exit_code: 3 }));
+        }),
+        ("T16", |reg, tid| {
+            assert_eq!(reg.kill_all(), 1);
+            assert_eq!(reg.ending(tid), Some(UnitEnding::Requested));
+        }),
+    ];
+    for (tid, end_the_row) in endings {
+        let reg = TerminalRegistry::new();
+        let got = record_screen_exits(&reg);
+        reg.create_in_unit(
+            &bash("exit 3"),
+            &env(),
+            tid.into(),
+            format!("S-{tid}"),
+            "codex",
+            Some("ses-race"),
+            None,
+            None,
+            None,
+            placement(None),
+        )
+        .unwrap();
+        wait("first screen exits", || got.lock().unwrap().len() == 1);
+        let pid_file = dir.path().join(tid);
+        let mut screen_env = env();
+        screen_env.insert("PID_FILE".into(), pid_file.display().to_string());
+        REPLACE_SCREEN_INTERLOCK.arm(tid);
+        let replacing = reg.clone();
+        let replace_tid = tid.to_string();
+        let replace = std::thread::spawn(move || {
+            let (logs, _guard) = tracing_capture::capture();
+            let result = replacing.replace_screen(
+                &replace_tid,
+                &bash("echo $$ > \"$PID_FILE\"; exec sleep 30"),
+                &screen_env,
+                placement(None),
+            );
+            let logs = logs.lock().unwrap().clone();
+            (result, logs)
+        });
+        wait(
+            "the replacement parked before installing its screen",
+            || REPLACE_SCREEN_INTERLOCK.reached(),
+        );
+        wait("the new screen wrote its pid", || {
+            std::fs::read_to_string(&pid_file).is_ok_and(|s| s.ends_with('\n'))
+        });
+        let new_screen = Own::pin(
+            std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        );
+        end_the_row(&reg, tid);
+        REPLACE_SCREEN_INTERLOCK.release();
+        let (result, logs) = replace.join().unwrap();
+        let err = result.expect_err("a row that ended takes no new screen");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{tid}: {err}");
+        wait("the refused screen is killed", || !new_screen.alive());
+        assert_eq!(reg.pid_of(tid), None, "{tid}: the row has no live screen");
+        let refused = logs
+            .iter()
+            .find(|e| {
+                e.fields.get("event").map(String::as_str)
+                    == Some("terminal.screen_replacement_refused")
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("{tid}: the refusal is logged: {logs:?}"));
+        assert_unit_keys(&refused, tid, "ses-race");
+        assert_eq!(refused.fields["pid"], new_screen.pid.to_string());
+        assert_eq!(refused.fields["signalled"], "true");
+    }
+}
+
+#[test]
+fn complete_unit_end_leaves_a_plain_row_alone() {
+    let reg = TerminalRegistry::new();
+    reg.create(
+        &bash("sleep 30"),
+        &env(),
+        "TP2".into(),
+        "SP2".into(),
+        "shell",
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let shell = Own::pin(reg.pid_of("TP2").expect("the shell runs"));
+    let seen = attach_collector(&reg, "TP2");
+    let rev = reg.revision();
+    for ending in [
+        UnitEnding::Requested,
+        UnitEnding::AgentExited { exit_code: 1 },
+        UnitEnding::StartFailed { exit_code: 1 },
+    ] {
+        assert!(
+            !reg.complete_unit_end("TP2", ending),
+            "{ending:?} is refused for a plain row"
+        );
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(exits(&seen).is_empty(), "nothing was published");
+    assert_eq!(reg.revision(), rev);
+    assert!(reg.is_pty_running("TP2"));
+    assert_eq!(
+        reg.pid_of("TP2"),
+        Some(shell.pid),
+        "the shell is still owned"
+    );
+    assert_eq!(reg.ending("TP2"), None);
+    assert!(shell.alive());
+    assert!(reg.kill("TP2"), "the plain row's own kill still works");
+    wait("the shell is killed", || !shell.alive());
+}
+
+#[test]
+fn unit_lifecycle_log_lines_carry_the_unit_keys() {
+    let reg = TerminalRegistry::new();
+    let got = record_screen_exits(&reg);
+    reg.create_in_unit(
+        &bash("exit 3"),
+        &env(),
+        "T17".into(),
+        "S17".into(),
+        "codex",
+        Some("ses-17"),
+        None,
+        None,
+        None,
+        placement(None),
+    )
+    .unwrap();
+    wait("first screen exits", || got.lock().unwrap().len() == 1);
+    let (logs, _guard) = tracing_capture::capture();
+    let pid = reg
+        .replace_screen("T17", &bash("sleep 30"), &env(), placement(None))
+        .unwrap();
+    let screen = Own::pin(pid);
+    let replaced = unit_event(&logs, "terminal.screen_replaced");
+    assert_unit_keys(&replaced, "T17", "ses-17");
+    assert_eq!(replaced.fields["pid"], pid.to_string());
+
+    assert_eq!(reg.kill_all(), 1);
+    let killed_screen = unit_event(&logs, "terminal.unit_screen_killed");
+    assert_unit_keys(&killed_screen, "T17", "ses-17");
+    assert_eq!(killed_screen.fields["by"], "shutdown");
+    wait("the screen is dead", || !screen.alive());
+
+    assert!(reg.complete_unit_end("T17", UnitEnding::Requested));
+    let gone = unit_event(&logs, "terminal.killed");
+    assert_unit_keys(&gone, "T17", "ses-17");
+    assert_eq!(gone.fields["by"], "unit");
 }
 
 #[test]
@@ -768,6 +1083,7 @@ fn a_unit_rows_live_commits_name_its_unit() {
 
 #[test]
 fn a_new_screen_that_exits_before_it_is_installed_still_reaches_the_hook() {
+    let _serial = interlock_serial();
     let reg = TerminalRegistry::new();
     let got = record_screen_exits(&reg);
     reg.create_in_unit(

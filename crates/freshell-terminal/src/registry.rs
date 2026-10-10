@@ -801,6 +801,50 @@ struct UnitRow {
     gone_hook: Option<crate::pty::ExitHook>,
 }
 
+/// The keys every unit lifecycle log line carries, read from the row: its
+/// unit (`""` for a plain row), its provider (the row's mode) and its
+/// conversation (the resumed session id, `""` when the row has none).
+/// [`unit_log!`] adds the terminal id and `operation_id = ""`: a stop's owner
+/// operation belongs to the unit lifecycle that started it, never to the
+/// registry.
+struct UnitLogKeys {
+    unit_id: String,
+    provider: String,
+    session_id: String,
+}
+
+impl UnitLogKeys {
+    fn of(s: &TerminalShared) -> Self {
+        UnitLogKeys {
+            unit_id: s
+                .unit
+                .as_ref()
+                .map_or_else(String::new, |unit| unit.unit_id.clone()),
+            provider: s.mode.clone(),
+            session_id: s.resume_session_id.clone().unwrap_or_default(),
+        }
+    }
+}
+
+/// A unit lifecycle log line: target `freshell_unit`, `event=`, the unit's
+/// keys from a [`UnitLogKeys`] plus the terminal id, then the line's own
+/// fields and message. Call it with no registry or row lock held.
+macro_rules! unit_log {
+    ($level:ident, $keys:expr, $terminal_id:expr, $event:literal, $($rest:tt)+) => {{
+        let keys: &UnitLogKeys = $keys;
+        tracing::$level!(
+            target: "freshell_unit",
+            event = $event,
+            unit_id = %keys.unit_id,
+            provider = %keys.provider,
+            session_id = %keys.session_id,
+            terminal_id = %$terminal_id,
+            operation_id = "",
+            $($rest)+
+        )
+    }};
+}
+
 impl TerminalShared {
     /// The earliest sequence position still available for replay (restore
     /// contract, responsive-terminal-restore): the retained ring's front
@@ -4272,22 +4316,22 @@ impl TerminalRegistry {
     /// no-op for a screen already seen exiting). Publishes nothing.
     fn kill_unit_screen(&self, terminal_id: &str, by: &'static str) -> bool {
         self.mark_ending(terminal_id, UnitEnding::Requested);
-        let mut inner = self.inner.lock().expect("registry lock");
-        let Some(handle) = inner.terminals.get_mut(terminal_id) else {
-            return false;
+        let keys = {
+            let mut inner = self.inner.lock().expect("registry lock");
+            let Some(handle) = inner.terminals.get_mut(terminal_id) else {
+                return false;
+            };
+            if let Some(pty) = handle.pty.as_mut() {
+                pty.kill();
+            }
+            let keys = UnitLogKeys::of(&handle.shared.lock().expect("terminal lock"));
+            keys
         };
-        if let Some(pty) = handle.pty.as_mut() {
-            pty.kill();
-        }
-        let s = handle.shared.lock().expect("terminal lock");
-        tracing::info!(
-            target: "freshell_unit",
-            event = "terminal.unit_screen_killed",
-            unit_id = %s.unit.as_ref().map_or("", |u| u.unit_id.as_str()),
-            provider = %s.mode,
-            session_id = %s.resume_session_id.as_deref().unwrap_or(""),
-            terminal_id = %terminal_id,
-            operation_id = "",
+        unit_log!(
+            info,
+            &keys,
+            terminal_id,
+            "terminal.unit_screen_killed",
             by = by,
             "unit row's screen killed; the row stays until its unit ends"
         );
@@ -4375,9 +4419,30 @@ impl TerminalRegistry {
     /// Then the row's Gone hook runs once with the published exit code.
     /// The row's PTY is dropped on a detached thread, so a process still
     /// holding the PTY slave cannot delay the publication. Returns whether
-    /// the row existed. Blocking callers only: the Gone hook may write to
-    /// disk.
+    /// a unit row existed: a plain (or unknown) row is left untouched,
+    /// because its processes belong to its PTY handle and dropping that
+    /// handle without a signal would leave them running unowned (WARN
+    /// `terminal.unit_end_refused`). Blocking callers only: the Gone hook
+    /// may write to disk.
     pub fn complete_unit_end(&self, terminal_id: &str, ending: UnitEnding) -> bool {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return false;
+        };
+        let (unit_row, keys) = {
+            let s = shared.lock().expect("terminal lock");
+            (s.unit.is_some(), UnitLogKeys::of(&s))
+        };
+        if !unit_row {
+            unit_log!(
+                warn,
+                &keys,
+                terminal_id,
+                "terminal.unit_end_refused",
+                ending = ?ending,
+                "complete_unit_end called for a row that is not a unit row; it is left untouched"
+            );
+            return false;
+        }
         let (exit_code, gone_hook) = match ending {
             UnitEnding::Requested => {
                 let Some((mut handle, _)) =
@@ -4385,17 +4450,24 @@ impl TerminalRegistry {
                 else {
                     return false;
                 };
+                let gone_hook = handle
+                    .shared
+                    .lock()
+                    .expect("terminal lock")
+                    .unit
+                    .as_mut()
+                    .and_then(|unit| unit.gone_hook.take());
                 if let Some(pty) = handle.pty.take() {
-                    drop_pty_detached(terminal_id, pty);
+                    drop_pty_detached(terminal_id, &keys, pty);
                 }
-                let (unit_id, gone_hook) = {
-                    let mut s = handle.shared.lock().expect("terminal lock");
-                    s.unit.as_mut().map_or((String::new(), None), |unit| {
-                        (unit.unit_id.clone(), unit.gone_hook.take())
-                    })
-                };
-                tracing::info!(terminal_id = %terminal_id, by = "unit", unit_id = %unit_id,
-                    "terminal.killed");
+                unit_log!(
+                    info,
+                    &keys,
+                    terminal_id,
+                    "terminal.killed",
+                    by = "unit",
+                    "unit row removed at Gone; its subscribers got terminal.exit"
+                );
                 self.release_session_ref_ownership(terminal_id, "unit");
                 self.notify_activity(ActivityEvent::Exit {
                     terminal_id: terminal_id.to_string(),
@@ -4408,15 +4480,15 @@ impl TerminalRegistry {
                 // The ending is settled now: a screen exit still in flight is
                 // ignored like any screen exit after a marked ending.
                 self.mark_ending(terminal_id, ending);
-                let (shared, pty) = {
+                let pty = {
                     let mut inner = self.inner.lock().expect("registry lock");
                     let Some(handle) = inner.terminals.get_mut(terminal_id) else {
                         return false;
                     };
-                    (Arc::clone(&handle.shared), handle.pty.take())
+                    handle.pty.take()
                 };
                 if let Some(pty) = pty {
-                    drop_pty_detached(terminal_id, pty);
+                    drop_pty_detached(terminal_id, &keys, pty);
                 }
                 let spontaneous = matches!(ending, UnitEnding::AgentExited { .. });
                 self.publish_natural_exit(terminal_id, &shared, exit_code, spontaneous);
@@ -4443,14 +4515,24 @@ impl TerminalRegistry {
     /// the highest sequence they have seen) accept it, and it starts at the
     /// row's current geometry (the last resize), not the original spec's.
     ///
+    /// Refused (`InvalidInput`, nothing changed, nothing signalled) unless
+    /// the row is a running unit row with no ending marked, no other
+    /// replacement in progress, and its current screen's exit already
+    /// taken: the old screen's reader has then reached end of stream, so no
+    /// old output can arrive under the sequence numbers the new screen uses.
+    ///
     /// Per-row cap: when the screen being replaced lived at least the
     /// respawn liveness window the restart count starts again at 1, when it
     /// died sooner the count grows by 1, and a count above the respawn
     /// generation cap fails with `respawn cap` without spawning. Auto-resume's
     /// create-request budget ([`Self::respawn_exhausted`]) is never touched.
-    /// A replacement whose spawn fails still counts. The old screen's PTY is
-    /// dropped on a detached thread without being signalled. Returns the new
-    /// screen's pid; the caller confirms its placement as for a start.
+    /// A replacement whose spawn fails still counts, and leaves the row
+    /// ready for another replacement. If the row ends or an ending is marked
+    /// while the new screen starts, the new screen is not put into the row:
+    /// it is killed (unless its exit was already taken) and the call fails
+    /// `NotFound`. The old screen's PTY is dropped on a detached thread
+    /// without being signalled. Returns the new screen's pid; the caller
+    /// confirms its placement as for a start.
     pub fn replace_screen(
         &self,
         terminal_id: &str,
@@ -4469,6 +4551,7 @@ impl TerminalRegistry {
             ring_max_bytes,
             generation,
             restarts,
+            keys,
         } = reserved;
         let spawned = PtyTerminal::spawn_with_sink_from_seq(
             &SpawnSpec {
@@ -4492,24 +4575,33 @@ impl TerminalRegistry {
         let installed = {
             let mut inner = self.inner.lock().expect("registry lock");
             let handle = inner.terminals.get_mut(terminal_id);
-            let exit_seen = handle.as_ref().and_then(|handle| {
+            // Settle the reservation: `(still open for the screen, the new
+            // screen's exit already taken)`; `None` for a removed row.
+            let settled = handle.as_ref().and_then(|handle| {
                 let mut s = handle.shared.lock().expect("terminal lock");
+                let open = s.status == TerminalRunStatus::Running && s.ending.is_none();
                 let unit = s.unit.as_mut()?;
                 unit.replacing = false;
-                Some(unit.screen_exit_seen)
+                if spawned.is_err() {
+                    // No screen of the reserved generation runs, so the row
+                    // is ready for the next replacement.
+                    unit.screen_exit_seen = true;
+                }
+                Some((open, unit.screen_exit_seen))
             });
-            match (spawned, handle, exit_seen) {
-                (Ok(mut pty), Some(handle), Some(exit_seen)) => {
+            match (spawned, handle, settled) {
+                (Ok(mut pty), Some(handle), Some((true, exit_seen))) => {
                     let pid = pty.pid();
                     if exit_seen {
                         pty.mark_naturally_exited();
                     }
                     Ok((pid, handle.pty.replace(pty)))
                 }
-                // The row ended while the screen started: the unit owns its
-                // processes, so the PTY is only released here.
-                (Ok(pty), _, _) => Err((
-                    Some(pty),
+                // The row ended, or its ending was marked, while the screen
+                // started: the new screen belongs to nobody, so it is killed
+                // (unless its exit was already taken).
+                (Ok(pty), _, settled) => Err((
+                    Some((pty, settled.is_some_and(|(_, exit_seen)| exit_seen))),
                     io::Error::new(
                         io::ErrorKind::NotFound,
                         format!("terminal {terminal_id} ended during its screen replacement"),
@@ -4520,23 +4612,35 @@ impl TerminalRegistry {
         };
         let (pid, old) = match installed {
             Ok(installed) => installed,
-            Err((orphan, err)) => {
-                if let Some(orphan) = orphan {
-                    drop_pty_detached(terminal_id, orphan);
+            Err((refused, err)) => {
+                if let Some((mut pty, exit_seen)) = refused {
+                    let pid = pty.pid();
+                    if !exit_seen {
+                        pty.kill();
+                    }
+                    unit_log!(
+                        warn,
+                        &keys,
+                        terminal_id,
+                        "terminal.screen_replacement_refused",
+                        screen_generation = generation,
+                        pid = pid.unwrap_or(0),
+                        signalled = !exit_seen,
+                        "the row ended while its new screen started; the new screen is not installed"
+                    );
+                    drop_pty_detached(terminal_id, &keys, pty);
                 }
                 return Err(err);
             }
         };
         if let Some(old) = old {
-            drop_pty_detached(terminal_id, old);
+            drop_pty_detached(terminal_id, &keys, old);
         }
-        tracing::info!(
-            target: "freshell_unit",
-            event = "terminal.screen_replaced",
-            unit_id = %placement.unit_id,
-            provider = %mode,
-            terminal_id = %terminal_id,
-            operation_id = "",
+        unit_log!(
+            info,
+            &keys,
+            terminal_id,
+            "terminal.screen_replaced",
             screen_generation = generation,
             quick_screen_restarts = restarts,
             pid = pid.unwrap_or(0),
@@ -4546,8 +4650,9 @@ impl TerminalRegistry {
     }
 
     /// The first half of [`Self::replace_screen`], under the registry and
-    /// row locks: check the cap and reserve the next screen generation (so
-    /// the new screen's exit is recognised however early it comes).
+    /// row locks: check that the row can take a new screen and the cap, and
+    /// reserve the next screen generation (so the new screen's exit is
+    /// recognised however early it comes).
     fn reserve_screen(
         &self,
         terminal_id: &str,
@@ -4560,21 +4665,37 @@ impl TerminalRegistry {
             )
         })?;
         let mut s = handle.shared.lock().expect("terminal lock");
-        let running = s.status == TerminalRunStatus::Running;
-        let (stream_id, mode, cols, rows, first_seq) = (
+        let (stream_id, mode, cols, rows, first_seq, status, ending, keys) = (
             s.stream_id.clone(),
             s.mode.clone(),
             s.cols,
             s.rows,
             s.head_seq + 1,
+            s.status,
+            s.ending,
+            UnitLogKeys::of(&s),
         );
-        let unit = s.unit.as_mut().filter(|unit| running && !unit.replacing);
-        let Some(unit) = unit else {
-            return Err(io::Error::new(
+        let refused = |reason: &str| {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("terminal {terminal_id} is not a running unit row ready for a new screen"),
-            ));
+                format!("terminal {terminal_id} cannot take a new screen: {reason}"),
+            )
         };
+        let Some(unit) = s.unit.as_mut() else {
+            return Err(refused("it is not a unit row"));
+        };
+        if status != TerminalRunStatus::Running {
+            return Err(refused("the row has ended"));
+        }
+        if ending.is_some() {
+            return Err(refused("the row is ending"));
+        }
+        if unit.replacing {
+            return Err(refused("another replacement is in progress"));
+        }
+        if !unit.screen_exit_seen {
+            return Err(refused("its screen has not exited"));
+        }
         let now = now_ms();
         let window = self.respawn_liveness_window_ms.load(Ordering::Relaxed);
         let restarts = if now.saturating_sub(unit.screen_started_at) < window {
@@ -4600,6 +4721,7 @@ impl TerminalRegistry {
             ring_max_bytes: unit.ring_max_bytes,
             generation: unit.screen_generation,
             restarts,
+            keys,
         };
         drop(s);
         Ok((Arc::clone(&handle.shared), reservation))
@@ -6784,6 +6906,7 @@ struct ScreenReservation {
     ring_max_bytes: Option<i64>,
     generation: u32,
     restarts: u32,
+    keys: UnitLogKeys,
 }
 
 /// What a screen exit means for its row ([`screen_exited`]).
@@ -6816,22 +6939,24 @@ fn screen_exited(
     let (unit, ending) = {
         let mut s = handle.shared.lock().expect("terminal lock");
         let ending = s.ending;
-        let unit = s.unit.as_mut().map(|unit| {
+        let keys = s.unit.is_some().then(|| UnitLogKeys::of(&s));
+        let unit = s.unit.as_mut().zip(keys).map(|(unit, keys)| {
             let current = unit.screen_generation;
             if generation.is_none_or(|exiting| exiting == current) {
                 unit.screen_exit_seen = true;
             }
-            (unit.unit_id.clone(), current)
+            (keys, current)
         });
         (unit, ending)
     };
-    if let (Some((unit_id, current)), Some(exiting)) = (&unit, generation) {
+    if let (Some((keys, current)), Some(exiting)) = (&unit, generation) {
         if exiting != *current {
-            tracing::debug!(
-                target: "freshell_unit",
-                event = "terminal.stale_screen_exit_ignored",
-                unit_id = %unit_id,
-                terminal_id = %terminal_id,
+            drop(inner);
+            unit_log!(
+                debug,
+                keys,
+                terminal_id,
+                "terminal.stale_screen_exit_ignored",
                 screen_generation = exiting,
                 current_generation = *current,
                 exit_code,
@@ -6852,10 +6977,10 @@ fn screen_exited(
     }
     match unit {
         None => ScreenExit::Plain(Arc::clone(&handle.shared)),
-        Some((unit_id, screen_generation)) => {
+        Some((keys, screen_generation)) => {
             ScreenExit::Unit(ending.is_none().then(|| UnitScreenExit {
                 terminal_id: terminal_id.to_string(),
-                unit_id,
+                unit_id: keys.unit_id,
                 exit_code,
                 screen_generation,
             }))
@@ -6879,7 +7004,7 @@ fn fire_unit_screen_exit(
 /// process holding the PTY slave closes it (a stuck, escaped or spared
 /// process can hold it indefinitely). Used where the unit, not the PTY
 /// handle, owns the processes: Gone publication and screen replacement.
-fn drop_pty_detached(terminal_id: &str, mut pty: PtyTerminal) {
+fn drop_pty_detached(terminal_id: &str, keys: &UnitLogKeys, mut pty: PtyTerminal) {
     pty.mark_naturally_exited();
     let slot = Arc::new(Mutex::new(Some(pty)));
     let held = Arc::clone(&slot);
@@ -6887,10 +7012,11 @@ fn drop_pty_detached(terminal_id: &str, mut pty: PtyTerminal) {
         .name(format!("pty-drop-{terminal_id}"))
         .spawn(move || drop(held.lock().expect("pty drop slot").take()));
     if let Err(err) = spawned {
-        tracing::error!(
-            target: "freshell_unit",
-            event = "terminal.pty_drop_detach_failed",
-            terminal_id = %terminal_id,
+        unit_log!(
+            error,
+            keys,
+            terminal_id,
+            "terminal.pty_drop_detach_failed",
             error = %err,
             "no thread to drop the PTY handle on; it is leaked instead of joined inline"
         );
@@ -7394,8 +7520,10 @@ pub(crate) struct RekeyInterlock {
 #[cfg(test)]
 impl RekeyInterlock {
     /// Arm the park for one terminal id — only that id parks. Re-arming
-    /// resets the arrival flag.
+    /// resets the arrival flag and closes the gate a previous release
+    /// opened, so the interlock can be used again.
     pub(crate) fn arm(&self, terminal_id: &str) {
+        *self.gate.lock().expect("interlock gate") = false;
         *self.target.lock().expect("interlock target") = Some(terminal_id.to_string());
         self.reached
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -7446,7 +7574,7 @@ mod tests {
     // `freshell-server`'s `logging::init` owns that (frozen, out of scope
     // here). This proves the lifecycle events fire with the documented
     // fields; the JSONL formatting itself is `freshell-server`'s concern.
-    mod tracing_capture {
+    pub(super) mod tracing_capture {
         use std::collections::BTreeMap;
         use std::sync::{Arc, Mutex};
         use tracing::field::{Field, Visit};
@@ -7457,6 +7585,9 @@ mod tests {
 
         #[derive(Debug, Clone, Default)]
         pub struct CapturedEvent {
+            /// Read by the Linux-only unit-row tests (`freshell_unit` lines).
+            #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+            pub target: String,
             pub message: String,
             pub fields: BTreeMap<String, String>,
         }
@@ -7519,6 +7650,7 @@ mod tests {
                     .lock()
                     .expect("capture lock")
                     .push(CapturedEvent {
+                        target: event.metadata().target().to_string(),
                         message: visitor.message,
                         fields: visitor.fields,
                     });
