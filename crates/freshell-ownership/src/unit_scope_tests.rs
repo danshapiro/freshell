@@ -105,6 +105,41 @@ fn wait_settled_is_woken_synchronously_by_the_gone_commit() {
     }
 }
 
+/// A wait polled again before anything changed (a `select!` loop whose
+/// other branch keeps firing) keeps ONE parked waker, not one per poll,
+/// and each parked wait is woken once.
+#[test]
+fn a_pending_wait_polled_again_parks_one_waker() {
+    let reg = Arc::new(RuntimeOwnershipRegistry::with_epoch(7));
+    make_live(&reg, "a", owner("T1", "u1"));
+    reg.begin_unit_stop("u1", "op-kill", "test", NOW);
+
+    let counter = Arc::new(CountingWaker::default());
+    let waker = Waker::from(Arc::clone(&counter));
+    let mut cx = Context::from_waker(&waker);
+    let mut first = std::pin::pin!(reg.wait_settled("codex", "a"));
+    let mut second = std::pin::pin!(reg.wait_settled("codex", "a"));
+    for _ in 0..5 {
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+    }
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(
+        reg.waiters.lock().unwrap().len(),
+        2,
+        "one parked waker per wait, however often it is polled"
+    );
+
+    reg.commit_unit_stop("u1", "op-kill");
+    assert_eq!(
+        counter.0.load(Ordering::SeqCst),
+        2,
+        "the Gone commit wakes each parked wait once"
+    );
+    assert!(reg.waiters.lock().unwrap().is_empty());
+    assert!(first.as_mut().poll(&mut cx).is_ready());
+    assert!(second.as_mut().poll(&mut cx).is_ready());
+}
+
 #[test]
 fn a_second_stop_on_a_stopping_key_is_told_to_join() {
     let reg = RuntimeOwnershipRegistry::with_epoch(7);
@@ -272,6 +307,15 @@ fn a_joining_unit_stop_moves_new_keys_under_the_in_flight_operation() {
 #[test]
 fn boot_seeds_stopping_and_the_finish_vacates() {
     let reg = RuntimeOwnershipRegistry::with_epoch(7);
+    let no_unit = OwnerIdentity {
+        terminal_id: Some("T1".into()),
+        ..OwnerIdentity::default()
+    };
+    assert!(
+        !reg.restore_stopping("codex", "a", no_unit, "op-boot", "boot", NOW),
+        "a seed must name its unit: no unit commit could ever vacate it"
+    );
+    assert_eq!(reg.observe("codex", "a").state, OwnershipState::Vacant);
     assert!(reg.restore_stopping("codex", "a", owner("T1", "u1"), "op-boot", "boot", NOW));
     assert!(matches!(
         reg.observe("codex", "a").state,
@@ -642,6 +686,102 @@ fn extra_holds_are_typed_and_never_switched_away() {
         "a stopping unit never gains holds"
     );
     assert_eq!(fresh.observe("codex", "late").state, OwnershipState::Vacant);
+}
+
+/// A hold that arrives after the unit reached Gone (a notification its
+/// app-server sent before it died, handled after the commit) is refused,
+/// so no dead unit owns a thread and a reopen never adopts a dead pane. A
+/// unit whose stop began while it held no key is refused the same way.
+#[test]
+fn a_unit_whose_stop_began_or_finished_never_gains_holds() {
+    let reg = RuntimeOwnershipRegistry::with_epoch(7);
+    make_live(&reg, "root", owner("T1", "u1"));
+    reg.begin_unit_stop("u1", "op-kill", "test", NOW);
+    reg.commit_unit_stop("u1", "op-kill");
+    assert!(
+        matches!(
+            reg.hold_extra("codex", "late", owner("T1", "u1"), "test", NOW),
+            HoldOutcome::Skipped {
+                state: OwnershipState::Vacant
+            }
+        ),
+        "a unit that reached Gone never gains holds"
+    );
+    assert_eq!(reg.observe("codex", "late").state, OwnershipState::Vacant);
+    assert!(
+        matches!(
+            reg.begin_start(
+                "codex",
+                "late",
+                RuntimeOwnerKind::Terminal,
+                "op-reopen",
+                None,
+                "test",
+                NOW
+            ),
+            BeginOutcome::Granted { .. }
+        ),
+        "a reopen of the thread starts it; it never adopts the dead unit"
+    );
+
+    // A unit stopped while it held no key at all.
+    assert!(reg
+        .begin_unit_stop("u2", "op-kill-2", "test", NOW)
+        .is_empty());
+    assert!(
+        matches!(
+            reg.hold_extra("codex", "racing", owner("T2", "u2"), "test", NOW),
+            HoldOutcome::Skipped {
+                state: OwnershipState::Vacant
+            }
+        ),
+        "a unit whose stop began never gains holds, even with no Stopping key"
+    );
+    assert!(reg.commit_unit_stop("u2", "op-kill-2").is_empty());
+    assert!(matches!(
+        reg.hold_extra("codex", "racing", owner("T2", "u2"), "test", NOW),
+        HoldOutcome::Skipped { .. }
+    ));
+    assert_eq!(reg.observe("codex", "racing").state, OwnershipState::Vacant);
+
+    // A boot-seeded unit whose stop is committed without a begin.
+    assert!(reg.restore_stopping("codex", "seeded", owner("T4", "u4"), "op-boot", "boot", NOW));
+    assert_eq!(
+        session_ids(&reg.commit_unit_stop("u4", "op-boot")),
+        vec!["seeded"]
+    );
+    assert!(matches!(
+        reg.hold_extra("codex", "seeded-late", owner("T4", "u4"), "test", NOW),
+        HoldOutcome::Skipped { .. }
+    ));
+
+    // Other units are unaffected.
+    assert!(matches!(
+        reg.hold_extra("codex", "helper", owner("T3", "u3"), "test", NOW),
+        HoldOutcome::Held { .. }
+    ));
+}
+
+/// The registry remembers only the most recent ended units, so a
+/// long-running server's memory stays flat; the newest are still refused.
+#[test]
+fn the_memory_of_ended_units_is_bounded() {
+    let reg = RuntimeOwnershipRegistry::with_epoch(7);
+    for i in 0..ENDED_UNIT_MEMORY + 10 {
+        let unit = format!("u-ended-{i}");
+        reg.begin_unit_stop(&unit, "op-kill", "test", NOW);
+        reg.commit_unit_stop(&unit, "op-kill");
+    }
+    assert_eq!(reg.ended_units.lock().unwrap().len(), ENDED_UNIT_MEMORY);
+    let newest = format!("u-ended-{}", ENDED_UNIT_MEMORY + 9);
+    assert!(matches!(
+        reg.hold_extra("codex", "late", owner("T1", &newest), "test", NOW),
+        HoldOutcome::Skipped { .. }
+    ));
+    assert!(matches!(
+        reg.hold_extra("codex", "first", owner("T1", "u-ended-0"), "test", NOW),
+        HoldOutcome::Held { .. }
+    ));
 }
 
 #[test]

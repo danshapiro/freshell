@@ -73,7 +73,8 @@
 //!   conversation as `HoldKind::Main`, threads its agent process holds
 //!   besides it as `HoldKind::Extra`); `begin_unit_stop` /
 //!   `commit_unit_stop` move all of them together, and a persisted
-//!   Stopping unit is seeded back at boot by `restore_stopping`.
+//!   Stopping unit is seeded back at boot by `restore_stopping`. A unit
+//!   whose stop began or reached Gone never gains another hold.
 //! - Waiting is event-driven: `wait_settled` registers a waker under the
 //!   records lock; every mutating scope wakes parked waiters when it ends.
 //!   No timers, no polling.
@@ -1019,6 +1020,7 @@ impl AttachGuard {
         let mut released_from_kind = None;
         let mut released_runtime_id = None;
         let mut released_pid = None;
+        let mut released = false;
         if let Some(record) = inner.get_mut(&key) {
             // b8ke ext r32 F1: the identified window closes with the
             // count (the holder's exemption list stays in lockstep). A
@@ -1032,6 +1034,7 @@ impl AttachGuard {
             {
                 record.armed_attach_ops.remove(pos);
                 record.in_flight_attaches = record.in_flight_attaches.saturating_sub(1);
+                released = true;
             }
             if let OwnershipState::Live { owner, .. } = &record.state {
                 released_from_kind = Some(owner.kind);
@@ -1040,6 +1043,25 @@ impl AttachGuard {
             }
         }
         let duration_ms = now_epoch_ms().saturating_sub(self.armed_at_ms);
+        // A window the unit's Gone commit already cleared has nothing left
+        // to release; the line says so instead of claiming a release.
+        let (outcome, message) = if released {
+            (
+                "released",
+                format!(
+                    "released after {duration_ms}ms — the key's window is closed and blocked \
+                     lifecycle operations may retry"
+                ),
+            )
+        } else {
+            (
+                "already-cleared",
+                format!(
+                    "dropped after {duration_ms}ms — its window was already cleared by the \
+                     unit's Gone commit, nothing is released"
+                ),
+            )
+        };
         tracing::info!(target: "freshell_ownership",
             event = "ownership.attach_guard.released",
             operation_id = %self.operation_id, provider = %self.provider,
@@ -1049,9 +1071,8 @@ impl AttachGuard {
             runtime_id = ?released_runtime_id, pid = ?released_pid,
             epoch = self.registry.epoch, generation = self.generation,
             duration_ms,
-            outcome = "released", failure_reason = "",
-            "the attach guard released after {duration_ms}ms — the key's window \
-             is closed and blocked lifecycle operations may retry");
+            outcome, failure_reason = "",
+            "the attach guard {message}");
     }
 }
 
@@ -1185,10 +1206,35 @@ impl Drop for OperationTicket {
 pub struct RuntimeOwnershipRegistry {
     epoch: u64,
     inner: Mutex<HashMap<SessionKey, SessionRecord>>,
-    /// Parked [`SettledWait`] futures. Woken (all of them; each re-checks
-    /// its own key) whenever a mutating lock scope ends. No timers, no
-    /// polling.
-    waiters: Mutex<Vec<std::task::Waker>>,
+    /// Parked [`SettledWait`] futures, one waker per wait (keyed by the
+    /// wait's slot, so a wait polled again replaces its own waker). Woken
+    /// (all of them; each re-checks its own key) whenever a mutating lock
+    /// scope ends. No timers, no polling.
+    waiters: Mutex<HashMap<u64, std::task::Waker>>,
+    /// The slot the next [`SettledWait`] parks under.
+    next_waiter: AtomicU64,
+    /// Units whose stop began or reached Gone, most recent last (at most
+    /// [`ENDED_UNIT_MEMORY`]): such a unit never gains a hold again. Read
+    /// and written only while the records lock is held (lock order: records,
+    /// then this), so a hold and the stop or commit that ends its unit are
+    /// ordered.
+    ended_units: Mutex<std::collections::VecDeque<String>>,
+}
+
+/// How many ended units the registry remembers. Unit ids are minted once
+/// and an ended unit never runs again, so a hold for one can only be a
+/// notification its agent sent before it died, handled moments later;
+/// remembering the most recent units covers that and keeps memory flat on
+/// a long-running server.
+const ENDED_UNIT_MEMORY: usize = 1024;
+
+/// The plain log value of an owner kind: its wire name, `""` when absent.
+fn kind_label(kind: Option<RuntimeOwnerKind>) -> &'static str {
+    match kind {
+        Some(RuntimeOwnerKind::Terminal) => "terminal",
+        Some(RuntimeOwnerKind::FreshAgent) => "fresh-agent",
+        None => "",
+    }
 }
 
 /// The records lock taken by every MUTATING scope
@@ -1198,7 +1244,7 @@ pub struct RuntimeOwnershipRegistry {
 /// the committed state.
 struct RecordsGuard<'a> {
     guard: Option<std::sync::MutexGuard<'a, HashMap<SessionKey, SessionRecord>>>,
-    waiters: &'a Mutex<Vec<std::task::Waker>>,
+    waiters: &'a Mutex<HashMap<u64, std::task::Waker>>,
 }
 
 impl std::ops::Deref for RecordsGuard<'_> {
@@ -1224,7 +1270,7 @@ impl Drop for RecordsGuard<'_> {
         // and takes it immediately.
         drop(self.guard.take());
         let wakers = std::mem::take(&mut *self.waiters.lock().expect("waiters lock poisoned"));
-        for waker in wakers {
+        for waker in wakers.into_values() {
             waker.wake();
         }
     }
@@ -1268,10 +1314,14 @@ fn by_session_id(a: &SessionKey, b: &SessionKey) -> std::cmp::Ordering {
 
 /// Event-driven wait for a key to settle
 /// ([`RuntimeOwnershipRegistry::wait_settled`]): resolves with the first
-/// snapshot whose state is not Starting / Handoff / Stopping.
+/// snapshot whose state is not Starting / Handoff / Stopping. It has no
+/// deadline of its own; the caller bounds or cancels it.
+#[must_use = "a SettledWait does nothing unless it is awaited or polled"]
 pub struct SettledWait {
     registry: Arc<RuntimeOwnershipRegistry>,
     key: SessionKey,
+    /// This wait's entry in the registry's parked wakers.
+    slot: u64,
 }
 
 impl std::future::Future for SettledWait {
@@ -1297,11 +1347,12 @@ impl std::future::Future for SettledWait {
             },
         };
         if in_progress(&snapshot.state) {
+            // One entry per wait: a poll before the next wake replaces it.
             self.registry
                 .waiters
                 .lock()
                 .expect("waiters lock poisoned")
-                .push(cx.waker().clone());
+                .insert(self.slot, cx.waker().clone());
             std::task::Poll::Pending
         } else {
             std::task::Poll::Ready(snapshot)
@@ -1329,7 +1380,9 @@ impl RuntimeOwnershipRegistry {
         Self {
             epoch,
             inner: Mutex::new(HashMap::new()),
-            waiters: Mutex::new(Vec::new()),
+            waiters: Mutex::new(HashMap::new()),
+            next_waiter: AtomicU64::new(0),
+            ended_units: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -1349,11 +1402,41 @@ impl RuntimeOwnershipRegistry {
     /// scope ends; it never polls on a timer. The caller resolves a stale
     /// id to its canonical key ([`Self::resolve_canonical`]) before
     /// waiting.
+    ///
+    /// The wait has NO deadline of its own: a unit's key stays Stopping
+    /// until its Gone is confirmed, however long that takes. Every caller
+    /// bounds it (a timeout) or runs it in a spawned task it cancels with
+    /// its request, and never awaits it inline in a shared loop.
     pub fn wait_settled(self: &Arc<Self>, provider: &str, session_id: &str) -> SettledWait {
         SettledWait {
             registry: Arc::clone(self),
             key: SessionKey::new(provider, session_id),
+            slot: self.next_waiter.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Remember that `unit_id`'s stop began or reached Gone (the records
+    /// lock must be held), forgetting the oldest beyond
+    /// [`ENDED_UNIT_MEMORY`].
+    fn remember_ended_unit(&self, unit_id: &str) {
+        let mut ended = self.ended_units.lock().expect("ended units lock poisoned");
+        if ended.iter().any(|id| id == unit_id) {
+            return;
+        }
+        ended.push_back(unit_id.to_string());
+        if ended.len() > ENDED_UNIT_MEMORY {
+            ended.pop_front();
+        }
+    }
+
+    /// Whether `unit_id`'s stop began or reached Gone (the records lock
+    /// must be held).
+    fn unit_has_ended(&self, unit_id: &str) -> bool {
+        self.ended_units
+            .lock()
+            .expect("ended units lock poisoned")
+            .iter()
+            .any(|id| id == unit_id)
     }
 
     /// The boot epoch (round-2 review): fenced comparisons use
@@ -2243,8 +2326,9 @@ impl RuntimeOwnershipRegistry {
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.handoff.extra_hold_adopt",
                     operation_id, provider, session_id, initiator,
-                    from_kind = ?Some(owner.kind), to_kind = ?Some(to_kind),
-                    runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                    from_kind = kind_label(Some(owner.kind)), to_kind = kind_label(Some(to_kind)),
+                    runtime_id = owner.terminal_id.as_deref().unwrap_or(""),
+                    pid = owner.pid.unwrap_or(0),
                     epoch = self.epoch, generation,
                     duration_ms = 0u64,
                     outcome = "adopt-live", failure_reason = "",
@@ -3926,7 +4010,9 @@ impl RuntimeOwnershipRegistry {
     /// of them), so the one [`Self::commit_unit_stop`] at Gone covers the
     /// whole unit. A kill always wins over an attach guard (logged
     /// `attach_in_flight=true`). `Aliased` keys carry no owner and are
-    /// never touched. The result is sorted by session id.
+    /// never touched. The result is sorted by session id. From here on
+    /// the unit never gains a hold ([`Self::hold_extra`]), even when it
+    /// holds no key yet.
     pub fn begin_unit_stop(
         &self,
         unit_id: &str,
@@ -3935,6 +4021,7 @@ impl RuntimeOwnershipRegistry {
         now_ms: u64,
     ) -> Vec<UnitStopKey> {
         let mut inner = self.lock_records();
+        self.remember_ended_unit(unit_id);
         let effective_op = {
             let mut in_flight: Vec<(&SessionKey, &str)> = inner
                 .iter()
@@ -3998,15 +4085,16 @@ impl RuntimeOwnershipRegistry {
                 initiator: initiator.to_string(),
                 since_ms: now_ms,
             };
+            let terminal_id = owner.terminal_id.as_deref().unwrap_or("");
             tracing::info!(target: "freshell_ownership",
                 event = "ownership.stop.begin", operation_id = %effective_op,
                 provider = %key.provider, session_id = %key.session_id, initiator,
-                from_kind = ?owner.kind, to_kind = ?Option::<RuntimeOwnerKind>::None,
-                runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                from_kind = kind_label(Some(owner.kind)), to_kind = kind_label(None),
+                runtime_id = terminal_id, pid = owner.pid.unwrap_or(0),
                 epoch = self.epoch, generation = record.generation,
                 duration_ms = now_ms.saturating_sub(prior_since_ms),
                 outcome = "granted", failure_reason = "",
-                unit_id, terminal_id = owner.terminal_id.as_deref().unwrap_or(""),
+                unit_id, terminal_id,
                 from_state, attach_in_flight = record.in_flight_attaches > 0,
                 requested_operation_id = operation_id,
                 "the unit's stop moved this key to Stopping");
@@ -4027,9 +4115,11 @@ impl RuntimeOwnershipRegistry {
     /// Vacant key stays blocked by a window the kill already won. Returns
     /// the vacated keys, sorted by session id, with their POST-COMMIT
     /// generation: the pair a fenced `begin_start` accepts (the one a
-    /// crash event built at Gone must carry).
+    /// crash event built at Gone must carry). The unit never gains a hold
+    /// afterwards ([`Self::hold_extra`]).
     pub fn commit_unit_stop(&self, unit_id: &str, operation_id: &str) -> Vec<UnitStopKey> {
         let mut inner = self.lock_records();
+        self.remember_ended_unit(unit_id);
         let mut keys = Vec::new();
         for (key, record) in inner.iter_mut() {
             let OwnershipState::Stopping {
@@ -4053,15 +4143,16 @@ impl RuntimeOwnershipRegistry {
             record.state = OwnershipState::Vacant;
             record.in_flight_attaches = 0;
             record.armed_attach_ops.clear();
+            let terminal_id = owner.terminal_id.as_deref().unwrap_or("");
             tracing::info!(target: "freshell_ownership",
                 event = "ownership.stop.commit", operation_id,
                 provider = %key.provider, session_id = %key.session_id,
                 initiator = %initiator,
-                from_kind = ?owner.kind, to_kind = ?Option::<RuntimeOwnerKind>::None,
-                runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                from_kind = kind_label(Some(owner.kind)), to_kind = kind_label(None),
+                runtime_id = terminal_id, pid = owner.pid.unwrap_or(0),
                 epoch = self.epoch, generation = record.generation,
                 duration_ms, outcome = "committed", failure_reason = "",
-                unit_id, terminal_id = owner.terminal_id.as_deref().unwrap_or(""),
+                unit_id, terminal_id,
                 attach_guards_cleared,
                 "the unit is Gone — the key is released");
             keys.push(UnitStopKey {
@@ -4082,6 +4173,9 @@ impl RuntimeOwnershipRegistry {
     /// owner holds Live is `HeldByOther`; any other state is `Skipped`.
     /// While any key of the unit is `Stopping`, nothing is held
     /// (`Skipped` carrying that state): a stopping unit never gains holds.
+    /// Nor does a unit whose stop began with no key or already reached
+    /// Gone (`Skipped` carrying the key's state): a notification its agent
+    /// sent before it died must not leave a dead unit owning the thread.
     pub fn hold_extra(
         &self,
         provider: &str,
@@ -4094,28 +4188,35 @@ impl RuntimeOwnershipRegistry {
         let unit_id = owner.unit_id.clone().unwrap_or_default();
         let operation_id = owner.ownership_id.clone().unwrap_or_default();
         let terminal_id = owner.terminal_id.clone().unwrap_or_default();
+        let to_kind = kind_label(Some(owner.kind));
+        let pid = owner.pid.unwrap_or(0);
         let log_refusal = |outcome: &str, failure_reason: &str, generation: u64| {
             tracing::info!(target: "freshell_ownership",
                 event = "ownership.extra.hold", operation_id = %operation_id,
                 provider, session_id, initiator,
-                from_kind = ?Option::<RuntimeOwnerKind>::None, to_kind = ?Some(owner.kind),
-                runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                from_kind = kind_label(None), to_kind,
+                runtime_id = %terminal_id, pid,
                 epoch = self.epoch, generation, duration_ms = 0u64,
                 outcome, failure_reason,
                 unit_id = %unit_id, terminal_id = %terminal_id,
                 "the extra-thread hold was not recorded");
         };
+        let current_state = |inner: &HashMap<SessionKey, SessionRecord>| {
+            inner
+                .get(&SessionKey::new(provider, session_id))
+                .map_or((OwnershipState::Vacant, 0), |record| {
+                    (record.state.clone(), snapshot_generation(record))
+                })
+        };
         if unit_id.is_empty() {
             // A caller bug: an extra hold names the unit that holds it.
-            let state = inner
-                .get(&SessionKey::new(provider, session_id))
-                .map_or(OwnershipState::Vacant, |record| record.state.clone());
+            let (state, generation) = current_state(&inner);
             tracing::warn!(target: "freshell_ownership",
                 event = "ownership.extra.hold", operation_id = %operation_id,
                 provider, session_id, initiator,
-                from_kind = ?Option::<RuntimeOwnerKind>::None, to_kind = ?Some(owner.kind),
-                runtime_id = ?owner.terminal_id, pid = ?owner.pid,
-                epoch = self.epoch, generation = 0u64, duration_ms = 0u64,
+                from_kind = kind_label(None), to_kind,
+                runtime_id = %terminal_id, pid,
+                epoch = self.epoch, generation, duration_ms = 0u64,
                 outcome = "skipped-no-unit", failure_reason = "OWNER_HAS_NO_UNIT",
                 unit_id = "", terminal_id = %terminal_id,
                 "an extra-thread hold must name its unit — nothing is recorded");
@@ -4131,6 +4232,11 @@ impl RuntimeOwnershipRegistry {
         {
             log_refusal("skipped-unit-stopping", "UNIT_STOPPING", 0);
             return HoldOutcome::Skipped { state: stopping };
+        }
+        if self.unit_has_ended(&unit_id) {
+            let (state, generation) = current_state(&inner);
+            log_refusal("skipped-unit-ended", "UNIT_ENDED", generation);
+            return HoldOutcome::Skipped { state };
         }
         let record = inner
             .entry(SessionKey::new(provider, session_id))
@@ -4150,8 +4256,8 @@ impl RuntimeOwnershipRegistry {
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.extra.hold", operation_id = %operation_id,
                     provider, session_id, initiator,
-                    from_kind = ?Option::<RuntimeOwnerKind>::None, to_kind = ?Some(owner.kind),
-                    runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                    from_kind = kind_label(None), to_kind,
+                    runtime_id = %terminal_id, pid,
                     epoch = self.epoch, generation = record.generation, duration_ms = 0u64,
                     outcome = "held", failure_reason = "",
                     unit_id = %unit_id, terminal_id = %terminal_id,
@@ -4174,8 +4280,9 @@ impl RuntimeOwnershipRegistry {
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.extra.hold", operation_id = %operation_id,
                     provider, session_id, initiator,
-                    from_kind = ?Some(held.kind), to_kind = ?Some(owner.kind),
-                    runtime_id = ?held.terminal_id, pid = ?held.pid,
+                    from_kind = kind_label(Some(held.kind)), to_kind,
+                    runtime_id = held.terminal_id.as_deref().unwrap_or(""),
+                    pid = held.pid.unwrap_or(0),
                     epoch = self.epoch, generation = *generation, duration_ms = 0u64,
                     outcome = "held-by-other", failure_reason = "HELD_BY_OTHER",
                     unit_id = %unit_id, terminal_id = %terminal_id,
@@ -4215,15 +4322,16 @@ impl RuntimeOwnershipRegistry {
         let owner = owner.clone();
         let duration_ms = now_epoch_ms().saturating_sub(*since_ms);
         record.state = OwnershipState::Vacant;
+        let terminal_id = owner.terminal_id.as_deref().unwrap_or("");
         tracing::info!(target: "freshell_ownership",
             event = "ownership.extra.release",
             operation_id = owner.ownership_id.as_deref().unwrap_or(""),
             provider, session_id,
-            from_kind = ?Some(owner.kind), to_kind = ?Option::<RuntimeOwnerKind>::None,
-            runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+            from_kind = kind_label(Some(owner.kind)), to_kind = kind_label(None),
+            runtime_id = terminal_id, pid = owner.pid.unwrap_or(0),
             epoch = self.epoch, generation = record.generation, duration_ms,
             outcome = "released", failure_reason = "",
-            unit_id, terminal_id = owner.terminal_id.as_deref().unwrap_or(""),
+            unit_id, terminal_id,
             "the unit no longer holds this extra thread — the key is released");
         true
     }
@@ -4232,7 +4340,9 @@ impl RuntimeOwnershipRegistry {
     /// this boot) key becomes `Stopping { owner: Some(owner),
     /// prior_generation: None, .. }` (generation + 1), so it is never
     /// offered for reuse while the boot finishes the stop. Any other state
-    /// refuses (`false`).
+    /// refuses (`false`), and so does an owner with no `unit_id` (WARN
+    /// `OWNER_HAS_NO_UNIT`): only the unit's own commit vacates the seed,
+    /// so a seed with no unit would block the key for good.
     pub fn restore_stopping(
         &self,
         provider: &str,
@@ -4243,17 +4353,34 @@ impl RuntimeOwnershipRegistry {
         now_ms: u64,
     ) -> bool {
         let mut inner = self.lock_records();
-        let record = inner
-            .entry(SessionKey::new(provider, session_id))
-            .or_default();
+        let key = SessionKey::new(provider, session_id);
         let unit_id = owner.unit_id.as_deref().unwrap_or("");
         let terminal_id = owner.terminal_id.as_deref().unwrap_or("");
+        let pid = owner.pid.unwrap_or(0);
+        if unit_id.is_empty() {
+            // A caller bug: a boot seed names the unit whose stop it finishes.
+            let (from_kind, generation) = inner.get(&key).map_or((None, 0), |record| {
+                (record.state.kind(), snapshot_generation(record))
+            });
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.stop.restored", operation_id, provider, session_id,
+                initiator,
+                from_kind = kind_label(from_kind), to_kind = kind_label(None),
+                runtime_id = terminal_id, pid,
+                epoch = self.epoch, generation,
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "OWNER_HAS_NO_UNIT",
+                unit_id, terminal_id,
+                "a persisted Stopping seed must name its unit — nothing is seeded");
+            return false;
+        }
+        let record = inner.entry(key).or_default();
         if record.state != OwnershipState::Vacant {
             tracing::warn!(target: "freshell_ownership",
                 event = "ownership.stop.restored", operation_id, provider, session_id,
                 initiator,
-                from_kind = ?record.state.kind(), to_kind = ?Option::<RuntimeOwnerKind>::None,
-                runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                from_kind = kind_label(record.state.kind()), to_kind = kind_label(None),
+                runtime_id = terminal_id, pid,
                 epoch = self.epoch, generation = snapshot_generation(record),
                 duration_ms = 0u64,
                 outcome = "refused", failure_reason = "KEY_NOT_VACANT",
@@ -4274,8 +4401,8 @@ impl RuntimeOwnershipRegistry {
         tracing::info!(target: "freshell_ownership",
             event = "ownership.stop.restored", operation_id, provider, session_id,
             initiator,
-            from_kind = ?Some(owner.kind), to_kind = ?Option::<RuntimeOwnerKind>::None,
-            runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+            from_kind = kind_label(Some(owner.kind)), to_kind = kind_label(None),
+            runtime_id = terminal_id, pid,
             epoch = self.epoch, generation = record.generation,
             duration_ms = 0u64,
             outcome = "stopping", failure_reason = "",
@@ -4426,9 +4553,10 @@ impl RuntimeOwnershipRegistry {
                         operation_id = %operation_id, provider = %key.provider,
                         session_id = %key.session_id,
                         initiator = %initiator,
-                        from_kind = ?Some(unit_owner.kind),
-                        to_kind = ?Option::<RuntimeOwnerKind>::None,
-                        runtime_id = ?unit_owner.terminal_id, pid = ?unit_owner.pid,
+                        from_kind = kind_label(Some(unit_owner.kind)),
+                        to_kind = kind_label(None),
+                        runtime_id = unit_owner.terminal_id.as_deref().unwrap_or(""),
+                        pid = unit_owner.pid.unwrap_or(0),
                         epoch = self.epoch, generation,
                         duration_ms = now_ms.saturating_sub(since_ms),
                         outcome = "skipped",
@@ -10536,27 +10664,7 @@ mod tests {
             unit_id: Some(unit_id.into()),
             ..OwnerIdentity::default()
         };
-        let BeginOutcome::Granted { generation } = r.begin_start(
-            PROVIDER,
-            "sid-unit-main",
-            RuntimeOwnerKind::Terminal,
-            "op-unit-start",
-            None,
-            "test",
-            18_000,
-        ) else {
-            panic!("expected Granted")
-        };
-        assert_eq!(
-            r.commit_live(
-                PROVIDER,
-                "sid-unit-main",
-                "op-unit-start",
-                generation,
-                unit_owner.clone()
-            ),
-            CommitOutcome::Committed
-        );
+        make_unit_live(r, "sid-unit-main", unit_id, terminal_id);
         assert!(matches!(
             r.hold_extra(
                 PROVIDER,
@@ -10662,6 +10770,262 @@ mod tests {
                         ));
                     }
                 }
+                plain_owner_fields(event)?;
+                for (key, expected) in [("runtime_id", "t-keys"), ("pid", "0")] {
+                    if event.values.get(key).map(String::as_str) != Some(expected) {
+                        return Err(format!(
+                            "{name} must write {key}={expected} — got {:?}",
+                            event.values
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The owner fields every unit-scoped ownership event writes as PLAIN
+    /// values (Global Constraints): kinds by their wire name, an absent
+    /// string or kind as `""`, an absent pid as `0` — never a `?`-formatted
+    /// `Option` such as `Some("T1")` or `None`.
+    fn plain_owner_fields(event: &CapturedEvent) -> Result<(), String> {
+        let name = event.event.as_deref().unwrap_or("<unnamed>");
+        for field in ["from_kind", "to_kind", "runtime_id", "pid"] {
+            let Some(value) = event.values.get(field) else {
+                return Err(format!("{name} must carry {field}"));
+            };
+            if value.starts_with("Some(") || value == "None" {
+                return Err(format!(
+                    "{name} must write {field} as a plain value — got {value:?}"
+                ));
+            }
+        }
+        for field in ["from_kind", "to_kind"] {
+            let value = event.values[field].as_str();
+            if !["terminal", "fresh-agent", ""].contains(&value) {
+                return Err(format!(
+                    "{name} must write {field} as the kind's wire name or \"\" — got {value:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drive `sid` Live for `unit_id` (owner terminal `terminal_id`)
+    /// through the ordinary start path.
+    fn make_unit_live(r: &RuntimeOwnershipRegistry, sid: &str, unit_id: &str, terminal_id: &str) {
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            sid,
+            RuntimeOwnerKind::Terminal,
+            "op-unit-start",
+            None,
+            "test",
+            19_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        let owner = OwnerIdentity {
+            terminal_id: Some(terminal_id.into()),
+            unit_id: Some(unit_id.into()),
+            ..OwnerIdentity::default()
+        };
+        assert_eq!(
+            r.commit_live(PROVIDER, sid, "op-unit-start", generation, owner),
+            CommitOutcome::Committed
+        );
+    }
+
+    /// codex-pane-lifecycle Task 8 fix: the refused unit-scoped requests
+    /// (a hold for a unit that already reached Gone, a hold or a boot seed
+    /// naming no unit, a seed on a held key, a hold another unit owns) are
+    /// each logged with their outcome, reason and severity, and with plain
+    /// owner values.
+    #[test]
+    fn unit_scoped_refusals_are_logged_with_plain_values() {
+        let mut last_problem = String::new();
+        for attempt in 0..3 {
+            match run_unit_refusals_once() {
+                Ok(()) => return,
+                Err(problem) => {
+                    eprintln!(
+                        "unit-refusals attempt {attempt} incomplete ({problem}); retrying with \
+                         a fresh capture"
+                    );
+                    last_problem = problem;
+                }
+            }
+        }
+        panic!("{last_problem}");
+    }
+
+    fn run_unit_refusals_once() -> Result<(), String> {
+        let r = RuntimeOwnershipRegistry::new();
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+        let owner_of = |unit: Option<&str>, terminal: &str| OwnerIdentity {
+            terminal_id: Some(terminal.into()),
+            unit_id: unit.map(str::to_string),
+            ..OwnerIdentity::default()
+        };
+
+        make_unit_live(&r, "sid-ref-root", "u-ref", "t-ref");
+        r.begin_unit_stop("u-ref", "op-ref-kill", "test", 19_100);
+        r.commit_unit_stop("u-ref", "op-ref-kill");
+        r.hold_extra(
+            PROVIDER,
+            "sid-ref-late",
+            owner_of(Some("u-ref"), "t-ref"),
+            "test",
+            19_200,
+        );
+        r.hold_extra(
+            PROVIDER,
+            "sid-ref-nounit",
+            owner_of(None, "t-ref"),
+            "test",
+            19_300,
+        );
+        r.restore_stopping(
+            PROVIDER,
+            "sid-ref-seed",
+            owner_of(None, "t-ref"),
+            "op-ref-boot",
+            "boot",
+            19_400,
+        );
+        make_unit_live(&r, "sid-ref-held", "u-ref-2", "t-ref-2");
+        r.restore_stopping(
+            PROVIDER,
+            "sid-ref-held",
+            owner_of(Some("u-ref-3"), "t-ref-3"),
+            "op-ref-boot-2",
+            "boot",
+            19_500,
+        );
+        r.hold_extra(
+            PROVIDER,
+            "sid-ref-held",
+            owner_of(Some("u-ref-3"), "t-ref-3"),
+            "test",
+            19_600,
+        );
+
+        let events = capture.events();
+        for (name, sid, level, outcome, reason) in [
+            (
+                "ownership.extra.hold",
+                "sid-ref-late",
+                tracing::Level::INFO,
+                "skipped-unit-ended",
+                "UNIT_ENDED",
+            ),
+            (
+                "ownership.extra.hold",
+                "sid-ref-nounit",
+                tracing::Level::WARN,
+                "skipped-no-unit",
+                "OWNER_HAS_NO_UNIT",
+            ),
+            (
+                "ownership.stop.restored",
+                "sid-ref-seed",
+                tracing::Level::WARN,
+                "refused",
+                "OWNER_HAS_NO_UNIT",
+            ),
+            (
+                "ownership.stop.restored",
+                "sid-ref-held",
+                tracing::Level::WARN,
+                "refused",
+                "KEY_NOT_VACANT",
+            ),
+            (
+                "ownership.extra.hold",
+                "sid-ref-held",
+                tracing::Level::WARN,
+                "held-by-other",
+                "HELD_BY_OTHER",
+            ),
+        ] {
+            let Some(event) = events.iter().find(|e| {
+                e.event.as_deref() == Some(name)
+                    && e.values.get("session_id").map(String::as_str) == Some(sid)
+            }) else {
+                return Err(format!("{name} for {sid} was not logged"));
+            };
+            if event.level != level
+                || event.values.get("outcome").map(String::as_str) != Some(outcome)
+                || event.values.get("failure_reason").map(String::as_str) != Some(reason)
+            {
+                return Err(format!(
+                    "{name} for {sid} must log {level} outcome={outcome} \
+                     failure_reason={reason} — got {} {:?}",
+                    event.level, event.values
+                ));
+            }
+            plain_owner_fields(event)?;
+        }
+        Ok(())
+    }
+
+    /// codex-pane-lifecycle Task 8 fix (N1): a guard whose window the
+    /// unit's Gone commit already cleared releases nothing when it drops,
+    /// and its release line says so; an ordinary drop still reports
+    /// `released`.
+    #[test]
+    fn a_cleared_guard_drop_logs_that_nothing_was_released() {
+        let mut last_problem = String::new();
+        for attempt in 0..3 {
+            match run_cleared_guard_once() {
+                Ok(()) => return,
+                Err(problem) => {
+                    eprintln!(
+                        "cleared-guard attempt {attempt} incomplete ({problem}); retrying with \
+                         a fresh capture"
+                    );
+                    last_problem = problem;
+                }
+            }
+        }
+        panic!("{last_problem}");
+    }
+
+    fn run_cleared_guard_once() -> Result<(), String> {
+        let r = Arc::new(RuntimeOwnershipRegistry::new());
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+        make_unit_live(&r, "sid-n1-gone", "u-n1", "t-n1");
+        make_unit_live(&r, "sid-n1-live", "u-n1-other", "t-n1-other");
+        let arm = |sid: &str, op: &str| match r.begin_attach_guard(PROVIDER, sid, op, None, "test")
+        {
+            AttachGuardOutcome::Armed(guard) => guard,
+            other => panic!("the attach guard arms on a Live key, got {other:?}"),
+        };
+        let cleared = arm("sid-n1-gone", "attach-n1-cleared");
+        let ordinary = arm("sid-n1-live", "attach-n1-ordinary");
+        r.begin_unit_stop("u-n1", "op-n1-kill", "test", 19_700);
+        r.commit_unit_stop("u-n1", "op-n1-kill");
+        drop(cleared);
+        drop(ordinary);
+
+        let events = capture.events();
+        for (op, outcome) in [
+            ("attach-n1-cleared", "already-cleared"),
+            ("attach-n1-ordinary", "released"),
+        ] {
+            let Some(event) = events.iter().find(|e| {
+                e.event.as_deref() == Some("ownership.attach_guard.released")
+                    && e.values.get("operation_id").map(String::as_str) == Some(op)
+            }) else {
+                return Err(format!("the release of {op} was not logged"));
+            };
+            if event.values.get("outcome").map(String::as_str) != Some(outcome) {
+                return Err(format!(
+                    "the release of {op} must log outcome={outcome} — got {:?}",
+                    event.values
+                ));
             }
         }
         Ok(())
