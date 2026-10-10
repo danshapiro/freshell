@@ -2332,17 +2332,23 @@ mod unit_sidecar {
         seed_over(shared_containment(), provider_session)
     }
 
-    /// A lifecycle that records every attempt's unit and reports a start
-    /// cancellation the test sets.
+    /// A lifecycle that records every attempt's unit and every stop started
+    /// through it, and reports a start cancellation the test sets.
     #[derive(Default)]
     struct RecordingLifecycle {
         attempts: Mutex<Vec<AgentUnit>>,
         cancelled: AtomicBool,
+        /// (unit id, initiator) of every stop started through the lifecycle.
+        stops: Mutex<Vec<(String, String)>>,
     }
 
     impl RecordingLifecycle {
         fn attempts(&self) -> Vec<AgentUnit> {
             self.attempts.lock().unwrap().clone()
+        }
+
+        fn stops(&self) -> Vec<(String, String)> {
+            self.stops.lock().unwrap().clone()
         }
     }
 
@@ -2362,6 +2368,10 @@ mod unit_sidecar {
             reason: StopReason,
             initiator: &str,
         ) -> StopHandle {
+            self.stops
+                .lock()
+                .unwrap()
+                .push((unit.id().to_string(), initiator.to_string()));
             unit.stop(StopRequest::new(mode, reason, initiator))
         }
 
@@ -2371,9 +2381,17 @@ mod unit_sidecar {
     }
 
     fn recording_seed(session: &str, lifecycle: Arc<RecordingLifecycle>) -> UnitSeed {
+        recording_seed_over(shared_containment(), session, lifecycle)
+    }
+
+    fn recording_seed_over(
+        containment: Containment,
+        session: &str,
+        lifecycle: Arc<RecordingLifecycle>,
+    ) -> UnitSeed {
         UnitSeed {
             services: CodexUnitServices {
-                containment: shared_containment(),
+                containment,
                 lifecycle,
             },
             label: codex_label(session),
@@ -3006,6 +3024,144 @@ mod unit_sidecar {
             store.load_all().is_empty(),
             "the sidecar record goes after Gone"
         );
+    }
+
+    /// A verified survivor that no longer answers on its recorded URL is
+    /// unusable: its reopened unit is stopped through the seed's lifecycle,
+    /// the reattach waits for Gone, and only then is the record removed
+    /// (review M2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unusable_reattached_sidecar_is_stopped_through_the_seed_and_its_record_removed() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let root = UnitStateRoot::new();
+        let options = || SelectOptions {
+            shim: None,
+            state_root: root.path().to_path_buf(),
+        };
+        let (runtime, _ready) = ready_realistic(
+            json!({"threadStartThreadId": "t-unusable"}),
+            home.path(),
+            store.clone(),
+            seed_over(Containment::select(options()), "t-unusable"),
+        )
+        .await;
+        runtime
+            .note_session_id("t-unusable".to_string())
+            .await
+            .expect("session id");
+        let launcher = runtime.child_pid().await.expect("launcher pid");
+        let _cleanup = KillOwnOnDrop {
+            launcher: (
+                launcher,
+                fake_codex::proc_starttime(launcher).expect("launcher start"),
+            ),
+            manifests: home.path().join("manifests"),
+        };
+        runtime
+            .prepare_retention("server-shutdown".to_string())
+            .await
+            .expect("retain");
+        drop(runtime);
+        let recorded = store.load_all().pop().expect("retained record");
+        let unit_id = recorded.unit_id.clone().expect("a unit record");
+        let native = recorded.main_pid.expect("native main recorded");
+        // The survivor no longer answers on its recorded URL (nothing
+        // listens on port 1).
+        store
+            .write(&CodexSidecarRecord {
+                ws_url: "ws://127.0.0.1:1".to_string(),
+                ..recorded
+            })
+            .expect("rewrite record");
+
+        let after = Containment::select(options());
+        let units = after.recorded_units().expect("records");
+        let (reconciler, report) =
+            SidecarReconciler::boot_reconcile_with_units(store.clone(), &units);
+        assert_eq!(report.held, 1, "the verified survivor is held: {report:?}");
+        let record = reconciler
+            .claim_for_session("t-unusable")
+            .await
+            .expect("claim");
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let reattached = ReattachedCodexAppServerRuntime::with_unit(
+            record,
+            reconciler.unit_record(&unit_id),
+            store.clone(),
+            recording_seed_over(after.clone(), "t-unusable", lifecycle.clone()),
+        );
+        let error = reattached
+            .ensure_ready(None)
+            .await
+            .expect_err("an unusable survivor is never reattached");
+        assert!(error.contains("unusable"), "{error}");
+        assert_eq!(
+            lifecycle.stops(),
+            vec![(unit_id.clone(), "codex-reattach-unusable".to_string())],
+            "the unit is stopped through the seed's lifecycle"
+        );
+        assert!(
+            !fake_codex::pid_alive(native),
+            "the native is dead when the reattach returns (Gone)"
+        );
+        assert!(
+            after
+                .recorded_units()
+                .expect("records")
+                .iter()
+                .all(|u| u.unit_id.as_str() != unit_id),
+            "the unit's record is deleted at Gone"
+        );
+        assert!(store.load_all().is_empty(), "the sidecar record is removed");
+        let unit = reattached.unit().expect("the reopened unit");
+        unit.stop_in_flight().unwrap().wait_swept().await;
+        wait_dead(launcher).await;
+    }
+
+    /// Retention of a sidecar with no record (a disabled store: the
+    /// macOS/Windows shape) stops its unit through the seed and waits for
+    /// Gone instead of retaining it (review M2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retention_without_a_record_stops_the_unit_through_the_seed() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::disabled());
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let (runtime, _ready) = ready_realistic(
+            json!({}),
+            home.path(),
+            store.clone(),
+            recording_seed("t-norecord", lifecycle.clone()),
+        )
+        .await;
+        let unit = runtime.unit().expect("spawned inside a unit");
+        let native = unit.main().expect("native main").pid();
+        let launcher = runtime.child_pid().await.expect("launcher pid");
+        assert!(!runtime.retainable().await, "no record: nothing to retain");
+
+        runtime
+            .prepare_retention("server-shutdown".to_string())
+            .await
+            .expect("retention");
+        assert_eq!(
+            lifecycle.stops(),
+            vec![(unit.id().to_string(), "server-shutdown".to_string())],
+            "the unit is stopped through the seed's lifecycle"
+        );
+        assert!(
+            !fake_codex::pid_alive(native),
+            "the native is dead when retention returns (Gone)"
+        );
+        assert!(
+            shared_containment()
+                .recorded_units()
+                .expect("records")
+                .iter()
+                .all(|u| u.unit_id != *unit.id()),
+            "the unit's record is deleted at Gone"
+        );
+        unit.stop_in_flight().unwrap().wait_swept().await;
+        wait_dead(launcher).await;
     }
 
     /// A probe answered by ANOTHER pane's app-server on a reused port fails
