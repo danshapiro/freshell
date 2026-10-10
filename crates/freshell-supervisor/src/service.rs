@@ -2666,14 +2666,17 @@ impl Supervisor {
             .stop_progress(handle)
             .await
             .map_err(map_registry)?;
-        // Docker's grace parameter bounds termination inside Docker, not its
-        // HTTP exchange. Bound the actual future so silence releases our lock.
-        if let Err(error) =
-            tokio::time::timeout(Duration::from_secs(2), self.backend.request_stop(handle, 2))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(BackendError::Unavailable("graceful Stop timed out".into()))
-                })
+        // Docker's grace parameter bounds termination inside Docker. Allow
+        // ownership inspection and HTTP overhead beyond that grace while
+        // keeping the whole future finite so silence releases our lock.
+        let grace_seconds = 2;
+        let request_budget = Duration::from_secs(grace_seconds) + Duration::from_secs(1);
+        if let Err(error) = tokio::time::timeout(
+            request_budget,
+            self.backend.request_stop(handle, grace_seconds),
+        )
+        .await
+        .unwrap_or_else(|_| Err(BackendError::Unavailable("graceful Stop timed out".into())))
         {
             // A concurrently removed exact enclosure can return 404 to Stop.
             // It still needs the backend's qualified empty observation.
@@ -5872,6 +5875,54 @@ mod interrupted_transaction_tests {
             .all(|r| r.starts_with("GET ")));
         close(revoke).await;
         fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_docker_grace_includes_http_overhead() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), false).await;
+        let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+        fixture.state.lock().unwrap().stop_response_overhead = Some(Duration::from_millis(250));
+        let fixture_host = host(&supervisor, dir.path()).await;
+        let lock = supervisor.lifecycle_lock(&id).await;
+        // The real HTTP peer remains Running until it consumes the requested
+        // Docker grace plus transport overhead; no observer retries this Stop.
+        let (outcome, view) = supervisor.stop(id, Some(1)).await.unwrap();
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        let progress: (u64, String, bool) = conn
+            .query_row("SELECT intent_revision,outcome,settled FROM ordinary_stops WHERE incarnation_id=?1",
+                [view.incarnation_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        let writers: u64 = conn
+            .query_row("SELECT count(*) FROM writer_claims", [], |r| r.get(0))
+            .unwrap();
+        let (requests, completed_stops) = {
+            let state = fixture.state.lock().unwrap();
+            (state.requests.clone(), state.completed_stops)
+        };
+        assert_retained(&supervisor, dir.path(), 2).await;
+        close(fixture_host).await;
+        fixture.close().await;
+
+        assert_eq!(outcome, StopOutcome::VerifiedEmpty);
+        assert_eq!(view.cleanup_state, CleanupState::VerifiedEmpty);
+        assert_eq!(progress, (2, "verified_empty".into(), true));
+        assert!(supervisor
+            .registry
+            .pending_stop_handles()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(lock.try_lock().is_ok());
+        assert_eq!(completed_stops, 1);
+        assert_eq!(
+            requests.iter().filter(|r| r.contains("/stop?t=2 ")).count(),
+            1
+        );
+        assert!(!requests
+            .iter()
+            .any(|r| r.contains("/kill?") || r.contains("/start") || r.contains("/create")));
+        assert_eq!(writers, 0);
     }
 
     #[tokio::test]

@@ -1751,6 +1751,7 @@ pub(crate) mod tests {
     use super::*;
     use freshell_runtime_protocol::{FreshProvider, LaunchNonce};
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     /// A Docker HTTP peer, not a RuntimeBackend double: all ownership, state
     /// interpretation and Stop requests still execute DockerEngineBackend.
@@ -1767,6 +1768,8 @@ pub(crate) mod tests {
         pub(crate) daemon_id: String,
         pub(crate) requests: Vec<String>,
         pub(crate) silence: Option<&'static str>,
+        pub(crate) stop_response_overhead: Option<Duration>,
+        pub(crate) completed_stops: usize,
         pub(crate) disconnected: usize,
         pub(crate) first_inspection_at: Option<std::time::Instant>,
         pub(crate) first_silent_eof_at: Option<std::time::Instant>,
@@ -1824,6 +1827,8 @@ pub(crate) mod tests {
                 daemon_id: handle.daemon_id().to_string(),
                 requests: vec![],
                 silence: None,
+                stop_response_overhead: None,
+                completed_stops: 0,
                 disconnected: 0,
                 first_inspection_at: None,
                 first_silent_eof_at: None,
@@ -1852,7 +1857,7 @@ pub(crate) mod tests {
                                 }
                                 let header = String::from_utf8(header).unwrap();
                                 let request = header.lines().next().unwrap().to_owned();
-                                let (silent, status, response) = {
+                                let (silent, status, response, stop_delay) = {
                                     let mut state = state.lock().unwrap();
                                     let inspect = request == format!("GET {DOCKER_API}/containers/{container}/json HTTP/1.1");
                                     if inspect {
@@ -1890,7 +1895,14 @@ pub(crate) mod tests {
                                     } else {
                                         panic!("unexpected Docker Stop request: {request}");
                                     };
-                                    (silent, status, response)
+                                    let stop_delay = if stop {
+                                        state.stop_response_overhead.map(|overhead| {
+                                            let grace = request.split("/stop?t=").nth(1).unwrap()
+                                                .split_whitespace().next().unwrap().parse::<u64>().unwrap();
+                                            Duration::from_secs(grace) + overhead
+                                        })
+                                    } else { None };
+                                    (silent, status, response, stop_delay)
                                 };
                                 if silent {
                                     // Accepted request, no response. Observe cancellation closing
@@ -1901,10 +1913,19 @@ pub(crate) mod tests {
                                     state.disconnected += 1;
                                     state.first_silent_eof_at.get_or_insert_with(std::time::Instant::now);
                                 } else {
+                                    if let Some(delay) = stop_delay {
+                                        tokio::time::sleep(delay).await;
+                                        state.lock().unwrap().inspection["State"] = json!({
+                                            "Status":"exited","Running":false,"Paused":false,"Restarting":false
+                                        });
+                                    }
                                     let body = serde_json::to_vec(&response).unwrap();
                                     stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
                                     stream.write_all(&body).await.unwrap();
                                     stream.shutdown().await.unwrap();
+                                    if stop_delay.is_some() {
+                                        state.lock().unwrap().completed_stops += 1;
+                                    }
                                 }
                             });
                         }
