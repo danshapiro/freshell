@@ -216,6 +216,13 @@ cleanup_owned_container() {
   local remaining_by_name
   remaining_by_name="$(docker ps -aq --no-trunc --filter "name=^/${OWNED_CONTAINER_NAME}$")" || cleanup_status=1
   [ -z "${remaining_by_name}" ] || cleanup_status=1
+  if [ "${SETTLE_ONLY}" -eq 1 ] && [ -z "${owned_cid}" ]; then
+    # An abruptly killed client cannot join an already accepted daemon
+    # creation. Empty lookups may precede publication: retain our evidence
+    # unless a published or discovered full ID proves creation completed.
+    sandbox_log error sandbox_creation_unconfirmed 1
+    cleanup_status=1
+  fi
   return "${cleanup_status}"
 }
 
