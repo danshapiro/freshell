@@ -394,6 +394,7 @@ async fn the_codex_daemon_family_is_spared_in_place_and_its_slice_left_running()
         slice_dir.is_dir(),
         "the slice the spared daemon still runs in was stopped"
     );
+    assert_thawed(&slice_dir, "the spared daemon family's slice");
     assert!(cap.has(tracing::Level::INFO, "unit.stop.spared"));
     for (pid, start, _) in family {
         if let Ok(watch) = ProcWatch::open_expecting(pid, start) {

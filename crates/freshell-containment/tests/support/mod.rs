@@ -448,6 +448,28 @@ pub fn unit_slice_of(pid: u32) -> Option<(String, PathBuf)> {
     Some((unit_slice.to_string(), dir))
 }
 
+/// Asserts that the cgroup at `dir` is thawed: `cgroup.freeze` is `0` and
+/// `cgroup.events` shows `frozen 0` (a frozen spared process passes every
+/// liveness check, so only this shows that it runs on).
+pub fn assert_thawed(dir: &Path, what: &str) {
+    let read = |file: &str| {
+        std::fs::read_to_string(dir.join(file))
+            .unwrap_or_else(|e| panic!("{what}: cannot read {file} of {}: {e}", dir.display()))
+    };
+    assert_eq!(
+        read("cgroup.freeze").trim(),
+        "0",
+        "{what}: {} is still set to freeze",
+        dir.display()
+    );
+    let events = read("cgroup.events");
+    assert!(
+        events.lines().any(|l| l.trim() == "frozen 0"),
+        "{what}: {} is frozen: {events}",
+        dir.display()
+    );
+}
+
 /// `systemctl --user stop <unit>`, ignoring every failure (cleanup of the
 /// test's own slices only; "not loaded" is fine).
 pub fn stop_user_unit(unit: &str) {
@@ -462,9 +484,17 @@ pub fn stop_user_unit(unit: &str) {
 pub struct StopSliceOnDrop(Option<String>);
 
 impl StopSliceOnDrop {
-    /// The unit slice holding `pid` now (nothing on the tag backend).
+    /// The unit slice holding `pid` now (nothing on the tag backend). Never
+    /// the slice the test itself runs in: a test run from a Freshell pane on
+    /// the systemd backend runs in that pane's unit slice, and on the tag
+    /// backend `pid` shares it.
     pub fn holding(pid: u32) -> Self {
-        Self(unit_slice_of(pid).map(|(name, _)| name))
+        let own = unit_slice_of(std::process::id()).map(|(name, _)| name);
+        Self(
+            unit_slice_of(pid)
+                .map(|(name, _)| name)
+                .filter(|name| Some(name) != own.as_ref()),
+        )
     }
 
     pub fn named(name: impl Into<String>) -> Self {

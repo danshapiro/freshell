@@ -189,6 +189,12 @@ async fn the_codex_managed_daemon_is_never_signalled() {
         let daemon = ProcWatch::open(p.daemon).unwrap();
         // The slice the spared daemon keeps running is stopped at the end.
         let _slice = StopSliceOnDrop::holding(p.daemon);
+        // On the systemd backend, the slice whose thaw is checked after the stop.
+        let slice_dir = (name == "selected").then(|| {
+            unit_slice_of(p.daemon)
+                .unwrap_or_else(|| panic!("{name}: the daemon is not in a unit slice"))
+                .1
+        });
         unit.stop(StopRequest::new(
             StopMode::Force,
             StopReason::ShiftX,
@@ -201,6 +207,9 @@ async fn the_codex_managed_daemon_is_never_signalled() {
             alive(p.daemon) && !daemon.has_exited(),
             "{name}: managed daemon must survive"
         );
+        if let Some(dir) = &slice_dir {
+            assert_thawed(dir, &format!("{name}: the spared daemon's slice"));
+        }
         assert!(
             survivors.iter().all(|s| s.pid != p.daemon),
             "{name}: a spared daemon is not a survivor"
@@ -345,6 +354,12 @@ async fn the_codex_daemon_family_is_never_signalled() {
         let p = read_pids(&s).await;
         // The slice the spared daemon family keeps running is stopped at the end.
         let _slice = StopSliceOnDrop::holding(p.daemon);
+        // On the systemd backend, the slice whose thaw is checked after the stop.
+        let slice_dir = (name == "selected").then(|| {
+            unit_slice_of(p.daemon)
+                .unwrap_or_else(|| panic!("{name}: the daemon is not in a unit slice"))
+                .1
+        });
         let family: Vec<(u32, u64)> = [p.daemon, p.updater, p.installer, p.legacy]
             .into_iter()
             .map(|pid| {
@@ -373,6 +388,9 @@ async fn the_codex_daemon_family_is_never_signalled() {
         }
         for pid in [p.main, p.setsid, p.nohup] {
             assert!(!alive(pid), "{name}: {pid} survived");
+        }
+        if let Some(dir) = &slice_dir {
+            assert_thawed(dir, &format!("{name}: the spared daemon family's slice"));
         }
         assert!(cap.has(tracing::Level::INFO, "unit.stop.spared"), "{name}");
         for (pid, start) in family {
