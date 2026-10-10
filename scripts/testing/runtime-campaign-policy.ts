@@ -10,6 +10,11 @@ import { loadRuntimeSoakReceipt } from './runtime-soak-evidence.js'
 import { stableJson } from './runtime-phase5-evidence-common.js'
 import { loadProviderParityLocalReceipt } from './provider-parity-receipt.js'
 
+export const TABS_CASE_TITLES = [
+  'managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth',
+  'P4-G08: controller inventory reconstructs views without duplicating souls',
+] as const
+
 export type BrowserCaseIdentity = { id: string; title: string; file: string }
 export type BrowserOriginalReference = { path: string; sha256: string }
 export const BROWSER_ORIGINAL_FILES = {
@@ -430,6 +435,13 @@ export function validateBrowserOriginalIndex(input: {
     || !Array.isArray(loaded.cleanup.unsafeBrokerAttempts) || loaded.cleanup.unsafeBrokerAttempts.length
     || !Array.isArray(loaded.cleanup.exactContainerIds) || !loaded.cleanup.exactContainerIds.length
     || loaded.cleanup.exactContainerIds.some((id: unknown) => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id))) throw new Error('browser original cleanup is incomplete')
+  const ownership = loaded.ownershipAfter
+  if (!ownership || typeof ownership !== 'object' || Array.isArray(ownership)
+    || !Array.isArray(ownership.brokerReceipts) || !Array.isArray(ownership.brokerEvents)
+    || ownership.brokerReceipts.some((receipt: any) => !receipt || typeof receipt !== 'object' || Array.isArray(receipt)
+      || typeof receipt.containerId !== 'string' || !/^[a-f0-9]{64}$/.test(receipt.containerId))) throw new Error('browser original ownership is malformed')
+  const cleanupIds = new Set<string>(loaded.cleanup.exactContainerIds)
+  if (ownership.brokerReceipts.some((receipt: any) => !cleanupIds.has(receipt.containerId))) throw new Error('browser original owned container is missing from cleanup targets')
   const observedEvents = loaded.lifecycle.filter((row: any) => String(row.event).startsWith('managed_external_')).map((row: any) => ({ ...row.data, event: row.event }))
   const events = [...new Map(observedEvents.map((row: any) => [stableJson(row), row])).values()] as any[]
   const one = (event: string) => {
@@ -547,6 +559,12 @@ export function validateProductionCampaignCoverage(input: {
           selected += validateBrowserOriginalIndex({ repoRoot: root, candidateSha, ...input.images, original })
         }
         if (selected !== event.counts.selected) throw new Error('browser original coverage differs from completed execution counts')
+        if (step.id === 'rehydrate') {
+          const requiredTitles = TABS_CASE_TITLES.map(title => `Phase 4 managed-runtime tab rehydration › ${title}`)
+          const selectedTitles = browserOriginals.flatMap(original => original.selected.map(row => row.title))
+          if (browserOriginals.length !== requiredTitles.length || browserOriginals.some(original => original.selected.length !== 1)
+            || !same([...selectedTitles].sort(), [...requiredTitles].sort())) throw new Error('browser original required rehydrate cases are incomplete or lack separate owners')
+        }
       }
       for (const name of required) {
         const reference = step.receipts![name]

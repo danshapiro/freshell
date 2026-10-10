@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { productionCertificationStatus, loadCapabilityManifest } from '../../../../scripts/testing/provider-certification.js'
-import { BROWSER_ORIGINAL_FILES, validateBrowserOriginalIndex, validateProductionCampaignCoverage } from '../../../../scripts/testing/runtime-campaign-policy.js'
+import { BROWSER_ORIGINAL_FILES, TABS_CASE_TITLES, validateBrowserOriginalIndex, validateProductionCampaignCoverage } from '../../../../scripts/testing/runtime-campaign-policy.js'
 import { ManagedExternalBrowserLifecycle, dispatchOwnedExternalBrowser } from '../../../../scripts/testing/runtime-external-browser.js'
 import * as providerEvidence from '../../../../scripts/testing/provider-qualification-receipt.js'
 import * as freshEvidence from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
@@ -60,7 +60,9 @@ function fixture() {
   return { options, dispatches, manifest }
 }
 
-async function browserOriginalFixture(f = fixture(), spec = 'runtime-tabs-rehydrate-rust.spec.ts') {
+const rehydrateTitles = TABS_CASE_TITLES.map(title => `Phase 4 managed-runtime tab rehydration › ${title}`)
+
+async function browserOriginalFixture(f = fixture(), spec = 'runtime-tabs-rehydrate-rust.spec.ts', title = rehydrateTitles[1]) {
   const root = f.options.repoRoot, runId = randomUUID()
   const runtimeImage = `sha256:${'b'.repeat(64)}`, browserImage = `sha256:${'c'.repeat(64)}`
   const evidenceDir = path.join(root, '.runtime-evidence', candidate.sha, runId)
@@ -68,7 +70,7 @@ async function browserOriginalFixture(f = fixture(), spec = 'runtime-tabs-rehydr
   fs.mkdirSync(path.join(root, 'test/runtime'), { recursive: true })
   const manifest = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'test/runtime/gate-manifest.json'), 'utf8'))
   fs.writeFileSync(path.join(root, 'test/runtime/gate-manifest.json'), JSON.stringify(manifest))
-  const cases = [{ id: 'case-owned', title: 'P4-G08: controller inventory reconstructs views without duplicating souls',
+  const cases = [{ id: 'case-owned', title,
     file: `test/e2e-browser/specs/${spec}` }]
   const executed = cases.map(row => ({ ...row, status: 'passed' as const }))
   const job = { severity: 'info', runId, candidateSha: candidate.sha, jobName: 'fictional-job' }
@@ -191,23 +193,30 @@ describe('actual finalized browser publisher and independently loaded originals'
       runtimeImage: f.runtimeImage, browserImage: f.browserImage, original })).toBe(1)
   })
   it('passes actual dispatcher results into the actual campaign validator and reopens attributable owner originals', async () => {
-    const f = await browserOriginalFixture()
+    const f = await browserOriginalFixture(undefined, undefined, rehydrateTitles[0])
+    const second = await browserOriginalFixture(f)
     const execute = async (_command: string, _args: string[], environment: NodeJS.ProcessEnv, logPath: string) => {
-      Object.assign(f.owned, { environment, receiptBefore: {} })
-      const target = environment.FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT!
-      fs.mkdirSync(path.dirname(target), { recursive: true })
-      fs.writeFileSync(target, JSON.stringify({ candidateSha: candidate.sha, runtimeImage: f.runtimeImage, status: 'PASS' }), { mode: 0o600 })
-      const result = await dispatchOwnedExternalBrowser({ spec: f.cases[0].file }, { FRESHELL_E2E_BACKEND: 'cloud' }, {
-        start: async () => ({ FRESHELL_E2E_TARGET_URL: 'https://fictional.invalid', FRESHELL_E2E_TARGET_WS_URL: 'wss://fictional.invalid/ws',
-          FRESHELL_E2E_TARGET_TOKEN: 'fictional-unused', FRESHELL_RUNTIME_EXTERNAL_RUN_ID: (f.owned as any).descriptor.runId,
-          FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: candidate.sha }), list: async () => f.cases,
-        child: async () => ({ exitCode: 0, cases: f.executed }), finish: () => f.owned.finish(), abort: () => f.owned.abort(),
-        publishOriginals: (selected, executed) => f.owned.publishOriginals(selected, executed),
-      })
+      const originals = []
+      let selected = 0
+      for (const owner of [f, second]) {
+        Object.assign(owner.owned, { environment, receiptBefore: {} })
+        const target = environment.FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT!
+        fs.mkdirSync(path.dirname(target), { recursive: true })
+        fs.writeFileSync(target, JSON.stringify({ candidateSha: candidate.sha, runtimeImage: f.runtimeImage, status: 'PASS' }), { mode: 0o600 })
+        const result = await dispatchOwnedExternalBrowser({ spec: owner.cases[0].file }, { FRESHELL_E2E_BACKEND: 'cloud' }, {
+          start: async () => ({ FRESHELL_E2E_TARGET_URL: 'https://fictional.invalid', FRESHELL_E2E_TARGET_WS_URL: 'wss://fictional.invalid/ws',
+            FRESHELL_E2E_TARGET_TOKEN: 'fictional-unused', FRESHELL_RUNTIME_EXTERNAL_RUN_ID: (owner.owned as any).descriptor.runId,
+            FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: candidate.sha }), list: async () => owner.cases,
+          child: async () => ({ exitCode: 0, cases: owner.executed }), finish: () => owner.owned.finish(), abort: () => owner.owned.abort(),
+          publishOriginals: (selected, executed) => owner.owned.publishOriginals(selected, executed),
+        })
+        selected += result.selected
+        originals.push(...result.originals!)
+      }
       fs.mkdirSync(path.dirname(logPath), { recursive: true })
       fs.writeFileSync(logPath, JSON.stringify({ event: 'managed_external_browser_passed', counts: {
-        selected: result.selected, executed: result.executed, passed: result.passed, failed: result.failed, skipped: result.skipped, timedOut: result.timedOut,
-      }, originals: result.originals }), { mode: 0o600 })
+        selected, executed: selected, passed: selected, failed: 0, skipped: 0, timedOut: 0,
+      }, originals }), { mode: 0o600 })
       return 0
     }
     await runCampaign(['--only', 'rehydrate'], { ...f.options, execute })
@@ -244,6 +253,49 @@ describe('actual finalized browser publisher and independently loaded originals'
     }
     expect(() => validateBrowserOriginalIndex({ repoRoot: f.options.repoRoot, candidateSha: candidate.sha,
       runtimeImage: f.runtimeImage, browserImage: f.browserImage, original })).toThrow()
+  })
+  it.each([
+    ['missing ownership object', null],
+    ['missing receipts', { brokerEvents: [] }],
+    ['malformed receipts', { brokerReceipts: {}, brokerEvents: [] }],
+    ['missing events', { brokerReceipts: [] }],
+    ['malformed receipt', { brokerReceipts: [null], brokerEvents: [] }],
+    ['missing container ID', { brokerReceipts: [{}], brokerEvents: [] }],
+    ['malformed container ID', { brokerReceipts: [{ containerId: 'short-id' }], brokerEvents: [] }],
+    ['mismatched owned container', { brokerReceipts: [{ containerId: 'e'.repeat(64) }], brokerEvents: [] }],
+    ['one missing owned container', { brokerReceipts: [{ containerId: 'd'.repeat(64) }, { containerId: 'e'.repeat(64) }], brokerEvents: [] }],
+  ])('refuses cleanup ownership contradiction %s after loading matching original hashes', async (_fault, ownershipAfter) => {
+    const f = await browserOriginalFixture()
+    await f.owned.finish()
+    const original = f.owned.publishOriginals(f.cases, f.executed)
+    const bytes = JSON.stringify(ownershipAfter)
+    fs.writeFileSync(path.join(f.evidenceDir, BROWSER_ORIGINAL_FILES.ownershipAfter), bytes)
+    original.artifacts.ownershipAfter.sha256 = createHash('sha256').update(bytes).digest('hex')
+    expect(() => validateBrowserOriginalIndex({ repoRoot: f.options.repoRoot, candidateSha: candidate.sha,
+      runtimeImage: f.runtimeImage, browserImage: f.browserImage, original })).toThrow(/ownership|owned container/)
+  })
+  it('refuses a missing ownership original before trusting cleanup', async () => {
+    const f = await browserOriginalFixture()
+    await f.owned.finish()
+    const original = f.owned.publishOriginals(f.cases, f.executed)
+    fs.unlinkSync(path.join(f.evidenceDir, BROWSER_ORIGINAL_FILES.ownershipAfter))
+    expect(() => validateBrowserOriginalIndex({ repoRoot: f.options.repoRoot, candidateSha: candidate.sha,
+      runtimeImage: f.runtimeImage, browserImage: f.browserImage, original })).toThrow()
+  })
+  it('accepts broker-owned container subset with additional tracked cleanup targets', async () => {
+    const f = await browserOriginalFixture()
+    await f.owned.finish()
+    const original = f.owned.publishOriginals(f.cases, f.executed)
+    for (const [key, value] of Object.entries({
+      ownershipAfter: { brokerReceipts: [{ containerId: 'd'.repeat(64) }, { containerId: 'e'.repeat(64) }], brokerEvents: [] },
+      cleanup: { ...f.files.cleanup as object, exactContainerIds: ['d'.repeat(64), 'e'.repeat(64), 'f'.repeat(64)] },
+    })) {
+      const name = key as 'cleanup' | 'ownershipAfter', bytes = JSON.stringify(value)
+      fs.writeFileSync(path.join(f.evidenceDir, BROWSER_ORIGINAL_FILES[name]), bytes)
+      original.artifacts[name].sha256 = createHash('sha256').update(bytes).digest('hex')
+    }
+    expect(validateBrowserOriginalIndex({ repoRoot: f.options.repoRoot, candidateSha: candidate.sha,
+      runtimeImage: f.runtimeImage, browserImage: f.browserImage, original })).toBe(1)
   })
   it.each(['candidate', 'run', 'runtime image', 'browser image', 'case', 'missing original', 'failed cleanup', 'failed Cloud case', 'Cloud image'])('refuses %s even with newly matching reference hashes', async fault => {
     const f = await browserOriginalFixture()
@@ -310,7 +362,14 @@ describe('complete finite campaign composition', () => {
       const log = `.runtime-evidence/${candidate.sha}/campaigns/${campaignRunId}/logs/${id}.log`
       const base = { id, outcome: 'PASS', exitCode: 0, failures: [], log }
       if (contracts[id]) {
-        const contract = contracts[id], browser = contract.spec ? await browserOriginalFixture(f, contract.spec) : undefined
+        const contract = contracts[id]
+        const browsers: Awaited<ReturnType<typeof browserOriginalFixture>>[] = []
+        if (contract.spec) {
+          for (const title of id === 'rehydrate' ? rehydrateTitles : [rehydrateTitles[1]]) {
+            browsers.push(await browserOriginalFixture(f, contract.spec, title))
+          }
+        }
+        const browser = browsers[0]
         const runId = browser ? (browser.owned as any).descriptor.runId : randomUUID()
         const receipts: Record<string, any> = {}, environment: NodeJS.ProcessEnv = {}
         for (const name of contract.names) {
@@ -324,12 +383,15 @@ describe('complete finite campaign composition', () => {
         }
         let text = 'fictional nonbrowser producer completed'
         if (browser) {
-          Object.assign(browser.owned, { environment, receiptBefore: {} })
-          await browser.owned.finish()
-          const original = browser.owned.publishOriginals(browser.cases, browser.executed)
+          const originals = []
+          for (const owner of browsers) {
+            Object.assign(owner.owned, { environment, receiptBefore: {} })
+            await owner.owned.finish()
+            originals.push(owner.owned.publishOriginals(owner.cases, owner.executed))
+          }
           text = JSON.stringify({ event: 'managed_external_browser_passed', counts: {
-            selected: 1, executed: 1, passed: 1, failed: 0, skipped: 0, timedOut: 0,
-          }, originals: [original] })
+            selected: browsers.length, executed: browsers.length, passed: browsers.length, failed: 0, skipped: 0, timedOut: 0,
+          }, originals })
         }
         completedSteps.push({ ...base, kind: 'producer', runner: browser ? 'playwright' : 'receipt', logDigest: write(log, text), receipts })
       } else {
@@ -372,6 +434,82 @@ describe('complete finite campaign composition', () => {
       if (fault === 'wrong image') input.images.browserImage = `sha256:${'f'.repeat(64)}`
       expect(validateProductionCampaignCoverage(input).complete, fault).toBe(false)
     }
+  })
+  it.each([0, 1])('refuses rehydrate coverage missing separately owned case %s with consistent remaining counts', async missing => {
+    const f = await completeFixture(), input = f.input
+    const step = input.completedSteps.find(step => step.id === 'rehydrate')!
+    const target = path.join(input.originals.repoRoot, step.log)
+    const event = JSON.parse(fs.readFileSync(target, 'utf8'))
+    expect(event.originals).toHaveLength(2)
+    expect(new Set(event.originals.map((original: any) => original.runId)).size).toBe(2)
+    event.originals.splice(missing, 1)
+    event.counts.selected = event.counts.executed = event.counts.passed = 1
+    // Keep the Phase 4 receipt attributable to the remaining owner as well.
+    const receiptRef = step.receipts.FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT
+    const receiptTarget = path.join(input.originals.repoRoot, receiptRef.path)
+    const receipt = JSON.parse(fs.readFileSync(receiptTarget, 'utf8'))
+    receipt.receiptRunId = event.originals[0].runId
+    const receiptBytes = JSON.stringify(receipt)
+    fs.writeFileSync(receiptTarget, receiptBytes)
+    receiptRef.digestSha256 = createHash('sha256').update(receiptBytes).digest('hex')
+    event.originals[0].receiptDigests.FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT = receiptRef.digestSha256
+    const bytes = JSON.stringify(event)
+    fs.writeFileSync(target, bytes)
+    step.logDigest = createHash('sha256').update(bytes).digest('hex')
+    const result = validateProductionCampaignCoverage(input)
+    expect(result.complete).toBe(false)
+    expect(result.failures).toEqual([expect.stringMatching(/^rehydrate:.*required.*case/)])
+  })
+  it.each(['duplicate case', 'shared owner', 'reused run'])('refuses rehydrate %s despite two passing executions', async fault => {
+    const f = await completeFixture(), input = f.input
+    const step = input.completedSteps.find(step => step.id === 'rehydrate')!
+    const target = path.join(input.originals.repoRoot, step.log)
+    const event = JSON.parse(fs.readFileSync(target, 'utf8'))
+    const first = event.originals[0], second = event.originals[1]
+    if (fault === 'reused run') event.originals[1] = structuredClone(first)
+    else {
+      const owner = fault === 'shared owner' ? first : second
+      if (fault === 'shared owner') {
+        owner.selected.push({ ...second.selected[0], id: 'second-owned-case' })
+        owner.executed.push({ ...second.executed[0], id: 'second-owned-case' })
+        event.originals.pop()
+      } else {
+        owner.selected[0].title = first.selected[0].title
+        owner.executed[0].title = first.executed[0].title
+      }
+      const lifecyclePath = path.join(input.originals.repoRoot, owner.artifacts.lifecycle.path)
+      const rows = fs.readFileSync(lifecyclePath, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line))
+      for (const row of rows) if (row.event === 'managed_external_cloud_cases') row.data.cases = owner.executed
+      const replacements = {
+        lifecycle: rows.map(row => JSON.stringify(row)).join('\n'),
+        cloudLauncher: JSON.stringify({ stdout: rows.map(row => JSON.stringify({ ...row.data, event: row.event })).join('\n'), stderr: '' }),
+      }
+      for (const [key, bytes] of Object.entries(replacements)) {
+        fs.writeFileSync(path.join(input.originals.repoRoot, owner.artifacts[key].path), bytes)
+        owner.artifacts[key].sha256 = createHash('sha256').update(bytes).digest('hex')
+      }
+    }
+    const bytes = JSON.stringify(event)
+    fs.writeFileSync(target, bytes)
+    step.logDigest = createHash('sha256').update(bytes).digest('hex')
+    const result = validateProductionCampaignCoverage(input)
+    expect(result.complete).toBe(false)
+    expect(result.failures).toEqual([expect.stringMatching(/^rehydrate:.*(required rehydrate cases|run is reused)/)])
+  })
+  it('refuses campaign composition when a current browser owner is omitted from cleanup', async () => {
+    const f = await completeFixture(), input = f.input
+    const step = input.completedSteps.find(step => step.id === 'continuity')!
+    const target = path.join(input.originals.repoRoot, step.log)
+    const event = JSON.parse(fs.readFileSync(target, 'utf8')), original = event.originals[0]
+    const ownership = JSON.stringify({ brokerReceipts: [{ containerId: 'e'.repeat(64) }], brokerEvents: [] })
+    fs.writeFileSync(path.join(input.originals.repoRoot, original.artifacts.ownershipAfter.path), ownership)
+    original.artifacts.ownershipAfter.sha256 = createHash('sha256').update(ownership).digest('hex')
+    const bytes = JSON.stringify(event)
+    fs.writeFileSync(target, bytes)
+    step.logDigest = createHash('sha256').update(bytes).digest('hex')
+    const result = validateProductionCampaignCoverage(input)
+    expect(result.complete).toBe(false)
+    expect(result.failures).toEqual(['continuity: browser original owned container is missing from cleanup targets'])
   })
   it.each(['wrong gate scope', 'contradictory cleanup'])('refuses %s after loading matching gate-original hashes', async fault => {
     const f = await completeFixture(), input = f.input, gate = input.completedSteps.at(-1)!.gate

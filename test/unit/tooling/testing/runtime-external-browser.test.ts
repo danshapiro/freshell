@@ -562,6 +562,12 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     const result = await runner.runExternalBrowserCli(['--spec', spec], { FRESHELL_E2E_BACKEND: 'cloud' }, { ...owned, publishOriginals })
     expect(result).toMatchObject({ selected: 2, executed: 2, passed: 2, originals: [{ runId: 'owned-first' }, { runId: 'owned-second' }] })
     expect(publishOriginals).toHaveBeenCalledTimes(2)
+    publishOriginals.mockClear().mockReturnValue({ runId: 'owned-partial' })
+    const partial = await runner.runExternalBrowserCli(['--spec', spec, '--grep', 'P4-G08:'],
+      { FRESHELL_E2E_BACKEND: 'cloud' }, { ...owned, publishOriginals })
+    expect(partial).toMatchObject({ selected: 1, executed: 1, passed: 1, originals: [{ runId: 'owned-partial' }] })
+    expect(publishOriginals).toHaveBeenCalledOnce()
+    expect(publishOriginals.mock.calls[0][0]).toEqual([cases[1]])
   })
   it('requires native provider cases while leaving separately opted-in synthetic cases honestly unselected', async () => {
     const { owned } = lifecycle()

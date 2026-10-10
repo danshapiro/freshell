@@ -1,4 +1,4 @@
-import { BROWSER_ORIGINAL_FILES, type BrowserOriginalIndex } from './runtime-campaign-policy.js'
+import { BROWSER_ORIGINAL_FILES, TABS_CASE_TITLES, type BrowserOriginalIndex } from './runtime-campaign-policy.js'
 import {
   QUALIFICATION_PROVIDER_SELECTION_ENV, parseQualificationProviderSelection,
   type QualifiableTerminalProvider,
@@ -2350,11 +2350,6 @@ async function verifyExternalManagedTransport(descriptor: ManagedExternalDescrip
   }
   throw new Error('owned HTTPS/WSS provenance and admission readiness failed')
 }
-
-const TABS_CASE_TITLES = [
-  'managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth',
-  'P4-G08: controller inventory reconstructs views without duplicating souls',
-] as const
 
 function tabsCaseSelections(selection: ExternalBrowserSelection): Array<ExternalBrowserSelection & { grep: string }> {
   const fullTitles = TABS_CASE_TITLES.map(title => `Phase 4 managed-runtime tab rehydration › ${title}`)
