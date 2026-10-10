@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 //! The one stop sequence, on every backend this host can run. Every process
 //! signalled here was spawned by the test (through the unit under test).
 //! Runtimes get two workers each: the Docker sandbox caps the container at

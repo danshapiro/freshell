@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 //! Own test binary: it sets the process-wide test-hook environment (both
 //! tests use the same values).
 mod support;

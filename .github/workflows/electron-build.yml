@@ -90,13 +90,34 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Per-pane containment on Windows: Job Object units, the self-placing
-      # exec shim, the process facts, and the design-decision tests that
-      # chose the unit job's flags. `--no-fail-fast` runs every test binary,
-      # so one failure never hides another's result. The macOS jobs join
-      # once the macOS process facts exist.
-      - name: Test containment (Windows)
-        if: matrix.os == 'windows-2022'
+      # The macOS containment tests read back the unit tag of the native
+      # Codex binary, as released. npm installs the pinned package into the
+      # runner's temp directory, outside the checkout, so the pnpm tree is
+      # untouched; the binary path is the one the package's codex.js
+      # resolves for this runner's architecture.
+      - name: Install the native Codex binary for the containment tests (macOS)
+        if: startsWith(matrix.os, 'macos')
+        working-directory: ${{ runner.temp }}
+        run: |
+          prefix="$RUNNER_TEMP/codex-npm"
+          npm install --prefix "$prefix" --no-audit --no-fund @openai/codex@0.162.0
+          native="$(cd "$prefix" && node -e '
+            const path = require("path");
+            const triple = { x64: "x86_64-apple-darwin", arm64: "aarch64-apple-darwin" }[process.arch];
+            const pkg = { x64: "@openai/codex-darwin-x64", arm64: "@openai/codex-darwin-arm64" }[process.arch];
+            const root = path.dirname(require.resolve(pkg + "/package.json", { paths: [process.cwd()] }));
+            console.log(path.join(root, "vendor", triple, "bin", "codex"));
+          ')"
+          test -x "$native"
+          echo "FRESHELL_TEST_CODEX_NATIVE=$native" >> "$GITHUB_ENV"
+
+      # Per-pane containment on Windows and macOS: Job Object units and the
+      # self-placing exec shim on Windows, the tag backend's libproc and
+      # kqueue facts on macOS, the process facts, and the design-decision
+      # tests that chose each backend's design. `--no-fail-fast` runs every
+      # test binary, so one failure never hides another's result.
+      - name: Test containment (Windows and macOS)
+        if: matrix.os != 'ubuntu-latest'
         run: cargo test --locked -p freshell-containment --no-fail-fast
 
       # Exercise the native Windows Claude profile lookup and the generated

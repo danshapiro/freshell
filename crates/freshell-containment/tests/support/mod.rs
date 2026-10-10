@@ -100,7 +100,8 @@ pub struct AgentOpts {
     pub on_int_copy: Option<PathBuf>,
     /// A detached job: an own-session intermediate starts it and exits; the
     /// job waits until the intermediate is gone and then execs
-    /// `env -i /bin/sleep 600` (no tag, own session, parent link lost).
+    /// `env -i /bin/sleep 600` (no tag, own session, parent link lost). The
+    /// session is made with perl's `POSIX::setsid` (macOS has no `setsid(1)`).
     pub envless_job: bool,
 }
 
@@ -242,7 +243,7 @@ fi
 N=0; [ "{untagged}" = 1 ] && {{ env -u FRESHELL_UNIT_ID perl -e '$SIG{{INT}} = "IGNORE"; sleep 600' & N=$!; }}
 E=0; EI=0
 if [ "{envless}" = 1 ]; then
-  setsid sh -c 'echo $$ > "$0/envless-intermediate.pid"; p=$$; sh -c "while kill -0 $p 2>/dev/null; do sleep 0.05; done; exec env -i /bin/sleep 600" & echo $! > "$0/envless.pid.tmp"; mv "$0/envless.pid.tmp" "$0/envless.pid"; exit 0' "{dir}"
+  perl -e 'use POSIX; POSIX::setsid() or die "setsid: $!"; exec "/bin/sh", "-c", @ARGV' 'echo $$ > "$0/envless-intermediate.pid"; p=$$; sh -c "while kill -0 $p 2>/dev/null; do sleep 0.05; done; exec env -i /bin/sleep 600" & echo $! > "$0/envless.pid.tmp"; mv "$0/envless.pid.tmp" "$0/envless.pid"; exit 0' "{dir}"
   while [ ! -s "{dir}/envless.pid" ]; do sleep 0.05; done
   E=$(cat "{dir}/envless.pid"); EI=$(cat "{dir}/envless-intermediate.pid")
 fi
@@ -388,9 +389,21 @@ pub fn alive(pid: u32) -> bool {
     pid != 0 && freshell_containment::process::is_running(pid)
 }
 
-/// Linux: whether `pid`'s environment is empty (it exec'd under `env -i`).
+/// Whether `pid`'s environment is empty (it exec'd under `env -i`).
+#[cfg(target_os = "linux")]
 pub fn environ_is_empty(pid: u32) -> bool {
     std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|raw| raw.is_empty())
+}
+
+/// macOS: whether `pid` runs the envless job's `/bin/sleep 600` with an
+/// empty environment, read independently of the crate through `ps -E`,
+/// which lists the environment after the arguments.
+#[cfg(target_os = "macos")]
+pub fn environ_is_empty(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-E", "-ww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "/bin/sleep 600")
 }
 
 /// Bounded wait (test helper) for a condition the test cannot observe by event.
