@@ -5160,7 +5160,8 @@ export class ManagedRuntimeOwner {
   private async replaceSupervisor(mode: 'graceful' | 'abrupt', crashPoint?: 'ordinary_stop_after_intent', beforeStart?: () => void): Promise<SupervisorInstance> {
     const previous = this.supervisor
     if (mode === 'abrupt') this.runtime.killTrackedContainerExact(previous.containerId)
-    else this.runtime.stopSupervisorExact(previous, Boolean(beforeStart))
+    else if (beforeStart) this.runtime.stopSupervisorExact(previous, true)
+    else this.runtime.stopSupervisorExact(previous)
     beforeStart?.()
     if (!beforeStart) this.runtime.removeContainerExact(previous.containerId)
     this.supervisor = await this.runtime.startSupervisor({
