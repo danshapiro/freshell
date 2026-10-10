@@ -16,8 +16,19 @@ use freshell_containment::*;
 use support::*;
 use tracing::Level;
 
+/// The User Request: "If Gone is not confirmed within 5 seconds, the tab
+/// stays open showing 'Stopping…' until it is confirmed." Stated here, not
+/// taken from the product's `UNCONFIRMED_AFTER`, so a change to the
+/// product's value fails these tests.
+const REQUIRED_UNCONFIRMED_AFTER: Duration = Duration::from_secs(5);
+
 /// Gone is held this long after the screen and main exit.
 const HOLD_MS: u64 = 6500;
+
+/// A bound on the wait for Gone, so a stop that never reaches Gone fails
+/// with the timeline instead of hanging: far above the slowest measured run
+/// (about 10 s with 192 CPU-bound processes on 96 cores).
+const GONE_WAIT_LIMIT: Duration = Duration::from_secs(60);
 
 fn hold_gone_confirmation() {
     std::env::set_var("FRESHELL_TEST_HOOKS", "1");
@@ -73,16 +84,28 @@ fn logged(
     })
 }
 
+/// The stop's report at Gone, failing with the timeline when Gone does not
+/// come within `GONE_WAIT_LIMIT`.
+async fn gone(handle: &StopHandle, cap: &capture::Captured, t0: Instant) -> StopReport {
+    handle.wait_for(GONE_WAIT_LIMIT).await.unwrap_or_else(|| {
+        panic!(
+            "not Gone within {GONE_WAIT_LIMIT:?}:\n{}",
+            timeline(cap, t0)
+        )
+    })
+}
+
 /// How late a due timer may fire: a wake-up delay, not a product tolerance.
 /// Measured at 1 to 10 ms with 192 CPU-bound processes on garageserver's 96
 /// cores (load average about 196); it stays under the hold's 1.5 s lead over
 /// the ERROR, so a timer this late still logs before Gone.
 const TIMER_LATENESS: Duration = Duration::from_secs(1);
 
-/// The stop's first unconfirmed ERROR came `UNCONFIRMED_AFTER` after the
-/// whole-unit kill (whose line is logged just before the clock starts), not
-/// earlier and at most `TIMER_LATENESS` later, was the after-kill one, and
-/// was logged while the stop was still unconfirmed: Gone followed it.
+/// The stop's first unconfirmed ERROR came `REQUIRED_UNCONFIRMED_AFTER`
+/// after the whole-unit kill (whose line is logged just before the clock
+/// starts), not earlier and at most `TIMER_LATENESS` later, was the
+/// after-kill one, and was logged while the stop was still unconfirmed: Gone
+/// followed it.
 fn assert_unconfirmed_measured_from_the_kill(cap: &capture::Captured, t0: Instant) {
     let kill = logged(
         cap,
@@ -95,21 +118,21 @@ fn assert_unconfirmed_measured_from_the_kill(cap: &capture::Captured, t0: Instan
     let gone = logged(cap, t0, Level::INFO, "unit.stop.gone", &[]);
     let after_kill = unconfirmed.at.checked_duration_since(kill.at);
     assert!(
-        after_kill.is_some_and(|d| d >= UNCONFIRMED_AFTER),
-        "unconfirmed is measured from the kill, not from the request \
-         ({after_kill:?} after the kill):\n{}",
+        after_kill.is_some_and(|d| d >= REQUIRED_UNCONFIRMED_AFTER),
+        "unconfirmed is logged {REQUIRED_UNCONFIRMED_AFTER:?} after the kill, \
+         not earlier and not from the request ({after_kill:?} after the kill):\n{}",
         timeline(cap, t0)
     );
     assert!(
-        after_kill.is_some_and(|d| d < UNCONFIRMED_AFTER + TIMER_LATENESS),
-        "unconfirmed is logged {UNCONFIRMED_AFTER:?} after the kill \
+        after_kill.is_some_and(|d| d < REQUIRED_UNCONFIRMED_AFTER + TIMER_LATENESS),
+        "unconfirmed is logged {REQUIRED_UNCONFIRMED_AFTER:?} after the kill \
          ({after_kill:?} after the kill):\n{}",
         timeline(cap, t0)
     );
     assert_eq!(
-        unconfirmed.fields["waiting_on"],
-        "screen, main or lock",
-        "{}",
+        unconfirmed.fields.get("waiting_on").map(String::as_str),
+        Some("screen, main or lock"),
+        "the first unconfirmed ERROR is the after-kill one:\n{}",
         timeline(cap, t0)
     );
     assert!(
@@ -138,7 +161,7 @@ async fn an_unconfirmed_stop_logs_an_error_at_five_seconds_and_keeps_waiting() {
     ));
     // The agent exits at its SIGINT, the kill follows, and Gone comes at
     // least the hold later.
-    let report = handle.wait().await;
+    let report = gone(&handle, &cap, t0).await;
     assert!(report.duration_ms >= HOLD_MS, "{}", timeline(&cap, t0));
     assert_unconfirmed_measured_from_the_kill(&cap, t0);
 }
@@ -161,8 +184,8 @@ async fn an_escalated_graceful_stop_measures_unconfirmed_from_its_kill() {
     // The kill lands after the 2 s grace, Gone at least the hold later. An
     // unconfirmed clock started at the request (the earlier sketch) would log
     // its ERROR 5 s after the request, at most 3 s after this kill.
-    let report = handle.wait().await;
-    assert!(report.escalated);
+    let report = gone(&handle, &cap, t0).await;
+    assert!(report.escalated, "{}", timeline(&cap, t0));
     let escalated = logged(&cap, t0, Level::WARN, "unit.stop.escalated", &[]);
     let kill = logged(
         &cap,
@@ -171,9 +194,16 @@ async fn an_escalated_graceful_stop_measures_unconfirmed_from_its_kill() {
         "unit.stop.signal_sent",
         &[("signal", "SIGKILL"), ("target", "unit")],
     );
+    // The grace starts at the soft signal, after `t0`, and a timer never
+    // fires early, so the escalation cannot come sooner than the grace.
     assert!(
-        escalated.at <= kill.at && kill.at.duration_since(t0) >= grace,
-        "the escalation, then the kill, after the grace:\n{}",
+        escalated.at.saturating_duration_since(t0) >= grace,
+        "the escalation came after the {grace:?} grace:\n{}",
+        timeline(&cap, t0)
+    );
+    assert!(
+        escalated.at <= kill.at,
+        "the kill came after the escalation:\n{}",
         timeline(&cap, t0)
     );
     assert_unconfirmed_measured_from_the_kill(&cap, t0);
