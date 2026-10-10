@@ -228,11 +228,12 @@ impl HostedPty {
                         directory.join(name),
                         launch.run_as_uid,
                         launch.run_as_gid,
-                        if launch.resume_session_id.is_some() {
-                            "resume".into()
-                        } else {
-                            "startup".into()
-                        },
+                        native_startup_source(
+                            &launch.mode,
+                            &launch.args,
+                            launch.resume_session_id.is_some(),
+                        )
+                        .into(),
                     ))
                 })
                 .transpose()?
@@ -1183,6 +1184,103 @@ fn validate_codex_candidate(
         }
     }
     Ok(())
+}
+
+fn native_startup_source(mode: &str, args: &[String], has_session_id: bool) -> &'static str {
+    // Claude also preallocates fresh UUIDs into resume_session_id. The
+    // actual CLI intent determines which SessionStart event must follow.
+    let resuming = if mode == "claude" {
+        args.iter()
+            .any(|arg| arg == "--resume" || arg.starts_with("--resume="))
+    } else {
+        has_session_id
+    };
+    if resuming {
+        "resume"
+    } else {
+        "startup"
+    }
+}
+
+#[cfg(all(test, unix))]
+mod native_startup_source_tests {
+    use super::native_startup_source;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn claude_actual_launch_intent_accepts_only_matching_native_hook_source() {
+        let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../freshell-claude-sidecar/native-session-channel.mjs");
+        let root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        for (flag, emitted_source, accepted) in [
+            ("--session-id", "startup", true),
+            ("--resume", "resume", true),
+            ("--session-id", "resume", false),
+            ("--resume", "startup", false),
+        ] {
+            let owned = tempfile::tempdir().unwrap();
+            let signal_dir = owned.path().join("signals");
+            let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+                launch_nonce: "current-launch".into(),
+                evidence_revision: 0,
+                execution_generation: 1,
+                requested_native_session_id: Some(root.into()),
+            };
+            let transcript = owned.path().join("native.jsonl");
+            let cwd = owned.path().to_string_lossy();
+            let hook = serde_json::json!({"hook_event_name":"SessionStart", "session_id":root,
+                "source":emitted_source, "cwd":cwd, "transcript_path":transcript});
+            let status = serde_json::json!({"session_id":root,"transcript_path":transcript,
+                "version":"2.1.263","model":{"id":"controlled-model"},
+                "workspace":{"current_dir":cwd},
+                "context_window":{"context_window_size":200000,"current_usage":null}});
+            for (option, payload) in [(None, hook), (Some("--status-line"), status)] {
+                let mut command = Command::new("node");
+                command.arg(&module);
+                if let Some(option) = option {
+                    command.arg(option);
+                }
+                let mut child = command
+                    .env("HOME", owned.path())
+                    .current_dir(owned.path())
+                    .env(
+                        "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+                        serde_json::to_string(&launch).unwrap(),
+                    )
+                    .env("FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR", &signal_dir)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(payload.to_string().as_bytes())
+                    .unwrap();
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let args = vec![flag.into(), root.into()];
+            let observed = crate::providers::native_identity::read_claude_observation(
+                &signal_dir.join("session-start.json"),
+                unsafe { libc::geteuid() },
+                unsafe { libc::getegid() },
+                &launch,
+                native_startup_source("claude", &args, true),
+                owned.path(),
+            )
+            .unwrap();
+            assert_eq!(observed.is_some(), accepted, "{flag} with {emitted_source}");
+        }
+    }
 }
 
 fn epoch_ms() -> i64 {
