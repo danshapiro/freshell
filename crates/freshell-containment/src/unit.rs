@@ -574,8 +574,10 @@ impl AgentUnit {
         lock(&self.inner.stop).as_ref().map(|s| s.handle.clone())
     }
 
-    /// The owner operation of the stop in flight, if any.
-    fn stop_operation(&self) -> Option<String> {
+    /// The owner operation of the unit's stop (in flight, or finished), if
+    /// it named one. A later stop joins that stop and drops its own
+    /// operation, so whatever a joiner releases belongs to this operation.
+    pub fn stop_operation(&self) -> Option<String> {
         lock(&self.inner.stop)
             .as_ref()
             .and_then(|s| s.operation_id())

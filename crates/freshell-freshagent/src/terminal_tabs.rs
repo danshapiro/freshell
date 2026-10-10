@@ -1245,6 +1245,41 @@ fn take_rest_claims(
     ))
 }
 
+/// Stamps the create's Starting key with the unit of its spawned row (as
+/// the WS create does): a stop of the unit from now on moves the key to
+/// Stopping and releases it only at Gone, and the create's commit then
+/// answers stale. A start a stop already cancelled is left unstamped: that
+/// stop (perhaps Gone already) moved no key of the create's, and the
+/// give-up before the commit releases the claim at the unit's Gone.
+fn stamp_claim_with_unit(
+    state: &FreshAgentState,
+    registry: &freshell_terminal::TerminalRegistry,
+    start: &RestUnitStart,
+    claim: &RestOwnershipClaim,
+    terminal_id: &str,
+) {
+    if start.cancelled() {
+        return;
+    }
+    if let Some(ownership) = state.ownership.as_ref() {
+        ownership.register_partial_runtime(
+            &claim.locator.provider,
+            &claim.locator.session_id,
+            claim.ticket.operation_id(),
+            claim.ticket.generation(),
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(terminal_id.to_string()),
+                live_session_key: None,
+                pid: registry.pid_of(terminal_id),
+                ownership_id: None,
+                unit_id: registry.unit_id_for(terminal_id),
+                hold: freshell_ownership::HoldKind::Main,
+            },
+        );
+    }
+}
+
 /// Releases a disarmed sessionRef lease (and its retained coordinator
 /// claim) when dropped: carried by a given-up start, it runs after the
 /// unit's Gone — the confirmed death `force_release_after_confirmed_kill`
@@ -3483,27 +3518,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             ));
         }
         start.bind(&terminal_id, screen_pid);
-        // The create's Starting key is stamped with the unit (as the WS
-        // create's is): a stop of the unit before the create commits moves
-        // it to Stopping and releases it at Gone, and the create's commit
-        // then answers stale.
-        if let (Some(ownership), Some(claim)) = (state.ownership.as_ref(), ownership_claim.as_ref())
-        {
-            ownership.register_partial_runtime(
-                &claim.locator.provider,
-                &claim.locator.session_id,
-                claim.ticket.operation_id(),
-                claim.ticket.generation(),
-                freshell_ownership::OwnerIdentity {
-                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
-                    terminal_id: Some(terminal_id.clone()),
-                    live_session_key: None,
-                    pid: registry.pid_of(&terminal_id),
-                    ownership_id: None,
-                    unit_id: registry.unit_id_for(&terminal_id),
-                    hold: freshell_ownership::HoldKind::Main,
-                },
-            );
+        if let Some(claim) = ownership_claim.as_ref() {
+            stamp_claim_with_unit(&state, &registry, &start, claim, &terminal_id);
         }
         // Kept for the failure arms below (they stop the unit).
         rest_unit_bound = Some(start);
@@ -3775,10 +3791,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             };
             let refusal = match claim {
                 crate::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
-                    ownership_claim = Some(RestOwnershipClaim {
+                    let claim = RestOwnershipClaim {
                         ticket,
                         locator: locator.clone(),
-                    });
+                    };
+                    if let Some(start) = rest_unit_bound.as_ref() {
+                        stamp_claim_with_unit(&state, &registry, start, &claim, &terminal_id);
+                    }
+                    ownership_claim = Some(claim);
                     None
                 }
                 crate::ownership_lane::TerminalLaneClaim::Unwired => None,
@@ -3826,6 +3846,37 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 ));
             }
         }
+    }
+
+    // A start a stop cancelled since its bind is given up before its claim
+    // could commit Live for a stopping unit (as the WS create is): the claims
+    // go at the unit's Gone.
+    if rest_unit_bound
+        .as_ref()
+        .is_some_and(RestUnitStart::cancelled)
+    {
+        let start = rest_unit_bound.take().expect("the start is bound");
+        let claims = take_rest_claims(
+            &mut ownership_claim,
+            &mut session_ref_lease,
+            &mut start_cancellation,
+        );
+        start.give_up(
+            "rest-start-cancelled",
+            Some(match claim_locator.clone() {
+                Some(locator) => Box::new((
+                    claims,
+                    ReleaseLeaseAfterGone {
+                        registry: registry.clone(),
+                        locator,
+                    },
+                )),
+                None => claims,
+            }),
+        );
+        return Err(codex_launch_error_response(
+            freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled,
+        ));
     }
 
     // kata b8ke Task 4: the REST rung's coordinator winner commit — right

@@ -302,6 +302,264 @@ async fn a_stop_that_reaches_gone_before_a_rest_start_commits_ends_the_start() {
     eventually("the conversation is released", || is_vacant(&h, "t-gone")).await;
 }
 
+/// What [`RegistrationHook`] runs, with the registering terminal's id.
+type OnRegistration = Box<dyn FnOnce(&str) + Send>;
+
+/// A REST identity binder that runs its hook (once) with the terminal id
+/// when the create registers the pane's identity: after the create's bind,
+/// before its late claim and its commit.
+#[derive(Default)]
+struct RegistrationHook {
+    hook: std::sync::Mutex<Option<OnRegistration>>,
+}
+
+impl std::fmt::Debug for RegistrationHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RegistrationHook")
+    }
+}
+
+impl freshell_terminal::registry::PaneIdentityBinder for RegistrationHook {
+    fn record_prespawn_claude_binding(
+        &self,
+        _session_id: &str,
+        _terminal_id: &str,
+        _mode: &str,
+        _cwd: Option<&str>,
+        _create_request_id: Option<&str>,
+    ) {
+    }
+
+    fn delete_prespawn_claude_binding(&self, _session_id: &str) {}
+
+    fn register_create_identity(
+        &self,
+        terminal_id: &str,
+        _mode: &str,
+        _resume_session_id: Option<&str>,
+        _cwd: Option<&str>,
+        _create_request_id: Option<&str>,
+        _observed: Option<(u64, u64)>,
+    ) -> Result<(), std::io::Error> {
+        if let Some(hook) = self.hook.lock().unwrap().take() {
+            hook(terminal_id);
+        }
+        Ok(())
+    }
+
+    fn retire_pane_identity(&self, _terminal_id: &str) {}
+}
+
+/// The terminal a hook stopped and the handle of that stop.
+type StoppedAtRegistration =
+    Arc<std::sync::Mutex<Option<(String, freshell_containment::StopHandle)>>>;
+
+/// Arms `registration` so that, after a REST create's bind, `before` runs
+/// and then the start's unit is stopped as a failed placement (an ending
+/// that keeps the pane's row as a failed start); with `until_gone` the
+/// create continues only once that stop reached Gone. Yields the terminal
+/// and the stop's handle once the hook ran.
+fn stop_at_registration(
+    h: &UnitHarness,
+    registration: &RegistrationHook,
+    until_gone: bool,
+    before: impl FnOnce() + Send + 'static,
+) -> StoppedAtRegistration {
+    let stop = Arc::new(std::sync::Mutex::new(None));
+    *registration.hook.lock().unwrap() = Some(Box::new({
+        let units = h.state.units.directory.clone();
+        let stop = stop.clone();
+        move |terminal_id: &str| {
+            before();
+            let entry = units
+                .by_terminal(terminal_id)
+                .expect("the bound start's entry names its terminal");
+            let handle = units
+                .stop_unit(
+                    entry.unit.id(),
+                    freshell_containment::StopMode::Force,
+                    freshell_containment::StopReason::PlacementFailed { exit_code: None },
+                    "test-placement-failed",
+                )
+                .expect("the start's unit stops through the lifecycle");
+            if until_gone {
+                // The identity registration runs on a blocking thread.
+                tokio::runtime::Handle::current()
+                    .block_on(handle.wait_for(LIMIT))
+                    .expect("the unit reaches Gone");
+            }
+            *stop.lock().unwrap() = Some((terminal_id.to_string(), handle));
+        }
+    }));
+    stop
+}
+
+/// What a REST start stopped after its bind must leave once its unit is
+/// Gone: the conversation released, no directory entry, the pane not
+/// running and its app-server dead.
+async fn assert_released_at_gone(
+    h: &UnitHarness,
+    session_id: &str,
+    tid: &str,
+    stop: freshell_containment::StopHandle,
+) {
+    stop.wait_for(LIMIT).await.expect("the unit reaches Gone");
+    eventually("the conversation is released after Gone", || {
+        is_vacant(h, session_id)
+    })
+    .await;
+    eventually("the entry is removed", || h.state.units.all().is_empty()).await;
+    assert!(
+        !h.state.registry.is_pty_running(tid),
+        "the pane is not running"
+    );
+    for native in h.native_manifests() {
+        assert!(!fake_codex::pid_alive(native.pid), "the app-server is dead");
+    }
+}
+
+/// A stop that begins after a REST start's bind (here its placement
+/// failing) moves the start's claim to Stopping at once, because the claim
+/// is stamped with the unit after the bind (so every device is told the
+/// conversation is stopping), and gives the start up before it commits:
+/// the create is answered as cancelled, and the conversation is released
+/// at the unit's Gone (Task 12 re-review 2, Minor 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_after_the_bind_moves_a_rest_starts_claim_to_stopping_and_gives_it_up() {
+    let registration = Arc::new(RegistrationHook::default());
+    let h = UnitHarness::start(HarnessOpts {
+        rest_identity_binder: Some(registration.clone()),
+        ..Default::default()
+    })
+    .await;
+    // Gone is held 1.5 s after the kill, so the stop is still in flight
+    // when the create answers.
+    let _gone_delay = GoneDelay::set(1500);
+    let stop = stop_at_registration(&h, &registration, false, || {});
+
+    let (status, body) = h.rest_create_codex(Some("t-bound")).await;
+    let (tid, stop) = stop
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the start's unit was stopped after its bind");
+    assert_ne!(
+        status, 200,
+        "a start stopped after its bind never commits: {body}"
+    );
+    let during_stop = h
+        .state
+        .ownership
+        .as_ref()
+        .unwrap()
+        .observe("codex", "t-bound")
+        .state;
+    assert!(
+        matches!(
+            during_stop,
+            freshell_ownership::OwnershipState::Stopping { .. }
+        ),
+        "the claim is Stopping while the unit stops: {during_stop:?}"
+    );
+    assert_released_at_gone(&h, "t-bound", &tid, stop).await;
+}
+
+/// The same when the create claims its conversation only after the spawn
+/// (its first claim answered Adopt over a terminal owner that went away
+/// mid-spawn): the stop began after the bind, before that late claim. The
+/// create is answered as cancelled and never commits the conversation Live
+/// for the stopping pane; once the unit is Gone the conversation is
+/// released (Task 12 re-review 2, Minor 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_after_the_bind_gives_a_late_claimed_rest_start_up_before_it_commits() {
+    late_claimed_rest_start_stopped_after_its_bind(false).await;
+}
+
+/// The same when that stop already reached Gone before the late claim: the
+/// claim is not tagged with the gone unit, so it is released rather than
+/// left Stopping under a stop that already finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_claimed_rest_start_whose_unit_is_already_gone_releases_its_claim() {
+    late_claimed_rest_start_stopped_after_its_bind(true).await;
+}
+
+async fn late_claimed_rest_start_stopped_after_its_bind(until_gone: bool) {
+    let registration = Arc::new(RegistrationHook::default());
+    let h = UnitHarness::start(HarnessOpts {
+        rest_identity_binder: Some(registration.clone()),
+        ..Default::default()
+    })
+    .await;
+    // Unless the hook waits for Gone, Gone is held 1.5 s after the kill, so
+    // the stop is still in flight when the create commits or gives up.
+    let _gone_delay = (!until_gone).then(|| GoneDelay::set(1500));
+    let ownership = h.state.ownership.clone().expect("an owner registry");
+
+    // A terminal owner with no row holds the conversation: the create's
+    // claim answers Adopt, so it spawns under its attach guard with no
+    // claim of its own and claims after the spawn.
+    let phantom_op = "op-phantom";
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+        "codex",
+        "t-late",
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        phantom_op,
+        None,
+        "test",
+        1_000,
+    ) else {
+        panic!("the phantom's start is granted")
+    };
+    let mut phantom = freshell_ownership::OwnerIdentity {
+        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+        terminal_id: Some("t-phantom".into()),
+        live_session_key: None,
+        pid: None,
+        ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
+    };
+    assert_eq!(
+        ownership.commit_live("codex", "t-late", phantom_op, generation, phantom.clone()),
+        freshell_ownership::CommitOutcome::Committed
+    );
+    phantom.ownership_id = Some(phantom_op.to_string());
+    // After the bind the phantom goes away (so the late claim is granted),
+    // then the start's unit is stopped.
+    let stop = stop_at_registration(&h, &registration, until_gone, {
+        let ownership = ownership.clone();
+        move || {
+            ownership.release(
+                "codex",
+                "t-late",
+                &freshell_ownership::ReleaseClaim {
+                    operation_id: phantom_op.to_string(),
+                    generation,
+                    runtime: Some(phantom),
+                },
+                "test",
+            );
+        }
+    });
+
+    let (status, body) = h.rest_create_codex(Some("t-late")).await;
+    let (tid, stop) = stop
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the start's unit was stopped after its bind");
+    assert_ne!(
+        status, 200,
+        "a start stopped after its bind never commits: {body}"
+    );
+    let answered = ownership.observe("codex", "t-late").state;
+    assert!(
+        !matches!(answered, freshell_ownership::OwnershipState::Live { .. }),
+        "the conversation is never committed Live for the stopped pane: {answered:?}"
+    );
+    assert_released_at_gone(&h, "t-late", &tid, stop).await;
+}
+
 /// A switch away from a Codex terminal pane in its unit (here to a new
 /// terminal pane of the same conversation, through the real handoff runner)
 /// succeeds on its first attempt: the prior is stopped under the handoff's

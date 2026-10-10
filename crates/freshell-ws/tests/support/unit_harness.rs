@@ -46,6 +46,10 @@ pub struct HarnessOpts {
     pub rest_codex_tui_cmd: Option<String>,
     /// The WebSocket doors' create protection (spawn permit wait included).
     pub create_protect: freshell_ws::create_limit::CreateProtectConfig,
+    /// The REST lane's pane identity binder (`main.rs` installs the session
+    /// identity registry's); its `register_create_identity` runs after a
+    /// REST create's bind and before its late claim and commit.
+    pub rest_identity_binder: Option<Arc<dyn freshell_terminal::registry::PaneIdentityBinder>>,
 }
 
 impl Default for HarnessOpts {
@@ -57,6 +61,7 @@ impl Default for HarnessOpts {
             spawn_gate: None,
             rest_codex_tui_cmd: None,
             create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+            rest_identity_binder: None,
         }
     }
 }
@@ -272,7 +277,7 @@ impl UnitHarness {
             },
             None => codex_cli_spec(),
         };
-        let fresh_agent_state = freshell_freshagent::FreshAgentState::new(
+        let mut fresh_agent_state = freshell_freshagent::FreshAgentState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
         )
@@ -283,6 +288,9 @@ impl UnitHarness {
             state.units.directory.clone(),
             state.units.containment.clone(),
         );
+        if let Some(binder) = opts.rest_identity_binder.clone() {
+            fresh_agent_state = fresh_agent_state.with_pane_identity_binder(binder);
+        }
         if let Some((gate, timeout)) = opts.spawn_gate.as_ref() {
             fresh_agent_state.set_spawn_gate(Arc::clone(gate), *timeout);
         }

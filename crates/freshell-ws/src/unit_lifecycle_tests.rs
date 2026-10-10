@@ -400,6 +400,76 @@ async fn a_stop_joins_a_key_already_stopping_under_another_operation() {
     );
 }
 
+/// A stop that began while the unit held no key moved none. A key tagged
+/// with the unit after that (a start's claim stamped once its row exists)
+/// is moved to Stopping by the next stop, which joins the one in flight,
+/// under the in-flight stop's operation: that stop's Gone releases it
+/// (Task 12 re-review 2, Minor 1). On the current-thread runtime the first
+/// stop's sequence runs only once the test awaits.
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_tagged_after_the_stop_began_is_released_at_that_stops_gone() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, _crashes) = unit_state(root.path());
+    let entry = running_pane(&state, "T-tagged", "crq-tagged", "sleep 30").await;
+    let ownership = state.ownership.clone().unwrap();
+    let mut frames = state.broadcast_tx.subscribe();
+    let command = |operation_id: &str| UnitStopCommand {
+        mode: StopMode::Force,
+        reason: StopReason::PlacementFailed { exit_code: None },
+        initiator: "test".into(),
+        operation_id: operation_id.into(),
+        record_stopped_pane: false,
+    };
+
+    let first = stop_terminal_unit(&state, &entry, command("op-first"));
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+        "codex",
+        "s-tagged",
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        "op-start",
+        None,
+        "test",
+        1,
+    ) else {
+        panic!("granted")
+    };
+    ownership.register_partial_runtime(
+        "codex",
+        "s-tagged",
+        "op-start",
+        generation,
+        freshell_ownership::OwnerIdentity {
+            terminal_id: Some("T-tagged".into()),
+            unit_id: Some(entry.unit.id().to_string()),
+            ..Default::default()
+        },
+    );
+    let second = stop_terminal_unit(&state, &entry, command("op-second"));
+
+    let report = first.wait_for(LIMIT).await.expect("Gone");
+    assert_eq!(second.wait_for(LIMIT).await, Some(report));
+    let state_after = ownership.observe("codex", "s-tagged").state;
+    assert!(
+        matches!(state_after, freshell_ownership::OwnershipState::Vacant),
+        "the key tagged after the stop began is released at its Gone: {state_after:?}"
+    );
+    let mut stopping_ops = Vec::new();
+    while let Ok(frame) = frames.try_recv() {
+        let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        if value["type"] == "session.runtimeOwner"
+            && value["sessionId"] == "s-tagged"
+            && value["transition"] == "stopping"
+        {
+            stopping_ops.push(value["operationId"].clone());
+        }
+    }
+    assert_eq!(
+        stopping_ops,
+        vec![serde_json::json!("op-first")],
+        "the key moved under the in-flight stop's operation"
+    );
+}
+
 /// The `freshell_unit` lines captured for `unit`.
 fn unit_lines(
     logs: &Arc<Mutex<Vec<crate::invariants::capture::CapturedEvent>>>,

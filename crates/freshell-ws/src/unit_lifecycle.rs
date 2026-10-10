@@ -159,7 +159,11 @@ pub fn stop_terminal_unit(state: &WsState, entry: &UnitEntry, cmd: UnitStopComma
         .and_then(|e| e.create_request_id.clone())
         .or_else(|| entry.create_request_id.clone());
 
-    // 1. The join decision comes from the registry, not the unit's latch.
+    // 1. The join decision comes from the registry, not the unit's latch:
+    //    a key already Stopping names the unit's one stop operation. When
+    //    none is (the stop in flight began before any key was stamped with
+    //    the unit, so it moved none), the stop in flight names it: this
+    //    call joins that stop, whose Gone commits only its own operation.
     let operation_id = state
         .ownership
         .as_ref()
@@ -174,6 +178,7 @@ pub fn stop_terminal_unit(state: &WsState, entry: &UnitEntry, cmd: UnitStopComma
                     _ => None,
                 })
         })
+        .or_else(|| unit.stop_operation())
         .unwrap_or_else(|| cmd.operation_id.clone());
 
     // 2. Every key the unit holds moves to Stopping; the live frame tells
