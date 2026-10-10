@@ -81,6 +81,7 @@ impl CodexLaunchRuntime for FakeRuntime {
             }
             Ok(CodexRuntimeReady {
                 ws_url: self.ws_url.clone(),
+                codex_home: None,
             })
         })
     }
@@ -99,10 +100,15 @@ impl CodexLaunchRuntime for FakeRuntime {
         })
     }
 
-    fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
+    fn stop(
+        &self,
+        _mode: freshell_containment::StopMode,
+        _reason: freshell_containment::StopReason,
+        _initiator: String,
+    ) -> BoxFuture<'_, Option<freshell_containment::StopHandle>> {
         Box::pin(async move {
             self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            None
         })
     }
 }

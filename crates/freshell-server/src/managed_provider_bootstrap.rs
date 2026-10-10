@@ -266,7 +266,24 @@ impl freshell_platform::mcp_inject::McpRuntime for ManagedImageMcpRuntime {
             "/opt/freshell-mcp/server.js".into(),
         )])
     }
+
+    fn mcp_context_env_vars(&self) -> &'static [&'static str] {
+        &MANAGED_IMAGE_MCP_CONTEXT_ENV_VARS
+    }
 }
+
+/// The context names a managed image's Codex forwards to its MCP server:
+/// Freshell's context without the containment unit tag. A managed-runtime
+/// pane runs inside its soul's container, never in a containment unit, and
+/// the session host's runtime protocol accepts exactly this recipe.
+const MANAGED_IMAGE_MCP_CONTEXT_ENV_VARS: [&str; 6] = [
+    "FRESHELL",
+    "FRESHELL_URL",
+    "FRESHELL_TOKEN",
+    "FRESHELL_TERMINAL_ID",
+    "FRESHELL_TAB_ID",
+    "FRESHELL_PANE_ID",
+];
 
 fn managed_codex_mcp_args() -> Option<Vec<String>> {
     let renderings = freshell_platform::mcp_inject::build_managed_codex_mcp_renderings(
@@ -462,6 +479,11 @@ mod tests {
         let context =
             provider_launch_context_for_managed("codex", workspace.path(), Some(capability))
                 .unwrap();
+        // The session host validates the context it is handed against the
+        // runtime protocol's packaged MCP recipe before it launches anything.
+        context
+            .validate("codex")
+            .expect("the session host accepts the managed Codex MCP recipe");
         let ProviderPreparation::Codex {
             tui_args,
             sidecar_args,

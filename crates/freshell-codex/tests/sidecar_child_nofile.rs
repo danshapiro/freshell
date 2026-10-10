@@ -76,7 +76,17 @@ async fn the_codex_sidecar_starts_with_the_recorded_soft_limit() {
         .await
         .expect("the sidecar must come up in time");
     let recorded = std::fs::read_to_string(&soft_file);
-    runtime.shutdown().await.expect("stop the sidecar");
+    let stopped = runtime
+        .stop(
+            freshell_containment::StopMode::Force,
+            freshell_containment::StopReason::StartCancelled,
+            "test".to_string(),
+        )
+        .await;
+    assert!(
+        stopped.is_none(),
+        "the seedless sidecar stops to completion"
+    );
 
     ready.expect("the sidecar must come up");
     let recorded = recorded.expect("the launcher must record its soft limit");

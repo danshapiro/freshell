@@ -116,8 +116,13 @@ impl CodexLaunchRuntime for FailingAdoptionRuntime {
         })
     }
 
-    fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
-        self.inner.shutdown()
+    fn stop(
+        &self,
+        mode: freshell_codex::launch_lifecycle::StopMode,
+        reason: freshell_codex::launch_lifecycle::StopReason,
+        initiator: String,
+    ) -> BoxFuture<'_, Option<freshell_codex::launch_lifecycle::StopHandle>> {
+        self.inner.stop(mode, reason, initiator)
     }
 }
 

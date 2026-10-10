@@ -2920,6 +2920,8 @@ async fn plan_codex_managed_launch(
         sandbox: plan_sandbox.as_deref(),
         approval_policy: plan_approval.as_deref(),
         sidecar_context: setup.sidecar_context.clone(),
+        // Task 12 passes the pane's containment seed.
+        unit_seed: None,
     };
     let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
     let result = match cancel {

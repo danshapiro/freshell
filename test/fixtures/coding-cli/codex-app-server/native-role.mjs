@@ -72,8 +72,27 @@ export function createNativeRole({ behavior, codexHome, broadcast, openConnectio
     const p = spawn('perl', ['-e', 'setpgrp(0,0); sleep 600'], { stdio: 'ignore' })
     children.helper = pin(p.pid)
   }
+  // Codex's stdio MCP launcher gives a server only the variables its
+  // `mcp_servers.<name>.env_vars` list names, plus PATH and HOME. A native
+  // started without `-c mcp_servers.freshell.env_vars=[…]` keeps handing the
+  // child its full environment, as before.
+  function mcpChildEnvironment() {
+    const argv = process.argv.slice(2)
+    for (let i = 0; i + 1 < argv.length; i += 1) {
+      if (argv[i] !== '-c') continue
+      const match = /^mcp_servers\.freshell\.env_vars=\[(.*)\]$/.exec(argv[i + 1])
+      if (!match) continue
+      const names = [...match[1].matchAll(/"([^"\\]*)"/g)].map((m) => m[1])
+      const env = {}
+      for (const name of [...names, 'PATH', 'HOME']) {
+        if (process.env[name] !== undefined) env[name] = process.env[name]
+      }
+      return env
+    }
+    return process.env
+  }
   function spawnMcpChild() {
-    const p = spawn(process.execPath, ['-e', 'process.stdin.resume(); process.stdin.on("end", () => process.exit(0))'], { stdio: ['pipe', 'ignore', 'ignore'] })
+    const p = spawn(process.execPath, ['-e', 'process.stdin.resume(); process.stdin.on("end", () => process.exit(0))'], { stdio: ['pipe', 'ignore', 'ignore'], env: mcpChildEnvironment() })
     children.mcp = pin(p.pid)
   }
   function spawnShellCommand() {

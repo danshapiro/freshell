@@ -52,6 +52,9 @@ pub async fn prepare(
                 .unwrap_or_default(),
             env: child_secret_env.clone(),
         },
+        // The session host's sidecar runs inside the soul's container, which
+        // contains it; it keeps the unit-less spawn.
+        unit_seed: None,
     };
     let launch = CodexTerminalLaunchManager::global()
         .plan_create_with_retry_uncancellable(

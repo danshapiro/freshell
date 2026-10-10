@@ -296,6 +296,7 @@ impl freshell_codex::launch_lifecycle::CodexLaunchRuntime for FakeRuntime {
         Box::pin(async move {
             Ok(freshell_codex::launch_lifecycle::CodexRuntimeReady {
                 ws_url: self.ws_url.clone(),
+                codex_home: None,
             })
         })
     }
@@ -308,8 +309,13 @@ impl freshell_codex::launch_lifecycle::CodexLaunchRuntime for FakeRuntime {
         Box::pin(async move { Ok(()) })
     }
 
-    fn shutdown(&self) -> freshell_codex::BoxFuture<'_, Result<(), String>> {
-        Box::pin(async move { Ok(()) })
+    fn stop(
+        &self,
+        _mode: freshell_codex::launch_lifecycle::StopMode,
+        _reason: freshell_codex::launch_lifecycle::StopReason,
+        _initiator: String,
+    ) -> freshell_codex::BoxFuture<'_, Option<freshell_codex::launch_lifecycle::StopHandle>> {
+        Box::pin(async move { None })
     }
 }
 
@@ -397,9 +403,14 @@ impl freshell_codex::launch_lifecycle::CodexLaunchRuntime for StormRuntime {
         Box::pin(async move { Ok(()) })
     }
 
-    fn shutdown(&self) -> freshell_codex::BoxFuture<'_, Result<(), String>> {
+    fn stop(
+        &self,
+        _mode: freshell_codex::launch_lifecycle::StopMode,
+        _reason: freshell_codex::launch_lifecycle::StopReason,
+        _initiator: String,
+    ) -> freshell_codex::BoxFuture<'_, Option<freshell_codex::launch_lifecycle::StopHandle>> {
         self.c.shutdown_calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(()) })
+        Box::pin(async { None })
     }
 }
 
@@ -705,8 +716,8 @@ fn deterministic_plan_failure_is_loud_for_that_create_only() {
         assert_eq!(registry.kill_all(), 11, "the doomed create must not spawn");
         // 7 adopted codex sidecars tear down asynchronously after kill_all.
         // PLUS: the planner's cleanup-on-plan-failure (`plan_create`'s Err
-        // arm, launch_lifecycle.rs) runs `sidecar.shutdown()` — and thus
-        // `runtime.shutdown()` — once per failed attempt, and the doomed
+        // arm, launch_lifecycle.rs) runs `sidecar.stop_and_finish()` — and thus
+        // `runtime.stop()` — once per failed attempt, and the doomed
         // create burns the full initial retry budget; those cleanups were
         // awaited inline BEFORE the error frame we already received, so the
         // total is exact and deterministic.

@@ -83,7 +83,7 @@ fn fake_rt(tmp: &Path, wsl: bool) -> FakeRt {
     FakeRt::new(tmp, wsl, mcp_unix_args())
 }
 
-const MANAGED_CODEX_CONTEXT_ENV_VARS_PAIR: &str = "mcp_servers.freshell.env_vars=[\"FRESHELL\", \"FRESHELL_URL\", \"FRESHELL_TOKEN\", \"FRESHELL_TERMINAL_ID\", \"FRESHELL_TAB_ID\", \"FRESHELL_PANE_ID\"]";
+const MANAGED_CODEX_CONTEXT_ENV_VARS_PAIR: &str = "mcp_servers.freshell.env_vars=[\"FRESHELL\", \"FRESHELL_URL\", \"FRESHELL_TOKEN\", \"FRESHELL_TERMINAL_ID\", \"FRESHELL_TAB_ID\", \"FRESHELL_PANE_ID\", \"FRESHELL_UNIT_ID\"]";
 
 fn managed_codex_pairs(args_pair: &str) -> Vec<String> {
     vec![

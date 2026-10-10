@@ -28,6 +28,8 @@
 
 use std::sync::Arc;
 
+use freshell_containment::{StopMode, StopReason};
+
 use super::*;
 use crate::sidecar_store::{proc_cmdline, proc_starttime, CodexSidecarRecord};
 use crate::sidecar_test_support::{
@@ -587,7 +589,13 @@ async fn reattach_shutdown_kills_only_after_reverification() {
         .ensure_ready(None)
         .await
         .expect("ensure_ready adopts survivor A");
-    runtime_a.shutdown().await.expect("shutdown A");
+    assert!(
+        runtime_a
+            .stop(StopMode::Force, StopReason::StartCancelled, "test".into())
+            .await
+            .is_none(),
+        "a seedless reattached runtime stops to completion (no unit handle)"
+    );
     tokio::time::timeout(Duration::from_secs(10), child_a.wait())
         .await
         .expect("shutdown must reap the adopted survivor within the drain budget")
@@ -620,10 +628,11 @@ async fn reattach_shutdown_kills_only_after_reverification() {
     // runtime, so private field access is available): the pid-reuse shape
     // appearing AFTER a successful adopt.
     runtime_b.record.lock().unwrap().starttime += 1;
-    runtime_b
-        .shutdown()
+    // The stop completes even when re-verification refuses the kill.
+    assert!(runtime_b
+        .stop(StopMode::Force, StopReason::StartCancelled, "test".into())
         .await
-        .expect("shutdown returns Ok even when re-verification refuses the kill");
+        .is_none());
     tokio::time::sleep(NEVER_SIGNALLED_GRACE).await;
     assert_eq!(
         child_b.try_wait().expect("try_wait fixture b"),
@@ -742,7 +751,13 @@ async fn select_codex_runtime_prefers_a_claimable_survivor() {
         1,
         "a fresh plan must not claim the survivor"
     );
-    runtime.shutdown().await.expect("spawn-type shutdown");
+    assert!(
+        runtime
+            .stop(StopMode::Force, StopReason::StartCancelled, "test".into())
+            .await
+            .is_none(),
+        "a seedless spawn-type runtime stops to completion"
+    );
     assert_eq!(
         store.load_all(),
         vec![record.clone()],
@@ -756,7 +771,13 @@ async fn select_codex_runtime_prefers_a_claimable_survivor() {
         1,
         "an unknown session must not claim the survivor"
     );
-    runtime.shutdown().await.expect("spawn-type shutdown");
+    assert!(
+        runtime
+            .stop(StopMode::Force, StopReason::StartCancelled, "test".into())
+            .await
+            .is_none(),
+        "a seedless spawn-type runtime stops to completion"
+    );
     assert_eq!(
         store.load_all(),
         vec![record.clone()],
@@ -770,7 +791,13 @@ async fn select_codex_runtime_prefers_a_claimable_survivor() {
         1,
         "a None reconciler must claim nothing"
     );
-    runtime.shutdown().await.expect("spawn-type shutdown");
+    assert!(
+        runtime
+            .stop(StopMode::Force, StopReason::StartCancelled, "test".into())
+            .await
+            .is_none(),
+        "a seedless spawn-type runtime stops to completion"
+    );
     assert_eq!(
         store.load_all(),
         vec![record.clone()],
@@ -786,7 +813,13 @@ async fn select_codex_runtime_prefers_a_claimable_survivor() {
         1,
         "a None store must claim nothing"
     );
-    runtime.shutdown().await.expect("spawn-type shutdown");
+    assert!(
+        runtime
+            .stop(StopMode::Force, StopReason::StartCancelled, "test".into())
+            .await
+            .is_none(),
+        "a seedless spawn-type runtime stops to completion"
+    );
     assert_eq!(
         store.load_all(),
         vec![record.clone()],

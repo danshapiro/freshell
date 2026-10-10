@@ -3531,8 +3531,11 @@ async fn async_main() -> ExitCode {
     // `registry.kill_all()` above, so adopted launches whose exit hooks already queued
     // retention are simply re-retained (idempotent). No-op when the managed-launch
     // flag never planned anything.
+    // One deadline for every codex launch stop (Stage 2: LB-45): 3.5 s from
+    // here until Task 19 passes the shared deadline measured from signal
+    // receipt.
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-        .shutdown()
+        .shutdown(tokio::time::Instant::now() + std::time::Duration::from_millis(3500))
         .await;
     // kata b8ke Task 10 (round-2 review M2): drain the layout store's
     // ordered persist writer before exit, so a graceful SIGTERM/SIGINT

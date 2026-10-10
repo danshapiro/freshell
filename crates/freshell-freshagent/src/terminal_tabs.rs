@@ -2544,6 +2544,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 sandbox: sandbox.as_deref(),
                 approval_policy: permission_mode.as_deref(),
                 sidecar_context: setup.sidecar_context.clone(),
+                // Task 12 passes the pane's containment seed.
+                unit_seed: None,
             };
             match freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .plan_create_with_retry_uncancellable(

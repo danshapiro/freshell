@@ -72,13 +72,18 @@ pub enum McpServerArg {
 
 /// Freshell context names that Codex forwards from the parent process to its
 /// stdio MCP child. Values intentionally remain in the parent environment.
-pub const FRESHELL_MCP_CONTEXT_ENV_VARS: [&str; 6] = [
+/// `FRESHELL_UNIT_ID` is `freshell_containment::UNIT_ENV`, the pane's
+/// containment unit tag: forwarded so a Codex stdio MCP server and its
+/// children carry the pane's unit tag (they are unit members on the tag
+/// backends even once no live root is their ancestor).
+pub const FRESHELL_MCP_CONTEXT_ENV_VARS: [&str; 7] = [
     "FRESHELL",
     "FRESHELL_URL",
     "FRESHELL_TOKEN",
     "FRESHELL_TERMINAL_ID",
     "FRESHELL_TAB_ID",
     "FRESHELL_PANE_ID",
+    "FRESHELL_UNIT_ID",
 ];
 
 /// Target-specific inline MCP renderings for a managed Codex TUI and its
@@ -134,6 +139,13 @@ pub trait McpRuntime {
 
     fn wsl_env(&self) -> Option<String> {
         None
+    }
+
+    /// The context names this runtime's Codex forwards to its stdio MCP
+    /// server (`mcp_servers.freshell.env_vars`). Default: every name in
+    /// [`FRESHELL_MCP_CONTEXT_ENV_VARS`].
+    fn mcp_context_env_vars(&self) -> &'static [&'static str] {
+        &FRESHELL_MCP_CONTEXT_ENV_VARS
     }
 }
 
@@ -528,9 +540,13 @@ pub fn codex_inline_toml_command_args(server_command: &str, server_args: &[Strin
     ]
 }
 
-fn managed_codex_inline_toml_args(server_command: &str, server_args: &[String]) -> Vec<String> {
+fn managed_codex_inline_toml_args(
+    server_command: &str,
+    server_args: &[String],
+    context_env_vars: &[&str],
+) -> Vec<String> {
     let mut args = codex_inline_toml_command_args(server_command, server_args);
-    let env_vars = FRESHELL_MCP_CONTEXT_ENV_VARS
+    let env_vars = context_env_vars
         .iter()
         .map(|name| toml_escape(name))
         .collect::<Vec<_>>()
@@ -597,7 +613,11 @@ fn managed_codex_mcp_injection(
                     McpServerArg::Literal(value) | McpServerArg::Path(value) => value.clone(),
                 }));
                 return Ok(McpInjection {
-                    args: managed_codex_inline_toml_args("env", &rendered),
+                    args: managed_codex_inline_toml_args(
+                        "env",
+                        &rendered,
+                        runtime.mcp_context_env_vars(),
+                    ),
                     env: BTreeMap::new(),
                 });
             }
@@ -631,7 +651,11 @@ fn managed_codex_mcp_injection(
     })?;
 
     Ok(McpInjection {
-        args: managed_codex_inline_toml_args(&server_command, &server_args),
+        args: managed_codex_inline_toml_args(
+            &server_command,
+            &server_args,
+            runtime.mcp_context_env_vars(),
+        ),
         env: BTreeMap::new(),
     })
 }

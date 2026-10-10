@@ -24,8 +24,12 @@
 //! - `if (!sandbox) return undefined` — `Some("")` normalizes to `None`, not an error.
 
 use crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV;
+use freshell_containment::{
+    AgentUnit, Containment, StopHandle, StopMode, StopReason, StopRequest, UnitId, UnitLabel,
+};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 // ─── constants ──────────────────────────────────────────────────────────────────────────
 
@@ -179,6 +183,10 @@ pub struct CodexLaunchPlanInput<'a> {
     /// Spawn-only configuration/context for a newly created app-server. A
     /// claimed survivor deliberately does not consume this new context.
     pub sidecar_context: CodexSidecarLaunchContext,
+    /// The pane's containment seed: each start attempt mints its own unit
+    /// from it. `None` (the managed session host, which runs inside its own
+    /// container) keeps the unit-less spawn.
+    pub unit_seed: Option<UnitSeed>,
 }
 
 /// The pure launch PLAN: every decision `planCreate` (`launch-planner.ts:125-163`)
@@ -210,6 +218,8 @@ pub struct CodexLaunchPlan {
     /// The immutable context a newly spawned runtime carries across retries.
     /// Environment values are never persisted into sidecar records.
     pub sidecar_context: CodexSidecarLaunchContext,
+    /// The pane's containment seed ([`CodexLaunchPlanInput::unit_seed`]).
+    pub unit_seed: Option<UnitSeed>,
 }
 
 /// The `planCodexLaunch` decision tree (`ws-handler.ts:928-950` →
@@ -239,7 +249,157 @@ pub fn plan_codex_launch(
         sandbox,
         approval_policy: input.approval_policy.map(str::to_string),
         sidecar_context: input.sidecar_context.clone(),
+        unit_seed: input.unit_seed.clone(),
     })
+}
+
+// ─── the pane's containment seed (one unit per start attempt) ──────────────────────────
+
+/// The ONE stop path for every containment unit the Codex crate touches. From
+/// Task 12 on, `freshell-ws`'s unit lifecycle implements it over the owner
+/// registry (`begin_unit_stop` → `unit.stop` → `commit_unit_stop` at Gone);
+/// nothing in this crate calls [`AgentUnit::stop`] itself.
+pub trait CodexUnitLifecycle: Send + Sync {
+    /// The pane's create path learns each start attempt's unit (a Shift-X
+    /// during the start then stops the current attempt). It does not stamp
+    /// the conversation's key: only the attempt that succeeds does.
+    fn attempt_started(&self, unit: &AgentUnit);
+    /// True once a kill cancelled this pane's start.
+    fn start_cancelled(&self) -> bool;
+    /// Starts (or joins) the unit's stop and returns its handle without
+    /// waiting.
+    fn stop(
+        &self,
+        unit: &AgentUnit,
+        mode: StopMode,
+        reason: StopReason,
+        initiator: &str,
+    ) -> StopHandle;
+    /// A stop of this unit has begun. Kill-versus-retain is decided by this,
+    /// never by the unit's private latch.
+    fn is_stopping(&self, unit: &AgentUnit) -> bool;
+}
+
+/// The lifecycle for units no registry key names (true until Task 12, and
+/// in this crate's tests): the stop goes straight to the unit.
+pub struct RegistryFreeUnitLifecycle;
+
+impl CodexUnitLifecycle for RegistryFreeUnitLifecycle {
+    fn attempt_started(&self, _unit: &AgentUnit) {}
+
+    fn start_cancelled(&self) -> bool {
+        false
+    }
+
+    fn stop(
+        &self,
+        unit: &AgentUnit,
+        mode: StopMode,
+        reason: StopReason,
+        initiator: &str,
+    ) -> StopHandle {
+        unit.stop(StopRequest::new(mode, reason, initiator))
+    }
+
+    fn is_stopping(&self, unit: &AgentUnit) -> bool {
+        unit.stop_in_flight().is_some()
+    }
+}
+
+/// What a pane's Codex sidecar needs from containment: where units are made
+/// and the one stop path.
+#[derive(Clone)]
+pub struct CodexUnitServices {
+    pub containment: Containment,
+    pub lifecycle: Arc<dyn CodexUnitLifecycle>,
+}
+
+impl CodexUnitServices {
+    /// Services whose stops go straight to the unit
+    /// ([`RegistryFreeUnitLifecycle`]).
+    pub fn registry_free(containment: Containment) -> Self {
+        Self {
+            containment,
+            lifecycle: Arc::new(RegistryFreeUnitLifecycle),
+        }
+    }
+}
+
+/// What the create path passes instead of a pre-made unit: every start
+/// attempt mints its own unit from it (one unit reused across attempts
+/// would be stopped by attempt 1's failure and then refuse later attempts).
+#[derive(Clone)]
+pub struct UnitSeed {
+    pub services: CodexUnitServices,
+    pub label: UnitLabel,
+}
+
+impl fmt::Debug for UnitSeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnitSeed")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for UnitSeed {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label
+    }
+}
+
+impl Eq for UnitSeed {}
+
+/// [`UnitSeed::mint_attempt`]'s refusal of a start a kill cancelled.
+pub const CODEX_START_CANCELLED_MESSAGE: &str = "codex start cancelled";
+
+impl UnitSeed {
+    /// One start attempt's own unit. Its Running record is written before
+    /// anything spawns (a store failure is a start failure). A start a kill
+    /// cancelled is refused, also when the kill raced the mint: the new,
+    /// memberless unit is then stopped through the lifecycle.
+    pub fn mint_attempt(&self) -> Result<AgentUnit, String> {
+        if self.start_cancelled() {
+            return Err(CODEX_START_CANCELLED_MESSAGE.to_string());
+        }
+        let unit = self
+            .services
+            .containment
+            .create_unit(UnitId::mint(), self.label.clone())
+            .map_err(|error| format!("codex unit could not be recorded: {error}"))?;
+        self.services.lifecycle.attempt_started(&unit);
+        if self.start_cancelled() {
+            let _ = self.stop(
+                &unit,
+                StopMode::Force,
+                StopReason::StartCancelled,
+                "codex-start-cancelled",
+            );
+            return Err(CODEX_START_CANCELLED_MESSAGE.to_string());
+        }
+        Ok(unit)
+    }
+
+    /// Starts (or joins) `unit`'s stop through the lifecycle.
+    pub fn stop(
+        &self,
+        unit: &AgentUnit,
+        mode: StopMode,
+        reason: StopReason,
+        initiator: &str,
+    ) -> StopHandle {
+        self.services.lifecycle.stop(unit, mode, reason, initiator)
+    }
+
+    /// Whether a stop of `unit` has begun (the lifecycle's answer).
+    pub fn is_stopping(&self, unit: &AgentUnit) -> bool {
+        self.services.lifecycle.is_stopping(unit)
+    }
+
+    /// Whether a kill cancelled this pane's start.
+    pub fn start_cancelled(&self) -> bool {
+        self.services.lifecycle.start_cancelled()
+    }
 }
 
 // ─── TUI remote argv shape (terminal-registry.ts:295-307) ───────────────────────────────
@@ -535,6 +695,7 @@ mod tests {
                 sandbox: None,
                 approval_policy: None,
                 sidecar_context: CodexSidecarLaunchContext::default(),
+                unit_seed: None,
             })
         );
     }
@@ -559,6 +720,7 @@ mod tests {
                 sandbox: None,
                 approval_policy: None,
                 sidecar_context: CodexSidecarLaunchContext::default(),
+                unit_seed: None,
             })
         );
     }
@@ -574,6 +736,7 @@ mod tests {
                 sandbox: Some("workspace-write"),
                 approval_policy: Some("on-request"),
                 sidecar_context: CodexSidecarLaunchContext::default(),
+                unit_seed: None,
             }),
             Ok(CodexLaunchPlan {
                 session_id: Some("thread-s".to_string()),
@@ -585,6 +748,7 @@ mod tests {
                 sandbox: Some(CodexSandboxMode::WorkspaceWrite),
                 approval_policy: Some("on-request".to_string()),
                 sidecar_context: CodexSidecarLaunchContext::default(),
+                unit_seed: None,
             })
         );
     }
@@ -912,5 +1076,110 @@ mod tests {
             CODEX_MANAGED_REMOTE_CONFIG_ARGS,
             ["-c", "features.apps=false"]
         );
+    }
+
+    // ── the containment seed: one unit per attempt, refused once a kill cancelled the start ──
+
+    /// A lifecycle whose start cancellation the test controls; it can cancel
+    /// the start as an attempt's unit is announced (a kill racing the mint).
+    #[derive(Default)]
+    struct CancellingLifecycle {
+        cancelled: std::sync::atomic::AtomicBool,
+        cancel_on_attempt: bool,
+        attempts: std::sync::Mutex<Vec<AgentUnit>>,
+    }
+
+    impl CodexUnitLifecycle for CancellingLifecycle {
+        fn attempt_started(&self, unit: &AgentUnit) {
+            self.attempts.lock().unwrap().push(unit.clone());
+            if self.cancel_on_attempt {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        fn start_cancelled(&self) -> bool {
+            self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn stop(
+            &self,
+            unit: &AgentUnit,
+            mode: StopMode,
+            reason: StopReason,
+            initiator: &str,
+        ) -> StopHandle {
+            unit.stop(StopRequest::new(mode, reason, initiator))
+        }
+
+        fn is_stopping(&self, unit: &AgentUnit) -> bool {
+            unit.stop_in_flight().is_some()
+        }
+    }
+
+    fn seed_with(lifecycle: Arc<CancellingLifecycle>) -> UnitSeed {
+        UnitSeed {
+            // An empty state root keeps the unit records in memory.
+            services: CodexUnitServices {
+                containment: Containment::tag_backend(Default::default()),
+                lifecycle,
+            },
+            label: UnitLabel {
+                provider: "codex".to_string(),
+                mode: "codex".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn each_mint_is_a_new_unit_announced_to_the_lifecycle() {
+        let lifecycle = Arc::new(CancellingLifecycle::default());
+        let seed = seed_with(lifecycle.clone());
+        let first = seed.mint_attempt().expect("first attempt");
+        let second = seed.mint_attempt().expect("second attempt");
+        assert_ne!(first.id(), second.id(), "one unit per attempt");
+        let announced: Vec<_> = lifecycle
+            .attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|unit| unit.id().clone())
+            .collect();
+        assert_eq!(announced, vec![first.id().clone(), second.id().clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_start_mints_no_unit() {
+        let lifecycle = Arc::new(CancellingLifecycle::default());
+        lifecycle
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let seed = seed_with(lifecycle.clone());
+        assert_eq!(
+            seed.mint_attempt().map(|unit| unit.id().clone()),
+            Err(CODEX_START_CANCELLED_MESSAGE.to_string())
+        );
+        assert!(lifecycle.attempts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_kill_racing_the_mint_stops_the_new_unit_and_refuses_the_attempt() {
+        let lifecycle = Arc::new(CancellingLifecycle {
+            cancel_on_attempt: true,
+            ..Default::default()
+        });
+        let seed = seed_with(lifecycle.clone());
+        assert_eq!(
+            seed.mint_attempt().map(|unit| unit.id().clone()),
+            Err(CODEX_START_CANCELLED_MESSAGE.to_string())
+        );
+        let minted = lifecycle.attempts.lock().unwrap().clone();
+        assert_eq!(minted.len(), 1, "the racing kill saw the minted unit");
+        let stop = minted[0]
+            .stop_in_flight()
+            .expect("the memberless unit is stopped through the lifecycle");
+        let report = stop.wait().await;
+        assert_eq!(report.reason, "start-cancelled");
     }
 }

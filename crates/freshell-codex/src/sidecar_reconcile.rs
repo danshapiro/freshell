@@ -14,17 +14,23 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
+
+use freshell_containment::{AgentUnit, StopHandle, StopMode, StopReason, UnitRecord};
 
 use crate::app_server::{BoxFuture, CodexAppServerClient};
 use crate::launch_lifecycle::{CodexLaunchRuntime, CodexRuntimeReady};
+use crate::launch_plan::UnitSeed;
 use crate::sidecar_store::{
     verify_sidecar_identity, CodexSidecarRecord, CodexSidecarStore, IdentityVerdict, SidecarLane,
     SidecarRecordState,
 };
 use crate::sidecar_sweep::kill_verified_sidecar_tree;
 use crate::transport::TungsteniteTransport;
+
+#[path = "sidecar_reconcile_unit.rs"]
+mod reattach_unit;
 
 /// Per-candidate budget for the duplicate-arm writer probe (connect + the
 /// `initialize`/`initialized` handshake + one `thread/loaded/list` round
@@ -559,18 +565,49 @@ pub struct ReattachedCodexAppServerRuntime {
     /// [`kill_verified_sidecar_tree`] caller contract).
     record: Mutex<CodexSidecarRecord>,
     store: Arc<CodexSidecarStore>,
-    /// Set by a successful `ensure_ready`; gates `shutdown`'s kill.
+    /// Set by a successful `ensure_ready`; gates `stop`'s kill.
     verified_usable: AtomicBool,
+    /// The pane's containment seed (`None`: the seedless reattach, stopped by
+    /// the verified tree kill).
+    seed: Option<UnitSeed>,
+    /// The boot unit record of a record that names a unit (the reattach
+    /// reopens the unit from it).
+    unit_record: Option<UnitRecord>,
+    /// The reopened (or, for a legacy record, adopted) unit.
+    unit: OnceLock<AgentUnit>,
 }
 
 impl ReattachedCodexAppServerRuntime {
     /// Wrap a record claimed via [`SidecarReconciler::claim_for_session`]
-    /// (Task 7's factory constructs this when a claim succeeds).
+    /// for a seedless plan. Its teardown is the verified tree kill, which
+    /// never reaches a native main behind an exited launcher: a record that
+    /// names a unit is reattached through [`Self::with_unit`].
     pub fn new(record: CodexSidecarRecord, store: Arc<CodexSidecarStore>) -> Self {
         Self {
             record: Mutex::new(record),
             store,
             verified_usable: AtomicBool::new(false),
+            seed: None,
+            unit_record: None,
+            unit: OnceLock::new(),
+        }
+    }
+
+    /// Reattach inside a unit: the recorded unit is reopened from its boot
+    /// unit record (roots re-pinned by pid and start time), or a legacy
+    /// record's sidecar is adopted into a fresh unit by its pinned launcher;
+    /// the native main is pinned, and every stop goes through the seed's
+    /// lifecycle (Stage 2: LB-02, LB-25, LB-32).
+    pub fn with_unit(
+        record: CodexSidecarRecord,
+        unit_record: Option<UnitRecord>,
+        store: Arc<CodexSidecarStore>,
+        seed: UnitSeed,
+    ) -> Self {
+        Self {
+            seed: Some(seed),
+            unit_record,
+            ..Self::new(record, store)
         }
     }
 }
@@ -589,6 +626,9 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
     ///   `store.remove`, `Err`. An unusable tracked sidecar must not leak;
     ///   killing it releases codex's per-thread writer-lock files on exit,
     ///   so the retry's fresh spawn can resume the thread (reports/V1.md).
+    /// - `Verified` with a unit seed ([`Self::with_unit`]): the reattach runs
+    ///   inside the sidecar's unit (`sidecar_reconcile_unit.rs`); an unusable
+    ///   survivor's unit is stopped through the seed instead.
     fn ensure_ready(
         &self,
         _cwd: Option<String>,
@@ -627,6 +667,9 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
                             .to_string(),
                     )
                 }
+                IdentityVerdict::Verified if self.seed.is_some() => {
+                    self.reattach_in_unit(record).await
+                }
                 IdentityVerdict::Verified => {
                     let probe_error = match tokio::time::timeout(
                         REATTACH_PROBE_BUDGET,
@@ -646,6 +689,7 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
                             );
                             return Ok(CodexRuntimeReady {
                                 ws_url: record.ws_url.clone(),
+                                codex_home: record.codex_home.clone(),
                             });
                         }
                         Ok(Err(error)) => error.to_string(),
@@ -714,11 +758,22 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
     /// Task 10: server-shutdown retention — the reattached survivor stays
     /// alive across ANOTHER restart. A reattached runtime always wraps a
     /// persisted record (claims only exist over an enabled store), so
-    /// retention applies unconditionally: NO signal is ever sent, the record
-    /// flips to `Retained{reason}`, and the `verified_usable` gate drops so
-    /// no later teardown path can kill the retained survivor.
+    /// retention applies unless its unit's stop has begun (a kill beats
+    /// retention): NO signal is ever sent, the record flips to
+    /// `Retained{reason}`, and the `verified_usable` gate drops so no later
+    /// teardown path can kill the retained survivor.
     fn prepare_retention(&self, reason: String) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
+            if let (Some(seed), Some(unit)) = (self.seed.as_ref(), self.unit.get()) {
+                if seed.is_stopping(unit) {
+                    tracing::info!(
+                        target: "freshell_codex::sidecar_reconcile",
+                        unit_id = %unit.id(),
+                        "sidecar_retention_skipped: the unit is stopping; a kill beats retention"
+                    );
+                    return Ok(());
+                }
+            }
             self.verified_usable.store(false, Ordering::SeqCst);
             let snapshot = {
                 let mut record = self.record.lock().unwrap();
@@ -738,17 +793,24 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
         })
     }
 
-    /// Teardown (pane closed, or the plan raced the planner's shutdown):
-    /// [`kill_verified_sidecar_tree`] + `store.remove`. Gated on
+    /// Stop (pane closed, or the plan raced the planner's shutdown), gated on
     /// `verified_usable` — if `ensure_ready` never positively adopted this
-    /// survivor (or its failure arm already disposed of it), shutdown
-    /// removes the record ONLY and never signals. The kill helper re-verifies
-    /// identity immediately before each signal, so `Mismatch`/`Dead`/
-    /// `Unverifiable` at kill time ⇒ remove record only.
-    fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
+    /// survivor (or its failure arm already disposed of it), the record is
+    /// removed ONLY and nothing is signalled. A usable survivor inside a unit
+    /// is stopped through the seed's lifecycle (its record goes at
+    /// [`CodexLaunchRuntime::finish_after_gone`]); a seedless one gets
+    /// [`kill_verified_sidecar_tree`] + `store.remove` (the kill helper
+    /// re-verifies identity immediately before each signal, so `Mismatch`/
+    /// `Dead`/`Unverifiable` at kill time ⇒ remove record only).
+    fn stop(
+        &self,
+        mode: StopMode,
+        reason: StopReason,
+        initiator: String,
+    ) -> BoxFuture<'_, Option<StopHandle>> {
         Box::pin(async move {
             let record = self.record.lock().unwrap().clone();
-            if !self.verified_usable.swap(false, Ordering::SeqCst) {
+            if !self.verified_usable.load(Ordering::SeqCst) {
                 tracing::info!(
                     target: "freshell_codex::sidecar_reconcile",
                     ownership_id = %record.ownership_id,
@@ -757,8 +819,12 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
                      usable by this runtime; record removed, nothing signalled"
                 );
                 remove_pruned(&self.store, &record.ownership_id);
-                return Ok(());
+                return None;
             }
+            if let (Some(seed), Some(unit)) = (self.seed.as_ref(), self.unit.get()) {
+                return Some(seed.stop(unit, mode, reason, &initiator));
+            }
+            self.verified_usable.store(false, Ordering::SeqCst);
             let outcome = kill_verified_sidecar_tree(&record).await;
             tracing::info!(
                 target: "freshell_codex::sidecar_reconcile",
@@ -768,7 +834,40 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
                 "sidecar_reattach_shutdown: reattached sidecar torn down; record removed"
             );
             remove_pruned(&self.store, &record.ownership_id);
-            Ok(())
+            None
+        })
+    }
+
+    fn unit(&self) -> Option<AgentUnit> {
+        self.unit.get().cloned()
+    }
+
+    /// After Gone: the record goes (and never before).
+    fn finish_after_gone(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.verified_usable.store(false, Ordering::SeqCst);
+            let ownership_id = self.record.lock().unwrap().ownership_id.clone();
+            remove_pruned(&self.store, &ownership_id);
+        })
+    }
+
+    /// A reattached runtime always wraps a persisted record.
+    fn retainable(&self) -> BoxFuture<'_, bool> {
+        Box::pin(async { true })
+    }
+
+    fn note_codex_home(&self, codex_home: String) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let snapshot = {
+                let mut record = self.record.lock().unwrap();
+                if record.codex_home.as_deref() == Some(codex_home.as_str()) {
+                    return;
+                }
+                record.codex_home = Some(codex_home);
+                record.updated_at = unix_millis();
+                record.clone()
+            };
+            write_record_loudly(&self.store, &snapshot);
         })
     }
 }

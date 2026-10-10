@@ -86,3 +86,7 @@ serde = { workspace = true }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 libc = "0.2"
+# Task 10's unit tests stop their own systemd namespace slice
+# (`freshell-n<ns>.slice`, the hash of the state root, as the containment
+# crate names it): implicit slices are never collected.
+sha2 = "0.10"

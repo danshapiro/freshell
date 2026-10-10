@@ -37,6 +37,7 @@ use freshell_codex::{
     CodexSidecarRecord, CodexSidecarStore, IdentityVerdict, ReattachedCodexAppServerRuntime,
     SidecarReconciler, SidecarRecordState, CODEX_SIDECAR_OWNERSHIP_ENV, SIDECAR_RECORD_VERSION,
 };
+use freshell_containment::{StopHandle, StopMode, StopReason};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 const SYNTHETIC_CONTEXT_TOKEN: &str = "not-visible";
@@ -174,6 +175,7 @@ impl CodexLaunchRuntime for FakeRuntime {
             }
             Ok(CodexRuntimeReady {
                 ws_url: self.ws_url.clone(),
+                codex_home: None,
             })
         })
     }
@@ -211,12 +213,38 @@ impl CodexLaunchRuntime for FakeRuntime {
         })
     }
 
-    fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
+    fn stop(
+        &self,
+        _mode: StopMode,
+        _reason: StopReason,
+        _initiator: String,
+    ) -> BoxFuture<'_, Option<StopHandle>> {
         Box::pin(async move {
             self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            None
         })
     }
+}
+
+/// One shutdown deadline, as the server passes it.
+fn shutdown_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_millis(3500)
+}
+
+/// Stops a seedless runtime, which runs its teardown to completion and
+/// hands back no unit stop.
+async fn stop_seedless(runtime: &dyn CodexLaunchRuntime) {
+    assert!(
+        runtime
+            .stop(
+                StopMode::Force,
+                StopReason::StartCancelled,
+                "test".to_string()
+            )
+            .await
+            .is_none(),
+        "a seedless runtime stops to completion"
+    );
 }
 
 fn planner_for(runtime: Arc<FakeRuntime>) -> CodexLaunchPlanner {
@@ -370,7 +398,7 @@ async fn planning_error_tears_the_sidecar_down_and_surfaces_the_error() {
 async fn planner_shutdown_rejects_new_plans_with_the_legacy_message() {
     let runtime = FakeRuntime::start().await;
     let planner = planner_for(runtime.clone());
-    planner.shutdown().await;
+    assert!(planner.begin_shutdown().is_empty());
     let err = planner
         .plan_create(&CodexLaunchPlanInput::default())
         .await
@@ -391,7 +419,13 @@ async fn planner_shutdown_tears_down_unadopted_sidecars() {
         .plan_create(&CodexLaunchPlanInput::default())
         .await
         .unwrap();
-    planner.shutdown().await;
+    // The planner hands its unadopted sidecars back; stopping them reaches
+    // the runtime.
+    let unadopted = planner.begin_shutdown();
+    assert_eq!(unadopted.len(), 1);
+    for sidecar in unadopted {
+        sidecar.shutdown().await.unwrap();
+    }
     assert_eq!(runtime.shutdown_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -412,9 +446,9 @@ async fn adopt_transfers_ownership_out_of_the_planner() {
         &[("term-1".to_string(), 0)]
     );
 
-    // An adopted sidecar is the TERMINAL's; planner.shutdown() must not tear it down
-    // (adopt removes it from activeSidecars, launch-planner.ts:242-243).
-    planner.shutdown().await;
+    // An adopted sidecar is the TERMINAL's; the planner's shutdown must not hand it
+    // back (adopt removes it from activeSidecars, launch-planner.ts:242-243).
+    assert!(planner.begin_shutdown().is_empty());
     assert_eq!(runtime.shutdown_calls.load(Ordering::SeqCst), 0);
 
     launch.sidecar.shutdown().await.unwrap();
@@ -574,7 +608,7 @@ async fn failed_adoption_discards_the_still_owned_launch() {
     // A later manager shutdown must find no active planned launch. This also
     // proves the failure did not leave a proxy/child retained for the planner
     // to clean up at process shutdown.
-    manager.shutdown().await;
+    manager.shutdown(shutdown_deadline()).await;
     assert_eq!(
         runtime.shutdown_calls.load(Ordering::SeqCst),
         1,
@@ -717,7 +751,7 @@ async fn manager_shutdown_tears_down_adopted_and_unadopted_and_rejects_new_plans
         .await
         .unwrap();
 
-    manager.shutdown().await;
+    manager.shutdown(shutdown_deadline()).await;
     // Both sidecars (two FakeRuntime instances? no — one shared runtime, one
     // shutdown call per sidecar) torn down: 2 runtime shutdowns.
     assert_eq!(runtime.shutdown_calls.load(Ordering::SeqCst), 2);
@@ -786,8 +820,13 @@ impl CodexLaunchRuntime for BlockingRuntime {
         Box::pin(async move { Ok(()) })
     }
 
-    fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
-        Box::pin(async move { Ok(()) })
+    fn stop(
+        &self,
+        _mode: StopMode,
+        _reason: StopReason,
+        _initiator: String,
+    ) -> BoxFuture<'_, Option<StopHandle>> {
+        Box::pin(async move { None })
     }
 }
 
@@ -889,8 +928,13 @@ impl CodexLaunchRuntime for CountingRuntime {
         Box::pin(async move { Ok(()) })
     }
 
-    fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
-        Box::pin(async move { Ok(()) })
+    fn stop(
+        &self,
+        _mode: StopMode,
+        _reason: StopReason,
+        _initiator: String,
+    ) -> BoxFuture<'_, Option<StopHandle>> {
+        Box::pin(async move { None })
     }
 }
 
@@ -1159,7 +1203,7 @@ async fn spawned_runtime_receives_context_but_reattached_runtime_does_not() {
         .await
         .expect("spawned runtime becomes ready");
     assert_captured_spawn_context(&wait_for_arg_log(&spawned_log).await);
-    spawned.shutdown().await.expect("tear down spawned child");
+    stop_seedless(spawned.as_ref()).await;
 
     // A verified survivor keeps its original process unchanged. Give a NEW
     // plan an observation path that only a wrongly-created replacement child
@@ -1205,10 +1249,7 @@ async fn spawned_runtime_receives_context_but_reattached_runtime_does_not() {
         "the verified survivor remains the live process"
     );
 
-    reattached
-        .shutdown()
-        .await
-        .expect("tear down the test survivor");
+    stop_seedless(reattached.as_ref()).await;
     wait_pid_gone(survivor_pid).await;
 }
 
@@ -1647,7 +1688,7 @@ async fn mark_candidate_persisted_is_a_noop_for_unknown_terminals() {
         .fail_candidate_capture("still-unknown", "test")
         .await;
     // The adopted terminal is unaffected (observable: manager can shut down cleanly).
-    manager.shutdown().await;
+    manager.shutdown(shutdown_deadline()).await;
 }
 
 /// Task 4: the manager seam forwards a captured session/thread id to the
@@ -1687,7 +1728,7 @@ async fn manager_note_session_id_reaches_adopted_runtime() {
         "the adopted terminal's runtime must see the noted session id"
     );
 
-    manager.shutdown().await;
+    manager.shutdown(shutdown_deadline()).await;
 }
 
 // ────── Task 3: durable sidecar records — persist on spawn, scrub on teardown,
@@ -1745,10 +1786,7 @@ async fn ensure_ready_persists_a_verified_sidecar_record() {
         "(starttime, cmdline) must verify against the live child"
     );
 
-    runtime
-        .shutdown()
-        .await
-        .expect("shutdown cleans up the child");
+    stop_seedless(&runtime).await;
 }
 
 #[tokio::test]
@@ -1762,7 +1800,7 @@ async fn runtime_shutdown_removes_the_sidecar_record() {
     let pid = runtime.child_pid().await.expect("child pid");
     assert_eq!(store.load_all().len(), 1, "record present before shutdown");
 
-    runtime.shutdown().await.expect("shutdown");
+    stop_seedless(&runtime).await;
 
     assert!(
         store.load_all().is_empty(),
@@ -1793,10 +1831,7 @@ async fn update_ownership_metadata_enriches_the_record() {
         "adopt must enrich the record with the terminal id"
     );
 
-    runtime
-        .shutdown()
-        .await
-        .expect("shutdown cleans up the child");
+    stop_seedless(&runtime).await;
 }
 
 /// Task 4: `note_session_id` rewrites the durable record with the codex
@@ -1823,10 +1858,7 @@ async fn spawned_runtime_note_session_id_enriches_the_record() {
         "note_session_id must enrich the record with the session id"
     );
 
-    runtime
-        .shutdown()
-        .await
-        .expect("shutdown cleans up the child");
+    stop_seedless(&runtime).await;
 }
 
 #[tokio::test]
@@ -1933,7 +1965,7 @@ async fn shutdown_retention_retains_adopted_sidecars_and_records_reason() {
     let pid = runtime.child_pid().await.expect("child pid");
 
     manager.begin_shutdown_retention();
-    manager.shutdown().await;
+    manager.shutdown(shutdown_deadline()).await;
 
     // The fixture pid is STILL ALIVE: retention never signals. (Give any
     // wrong kill a moment to land before asserting liveness — the
@@ -2029,7 +2061,7 @@ async fn shutdown_still_tears_down_unadopted_planner_sidecars() {
     let pid = runtime.child_pid().await.expect("child pid");
 
     manager.begin_shutdown_retention();
-    manager.shutdown().await;
+    manager.shutdown(shutdown_deadline()).await;
 
     wait_pid_gone(pid).await;
     assert!(
@@ -2064,7 +2096,7 @@ async fn retention_with_disabled_store_tears_down_as_today() {
     let pid = runtime.child_pid().await.expect("child pid");
 
     manager.begin_shutdown_retention();
-    manager.shutdown().await;
+    manager.shutdown(shutdown_deadline()).await;
 
     wait_pid_gone(pid).await;
 }
@@ -2173,4 +2205,1043 @@ async fn notify_terminal_exit_retains_under_retention_flag() {
         );
     }
     wait_pid_gone(pid_b).await;
+}
+
+// ────── Task 10: the sidecar runs inside its pane's containment unit ──────
+//
+// Every test below drives the REALISTIC fake (a Node launcher in front of a
+// separate native app-server, `fake-codex-launcher.mjs`) inside a real
+// containment unit on the backend this host selects. Every process the tests
+// signal or check was started by the test itself.
+
+#[cfg(target_os = "linux")]
+#[path = "support/fake_codex.rs"]
+mod fake_codex;
+
+#[cfg(target_os = "linux")]
+mod unit_sidecar {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    use freshell_codex::launch_plan::{CodexUnitLifecycle, CodexUnitServices, UnitSeed};
+    use freshell_containment::{
+        AgentUnit, Containment, SelectOptions, StopHandle, StopMode, StopReason, StopRequest,
+        UnitLabel,
+    };
+
+    use super::fake_codex;
+
+    const LIMIT: Duration = Duration::from_secs(15);
+
+    /// The systemd namespace slice of a state root (`freshell-n<ns>.slice`,
+    /// the containment crate's rule: the first 8 bytes of the SHA-256 of the
+    /// canonical root, in hex). Implicit slices are never collected, so the
+    /// tests stop theirs.
+    fn namespace_slice(root: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+        let ns: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        format!("freshell-n{ns}.slice")
+    }
+
+    /// Stops this test binary's own namespace slice, with any unit slice a
+    /// failed test left in it (a no-op on the tag backend).
+    fn stop_namespace_slice(root: &Path) {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", &namespace_slice(root)])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    /// A state root of its own (for the restart test), cleaned on drop.
+    struct UnitStateRoot(tempfile::TempDir);
+
+    impl UnitStateRoot {
+        fn new() -> Self {
+            Self(tempfile::tempdir().expect("unit state root"))
+        }
+
+        fn path(&self) -> &Path {
+            self.0.path()
+        }
+    }
+
+    impl Drop for UnitStateRoot {
+        fn drop(&mut self) {
+            stop_namespace_slice(self.0.path());
+        }
+    }
+
+    static SHARED_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+    extern "C" fn clean_shared_state_root() {
+        if let Some(root) = SHARED_ROOT.get() {
+            stop_namespace_slice(root);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    /// One state root for the whole test binary (unit ids are unique, so the
+    /// tests never collide). Cleaned when the binary exits.
+    fn shared_state_root() -> &'static Path {
+        SHARED_ROOT.get_or_init(|| {
+            let root = tempfile::tempdir().expect("shared unit state root").keep();
+            // SAFETY: registers a plain `extern "C"` function with no
+            // arguments; it only reads a set-once static.
+            unsafe { libc::atexit(clean_shared_state_root) };
+            root
+        })
+    }
+
+    /// The test binary's one containment over the shared root (the server
+    /// has exactly one, too).
+    fn shared_containment() -> Containment {
+        static CONTAINMENT: OnceLock<Containment> = OnceLock::new();
+        CONTAINMENT
+            .get_or_init(|| {
+                Containment::select(SelectOptions {
+                    shim: None,
+                    state_root: shared_state_root().to_path_buf(),
+                })
+            })
+            .clone()
+    }
+
+    fn codex_label(session: &str) -> UnitLabel {
+        UnitLabel {
+            provider: "codex".to_string(),
+            session_id: Some(session.to_string()),
+            mode: "codex".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn seed_over(containment: Containment, session: &str) -> UnitSeed {
+        UnitSeed {
+            services: CodexUnitServices::registry_free(containment),
+            label: codex_label(session),
+        }
+    }
+
+    /// A registry-free seed over the binary's shared containment.
+    fn tag_seed(provider_session: &str) -> UnitSeed {
+        seed_over(shared_containment(), provider_session)
+    }
+
+    /// A lifecycle that records every attempt's unit and reports a start
+    /// cancellation the test sets.
+    #[derive(Default)]
+    struct RecordingLifecycle {
+        attempts: Mutex<Vec<AgentUnit>>,
+        cancelled: AtomicBool,
+    }
+
+    impl RecordingLifecycle {
+        fn attempts(&self) -> Vec<AgentUnit> {
+            self.attempts.lock().unwrap().clone()
+        }
+    }
+
+    impl CodexUnitLifecycle for RecordingLifecycle {
+        fn attempt_started(&self, unit: &AgentUnit) {
+            self.attempts.lock().unwrap().push(unit.clone());
+        }
+
+        fn start_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+
+        fn stop(
+            &self,
+            unit: &AgentUnit,
+            mode: StopMode,
+            reason: StopReason,
+            initiator: &str,
+        ) -> StopHandle {
+            unit.stop(StopRequest::new(mode, reason, initiator))
+        }
+
+        fn is_stopping(&self, unit: &AgentUnit) -> bool {
+            unit.stop_in_flight().is_some()
+        }
+    }
+
+    fn recording_seed(session: &str, lifecycle: Arc<RecordingLifecycle>) -> UnitSeed {
+        UnitSeed {
+            services: CodexUnitServices {
+                containment: shared_containment(),
+                lifecycle,
+            },
+            label: codex_label(session),
+        }
+    }
+
+    /// No process-env mutation: everything the fake needs rides the
+    /// sidecar's own spawn environment (`CodexSidecarLaunchContext.env`).
+    fn fake_context(behavior: serde_json::Value, home: &Path) -> CodexSidecarLaunchContext {
+        let mut env = BTreeMap::new();
+        env.insert("CODEX_HOME".to_string(), home.display().to_string());
+        env.insert(
+            "FAKE_CODEX_APP_SERVER_BEHAVIOR".to_string(),
+            behavior.to_string(),
+        );
+        env.insert(
+            "FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES".to_string(),
+            "1".to_string(),
+        );
+        env.insert(
+            "FAKE_CODEX_MANIFEST_DIR".to_string(),
+            home.join("manifests").display().to_string(),
+        );
+        env.insert(
+            "FAKE_UNIT_RECORD_DIR".to_string(),
+            shared_state_root().join("units").display().to_string(),
+        );
+        CodexSidecarLaunchContext {
+            config_args: vec![],
+            env,
+        }
+    }
+
+    async fn ready_realistic(
+        behavior: serde_json::Value,
+        home: &Path,
+        store: Arc<CodexSidecarStore>,
+        seed: UnitSeed,
+    ) -> (SpawnedCodexAppServerRuntime, CodexRuntimeReady) {
+        let runtime = SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
+            fake_codex::launcher_command(),
+            store,
+            fake_context(behavior, home),
+            seed,
+        );
+        let ready = runtime.ensure_ready(None).await.expect("ready");
+        (runtime, ready)
+    }
+
+    /// The one native manifest (`native-<pid>.json`) in `dir`.
+    fn native_manifest_in(dir: &Path) -> fake_codex::NativeManifest {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .expect("manifest dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("native-") && n.ends_with(".json"))
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one native manifest: {found:?}");
+        let raw = std::fs::read_to_string(found.pop().unwrap()).expect("native manifest");
+        serde_json::from_str(&raw).expect("native manifest JSON")
+    }
+
+    /// Every launcher and native pid any manifest in `dir` names.
+    fn manifest_pids(dir: &Path) -> Vec<u32> {
+        let mut pids = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            for key in ["pid", "nativePid"] {
+                if let Some(pid) = value[key].as_u64() {
+                    pids.push(pid as u32);
+                }
+            }
+        }
+        pids
+    }
+
+    fn port_of(ws_url: &str) -> u16 {
+        ws_url.rsplit(':').next().unwrap().parse().unwrap()
+    }
+
+    fn manager_with_realistic_runtime(
+        store: Arc<CodexSidecarStore>,
+        home: &Path,
+        behavior: serde_json::Value,
+    ) -> CodexTerminalLaunchManager {
+        let home = home.to_path_buf();
+        CodexTerminalLaunchManager::new(Box::new(move |plan| {
+            let runtime = Arc::new(
+                SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
+                    fake_codex::launcher_command(),
+                    store.clone(),
+                    fake_context(behavior.clone(), &home),
+                    plan.unit_seed.clone().expect("a seeded plan"),
+                ),
+            ) as Arc<dyn CodexLaunchRuntime>;
+            Box::pin(async move { runtime })
+        }))
+    }
+
+    fn plan_input_with_seed(session: &str, seed: UnitSeed) -> CodexLaunchPlanInput<'_> {
+        CodexLaunchPlanInput {
+            resume_session_id: Some(session),
+            unit_seed: Some(seed),
+            ..Default::default()
+        }
+    }
+
+    /// A test-spawned process held stopped (SIGSTOP) until dropped (SIGCONT),
+    /// identified by pid and start time.
+    struct PausedChild(u32, u64);
+
+    impl PausedChild {
+        fn pause(pid: u32, start: u64) -> Self {
+            assert!(
+                fake_codex::signal_own_child(pid, start, libc::SIGSTOP),
+                "pause {pid}"
+            );
+            Self(pid, start)
+        }
+    }
+
+    impl Drop for PausedChild {
+        fn drop(&mut self) {
+            fake_codex::signal_own_child(self.0, self.1, libc::SIGCONT);
+        }
+    }
+
+    async fn wait_dead(pid: u32) {
+        fake_codex::wait_until(&format!("pid {pid} to exit"), LIMIT, || {
+            !fake_codex::pid_alive(pid)
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn force_stop_signals_native_first_and_kills_launcher_last() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let seed = tag_seed("t-shiftx");
+        let (runtime, ready) = ready_realistic(
+            json!({"threadStartThreadId": "t-shiftx", "turnCompleteDelayMs": 60000,
+                "turnSpawnsShellCommand": true, "detachedJobOnTurn": true, "spawnHelperProcess": true}),
+            home.path(),
+            store.clone(),
+            seed,
+        )
+        .await;
+        let unit = runtime.unit().expect("spawned inside a unit");
+        let record = store.load_all().pop().expect("record");
+        let manifest_dir = home.path().join("manifests");
+        let native = native_manifest_in(&manifest_dir);
+        assert_eq!(
+            unit.main().unwrap().pid(),
+            native.pid,
+            "main is the native app-server, not the launcher"
+        );
+        assert_ne!(Some(native.pid), runtime.child_pid().await);
+        assert_eq!(record.main_pid, Some(native.pid));
+        assert_eq!(record.main_starttime, Some(native.start_time(native.pid)));
+        assert_eq!(record.unit_id.as_deref(), Some(unit.id().as_str()));
+        let mut rpc = fake_codex::Rpc::connect(port_of(&ready.ws_url)).await;
+        rpc.initialize().await;
+        rpc.call("thread/start", json!({})).await.unwrap();
+        rpc.call("turn/start", json!({"threadId": "t-shiftx", "input": []}))
+            .await
+            .unwrap();
+        let lock = fake_codex::thread_lock_path(home.path(), "t-shiftx");
+        assert!(fake_codex::lock_held(&lock));
+        unit.set_lock_paths(vec![lock.clone()]);
+        let report = unit
+            .stop(StopRequest::new(
+                StopMode::Force,
+                StopReason::ShiftX,
+                "test",
+            ))
+            .wait()
+            .await;
+        let native = native_manifest_in(&manifest_dir);
+        assert_eq!(
+            native
+                .signals
+                .iter()
+                .map(|s| s.sig.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SIGINT"],
+            "SIGINT straight to the native"
+        );
+        assert!(
+            report.lock_released && !fake_codex::lock_held(&lock),
+            "lock released at Gone"
+        );
+        assert!(unit.stop_in_flight().unwrap().wait_swept().await.is_empty());
+        let c = native.children;
+        for pid in [native.pid, c.helper.unwrap()]
+            .into_iter()
+            .chain(c.shell)
+            .chain(c.detached)
+        {
+            assert!(!fake_codex::pid_alive(pid), "{pid} survived Shift-X");
+        }
+        assert_eq!(
+            store.load_all().len(),
+            1,
+            "the record waits for Gone's finish"
+        );
+        runtime.finish_after_gone().await;
+        assert!(
+            store.load_all().is_empty(),
+            "record removed only after Gone"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn units_stop_independently() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let (slow, slow_ready) = ready_realistic(
+            json!({"threadStartThreadId": "t-slow", "turnCompleteDelayMs": 4000}),
+            home.path(),
+            store.clone(),
+            tag_seed("t-slow"),
+        )
+        .await;
+        let (fast, _) = ready_realistic(
+            json!({"threadStartThreadId": "t-fast"}),
+            home.path(),
+            store.clone(),
+            tag_seed("t-fast"),
+        )
+        .await;
+        let mut rpc = fake_codex::Rpc::connect(port_of(&slow_ready.ws_url)).await;
+        rpc.initialize().await;
+        rpc.call("thread/start", json!({})).await.unwrap();
+        rpc.call("turn/start", json!({"threadId": "t-slow", "input": []}))
+            .await
+            .unwrap();
+        let draining = slow.unit().unwrap().stop(StopRequest::new(
+            StopMode::Graceful {
+                grace: Duration::from_secs(30),
+            },
+            StopReason::Cleanup,
+            "test",
+        ));
+        let t0 = std::time::Instant::now();
+        let fast_stop = fast.unit().unwrap().stop(StopRequest::new(
+            StopMode::Force,
+            StopReason::ShiftX,
+            "test",
+        ));
+        fast_stop.wait().await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(1500),
+            "never queued behind the draining unit"
+        );
+        assert!(
+            draining.try_report().is_none(),
+            "the slow unit is still finishing its reply"
+        );
+        draining.wait().await;
+        fast_stop.wait_swept().await;
+        draining.wait_swept().await;
+    }
+
+    /// Kill beats retention (Stage 2: LB-25, LB-45): a unit whose stop began
+    /// is never retained by a racing shutdown, and a unit whose stop reached
+    /// Gone is never re-retained.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kill_beats_shutdown_retention() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let manager = manager_with_realistic_runtime(
+            store.clone(),
+            home.path(),
+            json!({"threadStartThreadId": "t-race"}),
+        );
+        let seed = tag_seed("t-race");
+        let launch = manager
+            .plan_create_with_retry_uncancellable(
+                &plan_input_with_seed("t-race", seed.clone()),
+                1,
+                LaunchClass::Interactive,
+            )
+            .await
+            .expect("plan");
+        let unit = launch.unit.clone().expect("the launch carries its unit");
+        let native = unit.main().expect("native main").pid();
+        manager.adopt("T-race", launch, 1).await.expect("adopt");
+        assert_eq!(store.load_all().len(), 1, "a recorded (retainable) sidecar");
+        assert_eq!(
+            manager.adopted_unit("T-race").map(|u| u.id().clone()),
+            Some(unit.id().clone())
+        );
+
+        let handle = seed.stop(&unit, StopMode::Force, StopReason::ShiftX, "test");
+        manager.begin_shutdown_retention();
+        // The PTY exit hook racing the shutdown leaves a stopping unit alone.
+        manager.notify_terminal_exit("T-race");
+        assert!(
+            manager.adopted_unit("T-race").is_some(),
+            "a stopping unit stays adopted until its Gone"
+        );
+        manager
+            .shutdown(tokio::time::Instant::now() + Duration::from_millis(3500))
+            .await;
+        handle.wait().await;
+        manager.finish_unit("T-race").await;
+        assert!(
+            store.load_all().is_empty(),
+            "a killed unit is never retained: {:?}",
+            store.load_all()
+        );
+        assert!(!fake_codex::pid_alive(native), "the killed native is dead");
+        handle.wait_swept().await;
+
+        // A unit whose stop already reached Gone (and whose finish ran) is
+        // never re-retained by a later shutdown.
+        let home2 = tempfile::tempdir().unwrap();
+        let store2 = Arc::new(CodexSidecarStore::new(home2.path().join("records")));
+        let manager2 = manager_with_realistic_runtime(
+            store2.clone(),
+            home2.path(),
+            json!({"threadStartThreadId": "t-done"}),
+        );
+        let seed2 = tag_seed("t-done");
+        let launch2 = manager2
+            .plan_create_with_retry_uncancellable(
+                &plan_input_with_seed("t-done", seed2.clone()),
+                1,
+                LaunchClass::Interactive,
+            )
+            .await
+            .expect("plan 2");
+        let unit2 = launch2.unit.clone().expect("unit 2");
+        manager2.adopt("T-done", launch2, 1).await.expect("adopt 2");
+        let gone = seed2.stop(&unit2, StopMode::Force, StopReason::ShiftX, "test");
+        gone.wait().await;
+        manager2.finish_unit("T-done").await;
+        assert!(manager2.adopted_unit("T-done").is_none());
+        assert!(store2.load_all().is_empty());
+        manager2.begin_shutdown_retention();
+        manager2
+            .shutdown(tokio::time::Instant::now() + Duration::from_millis(3500))
+            .await;
+        assert!(
+            store2.load_all().is_empty(),
+            "a unit whose stop reached Gone is never re-retained"
+        );
+        gone.wait_swept().await;
+    }
+
+    /// A sidecar retained across a restart is reattached inside its
+    /// reopened unit and stopped through it (Stage 2: LB-02, LB-32).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reattached_sidecar_is_stopped_through_its_reopened_unit() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let root = UnitStateRoot::new();
+        let options = || SelectOptions {
+            shim: None,
+            state_root: root.path().to_path_buf(),
+        };
+        // The "old server": its own containment over the root.
+        let (runtime, ready) = ready_realistic(
+            json!({"threadStartThreadId": "t-re"}),
+            home.path(),
+            store.clone(),
+            seed_over(Containment::select(options()), "t-re"),
+        )
+        .await;
+        runtime
+            .note_session_id("t-re".to_string())
+            .await
+            .expect("session id");
+        let launcher = runtime.child_pid().await.expect("launcher pid");
+        runtime
+            .prepare_retention("server-shutdown".to_string())
+            .await
+            .expect("retain");
+        // The restart: the old server's containment (and its record locks)
+        // goes with the runtime; nothing is signalled.
+        drop(runtime);
+        let recorded = store.load_all().pop().expect("retained record");
+        let unit_id = recorded.unit_id.clone().expect("a unit record");
+        let native = recorded.main_pid.expect("native main recorded");
+        assert!(fake_codex::pid_alive(native) && fake_codex::pid_alive(launcher));
+
+        // The "new server" boots over the same root and store.
+        let after = Containment::select(options());
+        let units = after.recorded_units().expect("records");
+        assert!(units.iter().any(|u| u.unit_id.as_str() == unit_id));
+        let (reconciler, report) =
+            SidecarReconciler::boot_reconcile_with_units(store.clone(), &units);
+        assert_eq!(report.held, 1, "the retained sidecar is held: {report:?}");
+        let record = reconciler.claim_for_session("t-re").await.expect("claim");
+        let seed = seed_over(after.clone(), "t-re");
+        let reattached = ReattachedCodexAppServerRuntime::with_unit(
+            record.clone(),
+            reconciler.unit_record(&unit_id),
+            store.clone(),
+            seed.clone(),
+        );
+        let reattached_ready = reattached.ensure_ready(None).await.expect("reattach");
+        assert_eq!(reattached_ready.ws_url, ready.ws_url);
+        let unit = reattached.unit().expect("reattached inside its unit");
+        assert_eq!(unit.id().as_str(), unit_id);
+        assert_eq!(unit.main().map(|m| m.pid()), record.main_pid);
+
+        let stop = seed.stop(&unit, StopMode::Force, StopReason::ShiftX, "test");
+        stop.wait().await;
+        stop.wait_swept().await;
+        assert!(!fake_codex::pid_alive(native), "native stopped");
+        wait_dead(launcher).await;
+        assert!(
+            after
+                .recorded_units()
+                .expect("records")
+                .iter()
+                .all(|u| u.unit_id.as_str() != unit_id),
+            "the unit's record is deleted at Gone"
+        );
+        reattached.finish_after_gone().await;
+        assert!(
+            store.load_all().is_empty(),
+            "the sidecar record goes after Gone"
+        );
+    }
+
+    /// A probe answered by ANOTHER pane's app-server on a reused port fails
+    /// the attempt (no launcher-as-main fallback) and the retry starts on a
+    /// new port in a new unit (Stage 2: LB-30, LB-17).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_answered_by_another_panes_app_server_fails_the_attempt_and_retries_on_a_new_port(
+    ) {
+        let records = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(records.path().to_path_buf()));
+        let home_a = tempfile::tempdir().unwrap();
+        let (runtime_a, ready_a) = ready_realistic(
+            json!({"threadStartThreadId": "t-a"}),
+            home_a.path(),
+            store.clone(),
+            tag_seed("t-a"),
+        )
+        .await;
+        let taken = port_of(&ready_a.ws_url);
+        let record_a = store.load_all().pop().expect("pane A's record");
+        let manifest_a = native_manifest_in(&home_a.path().join("manifests"));
+        let native_a = manifest_a.pid;
+        // Pane A answers B's first probe only once B's own native runs, so
+        // B's launcher is already placed in its unit: the attempt can fail
+        // only on "the listener must be a member of this unit".
+        let paused_a = PausedChild::pause(native_a, manifest_a.start_time(native_a));
+
+        let home_b = tempfile::tempdir().unwrap();
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let seed_b = recording_seed("t-b", lifecycle.clone());
+        let built: Arc<Mutex<Vec<Arc<SpawnedCodexAppServerRuntime>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let factory_built = built.clone();
+        let factory_store = store.clone();
+        let factory_home = home_b.path().to_path_buf();
+        let planner = CodexLaunchPlanner::new(Box::new(move |plan| {
+            let mut built = factory_built.lock().unwrap();
+            let first = built.is_empty();
+            // Attempt 1's own native stays alive and is not listening yet
+            // when pane A's app-server answers its probe.
+            let behavior = if first {
+                json!({"threadStartThreadId": "t-b", "listenDelayMs": 30000})
+            } else {
+                json!({"threadStartThreadId": "t-b"})
+            };
+            let mut runtime = SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
+                fake_codex::launcher_command(),
+                factory_store.clone(),
+                fake_context(behavior, &factory_home),
+                plan.unit_seed.clone().expect("seeded plan"),
+            );
+            if first {
+                runtime = runtime.with_forced_listen_port(taken);
+            }
+            let runtime = Arc::new(runtime);
+            built.push(runtime.clone());
+            let runtime = runtime as Arc<dyn CodexLaunchRuntime>;
+            Box::pin(async move { runtime })
+        }));
+        let plan = tokio::spawn(async move {
+            planner
+                .plan_create_with_retry(&plan_input_with_seed("t-b", seed_b), 2, 0)
+                .await
+        });
+        let manifests_b = home_b.path().join("manifests");
+        let first_native = manifests_b.clone();
+        fake_codex::wait_until("attempt 1's native to run", LIMIT, move || {
+            std::fs::read_dir(&first_native).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().starts_with("native-"))
+            })
+        })
+        .await;
+        drop(paused_a);
+        let launch = timeout(LIMIT, plan)
+            .await
+            .expect("the plan settles")
+            .expect("join")
+            .expect("attempt 2 succeeds on a new port");
+
+        let attempts = lifecycle.attempts();
+        assert_eq!(attempts.len(), 2, "one unit per attempt");
+        assert_ne!(attempts[0].id(), attempts[1].id());
+        let first = attempts[0].stop_in_flight().expect("attempt 1 was stopped");
+        assert!(first.try_report().is_some(), "attempt 1's unit is Gone");
+        first.wait_swept().await;
+        assert!(
+            shared_containment()
+                .recorded_units()
+                .unwrap()
+                .iter()
+                .all(|u| u.unit_id != *attempts[0].id()),
+            "attempt 1's unit record is deleted"
+        );
+        assert!(attempts[1].stop_in_flight().is_none(), "attempt 2 runs");
+        assert_eq!(launch.unit.as_ref().map(|u| u.id()), Some(attempts[1].id()));
+        let second_runtime = built.lock().unwrap()[1].clone();
+        let second_launcher = second_runtime.child_pid().await.expect("pid 2");
+        for pid in manifest_pids(&manifests_b) {
+            if pid != second_launcher && Some(pid) != attempts[1].main().map(|m| m.pid()) {
+                assert!(
+                    !fake_codex::pid_alive(pid),
+                    "attempt 1's process {pid} is dead"
+                );
+            }
+        }
+
+        let records_now = store.load_all();
+        assert_eq!(records_now.len(), 2, "pane A's record and attempt 2's");
+        let record_b = records_now
+            .iter()
+            .find(|r| r.ownership_id != record_a.ownership_id)
+            .expect("attempt 2's record");
+        assert_ne!(
+            port_of(&record_b.ws_url),
+            taken,
+            "attempt 2 listens elsewhere"
+        );
+        assert_eq!(
+            records_now
+                .iter()
+                .find(|r| r.ownership_id == record_a.ownership_id),
+            Some(&record_a),
+            "pane A's record is untouched"
+        );
+        assert!(fake_codex::pid_alive(native_a), "pane A's native runs on");
+        assert!(
+            native_manifest_in(&home_a.path().join("manifests"))
+                .signals
+                .is_empty(),
+            "pane A was never signalled"
+        );
+
+        launch
+            .sidecar
+            .stop_and_finish(StopMode::Force, StopReason::ShiftX, "test")
+            .await
+            .expect("stop pane B");
+        let a = runtime_a.unit().unwrap();
+        a.stop(StopRequest::new(
+            StopMode::Force,
+            StopReason::ShiftX,
+            "test",
+        ))
+        .wait_swept()
+        .await;
+        attempts[1].stop_in_flight().unwrap().wait_swept().await;
+    }
+
+    /// A start killed while its first attempt is starting returns Cancelled
+    /// and never starts another attempt (Stage 2: LB-17, R3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_killed_start_is_never_retried() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let seed = recording_seed("t-kill", lifecycle.clone());
+        let factory_home = home.path().to_path_buf();
+        let planner = Arc::new(CodexLaunchPlanner::new(Box::new(move |plan| {
+            let runtime = Arc::new(
+                SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
+                    fake_codex::launcher_command(),
+                    store.clone(),
+                    fake_context(json!({"listenDelayMs": 3000}), &factory_home),
+                    plan.unit_seed.clone().expect("seeded plan"),
+                ),
+            ) as Arc<dyn CodexLaunchRuntime>;
+            Box::pin(async move { runtime })
+        })));
+        let task_planner = planner.clone();
+        let task_seed = seed.clone();
+        let plan = tokio::spawn(async move {
+            task_planner
+                .plan_create_with_retry(&plan_input_with_seed("t-kill", task_seed), 5, 0)
+                .await
+        });
+        let manifests = home.path().join("manifests");
+        let attempts = lifecycle.clone();
+        let native_dir = manifests.clone();
+        fake_codex::wait_until("the first attempt's native to run", LIMIT, move || {
+            attempts
+                .attempts()
+                .first()
+                .is_some_and(|unit| unit.members().is_ok_and(|m| !m.is_empty()))
+                && manifest_pids(&native_dir).len() >= 3
+        })
+        .await;
+        let unit = lifecycle.attempts()[0].clone();
+        lifecycle.cancelled.store(true, Ordering::SeqCst);
+        let stop = seed.stop(&unit, StopMode::Force, StopReason::ShiftX, "test");
+
+        let result = timeout(LIMIT, plan)
+            .await
+            .expect("plan settles")
+            .expect("join");
+        assert!(
+            matches!(result, Err(CodexLaunchError::Cancelled)),
+            "a killed start is Cancelled: {result:?}"
+        );
+        assert_eq!(
+            lifecycle.attempts().len(),
+            1,
+            "no second attempt was minted"
+        );
+        stop.wait().await;
+        stop.wait_swept().await;
+        for pid in manifest_pids(&manifests) {
+            assert!(
+                !fake_codex::pid_alive(pid),
+                "process {pid} survived the kill"
+            );
+        }
+    }
+
+    /// The sidecar record keeps the Codex home Codex itself reported, never
+    /// the server's own environment (Stage 2: LB-29, R9).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sidecar_record_keeps_the_codex_home_codex_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_a = home.path().join("codex-a");
+        std::fs::create_dir_all(&codex_a).unwrap();
+        let reported = codex_a.display().to_string();
+        let ambient = std::env::var("CODEX_HOME")
+            .ok()
+            .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.codex")));
+        assert_ne!(ambient.as_deref(), Some(reported.as_str()));
+
+        // The readiness answer carries it.
+        let direct_store = Arc::new(CodexSidecarStore::new(home.path().join("direct")));
+        let (runtime, ready) = ready_realistic(
+            json!({}),
+            &codex_a,
+            direct_store.clone(),
+            tag_seed("t-home-direct"),
+        )
+        .await;
+        assert_eq!(ready.codex_home.as_deref(), Some(reported.as_str()));
+        assert_eq!(
+            direct_store.load_all()[0].codex_home.as_deref(),
+            Some(reported.as_str())
+        );
+        let unit = runtime.unit().unwrap();
+        unit.stop(StopRequest::new(
+            StopMode::Force,
+            StopReason::ShiftX,
+            "test",
+        ))
+        .wait_swept()
+        .await;
+
+        // A planned, adopted pane: recorded before any client connects.
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let manager = manager_with_realistic_runtime(store.clone(), &codex_a, json!({}));
+        let launch = manager
+            .plan_create_with_retry_uncancellable(
+                &plan_input_with_seed("t-home", tag_seed("t-home")),
+                1,
+                LaunchClass::Interactive,
+            )
+            .await
+            .expect("plan");
+        manager.adopt("T-home", launch, 1).await.expect("adopt");
+        assert_eq!(
+            store.load_all()[0].codex_home.as_deref(),
+            Some(reported.as_str()),
+            "recorded before any client connects"
+        );
+        let proxy = manager.proxy_ws_url("T-home").expect("proxy url");
+        let mut rpc = fake_codex::Rpc::connect(port_of(&proxy)).await;
+        rpc.initialize().await;
+        assert_eq!(
+            store.load_all()[0].codex_home.as_deref(),
+            Some(reported.as_str()),
+            "still the home Codex reported after the proxied initialize"
+        );
+        let pane = manager.adopted_unit("T-home").unwrap();
+        pane.stop(StopRequest::new(
+            StopMode::Force,
+            StopReason::ShiftX,
+            "test",
+        ))
+        .wait_swept()
+        .await;
+        manager.finish_unit("T-home").await;
+    }
+
+    /// Codex forwards the unit tag to its stdio MCP servers, so they and
+    /// their children are unit members on the tag backends (Stage 2: LB-44).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_mcp_child_carries_the_unit_tag() {
+        let home = tempfile::tempdir().unwrap();
+        let names = freshell_platform::mcp_inject::FRESHELL_MCP_CONTEXT_ENV_VARS
+            .iter()
+            .map(|name| format!("{name:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut context = fake_context(json!({"mcpChild": true}), home.path());
+        context.config_args = vec![
+            "-c".to_string(),
+            format!("mcp_servers.freshell.env_vars=[{names}]"),
+        ];
+        let runtime = SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
+            fake_codex::launcher_command(),
+            Arc::new(CodexSidecarStore::disabled()),
+            context,
+            tag_seed("t-mcp"),
+        );
+        runtime.ensure_ready(None).await.expect("ready");
+        let unit = runtime.unit().expect("unit");
+        let native = native_manifest_in(&home.path().join("manifests"));
+        let mcp = native.children.mcp.expect("the MCP child");
+        assert_eq!(
+            fake_codex::environ_value(mcp, freshell_containment::UNIT_ENV).as_deref(),
+            Some(unit.id().as_str()),
+            "the MCP child carries the unit tag"
+        );
+        assert_eq!(
+            fake_codex::environ_value(mcp, "FAKE_CODEX_APP_SERVER_BEHAVIOR"),
+            None,
+            "the MCP child gets only the allow-listed variables"
+        );
+        unit.stop(StopRequest::new(
+            StopMode::Force,
+            StopReason::ShiftX,
+            "test",
+        ))
+        .wait_swept()
+        .await;
+        assert!(!fake_codex::pid_alive(mcp));
+    }
+
+    /// One shutdown deadline: every stop starts at once and all are awaited
+    /// together, never one after another (Stage 2: LB-45, R13).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_starts_every_stop_at_once_under_one_deadline() {
+        let home = tempfile::tempdir().unwrap();
+        // A disabled store: nothing is retainable (the macOS/Windows shape).
+        let store = Arc::new(CodexSidecarStore::disabled());
+        let wedged = json!({"ignoreSigint": true});
+        let manager = manager_with_realistic_runtime(store.clone(), home.path(), wedged.clone());
+        let mut natives = Vec::new();
+        for (session, terminal) in [("t-sd-1", "T-sd-1"), ("t-sd-2", "T-sd-2")] {
+            let launch = manager
+                .plan_create_with_retry_uncancellable(
+                    &plan_input_with_seed(session, tag_seed(session)),
+                    1,
+                    LaunchClass::Interactive,
+                )
+                .await
+                .expect("plan");
+            natives.push(launch.unit.clone().unwrap());
+            manager.adopt(terminal, launch, 1).await.expect("adopt");
+        }
+        manager.begin_shutdown_retention();
+        let t0 = std::time::Instant::now();
+        manager
+            .shutdown(tokio::time::Instant::now() + Duration::from_millis(3500))
+            .await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(1800),
+            "both 1 s force graces ran at once: {:?}",
+            t0.elapsed()
+        );
+        for unit in &natives {
+            assert!(!fake_codex::pid_alive(unit.main().unwrap().pid()));
+            unit.stop_in_flight().unwrap().wait_swept().await;
+        }
+
+        // A deadline shorter than a stop: shutdown returns at the deadline
+        // and the stops go on.
+        let home2 = tempfile::tempdir().unwrap();
+        let manager2 = manager_with_realistic_runtime(store, home2.path(), wedged);
+        let launch = manager2
+            .plan_create_with_retry_uncancellable(
+                &plan_input_with_seed("t-sd-3", tag_seed("t-sd-3")),
+                1,
+                LaunchClass::Interactive,
+            )
+            .await
+            .expect("plan 3");
+        let unit = launch.unit.clone().unwrap();
+        manager2.adopt("T-sd-3", launch, 1).await.expect("adopt 3");
+        let t0 = std::time::Instant::now();
+        manager2
+            .shutdown(tokio::time::Instant::now() + Duration::from_millis(300))
+            .await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t0.elapsed()
+        );
+        let in_flight = unit.stop_in_flight().expect("the stop started");
+        assert!(
+            in_flight.try_report().is_none(),
+            "the stop is still in flight"
+        );
+        wait_dead(unit.main().unwrap().pid()).await;
+        in_flight.wait_swept().await;
+    }
+
+    /// The PTY exit hook runs on the PTY reader thread, which has no tokio
+    /// runtime: it must hand the stop off without panicking (Stage 2: R14).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notify_terminal_exit_is_safe_on_the_pty_reader_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let manager = Arc::new(manager_with_realistic_runtime(
+            store.clone(),
+            home.path(),
+            json!({}),
+        ));
+        let launch = manager
+            .plan_create_with_retry_uncancellable(
+                &plan_input_with_seed("t-pty", tag_seed("t-pty")),
+                1,
+                LaunchClass::Interactive,
+            )
+            .await
+            .expect("plan");
+        let unit = launch.unit.clone().unwrap();
+        let native = unit.main().unwrap().pid();
+        manager.adopt("T-pty", launch, 1).await.expect("adopt");
+        let hook = manager.clone();
+        std::thread::spawn(move || hook.notify_terminal_exit("T-pty"))
+            .join()
+            .expect("the exit hook does not panic outside a runtime");
+        wait_dead(native).await;
+        let records = store.clone();
+        fake_codex::wait_until("the record to be removed", LIMIT, move || {
+            records.load_all().is_empty()
+        })
+        .await;
+        assert!(manager.adopted_unit("T-pty").is_none());
+        unit.stop_in_flight().unwrap().wait_swept().await;
+    }
 }

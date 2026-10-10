@@ -281,8 +281,13 @@ impl freshell_codex::launch_lifecycle::CodexLaunchRuntime for NeverRuntime {
         Box::pin(async move { Ok(()) })
     }
 
-    fn shutdown(&self) -> freshell_codex::BoxFuture<'_, Result<(), String>> {
-        Box::pin(async move { Ok(()) })
+    fn stop(
+        &self,
+        _mode: freshell_codex::launch_lifecycle::StopMode,
+        _reason: freshell_codex::launch_lifecycle::StopReason,
+        _initiator: String,
+    ) -> freshell_codex::BoxFuture<'_, Option<freshell_codex::launch_lifecycle::StopHandle>> {
+        Box::pin(async move { None })
     }
 }
 
