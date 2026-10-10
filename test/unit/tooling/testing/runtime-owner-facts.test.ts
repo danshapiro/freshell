@@ -421,11 +421,21 @@ describe('Task7 registered physical stopped fixture preparation', () => {
   })
 
   async function browserFixture(rig: owner.ManagedRuntimeOwner): Promise<owner.Task007PreparedStoppedFixture> {
+    vi.spyOn(rig.runtime, 'isContainerRunning').mockReturnValue(true)
     const root = rig.runtime.testRoot
     await fsp.mkdir(root, { recursive: true, mode: 0o700 })
     const sourceDatabaseFile = path.join(root, 'source.db')
     const source = owner.seedManagedOpenCodeSource({ repoRoot: fixtureRepoRoot, databasePath: sourceDatabaseFile,
       workspace: root, nonce: 'batch-browser-unit', batch: 'stopped-repair-seven-roots' })
+    await fsp.chmod(sourceDatabaseFile, 0o600)
+    await fsp.mkdir(path.dirname(rig.runtime.lifecyclePath), { recursive: true, mode: 0o700 })
+    await fsp.writeFile(rig.runtime.lifecyclePath, '', { mode: 0o600 })
+    const lifecycle = path.join(root, 'r/browser/evidence/lifecycle.jsonl')
+    await fsp.mkdir(path.dirname(lifecycle), { recursive: true, mode: 0o700 })
+    await fsp.writeFile(lifecycle, '', { mode: 0o600 })
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: '/controlled-unused', proxySocketPath: path.join(root, 'broker.sock'),
+      runtimeRootPrefix: root, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(),
+      testRunId: rig.runtime.runId, logPath: path.join(root, 'broker.jsonl') })
     const host = path.join(root, 'host')
     await fsp.writeFile(host, 'controlled registered host artifact', { mode: 0o550 })
     await fsp.chmod(host, 0o550)
@@ -459,6 +469,64 @@ describe('Task7 registered physical stopped fixture preparation', () => {
     return { input, output, source, inputFile: path.join(root, 'input.json'), outputDir: root, metadataFile,
       sourceDatabaseFile, registryRoot: path.join(root, 'registry'), scenarioId: 'browser-managed-runtime', volumeName: 'registered-unit-volume' }
   }
+
+  it('retains exact lost-ACK Registry reader ownership across failed inner and outer cleanup', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused cleanup-retry web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const supervisor: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    const helperId = 'e'.repeat(64), foreignId = 'f'.repeat(64)
+    const stateFile = path.join(batch.outputDir, 'cleanup-daemon.json'), calls = path.join(batch.outputDir, 'cleanup-calls.jsonl')
+    const state = { containers: {
+      [supervisor.containerId]: { Id: supervisor.containerId, Name: 'registered-supervisor' },
+      [foreignId]: { Id: foreignId, Name: 'unrelated-sentinel' },
+    }, volumes: [batch.volumeName!, 'unrelated-volume'], cleanupInspectFailed: false }
+    await fsp.writeFile(stateFile, JSON.stringify(state), { mode: 0o600 })
+    await fsp.writeFile(path.join(batch.outputDir, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),args=process.argv.slice(2),file=${JSON.stringify(stateFile)},state=JSON.parse(fs.readFileSync(file));const save=()=>fs.writeFileSync(file,JSON.stringify(state));fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');
+if(args[0]==='inspect'){
+ const item=Object.values(state.containers).find(item=>item.Id===args.at(-1)||item.Name===args.at(-1));if(!item)process.exit(1);
+ if(args.includes('--format'))process.stdout.write('false');else if(item.Id==='${helperId}'&&!state.cleanupInspectFailed){state.cleanupInspectFailed=true;save();process.exit(9)}else process.stdout.write(JSON.stringify([item]));
+}else if(args[0]==='create'){
+ const labels={};for(let i=0;i<args.length;i++)if(args[i]==='--label'){const [key,value]=args[++i].split('=');labels[key]=value}
+ const mounts=[];for(let i=0;i<args.length;i++)if(args[i]==='--mount'){const parts=args[++i].split(','),values=Object.fromEntries(parts.map(part=>part.split('=')));mounts.push({Type:values.type,Name:values.type==='volume'?values.source:undefined,Source:values.source,Destination:values.target,RW:!parts.includes('readonly')})}
+ state.containers['${helperId}']={Id:'${helperId}',Name:args[args.indexOf('--name')+1],Image:args[args.indexOf('--entrypoint')+2],Config:{Labels:labels},Mounts:mounts};save();process.stderr.write('controlled create ACK lost');process.exit(9);
+}else if(args[0]==='rm'){
+ if(args.at(-1)==='${foreignId}')process.exit(7);delete state.containers[args.at(-1)];save();
+}else if(args[0]==='ps')process.stdout.write(Object.values(state.containers).map(item=>args.includes('--format')?item.Name:item.Id).join('\\n'));
+else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')process.exit(7);state.volumes=state.volumes.filter(name=>name!==args[2]);save()}else process.stdout.write(state.volumes.join('\\n'))}else process.exit(8);\n`, { mode: 0o700 })
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch(); rig.supervisor = supervisor
+      Object.assign(rig.runtime, { imageRef: batch.input.imageRef, task007Fixtures: new Map([['browser', batch]]),
+        trackedSupervisorContainers: new Set([supervisor.containerId]), trackedVolumes: new Set([batch.volumeName]) })
+      vi.mocked(rig.runtime.isContainerRunning).mockRestore()
+      vi.stubEnv('PATH', `${batch.outputDir}${path.delimiter}${process.env.PATH}`)
+      await expect(rig.runtime.readTask007StoppedRegistry(supervisor, batch.input.fixtureId, 'repair-current')).rejects.toThrow(/owned cleanup failed/)
+      expect(rig.runtime.transferOwnedIds().containers).not.toContain(helperId)
+      const readState = () => JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+      let current = readState()
+      expect(current.cleanupInspectFailed).toBe(true)
+      expect(current.containers[helperId]).toBeDefined()
+      current.containers[helperId].Config.Labels['com.freshell.task007-supervisor-id'] = foreignId
+      await fsp.writeFile(stateFile, JSON.stringify(current))
+      const refused = await rig.runtime.cleanup()
+      expect(refused.ok).toBe(false)
+      expect(refused.errors.some(error => error.includes('ownership is unknown'))).toBe(true)
+      current = readState()
+      expect(current.containers[supervisor.containerId]).toBeUndefined()
+      expect(current.containers[helperId]).toBeDefined(); expect(current.containers[foreignId]).toBeDefined()
+      current.containers[helperId].Config.Labels['com.freshell.task007-supervisor-id'] = supervisor.containerId
+      await fsp.writeFile(stateFile, JSON.stringify(current))
+      await expect(rig.runtime.cleanup()).resolves.toEqual({ ok: true, errors: [] })
+      current = readState()
+      expect(Object.keys(current.containers)).toEqual([foreignId]); expect(current.volumes).toEqual(['unrelated-volume'])
+      const actual = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+      expect(actual.filter(args => args[0] === 'rm')).toEqual([['rm', '-f', supervisor.containerId], ['rm', '--force', helperId]])
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
 
   it('starts only the exact registered historical host copy and refuses changed artifact bytes', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused copied-host web') }, fixtureRepoRoot, 3,
@@ -497,6 +565,7 @@ describe('Task7 registered physical stopped fixture preparation', () => {
       {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
     const batch = await browserFixture(rig)
     const preparation = vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.spyOn(rig.runtime, 'waitForSupervisorHealth').mockResolvedValue({})
     const ordinary = vi.spyOn(rig.runtime, 'prepare')
     vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
     const previous: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
@@ -529,6 +598,531 @@ describe('Task7 registered physical stopped fixture preparation', () => {
       await expect(rig.setSyntheticStoppedRepairFault('foreign-fixture', 'none')).rejects.toThrow(/registered/)
       expect(stop).toHaveBeenCalledTimes(2)
     } finally { vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it.each((['failed', 'malformed', 'stop-unconfirmed'] as const).flatMap(mode =>
+    (['activation', 'restoration'] as const).map(stage => ({ mode, stage }))))(
+    'refuses unknown $mode supervisor state before registered-store $stage', async ({ mode, stage }) => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused inspection web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    const db = new DatabaseSync(batch.sourceDatabaseFile)
+    db.exec('PRAGMA journal_mode = DELETE'); db.close()
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const previous: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    const launch = vi.spyOn(rig.runtime, 'startSupervisor').mockResolvedValue(previous)
+    const remove = vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'waitForSupervisorHealth').mockResolvedValue({})
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
+    const state = path.join(batch.outputDir, 'inspect-mode'), calls = path.join(batch.outputDir, 'inspect-calls.jsonl')
+    await fsp.writeFile(state, 'stopped')
+    await fsp.writeFile(path.join(batch.outputDir, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),args=process.argv.slice(2),mode=fs.readFileSync(${JSON.stringify(state)},'utf8');fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='inspect'){if(mode==='failed')process.exit(9);process.stdout.write(mode==='malformed'?'unknown':mode==='stop-unconfirmed'?'true':'false')}else if(args[0]!=='stop')process.exit(8);\n`, { mode: 0o700 })
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch(); rig.supervisor = previous
+      Object.assign(rig.runtime, { imageRef: batch.input.imageRef, task007Fixtures: new Map([['browser', batch]]),
+        trackedSupervisorContainers: new Set([previous.containerId]), trackedVolumes: new Set([batch.volumeName]) })
+      vi.mocked(rig.runtime.isContainerRunning).mockRestore()
+      vi.stubEnv('PATH', `${batch.outputDir}${path.delimiter}${process.env.PATH}`)
+      const original = await fsp.readFile(batch.sourceDatabaseFile)
+      if (stage === 'restoration') {
+        await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')
+        expect(await fsp.readFile(batch.sourceDatabaseFile)).not.toEqual(original)
+        launch.mockClear(); remove.mockClear()
+      }
+      const beforeRefusal = await fsp.readFile(batch.sourceDatabaseFile)
+      await fsp.writeFile(state, mode)
+      if (stage === 'activation' && mode !== 'stop-unconfirmed') {
+        await expect(rig.runtime.readTask007StoppedRegistry(previous, batch.input.fixtureId, 'repair-current')).rejects.toThrow(/inspection|state/)
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/inspection|state/)
+      }
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId,
+        stage === 'activation' ? 'source_generation_change' : 'none')).rejects.toThrow(/inspection|state|stopped/)
+      expect(await fsp.readFile(batch.sourceDatabaseFile)).toEqual(beforeRefusal)
+      if (stage === 'activation') expect(beforeRefusal).toEqual(original)
+      expect(launch).not.toHaveBeenCalled(); expect(remove).not.toHaveBeenCalled()
+      expect((await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line)[0])).not.toContain('create')
+      if (stage === 'restoration') {
+        await fsp.writeFile(state, 'stopped')
+        await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+        expect(await fsp.readFile(batch.sourceDatabaseFile)).toEqual(original)
+      }
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it('changes only the registered fictional source generation and restores its exact original bytes', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused fault web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const previous: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    let stopped = false
+    vi.spyOn(rig.runtime, 'waitForSupervisorHealth').mockResolvedValue({})
+    vi.spyOn(rig.runtime, 'stopSupervisorExact').mockImplementation(() => { stopped = true })
+    vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    const closedSource = new DatabaseSync(batch.sourceDatabaseFile)
+    closedSource.exec('PRAGMA journal_mode = DELETE'); closedSource.close()
+    const originalBytes = await fsp.readFile(batch.sourceDatabaseFile)
+    const title = () => {
+      const db = new DatabaseSync(batch.sourceDatabaseFile, { readOnly: true })
+      try { return db.prepare('SELECT title FROM session WHERE id = ?').get(batch.source.families[0].rootId)?.title }
+      finally { db.close() }
+    }
+    const originalTitle = title()
+    const launch = vi.spyOn(rig.runtime, 'startSupervisor').mockImplementation(async options => {
+      expect(stopped).toBe(true)
+      expect(options).toMatchObject({ scenarioId: previous.scenarioId, volumeName: previous.volumeName, reuseSecret: true })
+      stopped = false
+      return { ...previous }
+    })
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
+    try {
+      const facts = await rig.prepareSyntheticStoppedRepairBatch()
+      rig.supervisor = previous
+      for (const suffix of ['-wal', '-shm', '-journal']) {
+        await fsp.writeFile(`${batch.sourceDatabaseFile}${suffix}`, 'controlled unsettled sidecar')
+        await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')).rejects.toThrow(/sidecar/)
+        expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(originalBytes)).toBe(true)
+        await fsp.unlink(`${batch.sourceDatabaseFile}${suffix}`)
+      }
+      await fsp.symlink(path.join(batch.outputDir, 'unregistered-sidecar'), `${batch.sourceDatabaseFile}-wal`)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')).rejects.toThrow(/sidecar/)
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(originalBytes)).toBe(true)
+      await fsp.unlink(`${batch.sourceDatabaseFile}-wal`)
+      const sourceAlias = path.join(batch.outputDir, 'unrelated-source-alias.db')
+      await fsp.link(batch.sourceDatabaseFile, sourceAlias)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')).rejects.toThrow(/custody/)
+      expect((await fsp.readFile(sourceAlias)).equals(originalBytes)).toBe(true)
+      await fsp.unlink(sourceAlias)
+      await fsp.appendFile(batch.sourceDatabaseFile, 'unexpected source bytes')
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')).rejects.toThrow(/unexpectedly/)
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(originalBytes)).toBe(false)
+      await fsp.writeFile(batch.sourceDatabaseFile, originalBytes)
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')
+      expect(title()).not.toEqual(originalTitle)
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(originalBytes)).toBe(false)
+      const mutated = await fsp.readFile(batch.sourceDatabaseFile)
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(mutated)).toBe(true)
+      await fsp.appendFile(batch.sourceDatabaseFile, 'unexpected changes during fault')
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).rejects.toThrow(/unexpectedly/)
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(originalBytes)).toBe(false)
+      await fsp.writeFile(batch.sourceDatabaseFile, mutated)
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(originalBytes)).toBe(true)
+      expect(title()).toEqual(originalTitle)
+      expect(await rig.syntheticStoppedRepairBatchFacts()).toEqual(facts)
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(originalBytes)).toBe(true)
+      expect(launch).toHaveBeenCalledTimes(4)
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')
+      const sync = fs.fsyncSync
+      let failDirectorySync = true
+      const directorySync = vi.spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+        if (failDirectorySync && fs.fstatSync(fd).isDirectory()) throw new Error('controlled restoration directory sync failure')
+        sync(fd)
+      })
+      try {
+        await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).rejects.toThrow(/directory sync failure/)
+        expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(originalBytes)).toBe(true)
+        failDirectorySync = false
+        await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).resolves.toEqual({ controlEpoch: 12 })
+        expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(originalBytes)).toBe(true)
+      } finally { directorySync.mockRestore() }
+      await expect(rig.setSyntheticStoppedRepairFault('foreign-fixture', 'source_generation_change')).rejects.toThrow(/registered/)
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it('refuses fictional source mutation until its actual tracked probe child settles', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused source probe web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const original = await fsp.readFile(batch.sourceDatabaseFile)
+    const pidFile = path.join(batch.outputDir, 'controlled-probe.pid'), release = path.join(batch.outputDir, 'release-probe')
+    await fsp.writeFile(path.join(batch.outputDir, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs');fs.writeFileSync(${JSON.stringify(pidFile)},String(process.pid));const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer);process.stdout.write('settled')}},10);\n`, { mode: 0o700 })
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: '/controlled-unused', proxySocketPath: batch.input.brokerSocketPath,
+      runtimeRootPrefix: batch.input.ownerRoot, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(),
+      testRunId: rig.runtime.runId, logPath: path.join(batch.outputDir, 'broker.jsonl') })
+    vi.spyOn(rig.runtime.broker, 'receiptIds').mockReturnValue(new Set(['a'.repeat(64)]))
+    vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    vi.stubEnv('PATH', `${batch.outputDir}${path.delimiter}${process.env.PATH}`)
+    let probe: Promise<string> | undefined, pid: number | undefined
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch()
+      probe = rig.ownedProviderExec('a'.repeat(64), ['node', '--version'])
+      await vi.waitFor(() => expect(fs.existsSync(pidFile)).toBe(true))
+      pid = Number(await fsp.readFile(pidFile, 'utf8'))
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')).rejects.toThrow(/consumers.*settled/)
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(original)).toBe(true)
+    } finally {
+      await fsp.writeFile(release, 'release exact controlled child')
+      if (probe) await expect(probe).resolves.toBe('settled')
+      if (pid) expect(fs.existsSync(`/proc/${pid}`)).toBe(false)
+      vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true })
+    }
+  })
+
+  it.each((['supervisor', 'web'] as const).flatMap(service =>
+    (['activation', 'restoration'] as const).map(stage => ({ service, stage }))))(
+    'settles both source consumers after failed $service $stage and retries the same services', async ({ service: failedService, stage }) => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused fault web factory') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    const db = new DatabaseSync(batch.sourceDatabaseFile)
+    db.exec('PRAGMA journal_mode = DELETE'); db.close()
+    const original = await fsp.readFile(batch.sourceDatabaseFile)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const previous: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    let webRunning = true, supervisorRunning = true, fail = stage === 'activation'
+    vi.spyOn(rig.runtime, 'waitForSupervisorHealth').mockResolvedValue({})
+    const stop = vi.spyOn(rig.runtime, 'stopSupervisorExact').mockImplementation(() => { supervisorRunning = false })
+    const remove = vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'startSupervisor').mockImplementation(async options => {
+      expect(webRunning).toBe(false)
+      expect(supervisorRunning).toBe(false)
+      expect(options).toMatchObject({ volumeName: previous.volumeName, reuseSecret: true, scenarioId: previous.scenarioId })
+      if (fail && failedService === 'supervisor') throw new Error('controlled supervisor start failure')
+      supervisorRunning = true
+      return { ...previous, containerId: 'b'.repeat(64) }
+    })
+    const info: owner.RuntimeWebInfo = { port: 3499, baseUrl: 'http://127.0.0.1:3499', wsUrl: 'ws://127.0.0.1:3499/ws',
+      token: 'controlled-unchanged-token', configDir: batch.outputDir, homeDir: batch.outputDir, logsDir: batch.outputDir,
+      debugLogPath: path.join(batch.outputDir, 'debug.log'), pid: 101, runtimeRoot: batch.input.runtimeRoot }
+    const webStop = vi.fn(async () => { webRunning = false })
+    const webStart = vi.fn(async () => {
+      expect(supervisorRunning).toBe(true)
+      webRunning = true
+      if (fail && failedService === 'web') throw new Error('controlled web start failure')
+      return { ...info, pid: 102 }
+    })
+    const web: owner.RuntimeWebHandle = { info, start: webStart, stop: webStop, restart: webStart, restartAbrupt: webStart,
+      kill: webStop, capturedOutput: () => ({ stdout: '', stderr: '' }), processEvidence: () => ({ pid: 101, bootAttemptCount: 1 }),
+      ownedChildPids: () => [] }
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch(); rig.supervisor = previous; rig.web = web; rig.info = info
+      if (stage === 'restoration') {
+        await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')
+        fail = true
+      }
+      const removedBefore = remove.mock.calls.length
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId,
+        stage === 'activation' ? 'source_generation_change' : 'none')).rejects.toThrow(/start failure/)
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(original)).toBe(stage === 'restoration')
+      expect(webRunning).toBe(false)
+      expect(supervisorRunning).toBe(false)
+      if (failedService === 'supervisor') expect(remove).toHaveBeenCalledTimes(removedBefore)
+      fail = false
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(original)).toBe(true)
+      expect(webRunning && supervisorRunning).toBe(true)
+      expect(rig.info).toEqual({ ...info, pid: 102 })
+      expect(stop).toHaveBeenCalled()
+      expect(webStop).toHaveBeenCalled()
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it('retains a fault replacement address before failed health and propagates ordinary health failure', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused fault-health web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const previous: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    const replacement = { ...previous, containerId: 'b'.repeat(64) }
+    const stop = vi.spyOn(rig.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    const health = vi.spyOn(rig.runtime, 'waitForSupervisorHealth').mockRejectedValue(new Error('controlled exited before health'))
+    const launch = vi.spyOn(rig.runtime, 'startSupervisor').mockImplementation(async options => {
+      expect(options).toMatchObject({ volumeName: previous.volumeName, reuseSecret: true })
+      if (options.waitForHealth !== false) await rig.runtime.waitForSupervisorHealth(replacement)
+      return replacement
+    })
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch(); rig.supervisor = previous
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'during_withdrawal_before_ack')).rejects.toThrow(/before health/)
+      expect(rig.supervisor.containerId).toBe(replacement.containerId)
+      expect(health).toHaveBeenCalledExactlyOnceWith(replacement)
+      health.mockResolvedValue({})
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+      expect(stop).toHaveBeenLastCalledWith(replacement, true)
+      expect(launch.mock.calls[1][0]).toMatchObject({ volumeName: previous.volumeName, waitForHealth: false })
+      health.mockRejectedValue(new Error('ordinary health failure'))
+      await expect(rig.restartSupervisor()).rejects.toThrow(/ordinary health failure/)
+      expect(launch.mock.calls[2][0].waitForHealth).toBeUndefined()
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it('refuses a symlinked withdrawal parent without writing into its unrelated target', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused obstruction web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const parent = path.join(path.dirname(batch.input.runtimeRoot), 'evidence')
+    const savedParent = `${parent}.controlled-original`, foreign = path.join(fixtureRepoRoot, 'unrelated-obstruction-target')
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch()
+      await fsp.rename(parent, savedParent); await fsp.mkdir(foreign)
+      await fsp.symlink(foreign, parent)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'pending_withdrawal')).rejects.toThrow(/custody/)
+      expect(await fsp.readdir(foreign)).toEqual([])
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it.each(['write', 'fsync', 'close'] as const)(
+    'retains exclusively created obstruction custody after activation $0 failure until exact none cleanup', async stage => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused activation-failure web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    vi.spyOn(rig.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'waitForSupervisorHealth').mockResolvedValue({})
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
+    const obstruction = path.join(path.dirname(batch.input.runtimeRoot), 'evidence/lifecycle.jsonl.1')
+    const supervisor: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    vi.spyOn(rig.runtime, 'startSupervisor').mockResolvedValue(supervisor)
+    const unrelated = path.join(path.dirname(obstruction), 'lifecycle.jsonl.2')
+    let failed = false, descriptor: number | undefined
+    const matches = (fd: unknown): fd is number => typeof fd === 'number' && fs.existsSync(obstruction)
+      && fs.fstatSync(fd).ino === fs.lstatSync(obstruction).ino
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch(); rig.supervisor = supervisor
+      await fsp.writeFile(unrelated, 'unrelated rotation bytes', { mode: 0o600 })
+      const write = fs.writeFileSync, sync = fs.fsyncSync, close = fs.closeSync
+      const writeFailure = vi.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
+        if (matches(file)) descriptor = file
+        if (stage === 'write' && !failed && matches(file)) {
+          failed = true; descriptor = file; write(file, Buffer.from(data as Uint8Array).subarray(0, 7))
+          throw new Error('controlled activation write failure')
+        }
+        write(file, data, options)
+      })
+      const syncFailure = vi.spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+        if (stage === 'fsync' && !failed && matches(fd)) {
+          failed = true; descriptor = fd; throw new Error('controlled activation fsync failure')
+        }
+        sync(fd)
+      })
+      const closeFailure = vi.spyOn(fs, 'closeSync').mockImplementation(fd => {
+        const fail = stage === 'close' && !failed && fd === descriptor
+        close(fd)
+        if (fail) { failed = true; descriptor = fd; throw new Error('controlled activation close failure') }
+      })
+      try {
+        await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'pending_withdrawal')).rejects.toThrow(/controlled activation/)
+      } finally { writeFailure.mockRestore(); syncFailure.mockRestore(); closeFailure.mockRestore() }
+      expect(failed).toBe(true)
+      expect(() => fs.fstatSync(descriptor!)).toThrow()
+      const ownedBytes = await fsp.readFile(obstruction)
+      expect(ownedBytes.length).toBeGreaterThan(0)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'pending_withdrawal')).rejects.toThrow(/completion.*removal/)
+      const held = `${obstruction}.held-owned`
+      await fsp.rename(obstruction, held)
+      await fsp.writeFile(obstruction, ownedBytes, { mode: 0o600 })
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).rejects.toThrow(/changed|owned/)
+      expect(await fsp.readFile(obstruction)).toEqual(ownedBytes)
+      await fsp.unlink(obstruction); await fsp.rename(held, obstruction)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).resolves.toEqual({ controlEpoch: 12 })
+      await expect(fsp.stat(obstruction)).rejects.toHaveProperty('code', 'ENOENT')
+      expect(await fsp.readFile(unrelated, 'utf8')).toBe('unrelated rotation bytes')
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'pending_withdrawal')
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+      await expect(fsp.stat(obstruction)).rejects.toHaveProperty('code', 'ENOENT')
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it('owns only the actual exporter rotation obstruction and clears only its recorded bytes', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused obstruction web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'waitForSupervisorHealth').mockResolvedValue({})
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const previous: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    vi.spyOn(rig.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    const launch = vi.spyOn(rig.runtime, 'startSupervisor').mockResolvedValue(previous)
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
+    const obstruction = path.join(path.dirname(previous.runtimeRoot), 'evidence/lifecycle.jsonl.1')
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch(); rig.supervisor = previous
+      await fsp.mkdir(path.dirname(obstruction), { recursive: true, mode: 0o700 })
+      const unrelated = path.join(path.dirname(obstruction), 'lifecycle.jsonl.2')
+      await fsp.writeFile(unrelated, '{"event":"unrelated"}\n', { mode: 0o600 })
+      await fsp.writeFile(obstruction, 'foreign pre-existing bytes', { mode: 0o600 })
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+      expect(await fsp.readFile(obstruction, 'utf8')).toBe('foreign pre-existing bytes')
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'pending_withdrawal')).rejects.toThrow(/exist|owned/)
+      expect(await fsp.readFile(obstruction, 'utf8')).toBe('foreign pre-existing bytes')
+      await fsp.unlink(obstruction)
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'pending_withdrawal')
+      const owned = await fsp.readFile(obstruction)
+      expect(() => JSON.parse(owned.toString())).toThrow()
+      expect((await fsp.stat(obstruction)).mode & 0o777).toBe(0o600)
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'pending_withdrawal')
+      expect((await fsp.readFile(obstruction)).equals(owned)).toBe(true)
+      await fsp.writeFile(obstruction, 'unexpected changed bytes')
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).rejects.toThrow(/changed|owned/)
+      expect(await fsp.readFile(obstruction, 'utf8')).toBe('unexpected changed bytes')
+      await fsp.writeFile(obstruction, owned)
+      const heldOwned = `${obstruction}.held-owned`
+      await fsp.rename(obstruction, heldOwned)
+      await fsp.writeFile(obstruction, owned, { mode: 0o600 })
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).rejects.toThrow(/changed|owned/)
+      expect((await fsp.readFile(obstruction)).equals(owned)).toBe(true)
+      await fsp.unlink(obstruction); await fsp.rename(heldOwned, obstruction)
+      await fsp.chmod(obstruction, 0o644)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).rejects.toThrow(/changed|owned/)
+      await fsp.chmod(obstruction, 0o600)
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+      await expect(fsp.stat(obstruction)).rejects.toHaveProperty('code', 'ENOENT')
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'pending_withdrawal')
+      const sync = fs.fsyncSync
+      let failDirectorySync = true
+      const directorySync = vi.spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+        if (failDirectorySync && fs.fstatSync(fd).isDirectory()) throw new Error('controlled obstruction directory sync failure')
+        sync(fd)
+      })
+      try {
+        await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).rejects.toThrow(/directory sync failure/)
+        await expect(fsp.stat(obstruction)).rejects.toHaveProperty('code', 'ENOENT')
+        failDirectorySync = false
+        await fsp.writeFile(obstruction, 'new foreign obstruction', { mode: 0o600 })
+        await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).rejects.toThrow(/changed|owned/)
+        expect(await fsp.readFile(obstruction, 'utf8')).toBe('new foreign obstruction')
+        await fsp.unlink(obstruction)
+        await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).resolves.toEqual({ controlEpoch: 12 })
+      } finally { directorySync.mockRestore() }
+      expect(await fsp.readFile(unrelated, 'utf8')).toBe('{"event":"unrelated"}\n')
+      expect(launch.mock.calls.every(([options]) => options.volumeName === previous.volumeName)).toBe(true)
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it.each((['provider', 'helper'] as const).flatMap(kind =>
+    (['lost', 'incomplete'] as const).map(outcome => ({ kind, outcome }))))(
+    'refuses zero activity after an owned $kind start reaches upstream with $outcome response', async ({ kind, outcome }) => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused start-outcome web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig), target = batch.output.targets[0], helperId = 'e'.repeat(64)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const upstreamSocket = path.join(batch.outputDir, 'upstream.sock'), received: string[] = []
+    const upstream = http.createServer((request, response) => {
+      request.resume(); request.on('end', () => {
+        received.push(request.url!)
+        if (request.url!.endsWith('/start')) {
+          if (outcome === 'incomplete') {
+            response.writeHead(200, { 'content-length': '20' }); response.write('partial')
+            setImmediate(() => response.destroy())
+          } else response.destroy()
+        } else response.writeHead(201).end(JSON.stringify({ Id: helperId }))
+      })
+    })
+    const broker = new RestrictedDockerBroker({ realSocketPath: upstreamSocket, proxySocketPath: batch.input.brokerSocketPath,
+      runtimeRootPrefix: batch.input.ownerRoot, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set([batch.input.imageRef]),
+      allowedWorkspaceRoots: new Set([batch.input.workspacePath]), testRunId: rig.runtime.runId, logPath: path.join(batch.outputDir, 'broker.jsonl') })
+    const receipt = { ...target, imageRef: batch.input.imageRef, workspacePath: batch.input.workspacePath,
+      createdAt: 'controlled', requestDigest: 'f'.repeat(64) }
+    Object.assign(broker, { receiptsById: new Map([[target.containerId, receipt]]), knownContainerIds: new Set([target.containerId]) })
+    rig.runtime.broker = broker
+    const request = (url: string, body?: unknown) => new Promise<number>((resolve, reject) => {
+      const client = http.request({ socketPath: broker.proxySocketPath, method: 'POST', path: url }, response => {
+        response.resume(); response.on('end', () => resolve(response.statusCode!)); response.on('error', reject)
+      })
+      client.on('error', reject); client.end(body === undefined ? undefined : JSON.stringify(body))
+    })
+    try {
+      await new Promise<void>(resolve => upstream.listen(upstreamSocket, resolve)); await broker.start()
+      if (kind === 'helper') {
+        const body = { Image: batch.input.imageRef, User: '65534:0', Tty: false, WorkingDir: batch.input.workspacePath, Entrypoint: ['node'],
+          Cmd: ['--no-warnings', '-e', owner.TASK007_BATCH_STORE_PROBE, '/home/freshell/provider/.local/share/opencode/opencode.db', target.rootSessionId],
+          Env: ['HOME=/home/freshell/provider'], HostConfig: { NetworkMode: 'none', ReadonlyRootfs: true,
+            CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges'], Memory: 256 * 1024 * 1024, MemorySwap: 256 * 1024 * 1024,
+            NanoCpus: 500_000_000, PidsLimit: 32, Tmpfs: { '/tmp': 'rw,noexec,nosuid,nodev,size=16m' },
+            Mounts: [{ Type: 'volume', Source: target.providerVolumeName, Target: '/home/freshell/provider', ReadOnly: true },
+              { Type: 'bind', Source: batch.input.workspacePath, Target: batch.input.workspacePath, ReadOnly: true }] } }
+        expect(await request(`/v1.47/containers/create?name=freshell-history-${randomUUID()}`, body)).toBe(201)
+      }
+      expect(await rig.prepareSyntheticStoppedRepairBatch()).toHaveProperty('activity.providerContainerStartRequests', 0)
+      const refusedUrl = `/v1.47/containers/${'f'.repeat(64)}/start`
+      expect(await request(refusedUrl)).toBe(403)
+      expect(received).not.toContain(refusedUrl)
+      expect((await rig.syntheticStoppedRepairBatchFacts()).activity).toMatchObject({ helperStartRequests: 0, providerContainerStartRequests: 0 })
+      const url = `/v1.47/containers/${kind === 'helper' ? helperId : target.containerId}/start`
+      await expect(request(url)).rejects.toThrow()
+      await broker.awaitPendingRequests()
+      expect(received).toContain(url)
+      expect(broker.eventsSnapshot()).toContainEqual(expect.objectContaining({ method: 'POST', url, reason: 'owner_request_failed' }))
+      expect(broker.eventsSnapshot()).toContainEqual(expect.objectContaining({ method: 'POST', url,
+        reason: outcome === 'lost' ? 'upstream_request_failed' : 'upstream_response_incomplete' }))
+      await expect(rig.syntheticStoppedRepairBatchFacts()).rejects.toThrow(/start.*outcome|activity.*unknown/)
+      const events = broker.eventsSnapshot()
+      const observedEvents = vi.spyOn(broker, 'eventsSnapshot')
+      for (const reason of ['owner_request_failed', outcome === 'lost' ? 'upstream_request_failed' : 'upstream_response_incomplete']) {
+        observedEvents.mockReturnValue(events.filter(event => event.reason === undefined || event.reason === reason || event.url === refusedUrl))
+        await expect(rig.syntheticStoppedRepairBatchFacts()).rejects.toThrow(/start.*outcome|activity.*unknown/)
+      }
+    } finally {
+      await broker.close(); upstream.closeAllConnections(); await new Promise<void>(resolve => upstream.close(() => resolve()))
+      vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('measures registered setup completion and forwarded helper/provider requests separately from launch events', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused activity web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: '/controlled-unused', proxySocketPath: batch.input.brokerSocketPath,
+      runtimeRootPrefix: batch.input.ownerRoot, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(),
+      testRunId: rig.runtime.runId, logPath: path.join(batch.outputDir, 'broker.jsonl') })
+    const target = batch.output.targets[0], helperId = 'e'.repeat(64)
+    vi.spyOn(rig.runtime.broker, 'receipts').mockReturnValue([{ ...target, imageRef: batch.input.imageRef,
+      runtimeDir: target.runtimeDir, createdAt: 'controlled', requestDigest: 'f'.repeat(64) }])
+    const event = { at: 'controlled', severity: 'info' as const, method: 'POST', decision: 'forward' as const, destructive: true, unsafeAttempt: false }
+    vi.spyOn(rig.runtime.broker, 'eventsSnapshot').mockReturnValue([
+      { ...event, url: `/v1.47/containers/${helperId}/start`, containerId: helperId, helperName: 'freshell-history-controlled', ownerContainerId: target.containerId },
+      { ...event, url: `/v1.47/containers/${target.containerId}/start`, containerId: target.containerId },
+      { ...event, decision: 'block', url: `/v1.47/containers/${target.containerId}/start`, containerId: target.containerId },
+      { ...event, url: `/v1.47/containers/${'f'.repeat(64)}/start`, containerId: 'f'.repeat(64), helperName: 'freshell-history-foreign', ownerContainerId: 'f'.repeat(64) },
+    ])
+    await fsp.mkdir(path.dirname(rig.runtime.lifecyclePath), { recursive: true })
+    await fsp.writeFile(rig.runtime.lifecyclePath, JSON.stringify({ event: 'task007.provider_home.initialized', data: {
+      fixtureId: batch.input.fixtureId, ownerContainerId: target.containerId } }) + '\n')
+    try {
+      const facts = await rig.prepareSyntheticStoppedRepairBatch()
+      expect(facts).toHaveProperty('activity', { setupHelpersCompleted: 1, helperStartRequests: 1,
+        providerContainerStartRequests: 1, providerLaunchRunningEvents: 0 })
+      rig.supervisor = { scenarioId: batch.scenarioId, volumeName: batch.volumeName!, containerId: 'c'.repeat(64),
+        runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled', controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+      const lifecycle = path.join(path.dirname(batch.input.runtimeRoot), 'evidence/lifecycle.jsonl')
+      await fsp.mkdir(path.dirname(lifecycle), { recursive: true })
+      await fsp.writeFile(lifecycle, JSON.stringify({ event: 'supervisor.launch_running', data: { soulId: target.soulId } }) + '\n')
+      expect(await rig.syntheticStoppedRepairBatchFacts()).toHaveProperty('activity.providerLaunchRunningEvents', 1)
+      await fsp.writeFile(lifecycle, 'malformed owned observation\n')
+      await expect(rig.syntheticStoppedRepairBatchFacts()).rejects.toThrow()
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
   })
 
   it.each(['running', 'blocked stopped', 'retained failed Retry'] as const)(
@@ -617,6 +1211,8 @@ describe('Task7 registered physical stopped fixture preparation', () => {
         execFile(process.execPath, [probeScript, ...args], { encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout))
       }))
       const observed = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
+      expect(observed).toHaveProperty('faultMarkers', { preset: 'none', supervisorContainerId: rig.supervisor.containerId,
+        crash: null, firstResumeObservationFailures: [] })
       expect(observed.status).toBe('complete')
       expect(observed.souls).toHaveLength(9)
       expect(observed.souls.every(soul => soul.activeWriters === 0 && !soul.incidentPresent)).toBe(true)
@@ -640,6 +1236,107 @@ describe('Task7 registered physical stopped fixture preparation', () => {
       expect(actual.at(-1)?.slice(0, 2)).toEqual(['rm', '--force'])
       expect(observed.unrelated).toEqual({ incidentPresent: true, viewPresent: true, noticeIds: ['notice-unrelated'],
         outboxEventIds: ['event-unrelated'], exportSha256: [createHash('sha256').update('unchanged unrelated artifact').digest('hex')] })
+      if (attempt === 'blocked stopped') {
+        Object.assign(rig.runtime, { task007Fixtures: new Map([['browser', batch]]),
+          trackedSupervisorContainers: new Set([rig.supervisor.containerId]), trackedVolumes: new Set([batch.volumeName]) })
+        const running = vi.spyOn(rig.runtime, 'isContainerRunning').mockReturnValue(false)
+        const registryCommands: string[][] = []
+        let created: string[] = [], output = '', failedLogs = false, lostAck = false, pendingHelper = false, foreignLabels = false, malformedProjection = false
+        const helperId = 'e'.repeat(64)
+        const execute: owner.Task007RunChild = async (file, args) => {
+          expect(file).toBe('docker'); registryCommands.push([...args])
+          if (args[0] === 'ps') return { stdout: pendingHelper ? created[created.indexOf('--name') + 1] : '', stderr: '' }
+          if (args[0] === 'create') {
+            created = args
+            pendingHelper = true
+            expect(args).toContain(`type=volume,source=${batch.volumeName},target=/registry,readonly,volume-nocopy`)
+            expect(args).toContain(`type=bind,source=${batch.metadataFile},target=/fixture/metadata.json,readonly`)
+            expect(args.slice(args.indexOf('--user'), args.indexOf('--user') + 2)).toEqual(['--user', '0:0'])
+            expect(args).toContain('--read-only'); expect(args).toContain('none'); expect(args).toContain('ALL')
+            expect(args).not.toContain(root.providerVolumeName)
+            if (lostAck) throw new Error('controlled create ACK lost')
+            return { stdout: helperId, stderr: '' }
+          }
+          if (args[0] === 'inspect') {
+            const labels: Record<string, string> = {}
+            args = created
+            for (let index = 0; index < args.length; index++) if (args[index] === '--label') {
+              const [key, value] = args[++index].split('='); labels[key] = value
+            }
+            if (foreignLabels) labels['com.freshell.task007-fixture-id'] = 'foreign-fixture'
+            return { stdout: JSON.stringify([{ Id: helperId, Image: batch.input.imageRef, Config: { Labels: labels }, Mounts: [
+              { Type: 'volume', Name: batch.volumeName, Destination: '/registry', RW: false },
+              { Type: 'bind', Source: batch.metadataFile, Destination: '/fixture/metadata.json', RW: false },
+            ] }]), stderr: '' }
+          }
+          if (args[0] === 'start') {
+            output = await new Promise<string>((resolve, reject) => execFile('python3', ['-I', '-c', created.at(-6)!,
+              database, batch.metadataFile, created.at(-3)!, batch.registryRoot, created.at(-1)!], { encoding: 'utf8' },
+              (error, stdout) => error ? reject(error) : resolve(stdout)))
+            return { stdout: '', stderr: '' }
+          }
+          if (args[0] === 'wait') return { stdout: '0', stderr: '' }
+          if (args[0] === 'logs') { if (failedLogs) throw new Error('controlled Registry read failure'); return { stdout: malformedProjection ? '{}' : output, stderr: '' } }
+          if (args[0] === 'rm') { expect(args).toEqual(['rm', '--force', helperId]); pendingHelper = false; return { stdout: '', stderr: '' } }
+          throw new Error('unexpected Registry helper command')
+        }
+        Object.assign(rig.runtime, { executeTask007Child: execute })
+        const beforeRefusal = registryCommands.length
+        await expect(rig.runtime.readTask007StoppedRegistry({ ...rig.supervisor, volumeName: 'foreign-volume' }, batch.input.fixtureId, 'repair-current')).rejects.toThrow(/ownership/)
+        await expect(rig.runtime.readTask007StoppedRegistry(rig.supervisor, 'foreign-fixture', 'repair-current')).rejects.toThrow(/ownership/)
+        running.mockReturnValue(true)
+        await expect(rig.runtime.readTask007StoppedRegistry(rig.supervisor, batch.input.fixtureId, 'repair-current')).rejects.toThrow(/running/)
+        running.mockReturnValue(false)
+        const metadata = await fsp.readFile(batch.metadataFile)
+        await fsp.writeFile(batch.metadataFile, JSON.stringify({ ...batch.output, fixtureId: 'foreign-fixture' }))
+        await expect(rig.runtime.readTask007StoppedRegistry(rig.supervisor, batch.input.fixtureId, 'repair-current')).rejects.toThrow(/metadata.*custody/)
+        await fsp.writeFile(batch.metadataFile, metadata)
+        expect(registryCommands).toHaveLength(beforeRefusal)
+        vi.spyOn(rig.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+        vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+        vi.spyOn(rig.runtime, 'startSupervisor').mockResolvedValue({ ...rig.supervisor })
+        vi.spyOn(rig.runtime, 'waitForSupervisorHealth').mockResolvedValue({})
+        vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
+        const logs = vi.spyOn(rig.runtime, 'containerLogs').mockReturnValue(JSON.stringify({ event: 'supervisor.test_crash', point: 'stopped_repair_after_import_publication' }))
+        vi.spyOn(rig.runtime, 'inspectContainer').mockReturnValue({ State: { Running: false, ExitCode: 134 } })
+        await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'after_import_publication')
+        const originalRegistry = await fsp.readFile(database)
+        const stoppedObserved = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
+        expect(stoppedObserved.operationId).toBe('repair-current')
+        expect(stoppedObserved.faultMarkers.crash).toEqual({ point: 'stopped_repair_after_import_publication', running: false, exitCode: 134 })
+        expect(stoppedObserved.unrelated).toEqual(observed.unrelated)
+        expect((await fsp.readFile(database)).equals(originalRegistry)).toBe(true)
+        expect(registryCommands.filter(args => args[0] === 'create')).toHaveLength(2)
+        expect(registryCommands.filter(args => args[0] === 'rm')).toHaveLength(2)
+        expect(rig.runtime.transferOwnedIds().containers).not.toContain(helperId)
+        failedLogs = true
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/controlled Registry read failure/)
+        expect(registryCommands.at(-1)).toEqual(['rm', '--force', helperId])
+        failedLogs = false
+        malformedProjection = true
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow()
+        expect(registryCommands.at(-1)).toEqual(['rm', '--force', helperId])
+        malformedProjection = false; lostAck = true
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/ACK lost/)
+        expect(registryCommands.at(-1)).toEqual(['rm', '--force', helperId])
+        expect(pendingHelper).toBe(false)
+        foreignLabels = true
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/owned cleanup failed/)
+        expect(registryCommands.at(-1)?.[0]).toBe('inspect')
+        expect(pendingHelper).toBe(true)
+        foreignLabels = false
+        await Reflect.apply(Object.getPrototypeOf(rig.runtime).removeTask007Helper, rig.runtime, [created[created.indexOf('--name') + 1]])
+        expect(pendingHelper).toBe(false)
+        lostAck = false
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'missing-operation')).rejects.toThrow(/absent|failed/)
+        expect(registryCommands.at(-1)).toEqual(['rm', '--force', helperId])
+        logs.mockReturnValue('{"event":"supervisor.test_crash", malformed')
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/malformed/)
+        logs.mockReturnValue('')
+        expect((await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).faultMarkers.crash).toBeNull()
+        await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+        running.mockReturnValue(true)
+      }
       const alteredGraph = new DatabaseSync(installedDatabase)
       alteredGraph.prepare('UPDATE session SET parent_id = ? WHERE id = ?').run(root.rootSessionId, batch.source.families[0].grandchildId)
       alteredGraph.close()
@@ -681,9 +1378,14 @@ describe('Task7 registered physical stopped fixture preparation', () => {
         const failedResume = new DatabaseSync(database)
         failedResume.exec("UPDATE souls SET recovery_state='blocked' WHERE soul_id='soul-0'; UPDATE incarnations SET launch_state='stopped'; DELETE FROM writer_claims")
         failedResume.close()
+        await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'first_resume_observation')
+        const failureMarker = { soulId: root.soulId, incarnationId: resumed.incarnationId, executionGeneration: 2 }
+        await fsp.appendFile(path.join(path.dirname(batch.input.runtimeRoot), 'evidence/lifecycle.jsonl'), JSON.stringify({
+          event: 'supervisor.stopped_repair_resume_observation_test_failure', data: failureMarker }) + '\n')
         inventory.mockImplementation(async () => persistedInventory())
         await fsp.writeFile(inspection, JSON.stringify([{ Id: resumed.containerId, State: { Running: false } }]))
         const blockedObservation = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
+        expect(blockedObservation.faultMarkers.firstResumeObservationFailures).toEqual([failureMarker])
         expect(blockedObservation.souls[0]).toMatchObject({ desiredState: 'running', recoveryState: 'blocked', activeWriters: 0 })
         expect(blockedObservation.nativeObservations[0]).toEqual({ rootSessionId: root.rootSessionId,
           canonicalSoulId: root.soulId, state: 'unavailable', reason: 'host_unavailable' })
@@ -882,7 +1584,7 @@ describe('Task7 registered physical stopped fixture preparation', () => {
       expect(fs.existsSync(path.join(hostRuntimeDir, 'host.sock'))).toBe(false)
       expect(fs.existsSync(rig.runtime.testRoot)).toBe(false)
     }
-  })
+  }, 60_000)
 
   it('refuses browser batch setup before any preparation unless the owner is isolated, grant-free and explicitly opted in', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused batch web') }, fixtureRepoRoot, 3)
